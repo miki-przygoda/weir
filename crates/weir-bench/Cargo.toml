@@ -1,0 +1,15 @@
+[package]
+name = "weir-bench"
+description = "Benchmark harness for weir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "weir-bench"
+path = "src/main.rs"
+
+[dependencies]
+weir-core = { path = "../weir-core" }
+weir-client = { path = "../weir-client" }
