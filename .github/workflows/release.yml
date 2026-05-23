@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p weir-server
+          else
+            cargo build --release --target ${{ matrix.target }} -p weir-server
+          fi
+      - name: Stage binary (Unix)
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: mv target/${{ matrix.target }}/release/weir-server weir-server-${{ matrix.target }}
+      - name: Stage binary (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: mv target/${{ matrix.target }}/release/weir-server.exe weir-server-${{ matrix.target }}.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weir-server-${{ matrix.target }}
+          path: weir-server-${{ matrix.target }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
