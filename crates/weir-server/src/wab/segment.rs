@@ -206,6 +206,91 @@ pub fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
     shard_dir.join(format!("seg_{counter:08}{EXT_ACTIVE}"))
 }
 
+/// Manages the active segment for one shard. Opens the segment lazily on first write.
+pub struct ShardWriter {
+    shard_id: u16,
+    shard_dir: PathBuf,
+    /// Counter used to name the next segment file (incremented on each rotation).
+    next_counter: u64,
+    active: Option<WabSegment>,
+}
+
+impl ShardWriter {
+    pub fn new(shard_id: u16, shard_dir: PathBuf) -> Self {
+        ShardWriter {
+            shard_id,
+            shard_dir,
+            next_counter: 1,
+            active: None,
+        }
+    }
+
+    /// Sets `next_counter` to one past the highest existing segment counter in the
+    /// shard directory. Called during startup so new segments don't collide with
+    /// existing (sealed) ones.
+    pub fn scan_and_advance_counter(&mut self) -> io::Result<()> {
+        let mut max: u64 = 0;
+        for entry in std::fs::read_dir(&self.shard_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(n) = segment_counter_from_path(&path) {
+                if n > max {
+                    max = n;
+                }
+            }
+        }
+        if max >= self.next_counter {
+            self.next_counter = max.checked_add(1).expect("segment counter overflow");
+        }
+        Ok(())
+    }
+
+    /// Writes one record, opening the segment lazily.
+    ///
+    /// Returns `Some(sealed_path)` if the write caused the segment to hit the rotation
+    /// threshold and be sealed. The caller is responsible for sending the sealed path
+    /// to the drain channel.
+    pub fn write_record(&mut self, payload: &[u8]) -> io::Result<Option<PathBuf>> {
+        self.ensure_open()?;
+        let seg = self.active.as_mut().expect("ensure_open guarantees Some");
+        seg.write_record(payload)?;
+        if seg.should_rotate() {
+            let sealed = self.active.take().unwrap().seal()?;
+            return Ok(Some(sealed));
+        }
+        Ok(None)
+    }
+
+    /// Fsyncs the current active segment. No-op if no segment is open.
+    pub fn fsync_current(&self) -> io::Result<()> {
+        if let Some(seg) = &self.active {
+            seg.fsync()?;
+        }
+        Ok(())
+    }
+
+    /// Seals the current active segment and returns its sealed path.
+    /// Returns `None` if no segment is currently open.
+    pub fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
+        match self.active.take() {
+            Some(seg) => Ok(Some(seg.seal()?)),
+            None => Ok(None),
+        }
+    }
+
+    fn ensure_open(&mut self) -> io::Result<()> {
+        if self.active.is_none() {
+            let path = segment_path(&self.shard_dir, self.next_counter);
+            self.next_counter = self
+                .next_counter
+                .checked_add(1)
+                .expect("segment counter overflow");
+            self.active = Some(WabSegment::create(&path, self.shard_id)?);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn platform_fsync(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
