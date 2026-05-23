@@ -12,3 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 weir-core = { path = "../weir-core" }
+crc32fast = "1.4"
+libc = "0.2"
+
+[dev-dependencies]
+# tempfile is not added: tests use std::env::temp_dir() with unique subpaths.

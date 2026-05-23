@@ -1,1 +1,3 @@
+mod wab;
+
 fn main() {}
