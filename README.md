@@ -30,22 +30,22 @@ Windows is not supported for the daemon. CI builds `weir-core` on Windows to kee
 
 ## Crate layout
 
-| Crate | Type | Description |
-|---|---|---|
-| `weir-core` | lib | Wire protocol types: `Envelope`, `Header`, `Durability`, `NackReason`, `DecodeError`, `Payload`. Cross-platform. |
-| `weir-server` | bin + lib | Daemon: socket layer, WAB, queue, worker pool, drain. Unix only. |
-| `weir-client` | lib | Client library. Thin wrapper around the socket protocol. |
-| `weir-bench` | bin | Benchmark harness. Three-tier throughput numbers per platform. |
+| Crate         | Type      | Description                                                                                                      |
+|---------------|-----------|------------------------------------------------------------------------------------------------------------------|
+| `weir-core`   | lib       | Wire protocol types: `Envelope`, `Header`, `Durability`, `NackReason`, `DecodeError`, `Payload`. Cross-platform. |
+| `weir-server` | bin + lib | Daemon: socket layer, WAB, queue, worker pool, drain. Unix only.                                                 |
+| `weir-client` | lib       | Client library. Thin wrapper around the socket protocol.                                                         |
+| `weir-bench`  | bin       | Benchmark harness. Three-tier throughput numbers per platform.                                                   |
 
 ---
 
 ## Durability tiers
 
-| Tier | ACK condition | Throughput |
-|---|---|---|
-| `Sync` | After `fdatasync` of the WAB segment | Lowest |
-| `Batched` | After group `fdatasync` at the next batch boundary | ~10–50× `Sync` |
-| `Buffered` | After WAB memory write — no fsync | Highest |
+| Tier       | ACK condition                                      | Throughput     |
+|------------|----------------------------------------------------|----------------|
+| `Sync`     | After `fdatasync` of the WAB segment               | Lowest         |
+| `Batched`  | After group `fdatasync` at the next batch boundary | ~10–50× `Sync` |
+| `Buffered` | After WAB memory write — no fsync                  | Highest        |
 
 The tier is set per-record in the wire frame header. `weir` does not hide the fsync cost behind a global setting — every record's durability contract is explicit at the call site.
 
