@@ -1309,6 +1309,96 @@ fn wab_data_integrity_after_crash() {
     }
 }
 
+// ── Socket takeover data safety ───────────────────────────────────────────────
+
+/// `bind_cleanup` removes the socket file (even if another process is
+/// listening) so that crash-recovery always succeeds. When a second server
+/// takes the socket path the first server's WAB files must be left entirely
+/// untouched — the socket file and the WAB are independent resources.
+#[test]
+fn socket_takeover_does_not_corrupt_wab_data() {
+    const N: usize = 20;
+
+    let srv_a = ServerHandle::start("socket_takeover");
+    let mut client = srv_a.client();
+
+    for i in 0..N {
+        client
+            .push(format!("srv-a-{i}").as_bytes(), Durability::Sync)
+            .expect("push to server A failed");
+    }
+
+    let wab_before = wab_dir_bytes(&srv_a.wab_dir);
+    assert!(wab_before > 0, "server A must have written WAB bytes");
+
+    // Spawn server B at the same socket path (it will call bind_cleanup and
+    // take over the socket). Use Command directly — we hold the process lock
+    // via srv_a and need two processes alive at once intentionally.
+    let second_tmp =
+        std::env::temp_dir().join(format!("weir_sys_takeover_b_{}", std::process::id()));
+    let second_wab = second_tmp.join("wab");
+    let second_config = second_tmp.join("weir.toml");
+
+    fs::create_dir_all(&second_wab).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&second_wab, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(
+        &second_config,
+        format!(
+            "[server]\n\
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = 1\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
+            srv_a.socket_path.display(),
+            second_wab.display(),
+            free_port(),
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+    let mut child_b = Command::new(binary)
+        .args(["--config", second_config.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn server B");
+
+    // Give server B time to start and take the socket.
+    thread::sleep(Duration::from_millis(500));
+
+    // Server A's WAB files must be completely untouched.
+    let wab_after = wab_dir_bytes(&srv_a.wab_dir);
+    assert_eq!(
+        wab_before, wab_after,
+        "server B startup modified server A's WAB bytes ({wab_before} → {wab_after})"
+    );
+
+    // Verify payload bytes are still present.
+    let wab_bytes = read_wab_bytes(&srv_a.wab_dir);
+    for i in 0..N {
+        let payload = format!("srv-a-{i}").into_bytes();
+        assert!(
+            wab_bytes
+                .windows(payload.len())
+                .any(|w| w == payload.as_slice()),
+            "payload srv-a-{i} missing from server A's WAB after socket takeover"
+        );
+    }
+
+    let _ = child_b.kill();
+    let _ = child_b.wait();
+    let _ = fs::remove_dir_all(&second_tmp);
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
