@@ -6,5 +6,4 @@ todos/
 examples/
 tests/
 *.md
-*.lock
 deploy/docker/weir.toml.example

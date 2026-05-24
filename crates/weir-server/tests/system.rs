@@ -81,8 +81,7 @@ impl ServerHandle {
     fn start(tag: &str) -> Self {
         let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
         let metrics_port = free_port();
-        let tmp_dir =
-            std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
         let wab_dir = tmp_dir.join("wab");
         let socket_dir = tmp_dir.join("run");
         let socket_path = socket_dir.join("weir.sock");
@@ -334,10 +333,7 @@ fn concurrent_producers_all_acked() {
             failures += 1;
         }
     }
-    assert_eq!(
-        failures, 0,
-        "{failures}/{THREADS} producer threads failed"
-    );
+    assert_eq!(failures, 0, "{failures}/{THREADS} producer threads failed");
 }
 
 #[test]
@@ -350,8 +346,7 @@ fn many_connections_open_simultaneously() {
     // semaphore-based connection cap under load.
     let clients: Vec<WeirClient> = (0..CONN_COUNT)
         .map(|i| {
-            WeirClient::connect(&srv.socket_path)
-                .unwrap_or_else(|e| panic!("connect {i}: {e}"))
+            WeirClient::connect(&srv.socket_path).unwrap_or_else(|e| panic!("connect {i}: {e}"))
         })
         .collect();
 
@@ -424,7 +419,9 @@ fn wab_writes_nonzero_bytes_to_disk_after_sync_pushes() {
     let srv = ServerHandle::start("wab_bytes");
     let mut client = srv.client();
     for _ in 0..20 {
-        client.push(b"gauge-test-payload", Durability::Sync).unwrap();
+        client
+            .push(b"gauge-test-payload", Durability::Sync)
+            .unwrap();
     }
     thread::sleep(Duration::from_millis(150));
 
@@ -441,10 +438,7 @@ fn wab_writes_nonzero_bytes_to_disk_after_sync_pushes() {
 fn metrics_endpoint_responds_with_openmetrics_content() {
     let srv = ServerHandle::start("metrics_up");
     let body = srv.scrape_metrics();
-    assert!(
-        !body.is_empty(),
-        "metrics endpoint returned empty body"
-    );
+    assert!(!body.is_empty(), "metrics endpoint returned empty body");
     // OpenMetrics text format always ends with EOF marker.
     assert!(
         body.contains("weir_") || body.contains("# EOF"),
