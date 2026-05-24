@@ -276,6 +276,84 @@ impl ServerHandle {
         self.child = None; // prevent Drop from double-killing
         let _ = fs::remove_dir_all(&self.tmp_dir);
     }
+
+    /// Starts the server with `RLIMIT_FSIZE = 0` so every WAB write fails with
+    /// `EFBIG`. `SIGXFSZ` is ignored in the child so the signal does not kill
+    /// the process; instead writes return an error that the server surfaces as
+    /// `Nack(InternalError)`.
+    ///
+    /// stdout/stderr are silenced (`/dev/null`) because the log file itself
+    /// would also fail to write under `RLIMIT_FSIZE = 0`.
+    fn start_disk_full(tag: &str) -> Self {
+        use std::os::unix::process::CommandExt;
+
+        let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let metrics_port = free_port();
+        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
+        let wab_dir = tmp_dir.join("wab");
+        let socket_dir = tmp_dir.join("run");
+        let socket_path = socket_dir.join("weir.sock");
+        let config_path = tmp_dir.join("weir.toml");
+
+        fs::create_dir_all(&wab_dir).unwrap();
+        fs::create_dir_all(&socket_dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let config = format!(
+            "[server]\n\
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = 1\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
+            socket_path.display(),
+            wab_dir.display(),
+            metrics_port,
+        );
+        fs::write(&config_path, config).unwrap();
+
+        let binary = env!("CARGO_BIN_EXE_weir-server");
+        let mut cmd = Command::new(binary);
+        cmd.args(["--config", config_path.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let rl = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &rl);
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .expect("failed to spawn weir-server (disk-full)");
+
+        let mut handle = Self {
+            child: Some(child),
+            socket_path,
+            wab_dir,
+            metrics_port,
+            config_path,
+            tmp_dir,
+            _proc_lock,
+        };
+
+        handle.wait_ready(Duration::from_secs(15));
+        handle
+    }
 }
 
 impl Drop for ServerHandle {
@@ -1138,6 +1216,31 @@ fn partial_frame_does_not_corrupt_next_connection() {
     srv.client()
         .health_check()
         .expect("server unresponsive after partial frame test");
+}
+
+// ── Disk full ─────────────────────────────────────────────────────────────────
+
+/// A WAB write failure (disk full simulated via `RLIMIT_FSIZE = 0`) must
+/// produce `Nack(InternalError)` on the client, not a server crash or silent
+/// data drop.
+#[test]
+fn disk_full_returns_nack_not_crash() {
+    use weir_core::NackReason;
+
+    let srv = ServerHandle::start_disk_full("disk_full");
+    let mut client = srv.client();
+
+    // With RLIMIT_FSIZE=0 the first WAB segment header write fails immediately.
+    let result = client.push(b"should-nack", Durability::Sync);
+    assert!(
+        matches!(result, Err(ClientError::Nack(NackReason::InternalError))),
+        "expected Nack(InternalError) from disk-full server, got {result:?}"
+    );
+
+    // Server must still be alive and accepting connections after the nack.
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after disk-full nack");
 }
 
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
