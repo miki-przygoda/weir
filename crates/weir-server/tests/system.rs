@@ -425,6 +425,23 @@ fn count_wab_files(dir: &Path, ext: &str) -> usize {
     count
 }
 
+// Helper: collect every byte from all files under a directory tree.
+fn read_wab_bytes(dir: &Path) -> Vec<u8> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend_from_slice(&read_wab_bytes(&p));
+        } else if let Ok(bytes) = fs::read(&p) {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 // ── Basic push / ack ──────────────────────────────────────────────────────────
@@ -1241,6 +1258,55 @@ fn disk_full_returns_nack_not_crash() {
     srv.client()
         .health_check()
         .expect("server unresponsive after disk-full nack");
+}
+
+// ── WAB data integrity after crash ────────────────────────────────────────────
+
+/// Every Sync push that returned `Ok` must be present on disk byte-for-byte
+/// after the server is killed with SIGKILL.
+///
+/// This tests the "Sync durability" contract at the byte level: if the client
+/// got an `Ok`, the payload must be in the WAB file (the fsync happened before
+/// the ack was sent).
+#[test]
+fn wab_data_integrity_after_crash() {
+    const N: usize = 50;
+
+    let mut srv = ServerHandle::start_sharded("wab_integrity", 1);
+    let mut client = srv.client();
+
+    let mut acked: Vec<Vec<u8>> = Vec::new();
+    for i in 0..N {
+        let payload = format!("integrity-{i:05}").into_bytes();
+        match client.push(&payload, Durability::Sync) {
+            Ok(()) => acked.push(payload),
+            Err(_) => break, // server died mid-push
+        }
+    }
+
+    assert!(!acked.is_empty(), "no pushes acked before crash");
+
+    // Crash without cleanup — WAB files stay on disk exactly as they were.
+    srv.kill_ungracefully();
+
+    let wab_bytes = read_wab_bytes(&srv.wab_dir);
+    assert!(
+        !wab_bytes.is_empty(),
+        "WAB directory empty after {} acked Sync pushes",
+        acked.len()
+    );
+
+    // Every acked payload must appear verbatim in the WAB bytes.
+    for payload in &acked {
+        let found = wab_bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_slice());
+        assert!(
+            found,
+            "acked payload {:?} not found in WAB bytes — possible data loss",
+            String::from_utf8_lossy(payload)
+        );
+    }
 }
 
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
