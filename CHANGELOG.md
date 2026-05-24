@@ -26,6 +26,58 @@ under **Wire protocol** below and may evolve independently of crate versions.
 ### Added
 - Conversion plan and architecture decisions (workspace-local, not committed).
 - Initial repository scaffolding.
+- **weir-core**: wire protocol types (`Envelope`, `Header`, `MessageType`,
+  `Durability`, `NackReason`, `DecodeError`, `WeirError`, `Payload`).
+  - `WIRE_VERSION = 1` and `MAX_PAYLOAD_HARD_CAP = 16 MiB` are the
+    single-source-of-truth constants shared across all crates.
+  - `NackReason::VersionMismatch` Nack payload encodes `[0x02, WIRE_VERSION]`
+    so future clients can inspect the daemon's supported version.
+  - `DecodeError::VersionMismatch { supported, received }` is a distinct
+    variant (not collapsed into `BadMagic` or `HeaderCrcMismatch`), enabling
+    producers to distinguish a version gate from a corrupt frame.
+  - Envelope decode checks `PayloadTooLarge` before any heap allocation and
+    before the full frame-length check, preventing pre-allocation DoS.
+  - Header decode checks the version byte before the header CRC so a v2
+    client gets `VersionMismatch` (actionable) rather than `HeaderCrcMismatch`
+    (confusing) when talking to a v1 daemon.
+- **WAB subsystem** (`weir-server::wab`): segment file format (FORMAT_VERSION=1),
+  crash recovery, and the flusher thread pool.
+  - Segment layout: 24-byte header + records (`payload_len u32 LE` + `crc32
+    u32 LE` + payload bytes) + 4-byte zero sentinel + 32-byte footer.
+  - `.confirmed` sidecar: 36-byte binary (`WCON` magic, version, reserved,
+    `sealed_at i64 LE`, `record_count u64 LE`, `drained_at i64 LE`,
+    `file_crc32 u32 LE`); CRC covers the first 32 bytes.
+  - `WabSegment` accumulates a running `crc32fast::Hasher` over every byte
+    written so the footer CRC requires no full-file re-read at seal time.
+  - `ShardWriter::write_record` returns `Option<PathBuf>` on rotation so the
+    flusher thread can forward the sealed path to the drain channel without an
+    extra seal-current call.
+  - Crash recovery replays every open segment, truncates trailing corrupt
+    records, and rebuilds the footer. Segments with bad magic or unknown
+    format versions are quarantined rather than deleted.
+  - `SegmentReader` enforces `MAX_PAYLOAD_HARD_CAP` before allocation to
+    prevent corrupt-length fields from triggering large heap allocations during
+    replay.
+  - `spawn` validates the WAB directory, advances shard counters past existing
+    segments, replays unconfirmed sealed segments, and pins each flusher thread
+    with `core_affinity`. SCHED_FIFO is attempted on Linux and fails open with
+    a warning.
+
+### Security
+- `Envelope::decode` and `SegmentReader` both enforce `MAX_PAYLOAD_HARD_CAP`
+  before any heap allocation, capping DoS surface from malformed length fields.
+- `WabSegment::create` uses `O_CREAT | O_EXCL | O_NOFOLLOW` to prevent
+  symlink-based TOCTOU attacks on segment file creation.
+- WAB directory validation (`validate_path`) requires an absolute path free of
+  `..` components and null bytes, then calls `canonicalize` to resolve symlinks;
+  dangling symlinks return a `NotFound` error that includes a `mkdir -p && chmod
+  700` hint (matching the PostgreSQL directory-creation UX).
+- `.confirmed` sidecar files with bad magic, unknown version, or CRC mismatch
+  are quarantined rather than trusted, preventing a corrupt sidecar from marking
+  a segment as drained when it was not.
+- Per-record CRC32 checked during crash recovery; only records up to the first
+  corrupt entry are replayed, so a torn write at crash time never silently
+  corrupts the replay stream.
 
 ---
 
@@ -34,9 +86,14 @@ under **Wire protocol** below and may evolve independently of crate versions.
 The envelope format carries a `VERSION` byte in its fixed header. Changes to
 the wire format are logged here so producers and consumers can negotiate.
 
-### v1 (unreleased)
-- Initial design. 16-byte header (magic, version, type, durability, flags,
-  payload length, header CRC32) followed by payload and payload CRC32.
+### v1
+- Initial implementation. 16-byte header (`WEIR` magic, version, type,
+  durability, flags, payload length u32 LE, header CRC32 of first 12 bytes)
+  followed by payload bytes and a trailing payload CRC32 u32 LE.
+- Version byte is checked before the header CRC so version mismatches surface
+  as `VersionMismatch` rather than `HeaderCrcMismatch`.
+- `VersionMismatch` Nack payload: `[0x02, WIRE_VERSION]` (two bytes; second
+  byte is the daemon's supported version).
 
 ---
 
