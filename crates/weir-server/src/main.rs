@@ -4,6 +4,7 @@
 
 mod models;
 mod queue;
+#[cfg(unix)]
 mod socket;
 mod wab;
 mod worker;
