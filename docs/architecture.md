@@ -14,7 +14,7 @@ weir is extracted from HTDIP (Hardware-Tuned Data Ingestion Pipeline), a product
 Producer
   │  Unix socket (weir wire protocol v1)
   ▼
-Socket layer          (async tokio, src/socket/)
+Socket layer          (async tokio, src/socket/)   [Unix only — #[cfg(unix)]]
   │  QueueSender::push_timeout  [crossing point: spawn_blocking]
   ▼
 Work queue            (bounded MPMC, src/queue.rs)
@@ -39,16 +39,21 @@ Under sustained load, if every active connection is simultaneously blocked waiti
 
 ## Component responsibilities
 
-### Socket layer (`src/socket/`)
+### Socket layer (`src/socket/`) — Unix only
 
-- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, chmod 0o600 after bind).
+The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exist on Windows; `weir-core` remains cross-platform.
+
+- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, `chmod 0o600` after bind).
 - Accepts connections up to `max_connections` (Semaphore-gated; over-cap streams are dropped immediately).
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
+- `QueueSender::push_timeout` is used with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.
+- Signal handling (SIGTERM/Ctrl-C) and CLI/env config for `shutdown_timeout_secs` are wired in step 08.
 
 ### Work queue (`src/queue.rs`)
 
 - Bounded MPMC `crossbeam_channel` with `QUEUE_CAPACITY = 65 536` slots.
+- `QueueSender` implements `Clone` so multiple socket handlers can push concurrently without shared mutable state.
 - `QueueSender::push` blocks the calling thread (intentional backpressure — stalls the socket handler rather than dropping records or allocating unboundedly).
 - `QueueSender::push_timeout` is used by the socket layer with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Generic over `T`; the socket layer instantiates `Queue<WorkUnit>` without the queue module depending on `WorkUnit`.
@@ -70,6 +75,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - One flusher thread per shard; each holds an active `WabSegment`.
 - Three durability tiers: `Sync` (fdatasync per record), `Batched` (group fdatasync per batch), `Buffered` (ack after memory write, no fsync).
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
+- Path validation (`validate_path`) is currently in `src/wab/mod.rs`; it will move to `src/config/mod.rs` in step 08 and be shared with socket path validation.
 
 ### Drain (step 06, not yet implemented)
 
@@ -81,12 +87,13 @@ Reads sealed segments via `SegmentReader`, forwards records to the sink, writes 
 
 | Concern | Mitigation |
 |---|---|
-| Pre-allocation DoS via large `payload_len` | Cap check (`min(config, MAX_PAYLOAD_HARD_CAP)`) before any allocation in both `handle_connection` and `SegmentReader` |
+| Pre-allocation DoS via large `payload_len` | Cap check (`min(config, MAX_PAYLOAD_HARD_CAP)`) before any allocation in both `handle_connection` and `SegmentReader`. `MAX_PAYLOAD_HARD_CAP` is defined once in `weir-core` and imported by every enforcement point. |
 | Symlink TOCTOU on segment creation | `O_CREAT \| O_EXCL \| O_NOFOLLOW` on Unix; `create_new(true)` on Windows |
 | Symlink TOCTOU on segment write-reopen | `O_NOFOLLOW` on the recovery write pass |
 | Stale socket file removal | `symlink_metadata` + S_ISSOCK check before `remove_file`; refuses to remove a non-socket |
 | Path traversal in WAB/socket paths | Absolute-path + no-`..` + no-null-byte + `canonicalize` validation |
-| World-readable WAB files | Segment files: `0o600`; shard dirs: `0o700`; quarantine dir: `0o700` |
+| World-readable WAB files | Segment files: `0o600`; shard dirs: `0o700`; quarantine dir: `0o700` — set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode` |
 | Corrupt `.confirmed` sidecar | Bad magic / unknown version / CRC mismatch quarantines both the sealed segment and sidecar |
 | Torn write in crash recovery | Per-record CRC32 checked; replay truncates at the first corrupt entry |
 | Blocked socket semaphore (dead workers) | `push_timeout` (5 s) returns `InternalError` Nack rather than blocking indefinitely |
+| WAB integrity on shared/network storage | **Out of scope.** CRC32 detects accidental corruption; it does not detect malicious modification. The WAB directory must be local storage accessible only to the daemon (`0o700`). Network filesystems break the security model. |

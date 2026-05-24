@@ -4,7 +4,9 @@
 
 weir uses a binary framing protocol over Unix sockets. Each frame is a fixed 16-byte header followed by a variable-length payload and a 4-byte payload CRC32.
 
-The `WIRE_VERSION` constant in `weir-core::version` is the single source of truth. Version negotiation is strict-equality: no forward or backward compatibility across versions.
+The `WIRE_VERSION` constant in `weir-core::version` is the single source of truth. Version negotiation is strict-equality: no forward or backward compatibility across versions. A future-version frame is not silently parsed as v1 — only `version == WIRE_VERSION` is accepted. This is intentional: silently parsing a v2 frame as v1 would corrupt the record when the v2 layout differs.
+
+The payload is opaque bytes to weir. `weir-core` exposes `pub type Payload = Vec<u8>`. Producers choose their own serialisation format (protobuf, bincode, raw, etc.).
 
 ---
 
