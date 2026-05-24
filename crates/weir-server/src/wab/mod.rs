@@ -3,13 +3,287 @@ pub mod recovery;
 pub mod segment;
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, BufReader, Read},
     path::{Component, Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
-use format::{FORMAT_VERSION, SEGMENT_HEADER_LEN};
-use weir_core::{Payload, MAX_PAYLOAD_HARD_CAP};
+use crossbeam_channel::{Receiver, Sender};
+use tracing::{info, warn};
+
+use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN};
+use recovery::{check_confirmed, recover_open_segments};
+use segment::ShardWriter;
+use weir_core::{Durability, Payload, MAX_PAYLOAD_HARD_CAP};
+
+/// A record queued by a connection handler for writing to the WAB.
+pub struct WabRecord {
+    pub payload: Payload,
+    pub durability: Durability,
+    /// Per-request ack channel. The flusher sends `Ok(())` after the record is
+    /// durably written according to the requested tier, or `Err` on an
+    /// unrecoverable write failure.
+    pub ack_tx: Sender<Result<(), io::Error>>,
+}
+
+/// Configuration for the WAB subsystem.
+pub struct WabConfig {
+    /// Number of shards (one flusher thread per shard).
+    pub shard_count: usize,
+    /// Maximum number of records per flush batch.
+    pub batch_size: usize,
+    /// Maximum time to accumulate a batch before flushing.
+    pub batch_deadline: Duration,
+}
+
+impl Default for WabConfig {
+    fn default() -> Self {
+        WabConfig {
+            shard_count: 1,
+            batch_size: 1000,
+            batch_deadline: Duration::from_millis(100),
+        }
+    }
+}
+
+/// Returned by `spawn`. Drop `shard_txs` to initiate shutdown (flusher threads
+/// exit when their receiver disconnects), then join the handles to wait for all
+/// segments to be sealed.
+pub struct WabHandle {
+    /// One sender per shard. Drop all of them to signal shutdown.
+    pub shard_txs: Vec<Sender<WabRecord>>,
+    pub join_handles: Vec<thread::JoinHandle<()>>,
+}
+
+fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
+    wab_dir.join(format!("shard_{shard_id:02}"))
+}
+
+/// Runs crash recovery, replays sealed-but-unconfirmed segments to `drain_tx`,
+/// then spawns one flusher thread per shard.
+pub fn spawn(
+    wab_dir: PathBuf,
+    config: WabConfig,
+    drain_tx: Sender<PathBuf>,
+) -> io::Result<WabHandle> {
+    // TODO step-08: replace with `config::validate_path(&wab_dir)?` once config/ exists.
+    let wab_dir = validate_path(&wab_dir)?;
+
+    for shard_id in 0..config.shard_count {
+        fs::create_dir_all(shard_dir_path(&wab_dir, shard_id))?;
+    }
+
+    // Phase 1 (calling thread): crash recovery — unsealed .wab → .wab.sealed
+    recover_open_segments(&wab_dir)?;
+
+    // Phase 2 (calling thread): replay sealed-but-unconfirmed segments
+    replay_unconfirmed(&wab_dir, config.shard_count, &drain_tx)?;
+
+    // Phase 3: one flusher thread per shard
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let mut shard_txs = Vec::with_capacity(config.shard_count);
+    let mut join_handles = Vec::with_capacity(config.shard_count);
+
+    for shard_id in 0..config.shard_count {
+        let (tx, rx) = crossbeam_channel::bounded::<WabRecord>(config.batch_size * 4);
+        shard_txs.push(tx);
+
+        let sdir = shard_dir_path(&wab_dir, shard_id);
+        let drain_clone = drain_tx.clone();
+        let batch_size = config.batch_size;
+        let batch_deadline = config.batch_deadline;
+        let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
+
+        let handle = thread::Builder::new()
+            .name(format!("wab-flusher-{shard_id}"))
+            .spawn(move || {
+                flusher_thread(shard_id as u16, sdir, rx, drain_clone, batch_size, batch_deadline, core_id);
+            })
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        join_handles.push(handle);
+    }
+
+    Ok(WabHandle { shard_txs, join_handles })
+}
+
+fn replay_unconfirmed(
+    wab_dir: &Path,
+    shard_count: usize,
+    drain_tx: &Sender<PathBuf>,
+) -> io::Result<()> {
+    for shard_id in 0..shard_count {
+        let sdir = shard_dir_path(wab_dir, shard_id);
+        if !sdir.exists() {
+            continue;
+        }
+        let mut sealed_segments: Vec<PathBuf> = fs::read_dir(&sdir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
+            .collect();
+        sealed_segments.sort(); // ascending counter order
+
+        for sealed in sealed_segments {
+            match check_confirmed(&sealed, wab_dir) {
+                Ok(true) => {
+                    info!(sealed = %sealed.display(), "skipping replay — segment already confirmed");
+                }
+                Ok(false) => {
+                    info!(sealed = %sealed.display(), "queuing segment for drain replay");
+                    drain_tx.send(sealed).map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "drain channel closed during startup replay")
+                    })?;
+                }
+                Err(e) => {
+                    // check_confirmed quarantined the segment; skip it.
+                    warn!(error = %e, "skipping quarantined segment during replay");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn flusher_thread(
+    shard_id: u16,
+    shard_dir: PathBuf,
+    work_rx: Receiver<WabRecord>,
+    drain_tx: Sender<PathBuf>,
+    batch_size: usize,
+    batch_deadline: Duration,
+    core_id: Option<core_affinity::CoreId>,
+) {
+    // Core affinity (fail-open: log and continue if denied)
+    if let Some(id) = core_id {
+        if !core_affinity::set_for_current(id) {
+            warn!(shard = shard_id, "failed to set CPU affinity; continuing without affinity");
+        }
+    }
+
+    // SCHED_FIFO (Linux only, requires CAP_SYS_NICE; fail-open)
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: 1 };
+        let ret = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+        if ret == -1 {
+            warn!(shard = shard_id, "failed to set SCHED_FIFO; continuing with default scheduler");
+        }
+    }
+
+    // Startup warmup
+    let mut writer = ShardWriter::new(shard_id, shard_dir);
+    if let Err(e) = writer.scan_and_advance_counter() {
+        warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
+    }
+
+    // Scratch buffer pre-touch: fault in the backing page before the first record arrives.
+    // push + clear is preferred over write_volatile — safe Rust, identical effect.
+    let mut scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
+    scratch.push(0u8);
+    scratch.clear();
+
+    // CRC/SIMD warmup: prime the instruction cache.
+    let _ = crc32fast::hash(&scratch);
+
+    info!(shard = shard_id, "WAB flusher started");
+
+    let mut batch: Vec<WabRecord> = Vec::with_capacity(batch_size);
+
+    loop {
+        // Block on the first record of the batch (or detect channel close).
+        match work_rx.recv_timeout(batch_deadline) {
+            Ok(record) => batch.push(record),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if !batch.is_empty() {
+                    flush_batch(&mut writer, &mut batch, &drain_tx, shard_id);
+                }
+                continue;
+            }
+        }
+
+        // Drain any additional available records up to batch_size.
+        while batch.len() < batch_size {
+            match work_rx.try_recv() {
+                Ok(record) => batch.push(record),
+                Err(_) => break,
+            }
+        }
+
+        flush_batch(&mut writer, &mut batch, &drain_tx, shard_id);
+    }
+
+    // Graceful shutdown: seal the active segment and send to drain.
+    match writer.seal_current() {
+        Ok(Some(sealed)) => {
+            info!(shard = shard_id, sealed = %sealed.display(), "WAB flusher sealed segment on shutdown");
+            drain_tx.send(sealed).ok();
+        }
+        Ok(None) => {
+            info!(shard = shard_id, "WAB flusher shut down with no active segment");
+        }
+        Err(e) => {
+            tracing::error!(shard = shard_id, error = %e, "WAB flusher failed to seal segment on shutdown");
+        }
+    }
+}
+
+fn flush_batch(
+    writer: &mut ShardWriter,
+    batch: &mut Vec<WabRecord>,
+    drain_tx: &Sender<PathBuf>,
+    shard_id: u16,
+) {
+    let mut batched_acks: Vec<Sender<Result<(), io::Error>>> = Vec::new();
+    let mut need_fsync = false;
+
+    for record in batch.drain(..) {
+        // write_record returns Some(sealed_path) when the segment rotated.
+        let rotation = match writer.write_record(&record.payload) {
+            Err(e) => {
+                let _ = record.ack_tx.send(Err(io::Error::new(e.kind(), e.to_string())));
+                continue;
+            }
+            Ok(maybe_sealed) => maybe_sealed,
+        };
+
+        if let Some(sealed) = rotation {
+            // Segment was sealed (seal includes fsync). Notify drain.
+            info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
+            drain_tx.send(sealed).ok();
+        }
+
+        match record.durability {
+            Durability::Sync => {
+                match writer.fsync_current() {
+                    Ok(()) => { let _ = record.ack_tx.send(Ok(())); }
+                    Err(e) => { let _ = record.ack_tx.send(Err(e)); }
+                }
+            }
+            Durability::Batched => {
+                need_fsync = true;
+                batched_acks.push(record.ack_tx);
+            }
+            Durability::Buffered => {
+                let _ = record.ack_tx.send(Ok(()));
+            }
+        }
+    }
+
+    // Group fsync for all Batched records in this flush.
+    if need_fsync {
+        let fsync_result = writer.fsync_current();
+        for ack_tx in batched_acks {
+            match &fsync_result {
+                Ok(()) => { let _ = ack_tx.send(Ok(())); }
+                Err(e) => { let _ = ack_tx.send(Err(io::Error::new(e.kind(), e.to_string()))); }
+            }
+        }
+    }
+}
 
 /// An iterator over records in a sealed WAB segment file.
 ///
@@ -201,7 +475,7 @@ mod tests {
         dir
     }
 
-    use std::path::PathBuf;
+    // ── SegmentReader ─────────────────────────────────────────────────────────
 
     #[test]
     fn segment_reader_round_trip() {
