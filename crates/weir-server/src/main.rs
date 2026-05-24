@@ -4,6 +4,7 @@
 
 mod models;
 mod queue;
+mod socket;
 mod wab;
 mod worker;
 
