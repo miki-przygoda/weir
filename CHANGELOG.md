@@ -13,6 +13,36 @@ changes are tracked separately under **Wire protocol** below.
 ## [Unreleased]
 
 ### Added
+- Config (`weir-server::config`): three-layer configuration system (CLI >
+  env > TOML file > defaults). `Config::load()` reads `pico-args` CLI flags,
+  `WEIR_*` env vars, and an optional TOML file (default:
+  `/etc/weir/weir.toml`), merges them in precedence order, and validates all
+  values. `ConfigError` — manual `impl std::error::Error` with variants
+  `InvalidValue`, `ParseError`, `IoError`, `PathInvalid`. Unknown TOML keys
+  produce a `warn!` log; a missing config file is not an error. Paths
+  validated at load time: absolute, no `..`, no null bytes, `canonicalize()`
+  re-validated.
+- Main loop (`weir-server::main`): full pipeline assembly — queue → workers →
+  bridge threads (one per shard, converts `Batch<WorkUnit>` → `WabRecord`) →
+  WAB flushers → drain (`NoopSink` placeholder). Graceful shutdown sequence:
+  `SIGTERM`/`Ctrl-C` fires shutdown signal → socket layer drains connections →
+  `queue_tx` dropped → workers flush → bridges exit → WAB seals segments →
+  drain confirms remaining segments. Metrics HTTP server bound before socket
+  accept loop.
+- `deploy/docker/weir.toml.example`: annotated example config file with all
+  fields documented with their defaults, valid ranges, and env-var equivalents.
+
+### Changed
+- `WorkUnit` gains `durability: Durability` field. The socket layer now
+  passes the wire-frame durability tier through to the WAB instead of
+  discarding it. Bridge threads propagate it from `WorkUnit` to `WabRecord`.
+- `WabRecord.ack_tx` type changed from
+  `crossbeam_channel::Sender<Result<(), io::Error>>` to
+  `tokio::sync::oneshot::Sender<bool>`, matching `WorkUnit.ack_tx`. Bridge
+  threads convert `WorkUnit → WabRecord` directly with no channel adaptation.
+  WAB `flush_batch` sends `true`/`false` instead of `Ok(())`/`Err(e)`.
+
+### Added
 - `weir-core`: wire protocol types — `Envelope`, `Header`, `MessageType`,
   `Durability`, `NackReason`, `DecodeError`, `Payload`. See
   [docs/wire_protocol.md](docs/wire_protocol.md).
