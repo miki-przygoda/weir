@@ -29,8 +29,13 @@ RUN cargo build --release -p weir-server && \
 # Now copy real sources and rebuild only weir-server (deps are cached above).
 COPY crates/ crates/
 
-# Touch main.rs so Cargo knows it changed and recompiles the binary.
-RUN touch crates/weir-server/src/main.rs && \
+# Docker BuildKit sets COPY'd file timestamps to the Unix epoch (time=0),
+# identical to the stub files created by `touch` above. Cargo's fingerprinter
+# compares mtimes, so both weir-core and weir-server appear unchanged and the
+# empty stub artifact would be reused. Touching all workspace .rs files sets
+# their mtime to "now" (> 0), signalling a change and forcing a full recompile
+# of all workspace crates while keeping the cached external-dep artifacts.
+RUN find crates -name "*.rs" -exec touch {} + && \
     cargo build --release -p weir-server
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
