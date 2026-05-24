@@ -147,10 +147,12 @@ impl WabSegment {
         self.bytes_written >= SEGMENT_MAX_BYTES
     }
 
+    #[allow(dead_code)]
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
 
+    #[allow(dead_code)]
     pub fn record_count(&self) -> u64 {
         self.record_count
     }
@@ -180,6 +182,7 @@ impl WabSegment {
         Ok(sealed_path)
     }
 
+    #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
     }

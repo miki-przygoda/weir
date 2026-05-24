@@ -117,13 +117,14 @@ pub async fn handle_connection(
 async fn handle_push(
     stream: &mut UnixStream,
     queue_tx: QueueSender<WorkUnit>,
-    _durability: Durability,
+    durability: Durability,
     payload: Vec<u8>,
 ) -> io::Result<()> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let unit = WorkUnit {
         shard_id: 0,
         payload,
+        durability,
         ack_tx,
     };
 

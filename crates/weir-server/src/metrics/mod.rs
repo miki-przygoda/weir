@@ -1,4 +1,7 @@
 //! Prometheus metrics for the weir daemon.
+// Label enum variants and Metrics fields are defined for completeness; subsystem
+// wiring that constructs them is added in a follow-up step.
+#![allow(dead_code)]
 //!
 //! Call `Metrics::new()` once at startup to get `(Arc<Metrics>, Registry)`.
 //! Pass `Arc<Metrics>` to every subsystem that needs to update counters/gauges.

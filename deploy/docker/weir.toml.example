@@ -1,0 +1,65 @@
+# weir daemon configuration file
+# Copy to /etc/weir/weir.toml and adjust for your deployment.
+# All fields are optional; values shown are the built-in defaults.
+# Precedence: CLI flags > environment variables (WEIR_*) > this file > defaults.
+
+[server]
+# Path to the Unix domain socket. Must be absolute.
+# Env: WEIR_SOCKET_PATH
+socket_path = "/run/weir/weir.sock"
+
+# Write-ahead buffer directory. Must exist before starting the daemon.
+# Create with: mkdir -p /var/lib/weir/wab && chmod 700 /var/lib/weir/wab
+# Env: WEIR_WAB_DIR
+wab_dir = "/var/lib/weir/wab"
+
+# Number of WAB shards (one flusher thread per shard). Range: 1-256.
+# Env: WEIR_SHARD_COUNT
+shard_count = 1
+
+# Number of worker threads (route queue items to per-shard batches). Range: 1-64.
+# Env: WEIR_WORKER_COUNT
+worker_count = 2
+
+# Maximum records per flush batch. Range: 1-100000.
+# Env: WEIR_BATCH_SIZE
+batch_size = 1000
+
+# Maximum time (ms) to accumulate a batch before flushing. Range: 1-60000.
+# Env: WEIR_BATCH_DEADLINE_MS
+batch_deadline_ms = 100
+
+# Maximum concurrent producer connections. Range: 1-512.
+# Must be <= the tokio blocking thread pool limit (default 512) because each
+# active connection occupies one spawn_blocking slot while pushing to the queue.
+# Env: WEIR_MAX_CONNECTIONS
+max_connections = 256
+
+# Maximum payload size per record in bytes. Cannot exceed 16 MiB (hard cap).
+# Env: WEIR_MAX_PAYLOAD_BYTES
+max_payload_bytes = 16777216
+
+# Port for the Prometheus /metrics HTTP endpoint (binds to 127.0.0.1).
+# Env: WEIR_METRICS_PORT
+metrics_port = 9185
+
+# Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
+# waits this long for in-flight connections to finish before aborting them.
+# Env: WEIR_SHUTDOWN_TIMEOUT_SECS
+shutdown_timeout_secs = 30
+
+# Maximum total size (bytes) of the dead-letter directory. When this cap would
+# be exceeded, the drain transitions to BlockedDeadLetterFull and pauses until
+# an operator removes files or raises the cap.
+# Default: 1 GiB. Values below 1 MiB produce a startup warning.
+# Env: WEIR_DEAD_LETTER_MAX_BYTES
+dead_letter_max_bytes = 1073741824
+
+# How often (seconds) the drain wakes to re-check dead-letter dir size while
+# in BlockedDeadLetterFull. Range: 1-3600.
+# Env: WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS
+dead_letter_check_interval_secs = 30
+
+# Log level for tracing-subscriber. One of: trace, debug, info, warn, error.
+# Env: WEIR_LOG_LEVEL
+log_level = "info"

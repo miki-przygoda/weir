@@ -39,15 +39,18 @@ impl<T> QueueSender<T> {
     /// If all `QueueReceiver` clones have been dropped (workers exited), the
     /// unit is silently discarded — the caller is in the shutdown path and the
     /// socket listener will be closed imminently.
+    #[allow(dead_code)]
     pub fn push(&self, unit: T) {
         self.tx.send(unit).ok();
     }
 
     /// Returns the number of items currently buffered in the channel.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.tx.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tx.is_empty()
     }

@@ -27,6 +27,10 @@ tracing = "0.1"
 libc = "0.2"
 core_affinity = "0.8"
 prometheus-client = "0.22"
+pico-args = "0.5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # tempfile is not added: tests use std::env::temp_dir() with unique subpaths.

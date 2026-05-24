@@ -219,7 +219,6 @@ mod tests {
     use crate::{models::WorkUnit, queue};
     use std::time::Duration;
     use tokio::{io::AsyncReadExt, net::UnixStream, sync::oneshot};
-    use weir_core::{Durability, Envelope, HEADER_LEN, Header, MessageType};
 
     fn tmp_socket_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("weir_sock_{label}_{}.sock", std::process::id()))
@@ -232,43 +231,6 @@ mod tests {
             max_payload_bytes: weir_core::MAX_PAYLOAD_HARD_CAP,
             shutdown_timeout_secs: 5,
         }
-    }
-
-    /// Spawns `run()` with an auto-acking queue. Returns shutdown sender and path.
-    async fn spawn_server(config: SocketConfig) -> (oneshot::Sender<()>, PathBuf) {
-        let path = config.socket_path.clone();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
-
-        // Auto-acker: receives WorkUnits and immediately sends true on ack_tx.
-        std::thread::spawn(move || {
-            let rx = queue_rx.get();
-            while let Ok(unit) = rx.recv() {
-                let _ = unit.ack_tx.send(true);
-            }
-        });
-
-        tokio::spawn(run(config, queue_tx, shutdown_rx));
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        (shutdown_tx, path)
-    }
-
-    fn push_frame(payload: &[u8]) -> Vec<u8> {
-        let header = Header::new(MessageType::Push, Durability::Sync, 0, payload.len() as u32);
-        Envelope::new(header, payload.to_vec()).encode()
-    }
-
-    async fn read_response(stream: &mut UnixStream) -> (MessageType, Vec<u8>) {
-        let mut header_buf = [0u8; HEADER_LEN];
-        stream.read_exact(&mut header_buf).await.unwrap();
-        let header = Header::decode(&header_buf).unwrap();
-        let mut payload = vec![0u8; header.payload_len as usize];
-        if !payload.is_empty() {
-            stream.read_exact(&mut payload).await.unwrap();
-        }
-        let mut crc_buf = [0u8; 4];
-        stream.read_exact(&mut crc_buf).await.unwrap();
-        (header.message_type, payload)
     }
 
     // ── Path validation ───────────────────────────────────────────────────────
