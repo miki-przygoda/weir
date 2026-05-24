@@ -24,12 +24,15 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use weir_client::WeirClient;
+use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
 
 // ── Process serialiser ────────────────────────────────────────────────────────
@@ -110,14 +113,15 @@ impl ServerHandle {
         // Write a minimal config.
         let config = format!(
             "[server]\n\
-             socket_path   = \"{}\"\n\
-             wab_dir       = \"{}\"\n\
-             metrics_port  = {}\n\
-             shard_count   = {}\n\
-             worker_count  = 2\n\
-             batch_size    = 100\n\
-             batch_deadline_ms = 20\n\
-             log_level     = \"warn\"\n",
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = {}\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
             socket_path.display(),
             wab_dir.display(),
             metrics_port,
@@ -242,6 +246,22 @@ impl ServerHandle {
             .expect("metrics request failed")
             .into_string()
             .expect("metrics body read failed")
+    }
+
+    /// Sends SIGTERM, waits for the process to exit, and returns how long it
+    /// took. Does NOT remove the temp directory — Drop handles cleanup — so
+    /// callers can inspect WAB files after the process has exited.
+    fn sigterm(&mut self) -> Duration {
+        let t = Instant::now();
+        if let Some(ref mut child) = self.child {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
+            let _ = child.wait();
+            self.child = None;
+        }
+        t.elapsed()
     }
 
     /// Sends SIGTERM and waits for the process to exit cleanly.
@@ -904,6 +924,102 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
     for h in handles {
         h.join().expect("producer thread panicked");
     }
+}
+
+// ── Graceful shutdown under load ──────────────────────────────────────────────
+
+/// Verifies that SIGTERM under concurrent Sync load produces no silent drops.
+///
+/// Every push that returned `Ok` must be on disk (Sync durability guarantee).
+/// Every push that did not complete must surface as `ClientError::Io` so the
+/// producer knows it needs to retry — not a silent half-write or a panic.
+#[test]
+fn graceful_shutdown_under_load() {
+    const THREADS: usize = 8;
+    const PUSH_BEFORE_SIGTERM: Duration = Duration::from_secs(2);
+    // shutdown_timeout_secs=3 in config + buffer for process exit overhead.
+    const MAX_SHUTDOWN_SECS: u64 = 8;
+
+    let mut srv = ServerHandle::start("shutdown_load");
+
+    let ok_count = Arc::new(AtomicU64::new(0));
+    let io_err_count = Arc::new(AtomicU64::new(0));
+    let unexpected_count = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let ok = Arc::clone(&ok_count);
+            let io_err = Arc::clone(&io_err_count);
+            let unexpected = Arc::clone(&unexpected_count);
+            let path = srv.socket_path.clone();
+            thread::spawn(move || {
+                let mut client = match WeirClient::connect(&path) {
+                    Ok(c) => c,
+                    Err(_) => return, // server already gone
+                };
+                loop {
+                    match client.push(b"shutdown-load", Durability::Sync) {
+                        Ok(()) => {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(ClientError::Io(_)) => {
+                            // Connection closed — expected during shutdown.
+                            io_err.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(_) => {
+                            // Nack or protocol error — not expected.
+                            unexpected.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Let the threads push for a bit, then signal shutdown.
+    thread::sleep(PUSH_BEFORE_SIGTERM);
+    let shutdown_elapsed = srv.sigterm();
+
+    for h in handles {
+        h.join().expect("producer thread panicked");
+    }
+
+    let oks = ok_count.load(Ordering::Relaxed);
+    let io_errs = io_err_count.load(Ordering::Relaxed);
+    let unexpected = unexpected_count.load(Ordering::Relaxed);
+    let wab_bytes = wab_dir_bytes(&srv.wab_dir);
+
+    // Server must exit within a reasonable bound after SIGTERM.
+    assert!(
+        shutdown_elapsed < Duration::from_secs(MAX_SHUTDOWN_SECS),
+        "server took {shutdown_elapsed:?} to shut down — expected < {MAX_SHUTDOWN_SECS}s"
+    );
+
+    // No unexpected errors: threads may see Ok or Io(EOF), never Nack/Protocol.
+    assert_eq!(
+        unexpected, 0,
+        "{unexpected} unexpected errors (Nack or Protocol) during shutdown — \
+         producers should only see Ok or Io"
+    );
+
+    // Every Ok means a Sync-flushed record. The WAB must have bytes.
+    assert!(
+        oks > 0,
+        "expected successful pushes before SIGTERM; got 0 — \
+         either the server started too slowly or {PUSH_BEFORE_SIGTERM:?} was too short"
+    );
+    assert!(
+        wab_bytes > 0,
+        "WAB has 0 bytes on disk after {oks} successful Sync pushes — \
+         possible silent data loss"
+    );
+
+    println!(
+        "graceful_shutdown_under_load: {oks} ok, {io_errs} io_err, \
+         {unexpected} unexpected | wab={wab_bytes}B | shutdown={shutdown_elapsed:?}"
+    );
 }
 
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
