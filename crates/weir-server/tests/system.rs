@@ -1650,3 +1650,60 @@ fn batch_deadline_timer_keeps_latency_bounded() {
         "p99 latency {p99:?} exceeded 3 × batch_deadline_ms ({MAX_P99:?})"
     );
 }
+
+// ── Metrics monotonicity under crash-restart ───────────────────────────────────
+
+/// After a crash-restart, per-session counters reset to zero (in-process
+/// atomics). Within each session the counters must be internally consistent:
+/// `records_accepted` must be ≥ `records_ack` and neither may be negative.
+#[test]
+fn metrics_consistent_across_crash_restart() {
+    const PUSHES_PER_ROUND: u32 = 10;
+    const ROUNDS: u32 = 3;
+
+    let mut srv = ServerHandle::start("metrics_crash");
+
+    for round in 0..ROUNDS {
+        let mut client = srv.client();
+        for i in 0..PUSHES_PER_ROUND {
+            client
+                .push(
+                    format!("round-{round}-rec-{i}").as_bytes(),
+                    Durability::Sync,
+                )
+                .unwrap_or_else(|e| panic!("push failed (round {round}, rec {i}): {e}"));
+        }
+
+        let body = srv.scrape_metrics();
+
+        let accepted = parse_metric(&body, "weir_records_accepted_total{tier=\"sync\"}");
+        let acked = parse_metric(&body, "weir_records_ack_total{tier=\"sync\"}");
+
+        assert!(
+            accepted <= u64::from(PUSHES_PER_ROUND),
+            "round {round}: records_accepted ({accepted}) exceeds pushes made \
+             ({PUSHES_PER_ROUND}) — phantom records in counter"
+        );
+        assert!(
+            acked <= accepted,
+            "round {round}: records_ack ({acked}) > records_accepted ({accepted})"
+        );
+
+        if round + 1 < ROUNDS {
+            srv.restart_in_place();
+        }
+    }
+}
+
+fn parse_metric(body: &str, prefix: &str) -> u64 {
+    for line in body.lines() {
+        if line.starts_with(prefix) {
+            if let Some(val) = line.split_whitespace().next_back() {
+                if let Ok(n) = val.parse() {
+                    return n;
+                }
+            }
+        }
+    }
+    0
+}
