@@ -31,7 +31,11 @@ struct Worker {
 impl Worker {
     fn new(shard_count: usize, batch_size: usize, shard_txs: Vec<Sender<Batch>>) -> Self {
         let buffers = pretouched_buffers(shard_count, batch_size);
-        Worker { buffers, batch_size, shard_txs }
+        Worker {
+            buffers,
+            batch_size,
+            shard_txs,
+        }
     }
 
     fn run(mut self, work_rx: Receiver<WorkUnit>, batch_deadline: Duration) {
@@ -66,7 +70,10 @@ impl Worker {
             Vec::with_capacity(self.batch_size),
         );
         self.shard_txs[shard]
-            .send(Batch { shard_id: shard as u32, records })
+            .send(Batch {
+                shard_id: shard as u32,
+                records,
+            })
             .ok(); // receiver gone means WAB is shutting down; discard silently
     }
 
@@ -125,21 +132,25 @@ pub fn spawn_workers(
             .name(format!("weir-worker-{worker_idx}"))
             .spawn(move || {
                 // ── Core affinity ────────────────────────────────────────────
-                if let Some(id) = core_id {
-                    if !core_affinity::set_for_current(id) {
-                        warn!(worker = worker_idx, "failed to set CPU affinity; continuing");
-                    }
+                if let Some(id) = core_id
+                    && !core_affinity::set_for_current(id)
+                {
+                    warn!(
+                        worker = worker_idx,
+                        "failed to set CPU affinity; continuing"
+                    );
                 }
 
                 // ── Thread priority ──────────────────────────────────────────
                 #[cfg(target_os = "linux")]
                 {
                     let param = libc::sched_param { sched_priority: 1 };
-                    let ret = unsafe {
-                        libc::sched_setscheduler(0, libc::SCHED_FIFO, &param)
-                    };
+                    let ret = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
                     if ret == -1 {
-                        warn!(worker = worker_idx, "SCHED_FIFO unavailable; continuing with default scheduler");
+                        warn!(
+                            worker = worker_idx,
+                            "SCHED_FIFO unavailable; continuing with default scheduler"
+                        );
                     }
                 }
 
@@ -154,11 +165,13 @@ pub fn spawn_workers(
                         ) -> libc::c_int;
                     }
                     const QOS_CLASS_USER_INTERACTIVE: libc::c_uint = 0x21;
-                    let ret = unsafe {
-                        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
-                    };
+                    let ret =
+                        unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
                     if ret != 0 {
-                        warn!(worker = worker_idx, "QOS_CLASS_USER_INTERACTIVE unavailable; continuing");
+                        warn!(
+                            worker = worker_idx,
+                            "QOS_CLASS_USER_INTERACTIVE unavailable; continuing"
+                        );
                     }
                 }
 
@@ -192,7 +205,9 @@ fn pretouched_buffers(shard_count: usize, batch_size: usize) -> Vec<Vec<WorkUnit
             while offset < byte_cap {
                 // Safety: `offset < byte_cap` and the memory was allocated by
                 // `Vec::with_capacity`, so this is within the owned allocation.
-                unsafe { ptr.add(offset).write_volatile(0u8); }
+                unsafe {
+                    ptr.add(offset).write_volatile(0u8);
+                }
                 offset = offset.saturating_add(4096);
             }
         }
@@ -248,14 +263,20 @@ mod tests {
 
     fn make_unit(shard_id: u32, payload: &[u8]) -> (WorkUnit, oneshot::Receiver<bool>) {
         let (tx, rx) = oneshot::channel();
-        (WorkUnit { shard_id, payload: payload.to_vec(), ack_tx: tx }, rx)
+        (
+            WorkUnit {
+                shard_id,
+                payload: payload.to_vec(),
+                ack_tx: tx,
+            },
+            rx,
+        )
     }
 
     #[test]
     fn single_worker_batches_on_deadline() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
-        let (batch_rxs, handles) =
-            spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(20));
+        let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(20));
 
         let (unit, _ack) = make_unit(0, b"hello");
         queue_tx.push(unit);
@@ -301,8 +322,7 @@ mod tests {
     fn pending_batches_flushed_on_sender_drop() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
         // 60s deadline — flush must be triggered by disconnect, not timeout.
-        let (batch_rxs, handles) =
-            spawn_workers(&queue_rx, 1, 1, 100, Duration::from_secs(60));
+        let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 100, Duration::from_secs(60));
 
         let (unit, _) = make_unit(0, b"pending");
         queue_tx.push(unit);
@@ -322,8 +342,7 @@ mod tests {
     #[test]
     fn spawn_workers_returns_correct_counts() {
         let (_queue_tx, queue_rx) = queue::new::<WorkUnit>();
-        let (batch_rxs, handles) =
-            spawn_workers(&queue_rx, 3, 2, 100, Duration::from_millis(10));
+        let (batch_rxs, handles) = spawn_workers(&queue_rx, 3, 2, 100, Duration::from_millis(10));
         assert_eq!(batch_rxs.len(), 3);
         assert_eq!(handles.len(), 2);
 
@@ -336,12 +355,12 @@ mod tests {
     #[test]
     fn worker_exits_cleanly_after_disconnect() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
-        let (_batch_rxs, handles) =
-            spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(10));
+        let (_batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(10));
 
         drop(queue_tx);
         for h in handles {
-            h.join().expect("worker thread should exit cleanly after disconnect");
+            h.join()
+                .expect("worker thread should exit cleanly after disconnect");
         }
     }
 }

@@ -34,7 +34,10 @@ impl fmt::Display for DecodeError {
             Self::BadMagic => {
                 write!(f, "bad magic bytes: not a weir frame")
             }
-            Self::VersionMismatch { supported, received } => {
+            Self::VersionMismatch {
+                supported,
+                received,
+            } => {
                 write!(
                     f,
                     "wire version mismatch: daemon supports v{supported}, frame carries v{received}"
@@ -104,10 +107,19 @@ mod tests {
 
     #[test]
     fn decode_error_display_is_human_readable() {
-        let e = DecodeError::VersionMismatch { supported: 1, received: 2 };
+        let e = DecodeError::VersionMismatch {
+            supported: 1,
+            received: 2,
+        };
         let s = e.to_string();
-        assert!(s.contains("v1"), "display should contain supported version: {s}");
-        assert!(s.contains("v2"), "display should contain received version: {s}");
+        assert!(
+            s.contains("v1"),
+            "display should contain supported version: {s}"
+        );
+        assert!(
+            s.contains("v2"),
+            "display should contain received version: {s}"
+        );
     }
 
     #[test]

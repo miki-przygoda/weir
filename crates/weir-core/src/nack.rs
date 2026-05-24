@@ -7,12 +7,12 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NackReason {
-    BadMagic         = 0x01,
-    VersionMismatch  = 0x02,
-    BadHeaderCrc     = 0x03,
-    PayloadTooLarge  = 0x04,
-    BadPayloadCrc    = 0x05,
-    InternalError    = 0x06,
+    BadMagic = 0x01,
+    VersionMismatch = 0x02,
+    BadHeaderCrc = 0x03,
+    PayloadTooLarge = 0x04,
+    BadPayloadCrc = 0x05,
+    InternalError = 0x06,
 }
 
 /// Error returned when a `u8` does not map to a known `NackReason` variant.
@@ -52,11 +52,26 @@ mod tests {
     #[test]
     fn try_from_accepts_all_known_reasons() {
         assert_eq!(NackReason::try_from(0x01).unwrap(), NackReason::BadMagic);
-        assert_eq!(NackReason::try_from(0x02).unwrap(), NackReason::VersionMismatch);
-        assert_eq!(NackReason::try_from(0x03).unwrap(), NackReason::BadHeaderCrc);
-        assert_eq!(NackReason::try_from(0x04).unwrap(), NackReason::PayloadTooLarge);
-        assert_eq!(NackReason::try_from(0x05).unwrap(), NackReason::BadPayloadCrc);
-        assert_eq!(NackReason::try_from(0x06).unwrap(), NackReason::InternalError);
+        assert_eq!(
+            NackReason::try_from(0x02).unwrap(),
+            NackReason::VersionMismatch
+        );
+        assert_eq!(
+            NackReason::try_from(0x03).unwrap(),
+            NackReason::BadHeaderCrc
+        );
+        assert_eq!(
+            NackReason::try_from(0x04).unwrap(),
+            NackReason::PayloadTooLarge
+        );
+        assert_eq!(
+            NackReason::try_from(0x05).unwrap(),
+            NackReason::BadPayloadCrc
+        );
+        assert_eq!(
+            NackReason::try_from(0x06).unwrap(),
+            NackReason::InternalError
+        );
     }
 
     #[test]

@@ -10,8 +10,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use crc32fast::Hasher as CrcHasher;
 
 use super::format::{
-    build_segment_footer, build_segment_header, build_sentinel, unix_nanos_now,
-    EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, SEGMENT_MAX_BYTES,
+    EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, SEGMENT_MAX_BYTES, build_segment_footer,
+    build_segment_header, build_sentinel, unix_nanos_now,
 };
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
@@ -161,12 +161,8 @@ impl WabSegment {
 
         self.file.write_all(&build_sentinel())?;
 
-        let footer = build_segment_footer(
-            self.record_count,
-            self.data_bytes,
-            file_crc32,
-            sealed_at,
-        );
+        let footer =
+            build_segment_footer(self.record_count, self.data_bytes, file_crc32, sealed_at);
         self.file.write_all(&footer)?;
 
         platform_fsync(&self.file)?;
@@ -233,10 +229,10 @@ impl ShardWriter {
         for entry in std::fs::read_dir(&self.shard_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if let Some(n) = segment_counter_from_path(&path) {
-                if n > max {
-                    max = n;
-                }
+            if let Some(n) = segment_counter_from_path(&path)
+                && n > max
+            {
+                max = n;
             }
         }
         if max >= self.next_counter {
@@ -315,8 +311,7 @@ mod tests {
     use std::fs;
 
     pub fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("weir_seg_{label}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("weir_seg_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -363,7 +358,10 @@ mod tests {
     fn sealed_path_for_derives_correctly() {
         let active = PathBuf::from("/wab/shard_00/seg_00000001.wab");
         let sealed = sealed_path_for(&active);
-        assert_eq!(sealed, PathBuf::from("/wab/shard_00/seg_00000001.wab.sealed"));
+        assert_eq!(
+            sealed,
+            PathBuf::from("/wab/shard_00/seg_00000001.wab.sealed")
+        );
     }
 
     #[test]

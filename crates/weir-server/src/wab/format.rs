@@ -171,7 +171,10 @@ pub enum ConfirmedParseError {
 impl std::fmt::Display for ConfirmedParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WrongLength { got } => write!(f, "confirmation file is {got} bytes, expected {CONFIRMED_LEN}"),
+            Self::WrongLength { got } => write!(
+                f,
+                "confirmation file is {got} bytes, expected {CONFIRMED_LEN}"
+            ),
             Self::BadMagic => write!(f, "confirmation file has bad magic (expected b\"WCON\")"),
             Self::UnknownVersion(v) => write!(
                 f,
@@ -236,7 +239,10 @@ mod tests {
     fn confirmed_parse_rejects_bad_magic() {
         let mut bytes = build_confirmed(0, 0, 0);
         bytes[0] = 0xff;
-        assert!(matches!(parse_confirmed(&bytes), Err(ConfirmedParseError::BadMagic)));
+        assert!(matches!(
+            parse_confirmed(&bytes),
+            Err(ConfirmedParseError::BadMagic)
+        ));
     }
 
     #[test]

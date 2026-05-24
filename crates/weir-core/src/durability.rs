@@ -4,9 +4,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
     /// fsync before ACK. Producer blocks until the record is on stable storage.
-    Sync     = 0x01,
+    Sync = 0x01,
     /// Batch fsync. Record is written before ACK but fsync is deferred to the batch boundary.
-    Batched  = 0x02,
+    Batched = 0x02,
     /// Memory write only. ACK is sent after the record enters the in-memory queue.
     Buffered = 0x03,
 }

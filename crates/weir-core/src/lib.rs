@@ -6,7 +6,7 @@ pub mod payload;
 pub mod version;
 
 pub use durability::Durability;
-pub use envelope::{Envelope, Header, MessageType, HEADER_LEN, MIN_FRAME_LEN};
+pub use envelope::{Envelope, HEADER_LEN, Header, MIN_FRAME_LEN, MessageType};
 pub use error::{DecodeError, WeirError};
 pub use nack::NackReason;
 pub use payload::Payload;

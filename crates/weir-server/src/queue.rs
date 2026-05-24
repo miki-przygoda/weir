@@ -53,7 +53,9 @@ impl<T> QueueSender<T> {
 
 impl<T> Clone for QueueSender<T> {
     fn clone(&self) -> Self {
-        QueueSender { tx: self.tx.clone() }
+        QueueSender {
+            tx: self.tx.clone(),
+        }
     }
 }
 
@@ -124,11 +126,16 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(20));
-        assert!(!handle.is_finished(), "producer should be blocked on a full queue");
+        assert!(
+            !handle.is_finished(),
+            "producer should be blocked on a full queue"
+        );
 
         // Drain one slot — producer should unblock.
         assert_eq!(recv.recv().unwrap(), 1);
-        handle.join().expect("producer thread should complete after slot freed");
+        handle
+            .join()
+            .expect("producer thread should complete after slot freed");
     }
 
     #[test]
@@ -143,8 +150,12 @@ mod tests {
         // Drain both receivers. Each item is delivered to exactly one receiver
         // with no duplication and no loss — total must be exactly [10, 20].
         let mut items = Vec::new();
-        while let Ok(v) = recv_a.try_recv() { items.push(v); }
-        while let Ok(v) = recv_b.try_recv() { items.push(v); }
+        while let Ok(v) = recv_a.try_recv() {
+            items.push(v);
+        }
+        while let Ok(v) = recv_b.try_recv() {
+            items.push(v);
+        }
         items.sort_unstable();
         assert_eq!(items, vec![10, 20]);
     }

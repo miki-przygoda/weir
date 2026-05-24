@@ -28,10 +28,10 @@ pub const MIN_FRAME_LEN: usize = HEADER_LEN + 4;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
-    Push                = 0x01,
-    Ack                 = 0x02,
-    Nack                = 0x03,
-    HealthCheck         = 0x04,
+    Push = 0x01,
+    Ack = 0x02,
+    Nack = 0x03,
+    HealthCheck = 0x04,
     HealthCheckResponse = 0x05,
 }
 
@@ -77,7 +77,12 @@ pub struct Header {
 
 impl Header {
     /// Constructs a header for outbound frames. Version is always `WIRE_VERSION`.
-    pub fn new(message_type: MessageType, durability: Durability, flags: u8, payload_len: u32) -> Self {
+    pub fn new(
+        message_type: MessageType,
+        durability: Durability,
+        flags: u8,
+        payload_len: u32,
+    ) -> Self {
         Self {
             version: WIRE_VERSION,
             message_type,
@@ -133,14 +138,20 @@ impl Header {
             });
         }
 
-        let message_type = MessageType::try_from(buf[5])
-            .map_err(|e| DecodeError::UnknownMessageType(e.0))?;
-        let durability = Durability::try_from(buf[6])
-            .map_err(|e| DecodeError::UnknownDurability(e.0))?;
+        let message_type =
+            MessageType::try_from(buf[5]).map_err(|e| DecodeError::UnknownMessageType(e.0))?;
+        let durability =
+            Durability::try_from(buf[6]).map_err(|e| DecodeError::UnknownDurability(e.0))?;
         let flags = buf[7];
         let payload_len = u32::from_le_bytes(buf[8..12].try_into().unwrap());
 
-        Ok(Self { version, message_type, durability, flags, payload_len })
+        Ok(Self {
+            version,
+            message_type,
+            durability,
+            flags,
+            payload_len,
+        })
     }
 }
 
@@ -312,7 +323,10 @@ mod tests {
         buf[5] = 0xff;
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(Header::decode(&buf), Err(DecodeError::UnknownMessageType(0xff)));
+        assert_eq!(
+            Header::decode(&buf),
+            Err(DecodeError::UnknownMessageType(0xff))
+        );
     }
 
     #[test]
@@ -321,7 +335,10 @@ mod tests {
         buf[6] = 0xff;
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
-        assert_eq!(Header::decode(&buf), Err(DecodeError::UnknownDurability(0xff)));
+        assert_eq!(
+            Header::decode(&buf),
+            Err(DecodeError::UnknownDurability(0xff))
+        );
     }
 
     // ── MessageType ──────────────────────────────────────────────────────────
@@ -331,8 +348,14 @@ mod tests {
         assert_eq!(MessageType::try_from(0x01).unwrap(), MessageType::Push);
         assert_eq!(MessageType::try_from(0x02).unwrap(), MessageType::Ack);
         assert_eq!(MessageType::try_from(0x03).unwrap(), MessageType::Nack);
-        assert_eq!(MessageType::try_from(0x04).unwrap(), MessageType::HealthCheck);
-        assert_eq!(MessageType::try_from(0x05).unwrap(), MessageType::HealthCheckResponse);
+        assert_eq!(
+            MessageType::try_from(0x04).unwrap(),
+            MessageType::HealthCheck
+        );
+        assert_eq!(
+            MessageType::try_from(0x05).unwrap(),
+            MessageType::HealthCheckResponse
+        );
     }
 
     #[test]

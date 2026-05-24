@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::ShardWriter;
-use weir_core::{Durability, Payload, MAX_PAYLOAD_HARD_CAP};
+use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
 
 /// A record queued by a connection handler for writing to the WAB.
 pub struct WabRecord {
@@ -99,14 +99,25 @@ pub fn spawn(
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
             .spawn(move || {
-                flusher_thread(shard_id as u16, sdir, rx, drain_clone, batch_size, batch_deadline, core_id);
+                flusher_thread(
+                    shard_id as u16,
+                    sdir,
+                    rx,
+                    drain_clone,
+                    batch_size,
+                    batch_deadline,
+                    core_id,
+                );
             })
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         join_handles.push(handle);
     }
 
-    Ok(WabHandle { shard_txs, join_handles })
+    Ok(WabHandle {
+        shard_txs,
+        join_handles,
+    })
 }
 
 fn replay_unconfirmed(
@@ -134,7 +145,10 @@ fn replay_unconfirmed(
                 Ok(false) => {
                     info!(sealed = %sealed.display(), "queuing segment for drain replay");
                     drain_tx.send(sealed).map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "drain channel closed during startup replay")
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "drain channel closed during startup replay",
+                        )
                     })?;
                 }
                 Err(e) => {
@@ -157,10 +171,13 @@ fn flusher_thread(
     core_id: Option<core_affinity::CoreId>,
 ) {
     // Core affinity (fail-open: log and continue if denied)
-    if let Some(id) = core_id {
-        if !core_affinity::set_for_current(id) {
-            warn!(shard = shard_id, "failed to set CPU affinity; continuing without affinity");
-        }
+    if let Some(id) = core_id
+        && !core_affinity::set_for_current(id)
+    {
+        warn!(
+            shard = shard_id,
+            "failed to set CPU affinity; continuing without affinity"
+        );
     }
 
     // SCHED_FIFO (Linux only, requires CAP_SYS_NICE; fail-open)
@@ -169,7 +186,10 @@ fn flusher_thread(
         let param = libc::sched_param { sched_priority: 1 };
         let ret = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
         if ret == -1 {
-            warn!(shard = shard_id, "failed to set SCHED_FIFO; continuing with default scheduler");
+            warn!(
+                shard = shard_id,
+                "failed to set SCHED_FIFO; continuing with default scheduler"
+            );
         }
     }
 
@@ -223,7 +243,10 @@ fn flusher_thread(
             drain_tx.send(sealed).ok();
         }
         Ok(None) => {
-            info!(shard = shard_id, "WAB flusher shut down with no active segment");
+            info!(
+                shard = shard_id,
+                "WAB flusher shut down with no active segment"
+            );
         }
         Err(e) => {
             tracing::error!(shard = shard_id, error = %e, "WAB flusher failed to seal segment on shutdown");
@@ -244,7 +267,9 @@ fn flush_batch(
         // write_record returns Some(sealed_path) when the segment rotated.
         let rotation = match writer.write_record(&record.payload) {
             Err(e) => {
-                let _ = record.ack_tx.send(Err(io::Error::new(e.kind(), e.to_string())));
+                let _ = record
+                    .ack_tx
+                    .send(Err(io::Error::new(e.kind(), e.to_string())));
                 continue;
             }
             Ok(maybe_sealed) => maybe_sealed,
@@ -257,12 +282,14 @@ fn flush_batch(
         }
 
         match record.durability {
-            Durability::Sync => {
-                match writer.fsync_current() {
-                    Ok(()) => { let _ = record.ack_tx.send(Ok(())); }
-                    Err(e) => { let _ = record.ack_tx.send(Err(e)); }
+            Durability::Sync => match writer.fsync_current() {
+                Ok(()) => {
+                    let _ = record.ack_tx.send(Ok(()));
                 }
-            }
+                Err(e) => {
+                    let _ = record.ack_tx.send(Err(e));
+                }
+            },
             Durability::Batched => {
                 need_fsync = true;
                 batched_acks.push(record.ack_tx);
@@ -278,8 +305,12 @@ fn flush_batch(
         let fsync_result = writer.fsync_current();
         for ack_tx in batched_acks {
             match &fsync_result {
-                Ok(()) => { let _ = ack_tx.send(Ok(())); }
-                Err(e) => { let _ = ack_tx.send(Err(io::Error::new(e.kind(), e.to_string()))); }
+                Ok(()) => {
+                    let _ = ack_tx.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = ack_tx.send(Err(io::Error::new(e.kind(), e.to_string())));
+                }
             }
         }
     }
@@ -316,7 +347,10 @@ impl SegmentReader {
             ));
         }
 
-        Ok(SegmentReader { reader, done: false })
+        Ok(SegmentReader {
+            reader,
+            done: false,
+        })
     }
 }
 
@@ -332,7 +366,10 @@ impl Iterator for SegmentReader {
         match self.reader.read_exact(&mut len_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => { self.done = true; return Some(Err(e)); }
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
         }
 
         let payload_len = u32::from_le_bytes(len_buf) as usize;
@@ -346,7 +383,9 @@ impl Iterator for SegmentReader {
             self.done = true;
             return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("record payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"),
+                format!(
+                    "record payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"
+                ),
             )));
         }
 
@@ -465,12 +504,11 @@ pub fn validate_path(path: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wab::segment::{segment_path, WabSegment};
+    use crate::wab::segment::{WabSegment, segment_path};
     use std::fs;
 
     fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("weir_wab_{label}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("weir_wab_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -560,10 +598,20 @@ mod tests {
         std::os::unix::fs::symlink("/weir_nonexistent_target_xyzzy_98765", &link).unwrap();
 
         let err = validate_path(&link).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound, "expected NotFound: {err}");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "expected NotFound: {err}"
+        );
         let msg = err.to_string();
-        assert!(msg.contains("mkdir"), "error should contain mkdir hint: {msg}");
-        assert!(msg.contains("chmod 700"), "error should contain chmod 700 hint: {msg}");
+        assert!(
+            msg.contains("mkdir"),
+            "error should contain mkdir hint: {msg}"
+        );
+        assert!(
+            msg.contains("chmod 700"),
+            "error should contain chmod 700 hint: {msg}"
+        );
 
         fs::remove_dir_all(dir).ok();
     }

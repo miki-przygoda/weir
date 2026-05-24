@@ -7,9 +7,8 @@ use std::{
 use tracing::{error, info, warn};
 
 use super::format::{
-    build_segment_footer, build_sentinel, parse_confirmed, unix_nanos_now, ConfirmedParseError,
-    EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN,
-    SEGMENT_MAGIC,
+    ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN,
+    SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed, unix_nanos_now,
 };
 use super::segment::sealed_path_for;
 use weir_core::MAX_PAYLOAD_HARD_CAP;
@@ -74,7 +73,10 @@ pub fn recover_segment(path: &Path, wab_dir: &Path) -> io::Result<PathBuf> {
             quarantine(path, wab_dir, "file is shorter than the segment header")?;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{}: quarantined — shorter than segment header", path.display()),
+                format!(
+                    "{}: quarantined — shorter than segment header",
+                    path.display()
+                ),
             ));
         }
         Err(e) => return Err(e),
@@ -209,7 +211,12 @@ pub fn recover_segment(path: &Path, wab_dir: &Path) -> io::Result<PathBuf> {
     file.set_len(valid_end_offset)?;
     file.seek(SeekFrom::Start(valid_end_offset))?;
     file.write_all(&build_sentinel())?;
-    file.write_all(&build_segment_footer(record_count, data_bytes, file_crc32, sealed_at))?;
+    file.write_all(&build_segment_footer(
+        record_count,
+        data_bytes,
+        file_crc32,
+        sealed_at,
+    ))?;
     file.sync_all()?;
     drop(file);
 
@@ -250,10 +257,7 @@ pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
 /// - Bad CRC or unknown version: quarantines the segment and its `.confirmed` file,
 ///   returns `Err` so the caller knows to skip this segment entirely.
 /// - Valid: returns `Ok(true)`.
-pub fn check_confirmed(
-    sealed_path: &Path,
-    wab_dir: &Path,
-) -> io::Result<bool> {
+pub fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
     let confirmed_path = {
         let s = sealed_path.to_string_lossy();
         let base = s.strip_suffix(EXT_SEALED).unwrap_or(&s);
@@ -291,14 +295,14 @@ mod tests {
     use std::fs;
 
     fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("weir_recovery_{label}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("weir_recovery_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     fn make_segment(dir: &Path, shard_id: u16, payloads: &[&[u8]]) -> PathBuf {
-        use crate::wab::segment::{segment_path, WabSegment};
+        use crate::wab::segment::{WabSegment, segment_path};
         let path = segment_path(dir, 1);
         let mut seg = WabSegment::create(&path, shard_id).unwrap();
         for p in payloads {
@@ -385,7 +389,7 @@ mod tests {
         let dir = tmp_dir("noconf");
         let sealed = dir.join("seg_00000001.wab.sealed");
         fs::write(&sealed, b"placeholder").unwrap();
-        assert_eq!(check_confirmed(&sealed, &dir).unwrap(), false);
+        assert!(!check_confirmed(&sealed, &dir).unwrap());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -396,7 +400,7 @@ mod tests {
         let confirmed = dir.join("seg_00000001.wab.confirmed");
         fs::write(&sealed, b"placeholder").unwrap();
         fs::write(&confirmed, build_confirmed(0, 5, 1)).unwrap();
-        assert_eq!(check_confirmed(&sealed, &dir).unwrap(), true);
+        assert!(check_confirmed(&sealed, &dir).unwrap());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -431,7 +435,10 @@ mod tests {
         fs::write(&confirmed, bytes).unwrap();
 
         let err = check_confirmed(&sealed, &dir).unwrap_err();
-        assert!(err.to_string().contains("99"), "error should mention the version byte");
+        assert!(
+            err.to_string().contains("99"),
+            "error should mention the version byte"
+        );
         fs::remove_dir_all(dir).ok();
     }
 }
