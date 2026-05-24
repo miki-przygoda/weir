@@ -61,6 +61,23 @@ fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
     wab_dir.join(format!("shard_{shard_id:02}"))
 }
 
+/// Creates a directory (and all parents) with mode `0o700` on Unix.
+/// On non-Unix platforms falls back to `create_dir_all` with the process umask.
+pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(&path)
+    }
+}
+
 /// Runs crash recovery, replays sealed-but-unconfirmed segments to `drain_tx`,
 /// then spawns one flusher thread per shard.
 pub fn spawn(
@@ -72,7 +89,7 @@ pub fn spawn(
     let wab_dir = validate_path(&wab_dir)?;
 
     for shard_id in 0..config.shard_count {
-        fs::create_dir_all(shard_dir_path(&wab_dir, shard_id))?;
+        create_dir_private(shard_dir_path(&wab_dir, shard_id))?;
     }
 
     // Phase 1 (calling thread): crash recovery — unsealed .wab → .wab.sealed

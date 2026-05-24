@@ -207,6 +207,18 @@ pub fn recover_segment(path: &Path, wab_dir: &Path) -> io::Result<PathBuf> {
     let file_crc32 = running_crc.finalize();
     let sealed_at = unix_nanos_now();
 
+    // O_NOFOLLOW: guards against a symlink being swapped in between the read
+    // pass above and this write pass. If the path is now a symlink the open
+    // fails rather than following it to an attacker-controlled target.
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
     let mut file = fs::OpenOptions::new().write(true).open(path)?;
     file.set_len(valid_end_offset)?;
     file.seek(SeekFrom::Start(valid_end_offset))?;
@@ -236,7 +248,7 @@ pub fn recover_segment(path: &Path, wab_dir: &Path) -> io::Result<PathBuf> {
 /// whether to abort or continue.
 pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
     let quarantine_dir = wab_dir.join("quarantine");
-    fs::create_dir_all(&quarantine_dir)?;
+    super::create_dir_private(quarantine_dir.clone())?;
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
