@@ -38,11 +38,15 @@ impl WabSegment {
     /// ensure the file is newly created. The caller must guarantee `path` does
     /// not already exist.
     pub fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
+        #[cfg(unix)]
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
+
+        #[cfg(not(unix))]
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
 
         let header = build_segment_header(shard_id);
 
