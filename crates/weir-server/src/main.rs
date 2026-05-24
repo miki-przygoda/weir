@@ -2,8 +2,10 @@
 // completes the wiring, unused-item warnings are noise rather than signal.
 #![allow(dead_code)]
 
+mod drain;
 mod models;
 mod queue;
+mod sink;
 #[cfg(unix)]
 mod socket;
 mod wab;

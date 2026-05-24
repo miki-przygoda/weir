@@ -1,0 +1,97 @@
+//! Sink trait and supporting types.
+//!
+//! A `Sink` receives batches of records from the drain and commits them to a
+//! downstream store. Implementations decide their own connection management and
+//! retry policy for transient failures.
+//!
+//! # Idempotency contract
+//!
+//! The drain guarantees **at-least-once delivery per segment**, not per record.
+//! If the daemon crashes after a partial commit but before writing the `.confirmed`
+//! file, `commit` will be called again with the full segment — including records
+//! already committed. Implementations **must** handle duplicates gracefully (e.g.
+//! via upsert, `INSERT IGNORE`, or application-level dedup). This is not a protocol
+//! weakness; it is the explicit durability trade-off.
+//!
+//! # Object safety
+//!
+//! `Sink` uses `async fn` in trait (AFIT, stable since Rust 1.75). The drain is
+//! generic over `S: Sink` and stores `Arc<S>`, so no `dyn Sink` is needed. Using
+//! `dyn Sink` with AFIT requires boxing the returned futures, which is left to the
+//! caller if they need type erasure.
+
+use weir_core::Payload;
+
+/// A record type carried through the drain pipeline.
+///
+/// The simplest implementation is `type Record = Payload` (opaque bytes). Richer
+/// sinks can define a concrete record type that deserialises the payload.
+pub trait SinkRecord: Send + 'static {
+    fn from_payload(payload: Payload) -> Self;
+    fn into_payload(self) -> Payload;
+}
+
+/// `Payload` (= `Vec<u8>`) is the pass-through implementation: the drain hands
+/// raw bytes to the sink without interpretation.
+impl SinkRecord for Payload {
+    fn from_payload(payload: Payload) -> Self {
+        payload
+    }
+
+    fn into_payload(self) -> Payload {
+        self
+    }
+}
+
+/// An error returned by `Sink::commit`.
+///
+/// Implementations must classify every error as transient or permanent.
+/// - **Transient**: the drain retries with exponential backoff (up to `MAX_RETRIES`).
+/// - **Permanent**: the record is dead-lettered and the segment is confirmed.
+pub trait SinkError: Send + Sync + std::error::Error + 'static {
+    fn is_transient(&self) -> bool;
+}
+
+/// The result of a successful `Sink::commit` call.
+///
+/// `committed`: records that were accepted by the sink.
+/// `dead_lettered`: records the sink permanently rejected, with a reason string.
+pub struct CommitResult<R> {
+    pub committed: Vec<R>,
+    pub dead_lettered: Vec<(R, String)>,
+}
+
+/// Coarse health signal from `Sink::health`.
+#[derive(Clone, Debug)]
+pub enum SinkHealth {
+    Healthy,
+    Degraded(String),
+    Down(String),
+}
+
+/// A downstream commit target for WAB records.
+///
+/// The drain calls `commit` with batches of records read from sealed WAB segments.
+/// Implementations may be async (tokio, sqlx, etc.); they run on a dedicated
+/// single-threaded tokio runtime in the drain thread.
+pub trait Sink: Send + Sync + 'static {
+    type Record: SinkRecord;
+    type Error: SinkError;
+
+    /// Commit a batch of records. Returns committed records and any permanently
+    /// rejected records. Transiently failed commits should return `Err(Transient)`;
+    /// the drain will retry the whole segment.
+    async fn commit(
+        &self,
+        batch: Vec<Self::Record>,
+    ) -> Result<CommitResult<Self::Record>, Self::Error>;
+
+    /// Maximum number of records per `commit` call. The drain splits larger
+    /// segments into sub-batches of this size.
+    fn max_batch_size(&self) -> usize {
+        1000
+    }
+
+    /// Periodic health probe. Surfaced via metrics in step 07.
+    async fn health(&self) -> SinkHealth;
+}
