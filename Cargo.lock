@@ -319,7 +319,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "weir-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "weir-client",
  "weir-core",
@@ -327,21 +327,21 @@ dependencies = [
 
 [[package]]
 name = "weir-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "weir-core",
 ]
 
 [[package]]
 name = "weir-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "weir-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core_affinity",
  "crc32fast",
