@@ -26,6 +26,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
+  load:
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build test binary
+        run: cargo test -p weir-server --test load --no-run
+      - name: Run load tests (5 iterations)
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "--- run $i ---"
+            cargo test -p weir-server --test load -- --nocapture 2>/dev/null \
+              | grep '^BENCH: ' >> load_results.jsonl || true
+          done
+      - name: Average results and update benchmarks.md
+        run: python3 scripts/avg_benchmarks.py load_results.jsonl docs/benchmarks.md
+      - name: Show benchmark summary
+        run: cat docs/benchmarks.md
+      - name: Commit benchmark results
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/benchmarks.md
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update benchmark baselines [skip ci]"
+            git push
+          fi
+
   build:
     needs: test
     strategy:
