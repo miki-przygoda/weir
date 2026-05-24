@@ -14,7 +14,7 @@
 //! # Output format
 //!
 //! Each test emits one `BENCH: <json>` line to stdout. The CI script
-//! (`scripts/avg_benchmarks.py`) collects these across 5 runs, averages them,
+//! (`deploy/avg_benchmarks.py`) collects these across 5 runs, averages them,
 //! and rewrites `docs/benchmarks.md`.
 //!
 //! # Performance work
@@ -34,12 +34,15 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Arc, Barrier, OnceLock},
+    sync::{
+        Arc, Barrier, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use weir_client::WeirClient;
+use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
 
 // ── Process serialiser (same pattern as system.rs) ─────────────────────────
@@ -72,6 +75,16 @@ struct LoadHandle {
 
 impl LoadHandle {
     fn start(tag: &str) -> Self {
+        Self::start_impl(tag, 256)
+    }
+
+    /// Start with a deliberately low `max_connections` cap so the ramp test
+    /// can exercise connection-drop behaviour without needing hundreds of threads.
+    fn start_capped(tag: &str, max_connections: usize) -> Self {
+        Self::start_impl(tag, max_connections)
+    }
+
+    fn start_impl(tag: &str, max_connections: usize) -> Self {
         let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
         let metrics_port = free_port();
         let tmp_dir =
@@ -98,10 +111,12 @@ impl LoadHandle {
              worker_count      = 4\n\
              batch_size        = 64\n\
              batch_deadline_ms = 2\n\
+             max_connections   = {}\n\
              log_level         = \"error\"\n",
             socket_path.display(),
             wab_dir.display(),
             metrics_port,
+            max_connections,
         );
         std::fs::write(&config_path, &config).unwrap();
 
@@ -224,6 +239,82 @@ fn thundering_herd(srv: &LoadHandle, n_threads: usize, records_per_thread: usize
         h.join().expect("thread panicked");
     }
     t0.elapsed()
+}
+
+// ── Ramp-to-saturation helper ──────────────────────────────────────────────
+//
+// Each level spawns N threads. All threads attempt to connect, then rendezvous
+// at a barrier so they start pushing simultaneously. They push Buffered records
+// for `duration`, then stop. The main thread tallies outcomes and verifies the
+// server is still alive afterwards via a health check.
+
+struct LevelResult {
+    acks: u64,
+    nacks: u64,
+    io_errors: u64,
+    duration: Duration,
+}
+
+fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> LevelResult {
+    let acks = Arc::new(AtomicU64::new(0));
+    let nacks = Arc::new(AtomicU64::new(0));
+    let io_errors = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(n_threads + 1));
+
+    let handles: Vec<_> = (0..n_threads)
+        .map(|_| {
+            let acks = Arc::clone(&acks);
+            let nacks = Arc::clone(&nacks);
+            let io_errs = Arc::clone(&io_errors);
+            let stop = Arc::clone(&stop);
+            let b = Arc::clone(&barrier);
+            let path = srv.socket_path.clone();
+
+            thread::spawn(move || {
+                // Connect before the barrier so all threads begin pushing together.
+                let conn = WeirClient::connect(&path);
+                b.wait();
+                let mut client = match conn {
+                    Ok(c) => c,
+                    Err(_) => {
+                        io_errs.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                };
+                while !stop.load(Ordering::Relaxed) {
+                    match client.push(b"ramp", Durability::Buffered) {
+                        Ok(()) => {
+                            acks.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(ClientError::Io(_)) => {
+                            // Server dropped the connection (cap exhausted or shutdown).
+                            io_errs.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(_) => {
+                            nacks.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    barrier.wait(); // release all threads simultaneously
+    let t0 = Instant::now();
+    thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        let _ = h.join();
+    }
+
+    LevelResult {
+        acks: acks.load(Ordering::Relaxed),
+        nacks: nacks.load(Ordering::Relaxed),
+        io_errors: io_errors.load(Ordering::Relaxed),
+        duration: t0.elapsed(),
+    }
 }
 
 // ── Load tests ─────────────────────────────────────────────────────────────
@@ -352,4 +443,62 @@ fn connection_churn() {
         elapsed.as_millis(),
         cps as u64,
     );
+}
+
+/// Ramp-to-saturation: DoS resistance verification.
+///
+/// Starts a server with `max_connections = 48` then escalates through thread
+/// levels [8, 16, 32, 48, 64, 96]. At and below 48 threads all connections
+/// are accepted; above 48 the server drops excess connections gracefully
+/// (client sees an I/O error) while continuing to serve the allowed connections.
+///
+/// The key assertion is that the server survives every level: a successful
+/// health-check after each level proves it did not crash and is still
+/// accepting new work.
+#[test]
+fn ramp_to_saturation() {
+    const MAX_CONN: usize = 48;
+    const LEVEL_DURATION: Duration = Duration::from_secs(3);
+    const LEVELS: &[usize] = &[8, 16, 32, 48, 64, 96];
+
+    let srv = LoadHandle::start_capped("ramp", MAX_CONN);
+
+    println!(
+        "\n{:<10} {:>10} {:>10} {:>8} {:>8} {:>12}",
+        "threads", "acks", "RPS", "nacks", "io_errs", "status"
+    );
+    println!("{}", "-".repeat(62));
+
+    for &n in LEVELS {
+        let result = run_ramp_level(&srv, n, LEVEL_DURATION);
+        let rps = result.acks as f64 / result.duration.as_secs_f64();
+        let status = if result.io_errors > 0 {
+            "SATURATED"
+        } else {
+            "ok"
+        };
+
+        println!(
+            "{:<10} {:>10} {:>10.0} {:>8} {:>8} {:>12}",
+            n, result.acks, rps, result.nacks, result.io_errors, status
+        );
+
+        println!(
+            "BENCH: {{\"scenario\":\"ramp_{n}_threads\",\"threads\":{n},\
+             \"acks\":{},\"nacks\":{},\"io_errors\":{},\
+             \"wall_ms\":{},\"throughput_rps\":{}}}",
+            result.acks,
+            result.nacks,
+            result.io_errors,
+            result.duration.as_millis(),
+            rps as u64,
+        );
+
+        // The server must still be alive and accepting work after every level.
+        let mut health = srv.client();
+        assert!(
+            health.health_check().is_ok(),
+            "server became unresponsive after {n}-thread level (status: {status})"
+        );
+    }
 }

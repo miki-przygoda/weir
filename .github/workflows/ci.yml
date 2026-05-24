@@ -46,7 +46,7 @@ jobs:
               | grep '^BENCH: ' >> load_results.jsonl || true
           done
       - name: Average results and update benchmarks.md
-        run: python3 scripts/avg_benchmarks.py load_results.jsonl docs/benchmarks.md
+        run: python3 deploy/avg_benchmarks.py load_results.jsonl docs/benchmarks.md
       - name: Show benchmark summary
         run: cat docs/benchmarks.md
       - name: Commit benchmark results
