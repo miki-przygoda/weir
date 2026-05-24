@@ -21,13 +21,18 @@ Work queue            (bounded MPMC, src/queue.rs)
   │  crossbeam_channel, QUEUE_CAPACITY = 65 536
   ▼
 Worker pool           (std::thread, src/worker.rs)
-  │  per-shard Batch channels
+  │  per-shard Batch channels (Vec<WorkUnit>)
+  ▼
+Bridge threads        (std::thread, src/main.rs)   [one per shard]
+  │  WorkUnit → WabRecord (direct field mapping; shared ack type)
   ▼
 WAB flusher threads   (std::thread, src/wab/)
   │  per-shard segment files
   ▼
+Drain channel         (crossbeam_channel<PathBuf>)  [sealed segment paths]
+  ▼
 Drain                 (std::thread, src/drain/)
-  │  crossbeam_channel<PathBuf>  [sealed segment paths]
+  │  reads segments via SegmentReader
   ▼
 Sink                  (async, single-threaded tokio runtime in drain thread)
   │  CommitResult: committed + dead_lettered
@@ -44,6 +49,18 @@ Under sustained load, if every active connection is simultaneously blocked waiti
 ---
 
 ## Component responsibilities
+
+### Config (`src/config/`)
+
+Three-layer configuration: `CLI > env > TOML file > defaults`.
+
+- `Config::load()` reads CLI flags (pico-args), `WEIR_*` env vars, and an optional TOML file (default `/etc/weir/weir.toml`). Merges in precedence order, then validates all values.
+- Each layer produces a `PartialConfig` (all fields `Option<T>`). `Config::from_layers()` merges and applies defaults; testable without touching real CLI args or env vars.
+- `validate_path(field, path)` — full four-check sequence (absolute, no `..`, no null bytes, `canonicalize()` re-validated against same checks). Used for `wab_dir`. Returns `ConfigError::PathInvalid` with field name on failure.
+- `validate_path_format(field, path)` — format-only check (no `canonicalize()`). Used for `socket_path`, which does not exist until bind time.
+- `ConfigError` — manual `impl std::error::Error`, no `thiserror`. Variants: `InvalidValue`, `ParseError`, `IoError`, `PathInvalid`.
+- Unknown TOML keys produce a `warn!` log; a missing config file is treated as an empty layer.
+- See `deploy/docker/weir.toml.example` for all fields, defaults, valid ranges, and `WEIR_*` env-var equivalents.
 
 ### Socket layer (`src/socket/`) — Unix only
 
