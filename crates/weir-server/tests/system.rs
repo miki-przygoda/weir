@@ -1095,6 +1095,51 @@ fn stalled_client_does_not_block_other_connections() {
         .expect("server unresponsive after stalled client test");
 }
 
+// ── Partial frame injection ───────────────────────────────────────────────────
+
+/// Sending a valid header then only half the declared payload bytes before
+/// closing the connection must not corrupt the server's per-connection state
+/// machine. The next fresh connection must work normally.
+#[test]
+fn partial_frame_does_not_corrupt_next_connection() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Envelope, HEADER_LEN, Header, MessageType};
+
+    let srv = ServerHandle::start("partial_frame");
+
+    // Build a valid Push frame with a 64-byte payload.
+    let payload = vec![0xabu8; 64];
+    let header = Header::new(
+        MessageType::Push,
+        Durability::Buffered,
+        0,
+        payload.len() as u32,
+    );
+    let frame = Envelope::new(header, payload).encode();
+
+    {
+        let mut stream = RawStream::connect(&srv.socket_path).expect("connect for partial frame");
+        // Write only header + first 16 bytes of the 64-byte payload.
+        stream
+            .write_all(&frame[..HEADER_LEN + 16])
+            .expect("write partial frame");
+        // Drop the stream — connection dies mid-frame.
+    }
+
+    // Give the server time to observe the EOF and clean up the connection.
+    thread::sleep(Duration::from_millis(50));
+
+    // A fresh connection must work normally — the partial frame must not have
+    // left the server's read state in a corrupt position.
+    srv.client()
+        .push(b"after-partial-frame", Durability::Sync)
+        .expect("push failed after partial frame injection");
+
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after partial frame test");
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
