@@ -69,6 +69,7 @@ struct ServerHandle {
     pub socket_path: PathBuf,
     pub wab_dir: PathBuf,
     pub metrics_port: u16,
+    config_path: PathBuf,
     tmp_dir: PathBuf,
     /// Held for the lifetime of the handle to serialise process spawning.
     _proc_lock: std::sync::MutexGuard<'static, ()>,
@@ -79,6 +80,15 @@ impl ServerHandle {
     ///
     /// `tag` is used to name the temp directory (helps with post-mortem debugging).
     fn start(tag: &str) -> Self {
+        Self::start_impl(tag, 1)
+    }
+
+    /// Like `start`, but configures `shard_count` WAB shards.
+    fn start_sharded(tag: &str, shard_count: usize) -> Self {
+        Self::start_impl(tag, shard_count)
+    }
+
+    fn start_impl(tag: &str, shard_count: usize) -> Self {
         let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
         let metrics_port = free_port();
         let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
@@ -103,7 +113,7 @@ impl ServerHandle {
              socket_path   = \"{}\"\n\
              wab_dir       = \"{}\"\n\
              metrics_port  = {}\n\
-             shard_count   = 1\n\
+             shard_count   = {}\n\
              worker_count  = 2\n\
              batch_size    = 100\n\
              batch_deadline_ms = 20\n\
@@ -111,6 +121,7 @@ impl ServerHandle {
             socket_path.display(),
             wab_dir.display(),
             metrics_port,
+            shard_count,
         );
         fs::write(&config_path, config).unwrap();
 
@@ -128,6 +139,7 @@ impl ServerHandle {
             socket_path,
             wab_dir,
             metrics_port,
+            config_path,
             tmp_dir,
             _proc_lock,
         };
@@ -137,16 +149,59 @@ impl ServerHandle {
         handle
     }
 
-    /// Blocks until the Unix socket is visible on the filesystem.
+    /// Kills the server immediately with SIGKILL. The socket and temp files remain
+    /// on disk. Used to simulate a crash for crash-recovery tests.
+    fn kill_ungracefully(&mut self) {
+        if let Some(ref mut child) = self.child {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            self.child = None;
+        }
+    }
+
+    /// Kills the server with SIGKILL then restarts it with the same config.
     ///
-    /// Also detects early process exit (server crash) and prints the log on failure.
+    /// Simulates crash recovery: `bind_cleanup` in the socket layer detects and
+    /// removes the stale socket left behind by the crash.
+    fn restart_in_place(&mut self) {
+        self.kill_ungracefully();
+
+        // Append to existing log so both runs appear in diagnostics.
+        let log_path = self.tmp_dir.join("weir.log");
+        let log_file = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_path)
+            .unwrap();
+
+        let binary = env!("CARGO_BIN_EXE_weir-server");
+        let child = Command::new(binary)
+            .args(["--config", self.config_path.to_str().unwrap()])
+            .stdout(Stdio::from(log_file.try_clone().unwrap()))
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .expect("failed to respawn weir-server");
+
+        self.child = Some(child);
+        self.wait_ready(Duration::from_secs(15));
+    }
+
+    /// Blocks until the server is ready to accept connections.
+    ///
+    /// Uses an actual connect attempt rather than checking file existence — this
+    /// correctly handles crash-restart scenarios where a stale socket file from
+    /// the previous run is still on disk but nobody is listening yet.
+    ///
+    /// Also detects early process exit and prints the log for diagnostics.
     fn wait_ready(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if self.socket_path.exists() {
+            if std::os::unix::net::UnixStream::connect(&self.socket_path).is_ok() {
                 return;
             }
-            // Check whether the server crashed before creating the socket.
             if let Some(ref mut child) = self.child {
                 if let Ok(Some(status)) = child.try_wait() {
                     let log_path = self.tmp_dir.join("weir.log");
@@ -160,11 +215,10 @@ impl ServerHandle {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        // Timeout — read the log file for diagnostics before Drop cleans it up.
         let log_path = self.tmp_dir.join("weir.log");
         let log = fs::read_to_string(&log_path).unwrap_or_default();
         panic!(
-            "weir-server did not create socket within {:?}: {}\nlog:\n{log}",
+            "weir-server did not become ready within {:?}: {}\nlog:\n{log}",
             timeout,
             self.socket_path.display()
         );
@@ -212,6 +266,33 @@ impl Drop for ServerHandle {
         }
         let _ = fs::remove_dir_all(&self.tmp_dir);
     }
+}
+
+/// Spawns weir-server with the given config and waits up to `timeout` for it
+/// to exit with a non-zero status. Returns `true` if the server failed as
+/// expected, `false` if it was still running when the timeout elapsed.
+///
+/// The caller is responsible for holding `process_lock()` while calling this.
+fn wait_for_server_failure(config_path: &Path, timeout: Duration) -> bool {
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+    let mut child = Command::new(binary)
+        .args(["--config", config_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn weir-server");
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return !status.success();
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 // Helper: sum all file bytes under a directory tree.
@@ -632,4 +713,237 @@ fn mixed_durability_under_concurrent_load() {
     for h in handles {
         h.join().expect("producer thread panicked");
     }
+}
+
+// ── Crash recovery ────────────────────────────────────────────────────────────
+
+#[test]
+fn server_restarts_after_sigkill() {
+    let mut srv = ServerHandle::start("crash_restart");
+    srv.client()
+        .push(b"before-crash", Durability::Sync)
+        .unwrap();
+
+    srv.kill_ungracefully();
+
+    // Socket file persists on disk (SIGKILL left it behind).
+    assert!(
+        srv.socket_path.exists(),
+        "socket should remain after SIGKILL"
+    );
+
+    // bind_cleanup removes the stale socket; server starts clean.
+    srv.restart_in_place();
+    srv.client()
+        .push(b"after-restart", Durability::Sync)
+        .unwrap();
+}
+
+#[test]
+fn stale_socket_removed_automatically_on_restart() {
+    let mut srv = ServerHandle::start("stale_sock");
+
+    srv.kill_ungracefully();
+    assert!(
+        srv.socket_path.exists(),
+        "socket should still exist after SIGKILL"
+    );
+
+    // The restarted process must remove the stale socket via bind_cleanup
+    // and bind a new one — we verify this by connecting successfully.
+    srv.restart_in_place();
+    srv.client().health_check().unwrap();
+}
+
+#[test]
+fn wab_data_preserved_across_crash_restart() {
+    let mut srv = ServerHandle::start("wab_crash");
+    let mut client = srv.client();
+    for i in 0..20u32 {
+        client
+            .push(format!("crash-rec-{i}").as_bytes(), Durability::Sync)
+            .unwrap();
+    }
+    drop(client);
+    thread::sleep(Duration::from_millis(150));
+
+    let bytes_before = wab_dir_bytes(&srv.wab_dir);
+    assert!(bytes_before > 0, "WAB should have data before crash");
+
+    srv.kill_ungracefully();
+
+    let bytes_after_kill = wab_dir_bytes(&srv.wab_dir);
+    assert_eq!(
+        bytes_before, bytes_after_kill,
+        "WAB data must not change during a crash"
+    );
+
+    srv.restart_in_place();
+
+    let bytes_after_restart = wab_dir_bytes(&srv.wab_dir);
+    assert!(
+        bytes_after_restart > 0,
+        "WAB data must persist across crash + restart"
+    );
+}
+
+// ── Fault injection ───────────────────────────────────────────────────────────
+
+#[test]
+fn readonly_wab_dir_prevents_startup() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp_dir = std::env::temp_dir().join(format!("weir_fault_ro_{}", std::process::id()));
+    let wab_dir = tmp_dir.join("wab");
+    let socket_dir = tmp_dir.join("run");
+    let socket_path = socket_dir.join("weir.sock");
+    let config_path = tmp_dir.join("weir.toml");
+    let metrics_port = free_port();
+
+    fs::create_dir_all(&wab_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+
+    // Remove all permissions so the server cannot create shard subdirs.
+    fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let config = format!(
+        "[server]\n\
+         socket_path  = \"{}\"\n\
+         wab_dir      = \"{}\"\n\
+         metrics_port = {}\n\
+         shard_count  = 1\n\
+         worker_count = 2\n\
+         batch_size   = 100\n\
+         batch_deadline_ms = 20\n\
+         log_level    = \"error\"\n",
+        socket_path.display(),
+        wab_dir.display(),
+        metrics_port,
+    );
+    fs::write(&config_path, config).unwrap();
+
+    let failed = wait_for_server_failure(&config_path, Duration::from_secs(5));
+
+    // Restore permissions so cleanup can remove the directory.
+    fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).ok();
+    fs::remove_dir_all(&tmp_dir).ok();
+
+    assert!(
+        failed,
+        "weir-server should fail to start when wab_dir is unreadable/unwritable"
+    );
+}
+
+// ── Multi-shard correctness ───────────────────────────────────────────────────
+
+#[test]
+fn all_pushes_acked_with_multiple_shards() {
+    let srv = ServerHandle::start_sharded("multi_shard_ack", 4);
+    let mut client = srv.client();
+    for i in 0..100u32 {
+        client
+            .push(format!("shard-rec-{i:04}").as_bytes(), Durability::Batched)
+            .unwrap_or_else(|e| panic!("record {i} failed: {e}"));
+    }
+}
+
+#[test]
+fn shard_directories_created_on_disk() {
+    let srv = ServerHandle::start_sharded("shard_dirs", 3);
+    let mut client = srv.client();
+    client
+        .push(b"trigger-shard-creation", Durability::Sync)
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    // WAB creates shard_00, shard_01, shard_02 directories.
+    let mut found = 0usize;
+    for entry in fs::read_dir(&srv.wab_dir).unwrap().flatten() {
+        if entry.file_type().unwrap().is_dir() {
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .map(|n| n.starts_with("shard_"))
+                .unwrap_or(false)
+            {
+                found += 1;
+            }
+        }
+    }
+    assert!(
+        found >= 3,
+        "expected at least 3 shard dirs in {}, found {found}",
+        srv.wab_dir.display()
+    );
+}
+
+#[test]
+fn concurrent_producers_all_acked_with_multiple_shards() {
+    const THREADS: usize = 4;
+    const RECORDS_PER_THREAD: usize = 50;
+
+    let srv = ServerHandle::start_sharded("multi_shard_conc", 4);
+    let socket_path = srv.socket_path.clone();
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let path = socket_path.clone();
+            thread::spawn(move || {
+                let mut client = WeirClient::connect(&path)
+                    .unwrap_or_else(|e| panic!("thread {t}: connect: {e}"));
+                for i in 0..RECORDS_PER_THREAD {
+                    client
+                        .push(format!("t{t}-r{i}").as_bytes(), Durability::Sync)
+                        .unwrap_or_else(|e| panic!("thread {t} record {i}: {e}"));
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("producer thread panicked");
+    }
+}
+
+// ── Metrics accuracy ──────────────────────────────────────────────────────────
+
+#[test]
+fn records_accepted_counter_increments_after_sync_pushes() {
+    const N: u32 = 10;
+
+    let srv = ServerHandle::start("metrics_accepted");
+    let mut client = srv.client();
+    for i in 0..N {
+        client
+            .push(format!("acc-{i}").as_bytes(), Durability::Sync)
+            .unwrap();
+    }
+
+    let body = srv.scrape_metrics();
+    let expected = format!("weir_records_accepted_total{{tier=\"sync\"}} {N}");
+    assert!(
+        body.contains(&expected),
+        "expected '{expected}' in metrics; body:\n{body:.800}"
+    );
+}
+
+#[test]
+fn records_ack_counter_increments_after_sync_pushes() {
+    const N: u32 = 7;
+
+    let srv = ServerHandle::start("metrics_ack");
+    let mut client = srv.client();
+    for i in 0..N {
+        client
+            .push(format!("ack-{i}").as_bytes(), Durability::Sync)
+            .unwrap();
+    }
+
+    let body = srv.scrape_metrics();
+    let expected = format!("weir_records_ack_total{{tier=\"sync\"}} {N}");
+    assert!(
+        body.contains(&expected),
+        "expected '{expected}' in metrics; body:\n{body:.800}"
+    );
 }

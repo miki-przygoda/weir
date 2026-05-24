@@ -9,3 +9,6 @@ repository.workspace = true
 [dependencies]
 weir-core = { path = "../weir-core" }
 crc32fast = "1"
+
+[dev-dependencies]
+proptest = "1"
