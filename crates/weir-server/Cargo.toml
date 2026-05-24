@@ -33,4 +33,5 @@ toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-# tempfile is not added: tests use std::env::temp_dir() with unique subpaths.
+weir-client = { path = "../weir-client" }
+ureq = "2"

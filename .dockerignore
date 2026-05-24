@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+docs/
+todos/
+examples/
+tests/
+*.md
+deploy/docker/weir.toml.example

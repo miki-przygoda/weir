@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -8,11 +8,15 @@ use tokio::{
 use tracing::debug;
 
 use weir_core::{
-    DecodeError, Durability, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType, NackReason,
-    WIRE_VERSION,
+    DecodeError, Durability, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType,
+    NackReason as WireNack, WIRE_VERSION,
 };
 
-use crate::{models::WorkUnit, queue::QueueSender};
+use crate::{
+    metrics::{Metrics, NackLabel, NackReason as MetricNack, TierLabel, TierValue},
+    models::WorkUnit,
+    queue::QueueSender,
+};
 
 /// How long `handle_connection` waits for the queue to accept a work unit before
 /// giving up and nacking. Prevents a saturated or dead worker pool from holding
@@ -44,6 +48,7 @@ pub async fn handle_connection(
     mut stream: UnixStream,
     queue_tx: QueueSender<WorkUnit>,
     config: ConnectionConfig,
+    metrics: Arc<Metrics>,
 ) -> io::Result<()> {
     loop {
         // ── 1. Read header ───────────────────────────────────────────────────
@@ -63,7 +68,15 @@ pub async fn handle_connection(
         let header = match Header::decode(&header_buf) {
             Ok(h) => h,
             Err(e) => {
+                let reason = decode_err_to_metric_nack(&e);
                 send_decode_nack(&mut stream, &e).await?;
+                metrics
+                    .records_nack
+                    .get_or_create(&NackLabel {
+                        tier: TierValue::sync,
+                        reason,
+                    })
+                    .inc();
                 return Ok(());
             }
         };
@@ -75,7 +88,15 @@ pub async fn handle_connection(
         let payload_len = header.payload_len as usize;
         let cap = config.max_payload_bytes.min(MAX_PAYLOAD_HARD_CAP);
         if payload_len > cap {
-            send_nack(&mut stream, NackReason::PayloadTooLarge, &[]).await?;
+            let tv = durability_to_tier(header.durability);
+            send_nack(&mut stream, WireNack::PayloadTooLarge, &[]).await?;
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: tv,
+                    reason: MetricNack::payload_too_large,
+                })
+                .inc();
             return Ok(());
         }
 
@@ -89,14 +110,35 @@ pub async fn handle_connection(
         let expected_crc = u32::from_le_bytes(crc_buf);
         let computed_crc = crc32fast::hash(&payload);
         if expected_crc != computed_crc {
-            send_nack(&mut stream, NackReason::BadPayloadCrc, &[]).await?;
+            let tv = durability_to_tier(header.durability);
+            send_nack(&mut stream, WireNack::BadPayloadCrc, &[]).await?;
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: tv,
+                    reason: MetricNack::bad_payload_crc,
+                })
+                .inc();
             return Ok(());
         }
 
         // ── 6 & 7. Dispatch by message type ─────────────────────────────────
         match header.message_type {
             MessageType::Push => {
-                handle_push(&mut stream, queue_tx.clone(), header.durability, payload).await?;
+                let tv = durability_to_tier(header.durability);
+                metrics
+                    .records_accepted
+                    .get_or_create(&TierLabel { tier: tv.clone() })
+                    .inc();
+                handle_push(
+                    &mut stream,
+                    queue_tx.clone(),
+                    header.durability,
+                    payload,
+                    tv,
+                    &metrics,
+                )
+                .await?;
             }
             MessageType::HealthCheck => {
                 let resp =
@@ -107,7 +149,14 @@ pub async fn handle_connection(
             }
             _ => {
                 debug!(msg_type = ?header.message_type, "unexpected message type from client");
-                send_nack(&mut stream, NackReason::InternalError, &[]).await?;
+                send_nack(&mut stream, WireNack::InternalError, &[]).await?;
+                metrics
+                    .records_nack
+                    .get_or_create(&NackLabel {
+                        tier: TierValue::sync,
+                        reason: MetricNack::internal_error,
+                    })
+                    .inc();
                 return Ok(());
             }
         }
@@ -119,6 +168,8 @@ async fn handle_push(
     queue_tx: QueueSender<WorkUnit>,
     durability: Durability,
     payload: Vec<u8>,
+    tv: TierValue,
+    metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let unit = WorkUnit {
@@ -133,13 +184,53 @@ async fn handle_push(
         .map_err(io::Error::other)?;
 
     if push_result.is_err() {
-        send_nack(stream, NackReason::InternalError, &[]).await?;
+        send_nack(stream, WireNack::InternalError, &[]).await?;
+        metrics
+            .records_nack
+            .get_or_create(&NackLabel {
+                tier: tv,
+                reason: MetricNack::internal_error,
+            })
+            .inc();
         return Ok(());
     }
 
     match ack_rx.await {
-        Ok(true) => send_ack(stream).await,
-        _ => send_nack(stream, NackReason::InternalError, &[]).await,
+        Ok(true) => {
+            metrics
+                .records_ack
+                .get_or_create(&TierLabel { tier: tv })
+                .inc();
+            send_ack(stream).await
+        }
+        _ => {
+            send_nack(stream, WireNack::InternalError, &[]).await?;
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: tv,
+                    reason: MetricNack::internal_error,
+                })
+                .inc();
+            Ok(())
+        }
+    }
+}
+
+fn durability_to_tier(d: Durability) -> TierValue {
+    match d {
+        Durability::Sync => TierValue::sync,
+        Durability::Batched => TierValue::batched,
+        Durability::Buffered => TierValue::buffered,
+    }
+}
+
+fn decode_err_to_metric_nack(e: &DecodeError) -> MetricNack {
+    match e {
+        DecodeError::BadMagic => MetricNack::bad_magic,
+        DecodeError::VersionMismatch { .. } => MetricNack::version_mismatch,
+        DecodeError::HeaderCrcMismatch { .. } => MetricNack::bad_header_crc,
+        _ => MetricNack::internal_error,
     }
 }
 
@@ -147,7 +238,7 @@ async fn handle_push(
 ///
 /// For `VersionMismatch`, pass `extra = &[WIRE_VERSION]` so the client can
 /// produce: "daemon is on wire protocol v{WIRE_VERSION}; this client is on vN."
-async fn send_nack(stream: &mut UnixStream, reason: NackReason, extra: &[u8]) -> io::Result<()> {
+async fn send_nack(stream: &mut UnixStream, reason: WireNack, extra: &[u8]) -> io::Result<()> {
     let mut nack_payload = Vec::with_capacity(1 + extra.len());
     nack_payload.push(reason as u8);
     nack_payload.extend_from_slice(extra);
@@ -173,16 +264,16 @@ async fn send_ack(stream: &mut UnixStream) -> io::Result<()> {
 /// Maps a `DecodeError` to the appropriate Nack.
 async fn send_decode_nack(stream: &mut UnixStream, err: &DecodeError) -> io::Result<()> {
     match err {
-        DecodeError::BadMagic => send_nack(stream, NackReason::BadMagic, &[]).await,
+        DecodeError::BadMagic => send_nack(stream, WireNack::BadMagic, &[]).await,
         DecodeError::VersionMismatch { .. } => {
             // Second byte is the daemon's WIRE_VERSION so the client can produce
             // a human-readable "upgrade the daemon / downgrade the client" message.
-            send_nack(stream, NackReason::VersionMismatch, &[WIRE_VERSION]).await
+            send_nack(stream, WireNack::VersionMismatch, &[WIRE_VERSION]).await
         }
         DecodeError::HeaderCrcMismatch { .. } => {
-            send_nack(stream, NackReason::BadHeaderCrc, &[]).await
+            send_nack(stream, WireNack::BadHeaderCrc, &[]).await
         }
-        _ => send_nack(stream, NackReason::InternalError, &[]).await,
+        _ => send_nack(stream, WireNack::InternalError, &[]).await,
     }
 }
 
@@ -210,6 +301,8 @@ mod tests {
     async fn spawn_handler(cfg: ConnectionConfig) -> UnixStream {
         let (client, server) = UnixStream::pair().unwrap();
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
 
         // Auto-acker: blocking crossbeam recv must run on an OS thread, not in a
         // tokio task — blocking a tokio worker thread stalls the entire runtime.
@@ -220,7 +313,7 @@ mod tests {
             }
         });
 
-        tokio::spawn(handle_connection(server, queue_tx, cfg));
+        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
         client
     }
 
@@ -401,7 +494,9 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
         drop(queue_rx); // no receivers → Disconnected on first push
         let cfg = test_cfg();
-        tokio::spawn(handle_connection(server, queue_tx, cfg));
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
 
         let mut client = client;
         client.write_all(&push_frame(b"data")).await.unwrap();

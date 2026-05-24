@@ -231,3 +231,87 @@ fn nack_reason_rejects_unknown_byte() {
     assert!(NackReason::try_from(0x07).is_err());
     assert!(NackReason::try_from(0xFF).is_err());
 }
+
+// ── Property-based tests ──────────────────────────────────────────────────────
+
+mod proptest_wire {
+    use proptest::prelude::*;
+    use weir_core::{Durability, Envelope, HEADER_LEN, Header, MessageType};
+
+    fn any_message_type() -> impl Strategy<Value = MessageType> {
+        prop_oneof![
+            Just(MessageType::Push),
+            Just(MessageType::Ack),
+            Just(MessageType::Nack),
+            Just(MessageType::HealthCheck),
+            Just(MessageType::HealthCheckResponse),
+        ]
+    }
+
+    fn any_durability() -> impl Strategy<Value = Durability> {
+        prop_oneof![
+            Just(Durability::Sync),
+            Just(Durability::Batched),
+            Just(Durability::Buffered),
+        ]
+    }
+
+    proptest! {
+        /// Encode → decode is the identity for any valid header field combination.
+        #[test]
+        fn header_encode_decode_roundtrip(
+            mt in any_message_type(),
+            d in any_durability(),
+            flags in any::<u8>(),
+            payload_len in 0u32..=1024,
+        ) {
+            let h = Header::new(mt, d, flags, payload_len);
+            let encoded = h.encode();
+            prop_assert_eq!(Header::decode(&encoded), Ok(h));
+        }
+
+        /// Encode → decode is the identity for any payload byte sequence.
+        #[test]
+        fn envelope_encode_decode_roundtrip(
+            payload in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let header = Header::new(
+                MessageType::Push,
+                Durability::Sync,
+                0,
+                payload.len() as u32,
+            );
+            let env = Envelope::new(header, payload);
+            prop_assert_eq!(Envelope::decode(&env.encode()), Ok(env));
+        }
+
+        /// `Header::decode` never panics on arbitrary 16-byte input.
+        #[test]
+        fn header_decode_never_panics(bytes: [u8; HEADER_LEN]) {
+            let _ = Header::decode(&bytes);
+        }
+
+        /// `Envelope::decode` never panics on any byte sequence.
+        #[test]
+        fn envelope_decode_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let _ = Envelope::decode(&bytes);
+        }
+
+        /// Corrupting one byte of a valid header always produces a result — never panics.
+        #[test]
+        fn header_single_byte_mutation_never_panics(
+            mt in any_message_type(),
+            d in any_durability(),
+            payload_len in 0u32..=1024,
+            pos in 0usize..HEADER_LEN,
+            corrupt_byte in any::<u8>(),
+        ) {
+            let h = Header::new(mt, d, 0, payload_len);
+            let mut buf = h.encode();
+            buf[pos] = corrupt_byte;
+            let _ = Header::decode(&buf);
+        }
+    }
+}

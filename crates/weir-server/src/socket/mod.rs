@@ -34,7 +34,7 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
-use crate::{models::WorkUnit, queue::QueueSender};
+use crate::{metrics::Metrics, models::WorkUnit, queue::QueueSender};
 
 /// Configuration for the socket accept loop.
 pub struct SocketConfig {
@@ -67,6 +67,7 @@ pub async fn run(
     config: SocketConfig,
     queue_tx: QueueSender<WorkUnit>,
     shutdown_rx: oneshot::Receiver<()>,
+    metrics: std::sync::Arc<Metrics>,
 ) -> io::Result<()> {
     validate_socket_path(&config.socket_path)?;
     bind_cleanup(&config.socket_path)?;
@@ -111,9 +112,10 @@ pub async fn run(
                         };
                         let tx = queue_tx.clone();
                         let cfg = conn_cfg.clone();
+                        let m = std::sync::Arc::clone(&metrics);
                         join_set.spawn(async move {
                             let _permit = permit;
-                            if let Err(e) = handle_connection(stream, tx, cfg).await
+                            if let Err(e) = handle_connection(stream, tx, cfg, m).await
                                 && e.kind() != io::ErrorKind::UnexpectedEof
                                 && e.kind() != io::ErrorKind::ConnectionReset
                                 && e.kind() != io::ErrorKind::BrokenPipe
@@ -233,6 +235,11 @@ mod tests {
         }
     }
 
+    fn test_metrics() -> std::sync::Arc<crate::metrics::Metrics> {
+        let (m, _reg) = crate::metrics::Metrics::new();
+        std::sync::Arc::new(m)
+    }
+
     // ── Path validation ───────────────────────────────────────────────────────
 
     #[test]
@@ -305,7 +312,7 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
         let _rx = queue_rx.get(); // keep receiver alive
 
-        tokio::spawn(run(cfg, queue_tx, shutdown_rx));
+        tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // First connection fills the cap.
@@ -333,7 +340,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>();
 
-        let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx));
+        let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         shutdown_tx.send(()).unwrap();
@@ -360,7 +367,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let (queue_tx, _) = queue::new::<WorkUnit>();
 
-            tokio::spawn(run(cfg, queue_tx, shutdown_rx));
+            tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
             tokio::time::sleep(Duration::from_millis(30)).await;
 
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();

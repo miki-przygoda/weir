@@ -161,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics_listener =
             tokio::net::TcpListener::bind(("127.0.0.1", config.metrics_port)).await?;
         let (metrics_struct, registry) = metrics::Metrics::new();
-        let _ = metrics_struct; // subsystem wiring deferred to a later step
+        let metrics = Arc::new(metrics_struct);
         metrics::server::spawn(metrics_listener, Arc::new(registry));
 
         info!(port = config.metrics_port, "metrics endpoint listening");
@@ -201,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_payload_bytes: config.max_payload_bytes,
                 shutdown_timeout_secs: config.shutdown_timeout_secs,
             };
-            socket::run(socket_config, queue_tx, shutdown_rx).await?;
+            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics)).await?;
         }
         #[cfg(not(unix))]
         {
