@@ -1,0 +1,43 @@
+services:
+  weir:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: weir-server:local
+    restart: unless-stopped
+
+    volumes:
+      # WAB segments persist across restarts.
+      - wab_data:/var/lib/weir/wab
+      # Unix socket shared with producer containers on the same host.
+      - weir_socket:/run/weir
+      # Bind-mount your config into the container.
+      - ./weir.toml.example:/etc/weir/weir.toml:ro
+
+    ports:
+      # Prometheus metrics — scrape at http://localhost:9185/metrics
+      - "127.0.0.1:9185:9185"
+
+    environment:
+      # Override individual config values without editing the TOML file.
+      # All WEIR_* variables take precedence over the file.
+      WEIR_LOG_LEVEL: info
+
+    # weir-server writes to /var/lib/weir/wab (0o700) and binds the socket.
+    # The image already creates a non-root 'weir' user; keep it.
+    user: weir
+
+    healthcheck:
+      # The metrics endpoint doubles as a liveness probe —
+      # it only comes up after the socket is bound and the pipeline is running.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9185/metrics > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  wab_data:
+    driver: local
+  weir_socket:
+    driver: local
