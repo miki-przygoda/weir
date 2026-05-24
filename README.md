@@ -10,7 +10,7 @@ Producers write records to the `weir` daemon over a Unix domain socket. The daem
 
 **Pre-release. Not yet ready for production use.**
 
-Core pipeline (wire protocol, WAB, queue, worker pool, socket layer) is implemented and tested. Sink/drain, metrics, and config wiring are in progress. The wire protocol and WAB on-disk format are versioned and will not change without a version bump.
+Core pipeline (wire protocol, WAB, queue, worker pool, socket layer, sink/drain, and Prometheus metrics) is implemented and tested. Config wiring and main-loop assembly are in progress (step 08). The wire protocol and WAB on-disk format are versioned and will not change without a version bump.
 
 ---
 
@@ -33,7 +33,7 @@ Windows is not supported for the daemon. CI builds `weir-core` on Windows to kee
 | Crate         | Type      | Description                                                                                                      |
 |---------------|-----------|------------------------------------------------------------------------------------------------------------------|
 | `weir-core`   | lib       | Wire protocol types: `Envelope`, `Header`, `Durability`, `NackReason`, `DecodeError`, `Payload`. Cross-platform. |
-| `weir-server` | bin + lib | Daemon: socket layer, WAB, queue, worker pool, drain. Unix only.                                                 |
+| `weir-server` | bin + lib | Daemon: socket layer, WAB, queue, worker pool, drain, metrics. Unix only.                                        |
 | `weir-client` | lib       | Client library. Thin wrapper around the socket protocol.                                                         |
 | `weir-bench`  | bin       | Benchmark harness. Three-tier throughput numbers per platform.                                                   |
 

@@ -26,7 +26,13 @@ Worker pool           (std::thread, src/worker.rs)
 WAB flusher threads   (std::thread, src/wab/)
   │  per-shard segment files
   ▼
-Drain / Sink          (step 06+)
+Drain                 (std::thread, src/drain/)
+  │  crossbeam_channel<PathBuf>  [sealed segment paths]
+  ▼
+Sink                  (async, single-threaded tokio runtime in drain thread)
+  │  CommitResult: committed + dead_lettered
+  ▼
+Dead-letter writer    (src/drain/dead_letter.rs)   [on permanent rejection]
 ```
 
 ### Runtime boundary
@@ -77,9 +83,75 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
 - Path validation (`validate_path`) is currently in `src/wab/mod.rs`; it will move to `src/config/mod.rs` in step 08 and be shared with socket path validation.
 
-### Drain (step 06, not yet implemented)
+### Sink (`src/sink/`)
 
-Reads sealed segments via `SegmentReader`, forwards records to the sink, writes `.confirmed` sidecars, and resolves `ack_tx` on each `WorkUnit`.
+- `Sink` trait uses native async fn in trait (AFIT, stable since Rust 1.75). The drain is generic `spawn<S: Sink>` to avoid `dyn Sink` object-safety issues with AFIT.
+- `SinkError::is_transient()` classifies errors: transient errors trigger exponential backoff retry of the whole segment; permanent errors dead-letter the batch.
+- `CommitResult<R>` splits a batch into `committed` and `dead_lettered` records — partial success is a first-class outcome, not an error.
+- `SinkRecord` trait decouples the drain's `Payload` bytes from the sink's own record type; pass-through implementation (`impl SinkRecord for Payload`) is provided.
+- `SinkHealth` (`Healthy / Degraded / Down`) is surfaced via the `weir_sink_health` gauge; queried periodically (wired in step 08).
+
+### Drain (`src/drain/`)
+
+Reads sealed segments via `SegmentReader`, forwards records to the sink in sub-batches respecting `Sink::max_batch_size()`, writes `.confirmed` sidecars, and deletes sealed segments after confirmation.
+
+**State machine** — three explicit states, one active at a time:
+
+```
+Draining
+  │  Err(Transient) → RetryingTransient
+  │  Err(Permanent) AND dead-letter cap exceeded → BlockedDeadLetterFull
+  │  Ok → write .confirmed, delete segment, stay Draining
+  ▼
+RetryingTransient
+  │  retry succeeds → Draining
+  │  MAX_RETRIES (3) exhausted → leave segment on disk, log, Draining
+  │  (exponential backoff: base × 2ⁿ per attempt)
+  ▼
+BlockedDeadLetterFull
+  │  wake every dead_letter_check_interval; rescan dead_letter/ dir
+  │  bytes < cap → unblock, push segment to front of pending queue, Draining
+  │  bytes ≥ cap → stay blocked
+  │  channel disconnect + bytes < cap → confirm segment, exit
+  │  channel disconnect + bytes ≥ cap → exit without confirming (crash recovery replays)
+```
+
+- **At-least-once delivery**: sinks must be idempotent. If the daemon crashes after a partial commit but before writing `.confirmed`, the full segment is replayed on restart.
+- **Payload clone before commit**: payloads are cloned before `Sink::commit()` so permanent errors can dead-letter records without recovering them from the error value.
+- **Segment confirmed path**: `.wab.sealed` suffix stripped, `.wab.confirmed` appended. Confirmed sidecar format: see [wab_format.md](wab_format.md).
+- **`dead_letter_full_total`** increments once per entry into `BlockedDeadLetterFull`, not per wake cycle — tracks distinct blocking events, not polling iterations.
+
+### Dead-letter writer (`src/drain/dead_letter.rs`)
+
+- Permanently rejected records are written to `<wab_dir>/dead_letter/` as sealed WAB segments (shard ID `0xFFFF`), so `SegmentReader` can read them without a separate parser.
+- Files named `dl_NNNNNNNN.wab.sealed`; counter increments per file, persisted across restarts by scanning on open.
+- Running `total_bytes` updated after every write; `rescan()` called on each blocked-state wake to detect files deleted by the operator outside the daemon.
+- `would_exceed_cap(additional_bytes, cap)` is checked before every write; if it would exceed, the drain enters `BlockedDeadLetterFull` instead.
+
+### Metrics (`src/metrics/`)
+
+16 Prometheus metrics registered with a `prometheus-client` registry. `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `weir_records_accepted_total{tier}` | counter | Records accepted from producers |
+| `weir_records_ack_total{tier}` | counter | Records acknowledged to producers |
+| `weir_records_nack_total{tier,reason}` | counter | Records rejected (Nack) |
+| `weir_wab_segments_total{state}` | counter | WAB segment transitions |
+| `weir_wab_bytes_on_disk` | gauge | WAB directory size |
+| `weir_wab_fsync_duration_seconds` | histogram | fdatasync latency |
+| `weir_sink_commit_duration_seconds` | histogram | `Sink::commit` latency |
+| `weir_sink_commit_records_total{outcome}` | counter | Records by drain outcome |
+| `weir_sink_health{state}` | gauge | Sink health (1 = active state) |
+| `weir_queue_depth` | gauge | Work queue occupancy |
+| `weir_recovery_records_replayed_total` | counter | Records replayed on startup |
+| `weir_recovery_segments_quarantined_total` | counter | Segments quarantined on startup |
+| `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size |
+| `weir_dead_letter_full_total` | counter | Distinct `BlockedDeadLetterFull` entries |
+| `weir_drain_state{state}` | gauge | Drain state (exactly one label = 1) |
+| `weir_dead_letter_blocked_duration_seconds` | gauge | Time in `BlockedDeadLetterFull`; alert target |
+
+`weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `127.0.0.1:{metrics_port}` and serves `GET /metrics` in OpenMetrics text format.
 
 ---
 

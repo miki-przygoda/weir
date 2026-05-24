@@ -28,6 +28,35 @@ changes are tracked separately under **Wire protocol** below.
   `Semaphore`-based connection cap and configurable shutdown timeout.
   Frame parser enforces the decode order specified in
   [docs/wire_protocol.md](docs/wire_protocol.md).
+- Sink trait (`weir-server::sink`): `Sink`, `SinkRecord`, `SinkError`,
+  `CommitResult`, and `SinkHealth` — the interface between the drain and
+  any downstream store. Uses native async fn in trait (AFIT, no
+  `async-trait` dep). Implementations classify errors as transient
+  (retried with exponential backoff) or permanent (dead-lettered).
+- Drain (`weir-server::drain`): three-state machine — `Draining`,
+  `RetryingTransient` (exponential backoff, up to `MAX_RETRIES = 3`),
+  and `BlockedDeadLetterFull` (waits for dead-letter cap headroom before
+  retrying the preserved segment). Runs on a dedicated `std::thread` with
+  a single-threaded Tokio runtime for async sink calls. Writes
+  `.confirmed` sidecars after successful drain; deletes WAB segments only
+  after confirmation. At-least-once delivery: sinks must be idempotent.
+- Dead-letter writer (`weir-server::drain::dead_letter`): permanently
+  rejected records are appended to sealed WAB segments under
+  `<wab_dir>/dead_letter/` (shard ID `0xFFFF`), readable by
+  `SegmentReader` without a separate parser. Cap enforced via a running
+  byte total; rescanned from disk on each blocked-state wake to detect
+  operator-deleted files.
+- Metrics (`weir-server::metrics`): 16 Prometheus metrics covering all
+  subsystems, registered with a `prometheus-client` registry. Includes
+  counters (`weir_records_accepted_total`, `weir_sink_commit_records_total`,
+  `weir_dead_letter_full_total`, etc.), gauges (`weir_drain_state`,
+  `weir_dead_letter_blocked_duration_seconds`, etc.), and histograms
+  (`weir_wab_fsync_duration_seconds`, `weir_sink_commit_duration_seconds`).
+- Metrics HTTP server (`weir-server::metrics::server`): minimal tokio
+  TCP server exposing `GET /metrics` in OpenMetrics text format
+  (`application/openmetrics-text; version=1.0.0; charset=utf-8`).
+  Binds to `127.0.0.1:{metrics_port}`; accepts a `TcpListener` for
+  testability with OS-assigned ports.
 
 ### Security
 - Segment files created with mode `0o600`; shard and quarantine
