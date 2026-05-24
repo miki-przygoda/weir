@@ -1022,6 +1022,79 @@ fn graceful_shutdown_under_load() {
     );
 }
 
+// ── Stalled client isolation ──────────────────────────────────────────────────
+
+/// A client that connects, sends one Push frame, and then never reads the Ack
+/// must not block or slow down other connections.
+///
+/// The stalled connection holds a permit in the connection semaphore and keeps
+/// the server's per-connection async task suspended (waiting to read the next
+/// frame). Other connections must get their own permits and proceed normally.
+#[test]
+fn stalled_client_does_not_block_other_connections() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Envelope, Header, MessageType};
+
+    const CONCURRENT_RECORDS: usize = 50;
+    const CONCURRENT_DEADLINE: Duration = Duration::from_secs(5);
+
+    let srv = ServerHandle::start("stall_isolation");
+
+    // Pre-encode one Push frame for the stalled client to send.
+    let payload = b"stall";
+    let header = Header::new(
+        MessageType::Push,
+        Durability::Buffered,
+        0,
+        payload.len() as u32,
+    );
+    let frame = Envelope::new(header, payload.to_vec()).encode();
+
+    let stop_stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Stalled client: connects, sends one frame, holds the connection open
+    // without ever reading the Ack. The server task for this connection is
+    // suspended waiting for the next frame — which never comes.
+    let stall_handle = {
+        let path = srv.socket_path.clone();
+        let stop = Arc::clone(&stop_stall);
+        thread::spawn(move || {
+            let mut stream = RawStream::connect(&path).expect("stall: connect");
+            stream.write_all(&frame).expect("stall: write frame");
+            // Deliberately do not read the Ack. Hold the connection open.
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+
+    // Let the stall thread connect and send its frame before we proceed.
+    thread::sleep(Duration::from_millis(100));
+
+    // Concurrent client: 50 Sync pushes while the stalled connection is held.
+    let mut client = srv.client();
+    let t0 = Instant::now();
+    for i in 0..CONCURRENT_RECORDS {
+        client
+            .push(format!("concurrent-{i}").as_bytes(), Durability::Sync)
+            .unwrap_or_else(|e| panic!("concurrent push {i} failed: {e}"));
+    }
+    let elapsed = t0.elapsed();
+
+    stop_stall.store(true, Ordering::Relaxed);
+    stall_handle.join().expect("stall thread panicked");
+
+    assert!(
+        elapsed < CONCURRENT_DEADLINE,
+        "{CONCURRENT_RECORDS} pushes took {elapsed:?} with stalled connection held — \
+         expected < {CONCURRENT_DEADLINE:?} (stalled client may be blocking the worker)"
+    );
+
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after stalled client test");
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
