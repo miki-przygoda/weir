@@ -1,4 +1,6 @@
-use crossbeam_channel::{Receiver, Sender};
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 
 /// Bounded MPMC queue capacity. The socket layer blocks on `push` when the
 /// channel is full, providing backpressure that signals producers to slow
@@ -48,6 +50,18 @@ impl<T> QueueSender<T> {
 
     pub fn is_empty(&self) -> bool {
         self.tx.is_empty()
+    }
+
+    /// Attempts to push a work unit within `timeout`.
+    ///
+    /// Returns `Err(unit)` if the channel is full for the entire duration or all
+    /// receivers have disconnected. The socket layer uses this to nack rather
+    /// than block indefinitely when the queue is saturated or workers have exited.
+    pub fn push_timeout(&self, unit: T, timeout: Duration) -> Result<(), T> {
+        match self.tx.send_timeout(unit, timeout) {
+            Ok(()) => Ok(()),
+            Err(SendTimeoutError::Timeout(u) | SendTimeoutError::Disconnected(u)) => Err(u),
+        }
     }
 }
 
@@ -136,6 +150,37 @@ mod tests {
         handle
             .join()
             .expect("producer thread should complete after slot freed");
+    }
+
+    #[test]
+    fn push_timeout_returns_unit_when_full_and_timeout_expires() {
+        let (tx, _rx) = new_with_capacity::<u32>(1);
+        tx.push(1); // fill the channel
+        let result = tx.push_timeout(2, Duration::from_millis(20));
+        assert!(
+            result.is_err(),
+            "push_timeout should time out on a full channel"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            2,
+            "returned item should be the original unit"
+        );
+    }
+
+    #[test]
+    fn push_timeout_succeeds_when_slot_available() {
+        let (tx, rx) = new_with_capacity::<u32>(2);
+        let _recv = rx.get();
+        assert!(tx.push_timeout(42, Duration::from_millis(20)).is_ok());
+    }
+
+    #[test]
+    fn push_timeout_returns_unit_when_disconnected() {
+        let (tx, rx) = new_with_capacity::<u32>(1);
+        drop(rx); // drop all receivers
+        let result = tx.push_timeout(99, Duration::from_millis(20));
+        assert_eq!(result.unwrap_err(), 99);
     }
 
     #[test]

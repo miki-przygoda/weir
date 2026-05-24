@@ -38,11 +38,14 @@ impl WabSegment {
     /// ensure the file is newly created. The caller must guarantee `path` does
     /// not already exist.
     pub fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
+        // O_NOFOLLOW: reject symlinks at the target path (prevents TOCTOU redirect).
+        // mode 0o600: segment files are private to the daemon; no group/other read.
         #[cfg(unix)]
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o600)
             .open(path)?;
 
         #[cfg(not(unix))]
