@@ -1,21 +1,25 @@
 //! Concurrency and throughput load tests for weir-server.
 //!
-//! These run as part of the dedicated `load` CI job (5 iterations, results
-//! averaged and written to `docs/benchmarks.md`). They are NOT marked
+//! These run as part of the dedicated `load` CI job and are NOT marked
 //! `#[ignore]` — they are the baseline for an ongoing performance improvement
 //! effort and must stay green on every push.
 //!
 //! # Running locally
 //!
 //! ```sh
-//! cargo test -p weir-server --test load -- --nocapture
+//! # Default (1 ms deadline):
+//! cargo test -p weir-server --test load --release -- --nocapture
+//!
+//! # Specific deadline:
+//! WEIR_BENCH_DEADLINE=2 cargo test -p weir-server --test load --release -- --nocapture
 //! ```
 //!
-//! # Output format
+//! # Deadline comparison
 //!
-//! Each test emits one `BENCH: <json>` line to stdout. The CI script
-//! (`deploy/avg_benchmarks.py`) collects these across 5 runs, averages them,
-//! and rewrites `docs/benchmarks.md`.
+//! CI runs the full suite twice per iteration — once with `WEIR_BENCH_DEADLINE=1`
+//! and once with `WEIR_BENCH_DEADLINE=2` — and appends all results to the same
+//! `load_results.jsonl`. Scenario names include a `_d{N}ms` suffix so
+//! `deploy/avg_benchmarks.py` can render a side-by-side comparison table.
 //!
 //! # Performance work
 //!
@@ -31,7 +35,9 @@
 #![cfg(unix)]
 
 use std::{
+    io::Write,
     net::TcpListener,
+    os::unix::net::UnixStream,
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -43,9 +49,9 @@ use std::{
 };
 
 use weir_client::{ClientError, WeirClient};
-use weir_core::Durability;
+use weir_core::{Durability, Envelope, Header, MessageType};
 
-// ── Process serialiser (same pattern as system.rs) ─────────────────────────
+// ── Process serialiser ─────────────────────────────────────────────────────
 
 fn process_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
@@ -60,15 +66,31 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Reads `WEIR_BENCH_DEADLINE` from the environment (default: 1).
+/// CI sets this to 1 and 2 in successive passes to populate the comparison.
+fn bench_deadline_ms() -> u64 {
+    std::env::var("WEIR_BENCH_DEADLINE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Returns the scenario name with the active deadline suffix embedded,
+/// e.g. `"single_thread_buffered_d1ms"`.
+fn bench_tag(base: &str) -> String {
+    format!("{base}_d{}ms", bench_deadline_ms())
+}
+
 // ── LoadHandle ─────────────────────────────────────────────────────────────
 //
 // Lighter than system.rs's ServerHandle: no crash-recovery plumbing, no
-// metrics scraping. Uses a shorter batch_deadline (2 ms) and 4 shards so
-// throughput numbers are not dominated by the deadline timer.
+// metrics scraping. `batch_deadline_ms` is read from `WEIR_BENCH_DEADLINE`
+// so the same binary can be driven at different deadline values by CI.
 
 struct LoadHandle {
     child: Option<Child>,
     pub socket_path: PathBuf,
+    pub deadline_ms: u64,
     tmp_dir: PathBuf,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -86,6 +108,7 @@ impl LoadHandle {
 
     fn start_impl(tag: &str, max_connections: usize) -> Self {
         let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let deadline_ms = bench_deadline_ms();
         let metrics_port = free_port();
         let tmp_dir =
             std::env::temp_dir().join(format!("weir_load_{}_{}", tag, std::process::id()));
@@ -110,12 +133,13 @@ impl LoadHandle {
              shard_count       = 4\n\
              worker_count      = 4\n\
              batch_size        = 64\n\
-             batch_deadline_ms = 2\n\
+             batch_deadline_ms = {}\n\
              max_connections   = {}\n\
              log_level         = \"error\"\n",
             socket_path.display(),
             wab_dir.display(),
             metrics_port,
+            deadline_ms,
             max_connections,
         );
         std::fs::write(&config_path, &config).unwrap();
@@ -132,6 +156,7 @@ impl LoadHandle {
         let mut handle = Self {
             child: Some(child),
             socket_path,
+            deadline_ms,
             tmp_dir,
             _lock,
         };
@@ -142,7 +167,7 @@ impl LoadHandle {
     fn wait_ready(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if std::os::unix::net::UnixStream::connect(&self.socket_path).is_ok() {
+            if UnixStream::connect(&self.socket_path).is_ok() {
                 return;
             }
             if let Some(ref mut child) = self.child {
@@ -178,7 +203,6 @@ impl Drop for LoadHandle {
 
 // ── Output helpers ─────────────────────────────────────────────────────────
 
-/// Prints a throughput result line that the CI averaging script can parse.
 fn emit_throughput(scenario: &str, threads: usize, total_records: usize, elapsed: Duration) {
     let rps = total_records as f64 / elapsed.as_secs_f64();
     println!(
@@ -190,7 +214,6 @@ fn emit_throughput(scenario: &str, threads: usize, total_records: usize, elapsed
     );
 }
 
-/// Prints a latency result line.
 fn emit_latency(scenario: &str, samples: usize, sorted_us: &[u64]) {
     let p = |pct: f64| -> u64 {
         let idx = ((samples as f64 * pct / 100.0) as usize).min(samples - 1);
@@ -212,8 +235,7 @@ fn emit_latency(scenario: &str, samples: usize, sorted_us: &[u64]) {
 // ── Thundering-herd helper ─────────────────────────────────────────────────
 //
 // All N threads connect first, then synchronise on a barrier so their first
-// push() calls hit the server at the same instant. This is the "same
-// nanosecond" burst the user wants to stress-test.
+// push() calls hit the server at the same instant.
 
 fn thundering_herd(srv: &LoadHandle, n_threads: usize, records_per_thread: usize) -> Duration {
     let barrier = Arc::new(Barrier::new(n_threads + 1));
@@ -225,7 +247,7 @@ fn thundering_herd(srv: &LoadHandle, n_threads: usize, records_per_thread: usize
             let path = socket.clone();
             thread::spawn(move || {
                 let mut client = WeirClient::connect(&path).expect("connect");
-                b.wait(); // wait until all threads are connected
+                b.wait();
                 for _ in 0..records_per_thread {
                     client.push(b"bench", Durability::Sync).expect("push");
                 }
@@ -233,7 +255,7 @@ fn thundering_herd(srv: &LoadHandle, n_threads: usize, records_per_thread: usize
         })
         .collect();
 
-    barrier.wait(); // release all threads simultaneously
+    barrier.wait();
     let t0 = Instant::now();
     for h in handles {
         h.join().expect("thread panicked");
@@ -242,11 +264,6 @@ fn thundering_herd(srv: &LoadHandle, n_threads: usize, records_per_thread: usize
 }
 
 // ── Ramp-to-saturation helper ──────────────────────────────────────────────
-//
-// Each level spawns N threads. All threads attempt to connect, then rendezvous
-// at a barrier so they start pushing simultaneously. They push Buffered records
-// for `duration`, then stop. The main thread tallies outcomes and verifies the
-// server is still alive afterwards via a health check.
 
 struct LevelResult {
     acks: u64,
@@ -272,7 +289,6 @@ fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> Lev
             let path = srv.socket_path.clone();
 
             thread::spawn(move || {
-                // Connect before the barrier so all threads begin pushing together.
                 let conn = WeirClient::connect(&path);
                 b.wait();
                 let mut client = match conn {
@@ -288,7 +304,6 @@ fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> Lev
                             acks.fetch_add(1, Ordering::Relaxed);
                         }
                         Err(ClientError::Io(_)) => {
-                            // Server dropped the connection (cap exhausted or shutdown).
                             io_errs.fetch_add(1, Ordering::Relaxed);
                             break;
                         }
@@ -301,7 +316,7 @@ fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> Lev
         })
         .collect();
 
-    barrier.wait(); // release all threads simultaneously
+    barrier.wait();
     let t0 = Instant::now();
     thread::sleep(duration);
     stop.store(true, Ordering::Relaxed);
@@ -320,7 +335,6 @@ fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> Lev
 // ── Load tests ─────────────────────────────────────────────────────────────
 
 /// Baseline: single producer, Buffered (no fsync wait).
-/// Establishes the ceiling throughput for a sequential producer.
 #[test]
 fn baseline_single_thread_throughput_buffered() {
     const RECORDS: usize = 500;
@@ -333,11 +347,10 @@ fn baseline_single_thread_throughput_buffered() {
     }
     let elapsed = t0.elapsed();
 
-    emit_throughput("single_thread_buffered", 1, RECORDS, elapsed);
+    emit_throughput(&bench_tag("single_thread_buffered"), 1, RECORDS, elapsed);
 }
 
 /// Baseline: single producer, Sync (fsync per batch).
-/// Shows the fsync-per-batch cost for sequential workloads.
 #[test]
 fn baseline_single_thread_throughput_sync() {
     const RECORDS: usize = 300;
@@ -350,11 +363,10 @@ fn baseline_single_thread_throughput_sync() {
     }
     let elapsed = t0.elapsed();
 
-    emit_throughput("single_thread_sync", 1, RECORDS, elapsed);
+    emit_throughput(&bench_tag("single_thread_sync"), 1, RECORDS, elapsed);
 }
 
 /// Latency percentiles: single Sync producer, every push timed individually.
-/// Captures p50 / p95 / p99 / p99.9 / max latency.
 #[test]
 fn baseline_latency_percentiles_sync() {
     const SAMPLES: usize = 300;
@@ -369,11 +381,10 @@ fn baseline_latency_percentiles_sync() {
     }
     us.sort_unstable();
 
-    emit_latency("latency_sync", SAMPLES, &us);
+    emit_latency(&bench_tag("latency_sync"), SAMPLES, &us);
 }
 
 /// Thundering herd — 8 threads.
-/// All threads connect, synchronise on a barrier, then push simultaneously.
 #[test]
 fn thundering_herd_8_threads() {
     const THREADS: usize = 8;
@@ -381,7 +392,7 @@ fn thundering_herd_8_threads() {
     let srv = LoadHandle::start("herd_8");
     let elapsed = thundering_herd(&srv, THREADS, RECORDS_PER_THREAD);
     emit_throughput(
-        "thundering_herd_8_threads",
+        &bench_tag("thundering_herd_8_threads"),
         THREADS,
         THREADS * RECORDS_PER_THREAD,
         elapsed,
@@ -396,7 +407,7 @@ fn thundering_herd_32_threads() {
     let srv = LoadHandle::start("herd_32");
     let elapsed = thundering_herd(&srv, THREADS, RECORDS_PER_THREAD);
     emit_throughput(
-        "thundering_herd_32_threads",
+        &bench_tag("thundering_herd_32_threads"),
         THREADS,
         THREADS * RECORDS_PER_THREAD,
         elapsed,
@@ -404,7 +415,6 @@ fn thundering_herd_32_threads() {
 }
 
 /// Thundering herd — 64 threads.
-/// Maximum concurrency test: 64 simultaneous producers, same-instant burst.
 #[test]
 fn thundering_herd_64_threads() {
     const THREADS: usize = 64;
@@ -412,7 +422,7 @@ fn thundering_herd_64_threads() {
     let srv = LoadHandle::start("herd_64");
     let elapsed = thundering_herd(&srv, THREADS, RECORDS_PER_THREAD);
     emit_throughput(
-        "thundering_herd_64_threads",
+        &bench_tag("thundering_herd_64_threads"),
         THREADS,
         THREADS * RECORDS_PER_THREAD,
         elapsed,
@@ -420,7 +430,6 @@ fn thundering_herd_64_threads() {
 }
 
 /// Connection churn: repeated connect → push → disconnect cycles.
-/// Measures the overhead of connection establishment under load.
 #[test]
 fn connection_churn() {
     const ROUNDS: usize = 100;
@@ -430,14 +439,13 @@ fn connection_churn() {
     for _ in 0..ROUNDS {
         let mut client = srv.client();
         client.push(b"churn", Durability::Buffered).expect("push");
-        // client drops here, closing the connection
     }
     let elapsed = t0.elapsed();
 
-    // Report as connections/second rather than records/second.
     let cps = ROUNDS as f64 / elapsed.as_secs_f64();
+    let scenario = bench_tag("connection_churn");
     println!(
-        "BENCH: {{\"scenario\":\"connection_churn\",\"threads\":1,\
+        "BENCH: {{\"scenario\":\"{scenario}\",\"threads\":1,\
          \"total_records\":{ROUNDS},\
          \"wall_ms\":{},\"throughput_rps\":{}}}",
         elapsed.as_millis(),
@@ -448,13 +456,10 @@ fn connection_churn() {
 /// Ramp-to-saturation: DoS resistance verification.
 ///
 /// Starts a server with `max_connections = 48` then escalates through thread
-/// levels [8, 16, 32, 48, 64, 96]. At and below 48 threads all connections
-/// are accepted; above 48 the server drops excess connections gracefully
-/// (client sees an I/O error) while continuing to serve the allowed connections.
-///
-/// The key assertion is that the server survives every level: a successful
-/// health-check after each level proves it did not crash and is still
-/// accepting new work.
+/// levels [8, 16, 32, 48, 64, 96]. Above the cap the server drops excess
+/// connections gracefully (client sees an I/O error) while continuing to
+/// serve the allowed connections. The health-check assertion after every
+/// level proves the server did not crash.
 #[test]
 fn ramp_to_saturation() {
     const MAX_CONN: usize = 48;
@@ -462,6 +467,7 @@ fn ramp_to_saturation() {
     const LEVELS: &[usize] = &[8, 16, 32, 48, 64, 96];
 
     let srv = LoadHandle::start_capped("ramp", MAX_CONN);
+    let d = srv.deadline_ms;
 
     println!(
         "\n{:<10} {:>10} {:>10} {:>8} {:>8} {:>12}",
@@ -484,7 +490,7 @@ fn ramp_to_saturation() {
         );
 
         println!(
-            "BENCH: {{\"scenario\":\"ramp_{n}_threads\",\"threads\":{n},\
+            "BENCH: {{\"scenario\":\"ramp_{n}_threads_d{d}ms\",\"threads\":{n},\
              \"acks\":{},\"nacks\":{},\"io_errors\":{},\
              \"wall_ms\":{},\"throughput_rps\":{}}}",
             result.acks,
@@ -494,11 +500,94 @@ fn ramp_to_saturation() {
             rps as u64,
         );
 
-        // The server must still be alive and accepting work after every level.
         let mut health = srv.client();
         assert!(
             health.health_check().is_ok(),
             "server became unresponsive after {n}-thread level (status: {status})"
         );
     }
+}
+
+/// Fire-and-forget overload: packets arriving faster than the server can drain them.
+///
+/// N threads each open a raw `UnixStream` and write properly-encoded Push frames
+/// as fast as the kernel socket buffer allows — without ever reading the ack.
+/// The server's internal queue fills, backpressure propagates through the socket
+/// send buffer, and writers eventually block or get reset.
+///
+/// The critical assertion is that after the blast the server is still alive and
+/// responsive to new connections, proving it doesn't crash or deadlock under
+/// queue saturation.
+#[test]
+fn fire_and_forget_overload() {
+    const THREADS: usize = 32;
+    const BLAST_DURATION: Duration = Duration::from_secs(5);
+
+    let srv = LoadHandle::start("fire_forget");
+    let d = srv.deadline_ms;
+
+    let frames_sent = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Pre-encode one Push frame to reuse across all writes.
+    let payload: Vec<u8> = b"overload"[..].to_vec();
+    let header = Header::new(
+        MessageType::Push,
+        Durability::Buffered,
+        0,
+        payload.len() as u32,
+    );
+    let frame = Envelope::new(header, payload).encode();
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let sent = Arc::clone(&frames_sent);
+            let stop = Arc::clone(&stop);
+            let frame = frame.clone();
+            let path = srv.socket_path.clone();
+
+            thread::spawn(move || {
+                let mut stream = match UnixStream::connect(&path) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                // Short write timeout: don't block the thread indefinitely when
+                // the kernel send buffer is full; treat it as backpressure and exit.
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+
+                while !stop.load(Ordering::Relaxed) {
+                    match stream.write_all(&frame) {
+                        Ok(()) => {
+                            sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        })
+        .collect();
+
+    thread::sleep(BLAST_DURATION);
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let total = frames_sent.load(Ordering::Relaxed);
+    let rps = total as f64 / BLAST_DURATION.as_secs_f64();
+
+    println!(
+        "BENCH: {{\"scenario\":\"fire_and_forget_overload_d{d}ms\",\"threads\":{THREADS},\
+         \"total_records\":{total},\
+         \"wall_ms\":{},\"throughput_rps\":{}}}",
+        BLAST_DURATION.as_millis(),
+        rps as u64,
+    );
+
+    // Server must still be alive and accepting new connections after the blast.
+    let mut health = srv.client();
+    assert!(
+        health.health_check().is_ok(),
+        "server became unresponsive after fire-and-forget overload ({total} frames sent)"
+    );
 }

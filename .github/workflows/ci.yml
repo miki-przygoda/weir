@@ -38,12 +38,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build test binary
         run: cargo test -p weir-server --test load --no-run
-      - name: Run load tests (5 iterations)
+      - name: Run load tests (5 × 1ms deadline, 5 × 2ms deadline)
         run: |
-          for i in 1 2 3 4 5; do
-            echo "--- run $i ---"
-            cargo test -p weir-server --test load -- --nocapture 2>/dev/null \
-              | grep '^BENCH: ' >> load_results.jsonl || true
+          for deadline in 1 2; do
+            for i in 1 2 3 4 5; do
+              echo "--- deadline=${deadline}ms run $i ---"
+              WEIR_BENCH_DEADLINE=$deadline \
+                cargo test -p weir-server --test load --release -- --nocapture 2>/dev/null \
+                | grep '^BENCH: ' >> load_results.jsonl || true
+            done
           done
       - name: Average results and update benchmarks.md
         run: python3 deploy/avg_benchmarks.py load_results.jsonl docs/benchmarks.md
