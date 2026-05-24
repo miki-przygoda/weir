@@ -85,15 +85,15 @@ Reads sealed segments via `SegmentReader`, forwards records to the sink, writes 
 
 ## Security design
 
-| Concern | Mitigation |
-|---|---|
-| Pre-allocation DoS via large `payload_len` | Cap check (`min(config, MAX_PAYLOAD_HARD_CAP)`) before any allocation in both `handle_connection` and `SegmentReader`. `MAX_PAYLOAD_HARD_CAP` is defined once in `weir-core` and imported by every enforcement point. |
-| Symlink TOCTOU on segment creation | `O_CREAT \| O_EXCL \| O_NOFOLLOW` on Unix; `create_new(true)` on Windows |
-| Symlink TOCTOU on segment write-reopen | `O_NOFOLLOW` on the recovery write pass |
-| Stale socket file removal | `symlink_metadata` + S_ISSOCK check before `remove_file`; refuses to remove a non-socket |
-| Path traversal in WAB/socket paths | Absolute-path + no-`..` + no-null-byte + `canonicalize` validation |
-| World-readable WAB files | Segment files: `0o600`; shard dirs: `0o700`; quarantine dir: `0o700` — set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode` |
-| Corrupt `.confirmed` sidecar | Bad magic / unknown version / CRC mismatch quarantines both the sealed segment and sidecar |
-| Torn write in crash recovery | Per-record CRC32 checked; replay truncates at the first corrupt entry |
-| Blocked socket semaphore (dead workers) | `push_timeout` (5 s) returns `InternalError` Nack rather than blocking indefinitely |
-| WAB integrity on shared/network storage | **Out of scope.** CRC32 detects accidental corruption; it does not detect malicious modification. The WAB directory must be local storage accessible only to the daemon (`0o700`). Network filesystems break the security model. |
+| Concern                                    | Mitigation                                                                                                                                                                                                                       |
+|--------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Pre-allocation DoS via large `payload_len` | Cap check (`min(config, MAX_PAYLOAD_HARD_CAP)`) before any allocation in both `handle_connection` and `SegmentReader`. `MAX_PAYLOAD_HARD_CAP` is defined once in `weir-core` and imported by every enforcement point.            |
+| Symlink TOCTOU on segment creation         | `O_CREAT \| O_EXCL \| O_NOFOLLOW` on Unix; `create_new(true)` on Windows                                                                                                                                                         |
+| Symlink TOCTOU on segment write-reopen     | `O_NOFOLLOW` on the recovery write pass                                                                                                                                                                                          |
+| Stale socket file removal                  | `symlink_metadata` + S_ISSOCK check before `remove_file`; refuses to remove a non-socket                                                                                                                                         |
+| Path traversal in WAB/socket paths         | Absolute-path + no-`..` + no-null-byte + `canonicalize` validation                                                                                                                                                               |
+| World-readable WAB files                   | Segment files: `0o600`; shard dirs: `0o700`; quarantine dir: `0o700` — set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode`                                                                      |
+| Corrupt `.confirmed` sidecar               | Bad magic / unknown version / CRC mismatch quarantines both the sealed segment and sidecar                                                                                                                                       |
+| Torn write in crash recovery               | Per-record CRC32 checked; replay truncates at the first corrupt entry                                                                                                                                                            |
+| Blocked socket semaphore (dead workers)    | `push_timeout` (5 s) returns `InternalError` Nack rather than blocking indefinitely                                                                                                                                              |
+| WAB integrity on shared/network storage    | **Out of scope.** CRC32 detects accidental corruption; it does not detect malicious modification. The WAB directory must be local storage accessible only to the daemon (`0o700`). Network filesystems break the security model. |
