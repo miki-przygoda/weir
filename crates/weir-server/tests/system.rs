@@ -1557,3 +1557,53 @@ fn records_ack_counter_increments_after_sync_pushes() {
         "expected '{expected}' in metrics; body:\n{body:.800}"
     );
 }
+
+// ── Per-shard record ordering ─────────────────────────────────────────────────
+
+/// With a single-shard server, records submitted sequentially from a single
+/// producer must appear in submission order in the raw WAB bytes.
+///
+/// This is the fundamental append-log ordering contract. Any change to the
+/// batching or queue path that accidentally reorders records will be caught
+/// here.
+#[test]
+fn per_shard_records_appear_in_submission_order() {
+    const N: usize = 30;
+
+    // Single shard: all records go to the same WAB file, so order is preserved.
+    let srv = ServerHandle::start_sharded("ordering", 1);
+    let mut client = srv.client();
+
+    for i in 0..N {
+        client
+            .push(format!("order-{i:05}").as_bytes(), Durability::Sync)
+            .expect("push failed");
+    }
+
+    // Flush any remaining data and give the server time to seal.
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after pushes");
+
+    let wab_bytes = read_wab_bytes(&srv.wab_dir);
+    assert!(!wab_bytes.is_empty(), "WAB must have data after pushes");
+
+    // Find the byte offset of each payload in the WAB.
+    let mut prev_offset: Option<usize> = None;
+    for i in 0..N {
+        let payload = format!("order-{i:05}").into_bytes();
+        let offset = wab_bytes
+            .windows(payload.len())
+            .position(|w| w == payload.as_slice())
+            .unwrap_or_else(|| panic!("payload order-{i:05} not found in WAB bytes"));
+
+        if let Some(prev) = prev_offset {
+            assert!(
+                offset > prev,
+                "record order-{i:05} at offset {offset} appears before the previous record \
+                 at offset {prev} — submission order not preserved"
+            );
+        }
+        prev_offset = Some(offset);
+    }
+}
