@@ -354,6 +354,81 @@ impl ServerHandle {
         handle.wait_ready(Duration::from_secs(15));
         handle
     }
+
+    /// Starts the server with `RLIMIT_NOFILE` capped at `nofile_limit`.
+    ///
+    /// This lets tests verify the server degrades gracefully (refuses new
+    /// connections, does not crash) when it runs out of file descriptors.
+    /// The server is otherwise identical to a `start()` instance.
+    fn start_with_nofile_limit(tag: &str, nofile_limit: u64) -> Self {
+        use std::os::unix::process::CommandExt;
+
+        let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let metrics_port = free_port();
+        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
+        let wab_dir = tmp_dir.join("wab");
+        let socket_dir = tmp_dir.join("run");
+        let socket_path = socket_dir.join("weir.sock");
+        let config_path = tmp_dir.join("weir.toml");
+
+        fs::create_dir_all(&wab_dir).unwrap();
+        fs::create_dir_all(&socket_dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let config = format!(
+            "[server]\n\
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = 1\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
+            socket_path.display(),
+            wab_dir.display(),
+            metrics_port,
+        );
+        fs::write(&config_path, config).unwrap();
+
+        let binary = env!("CARGO_BIN_EXE_weir-server");
+        let mut cmd = Command::new(binary);
+        cmd.args(["--config", config_path.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        unsafe {
+            cmd.pre_exec(move || {
+                let rl = libc::rlimit {
+                    rlim_cur: nofile_limit,
+                    rlim_max: nofile_limit,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .expect("failed to spawn weir-server (nofile-limit)");
+
+        let mut handle = Self {
+            child: Some(child),
+            socket_path,
+            wab_dir,
+            metrics_port,
+            config_path,
+            tmp_dir,
+            _proc_lock,
+        };
+
+        handle.wait_ready(Duration::from_secs(15));
+        handle
+    }
 }
 
 impl Drop for ServerHandle {
@@ -1397,6 +1472,48 @@ fn socket_takeover_does_not_corrupt_wab_data() {
     let _ = child_b.kill();
     let _ = child_b.wait();
     let _ = fs::remove_dir_all(&second_tmp);
+}
+
+// ── File descriptor limit exhaustion ─────────────────────────────────────────
+
+/// When the server hits its `RLIMIT_NOFILE` ceiling it must not crash —
+/// new connections are refused or queued by the kernel, and connections
+/// within the fd budget continue to work normally.
+#[test]
+fn fd_limit_exhaustion_does_not_crash_server() {
+    use std::os::unix::net::UnixStream as RawStream;
+
+    // 128 fds: comfortably above server startup overhead (~20 fds) but low
+    // enough that opening 200 connections will exhaust the limit.
+    const NOFILE_LIMIT: u64 = 128;
+    const FLOOD_CONNS: usize = 200;
+
+    let srv = ServerHandle::start_with_nofile_limit("fd_limit", NOFILE_LIMIT);
+
+    // Flood the server with raw connections and keep them open.
+    let mut open: Vec<RawStream> = Vec::new();
+    for _ in 0..FLOOD_CONNS {
+        match RawStream::connect(&srv.socket_path) {
+            Ok(s) => open.push(s),
+            Err(_) => break, // kernel backlog full — stop
+        }
+    }
+
+    // Hold connections briefly to let the server try (and fail) to accept them.
+    thread::sleep(Duration::from_millis(200));
+
+    drop(open);
+
+    // After releasing the flood, the server must still be alive.
+    thread::sleep(Duration::from_millis(100));
+    srv.client()
+        .health_check()
+        .expect("server crashed or hung under fd pressure");
+
+    // A normal Sync push must succeed after the fd pressure is relieved.
+    srv.client()
+        .push(b"after-fd-flood", Durability::Sync)
+        .expect("push failed after fd-limit flood");
 }
 
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
