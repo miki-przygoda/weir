@@ -553,6 +553,7 @@ dependencies = [
 name = "weir-client"
 version = "0.2.0"
 dependencies = [
+ "crc32fast",
  "weir-core",
 ]
 
