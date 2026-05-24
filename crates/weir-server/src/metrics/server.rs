@@ -75,7 +75,10 @@ mod tests {
 
     async fn scrape(addr: std::net::SocketAddr) -> String {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"GET /metrics HTTP/1.0\r\n\r\n")
+            .await
+            .unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         String::from_utf8_lossy(&response).into_owned()

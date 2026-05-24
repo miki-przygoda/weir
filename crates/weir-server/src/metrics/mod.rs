@@ -14,12 +14,7 @@ pub(crate) mod server;
 
 use prometheus_client::{
     encoding::{EncodeLabelSet, EncodeLabelValue},
-    metrics::{
-        counter::Counter,
-        family::Family,
-        gauge::Gauge,
-        histogram::Histogram,
-    },
+    metrics::{counter::Counter, family::Family, gauge::Gauge, histogram::Histogram},
     registry::Registry,
 };
 use std::sync::atomic::AtomicU64;
@@ -279,11 +274,15 @@ impl Metrics {
         // even before any state transition has occurred.
         metrics
             .drain_state
-            .get_or_create(&DrainStateLabel { state: DrainStateValue::draining })
+            .get_or_create(&DrainStateLabel {
+                state: DrainStateValue::draining,
+            })
             .set(1.0);
         metrics
             .drain_state
-            .get_or_create(&DrainStateLabel { state: DrainStateValue::retrying_transient })
+            .get_or_create(&DrainStateLabel {
+                state: DrainStateValue::retrying_transient,
+            })
             .set(0.0);
         metrics
             .drain_state
@@ -294,15 +293,21 @@ impl Metrics {
 
         metrics
             .sink_health
-            .get_or_create(&SinkHealthLabel { state: SinkHealthState::healthy })
+            .get_or_create(&SinkHealthLabel {
+                state: SinkHealthState::healthy,
+            })
             .set(1.0);
         metrics
             .sink_health
-            .get_or_create(&SinkHealthLabel { state: SinkHealthState::degraded })
+            .get_or_create(&SinkHealthLabel {
+                state: SinkHealthState::degraded,
+            })
             .set(0.0);
         metrics
             .sink_health
-            .get_or_create(&SinkHealthLabel { state: SinkHealthState::down })
+            .get_or_create(&SinkHealthLabel {
+                state: SinkHealthState::down,
+            })
             .set(0.0);
 
         (metrics, reg)
@@ -366,7 +371,10 @@ mod tests {
             "weir_dead_letter_blocked_duration_seconds",
         ];
         for name in expected {
-            assert!(out.contains(name), "metric {name:?} missing from output:\n{out}");
+            assert!(
+                out.contains(name),
+                "metric {name:?} missing from output:\n{out}"
+            );
         }
     }
 
@@ -374,9 +382,18 @@ mod tests {
     fn drain_state_and_sink_health_pre_initialised() {
         let (_m, reg) = Metrics::new();
         let out = encode_to_string(&reg);
-        assert!(out.contains("draining"), "drain_state draining label missing");
-        assert!(out.contains("retrying_transient"), "drain_state retrying_transient label missing");
-        assert!(out.contains("blocked_dead_letter_full"), "drain_state blocked label missing");
+        assert!(
+            out.contains("draining"),
+            "drain_state draining label missing"
+        );
+        assert!(
+            out.contains("retrying_transient"),
+            "drain_state retrying_transient label missing"
+        );
+        assert!(
+            out.contains("blocked_dead_letter_full"),
+            "drain_state blocked label missing"
+        );
         assert!(out.contains("healthy"), "sink_health healthy label missing");
     }
 }
