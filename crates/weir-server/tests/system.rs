@@ -1607,3 +1607,46 @@ fn per_shard_records_appear_in_submission_order() {
         prev_offset = Some(offset);
     }
 }
+
+// ── Batch deadline timer accuracy ─────────────────────────────────────────────
+
+/// With `batch_deadline_ms = 20`, each individual Sync push must complete
+/// within a generous multiple of the deadline. A push that exceeds 5×deadline
+/// indicates the batch timer is being starved (e.g. the accept loop is
+/// spinning) and latency would be non-deterministic in production.
+#[test]
+fn batch_deadline_timer_keeps_latency_bounded() {
+    const SAMPLES: usize = 20;
+    const DEADLINE_MS: u64 = 20; // matches start_impl config
+    const MAX_EACH: Duration = Duration::from_millis(DEADLINE_MS * 5); // 100 ms
+    const MAX_P99: Duration = Duration::from_millis(DEADLINE_MS * 3); // 60 ms
+
+    let srv = ServerHandle::start("deadline_accuracy");
+    let mut client = srv.client();
+    let mut latencies: Vec<Duration> = Vec::with_capacity(SAMPLES);
+
+    for i in 0..SAMPLES {
+        let t0 = Instant::now();
+        client
+            .push(format!("timer-{i}").as_bytes(), Durability::Sync)
+            .expect("push failed");
+        latencies.push(t0.elapsed());
+    }
+
+    // Every sample must finish within 5 × deadline.
+    for (i, &lat) in latencies.iter().enumerate() {
+        assert!(
+            lat <= MAX_EACH,
+            "sample {i} took {lat:?} — exceeded 5 × batch_deadline_ms ({MAX_EACH:?})"
+        );
+    }
+
+    // p99 (here: worst sample across 20) must be within 3 × deadline.
+    let mut sorted = latencies.clone();
+    sorted.sort();
+    let p99 = sorted[sorted.len() - 1]; // max of 20 samples ≈ p99
+    assert!(
+        p99 <= MAX_P99,
+        "p99 latency {p99:?} exceeded 3 × batch_deadline_ms ({MAX_P99:?})"
+    );
+}
