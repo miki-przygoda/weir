@@ -13,6 +13,7 @@ const WORKER_CORE_START: usize = 2;
 /// `ack_tx` inside each `WorkUnit` is carried intact; the WAB drain resolves
 /// it after the record is durably written.
 pub struct Batch {
+    #[allow(dead_code)]
     pub shard_id: u32,
     pub records: Vec<WorkUnit>,
 }
@@ -267,6 +268,7 @@ mod tests {
             WorkUnit {
                 shard_id,
                 payload: payload.to_vec(),
+                durability: weir_core::Durability::Buffered,
                 ack_tx: tx,
             },
             rx,

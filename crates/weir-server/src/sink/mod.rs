@@ -63,6 +63,7 @@ pub struct CommitResult<R> {
 
 /// Coarse health signal from `Sink::health`.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum SinkHealth {
     Healthy,
     Degraded(String),
@@ -92,6 +93,7 @@ pub trait Sink: Send + Sync + 'static {
         1000
     }
 
-    /// Periodic health probe. Surfaced via metrics in step 07.
+    /// Periodic health probe. Surfaced via metrics; queried by the main loop.
+    #[allow(dead_code)]
     async fn health(&self) -> SinkHealth;
 }

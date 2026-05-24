@@ -1,5 +1,5 @@
 use tokio::sync::oneshot;
-use weir_core::Payload;
+use weir_core::{Durability, Payload};
 
 /// A single unit of work flowing from the socket layer through the queue to a
 /// worker. The worker batches these by shard and forwards the batch to the WAB.
@@ -10,6 +10,8 @@ pub struct WorkUnit {
     pub shard_id: u32,
     /// Opaque payload bytes from the wire envelope.
     pub payload: Payload,
+    /// Durability tier requested by the producer.
+    pub durability: Durability,
     /// Oneshot back-channel to the async socket handler. The WAB drain resolves
     /// this with `true` on successful write, `false` on unrecoverable failure.
     pub ack_tx: oneshot::Sender<bool>,

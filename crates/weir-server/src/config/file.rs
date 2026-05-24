@@ -1,0 +1,105 @@
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use tracing::warn;
+
+use super::{ConfigError, PartialConfig};
+
+#[derive(Deserialize)]
+struct RawConfig {
+    #[serde(default)]
+    server: Option<RawServer>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawServer {
+    socket_path: Option<String>,
+    wab_dir: Option<String>,
+    shard_count: Option<usize>,
+    worker_count: Option<usize>,
+    batch_size: Option<usize>,
+    batch_deadline_ms: Option<u64>,
+    max_connections: Option<usize>,
+    max_payload_bytes: Option<usize>,
+    metrics_port: Option<u16>,
+    shutdown_timeout_secs: Option<u64>,
+    dead_letter_max_bytes: Option<u64>,
+    dead_letter_check_interval_secs: Option<u64>,
+    log_level: Option<String>,
+}
+
+const KNOWN_SERVER_KEYS: &[&str] = &[
+    "socket_path",
+    "wab_dir",
+    "shard_count",
+    "worker_count",
+    "batch_size",
+    "batch_deadline_ms",
+    "max_connections",
+    "max_payload_bytes",
+    "metrics_port",
+    "shutdown_timeout_secs",
+    "dead_letter_max_bytes",
+    "dead_letter_check_interval_secs",
+    "log_level",
+];
+
+pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PartialConfig::empty());
+        }
+        Err(e) => return Err(ConfigError::IoError { source: e }),
+    };
+
+    let value: toml::Value = toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
+        field: "config file",
+        source: Box::new(e),
+    })?;
+
+    warn_unknown_keys(&value);
+
+    let raw: RawConfig =
+        value
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::ParseError {
+                field: "config file",
+                source: Box::new(e),
+            })?;
+
+    let s = raw.server.unwrap_or_default();
+    Ok(PartialConfig {
+        socket_path: s.socket_path.map(PathBuf::from),
+        wab_dir: s.wab_dir.map(PathBuf::from),
+        shard_count: s.shard_count,
+        worker_count: s.worker_count,
+        batch_size: s.batch_size,
+        batch_deadline_ms: s.batch_deadline_ms,
+        max_connections: s.max_connections,
+        max_payload_bytes: s.max_payload_bytes,
+        metrics_port: s.metrics_port,
+        shutdown_timeout_secs: s.shutdown_timeout_secs,
+        dead_letter_max_bytes: s.dead_letter_max_bytes,
+        dead_letter_check_interval_secs: s.dead_letter_check_interval_secs,
+        log_level: s.log_level,
+    })
+}
+
+fn warn_unknown_keys(value: &toml::Value) {
+    let Some(top) = value.as_table() else { return };
+    for key in top.keys() {
+        if key != "server" {
+            warn!(key = %key, "unknown top-level config key; ignoring");
+        }
+    }
+    if let Some(server_val) = top.get("server")
+        && let Some(server_table) = server_val.as_table()
+    {
+        for key in server_table.keys() {
+            if !KNOWN_SERVER_KEYS.contains(&key.as_str()) {
+                warn!(key = %key, "unknown [server] config key; ignoring");
+            }
+        }
+    }
+}

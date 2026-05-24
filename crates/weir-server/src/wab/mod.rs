@@ -11,6 +11,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender};
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN};
@@ -22,10 +23,10 @@ use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
 pub struct WabRecord {
     pub payload: Payload,
     pub durability: Durability,
-    /// Per-request ack channel. The flusher sends `Ok(())` after the record is
-    /// durably written according to the requested tier, or `Err` on an
+    /// Per-request ack channel. The flusher sends `true` after the record is
+    /// durably written according to the requested tier, or `false` on an
     /// unrecoverable write failure.
-    pub ack_tx: Sender<Result<(), io::Error>>,
+    pub ack_tx: oneshot::Sender<bool>,
 }
 
 /// Configuration for the WAB subsystem.
@@ -277,16 +278,14 @@ fn flush_batch(
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
 ) {
-    let mut batched_acks: Vec<Sender<Result<(), io::Error>>> = Vec::new();
+    let mut batched_acks: Vec<oneshot::Sender<bool>> = Vec::new();
     let mut need_fsync = false;
 
     for record in batch.drain(..) {
         // write_record returns Some(sealed_path) when the segment rotated.
         let rotation = match writer.write_record(&record.payload) {
-            Err(e) => {
-                let _ = record
-                    .ack_tx
-                    .send(Err(io::Error::new(e.kind(), e.to_string())));
+            Err(_) => {
+                let _ = record.ack_tx.send(false);
                 continue;
             }
             Ok(maybe_sealed) => maybe_sealed,
@@ -301,10 +300,10 @@ fn flush_batch(
         match record.durability {
             Durability::Sync => match writer.fsync_current() {
                 Ok(()) => {
-                    let _ = record.ack_tx.send(Ok(()));
+                    let _ = record.ack_tx.send(true);
                 }
-                Err(e) => {
-                    let _ = record.ack_tx.send(Err(e));
+                Err(_) => {
+                    let _ = record.ack_tx.send(false);
                 }
             },
             Durability::Batched => {
@@ -312,23 +311,16 @@ fn flush_batch(
                 batched_acks.push(record.ack_tx);
             }
             Durability::Buffered => {
-                let _ = record.ack_tx.send(Ok(()));
+                let _ = record.ack_tx.send(true);
             }
         }
     }
 
     // Group fsync for all Batched records in this flush.
     if need_fsync {
-        let fsync_result = writer.fsync_current();
+        let ok = writer.fsync_current().is_ok();
         for ack_tx in batched_acks {
-            match &fsync_result {
-                Ok(()) => {
-                    let _ = ack_tx.send(Ok(()));
-                }
-                Err(e) => {
-                    let _ = ack_tx.send(Err(io::Error::new(e.kind(), e.to_string())));
-                }
-            }
+            let _ = ack_tx.send(ok);
         }
     }
 }
