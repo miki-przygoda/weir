@@ -62,6 +62,33 @@ under **Wire protocol** below and may evolve independently of crate versions.
     segments, replays unconfirmed sealed segments, and pins each flusher thread
     with `core_affinity`. SCHED_FIFO is attempted on Linux and fails open with
     a warning.
+- **Work queue** (`weir-server::queue`): bounded MPMC channel between the
+  socket layer and worker pool.
+  - `QUEUE_CAPACITY = 65_536` slots. `QueueSender::push` blocks the calling
+    thread when the channel is full — intentional backpressure that stalls the
+    socket handler rather than dropping records or growing unboundedly.
+  - Generic over `T` so the socket layer instantiates `Queue<WorkUnit>` without
+    the queue module depending on `WorkUnit`.
+  - `QueueSender` is `Clone`; dropping all clones closes the channel and
+    propagates the shutdown signal to every worker `Receiver`.
+- **Worker pool** (`weir-server::worker`, `weir-server::models`): batching
+  layer between the queue and the WAB.
+  - `WorkUnit { shard_id, payload, ack_tx }` — the `tokio::sync::oneshot`
+    sender travels intact through the `Batch` to the WAB drain (step-06),
+    which resolves it after the durable write. Workers do not ack directly.
+  - `Batch { shard_id, records: Vec<WorkUnit> }` — flushed per shard via
+    `std::mem::replace` (zero allocation on the hot path; fresh pre-allocated
+    buffer swapped in on every flush).
+  - Workers flush on batch-full or on `batch_deadline`; `on_disconnect` is
+    `#[cold] #[inline(never)]` to keep it off the hot path and bias the branch
+    predictor toward the `Ok(unit)` arm.
+  - Startup warmup: page pre-touch faults in batch buffer backing pages;
+    10 000 multiply-accumulate iterations prime the FP pipeline
+    (`_mm_mul_ps` on x86_64, `vmulq_f32` on AArch64).
+  - Workers pinned starting at core 2 (`WORKER_CORE_START = 2`), leaving
+    cores 0–1 free for OS and network interrupt handlers.
+  - `QOS_CLASS_USER_INTERACTIVE` on macOS (declared via `unsafe extern "C"`;
+    not in the libc crate); `SCHED_FIFO` on Linux — both fail-open.
 
 ### Security
 - `Envelope::decode` and `SegmentReader` both enforce `MAX_PAYLOAD_HARD_CAP`
