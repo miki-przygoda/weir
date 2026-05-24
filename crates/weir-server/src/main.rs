@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod drain;
+mod metrics;
 mod models;
 mod queue;
 mod sink;

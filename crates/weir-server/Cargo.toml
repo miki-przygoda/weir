@@ -26,6 +26,7 @@ tokio = { version = "1", features = [
 tracing = "0.1"
 libc = "0.2"
 core_affinity = "0.8"
+prometheus-client = "0.22"
 
 [dev-dependencies]
 # tempfile is not added: tests use std::env::temp_dir() with unique subpaths.
