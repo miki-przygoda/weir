@@ -49,8 +49,8 @@ changes are tracked separately under **Wire protocol** below.
 
 ## Wire protocol
 
-| Version | Status  | Notes                        |
-|---------|---------|------------------------------|
+| Version | Status  | Notes                                              |
+|---------|---------|----------------------------------------------------|
 | v1      | current | See [docs/wire_protocol.md](docs/wire_protocol.md) |
 
 ---
