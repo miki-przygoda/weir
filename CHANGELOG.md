@@ -10,6 +10,51 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`weir-client`**: client library implementing the wire protocol over a Unix
+  socket. `WeirClient::connect(path)` returns a connected client;
+  `push(payload, durability)` sends a Push frame and awaits Ack/Nack;
+  `health_check()` sends a HealthCheck frame. `ClientError` variants:
+  `Io`, `Protocol`, `Nack(NackReason)`, `UnknownNack(u8)`.
+- **CI pipeline** (`.github/workflows/ci.yml`): four jobs — `lint` (fmt +
+  clippy), `test` (full test suite), `load` (5 × 1ms + 5 × 2ms deadline runs,
+  benchmark result averaged and committed to `docs/benchmarks.md` on `main`),
+  and `build` (cross-compiled release binaries for five targets: `x86_64-linux`,
+  `aarch64-linux`, `x86_64-macos`, `aarch64-macos`, `x86_64-windows`).
+- **Release pipeline** (`.github/workflows/release.yml`): triggered on version
+  tags (`v*`); builds and attaches binaries to a GitHub release.
+- **Docker infrastructure** (`deploy/Dockerfile`): multi-stage build —
+  `rust:1-slim-bookworm` builder, `gcr.io/distroless/cc-debian12` runtime.
+  `deploy/docker-compose.yml` mounts a local WAB directory and socket path.
+  `deploy/smoke-test.sh` pushes five records via `weir-client` and checks the
+  health endpoint; exits non-zero on any failure.
+- **Load benchmark suite** (`crates/weir-server/tests/load.rs`): 9 scenarios
+  across two batch deadlines (`WEIR_BENCH_DEADLINE` env var). Each scenario
+  emits `BENCH: {json}` lines consumed by `deploy/avg_benchmarks.py`.
+  Scenarios: `single_thread_buffered`, `single_thread_sync`,
+  `thundering_herd_{8,32,64}_threads`, `connection_churn`,
+  `fire_and_forget_overload`, `latency_sync`, and saturation ramp
+  (`ramp_{8,16,32,48,64,96}_threads`).
+- **`deploy/avg_benchmarks.py`**: averages `BENCH:` lines from multiple CI
+  runs, renders deadline-comparison throughput table, latency percentile table,
+  and saturation ramp table, and writes `docs/benchmarks.md`.
+- **`docs/benchmarks.md`**: CI-populated throughput and latency baseline.
+  Updated automatically on every push to `main`.
+- **Systems hardening test suite** (10 new tests in
+  `crates/weir-server/tests/system.rs`): graceful shutdown under load,
+  stalled-client isolation, partial frame injection, disk-full nacks
+  (`RLIMIT_FSIZE=0`), WAB byte-level integrity after SIGKILL, socket-takeover
+  WAB data safety, fd-limit exhaustion (`RLIMIT_NOFILE=128`), per-shard record
+  ordering, batch deadline timer accuracy, and metrics consistency across
+  crash-restart cycles. Total system test count: 41.
+- **`deploy/docker/weir.toml.example`**: annotated example config with all
+  fields, defaults, valid ranges, and `WEIR_*` env-var equivalents.
+
+---
+
 ## [0.2.0] - 2026-05-24
 
 ### Added
