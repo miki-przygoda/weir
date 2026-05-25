@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "weir-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "weir-client",
  "weir-core",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "weir-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc32fast",
  "proptest",
@@ -1253,14 +1253,14 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "weir-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "core_affinity",
  "crc32fast",
