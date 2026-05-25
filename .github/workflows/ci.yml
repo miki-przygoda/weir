@@ -48,16 +48,23 @@ jobs:
                 | grep '^BENCH: ' >> load_results.jsonl || true
             done
           done
-      - name: Average results and update benchmarks.md
-        run: python3 deploy/avg_benchmarks.py load_results.jsonl docs/benchmarks.md
+      - name: Extract version
+        run: |
+          echo "WEIR_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')" >> "$GITHUB_ENV"
+      - name: Average results and update benchmarks
+        run: |
+          python3 deploy/avg_benchmarks.py \
+            load_results.jsonl \
+            docs/benchmarks/latest.md \
+            docs/benchmarks/history.md
       - name: Show benchmark summary
-        run: cat docs/benchmarks.md
+        run: cat docs/benchmarks/latest.md
       - name: Commit benchmark results
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/benchmarks.md
+          git add docs/benchmarks/latest.md docs/benchmarks/history.md
           if ! git diff --staged --quiet; then
             git commit -m "chore: update benchmark baselines [skip ci]"
             git push

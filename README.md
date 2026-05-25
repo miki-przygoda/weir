@@ -58,7 +58,7 @@ The tier is set per-record in the wire frame header. `weir` does not hide the fs
 - [Architecture](docs/architecture.md) — data flow, component responsibilities, runtime boundary, security design
 - [Wire protocol](docs/wire_protocol.md) — frame layout, message types, decode order, Nack payload format
 - [WAB format](docs/wab_format.md) — segment binary format, `.confirmed` sidecar, crash recovery algorithm
-- [Benchmarks](docs/benchmarks.md) — throughput baseline by deadline, latency percentiles, saturation ramp
+- [Benchmarks](docs/benchmarks.md) — hub: latest CI results, per-version history, and environment guide
 
 ---
 

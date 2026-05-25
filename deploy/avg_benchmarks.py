@@ -324,12 +324,81 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
     return "\n".join(lines)
 
 
+HISTORY_HEADER = """\
+# Benchmark History
+
+One row appended per CI run on `main`. All numbers at `batch_deadline_ms=1`.
+Sync p99 and Buffered p50 are single-thread latency measurements.
+Ramp peak = highest throughput level before connection-cap saturation kicks in.
+
+| Version | Date | Runs | Sync RPS | Sync p99 | Buf p50 | Ramp peak RPS |
+|---------|------|------|----------|----------|---------|---------------|
+"""
+
+
+def append_history(groups: dict, run_count: int, history_path: str, version: str) -> None:
+    import os
+
+    def get_rps(scenario: str) -> float | None:
+        rows = groups.get(scenario, [])
+        return rps_avg(rows) if rows else None
+
+    def get_lat(scenario: str, field: str) -> float | None:
+        rows = groups.get(scenario, [])
+        vals = [float(r[field]) for r in rows if field in r]
+        return avg(vals) if vals else None
+
+    sync_rps = get_rps("single_thread_sync_d1ms")
+    sync_p99 = get_lat("latency_sync_d1ms", "p99_us")
+    buf_p50 = get_lat("latency_buffered_d1ms", "p50_us")
+
+    # Peak ramp = highest RPS at the last unsaturated level.
+    peak_rps: float | None = None
+    for n in [8, 16, 32, 48, 64, 96]:
+        key = f"ramp_{n}_threads_d1ms"
+        rows = groups.get(key, [])
+        if rows:
+            io = avg([float(r.get("io_errors", 0)) for r in rows])
+            if io == 0:
+                peak_rps = rps_avg(rows)
+
+    if sync_rps is None:
+        print("append_history: no d1ms Sync data — skipping", file=sys.stderr)
+        return
+
+    date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    row = (
+        f"| {version} | {date_str} | {run_count}"
+        f" | {fmt_rps(sync_rps)}"
+        f" | {fmt_us(sync_p99) if sync_p99 else '—'}"
+        f" | {fmt_us(buf_p50) if buf_p50 else '—'}"
+        f" | {fmt_rps(peak_rps) if peak_rps else '—'} |"
+    )
+
+    if not os.path.exists(history_path):
+        with open(history_path, "w") as f:
+            f.write(HISTORY_HEADER)
+
+    with open(history_path, "a") as f:
+        f.write(row + "\n")
+
+    print(f"Appended history row to {history_path}")
+
+
 def main():
-    if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} <results_file> <output_md>", file=sys.stderr)
+    if len(sys.argv) not in (3, 4):
+        print(
+            f"usage: {sys.argv[0]} <results_file> <output_md> [history_md]",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    results_path, output_path = sys.argv[1], sys.argv[2]
+    import os
+
+    results_path = sys.argv[1]
+    output_path = sys.argv[2]
+    history_path = sys.argv[3] if len(sys.argv) == 4 else None
+
     groups = parse_results(results_path)
 
     if not groups:
@@ -339,10 +408,14 @@ def main():
     run_count = max(len(v) for v in groups.values())
     md = build_md(groups, run_count)
 
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w") as f:
         f.write(md)
-
     print(f"Wrote {output_path} ({run_count} run(s), {len(groups)} scenario(s))")
+
+    if history_path:
+        version = os.environ.get("WEIR_VERSION", "dev")
+        append_history(groups, run_count, history_path, version)
 
 
 if __name__ == "__main__":
