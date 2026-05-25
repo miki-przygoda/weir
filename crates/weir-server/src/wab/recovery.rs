@@ -92,7 +92,12 @@ pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> i
         );
         quarantine(path, wab_dir, &reason)?;
         metrics.recovery_segments_quarantined.inc();
-        metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::quarantined }).inc();
+        metrics
+            .wab_segments
+            .get_or_create(&SegmentStateLabel {
+                state: SegmentState::quarantined,
+            })
+            .inc();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{}: quarantined — {reason}", path.display()),
@@ -106,7 +111,12 @@ pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> i
         );
         quarantine(path, wab_dir, &reason)?;
         metrics.recovery_segments_quarantined.inc();
-        metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::quarantined }).inc();
+        metrics
+            .wab_segments
+            .get_or_create(&SegmentStateLabel {
+                state: SegmentState::quarantined,
+            })
+            .inc();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{}: quarantined — {reason}", path.display()),

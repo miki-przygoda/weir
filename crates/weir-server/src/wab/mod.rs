@@ -15,10 +15,10 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::ShardWriter;
-use crate::metrics::{Metrics, SegmentStateLabel, SegmentState};
 use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
 
 /// A record queued by a connection handler for writing to the WAB.
@@ -279,7 +279,12 @@ fn flusher_thread(
     match writer.seal_current() {
         Ok(Some(sealed)) => {
             info!(shard = shard_id, sealed = %sealed.display(), "WAB flusher sealed segment on shutdown");
-            metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::sealed }).inc();
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::sealed,
+                })
+                .inc();
             drain_tx.send(sealed).ok();
         }
         Ok(None) => {
@@ -317,7 +322,12 @@ fn flush_batch(
         if let Some(sealed) = rotation {
             // Segment was sealed (seal includes fsync). Notify drain.
             info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
-            metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::sealed }).inc();
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::sealed,
+                })
+                .inc();
             drain_tx.send(sealed).ok();
         }
 
@@ -325,7 +335,9 @@ fn flush_batch(
             Durability::Sync => {
                 let t = Instant::now();
                 let ok = writer.fsync_current().is_ok();
-                metrics.wab_fsync_duration.observe(t.elapsed().as_secs_f64());
+                metrics
+                    .wab_fsync_duration
+                    .observe(t.elapsed().as_secs_f64());
                 let _ = record.ack_tx.send(ok);
             }
             Durability::Batched => {
@@ -342,7 +354,9 @@ fn flush_batch(
     if need_fsync {
         let t = Instant::now();
         let ok = writer.fsync_current().is_ok();
-        metrics.wab_fsync_duration.observe(t.elapsed().as_secs_f64());
+        metrics
+            .wab_fsync_duration
+            .observe(t.elapsed().as_secs_f64());
         for ack_tx in batched_acks {
             let _ = ack_tx.send(ok);
         }
