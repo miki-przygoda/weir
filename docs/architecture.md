@@ -71,7 +71,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
 - `QueueSender::push_timeout` is used with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.
-- Signal handling (SIGTERM/Ctrl-C) and CLI/env config for `shutdown_timeout_secs` are wired in step 08.
+- SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer receives a `CancellationToken` and drains the `JoinSet` before returning.
 
 ### Work queue (`src/queue.rs`)
 
@@ -98,7 +98,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - One flusher thread per shard; each holds an active `WabSegment`.
 - Three durability tiers: `Sync` (fdatasync per record), `Batched` (group fdatasync per batch), `Buffered` (ack after memory write, no fsync).
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
-- Path validation (`validate_path`) is currently in `src/wab/mod.rs`; it will move to `src/config/mod.rs` in step 08 and be shared with socket path validation.
+- Path validation (`validate_path`) exists in both `src/wab/mod.rs` (local copy, with a TODO to consolidate) and `src/config/mod.rs` (canonical version). The `config` version is used for `wab_dir` and `socket_path` at load time; the WAB module's local copy is used at spawn time as a belt-and-suspenders check.
 
 ### Sink (`src/sink/`)
 
@@ -169,6 +169,18 @@ BlockedDeadLetterFull
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Time in `BlockedDeadLetterFull`; alert target |
 
 `weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `127.0.0.1:{metrics_port}` and serves `GET /metrics` in OpenMetrics text format.
+
+### Testing infrastructure
+
+**System tests** (`crates/weir-server/tests/system.rs`, 41 tests, Unix-only):
+
+Each test spawns a real `weir-server` binary via `env!("CARGO_BIN_EXE_weir-server")` with its own temp directory, socket path, WAB directory, and metrics port. A global process mutex serialises server spawning so the suite runs safely with any `--test-threads` value. Tests are written against the client library (`weir-client`) and the raw wire protocol where needed.
+
+Coverage includes: basic push/ack round-trips, all three durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, socket takeover data safety, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
+
+**Load tests** (`crates/weir-server/tests/load.rs`, 9 scenarios):
+
+Throughput and latency measurements for single-threaded, thundering-herd, connection-churn, fire-and-forget overload, latency, and saturation-ramp scenarios. Results are emitted as `BENCH: {json}` lines; `deploy/avg_benchmarks.py` averages multiple runs and writes `docs/benchmarks.md`. CI runs 5 passes at each of two batch deadlines (1ms and 2ms) and commits the averaged result on pushes to `main`.
 
 ---
 

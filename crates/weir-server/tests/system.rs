@@ -24,12 +24,15 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
 
-use weir_client::WeirClient;
+use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
 
 // ── Process serialiser ────────────────────────────────────────────────────────
@@ -110,14 +113,15 @@ impl ServerHandle {
         // Write a minimal config.
         let config = format!(
             "[server]\n\
-             socket_path   = \"{}\"\n\
-             wab_dir       = \"{}\"\n\
-             metrics_port  = {}\n\
-             shard_count   = {}\n\
-             worker_count  = 2\n\
-             batch_size    = 100\n\
-             batch_deadline_ms = 20\n\
-             log_level     = \"warn\"\n",
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = {}\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
             socket_path.display(),
             wab_dir.display(),
             metrics_port,
@@ -244,6 +248,22 @@ impl ServerHandle {
             .expect("metrics body read failed")
     }
 
+    /// Sends SIGTERM, waits for the process to exit, and returns how long it
+    /// took. Does NOT remove the temp directory — Drop handles cleanup — so
+    /// callers can inspect WAB files after the process has exited.
+    fn sigterm(&mut self) -> Duration {
+        let t = Instant::now();
+        if let Some(ref mut child) = self.child {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
+            let _ = child.wait();
+            self.child = None;
+        }
+        t.elapsed()
+    }
+
     /// Sends SIGTERM and waits for the process to exit cleanly.
     fn shutdown(mut self) {
         if let Some(ref mut child) = self.child {
@@ -255,6 +275,159 @@ impl ServerHandle {
         }
         self.child = None; // prevent Drop from double-killing
         let _ = fs::remove_dir_all(&self.tmp_dir);
+    }
+
+    /// Starts the server with `RLIMIT_FSIZE = 0` so every WAB write fails with
+    /// `EFBIG`. `SIGXFSZ` is ignored in the child so the signal does not kill
+    /// the process; instead writes return an error that the server surfaces as
+    /// `Nack(InternalError)`.
+    ///
+    /// stdout/stderr are silenced (`/dev/null`) because the log file itself
+    /// would also fail to write under `RLIMIT_FSIZE = 0`.
+    fn start_disk_full(tag: &str) -> Self {
+        use std::os::unix::process::CommandExt;
+
+        let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let metrics_port = free_port();
+        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
+        let wab_dir = tmp_dir.join("wab");
+        let socket_dir = tmp_dir.join("run");
+        let socket_path = socket_dir.join("weir.sock");
+        let config_path = tmp_dir.join("weir.toml");
+
+        fs::create_dir_all(&wab_dir).unwrap();
+        fs::create_dir_all(&socket_dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let config = format!(
+            "[server]\n\
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = 1\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
+            socket_path.display(),
+            wab_dir.display(),
+            metrics_port,
+        );
+        fs::write(&config_path, config).unwrap();
+
+        let binary = env!("CARGO_BIN_EXE_weir-server");
+        let mut cmd = Command::new(binary);
+        cmd.args(["--config", config_path.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let rl = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &rl);
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .expect("failed to spawn weir-server (disk-full)");
+
+        let mut handle = Self {
+            child: Some(child),
+            socket_path,
+            wab_dir,
+            metrics_port,
+            config_path,
+            tmp_dir,
+            _proc_lock,
+        };
+
+        handle.wait_ready(Duration::from_secs(15));
+        handle
+    }
+
+    /// Starts the server with `RLIMIT_NOFILE` capped at `nofile_limit`.
+    ///
+    /// This lets tests verify the server degrades gracefully (refuses new
+    /// connections, does not crash) when it runs out of file descriptors.
+    /// The server is otherwise identical to a `start()` instance.
+    fn start_with_nofile_limit(tag: &str, nofile_limit: u64) -> Self {
+        use std::os::unix::process::CommandExt;
+
+        let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let metrics_port = free_port();
+        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
+        let wab_dir = tmp_dir.join("wab");
+        let socket_dir = tmp_dir.join("run");
+        let socket_path = socket_dir.join("weir.sock");
+        let config_path = tmp_dir.join("weir.toml");
+
+        fs::create_dir_all(&wab_dir).unwrap();
+        fs::create_dir_all(&socket_dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let config = format!(
+            "[server]\n\
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = 1\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
+            socket_path.display(),
+            wab_dir.display(),
+            metrics_port,
+        );
+        fs::write(&config_path, config).unwrap();
+
+        let binary = env!("CARGO_BIN_EXE_weir-server");
+        let mut cmd = Command::new(binary);
+        cmd.args(["--config", config_path.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        unsafe {
+            cmd.pre_exec(move || {
+                let rl = libc::rlimit {
+                    rlim_cur: nofile_limit,
+                    rlim_max: nofile_limit,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+                Ok(())
+            });
+        }
+
+        let child = cmd
+            .spawn()
+            .expect("failed to spawn weir-server (nofile-limit)");
+
+        let mut handle = Self {
+            child: Some(child),
+            socket_path,
+            wab_dir,
+            metrics_port,
+            config_path,
+            tmp_dir,
+            _proc_lock,
+        };
+
+        handle.wait_ready(Duration::from_secs(15));
+        handle
     }
 }
 
@@ -325,6 +498,23 @@ fn count_wab_files(dir: &Path, ext: &str) -> usize {
         }
     }
     count
+}
+
+// Helper: collect every byte from all files under a directory tree.
+fn read_wab_bytes(dir: &Path) -> Vec<u8> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend_from_slice(&read_wab_bytes(&p));
+        } else if let Ok(bytes) = fs::read(&p) {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -906,6 +1096,426 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
     }
 }
 
+// ── Graceful shutdown under load ──────────────────────────────────────────────
+
+/// Verifies that SIGTERM under concurrent Sync load produces no silent drops.
+///
+/// Every push that returned `Ok` must be on disk (Sync durability guarantee).
+/// Every push that did not complete must surface as `ClientError::Io` so the
+/// producer knows it needs to retry — not a silent half-write or a panic.
+#[test]
+fn graceful_shutdown_under_load() {
+    const THREADS: usize = 8;
+    const PUSH_BEFORE_SIGTERM: Duration = Duration::from_secs(2);
+    // shutdown_timeout_secs=3 in config + buffer for process exit overhead.
+    const MAX_SHUTDOWN_SECS: u64 = 8;
+
+    let mut srv = ServerHandle::start("shutdown_load");
+
+    let ok_count = Arc::new(AtomicU64::new(0));
+    let io_err_count = Arc::new(AtomicU64::new(0));
+    let unexpected_count = Arc::new(AtomicU64::new(0));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let ok = Arc::clone(&ok_count);
+            let io_err = Arc::clone(&io_err_count);
+            let unexpected = Arc::clone(&unexpected_count);
+            let path = srv.socket_path.clone();
+            thread::spawn(move || {
+                let mut client = match WeirClient::connect(&path) {
+                    Ok(c) => c,
+                    Err(_) => return, // server already gone
+                };
+                loop {
+                    match client.push(b"shutdown-load", Durability::Sync) {
+                        Ok(()) => {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(ClientError::Io(_)) => {
+                            // Connection closed — expected during shutdown.
+                            io_err.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        Err(_) => {
+                            // Nack or protocol error — not expected.
+                            unexpected.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Let the threads push for a bit, then signal shutdown.
+    thread::sleep(PUSH_BEFORE_SIGTERM);
+    let shutdown_elapsed = srv.sigterm();
+
+    for h in handles {
+        h.join().expect("producer thread panicked");
+    }
+
+    let oks = ok_count.load(Ordering::Relaxed);
+    let io_errs = io_err_count.load(Ordering::Relaxed);
+    let unexpected = unexpected_count.load(Ordering::Relaxed);
+    let wab_bytes = wab_dir_bytes(&srv.wab_dir);
+
+    // Server must exit within a reasonable bound after SIGTERM.
+    assert!(
+        shutdown_elapsed < Duration::from_secs(MAX_SHUTDOWN_SECS),
+        "server took {shutdown_elapsed:?} to shut down — expected < {MAX_SHUTDOWN_SECS}s"
+    );
+
+    // No unexpected errors: threads may see Ok or Io(EOF), never Nack/Protocol.
+    assert_eq!(
+        unexpected, 0,
+        "{unexpected} unexpected errors (Nack or Protocol) during shutdown — \
+         producers should only see Ok or Io"
+    );
+
+    // Every Ok means a Sync-flushed record. The WAB must have bytes.
+    assert!(
+        oks > 0,
+        "expected successful pushes before SIGTERM; got 0 — \
+         either the server started too slowly or {PUSH_BEFORE_SIGTERM:?} was too short"
+    );
+    assert!(
+        wab_bytes > 0,
+        "WAB has 0 bytes on disk after {oks} successful Sync pushes — \
+         possible silent data loss"
+    );
+
+    println!(
+        "graceful_shutdown_under_load: {oks} ok, {io_errs} io_err, \
+         {unexpected} unexpected | wab={wab_bytes}B | shutdown={shutdown_elapsed:?}"
+    );
+}
+
+// ── Stalled client isolation ──────────────────────────────────────────────────
+
+/// A client that connects, sends one Push frame, and then never reads the Ack
+/// must not block or slow down other connections.
+///
+/// The stalled connection holds a permit in the connection semaphore and keeps
+/// the server's per-connection async task suspended (waiting to read the next
+/// frame). Other connections must get their own permits and proceed normally.
+#[test]
+fn stalled_client_does_not_block_other_connections() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Envelope, Header, MessageType};
+
+    const CONCURRENT_RECORDS: usize = 50;
+    const CONCURRENT_DEADLINE: Duration = Duration::from_secs(5);
+
+    let srv = ServerHandle::start("stall_isolation");
+
+    // Pre-encode one Push frame for the stalled client to send.
+    let payload = b"stall";
+    let header = Header::new(
+        MessageType::Push,
+        Durability::Buffered,
+        0,
+        payload.len() as u32,
+    );
+    let frame = Envelope::new(header, payload.to_vec()).encode();
+
+    let stop_stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Stalled client: connects, sends one frame, holds the connection open
+    // without ever reading the Ack. The server task for this connection is
+    // suspended waiting for the next frame — which never comes.
+    let stall_handle = {
+        let path = srv.socket_path.clone();
+        let stop = Arc::clone(&stop_stall);
+        thread::spawn(move || {
+            let mut stream = RawStream::connect(&path).expect("stall: connect");
+            stream.write_all(&frame).expect("stall: write frame");
+            // Deliberately do not read the Ack. Hold the connection open.
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+
+    // Let the stall thread connect and send its frame before we proceed.
+    thread::sleep(Duration::from_millis(100));
+
+    // Concurrent client: 50 Sync pushes while the stalled connection is held.
+    let mut client = srv.client();
+    let t0 = Instant::now();
+    for i in 0..CONCURRENT_RECORDS {
+        client
+            .push(format!("concurrent-{i}").as_bytes(), Durability::Sync)
+            .unwrap_or_else(|e| panic!("concurrent push {i} failed: {e}"));
+    }
+    let elapsed = t0.elapsed();
+
+    stop_stall.store(true, Ordering::Relaxed);
+    stall_handle.join().expect("stall thread panicked");
+
+    assert!(
+        elapsed < CONCURRENT_DEADLINE,
+        "{CONCURRENT_RECORDS} pushes took {elapsed:?} with stalled connection held — \
+         expected < {CONCURRENT_DEADLINE:?} (stalled client may be blocking the worker)"
+    );
+
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after stalled client test");
+}
+
+// ── Partial frame injection ───────────────────────────────────────────────────
+
+/// Sending a valid header then only half the declared payload bytes before
+/// closing the connection must not corrupt the server's per-connection state
+/// machine. The next fresh connection must work normally.
+#[test]
+fn partial_frame_does_not_corrupt_next_connection() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Envelope, HEADER_LEN, Header, MessageType};
+
+    let srv = ServerHandle::start("partial_frame");
+
+    // Build a valid Push frame with a 64-byte payload.
+    let payload = vec![0xabu8; 64];
+    let header = Header::new(
+        MessageType::Push,
+        Durability::Buffered,
+        0,
+        payload.len() as u32,
+    );
+    let frame = Envelope::new(header, payload).encode();
+
+    {
+        let mut stream = RawStream::connect(&srv.socket_path).expect("connect for partial frame");
+        // Write only header + first 16 bytes of the 64-byte payload.
+        stream
+            .write_all(&frame[..HEADER_LEN + 16])
+            .expect("write partial frame");
+        // Drop the stream — connection dies mid-frame.
+    }
+
+    // Give the server time to observe the EOF and clean up the connection.
+    thread::sleep(Duration::from_millis(50));
+
+    // A fresh connection must work normally — the partial frame must not have
+    // left the server's read state in a corrupt position.
+    srv.client()
+        .push(b"after-partial-frame", Durability::Sync)
+        .expect("push failed after partial frame injection");
+
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after partial frame test");
+}
+
+// ── Disk full ─────────────────────────────────────────────────────────────────
+
+/// A WAB write failure (disk full simulated via `RLIMIT_FSIZE = 0`) must
+/// produce `Nack(InternalError)` on the client, not a server crash or silent
+/// data drop.
+#[test]
+fn disk_full_returns_nack_not_crash() {
+    use weir_core::NackReason;
+
+    let srv = ServerHandle::start_disk_full("disk_full");
+    let mut client = srv.client();
+
+    // With RLIMIT_FSIZE=0 the first WAB segment header write fails immediately.
+    let result = client.push(b"should-nack", Durability::Sync);
+    assert!(
+        matches!(result, Err(ClientError::Nack(NackReason::InternalError))),
+        "expected Nack(InternalError) from disk-full server, got {result:?}"
+    );
+
+    // Server must still be alive and accepting connections after the nack.
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after disk-full nack");
+}
+
+// ── WAB data integrity after crash ────────────────────────────────────────────
+
+/// Every Sync push that returned `Ok` must be present on disk byte-for-byte
+/// after the server is killed with SIGKILL.
+///
+/// This tests the "Sync durability" contract at the byte level: if the client
+/// got an `Ok`, the payload must be in the WAB file (the fsync happened before
+/// the ack was sent).
+#[test]
+fn wab_data_integrity_after_crash() {
+    const N: usize = 50;
+
+    let mut srv = ServerHandle::start_sharded("wab_integrity", 1);
+    let mut client = srv.client();
+
+    let mut acked: Vec<Vec<u8>> = Vec::new();
+    for i in 0..N {
+        let payload = format!("integrity-{i:05}").into_bytes();
+        match client.push(&payload, Durability::Sync) {
+            Ok(()) => acked.push(payload),
+            Err(_) => break, // server died mid-push
+        }
+    }
+
+    assert!(!acked.is_empty(), "no pushes acked before crash");
+
+    // Crash without cleanup — WAB files stay on disk exactly as they were.
+    srv.kill_ungracefully();
+
+    let wab_bytes = read_wab_bytes(&srv.wab_dir);
+    assert!(
+        !wab_bytes.is_empty(),
+        "WAB directory empty after {} acked Sync pushes",
+        acked.len()
+    );
+
+    // Every acked payload must appear verbatim in the WAB bytes.
+    for payload in &acked {
+        let found = wab_bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_slice());
+        assert!(
+            found,
+            "acked payload {:?} not found in WAB bytes — possible data loss",
+            String::from_utf8_lossy(payload)
+        );
+    }
+}
+
+// ── Socket takeover data safety ───────────────────────────────────────────────
+
+/// `bind_cleanup` removes the socket file (even if another process is
+/// listening) so that crash-recovery always succeeds. When a second server
+/// takes the socket path the first server's WAB files must be left entirely
+/// untouched — the socket file and the WAB are independent resources.
+#[test]
+fn socket_takeover_does_not_corrupt_wab_data() {
+    const N: usize = 20;
+
+    let srv_a = ServerHandle::start("socket_takeover");
+    let mut client = srv_a.client();
+
+    for i in 0..N {
+        client
+            .push(format!("srv-a-{i}").as_bytes(), Durability::Sync)
+            .expect("push to server A failed");
+    }
+
+    let wab_before = wab_dir_bytes(&srv_a.wab_dir);
+    assert!(wab_before > 0, "server A must have written WAB bytes");
+
+    // Spawn server B at the same socket path (it will call bind_cleanup and
+    // take over the socket). Use Command directly — we hold the process lock
+    // via srv_a and need two processes alive at once intentionally.
+    let second_tmp =
+        std::env::temp_dir().join(format!("weir_sys_takeover_b_{}", std::process::id()));
+    let second_wab = second_tmp.join("wab");
+    let second_config = second_tmp.join("weir.toml");
+
+    fs::create_dir_all(&second_wab).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&second_wab, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(
+        &second_config,
+        format!(
+            "[server]\n\
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = 1\n\
+             worker_count          = 2\n\
+             batch_size            = 100\n\
+             batch_deadline_ms     = 20\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"warn\"\n",
+            srv_a.socket_path.display(),
+            second_wab.display(),
+            free_port(),
+        ),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+    let mut child_b = Command::new(binary)
+        .args(["--config", second_config.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn server B");
+
+    // Give server B time to start and take the socket.
+    thread::sleep(Duration::from_millis(500));
+
+    // Server A's WAB files must be completely untouched.
+    let wab_after = wab_dir_bytes(&srv_a.wab_dir);
+    assert_eq!(
+        wab_before, wab_after,
+        "server B startup modified server A's WAB bytes ({wab_before} → {wab_after})"
+    );
+
+    // Verify payload bytes are still present.
+    let wab_bytes = read_wab_bytes(&srv_a.wab_dir);
+    for i in 0..N {
+        let payload = format!("srv-a-{i}").into_bytes();
+        assert!(
+            wab_bytes
+                .windows(payload.len())
+                .any(|w| w == payload.as_slice()),
+            "payload srv-a-{i} missing from server A's WAB after socket takeover"
+        );
+    }
+
+    let _ = child_b.kill();
+    let _ = child_b.wait();
+    let _ = fs::remove_dir_all(&second_tmp);
+}
+
+// ── File descriptor limit exhaustion ─────────────────────────────────────────
+
+/// When the server hits its `RLIMIT_NOFILE` ceiling it must not crash —
+/// new connections are refused or queued by the kernel, and connections
+/// within the fd budget continue to work normally.
+#[test]
+fn fd_limit_exhaustion_does_not_crash_server() {
+    use std::os::unix::net::UnixStream as RawStream;
+
+    // 128 fds: comfortably above server startup overhead (~20 fds) but low
+    // enough that opening 200 connections will exhaust the limit.
+    const NOFILE_LIMIT: u64 = 128;
+    const FLOOD_CONNS: usize = 200;
+
+    let srv = ServerHandle::start_with_nofile_limit("fd_limit", NOFILE_LIMIT);
+
+    // Flood the server with raw connections and keep them open.
+    let mut open: Vec<RawStream> = Vec::new();
+    for _ in 0..FLOOD_CONNS {
+        match RawStream::connect(&srv.socket_path) {
+            Ok(s) => open.push(s),
+            Err(_) => break, // kernel backlog full — stop
+        }
+    }
+
+    // Hold connections briefly to let the server try (and fail) to accept them.
+    thread::sleep(Duration::from_millis(200));
+
+    drop(open);
+
+    // After releasing the flood, the server must still be alive.
+    thread::sleep(Duration::from_millis(100));
+    srv.client()
+        .health_check()
+        .expect("server crashed or hung under fd pressure");
+
+    // A normal Sync push must succeed after the fd pressure is relieved.
+    srv.client()
+        .push(b"after-fd-flood", Durability::Sync)
+        .expect("push failed after fd-limit flood");
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
@@ -946,4 +1556,154 @@ fn records_ack_counter_increments_after_sync_pushes() {
         body.contains(&expected),
         "expected '{expected}' in metrics; body:\n{body:.800}"
     );
+}
+
+// ── Per-shard record ordering ─────────────────────────────────────────────────
+
+/// With a single-shard server, records submitted sequentially from a single
+/// producer must appear in submission order in the raw WAB bytes.
+///
+/// This is the fundamental append-log ordering contract. Any change to the
+/// batching or queue path that accidentally reorders records will be caught
+/// here.
+#[test]
+fn per_shard_records_appear_in_submission_order() {
+    const N: usize = 30;
+
+    // Single shard: all records go to the same WAB file, so order is preserved.
+    let srv = ServerHandle::start_sharded("ordering", 1);
+    let mut client = srv.client();
+
+    for i in 0..N {
+        client
+            .push(format!("order-{i:05}").as_bytes(), Durability::Sync)
+            .expect("push failed");
+    }
+
+    // Flush any remaining data and give the server time to seal.
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after pushes");
+
+    let wab_bytes = read_wab_bytes(&srv.wab_dir);
+    assert!(!wab_bytes.is_empty(), "WAB must have data after pushes");
+
+    // Find the byte offset of each payload in the WAB.
+    let mut prev_offset: Option<usize> = None;
+    for i in 0..N {
+        let payload = format!("order-{i:05}").into_bytes();
+        let offset = wab_bytes
+            .windows(payload.len())
+            .position(|w| w == payload.as_slice())
+            .unwrap_or_else(|| panic!("payload order-{i:05} not found in WAB bytes"));
+
+        if let Some(prev) = prev_offset {
+            assert!(
+                offset > prev,
+                "record order-{i:05} at offset {offset} appears before the previous record \
+                 at offset {prev} — submission order not preserved"
+            );
+        }
+        prev_offset = Some(offset);
+    }
+}
+
+// ── Batch deadline timer accuracy ─────────────────────────────────────────────
+
+/// With `batch_deadline_ms = 20`, each individual Sync push must complete
+/// within a generous multiple of the deadline. A push that exceeds 5×deadline
+/// indicates the batch timer is being starved (e.g. the accept loop is
+/// spinning) and latency would be non-deterministic in production.
+#[test]
+fn batch_deadline_timer_keeps_latency_bounded() {
+    const SAMPLES: usize = 20;
+    const DEADLINE_MS: u64 = 20; // matches start_impl config
+    const MAX_EACH: Duration = Duration::from_millis(DEADLINE_MS * 5); // 100 ms
+    const MAX_P99: Duration = Duration::from_millis(DEADLINE_MS * 3); // 60 ms
+
+    let srv = ServerHandle::start("deadline_accuracy");
+    let mut client = srv.client();
+    let mut latencies: Vec<Duration> = Vec::with_capacity(SAMPLES);
+
+    for i in 0..SAMPLES {
+        let t0 = Instant::now();
+        client
+            .push(format!("timer-{i}").as_bytes(), Durability::Sync)
+            .expect("push failed");
+        latencies.push(t0.elapsed());
+    }
+
+    // Every sample must finish within 5 × deadline.
+    for (i, &lat) in latencies.iter().enumerate() {
+        assert!(
+            lat <= MAX_EACH,
+            "sample {i} took {lat:?} — exceeded 5 × batch_deadline_ms ({MAX_EACH:?})"
+        );
+    }
+
+    // p99 (here: worst sample across 20) must be within 3 × deadline.
+    let mut sorted = latencies.clone();
+    sorted.sort();
+    let p99 = sorted[sorted.len() - 1]; // max of 20 samples ≈ p99
+    assert!(
+        p99 <= MAX_P99,
+        "p99 latency {p99:?} exceeded 3 × batch_deadline_ms ({MAX_P99:?})"
+    );
+}
+
+// ── Metrics monotonicity under crash-restart ───────────────────────────────────
+
+/// After a crash-restart, per-session counters reset to zero (in-process
+/// atomics). Within each session the counters must be internally consistent:
+/// `records_accepted` must be ≥ `records_ack` and neither may be negative.
+#[test]
+fn metrics_consistent_across_crash_restart() {
+    const PUSHES_PER_ROUND: u32 = 10;
+    const ROUNDS: u32 = 3;
+
+    let mut srv = ServerHandle::start("metrics_crash");
+
+    for round in 0..ROUNDS {
+        let mut client = srv.client();
+        for i in 0..PUSHES_PER_ROUND {
+            client
+                .push(
+                    format!("round-{round}-rec-{i}").as_bytes(),
+                    Durability::Sync,
+                )
+                .unwrap_or_else(|e| panic!("push failed (round {round}, rec {i}): {e}"));
+        }
+
+        let body = srv.scrape_metrics();
+
+        let accepted = parse_metric(&body, "weir_records_accepted_total{tier=\"sync\"}");
+        let acked = parse_metric(&body, "weir_records_ack_total{tier=\"sync\"}");
+
+        assert!(
+            accepted <= u64::from(PUSHES_PER_ROUND),
+            "round {round}: records_accepted ({accepted}) exceeds pushes made \
+             ({PUSHES_PER_ROUND}) — phantom records in counter"
+        );
+        assert!(
+            acked <= accepted,
+            "round {round}: records_ack ({acked}) > records_accepted ({accepted})"
+        );
+
+        if round + 1 < ROUNDS {
+            srv.restart_in_place();
+        }
+    }
+}
+
+fn parse_metric(body: &str, prefix: &str) -> u64 {
+    for line in body.lines() {
+        if line.starts_with(prefix) {
+            if let Some(val) = line.split_whitespace().next_back() {
+                if let Ok(n) = val.parse() {
+                    return n;
+                }
+            }
+        }
+    }
+    0
 }
