@@ -220,11 +220,13 @@ fn emit_latency(scenario: &str, samples: usize, sorted_us: &[u64]) {
         sorted_us[idx]
     };
     let mean = sorted_us.iter().sum::<u64>() / samples as u64;
+    let min = sorted_us.first().copied().unwrap_or(0);
     println!(
         "BENCH: {{\"scenario\":\"{scenario}\",\"samples\":{samples},\
-         \"mean_us\":{mean},\"p50_us\":{},\"p95_us\":{},\
-         \"p99_us\":{},\"p999_us\":{},\"max_us\":{}}}",
+         \"min_us\":{min},\"mean_us\":{mean},\"p50_us\":{},\"p75_us\":{},\
+         \"p95_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{}}}",
         p(50.0),
+        p(75.0),
         p(95.0),
         p(99.0),
         p(99.9),
@@ -337,7 +339,7 @@ fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> Lev
 /// Baseline: single producer, Buffered (no fsync wait).
 #[test]
 fn baseline_single_thread_throughput_buffered() {
-    const RECORDS: usize = 500;
+    const RECORDS: usize = 1_000;
     let srv = LoadHandle::start("single_buffered");
     let mut client = srv.client();
 
@@ -353,7 +355,7 @@ fn baseline_single_thread_throughput_buffered() {
 /// Baseline: single producer, Sync (fsync per batch).
 #[test]
 fn baseline_single_thread_throughput_sync() {
-    const RECORDS: usize = 300;
+    const RECORDS: usize = 500;
     let srv = LoadHandle::start("single_sync");
     let mut client = srv.client();
 
@@ -369,7 +371,7 @@ fn baseline_single_thread_throughput_sync() {
 /// Latency percentiles: single Sync producer, every push timed individually.
 #[test]
 fn baseline_latency_percentiles_sync() {
-    const SAMPLES: usize = 300;
+    const SAMPLES: usize = 500;
     let srv = LoadHandle::start("latency_sync");
     let mut client = srv.client();
 
@@ -382,6 +384,42 @@ fn baseline_latency_percentiles_sync() {
     us.sort_unstable();
 
     emit_latency(&bench_tag("latency_sync"), SAMPLES, &us);
+}
+
+/// Latency percentiles: single Batched producer.
+#[test]
+fn baseline_latency_percentiles_batched() {
+    const SAMPLES: usize = 500;
+    let srv = LoadHandle::start("latency_batched");
+    let mut client = srv.client();
+
+    let mut us: Vec<u64> = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let t = Instant::now();
+        client.push(b"lat", Durability::Batched).expect("push");
+        us.push(t.elapsed().as_micros() as u64);
+    }
+    us.sort_unstable();
+
+    emit_latency(&bench_tag("latency_batched"), SAMPLES, &us);
+}
+
+/// Latency percentiles: single Buffered producer.
+#[test]
+fn baseline_latency_percentiles_buffered() {
+    const SAMPLES: usize = 500;
+    let srv = LoadHandle::start("latency_buffered");
+    let mut client = srv.client();
+
+    let mut us: Vec<u64> = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let t = Instant::now();
+        client.push(b"lat", Durability::Buffered).expect("push");
+        us.push(t.elapsed().as_micros() as u64);
+    }
+    us.sort_unstable();
+
+    emit_latency(&bench_tag("latency_buffered"), SAMPLES, &us);
 }
 
 /// Thundering herd — 8 threads.
