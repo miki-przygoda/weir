@@ -82,9 +82,9 @@ jobs:
             sleep 0.5
           done
           echo "Socket ready."
-          # The container's weir user owns the socket; make it world-writable
-          # so the CI runner (different UID) can connect.
-          chmod a+rw "$SOCKDIR/weir.sock"
+          # Runner can't chmod a file owned by the container's weir uid;
+          # exec inside the container (runs as root) to open the socket.
+          docker exec weir-smoke chmod a+rw /run/weir/weir.sock
 
           # Push records across all three durability tiers and verify Acks.
           ./target/release/weir-bench \
