@@ -110,12 +110,14 @@ jobs:
             fi
           done
 
-          # Confirm WAB segments were written to the bind-mounted directory.
-          WAB_COUNT=$(find "$WAB" \( -name "*.wab" -o -name "*.wab.sealed" \) | wc -l)
+          # Confirm WAB segments were written.  Use docker exec so the find
+          # runs as root inside the container (shard dirs are owned by weir).
+          WAB_COUNT=$(docker exec weir-smoke \
+            find /var/lib/weir/wab \( -name "*.wab" -o -name "*.wab.sealed" \) | wc -l)
           if [ "$WAB_COUNT" -gt 0 ]; then
             echo "  ✓ WAB segments on disk: $WAB_COUNT"
           else
-            echo "  ✗ No WAB segments found in $WAB"
+            echo "  ✗ No WAB segments found"
             docker logs weir-smoke
             exit 1
           fi
