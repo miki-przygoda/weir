@@ -26,18 +26,18 @@ throughput ceiling.
 
 | Scenario | RPS |
 |----------|-----|
-| Single thread, Buffered | ~800 |
-| Single thread, Sync | ~600 |
-| Thundering herd, 64 threads | ~2,900 |
-| Saturation ceiling (48 threads) | ~17,000 |
+| Single thread, Buffered | ~850 |
+| Single thread, Sync | ~700 |
+| Thundering herd, 64 threads | ~3,100 |
+| Saturation ceiling (48 threads) | ~17,300 |
 
 ### Latency at `batch_deadline_ms=1` (single thread)
 
 | Tier | p50 | p99 |
 |------|-----|-----|
-| Buffered | ~1.3 ms | ~1.6 ms |
-| Batched | ~2.0 ms | ~2.3 ms |
-| Sync | ~2.0 ms | ~2.3 ms |
+| Buffered | ~1.2 ms | ~1.2 ms |
+| Batched | ~1.4 ms | ~1.8 ms |
+| Sync | ~1.4 ms | ~1.7 ms |
 
 *Numbers above are approximate CI baselines. Exact figures are in
 [latest.md](benchmarks/latest.md) and updated automatically on every push.*
