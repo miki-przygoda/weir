@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 weir-core = { path = "../weir-core" }
 weir-client = { path = "../weir-client" }
+pico-args = "0.5"

@@ -9,12 +9,12 @@ mod socket;
 mod wab;
 mod worker;
 
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use tracing::info;
 
 use config::Config;
-use drain::{DrainConfig, DrainMetrics, MAX_RETRIES};
+use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
 use sink::{CommitResult, Sink, SinkError, SinkHealth};
 use wab::WabRecord;
@@ -59,6 +59,32 @@ impl Sink for NoopSink {
     }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
+    let Ok(dir) = std::fs::read_dir(wab_dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in dir.flatten() {
+        let shard_path = entry.path();
+        if !shard_path.is_dir() {
+            continue;
+        }
+        let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
+            continue;
+        };
+        for file in shard_dir.flatten() {
+            let fpath = file.path();
+            let name = fpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with(".wab") || name.ends_with(".wab.sealed") {
+                total += std::fs::metadata(&fpath).map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,6 +105,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "weir starting"
     );
 
+    // ── Metrics ───────────────────────────────────────────────────────────────
+
+    let (metrics_struct, registry) = metrics::Metrics::new();
+    let metrics = Arc::new(metrics_struct);
+    let registry = Arc::new(registry);
+
     // ── Queue ─────────────────────────────────────────────────────────────────
 
     let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
@@ -94,7 +126,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch_size: config.batch_size,
         batch_deadline: Duration::from_millis(config.batch_deadline_ms),
     };
-    let wab_handle = wab::spawn(config.wab_dir.clone(), wab_config, drain_tx)?;
+    let wab_handle = wab::spawn(
+        config.wab_dir.clone(),
+        wab_config,
+        drain_tx,
+        Arc::clone(&metrics),
+    )?;
 
     // ── Workers (queue → per-shard Batch channels) ────────────────────────────
 
@@ -142,12 +179,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_retry_delay: Duration::from_millis(100),
         max_retries: MAX_RETRIES,
     };
-    let drain_metrics = Arc::new(DrainMetrics::new());
     let drain_handle = drain::spawn(
         drain_rx,
         Arc::new(NoopSink),
         drain_config,
-        Arc::clone(&drain_metrics),
+        Arc::clone(&metrics),
     );
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
@@ -160,11 +196,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bind metrics listener before starting the socket loop.
         let metrics_listener =
             tokio::net::TcpListener::bind(("127.0.0.1", config.metrics_port)).await?;
-        let (metrics_struct, registry) = metrics::Metrics::new();
-        let metrics = Arc::new(metrics_struct);
-        metrics::server::spawn(metrics_listener, Arc::new(registry));
+        metrics::server::spawn(metrics_listener, Arc::clone(&registry));
 
         info!(port = config.metrics_port, "metrics endpoint listening");
+
+        // Background: poll queue depth every 500 ms.
+        let queue_tx_bg = queue_tx.clone();
+        let metrics_q = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                metrics_q.queue_depth.set(queue_tx_bg.len() as f64);
+            }
+        });
+
+        // Background: scan WAB shard dirs for on-disk byte usage every 5 s.
+        let wab_dir_bg = config.wab_dir.clone();
+        let metrics_w = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let bytes = compute_wab_bytes_on_disk(&wab_dir_bg);
+                metrics_w.wab_bytes_on_disk.set(bytes as f64);
+            }
+        });
 
         // Shutdown coordination: signal handler → shutdown_tx → socket::run exits.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

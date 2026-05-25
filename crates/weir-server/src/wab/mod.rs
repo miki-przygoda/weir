@@ -4,19 +4,21 @@ pub mod segment;
 
 use std::{
     fs::{self, File},
-    io::{self, BufReader, Read},
+    io::{self, BufReader, Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
+    sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN};
+use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::ShardWriter;
+use crate::metrics::{Metrics, SegmentStateLabel, SegmentState};
 use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
 
 /// A record queued by a connection handler for writing to the WAB.
@@ -85,6 +87,7 @@ pub fn spawn(
     wab_dir: PathBuf,
     config: WabConfig,
     drain_tx: Sender<PathBuf>,
+    metrics: Arc<Metrics>,
 ) -> io::Result<WabHandle> {
     // TODO step-08: replace with `config::validate_path(&wab_dir)?` once config/ exists.
     let wab_dir = validate_path(&wab_dir)?;
@@ -94,10 +97,10 @@ pub fn spawn(
     }
 
     // Phase 1 (calling thread): crash recovery — unsealed .wab → .wab.sealed
-    recover_open_segments(&wab_dir)?;
+    recover_open_segments(&wab_dir, &metrics)?;
 
     // Phase 2 (calling thread): replay sealed-but-unconfirmed segments
-    replay_unconfirmed(&wab_dir, config.shard_count, &drain_tx)?;
+    replay_unconfirmed(&wab_dir, config.shard_count, &drain_tx, &metrics)?;
 
     // Phase 3: one flusher thread per shard
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
@@ -110,6 +113,7 @@ pub fn spawn(
 
         let sdir = shard_dir_path(&wab_dir, shard_id);
         let drain_clone = drain_tx.clone();
+        let metrics_clone = Arc::clone(&metrics);
         let batch_size = config.batch_size;
         let batch_deadline = config.batch_deadline;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
@@ -125,6 +129,7 @@ pub fn spawn(
                     batch_size,
                     batch_deadline,
                     core_id,
+                    metrics_clone,
                 );
             })
             .map_err(io::Error::other)?;
@@ -142,6 +147,7 @@ fn replay_unconfirmed(
     wab_dir: &Path,
     shard_count: usize,
     drain_tx: &Sender<PathBuf>,
+    metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
     for shard_id in 0..shard_count {
         let sdir = shard_dir_path(wab_dir, shard_id);
@@ -161,7 +167,9 @@ fn replay_unconfirmed(
                     info!(sealed = %sealed.display(), "skipping replay — segment already confirmed");
                 }
                 Ok(false) => {
-                    info!(sealed = %sealed.display(), "queuing segment for drain replay");
+                    let record_count = read_segment_record_count(&sealed).unwrap_or(0);
+                    info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
+                    metrics.recovery_records_replayed.inc_by(record_count);
                     drain_tx.send(sealed).map_err(|_| {
                         io::Error::new(
                             io::ErrorKind::BrokenPipe,
@@ -179,6 +187,18 @@ fn replay_unconfirmed(
     Ok(())
 }
 
+/// Reads `record_count` from the footer of a sealed segment file without reading
+/// all records. The footer occupies the last `SEGMENT_FOOTER_LEN` bytes; its first
+/// 8 bytes are `record_count` as a u64 LE (see wab/format.rs for the layout).
+fn read_segment_record_count(path: &Path) -> io::Result<u64> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::End(-(SEGMENT_FOOTER_LEN as i64)))?;
+    let mut footer = [0u8; 8];
+    file.read_exact(&mut footer)?;
+    Ok(u64::from_le_bytes(footer))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn flusher_thread(
     shard_id: u16,
     shard_dir: PathBuf,
@@ -187,6 +207,7 @@ fn flusher_thread(
     batch_size: usize,
     batch_deadline: Duration,
     core_id: Option<core_affinity::CoreId>,
+    metrics: Arc<Metrics>,
 ) {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
@@ -237,7 +258,7 @@ fn flusher_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !batch.is_empty() {
-                    flush_batch(&mut writer, &mut batch, &drain_tx, shard_id);
+                    flush_batch(&mut writer, &mut batch, &drain_tx, shard_id, &metrics);
                 }
                 continue;
             }
@@ -251,13 +272,14 @@ fn flusher_thread(
             }
         }
 
-        flush_batch(&mut writer, &mut batch, &drain_tx, shard_id);
+        flush_batch(&mut writer, &mut batch, &drain_tx, shard_id, &metrics);
     }
 
     // Graceful shutdown: seal the active segment and send to drain.
     match writer.seal_current() {
         Ok(Some(sealed)) => {
             info!(shard = shard_id, sealed = %sealed.display(), "WAB flusher sealed segment on shutdown");
+            metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::sealed }).inc();
             drain_tx.send(sealed).ok();
         }
         Ok(None) => {
@@ -277,6 +299,7 @@ fn flush_batch(
     batch: &mut Vec<WabRecord>,
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
+    metrics: &Arc<Metrics>,
 ) {
     let mut batched_acks: Vec<oneshot::Sender<bool>> = Vec::new();
     let mut need_fsync = false;
@@ -294,18 +317,17 @@ fn flush_batch(
         if let Some(sealed) = rotation {
             // Segment was sealed (seal includes fsync). Notify drain.
             info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
+            metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::sealed }).inc();
             drain_tx.send(sealed).ok();
         }
 
         match record.durability {
-            Durability::Sync => match writer.fsync_current() {
-                Ok(()) => {
-                    let _ = record.ack_tx.send(true);
-                }
-                Err(_) => {
-                    let _ = record.ack_tx.send(false);
-                }
-            },
+            Durability::Sync => {
+                let t = Instant::now();
+                let ok = writer.fsync_current().is_ok();
+                metrics.wab_fsync_duration.observe(t.elapsed().as_secs_f64());
+                let _ = record.ack_tx.send(ok);
+            }
             Durability::Batched => {
                 need_fsync = true;
                 batched_acks.push(record.ack_tx);
@@ -318,7 +340,9 @@ fn flush_batch(
 
     // Group fsync for all Batched records in this flush.
     if need_fsync {
+        let t = Instant::now();
         let ok = writer.fsync_current().is_ok();
+        metrics.wab_fsync_duration.observe(t.elapsed().as_secs_f64());
         for ack_tx in batched_acks {
             let _ = ack_tx.send(ok);
         }

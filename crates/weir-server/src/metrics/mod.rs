@@ -1,7 +1,4 @@
 //! Prometheus metrics for the weir daemon.
-// Label enum variants and Metrics fields are defined for completeness; subsystem
-// wiring that constructs them is added in a follow-up step.
-#![allow(dead_code)]
 //!
 //! Call `Metrics::new()` once at startup to get `(Arc<Metrics>, Registry)`.
 //! Pass `Arc<Metrics>` to every subsystem that needs to update counters/gauges.
@@ -61,7 +58,9 @@ pub struct SegmentStateLabel {
     pub state: SegmentState,
 }
 
-#[allow(non_camel_case_types)]
+// `open` is defined for metric completeness; wiring it requires threading metrics
+// into ShardWriter in segment.rs, which is deferred.
+#[allow(non_camel_case_types, dead_code)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum SegmentState {
     open,

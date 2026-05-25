@@ -31,10 +31,7 @@ use std::{
     collections::VecDeque,
     io,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -43,7 +40,11 @@ use tracing::{error, info, warn};
 use weir_core::Payload;
 
 use crate::{
-    sink::{Sink, SinkError, SinkRecord},
+    metrics::{
+        DrainStateLabel, DrainStateValue, Metrics, OutcomeLabel, Outcome,
+        SegmentStateLabel, SegmentState, SinkHealthLabel, SinkHealthState,
+    },
+    sink::{Sink, SinkError, SinkHealth, SinkRecord},
     wab::{
         SegmentReader,
         format::{EXT_CONFIRMED, EXT_SEALED, SEGMENT_FOOTER_LEN, build_confirmed, unix_nanos_now},
@@ -55,11 +56,6 @@ use dead_letter::DeadLetterWriter;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const MAX_RETRIES: u32 = 3;
-
-/// Drain state label values stored in `DrainMetrics::state`.
-pub const STATE_DRAINING: u8 = 0;
-pub const STATE_RETRYING: u8 = 1;
-pub const STATE_BLOCKED: u8 = 2;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -77,41 +73,6 @@ pub struct DrainConfig {
     /// Maximum number of retry attempts per segment before the segment is left
     /// on disk and the drain advances to the next segment.
     pub max_retries: u32,
-}
-
-// ── Metrics ───────────────────────────────────────────────────────────────────
-
-pub struct DrainMetrics {
-    pub segments_drained: AtomicU64,
-    pub records_committed: AtomicU64,
-    pub records_dead_lettered: AtomicU64,
-    /// Increments once each time the drain enters `BlockedDeadLetterFull`. Does
-    /// NOT increment on each wake cycle within a blocked period.
-    pub dead_letter_full_total: AtomicU64,
-    /// Current state: `STATE_DRAINING`, `STATE_RETRYING`, or `STATE_BLOCKED`.
-    pub state: AtomicU8,
-    /// Set to `Some(Instant)` when entering `BlockedDeadLetterFull`; reset to
-    /// `None` on exit. Step 07 computes the blocked duration from this.
-    pub blocked_since: std::sync::Mutex<Option<Instant>>,
-}
-
-impl DrainMetrics {
-    pub fn new() -> Self {
-        Self {
-            segments_drained: AtomicU64::new(0),
-            records_committed: AtomicU64::new(0),
-            records_dead_lettered: AtomicU64::new(0),
-            dead_letter_full_total: AtomicU64::new(0),
-            state: AtomicU8::new(STATE_DRAINING),
-            blocked_since: std::sync::Mutex::new(None),
-        }
-    }
-}
-
-impl Default for DrainMetrics {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 // ── Internal state machine types ──────────────────────────────────────────────
@@ -153,12 +114,37 @@ pub fn spawn<S: Sink + 'static>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
     config: DrainConfig,
-    metrics: Arc<DrainMetrics>,
+    metrics: Arc<Metrics>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("weir-drain".into())
         .spawn(move || drain_thread(drain_rx, sink, config, metrics))
         .expect("failed to spawn drain thread")
+}
+
+// ── Drain state helper ────────────────────────────────────────────────────────
+
+fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
+    let states = [
+        DrainStateValue::draining,
+        DrainStateValue::retrying_transient,
+        DrainStateValue::blocked_dead_letter_full,
+    ];
+    for s in states {
+        let v = if s == active { 1.0 } else { 0.0 };
+        metrics.drain_state.get_or_create(&DrainStateLabel { state: s }).set(v);
+    }
+}
+
+fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
+    let (healthy, degraded, down) = match health {
+        SinkHealth::Healthy => (1.0, 0.0, 0.0),
+        SinkHealth::Degraded(_) => (0.0, 1.0, 0.0),
+        SinkHealth::Down(_) => (0.0, 0.0, 1.0),
+    };
+    metrics.sink_health.get_or_create(&SinkHealthLabel { state: SinkHealthState::healthy }).set(healthy);
+    metrics.sink_health.get_or_create(&SinkHealthLabel { state: SinkHealthState::degraded }).set(degraded);
+    metrics.sink_health.get_or_create(&SinkHealthLabel { state: SinkHealthState::down }).set(down);
 }
 
 // ── Drain thread ──────────────────────────────────────────────────────────────
@@ -167,7 +153,7 @@ fn drain_thread<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
     config: DrainConfig,
-    metrics: Arc<DrainMetrics>,
+    metrics: Arc<Metrics>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -189,7 +175,7 @@ fn drain_thread<S: Sink>(
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
-                metrics.state.store(STATE_DRAINING, Ordering::Relaxed);
+                set_drain_state(&metrics, DrainStateValue::draining);
 
                 let segment = if let Some(p) = pending.pop_front() {
                     p
@@ -208,6 +194,9 @@ fn drain_thread<S: Sink>(
                     &mut dead_letter,
                 ));
 
+                let health = rt.block_on(sink.health());
+                set_sink_health(&metrics, health);
+
                 transition_from_draining(segment, result, &config, &metrics)
             }
 
@@ -217,7 +206,7 @@ fn drain_thread<S: Sink>(
                 retries_left,
                 next_delay,
             } => {
-                metrics.state.store(STATE_RETRYING, Ordering::Relaxed);
+                set_drain_state(&metrics, DrainStateValue::retrying_transient);
                 std::thread::sleep(next_delay);
 
                 if retries_left == 0 {
@@ -254,7 +243,8 @@ fn drain_thread<S: Sink>(
                 segment,
                 blocked_since,
             } => {
-                metrics.state.store(STATE_BLOCKED, Ordering::Relaxed);
+                set_drain_state(&metrics, DrainStateValue::blocked_dead_letter_full);
+                metrics.dead_letter_blocked_duration.set(blocked_since.elapsed().as_secs_f64());
 
                 // Drain new segments into the pending buffer while waiting.
                 // Use recv_timeout in short slices to detect channel disconnection.
@@ -278,9 +268,10 @@ fn drain_thread<S: Sink>(
 
                 // Rescan so external deletions (e.g. operator cleanup) are reflected.
                 let _ = dead_letter.rescan();
+                metrics.dead_letter_bytes_on_disk.set(dead_letter.total_bytes() as f64);
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
                     // Headroom available — retry the preserved segment from the beginning.
-                    *metrics.blocked_since.lock().unwrap() = None;
+                    metrics.dead_letter_blocked_duration.set(0.0);
                     pending.push_front(segment);
                     DrainState::Draining
                 } else if channel_closed {
@@ -308,7 +299,7 @@ fn transition_from_draining(
     segment: PathBuf,
     result: ProcessResult,
     config: &DrainConfig,
-    metrics: &DrainMetrics,
+    metrics: &Metrics,
 ) -> DrainState {
     match result {
         ProcessResult::Confirmed { record_count } => {
@@ -324,25 +315,22 @@ fn transition_from_draining(
     }
 }
 
-fn enter_blocked(segment: PathBuf, metrics: &DrainMetrics) -> DrainState {
+fn enter_blocked(segment: PathBuf, metrics: &Metrics) -> DrainState {
     let blocked_since = Instant::now();
-    metrics
-        .dead_letter_full_total
-        .fetch_add(1, Ordering::Relaxed);
-    *metrics.blocked_since.lock().unwrap() = Some(blocked_since);
-    metrics.state.store(STATE_BLOCKED, Ordering::Relaxed);
+    metrics.dead_letter_full.inc();
+    set_drain_state(metrics, DrainStateValue::blocked_dead_letter_full);
     DrainState::BlockedDeadLetterFull {
         segment,
         blocked_since,
     }
 }
 
-fn confirm_and_delete(sealed: &Path, record_count: u64, metrics: &DrainMetrics) {
+fn confirm_and_delete(sealed: &Path, record_count: u64, metrics: &Metrics) {
     write_confirmed_file(sealed, record_count);
     if let Err(e) = std::fs::remove_file(sealed) {
         warn!(path = %sealed.display(), error = %e, "drain: failed to delete confirmed segment");
     }
-    metrics.segments_drained.fetch_add(1, Ordering::Relaxed);
+    metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::confirmed }).inc();
 }
 
 // ── Segment processing ────────────────────────────────────────────────────────
@@ -351,7 +339,7 @@ async fn process_segment<S: Sink>(
     segment: &Path,
     sink: &S,
     config: &DrainConfig,
-    metrics: &DrainMetrics,
+    metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
 ) -> ProcessResult {
     let reader = match SegmentReader::open(segment) {
@@ -404,7 +392,7 @@ async fn commit_batch<S: Sink>(
     payloads: &[Payload],
     sink: &S,
     config: &DrainConfig,
-    metrics: &DrainMetrics,
+    metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
 ) -> BatchResult {
     // Convert payloads to the sink's record type. Cloning here keeps the original
@@ -415,11 +403,14 @@ async fn commit_batch<S: Sink>(
         .map(S::Record::from_payload)
         .collect();
 
+    let t = std::time::Instant::now();
     match sink.commit(records).await {
         Ok(commit_result) => {
+            metrics.sink_commit_duration.observe(t.elapsed().as_secs_f64());
             metrics
-                .records_committed
-                .fetch_add(commit_result.committed.len() as u64, Ordering::Relaxed);
+                .sink_commit_records
+                .get_or_create(&OutcomeLabel { outcome: Outcome::committed })
+                .inc_by(commit_result.committed.len() as u64);
 
             if !commit_result.dead_lettered.is_empty() {
                 let dead_payloads: Vec<Payload> = commit_result
@@ -436,8 +427,10 @@ async fn commit_batch<S: Sink>(
                 match dead_letter.write_records(&dead_payloads) {
                     Ok(()) => {
                         metrics
-                            .records_dead_lettered
-                            .fetch_add(dead_payloads.len() as u64, Ordering::Relaxed);
+                            .sink_commit_records
+                            .get_or_create(&OutcomeLabel { outcome: Outcome::dead_lettered })
+                            .inc_by(dead_payloads.len() as u64);
+                        metrics.dead_letter_bytes_on_disk.set(dead_letter.total_bytes() as f64);
                     }
                     Err(e) => {
                         error!(error = %e, "drain: failed to write dead-letter records");
@@ -449,12 +442,18 @@ async fn commit_batch<S: Sink>(
         }
 
         Err(e) if e.is_transient() => {
+            metrics.sink_commit_duration.observe(t.elapsed().as_secs_f64());
+            metrics
+                .sink_commit_records
+                .get_or_create(&OutcomeLabel { outcome: Outcome::retried })
+                .inc_by(payloads.len() as u64);
             warn!(error = %e, "drain: transient sink error; will retry segment");
             BatchResult::Transient
         }
 
         Err(e) => {
             // Permanent error — dead-letter the whole batch.
+            metrics.sink_commit_duration.observe(t.elapsed().as_secs_f64());
             error!(error = %e, "drain: permanent sink error; dead-lettering batch");
 
             let estimated = estimated_write_bytes(payloads);
@@ -465,8 +464,10 @@ async fn commit_batch<S: Sink>(
             match dead_letter.write_records(payloads) {
                 Ok(()) => {
                     metrics
-                        .records_dead_lettered
-                        .fetch_add(payloads.len() as u64, Ordering::Relaxed);
+                        .sink_commit_records
+                        .get_or_create(&OutcomeLabel { outcome: Outcome::dead_lettered })
+                        .inc_by(payloads.len() as u64);
+                    metrics.dead_letter_bytes_on_disk.set(dead_letter.total_bytes() as f64);
                 }
                 Err(dl_err) => {
                     error!(error = %dl_err, "drain: failed to write dead-letter records for permanent error");
@@ -529,10 +530,17 @@ fn read_sealed_at_nanos(path: &Path) -> io::Result<i64> {
 mod tests {
     use super::*;
     use crate::{
+        metrics::Metrics,
         sink::{CommitResult, SinkHealth},
         wab::segment::{WabSegment, segment_path},
     };
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
     use weir_core::Payload;
 
     // ── Mock sink ─────────────────────────────────────────────────────────────
@@ -633,6 +641,41 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    fn noop_metrics() -> Arc<Metrics> {
+        Arc::new(Metrics::new().0)
+    }
+
+    fn segments_confirmed(m: &Metrics) -> u64 {
+        m.wab_segments
+            .get_or_create(&SegmentStateLabel { state: SegmentState::confirmed })
+            .get()
+    }
+
+    fn records_committed(m: &Metrics) -> u64 {
+        m.sink_commit_records
+            .get_or_create(&OutcomeLabel { outcome: Outcome::committed })
+            .get()
+    }
+
+    fn records_dead_lettered(m: &Metrics) -> u64 {
+        m.sink_commit_records
+            .get_or_create(&OutcomeLabel { outcome: Outcome::dead_lettered })
+            .get()
+    }
+
+    fn dl_full_count(m: &Metrics) -> u64 {
+        m.dead_letter_full.get()
+    }
+
+    fn drain_is_blocked(m: &Metrics) -> bool {
+        m.drain_state
+            .get_or_create(&DrainStateLabel {
+                state: DrainStateValue::blocked_dead_letter_full,
+            })
+            .get()
+            == 1.0
+    }
+
     fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weir_drain_{label}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -675,7 +718,7 @@ mod tests {
         drain_tx: crossbeam_channel::Sender<PathBuf>,
         sink: Arc<S>,
         config: DrainConfig,
-        metrics: Arc<DrainMetrics>,
+        metrics: Arc<Metrics>,
     ) {
         let handle = spawn(drain_rx, sink, config, metrics);
         drop(drain_tx);
@@ -713,19 +756,13 @@ mod tests {
             b"r1".to_vec(),
             b"r2".to_vec(),
         ])]));
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
 
-        assert!(
-            get_confirmed_path(&sealed).exists(),
-            "confirmed file must exist"
-        );
-        assert!(
-            !sealed.exists(),
-            "sealed segment must be deleted after drain"
-        );
-        assert_eq!(metrics.segments_drained.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.records_committed.load(Ordering::Relaxed), 2);
+        assert!(get_confirmed_path(&sealed).exists(), "confirmed file must exist");
+        assert!(!sealed.exists(), "sealed segment must be deleted after drain");
+        assert_eq!(segments_confirmed(&metrics), 1);
+        assert_eq!(records_committed(&metrics), 2);
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -738,20 +775,12 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([]));
-        run_drain(
-            rx,
-            tx,
-            sink,
-            fast_config(dir.clone()),
-            Arc::new(DrainMetrics::new()),
-        );
+        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
         // Confirmed file should exist; check_confirmed should return true.
         let confirmed = get_confirmed_path(&sealed);
         assert!(confirmed.exists());
         let _ok = crate::wab::recovery::check_confirmed(&sealed, &dir).unwrap();
-        // check_confirmed returns false for a missing *sealed* segment (it was deleted).
-        // Verify the confirmed file was written correctly by parsing it directly.
         let bytes = std::fs::read(&confirmed).unwrap();
         assert!(crate::wab::format::parse_confirmed(&bytes).is_ok());
 
@@ -768,16 +797,12 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([
-            Err(MockError::Transient),            // first attempt
-            MockSink::ok(vec![b"data".to_vec()]), // first retry succeeds
+            Err(MockError::Transient),
+            MockSink::ok(vec![b"data".to_vec()]),
         ]));
-        let metrics = Arc::new(DrainMetrics::new());
-        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
-        assert!(
-            get_confirmed_path(&sealed).exists(),
-            "confirmed after successful retry"
-        );
+        assert!(get_confirmed_path(&sealed).exists(), "confirmed after successful retry");
         assert!(!sealed.exists());
 
         std::fs::remove_dir_all(dir).ok();
@@ -790,24 +815,13 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(sealed.clone()).unwrap();
 
-        // Always transient — initial attempt + MAX_RETRIES retries all fail.
         let responses: Vec<MockResult> = (0..=MAX_RETRIES)
             .map(|_| Err(MockError::Transient))
             .collect();
         let sink = Arc::new(MockSink::with_responses(responses));
-        run_drain(
-            rx,
-            tx,
-            sink,
-            fast_config(dir.clone()),
-            Arc::new(DrainMetrics::new()),
-        );
+        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
-        // Segment should still exist (not confirmed, not deleted).
-        assert!(
-            sealed.exists(),
-            "segment must remain on disk after max retries"
-        );
+        assert!(sealed.exists(), "segment must remain on disk after max retries");
         assert!(!get_confirmed_path(&sealed).exists(), "no confirmed file");
 
         std::fs::remove_dir_all(dir).ok();
@@ -833,19 +847,12 @@ mod tests {
         tx.send(seg1.clone()).unwrap();
         tx.send(seg2.clone()).unwrap();
 
-        // seg1: all transient → exhausted. seg2: ok.
         let mut responses: Vec<MockResult> = (0..=MAX_RETRIES)
             .map(|_| Err(MockError::Transient))
             .collect();
         responses.push(MockSink::ok(vec![b"seg2".to_vec()]));
         let sink = Arc::new(MockSink::with_responses(responses));
-        run_drain(
-            rx,
-            tx,
-            sink,
-            fast_config(dir.clone()),
-            Arc::new(DrainMetrics::new()),
-        );
+        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
         assert!(seg1.exists(), "seg1 left on disk after exhausted retries");
         assert!(!seg2.exists(), "seg2 confirmed and deleted");
@@ -864,26 +871,20 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
 
-        // Segment confirmed and deleted.
         assert!(get_confirmed_path(&sealed).exists());
         assert!(!sealed.exists());
-        assert_eq!(metrics.records_dead_lettered.load(Ordering::Relaxed), 1);
+        assert_eq!(records_dead_lettered(&metrics), 1);
 
-        // Dead-letter dir has a readable segment.
         let dl_dir = dir.join("dead_letter");
         let dl_files: Vec<_> = std::fs::read_dir(&dl_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(
-            !dl_files.is_empty(),
-            "dead-letter directory must not be empty"
-        );
+        assert!(!dl_files.is_empty(), "dead-letter directory must not be empty");
 
-        // All dead-letter records are readable via SegmentReader.
         for entry in &dl_files {
             let path = entry.path();
             if path.to_str().unwrap_or("").ends_with(".wab.sealed") {
@@ -909,11 +910,11 @@ mod tests {
             vec![b"ok_record".to_vec()],
             vec![b"bad_record".to_vec()],
         )]));
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
 
-        assert_eq!(metrics.records_committed.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.records_dead_lettered.load(Ordering::Relaxed), 1);
+        assert_eq!(records_committed(&metrics), 1);
+        assert_eq!(records_dead_lettered(&metrics), 1);
         assert!(get_confirmed_path(&sealed).exists());
 
         std::fs::remove_dir_all(dir).ok();
@@ -926,7 +927,6 @@ mod tests {
         let dir = tmp_dir("blocked");
         let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
 
-        // Pre-fill dead-letter dir with a file to exceed the cap.
         let dl_dir = dir.join("dead_letter");
         std::fs::create_dir_all(&dl_dir).unwrap();
         std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
@@ -934,38 +934,28 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(sealed.clone()).unwrap();
 
-        // Permanent error. Cap = 100 bytes but dead-letter already has 200.
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
         let config = tight_dl_config(dir.clone(), 100);
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
 
         let handle = spawn(rx, sink, config, metrics.clone());
 
-        // Wait for the drain to enter blocked state.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if metrics.state.load(Ordering::Relaxed) == STATE_BLOCKED {
+            if drain_is_blocked(&metrics) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for blocked state"
-            );
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for blocked state");
         }
 
-        assert_eq!(metrics.dead_letter_full_total.load(Ordering::Relaxed), 1);
-        // Segment must not be confirmed while blocked.
+        assert_eq!(dl_full_count(&metrics), 1);
         assert!(!get_confirmed_path(&sealed).exists());
 
-        // Signal shutdown by dropping tx — drain exits without confirming.
         drop(tx);
         handle.join().unwrap();
 
-        assert!(
-            !get_confirmed_path(&sealed).exists(),
-            "segment must not be confirmed on blocked shutdown"
-        );
+        assert!(!get_confirmed_path(&sealed).exists(), "segment must not be confirmed on blocked shutdown");
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -975,7 +965,6 @@ mod tests {
         let dir = tmp_dir("blocked_no_commit");
         let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
 
-        // Pre-fill dead-letter dir to exceed cap.
         let dl_dir = dir.join("dead_letter");
         std::fs::create_dir_all(&dl_dir).unwrap();
         std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
@@ -985,31 +974,22 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
         let config = tight_dl_config(dir.clone(), 100);
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
 
         let handle = spawn(rx, sink.clone(), config, metrics.clone());
 
-        // Wait for blocked state.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if metrics.state.load(Ordering::Relaxed) == STATE_BLOCKED {
+            if drain_is_blocked(&metrics) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for blocked state"
-            );
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for blocked state");
         }
 
         let calls_at_block = sink.call_count();
-        // Wait for several check intervals — commit must not be called again.
         std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(
-            sink.call_count(),
-            calls_at_block,
-            "commit must not be called while blocked"
-        );
+        assert_eq!(sink.call_count(), calls_at_block, "commit must not be called while blocked");
 
         drop(tx);
         handle.join().unwrap();
@@ -1022,7 +1002,6 @@ mod tests {
         let dir = tmp_dir("unblock");
         let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
 
-        // Start with dead-letter dir at cap.
         let dl_dir = dir.join("dead_letter");
         std::fs::create_dir_all(&dl_dir).unwrap();
         let blocking_file = dl_dir.join("dl_00000001.wab.sealed");
@@ -1031,48 +1010,32 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(sealed.clone()).unwrap();
 
-        // First call: Permanent, cap exceeded → blocked.
-        // Second call (after unblock, same segment): ok.
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::Permanent),
             MockSink::ok(vec![b"record".to_vec()]),
         ]));
         let config = tight_dl_config(dir.clone(), 100);
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
 
         let handle = spawn(rx, sink.clone(), config, metrics.clone());
 
-        // Wait for blocked state.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if metrics.state.load(Ordering::Relaxed) == STATE_BLOCKED {
+            if drain_is_blocked(&metrics) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out entering blocked"
-            );
+            assert!(std::time::Instant::now() < deadline, "timed out entering blocked");
         }
 
-        // Clear the blocking file → dead-letter dir is now below cap.
         std::fs::remove_file(&blocking_file).unwrap();
 
-        // Drain should unblock and retry the same segment.
         drop(tx);
         handle.join().unwrap();
 
-        // Segment confirmed and deleted (second attempt succeeded).
-        assert!(
-            get_confirmed_path(&sealed).exists(),
-            "segment must be confirmed after unblock"
-        );
+        assert!(get_confirmed_path(&sealed).exists(), "segment must be confirmed after unblock");
         assert!(!sealed.exists());
-        assert_eq!(
-            sink.call_count(),
-            2,
-            "commit called exactly twice: first attempt + retry"
-        );
+        assert_eq!(sink.call_count(), 2, "commit called exactly twice: first attempt + retry");
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1091,23 +1054,21 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
         let config = tight_dl_config(dir.clone(), 100);
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
         let handle = spawn(rx, sink, config, metrics.clone());
 
-        // Wait for blocked, then wait for multiple check intervals.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if metrics.state.load(Ordering::Relaxed) == STATE_BLOCKED {
+            if drain_is_blocked(&metrics) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
             assert!(std::time::Instant::now() < deadline, "timed out");
         }
-        // Sleep long enough to cover several check intervals (10ms each).
         std::thread::sleep(Duration::from_millis(60));
 
         assert_eq!(
-            metrics.dead_letter_full_total.load(Ordering::Relaxed),
+            dl_full_count(&metrics),
             1,
             "counter must increment exactly once per entry into blocked, not per wake"
         );
@@ -1119,8 +1080,8 @@ mod tests {
     }
 
     #[test]
-    fn blocked_since_set_on_entry_and_cleared_on_exit() {
-        let dir = tmp_dir("blocked_since");
+    fn blocked_duration_set_on_entry_and_cleared_on_exit() {
+        let dir = tmp_dir("blocked_duration");
         let sealed = make_sealed_segment(&dir, 0, &[b"r"]);
 
         let dl_dir = dir.join("dead_letter");
@@ -1136,13 +1097,13 @@ mod tests {
             MockSink::ok(vec![b"r".to_vec()]),
         ]));
         let config = tight_dl_config(dir.clone(), 100);
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
         let handle = spawn(rx, sink, config, metrics.clone());
 
-        // Wait for blocked_since to be set.
+        // Wait for drain to enter blocked state.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if metrics.blocked_since.lock().unwrap().is_some() {
+            if drain_is_blocked(&metrics) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1154,21 +1115,29 @@ mod tests {
         drop(tx);
         handle.join().unwrap();
 
-        // blocked_since reset to None after exit.
-        assert!(
-            metrics.blocked_since.lock().unwrap().is_none(),
-            "blocked_since must be None after unblocking"
+        // After unblocking, drain_state{blocked} must be 0 and blocked_duration reset to 0.
+        assert!(!drain_is_blocked(&metrics), "drain must not be blocked after unblocking");
+        assert_eq!(
+            metrics.dead_letter_blocked_duration.get(),
+            0.0,
+            "blocked_duration must be zero after unblocking"
         );
 
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn drain_state_only_one_value_active_at_any_time() {
-        // This is a structural property of the constants — each state is a distinct u8.
-        assert_ne!(STATE_DRAINING, STATE_RETRYING);
-        assert_ne!(STATE_DRAINING, STATE_BLOCKED);
-        assert_ne!(STATE_RETRYING, STATE_BLOCKED);
+    fn drain_state_gauge_reflects_active_state() {
+        // Structural check: set_drain_state sets exactly one gauge to 1.0.
+        let (m, _reg) = Metrics::new();
+        set_drain_state(&m, DrainStateValue::draining);
+        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::draining }).get(), 1.0);
+        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::retrying_transient }).get(), 0.0);
+        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::blocked_dead_letter_full }).get(), 0.0);
+
+        set_drain_state(&m, DrainStateValue::blocked_dead_letter_full);
+        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::draining }).get(), 0.0);
+        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::blocked_dead_letter_full }).get(), 1.0);
     }
 
     // ── max_batch_size ────────────────────────────────────────────────────────
@@ -1180,23 +1149,12 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(sealed.clone()).unwrap();
 
-        // max_batch_size = 2: 5 records → 3 commit calls (2+2+1).
         let sink = Arc::new(MockSink::with_batch_size(2, []));
-        let metrics = Arc::new(DrainMetrics::new());
-        run_drain(
-            rx,
-            tx,
-            sink.clone(),
-            fast_config(dir.clone()),
-            metrics.clone(),
-        );
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
 
-        assert_eq!(
-            sink.call_count(),
-            3,
-            "5 records with batch=2 → 3 commit calls"
-        );
-        assert_eq!(metrics.records_committed.load(Ordering::Relaxed), 5);
+        assert_eq!(sink.call_count(), 3, "5 records with batch=2 → 3 commit calls");
+        assert_eq!(records_committed(&metrics), 5);
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1211,13 +1169,7 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
-        run_drain(
-            rx,
-            tx,
-            sink,
-            fast_config(dir.clone()),
-            Arc::new(DrainMetrics::new()),
-        );
+        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
         let dl_dir = dir.join("dead_letter");
         let dl_files: Vec<PathBuf> = std::fs::read_dir(&dl_dir)
@@ -1248,12 +1200,7 @@ mod tests {
         let dir = tmp_dir("exit");
         let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
         let sink = Arc::new(MockSink::with_responses([]));
-        let handle = spawn(
-            rx,
-            sink,
-            fast_config(dir.clone()),
-            Arc::new(DrainMetrics::new()),
-        );
+        let handle = spawn(rx, sink, fast_config(dir.clone()), noop_metrics());
         drop(tx);
         let done = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < done {
@@ -1279,13 +1226,12 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
         let config = tight_dl_config(dir.clone(), 100);
-        let metrics = Arc::new(DrainMetrics::new());
+        let metrics = noop_metrics();
         let handle = spawn(rx, sink, config, metrics.clone());
 
-        // Wait for blocked state then drop sender (shutdown signal).
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if metrics.state.load(Ordering::Relaxed) == STATE_BLOCKED {
+            if drain_is_blocked(&metrics) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1295,14 +1241,8 @@ mod tests {
         drop(tx);
         handle.join().unwrap();
 
-        assert!(
-            !get_confirmed_path(&sealed).exists(),
-            "segment must NOT be confirmed on blocked shutdown"
-        );
-        assert!(
-            sealed.exists(),
-            "segment must still exist after blocked shutdown"
-        );
+        assert!(!get_confirmed_path(&sealed).exists(), "segment must NOT be confirmed on blocked shutdown");
+        assert!(sealed.exists(), "segment must still exist after blocked shutdown");
 
         std::fs::remove_dir_all(dir).ok();
     }

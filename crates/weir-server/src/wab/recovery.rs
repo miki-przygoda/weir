@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use tracing::{error, info, warn};
@@ -11,12 +12,13 @@ use super::format::{
     SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed, unix_nanos_now,
 };
 use super::segment::sealed_path_for;
+use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
 /// Scans all shard directories under `wab_dir` and runs crash recovery on any
 /// unsealed `.wab` files found. Sealed files are left untouched by this function;
 /// the replay pass (in `spawn`) handles those.
-pub fn recover_open_segments(wab_dir: &Path) -> io::Result<()> {
+pub fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
     for entry in fs::read_dir(wab_dir)? {
         let entry = entry?;
         let shard_dir = entry.path();
@@ -27,12 +29,12 @@ pub fn recover_open_segments(wab_dir: &Path) -> io::Result<()> {
         if name == "quarantine" {
             continue;
         }
-        recover_shard_dir(&shard_dir, wab_dir)?;
+        recover_shard_dir(&shard_dir, wab_dir, metrics)?;
     }
     Ok(())
 }
 
-fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path) -> io::Result<()> {
+fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
     for entry in fs::read_dir(shard_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -40,7 +42,7 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path) -> io::Result<()> {
             && path.to_string_lossy().ends_with(EXT_ACTIVE)
         {
             info!(path = %path.display(), "recovering unsealed WAB segment");
-            match recover_segment(&path, wab_dir) {
+            match recover_segment(&path, wab_dir, metrics) {
                 Ok(sealed) => {
                     info!(sealed = %sealed.display(), "recovery complete");
                 }
@@ -61,7 +63,7 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path) -> io::Result<()> {
 ///
 /// If the header has bad magic or an unknown version, the segment is quarantined
 /// rather than silently skipped or left in place.
-pub fn recover_segment(path: &Path, wab_dir: &Path) -> io::Result<PathBuf> {
+pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<PathBuf> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -89,6 +91,8 @@ pub fn recover_segment(path: &Path, wab_dir: &Path) -> io::Result<PathBuf> {
             &header_buf[0..4]
         );
         quarantine(path, wab_dir, &reason)?;
+        metrics.recovery_segments_quarantined.inc();
+        metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::quarantined }).inc();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{}: quarantined — {reason}", path.display()),
@@ -101,6 +105,8 @@ pub fn recover_segment(path: &Path, wab_dir: &Path) -> io::Result<PathBuf> {
             header_buf[4]
         );
         quarantine(path, wab_dir, &reason)?;
+        metrics.recovery_segments_quarantined.inc();
+        metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::quarantined }).inc();
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{}: quarantined — {reason}", path.display()),
@@ -303,6 +309,7 @@ pub fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
     use crate::wab::format::build_confirmed;
     use std::fs;
 
@@ -311,6 +318,10 @@ mod tests {
             std::env::temp_dir().join(format!("weir_recovery_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn noop_metrics() -> Arc<Metrics> {
+        Arc::new(Metrics::new().0)
     }
 
     fn make_segment(dir: &Path, shard_id: u16, payloads: &[&[u8]]) -> PathBuf {
@@ -327,7 +338,7 @@ mod tests {
     fn recovery_seals_a_clean_segment() {
         let dir = tmp_dir("clean");
         let path = make_segment(&dir, 0, &[b"alpha", b"beta", b"gamma"]);
-        let sealed = recover_segment(&path, &dir).unwrap();
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
         assert!(sealed.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
         assert!(!path.exists());
@@ -338,7 +349,7 @@ mod tests {
     fn recovery_handles_empty_segment() {
         let dir = tmp_dir("empty");
         let path = make_segment(&dir, 0, &[]);
-        let sealed = recover_segment(&path, &dir).unwrap();
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
         assert!(sealed.exists());
         // Read back — should yield zero records.
         let mut reader = crate::wab::SegmentReader::open(&sealed).unwrap();
@@ -363,7 +374,7 @@ mod tests {
             .unwrap();
         assert!(fs::metadata(&path).unwrap().len() < file_len);
 
-        let sealed = recover_segment(&path, &dir).unwrap();
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
 
         // Recovery should have recovered exactly 2 records.
         let records: Vec<Vec<u8>> = crate::wab::SegmentReader::open(&sealed)
@@ -386,8 +397,10 @@ mod tests {
         f.write_all(b"XXXX").unwrap();
         drop(f);
 
-        let result = recover_segment(&path, &dir);
+        let metrics = noop_metrics();
+        let result = recover_segment(&path, &dir, &metrics);
         assert!(result.is_err());
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
         // Original path should be gone (quarantined).
         assert!(!path.exists());
         // Quarantine dir should contain it.
