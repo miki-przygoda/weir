@@ -195,7 +195,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.block_on(async {
         // Bind metrics listener before starting the socket loop.
         let metrics_listener =
-            tokio::net::TcpListener::bind(("127.0.0.1", config.metrics_port)).await?;
+            tokio::net::TcpListener::bind(("0.0.0.0", config.metrics_port)).await?;
         metrics::server::spawn(metrics_listener, Arc::clone(&registry));
 
         info!(port = config.metrics_port, "metrics endpoint listening");
