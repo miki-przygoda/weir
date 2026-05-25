@@ -123,7 +123,6 @@ jobs:
           fi
 
           docker stop weir-smoke
-          rm -rf "$SMOKE"
           echo "✓ Smoke test passed"
 
   # ── Push to the registry only after the smoke test clears ─────────────────
