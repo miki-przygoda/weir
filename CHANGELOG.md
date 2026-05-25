@@ -10,7 +10,7 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
-## [Unreleased]
+## [0.3.0] - 2026-05-25
 
 ### Added
 
@@ -159,4 +159,5 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
+[0.3.0]: https://github.com/miki-przygoda/weir/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/miki-przygoda/weir/compare/v0.1.0...v0.2.0
