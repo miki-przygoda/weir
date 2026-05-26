@@ -423,6 +423,121 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ---
 
+### Sink selection
+
+Weir ships with two built-in sinks. The `noop` sink is the default; the
+`http` sink POSTs each record to a configurable URL with transient /
+permanent error classification.
+
+#### `sink_type`
+
+- **Type**: string (`"noop"` or `"http"`)
+- **Default**: `"noop"`
+- **CLI**: `--sink-type <value>`
+- **Env**: `WEIR_SINK_TYPE`
+- **TOML**: `sink_type`
+
+Which built-in sink to run.
+
+- `"noop"` — accepts every record, forwards nothing. Use for soak-testing
+  the daemon pipeline without a downstream, or as a known-good sink in
+  integration tests.
+- `"http"` — POSTs records to `sink_url`. See classification rules below.
+
+**When to change**: set to `"http"` once a real downstream is available;
+leave at `"noop"` until then.
+
+---
+
+#### `sink_url`
+
+- **Type**: URL string
+- **Default**: none (required when `sink_type = "http"`)
+- **Validation**: parsed at startup; invalid URLs fail fast.
+- **CLI**: `--sink-url <url>`
+- **Env**: `WEIR_SINK_URL`
+- **TOML**: `sink_url`
+
+The HTTP endpoint that receives one POST per record. The body is the raw
+payload bytes; `Content-Type` is `application/octet-stream`. The endpoint
+is expected to return:
+
+- **2xx** for accepted records → committed
+- **4xx (except 408, 429)** for rejected records → dead-lettered
+- **408, 429, 5xx** for retryable failures → drain retries the whole
+  segment with exponential backoff (up to `MAX_RETRIES`)
+
+Network-layer failures (connect refused, DNS failure, timeout) are
+treated as transient.
+
+**Idempotency**: the drain guarantees at-least-once delivery per
+segment, so the endpoint **must** handle duplicates gracefully
+(idempotency key, upsert, dedup). This is documented in the `Sink`
+trait and applies to every sink, but is especially relevant for HTTP
+endpoints where retries cross a network boundary.
+
+---
+
+#### `sink_timeout_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `10`
+- **Range**: 1–300
+- **CLI**: `--sink-timeout-secs <n>`
+- **Env**: `WEIR_SINK_TIMEOUT_SECS`
+- **TOML**: `sink_timeout_secs`
+
+Per-request timeout for the HTTP sink. Applies to the whole request
+(connect + send + receive). On timeout, the request is classified as a
+transient transport error and the drain retries.
+
+**When to tune**: lower if the endpoint is local / sub-millisecond and a
+stuck request shouldn't block other records; higher for slow endpoints
+that legitimately take seconds (some logging ingesters do).
+
+---
+
+#### `sink_max_batch_size`
+
+- **Type**: usize
+- **Default**: `100`
+- **Range**: 1–10000
+- **CLI**: `--sink-max-batch-size <n>`
+- **Env**: `WEIR_SINK_MAX_BATCH_SIZE`
+- **TOML**: `sink_max_batch_size`
+
+Maximum records the drain hands to a single `Sink::commit` call. The
+HTTP sink iterates records inside `commit` (one POST per record), so
+this also caps the longest contiguous run of POSTs before the drain
+re-checks its shutdown signal and dead-letter state.
+
+**When to tune**: lower for endpoints that prefer many small calls; the
+default 100 is a balanced point for most deployments.
+
+---
+
+#### `WEIR_SINK_BEARER_TOKEN` (env-only)
+
+- **Type**: string
+- **Default**: none
+- **Env**: `WEIR_SINK_BEARER_TOKEN`
+- **TOML**: deliberately **not** supported
+
+Optional bearer token sent as `Authorization: Bearer <token>` with each
+HTTP-sink request.
+
+**Why env-only**: bearer tokens are secrets. Putting them in a config
+file invites accidental commits to git, inclusion in container image
+layers, and exposure via `cat /etc/weir/weir.toml` to anyone who can
+read the file. Env vars don't have those failure modes by default.
+Containers should source the token from a secrets manager (Kubernetes
+`Secret`, AWS Secrets Manager, HashiCorp Vault) into the env at start.
+
+The token is also redacted from `HttpSinkConfig`'s `Debug` impl so it
+never reaches a log line via accidental `?config` interpolation.
+
+---
+
 ### Logging
 
 #### `log_level`
@@ -468,6 +583,7 @@ The daemon will:
 - Use the (256, 1ms) batch defaults
 - Cap connections at 256, payload at 16 MiB
 - Drop idle connections after 30s
+- Use the `noop` sink (accepts all records, forwards nothing)
 - Run with log level `info`
 
 For container deployments, the same config can come entirely from env
@@ -512,6 +628,14 @@ shutdown_timeout_secs = 40
 # Bigger dead-letter cap; operator response loop can be 30+ minutes.
 dead_letter_max_bytes           = 5_368_709_120  # 5 GiB
 dead_letter_check_interval_secs = 60
+
+# Forward records to an internal ingest endpoint via HTTP.
+# Bearer token comes from $WEIR_SINK_BEARER_TOKEN in the unit's
+# Environment= file, not from this config.
+sink_type           = "http"
+sink_url            = "https://ingest.internal.example.com/weir"
+sink_timeout_secs   = 5
+sink_max_batch_size = 200
 
 log_level = "info"
 ```

@@ -69,6 +69,26 @@ impl std::error::Error for ConfigError {
     }
 }
 
+/// Which built-in sink the daemon should run with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkType {
+    Noop,
+    Http,
+}
+
+impl SinkType {
+    fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "noop" => Ok(SinkType::Noop),
+            "http" => Ok(SinkType::Http),
+            other => Err(ConfigError::InvalidValue {
+                field: "sink_type",
+                reason: format!("'{other}' is not a valid sink type; expected 'noop' or 'http'"),
+            }),
+        }
+    }
+}
+
 // ── Partial config (one layer) ────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -84,6 +104,10 @@ pub(crate) struct PartialConfig {
     pub metrics_port: Option<u16>,
     pub shutdown_timeout_secs: Option<u64>,
     pub connection_read_timeout_secs: Option<u64>,
+    pub sink_type: Option<String>,
+    pub sink_url: Option<String>,
+    pub sink_timeout_secs: Option<u64>,
+    pub sink_max_batch_size: Option<usize>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
@@ -112,6 +136,10 @@ pub struct Config {
     pub metrics_port: u16,
     pub shutdown_timeout_secs: u64,
     pub connection_read_timeout_secs: u64,
+    pub sink_type: SinkType,
+    pub sink_url: Option<String>,
+    pub sink_timeout_secs: u64,
+    pub sink_max_batch_size: usize,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -212,6 +240,25 @@ impl Config {
             600,
         )?;
 
+        // ── Sink ──────────────────────────────────────────────────────────────
+
+        let sink_type_str = merge!(sink_type).unwrap_or_else(|| "noop".to_string());
+        let sink_type = SinkType::parse(&sink_type_str)?;
+
+        let sink_url = merge!(sink_url);
+        if sink_type == SinkType::Http && sink_url.as_deref().unwrap_or("").is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_url",
+                reason: "sink_url must be set when sink_type = \"http\"".into(),
+            });
+        }
+
+        let sink_timeout_secs = merge!(sink_timeout_secs).unwrap_or(10);
+        check_range("sink_timeout_secs", sink_timeout_secs as usize, 1, 300)?;
+
+        let sink_max_batch_size = merge!(sink_max_batch_size).unwrap_or(100);
+        check_range("sink_max_batch_size", sink_max_batch_size, 1, 10_000)?;
+
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
@@ -249,6 +296,10 @@ impl Config {
             metrics_port,
             shutdown_timeout_secs,
             connection_read_timeout_secs,
+            sink_type,
+            sink_url,
+            sink_timeout_secs,
+            sink_max_batch_size,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,
@@ -378,6 +429,10 @@ mod tests {
         assert_eq!(c.metrics_port, 9185);
         assert_eq!(c.shutdown_timeout_secs, 30);
         assert_eq!(c.connection_read_timeout_secs, 30);
+        assert_eq!(c.sink_type, SinkType::Noop);
+        assert_eq!(c.sink_url, None);
+        assert_eq!(c.sink_timeout_secs, 10);
+        assert_eq!(c.sink_max_batch_size, 100);
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");

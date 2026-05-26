@@ -14,6 +14,31 @@ changes are tracked separately under **Wire protocol** below.
 
 ### Added
 
+- **`HttpSink` — first real sink implementation**
+  (`crates/weir-server/src/sink/http.rs`). Replaces the placeholder
+  `NoopSink` as the recommended production sink. POSTs each record as an
+  `application/octet-stream` body to a configurable URL, with strict
+  transient/permanent classification:
+  - 2xx → committed
+  - 4xx (except 408 and 429) → dead-lettered with a body excerpt for
+    operator debugging
+  - 408, 429, 5xx, connect/timeout/transport failures → transient
+    (drain retries the whole segment via the existing exponential
+    backoff)
+  Holds a reusable `reqwest::Client` (rustls TLS — no system OpenSSL
+  dependency) with keep-alive pooling. Optional bearer token via
+  `WEIR_SINK_BEARER_TOKEN` env var; never sourced from config files
+  and redacted from `Debug` output. New config options
+  `sink_type` (`"noop"` | `"http"`, default `"noop"`), `sink_url`,
+  `sink_timeout_secs` (default 10, range 1-300),
+  `sink_max_batch_size` (default 100, range 1-10_000), wired through
+  CLI / env / file / defaults. 12 unit tests covering happy path,
+  every classification bucket, connect-refused, mixed batch outcomes,
+  and transient-mid-batch retry semantics. Documented in
+  `docs/operations/configuration.md` (full reference with bearer-token
+  security rationale).
+- **`sink::noop::NoopSink`** extracted from `main.rs` into its own
+  module for symmetry with the new `sink::http::HttpSink`.
 - **Hardened socket bind sequence** (`bind_hardened` in
   `crates/weir-server/src/socket/mod.rs`). Replaces the original
   `lstat → check → remove → bind → set_permissions` pattern with a

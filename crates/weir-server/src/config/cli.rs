@@ -71,6 +71,14 @@ pub(super) fn parse_from(
         connection_read_timeout_secs: pargs
             .opt_value_from_str("--connection-read-timeout")
             .map_err(pico_err)?,
+        sink_type: pargs.opt_value_from_str("--sink-type").map_err(pico_err)?,
+        sink_url: pargs.opt_value_from_str("--sink-url").map_err(pico_err)?,
+        sink_timeout_secs: pargs
+            .opt_value_from_str("--sink-timeout-secs")
+            .map_err(pico_err)?,
+        sink_max_batch_size: pargs
+            .opt_value_from_str("--sink-max-batch-size")
+            .map_err(pico_err)?,
         dead_letter_max_bytes: pargs
             .opt_value_from_str("--dead-letter-max-bytes")
             .map_err(pico_err)?,

@@ -1,4 +1,11 @@
-//! Sink trait and supporting types.
+//! Sink trait, error contract, and built-in implementations.
+//!
+//! Built-in sinks:
+//! - [`noop::NoopSink`] — accepts all records, forwards nothing. The default
+//!   when `sink_type = "noop"`. Useful for soak-testing the daemon pipeline
+//!   without a real downstream.
+//! - [`http::HttpSink`] — POSTs each record to a configurable URL with
+//!   transient/permanent error classification. Use when `sink_type = "http"`.
 //!
 //! A `Sink` receives batches of records from the drain and commits them to a
 //! downstream store. Implementations decide their own connection management and
@@ -19,6 +26,9 @@
 //! generic over `S: Sink` and stores `Arc<S>`, so no `dyn Sink` is needed. Using
 //! `dyn Sink` with AFIT requires boxing the returned futures, which is left to the
 //! caller if they need type erasure.
+
+pub mod http;
+pub mod noop;
 
 use weir_core::Payload;
 
@@ -56,6 +66,7 @@ pub trait SinkError: Send + Sync + std::error::Error + 'static {
 ///
 /// `committed`: records that were accepted by the sink.
 /// `dead_lettered`: records the sink permanently rejected, with a reason string.
+#[derive(Debug)]
 pub struct CommitResult<R> {
     pub committed: Vec<R>,
     pub dead_lettered: Vec<(R, String)>,

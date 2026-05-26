@@ -13,51 +13,12 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use tracing::info;
 
-use config::Config;
+use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
-use sink::{CommitResult, Sink, SinkError, SinkHealth};
+use sink::http::{HttpSink, HttpSinkConfig};
+use sink::noop::NoopSink;
 use wab::WabRecord;
-use weir_core::Payload;
-
-// ── NoopSink ──────────────────────────────────────────────────────────────────
-
-/// Placeholder sink that accepts all records. Replace with a real sink
-/// implementation once downstream targets are wired up.
-struct NoopSink;
-
-#[derive(Debug)]
-struct NoopError;
-
-impl std::fmt::Display for NoopError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "noop error (unreachable)")
-    }
-}
-
-impl std::error::Error for NoopError {}
-
-impl SinkError for NoopError {
-    fn is_transient(&self) -> bool {
-        false
-    }
-}
-
-impl Sink for NoopSink {
-    type Record = Payload;
-    type Error = NoopError;
-
-    async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, NoopError> {
-        Ok(CommitResult {
-            committed: batch,
-            dead_lettered: vec![],
-        })
-    }
-
-    async fn health(&self) -> SinkHealth {
-        SinkHealth::Healthy
-    }
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -198,12 +159,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_retry_delay: Duration::from_millis(100),
         max_retries: MAX_RETRIES,
     };
-    let drain_handle = drain::spawn(
-        drain_rx,
-        Arc::new(NoopSink),
-        drain_config,
-        Arc::clone(&metrics),
-    );
+    // Sink selection. drain::spawn is generic over the sink type but returns
+    // the same JoinHandle<()> regardless, so both arms produce a uniform
+    // drain_handle for the join sequence later in this function.
+    let drain_handle = match config.sink_type {
+        SinkType::Noop => {
+            info!("sink: noop (records committed-and-forgotten)");
+            drain::spawn(
+                drain_rx,
+                Arc::new(NoopSink),
+                drain_config,
+                Arc::clone(&metrics),
+            )
+        }
+        SinkType::Http => {
+            let url = config
+                .sink_url
+                .clone()
+                .expect("config validation guarantees sink_url is set when sink_type = Http");
+            // Bearer token read from env at startup (never from config file).
+            // Logged only as a presence boolean — the token itself never reaches
+            // a log line.
+            let bearer_token = std::env::var("WEIR_SINK_BEARER_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .map(Arc::from);
+            info!(
+                url = %url,
+                bearer = bearer_token.is_some(),
+                timeout_secs = config.sink_timeout_secs,
+                max_batch_size = config.sink_max_batch_size,
+                "sink: http"
+            );
+            let http_cfg = HttpSinkConfig {
+                url,
+                timeout: Duration::from_secs(config.sink_timeout_secs),
+                max_batch_size: config.sink_max_batch_size,
+                bearer_token,
+            };
+            let sink = HttpSink::new(http_cfg).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
+            })?;
+            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+        }
+    };
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
 

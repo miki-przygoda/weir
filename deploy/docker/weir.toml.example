@@ -74,6 +74,34 @@ dead_letter_max_bytes = 1073741824
 # Env: WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS
 dead_letter_check_interval_secs = 30
 
+# ── Sink selection ────────────────────────────────────────────────────────────
+
+# Which built-in sink to run. One of:
+#   "noop"  — accepts records, forwards nothing (default, useful for soak tests)
+#   "http"  — POSTs each record to sink_url (set sink_url below)
+# Env: WEIR_SINK_TYPE
+sink_type = "noop"
+
+# Required when sink_type = "http". The endpoint receives one POST per record
+# with Content-Type: application/octet-stream and the raw payload as body.
+# Env: WEIR_SINK_URL
+# sink_url = "https://example.com/ingest"
+
+# Per-request timeout for the HTTP sink, in seconds. Range: 1-300.
+# Env: WEIR_SINK_TIMEOUT_SECS
+sink_timeout_secs = 10
+
+# Maximum records the drain hands to a single Sink::commit call. The HTTP
+# sink iterates records inside commit, so this also caps the longest run
+# of consecutive POSTs before the drain re-checks shutdown. Range: 1-10000.
+# Env: WEIR_SINK_MAX_BATCH_SIZE
+sink_max_batch_size = 100
+
+# Bearer token for the HTTP sink. NEVER set this in the config file —
+# it must come from the environment so it doesn't end up in version control,
+# logs, or container image layers.
+# Env: WEIR_SINK_BEARER_TOKEN
+
 # Log level for tracing-subscriber. One of: trace, debug, info, warn, error,
 # or any EnvFilter directive (e.g. "weir_server=debug,info").
 # Env: WEIR_LOG_LEVEL (RUST_LOG also recognised as a fallback)
