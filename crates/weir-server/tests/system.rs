@@ -718,11 +718,11 @@ fn metrics_endpoint_responds_with_openmetrics_content() {
 }
 
 #[test]
-fn metrics_all_18_families_registered() {
+fn metrics_all_19_families_registered() {
     let srv = ServerHandle::start("metrics_families");
     let body = srv.scrape_metrics();
 
-    // All 18 metric families must appear in the output as # HELP lines.
+    // All 19 metric families must appear in the output as # HELP lines.
     // Data lines only appear for pre-initialised gauges and histograms;
     // counter families that haven't been incremented yet show only HELP/TYPE.
     for family in [
@@ -740,6 +740,7 @@ fn metrics_all_18_families_registered() {
         "weir_queue_depth",
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
+        "weir_wab_unexpected_mode",
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
         "weir_drain_state",

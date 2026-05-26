@@ -29,9 +29,53 @@ pub fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Resu
         if name == "quarantine" {
             continue;
         }
+        audit_segment_modes(&shard_dir, metrics);
         recover_shard_dir(&shard_dir, wab_dir, metrics)?;
     }
     Ok(())
+}
+
+/// Walks a shard directory and warns about any `.wab`, `.wab.sealed`, or
+/// `.wab.confirmed` file whose permissions are not exactly 0o600.
+///
+/// Defense-in-depth: segments are created with mode 0o600 via
+/// `OpenOptions::mode(0o600)` and the shard directory is 0o700, so a wider
+/// mode here means either an operator copied a segment in with wrong perms
+/// or something tampered with the WAB. We log a warning and bump
+/// `weir_wab_unexpected_mode_total` so it's alertable, but do not refuse
+/// to start — recovery on a slightly-wide segment is safer than refusing to
+/// run and dropping all in-flight durability.
+fn audit_segment_modes(shard_dir: &Path, metrics: &Arc<Metrics>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(entries) = fs::read_dir(shard_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_segment = name.ends_with(EXT_ACTIVE)
+                || name.ends_with(EXT_SEALED)
+                || name.ends_with(EXT_CONFIRMED);
+            if !is_segment {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                warn!(
+                    path = %path.display(),
+                    actual_mode = format!("{mode:#o}"),
+                    expected_mode = "0o600",
+                    "WAB segment file has unexpected permissions; possible tampering or operator error"
+                );
+                metrics.wab_unexpected_mode.inc();
+            }
+        }
+    }
+    let _ = shard_dir;
+    let _ = metrics;
 }
 
 fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
@@ -474,6 +518,54 @@ mod tests {
             err.to_string().contains("99"),
             "error should mention the version byte"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_segment_modes_flags_wide_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("mode_audit");
+        // Create three segment-shaped files: one correct (0o600), two wide.
+        let good = dir.join("seg_00000001.wab.sealed");
+        let wide1 = dir.join("seg_00000002.wab.sealed");
+        let wide2 = dir.join("seg_00000003.wab.confirmed");
+        let unrelated = dir.join("README"); // not a segment, must not trigger
+        fs::write(&good, b"x").unwrap();
+        fs::write(&wide1, b"x").unwrap();
+        fs::write(&wide2, b"x").unwrap();
+        fs::write(&unrelated, b"x").unwrap();
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&wide1, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&wide2, fs::Permissions::from_mode(0o660)).unwrap();
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (m, _reg) = Metrics::new();
+        let metrics = Arc::new(m);
+        audit_segment_modes(&dir, &metrics);
+
+        assert_eq!(
+            metrics.wab_unexpected_mode.get(),
+            2,
+            "audit must flag the two wide-mode segments and ignore README + the correct file"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_segment_modes_clean_dir_increments_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("mode_audit_clean");
+        let path = dir.join("seg_00000001.wab.sealed");
+        fs::write(&path, b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (m, _reg) = Metrics::new();
+        let metrics = Arc::new(m);
+        audit_segment_modes(&dir, &metrics);
+
+        assert_eq!(metrics.wab_unexpected_mode.get(), 0);
         fs::remove_dir_all(dir).ok();
     }
 }

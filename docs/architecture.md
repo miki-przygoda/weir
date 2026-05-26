@@ -147,7 +147,7 @@ BlockedDeadLetterFull
 
 ### Metrics (`src/metrics/`)
 
-18 Prometheus metrics registered with a `prometheus-client` registry. `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
+19 Prometheus metrics registered with a `prometheus-client` registry. `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -165,6 +165,7 @@ BlockedDeadLetterFull
 | `weir_queue_depth` | gauge | Work queue occupancy |
 | `weir_recovery_records_replayed_total` | counter | Records replayed on startup |
 | `weir_recovery_segments_quarantined_total` | counter | Segments quarantined on startup |
+| `weir_wab_unexpected_mode_total` | counter | WAB segment files seen during recovery with permissions ≠ 0o600 (tampering / operator-error signal) |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size |
 | `weir_dead_letter_full_total` | counter | Distinct `BlockedDeadLetterFull` entries |
 | `weir_drain_state{state}` | gauge | Drain state (exactly one label = 1) |
