@@ -2,9 +2,12 @@
 # Copy to /etc/weir/weir.toml and adjust for your deployment.
 # All fields are optional; values shown are the built-in defaults.
 # Precedence: CLI flags > environment variables (WEIR_*) > this file > defaults.
+#
+# Full reference: docs/operations/configuration.md
 
 [server]
 # Path to the Unix domain socket. Must be absolute.
+# The parent directory must exist and be writable only by the daemon user.
 # Env: WEIR_SOCKET_PATH
 socket_path = "/run/weir/weir.sock"
 
@@ -14,6 +17,7 @@ socket_path = "/run/weir/weir.sock"
 wab_dir = "/var/lib/weir/wab"
 
 # Number of WAB shards (one flusher thread per shard). Range: 1-256.
+# Default 1 is correct for single-disk deployments.
 # Env: WEIR_SHARD_COUNT
 shard_count = 1
 
@@ -22,12 +26,14 @@ shard_count = 1
 worker_count = 2
 
 # Maximum records per flush batch. Range: 1-100000.
+# Default 256 is the sweet spot from docs/benchmarks/batch-tuning.md.
 # Env: WEIR_BATCH_SIZE
-batch_size = 1000
+batch_size = 256
 
 # Maximum time (ms) to accumulate a batch before flushing. Range: 1-60000.
+# Default 1 minimises tail latency; raise for pure-throughput workloads.
 # Env: WEIR_BATCH_DEADLINE_MS
-batch_deadline_ms = 100
+batch_deadline_ms = 1
 
 # Maximum concurrent producer connections. Range: 1-512.
 # Must be <= the tokio blocking thread pool limit (default 512) because each
@@ -35,16 +41,24 @@ batch_deadline_ms = 100
 # Env: WEIR_MAX_CONNECTIONS
 max_connections = 256
 
+# Maximum time (seconds) a connection handler may sit in read_exact waiting
+# for the next byte before being dropped. Slowloris guard. Range: 1-600.
+# Env: WEIR_CONNECTION_READ_TIMEOUT_SECS
+connection_read_timeout_secs = 30
+
 # Maximum payload size per record in bytes. Cannot exceed 16 MiB (hard cap).
 # Env: WEIR_MAX_PAYLOAD_BYTES
 max_payload_bytes = 16777216
 
-# Port for the Prometheus /metrics HTTP endpoint (binds to 127.0.0.1).
+# Port for the Prometheus /metrics HTTP endpoint.
+# Binds to 0.0.0.0:{metrics_port} for container/sidecar visibility.
+# Restrict access via firewall rules or port-mapping, not the bind address.
 # Env: WEIR_METRICS_PORT
 metrics_port = 9185
 
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.
+# Set <= the orchestrator's terminationGracePeriodSeconds minus a few seconds.
 # Env: WEIR_SHUTDOWN_TIMEOUT_SECS
 shutdown_timeout_secs = 30
 
@@ -60,6 +74,42 @@ dead_letter_max_bytes = 1073741824
 # Env: WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS
 dead_letter_check_interval_secs = 30
 
-# Log level for tracing-subscriber. One of: trace, debug, info, warn, error.
-# Env: WEIR_LOG_LEVEL
+# ── Sink selection ────────────────────────────────────────────────────────────
+
+# Which built-in sink to run. One of:
+#   "noop"  — accepts records, forwards nothing (default, useful for soak tests)
+#   "http"  — POSTs each record to sink_url (set sink_url below)
+# Env: WEIR_SINK_TYPE
+sink_type = "noop"
+
+# Required when sink_type = "http". The endpoint receives one POST per record
+# with Content-Type: application/octet-stream and the raw payload as body.
+# Env: WEIR_SINK_URL
+# sink_url = "https://example.com/ingest"
+
+# Per-request timeout for the HTTP sink, in seconds. Range: 1-300.
+# Env: WEIR_SINK_TIMEOUT_SECS
+sink_timeout_secs = 10
+
+# Maximum records the drain hands to a single Sink::commit call. The HTTP
+# sink iterates records inside commit, so this also caps the longest run
+# of consecutive POSTs before the drain re-checks shutdown. Range: 1-10000.
+# Env: WEIR_SINK_MAX_BATCH_SIZE
+sink_max_batch_size = 100
+
+# Send `Idempotency-Key: sha256:<hex>` of the payload with each HTTP request
+# so the endpoint can dedupe retries. The drain delivers at-least-once per
+# segment, so retries re-POST records that may have already been accepted.
+# Set false only if your endpoint can't tolerate the extra header.
+# Env: WEIR_SINK_SEND_IDEMPOTENCY_KEY
+sink_send_idempotency_key = true
+
+# Bearer token for the HTTP sink. NEVER set this in the config file —
+# it must come from the environment so it doesn't end up in version control,
+# logs, or container image layers.
+# Env: WEIR_SINK_BEARER_TOKEN
+
+# Log level for tracing-subscriber. One of: trace, debug, info, warn, error,
+# or any EnvFilter directive (e.g. "weir_server=debug,info").
+# Env: WEIR_LOG_LEVEL (RUST_LOG also recognised as a fallback)
 log_level = "info"

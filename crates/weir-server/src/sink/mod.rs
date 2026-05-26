@@ -1,4 +1,11 @@
-//! Sink trait and supporting types.
+//! Sink trait, error contract, and built-in implementations.
+//!
+//! Built-in sinks:
+//! - [`noop::NoopSink`] — accepts all records, forwards nothing. The default
+//!   when `sink_type = "noop"`. Useful for soak-testing the daemon pipeline
+//!   without a real downstream.
+//! - [`http::HttpSink`] — POSTs each record to a configurable URL with
+//!   transient/permanent error classification. Use when `sink_type = "http"`.
 //!
 //! A `Sink` receives batches of records from the drain and commits them to a
 //! downstream store. Implementations decide their own connection management and
@@ -19,6 +26,9 @@
 //! generic over `S: Sink` and stores `Arc<S>`, so no `dyn Sink` is needed. Using
 //! `dyn Sink` with AFIT requires boxing the returned futures, which is left to the
 //! caller if they need type erasure.
+
+pub mod http;
+pub mod noop;
 
 use weir_core::Payload;
 
@@ -50,12 +60,21 @@ impl SinkRecord for Payload {
 /// - **Permanent**: the record is dead-lettered and the segment is confirmed.
 pub trait SinkError: Send + Sync + std::error::Error + 'static {
     fn is_transient(&self) -> bool;
+
+    /// Hint from the sink about how long to wait before retrying, e.g. parsed
+    /// from an HTTP `Retry-After` header on a 429 / 503 response. The drain
+    /// uses this in place of its exponential-backoff delay when present
+    /// (subject to a sanity cap). Default: no hint.
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// The result of a successful `Sink::commit` call.
 ///
 /// `committed`: records that were accepted by the sink.
 /// `dead_lettered`: records the sink permanently rejected, with a reason string.
+#[derive(Debug)]
 pub struct CommitResult<R> {
     pub committed: Vec<R>,
     pub dead_lettered: Vec<(R, String)>,
@@ -63,7 +82,6 @@ pub struct CommitResult<R> {
 
 /// Coarse health signal from `Sink::health`.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum SinkHealth {
     Healthy,
     Degraded(String),
@@ -93,7 +111,10 @@ pub trait Sink: Send + Sync + 'static {
         1000
     }
 
-    /// Periodic health probe. Surfaced via metrics; queried by the main loop.
-    #[allow(dead_code)]
+    /// Periodic health probe. Called by the drain (a) after every segment
+    /// commit attempt and (b) on a wall-clock interval (default every 30 s)
+    /// so the `weir_sink_health{state}` gauge keeps moving even when no
+    /// segments are flowing. Implementations should keep this cheap — a
+    /// single HEAD or ping is the typical pattern.
     async fn health(&self) -> SinkHealth;
 }

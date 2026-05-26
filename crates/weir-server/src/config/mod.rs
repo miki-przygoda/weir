@@ -69,6 +69,26 @@ impl std::error::Error for ConfigError {
     }
 }
 
+/// Which built-in sink the daemon should run with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkType {
+    Noop,
+    Http,
+}
+
+impl SinkType {
+    fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "noop" => Ok(SinkType::Noop),
+            "http" => Ok(SinkType::Http),
+            other => Err(ConfigError::InvalidValue {
+                field: "sink_type",
+                reason: format!("'{other}' is not a valid sink type; expected 'noop' or 'http'"),
+            }),
+        }
+    }
+}
+
 // ── Partial config (one layer) ────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -83,6 +103,12 @@ pub(crate) struct PartialConfig {
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
     pub shutdown_timeout_secs: Option<u64>,
+    pub connection_read_timeout_secs: Option<u64>,
+    pub sink_type: Option<String>,
+    pub sink_url: Option<String>,
+    pub sink_timeout_secs: Option<u64>,
+    pub sink_max_batch_size: Option<usize>,
+    pub sink_send_idempotency_key: Option<bool>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
@@ -110,6 +136,12 @@ pub struct Config {
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
     pub shutdown_timeout_secs: u64,
+    pub connection_read_timeout_secs: u64,
+    pub sink_type: SinkType,
+    pub sink_url: Option<String>,
+    pub sink_timeout_secs: u64,
+    pub sink_max_batch_size: usize,
+    pub sink_send_idempotency_key: bool,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -154,10 +186,12 @@ impl Config {
         let worker_count = merge!(worker_count).unwrap_or(2);
         check_range("worker_count", worker_count, 1, 64)?;
 
-        let batch_size = merge!(batch_size).unwrap_or(1_000);
+        // Defaults from docs/benchmarks/batch-tuning.md: (256, 1ms) is the sweet
+        // spot for both latency and throughput across the sweep grid.
+        let batch_size = merge!(batch_size).unwrap_or(256);
         check_range("batch_size", batch_size, 1, 100_000)?;
 
-        let batch_deadline_ms = merge!(batch_deadline_ms).unwrap_or(100);
+        let batch_deadline_ms = merge!(batch_deadline_ms).unwrap_or(1);
         check_range("batch_deadline_ms", batch_deadline_ms as usize, 1, 60_000)?;
 
         let max_connections = merge!(max_connections).unwrap_or(256);
@@ -195,6 +229,43 @@ impl Config {
             });
         }
 
+        // Per-connection read timeout. Caps how long a connection handler can
+        // sit in read_exact waiting for the next byte. Without this a slow or
+        // silent client can hold a semaphore permit indefinitely (slowloris).
+        // Default 30 s is generous for legitimate clients doing batched
+        // sends but cuts off a stalled connection promptly.
+        let connection_read_timeout_secs = merge!(connection_read_timeout_secs).unwrap_or(30);
+        check_range(
+            "connection_read_timeout_secs",
+            connection_read_timeout_secs as usize,
+            1,
+            600,
+        )?;
+
+        // ── Sink ──────────────────────────────────────────────────────────────
+
+        let sink_type_str = merge!(sink_type).unwrap_or_else(|| "noop".to_string());
+        let sink_type = SinkType::parse(&sink_type_str)?;
+
+        let sink_url = merge!(sink_url);
+        if sink_type == SinkType::Http && sink_url.as_deref().unwrap_or("").is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_url",
+                reason: "sink_url must be set when sink_type = \"http\"".into(),
+            });
+        }
+
+        let sink_timeout_secs = merge!(sink_timeout_secs).unwrap_or(10);
+        check_range("sink_timeout_secs", sink_timeout_secs as usize, 1, 300)?;
+
+        let sink_max_batch_size = merge!(sink_max_batch_size).unwrap_or(100);
+        check_range("sink_max_batch_size", sink_max_batch_size, 1, 10_000)?;
+
+        // Default true: at-least-once delivery means retries re-POST records
+        // that may have been accepted; the Idempotency-Key header lets the
+        // endpoint dedupe without computing the hash itself.
+        let sink_send_idempotency_key = merge!(sink_send_idempotency_key).unwrap_or(true);
+
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
@@ -231,6 +302,12 @@ impl Config {
             max_payload_bytes,
             metrics_port,
             shutdown_timeout_secs,
+            connection_read_timeout_secs,
+            sink_type,
+            sink_url,
+            sink_timeout_secs,
+            sink_max_batch_size,
+            sink_send_idempotency_key,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,
@@ -353,12 +430,18 @@ mod tests {
         let c = layers_with_wab(dir.clone()).unwrap();
         assert_eq!(c.shard_count, 1);
         assert_eq!(c.worker_count, 2);
-        assert_eq!(c.batch_size, 1_000);
-        assert_eq!(c.batch_deadline_ms, 100);
+        assert_eq!(c.batch_size, 256);
+        assert_eq!(c.batch_deadline_ms, 1);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
         assert_eq!(c.shutdown_timeout_secs, 30);
+        assert_eq!(c.connection_read_timeout_secs, 30);
+        assert_eq!(c.sink_type, SinkType::Noop);
+        assert_eq!(c.sink_url, None);
+        assert_eq!(c.sink_timeout_secs, 10);
+        assert_eq!(c.sink_max_batch_size, 100);
+        assert!(c.sink_send_idempotency_key);
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");

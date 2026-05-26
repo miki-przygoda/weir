@@ -5,7 +5,7 @@ pub mod segment;
 use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -15,10 +15,10 @@ use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::ShardWriter;
-use crate::metrics::{Metrics, SegmentStateLabel, SegmentState};
 use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
 
 /// A record queued by a connection handler for writing to the WAB.
@@ -45,8 +45,8 @@ impl Default for WabConfig {
     fn default() -> Self {
         WabConfig {
             shard_count: 1,
-            batch_size: 1000,
-            batch_deadline: Duration::from_millis(100),
+            batch_size: 256,
+            batch_deadline: Duration::from_millis(1),
         }
     }
 }
@@ -89,8 +89,7 @@ pub fn spawn(
     drain_tx: Sender<PathBuf>,
     metrics: Arc<Metrics>,
 ) -> io::Result<WabHandle> {
-    // TODO step-08: replace with `config::validate_path(&wab_dir)?` once config/ exists.
-    let wab_dir = validate_path(&wab_dir)?;
+    // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
 
     for shard_id in 0..config.shard_count {
         create_dir_private(shard_dir_path(&wab_dir, shard_id))?;
@@ -279,7 +278,12 @@ fn flusher_thread(
     match writer.seal_current() {
         Ok(Some(sealed)) => {
             info!(shard = shard_id, sealed = %sealed.display(), "WAB flusher sealed segment on shutdown");
-            metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::sealed }).inc();
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::sealed,
+                })
+                .inc();
             drain_tx.send(sealed).ok();
         }
         Ok(None) => {
@@ -317,7 +321,12 @@ fn flush_batch(
         if let Some(sealed) = rotation {
             // Segment was sealed (seal includes fsync). Notify drain.
             info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
-            metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::sealed }).inc();
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::sealed,
+                })
+                .inc();
             drain_tx.send(sealed).ok();
         }
 
@@ -325,7 +334,9 @@ fn flush_batch(
             Durability::Sync => {
                 let t = Instant::now();
                 let ok = writer.fsync_current().is_ok();
-                metrics.wab_fsync_duration.observe(t.elapsed().as_secs_f64());
+                metrics
+                    .wab_fsync_duration
+                    .observe(t.elapsed().as_secs_f64());
                 let _ = record.ack_tx.send(ok);
             }
             Durability::Batched => {
@@ -342,7 +353,9 @@ fn flush_batch(
     if need_fsync {
         let t = Instant::now();
         let ok = writer.fsync_current().is_ok();
-        metrics.wab_fsync_duration.observe(t.elapsed().as_secs_f64());
+        metrics
+            .wab_fsync_duration
+            .observe(t.elapsed().as_secs_f64());
         for ack_tx in batched_acks {
             let _ = ack_tx.send(ok);
         }
@@ -450,90 +463,6 @@ impl Iterator for SegmentReader {
     }
 }
 
-/// Validates a WAB directory path. Four-check sequence:
-/// 1. Must be absolute.
-/// 2. Must not contain `..` components.
-/// 3. Must not contain null bytes (Unix).
-/// 4. `canonicalize()` — requires the directory to already exist; re-validates the
-///    canonical path against checks 1–2 to catch symlink escapes.
-///
-/// The daemon does not create the WAB directory (PostgreSQL model). The operator
-/// must create it before starting the daemon.
-///
-/// TODO step-08: move to `config/mod.rs` and import from there; shared with socket
-/// bind (step-05) and config load (step-08).
-pub fn validate_path(path: &Path) -> io::Result<PathBuf> {
-    if !path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "WAB directory path '{}' is not absolute — provide an absolute path",
-                path.display()
-            ),
-        ));
-    }
-
-    if path.components().any(|c| c == Component::ParentDir) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "WAB directory path '{}' contains '..' components — remove all '..' from the path",
-                path.display()
-            ),
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        if path.as_os_str().as_bytes().contains(&0u8) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "WAB directory path contains a null byte — null bytes are not permitted in paths",
-            ));
-        }
-    }
-
-    let canonical = std::fs::canonicalize(path).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "WAB directory '{}' does not exist or is not a directory. \
-                     Create it before starting the daemon: \
-                     mkdir -p {p} && chmod 700 {p}",
-                    path.display(),
-                    p = path.display()
-                ),
-            )
-        } else {
-            e
-        }
-    })?;
-
-    // Re-validate the resolved path to catch symlink escapes.
-    if !canonical.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "canonicalized WAB path '{}' is not absolute — possible symlink escape",
-                canonical.display()
-            ),
-        ));
-    }
-    if canonical.components().any(|c| c == Component::ParentDir) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "canonicalized WAB path '{}' contains '..' components",
-                canonical.display()
-            ),
-        ));
-    }
-
-    Ok(canonical)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,88 +513,5 @@ mod tests {
         let mut reader = SegmentReader::open(&sealed).unwrap();
         assert!(reader.next().unwrap().is_err());
         fs::remove_dir_all(dir).ok();
-    }
-
-    // ── validate_path ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn validate_path_rejects_relative() {
-        let err = validate_path(Path::new("relative/path")).unwrap_err();
-        assert!(err.to_string().contains("not absolute"), "{err}");
-    }
-
-    #[test]
-    fn validate_path_rejects_dotdot() {
-        let err = validate_path(Path::new("/valid/../escape")).unwrap_err();
-        assert!(err.to_string().contains("'..'"), "{err}");
-    }
-
-    #[test]
-    fn validate_path_rejects_nonexistent_with_mkdir_hint() {
-        let err = validate_path(Path::new("/weir_no_such_dir_xyzzy_12345")).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("mkdir"), "{msg}");
-        assert!(msg.contains("chmod 700"), "{msg}");
-    }
-
-    #[test]
-    fn validate_path_accepts_existing_absolute_dir() {
-        let dir = tmp_dir("validpath");
-        assert!(validate_path(&dir).is_ok());
-        fs::remove_dir_all(dir).ok();
-    }
-
-    /// A symlink whose target does not exist is rejected — `canonicalize()` returns
-    /// `NotFound`, and the error message must contain the mkdir hint.
-    ///
-    /// This is the "symlink escape caught by canonicalize" case: the symlink bypasses
-    /// the pre-canonicalize path-string checks (the symlink path itself is absolute, has
-    /// no `..`, has no null bytes), but `canonicalize()` follows it to a non-existent
-    /// target and returns `NotFound`.
-    #[test]
-    #[cfg(unix)]
-    fn validate_path_rejects_dangling_symlink() {
-        let dir = tmp_dir("dangling_symlink");
-        let link = dir.join("dangling_link");
-        // Point to a target that does not exist.
-        std::os::unix::fs::symlink("/weir_nonexistent_target_xyzzy_98765", &link).unwrap();
-
-        let err = validate_path(&link).unwrap_err();
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::NotFound,
-            "expected NotFound: {err}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("mkdir"),
-            "error should contain mkdir hint: {msg}"
-        );
-        assert!(
-            msg.contains("chmod 700"),
-            "error should contain chmod 700 hint: {msg}"
-        );
-
-        fs::remove_dir_all(dir).ok();
-    }
-
-    /// A symlink to a real directory is accepted. `canonicalize()` resolves it to
-    /// the target's absolute path, which becomes the canonical wab_dir used for all
-    /// subsequent operations. The symlink path itself is not stored.
-    #[test]
-    #[cfg(unix)]
-    fn validate_path_symlink_to_real_directory_resolves_to_canonical_target() {
-        let dir_a = tmp_dir("symlink_src");
-        let dir_b = tmp_dir("symlink_tgt");
-        let link = dir_a.join("link_to_b");
-        std::os::unix::fs::symlink(&dir_b, &link).unwrap();
-
-        let resolved = validate_path(&link).unwrap();
-        // The returned path is the canonical target, not the symlink path.
-        assert_eq!(resolved, dir_b.canonicalize().unwrap());
-        assert_ne!(resolved, link);
-
-        fs::remove_dir_all(dir_a).ok();
-        fs::remove_dir_all(dir_b).ok();
     }
 }

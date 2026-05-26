@@ -120,6 +120,12 @@ pub(crate) struct Metrics {
     pub records_accepted: Family<TierLabel, Counter<u64, AtomicU64>>,
     pub records_ack: Family<TierLabel, Counter<u64, AtomicU64>>,
     pub records_nack: Family<NackLabel, Counter<u64, AtomicU64>>,
+    pub accept_latency: Histogram,
+    /// Counts connections dropped because the handler sat in `read_exact`
+    /// longer than `connection_read_timeout_secs` without receiving the next
+    /// byte. Elevated values suggest slowloris-style activity or a flaky
+    /// client.
+    pub connection_idle_timeout: Counter<u64, AtomicU64>,
 
     // ── WAB ───────────────────────────────────────────────────────────────────
     pub wab_segments: Family<SegmentStateLabel, Counter<u64, AtomicU64>>,
@@ -135,6 +141,9 @@ pub(crate) struct Metrics {
     // ── Recovery ──────────────────────────────────────────────────────────────
     pub recovery_records_replayed: Counter<u64, AtomicU64>,
     pub recovery_segments_quarantined: Counter<u64, AtomicU64>,
+    /// Counts WAB segment files seen during recovery whose permissions are
+    /// not 0o600. Defense-in-depth signal for tampering or operator error.
+    pub wab_unexpected_mode: Counter<u64, AtomicU64>,
 
     // ── Dead letter / drain state ─────────────────────────────────────────────
     pub dead_letter_bytes_on_disk: Gauge<f64, AtomicU64>,
@@ -182,6 +191,17 @@ impl Metrics {
             "weir_records_nack",
             "Total records rejected (Nack), by durability tier and rejection reason"
         );
+        let accept_latency = reg!(
+            Histogram::new(LATENCY_BUCKETS.iter().copied()),
+            "weir_accept_latency_seconds",
+            "Wall-clock time from socket accept to spawn of the connection handler"
+        );
+        let connection_idle_timeout = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_connection_idle_timeout",
+            "Connections dropped because the handler sat in read_exact longer than \
+             connection_read_timeout_secs without receiving the next byte"
+        );
         let wab_segments = reg!(
             Family::<SegmentStateLabel, Counter<u64, AtomicU64>>::default(),
             "weir_wab_segments",
@@ -227,6 +247,12 @@ impl Metrics {
             "weir_recovery_segments_quarantined",
             "WAB segments quarantined due to corruption detected during crash recovery"
         );
+        let wab_unexpected_mode = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_unexpected_mode",
+            "WAB segment files seen during recovery whose permissions are not 0o600. \
+             Non-zero values indicate tampering or operator error."
+        );
         let dead_letter_bytes_on_disk = reg!(
             Gauge::<f64, AtomicU64>::default(),
             "weir_dead_letter_bytes_on_disk",
@@ -257,6 +283,8 @@ impl Metrics {
             records_accepted,
             records_ack,
             records_nack,
+            accept_latency,
+            connection_idle_timeout,
             wab_segments,
             wab_bytes_on_disk,
             wab_fsync_duration,
@@ -266,6 +294,7 @@ impl Metrics {
             queue_depth,
             recovery_records_replayed,
             recovery_segments_quarantined,
+            wab_unexpected_mode,
             dead_letter_bytes_on_disk,
             dead_letter_full,
             drain_state,

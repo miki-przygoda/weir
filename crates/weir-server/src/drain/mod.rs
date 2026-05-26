@@ -41,8 +41,8 @@ use weir_core::Payload;
 
 use crate::{
     metrics::{
-        DrainStateLabel, DrainStateValue, Metrics, OutcomeLabel, Outcome,
-        SegmentStateLabel, SegmentState, SinkHealthLabel, SinkHealthState,
+        DrainStateLabel, DrainStateValue, Metrics, Outcome, OutcomeLabel, SegmentState,
+        SegmentStateLabel, SinkHealthLabel, SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth, SinkRecord},
     wab::{
@@ -93,15 +93,17 @@ enum DrainState {
 enum ProcessResult {
     /// Segment fully processed. Confirm and delete it.
     Confirmed { record_count: u64 },
-    /// Sink returned a transient error. Retry the segment.
-    Transient,
+    /// Sink returned a transient error. Retry the segment after `retry_after`
+    /// (if the sink supplied a hint, e.g. an HTTP Retry-After header) or
+    /// after the drain's exponential-backoff delay (if `None`).
+    Transient { retry_after: Option<Duration> },
     /// Dead-letter cap would be exceeded. Block until capacity frees.
     BlockedDeadLetter,
 }
 
 enum BatchResult {
     Ok,
-    Transient,
+    Transient { retry_after: Option<Duration> },
     Blocked,
 }
 
@@ -132,19 +134,43 @@ fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
     ];
     for s in states {
         let v = if s == active { 1.0 } else { 0.0 };
-        metrics.drain_state.get_or_create(&DrainStateLabel { state: s }).set(v);
+        metrics
+            .drain_state
+            .get_or_create(&DrainStateLabel { state: s })
+            .set(v);
     }
 }
 
 fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
-    let (healthy, degraded, down) = match health {
+    let (healthy, degraded, down) = match &health {
         SinkHealth::Healthy => (1.0, 0.0, 0.0),
-        SinkHealth::Degraded(_) => (0.0, 1.0, 0.0),
-        SinkHealth::Down(_) => (0.0, 0.0, 1.0),
+        SinkHealth::Degraded(reason) => {
+            warn!(reason = %reason, "sink health: degraded");
+            (0.0, 1.0, 0.0)
+        }
+        SinkHealth::Down(reason) => {
+            error!(reason = %reason, "sink health: down");
+            (0.0, 0.0, 1.0)
+        }
     };
-    metrics.sink_health.get_or_create(&SinkHealthLabel { state: SinkHealthState::healthy }).set(healthy);
-    metrics.sink_health.get_or_create(&SinkHealthLabel { state: SinkHealthState::degraded }).set(degraded);
-    metrics.sink_health.get_or_create(&SinkHealthLabel { state: SinkHealthState::down }).set(down);
+    metrics
+        .sink_health
+        .get_or_create(&SinkHealthLabel {
+            state: SinkHealthState::healthy,
+        })
+        .set(healthy);
+    metrics
+        .sink_health
+        .get_or_create(&SinkHealthLabel {
+            state: SinkHealthState::degraded,
+        })
+        .set(degraded);
+    metrics
+        .sink_health
+        .get_or_create(&SinkHealthLabel {
+            state: SinkHealthState::down,
+        })
+        .set(down);
 }
 
 // ── Drain thread ──────────────────────────────────────────────────────────────
@@ -180,9 +206,19 @@ fn drain_thread<S: Sink>(
                 let segment = if let Some(p) = pending.pop_front() {
                     p
                 } else {
-                    match drain_rx.recv() {
-                        Ok(p) => p,
-                        Err(_) => break 'outer,
+                    // Wait for a new segment, but wake every
+                    // HEALTH_POLL_INTERVAL to refresh sink health so the
+                    // gauge stays current even on an idle daemon. Channel
+                    // closure (all WAB flushers exited) still ends the loop.
+                    loop {
+                        match drain_rx.recv_timeout(HEALTH_POLL_INTERVAL) {
+                            Ok(p) => break p,
+                            Err(RecvTimeoutError::Timeout) => {
+                                let health = rt.block_on(sink.health());
+                                set_sink_health(&metrics, health);
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break 'outer,
+                        }
                     }
                 };
 
@@ -228,11 +264,13 @@ fn drain_thread<S: Sink>(
                             confirm_and_delete(&segment, record_count, &metrics);
                             DrainState::Draining
                         }
-                        ProcessResult::Transient => DrainState::RetryingTransient {
-                            segment,
-                            retries_left: retries_left - 1,
-                            next_delay: next_delay * 2,
-                        },
+                        ProcessResult::Transient { retry_after } => {
+                            DrainState::RetryingTransient {
+                                segment,
+                                retries_left: retries_left - 1,
+                                next_delay: next_retry_delay(next_delay * 2, retry_after),
+                            }
+                        }
                         ProcessResult::BlockedDeadLetter => enter_blocked(segment, &metrics),
                     }
                 }
@@ -244,7 +282,9 @@ fn drain_thread<S: Sink>(
                 blocked_since,
             } => {
                 set_drain_state(&metrics, DrainStateValue::blocked_dead_letter_full);
-                metrics.dead_letter_blocked_duration.set(blocked_since.elapsed().as_secs_f64());
+                metrics
+                    .dead_letter_blocked_duration
+                    .set(blocked_since.elapsed().as_secs_f64());
 
                 // Drain new segments into the pending buffer while waiting.
                 // Use recv_timeout in short slices to detect channel disconnection.
@@ -268,7 +308,17 @@ fn drain_thread<S: Sink>(
 
                 // Rescan so external deletions (e.g. operator cleanup) are reflected.
                 let _ = dead_letter.rescan();
-                metrics.dead_letter_bytes_on_disk.set(dead_letter.total_bytes() as f64);
+                metrics
+                    .dead_letter_bytes_on_disk
+                    .set(dead_letter.total_bytes() as f64);
+
+                // Refresh sink health every wake-cycle. Operators monitoring
+                // weir_sink_health need to know if the sink came back up
+                // while we were waiting on dead-letter headroom; without
+                // this poll the gauge would be stuck at whatever value the
+                // last segment commit produced.
+                let health = rt.block_on(sink.health());
+                set_sink_health(&metrics, health);
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
                     // Headroom available — retry the preserved segment from the beginning.
                     metrics.dead_letter_blocked_duration.set(0.0);
@@ -306,13 +356,30 @@ fn transition_from_draining(
             confirm_and_delete(&segment, record_count, metrics);
             DrainState::Draining
         }
-        ProcessResult::Transient => DrainState::RetryingTransient {
+        ProcessResult::Transient { retry_after } => DrainState::RetryingTransient {
             segment,
             retries_left: config.max_retries,
-            next_delay: config.base_retry_delay,
+            next_delay: next_retry_delay(config.base_retry_delay, retry_after),
         },
         ProcessResult::BlockedDeadLetter => enter_blocked(segment, metrics),
     }
+}
+
+/// How often the drain polls `Sink::health()` while idle (waiting on the
+/// channel) or while blocked on a full dead-letter directory. Keeps the
+/// `weir_sink_health{state}` gauge fresh even when no segments are flowing.
+/// Not currently configurable; 30 s matches the default
+/// `dead_letter_check_interval_secs` for symmetry.
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Picks the next retry delay. If the sink supplied a `Retry-After`-style
+/// hint, honour it; otherwise fall back to `default` (typically the
+/// exponential-backoff value). Caps at 5 minutes regardless of source so a
+/// misbehaving server can't stall the drain indefinitely.
+fn next_retry_delay(default: Duration, hint: Option<Duration>) -> Duration {
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+    let chosen = hint.unwrap_or(default);
+    chosen.min(MAX_RETRY_DELAY)
 }
 
 fn enter_blocked(segment: PathBuf, metrics: &Metrics) -> DrainState {
@@ -330,7 +397,12 @@ fn confirm_and_delete(sealed: &Path, record_count: u64, metrics: &Metrics) {
     if let Err(e) = std::fs::remove_file(sealed) {
         warn!(path = %sealed.display(), error = %e, "drain: failed to delete confirmed segment");
     }
-    metrics.wab_segments.get_or_create(&SegmentStateLabel { state: SegmentState::confirmed }).inc();
+    metrics
+        .wab_segments
+        .get_or_create(&SegmentStateLabel {
+            state: SegmentState::confirmed,
+        })
+        .inc();
 }
 
 // ── Segment processing ────────────────────────────────────────────────────────
@@ -369,7 +441,9 @@ async fn process_segment<S: Sink>(
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
             match commit_batch(&full_batch, sink, config, metrics, dead_letter).await {
                 BatchResult::Ok => {}
-                BatchResult::Transient => return ProcessResult::Transient,
+                BatchResult::Transient { retry_after } => {
+                    return ProcessResult::Transient { retry_after };
+                }
                 BatchResult::Blocked => return ProcessResult::BlockedDeadLetter,
             }
         }
@@ -378,7 +452,9 @@ async fn process_segment<S: Sink>(
     if !batch.is_empty() {
         match commit_batch(&batch, sink, config, metrics, dead_letter).await {
             BatchResult::Ok => {}
-            BatchResult::Transient => return ProcessResult::Transient,
+            BatchResult::Transient { retry_after } => {
+                return ProcessResult::Transient { retry_after };
+            }
             BatchResult::Blocked => return ProcessResult::BlockedDeadLetter,
         }
     }
@@ -406,10 +482,14 @@ async fn commit_batch<S: Sink>(
     let t = std::time::Instant::now();
     match sink.commit(records).await {
         Ok(commit_result) => {
-            metrics.sink_commit_duration.observe(t.elapsed().as_secs_f64());
+            metrics
+                .sink_commit_duration
+                .observe(t.elapsed().as_secs_f64());
             metrics
                 .sink_commit_records
-                .get_or_create(&OutcomeLabel { outcome: Outcome::committed })
+                .get_or_create(&OutcomeLabel {
+                    outcome: Outcome::committed,
+                })
                 .inc_by(commit_result.committed.len() as u64);
 
             if !commit_result.dead_lettered.is_empty() {
@@ -428,9 +508,13 @@ async fn commit_batch<S: Sink>(
                     Ok(()) => {
                         metrics
                             .sink_commit_records
-                            .get_or_create(&OutcomeLabel { outcome: Outcome::dead_lettered })
+                            .get_or_create(&OutcomeLabel {
+                                outcome: Outcome::dead_lettered,
+                            })
                             .inc_by(dead_payloads.len() as u64);
-                        metrics.dead_letter_bytes_on_disk.set(dead_letter.total_bytes() as f64);
+                        metrics
+                            .dead_letter_bytes_on_disk
+                            .set(dead_letter.total_bytes() as f64);
                     }
                     Err(e) => {
                         error!(error = %e, "drain: failed to write dead-letter records");
@@ -442,18 +526,29 @@ async fn commit_batch<S: Sink>(
         }
 
         Err(e) if e.is_transient() => {
-            metrics.sink_commit_duration.observe(t.elapsed().as_secs_f64());
+            metrics
+                .sink_commit_duration
+                .observe(t.elapsed().as_secs_f64());
             metrics
                 .sink_commit_records
-                .get_or_create(&OutcomeLabel { outcome: Outcome::retried })
+                .get_or_create(&OutcomeLabel {
+                    outcome: Outcome::retried,
+                })
                 .inc_by(payloads.len() as u64);
-            warn!(error = %e, "drain: transient sink error; will retry segment");
-            BatchResult::Transient
+            let retry_after = e.retry_after();
+            warn!(
+                error = %e,
+                retry_after_secs = retry_after.map(|d| d.as_secs()),
+                "drain: transient sink error; will retry segment"
+            );
+            BatchResult::Transient { retry_after }
         }
 
         Err(e) => {
             // Permanent error — dead-letter the whole batch.
-            metrics.sink_commit_duration.observe(t.elapsed().as_secs_f64());
+            metrics
+                .sink_commit_duration
+                .observe(t.elapsed().as_secs_f64());
             error!(error = %e, "drain: permanent sink error; dead-lettering batch");
 
             let estimated = estimated_write_bytes(payloads);
@@ -465,9 +560,13 @@ async fn commit_batch<S: Sink>(
                 Ok(()) => {
                     metrics
                         .sink_commit_records
-                        .get_or_create(&OutcomeLabel { outcome: Outcome::dead_lettered })
+                        .get_or_create(&OutcomeLabel {
+                            outcome: Outcome::dead_lettered,
+                        })
                         .inc_by(payloads.len() as u64);
-                    metrics.dead_letter_bytes_on_disk.set(dead_letter.total_bytes() as f64);
+                    metrics
+                        .dead_letter_bytes_on_disk
+                        .set(dead_letter.total_bytes() as f64);
                 }
                 Err(dl_err) => {
                     error!(error = %dl_err, "drain: failed to write dead-letter records for permanent error");
@@ -541,6 +640,41 @@ mod tests {
             atomic::{AtomicU64, Ordering},
         },
     };
+
+    // ── next_retry_delay (Retry-After honoring) ─────────────────────────────
+
+    #[test]
+    fn next_retry_delay_uses_hint_when_present() {
+        // Hint overrides the default — the server knows its load better
+        // than our exponential backoff does.
+        let default = Duration::from_millis(100);
+        let hint = Some(Duration::from_secs(5));
+        assert_eq!(next_retry_delay(default, hint), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn next_retry_delay_falls_back_to_default_without_hint() {
+        let default = Duration::from_millis(500);
+        assert_eq!(next_retry_delay(default, None), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn next_retry_delay_caps_at_5_minutes() {
+        // A malicious or misbehaving server could send a huge Retry-After;
+        // we cap so the drain isn't stalled indefinitely.
+        let hint = Some(Duration::from_secs(86_400)); // 1 day
+        assert_eq!(
+            next_retry_delay(Duration::from_millis(100), hint),
+            Duration::from_secs(300)
+        );
+        // Same cap applies to the default path (exponential backoff can
+        // theoretically run away too).
+        let default = Duration::from_secs(10_000);
+        assert_eq!(
+            next_retry_delay(default, None),
+            Duration::from_secs(300)
+        );
+    }
     use weir_core::Payload;
 
     // ── Mock sink ─────────────────────────────────────────────────────────────
@@ -647,19 +781,25 @@ mod tests {
 
     fn segments_confirmed(m: &Metrics) -> u64 {
         m.wab_segments
-            .get_or_create(&SegmentStateLabel { state: SegmentState::confirmed })
+            .get_or_create(&SegmentStateLabel {
+                state: SegmentState::confirmed,
+            })
             .get()
     }
 
     fn records_committed(m: &Metrics) -> u64 {
         m.sink_commit_records
-            .get_or_create(&OutcomeLabel { outcome: Outcome::committed })
+            .get_or_create(&OutcomeLabel {
+                outcome: Outcome::committed,
+            })
             .get()
     }
 
     fn records_dead_lettered(m: &Metrics) -> u64 {
         m.sink_commit_records
-            .get_or_create(&OutcomeLabel { outcome: Outcome::dead_lettered })
+            .get_or_create(&OutcomeLabel {
+                outcome: Outcome::dead_lettered,
+            })
             .get()
     }
 
@@ -759,8 +899,14 @@ mod tests {
         let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
 
-        assert!(get_confirmed_path(&sealed).exists(), "confirmed file must exist");
-        assert!(!sealed.exists(), "sealed segment must be deleted after drain");
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "confirmed file must exist"
+        );
+        assert!(
+            !sealed.exists(),
+            "sealed segment must be deleted after drain"
+        );
         assert_eq!(segments_confirmed(&metrics), 1);
         assert_eq!(records_committed(&metrics), 2);
 
@@ -802,7 +948,10 @@ mod tests {
         ]));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
-        assert!(get_confirmed_path(&sealed).exists(), "confirmed after successful retry");
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "confirmed after successful retry"
+        );
         assert!(!sealed.exists());
 
         std::fs::remove_dir_all(dir).ok();
@@ -821,7 +970,10 @@ mod tests {
         let sink = Arc::new(MockSink::with_responses(responses));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
-        assert!(sealed.exists(), "segment must remain on disk after max retries");
+        assert!(
+            sealed.exists(),
+            "segment must remain on disk after max retries"
+        );
         assert!(!get_confirmed_path(&sealed).exists(), "no confirmed file");
 
         std::fs::remove_dir_all(dir).ok();
@@ -883,7 +1035,10 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(!dl_files.is_empty(), "dead-letter directory must not be empty");
+        assert!(
+            !dl_files.is_empty(),
+            "dead-letter directory must not be empty"
+        );
 
         for entry in &dl_files {
             let path = entry.path();
@@ -946,7 +1101,10 @@ mod tests {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for blocked state");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for blocked state"
+            );
         }
 
         assert_eq!(dl_full_count(&metrics), 1);
@@ -955,7 +1113,10 @@ mod tests {
         drop(tx);
         handle.join().unwrap();
 
-        assert!(!get_confirmed_path(&sealed).exists(), "segment must not be confirmed on blocked shutdown");
+        assert!(
+            !get_confirmed_path(&sealed).exists(),
+            "segment must not be confirmed on blocked shutdown"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -984,12 +1145,19 @@ mod tests {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for blocked state");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for blocked state"
+            );
         }
 
         let calls_at_block = sink.call_count();
         std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(sink.call_count(), calls_at_block, "commit must not be called while blocked");
+        assert_eq!(
+            sink.call_count(),
+            calls_at_block,
+            "commit must not be called while blocked"
+        );
 
         drop(tx);
         handle.join().unwrap();
@@ -1025,7 +1193,10 @@ mod tests {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
-            assert!(std::time::Instant::now() < deadline, "timed out entering blocked");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out entering blocked"
+            );
         }
 
         std::fs::remove_file(&blocking_file).unwrap();
@@ -1033,9 +1204,16 @@ mod tests {
         drop(tx);
         handle.join().unwrap();
 
-        assert!(get_confirmed_path(&sealed).exists(), "segment must be confirmed after unblock");
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "segment must be confirmed after unblock"
+        );
         assert!(!sealed.exists());
-        assert_eq!(sink.call_count(), 2, "commit called exactly twice: first attempt + retry");
+        assert_eq!(
+            sink.call_count(),
+            2,
+            "commit called exactly twice: first attempt + retry"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1116,7 +1294,10 @@ mod tests {
         handle.join().unwrap();
 
         // After unblocking, drain_state{blocked} must be 0 and blocked_duration reset to 0.
-        assert!(!drain_is_blocked(&metrics), "drain must not be blocked after unblocking");
+        assert!(
+            !drain_is_blocked(&metrics),
+            "drain must not be blocked after unblocking"
+        );
         assert_eq!(
             metrics.dead_letter_blocked_duration.get(),
             0.0,
@@ -1131,13 +1312,48 @@ mod tests {
         // Structural check: set_drain_state sets exactly one gauge to 1.0.
         let (m, _reg) = Metrics::new();
         set_drain_state(&m, DrainStateValue::draining);
-        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::draining }).get(), 1.0);
-        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::retrying_transient }).get(), 0.0);
-        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::blocked_dead_letter_full }).get(), 0.0);
+        assert_eq!(
+            m.drain_state
+                .get_or_create(&DrainStateLabel {
+                    state: DrainStateValue::draining
+                })
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            m.drain_state
+                .get_or_create(&DrainStateLabel {
+                    state: DrainStateValue::retrying_transient
+                })
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            m.drain_state
+                .get_or_create(&DrainStateLabel {
+                    state: DrainStateValue::blocked_dead_letter_full
+                })
+                .get(),
+            0.0
+        );
 
         set_drain_state(&m, DrainStateValue::blocked_dead_letter_full);
-        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::draining }).get(), 0.0);
-        assert_eq!(m.drain_state.get_or_create(&DrainStateLabel { state: DrainStateValue::blocked_dead_letter_full }).get(), 1.0);
+        assert_eq!(
+            m.drain_state
+                .get_or_create(&DrainStateLabel {
+                    state: DrainStateValue::draining
+                })
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            m.drain_state
+                .get_or_create(&DrainStateLabel {
+                    state: DrainStateValue::blocked_dead_letter_full
+                })
+                .get(),
+            1.0
+        );
     }
 
     // ── max_batch_size ────────────────────────────────────────────────────────
@@ -1151,9 +1367,19 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_batch_size(2, []));
         let metrics = noop_metrics();
-        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+        run_drain(
+            rx,
+            tx,
+            sink.clone(),
+            fast_config(dir.clone()),
+            metrics.clone(),
+        );
 
-        assert_eq!(sink.call_count(), 3, "5 records with batch=2 → 3 commit calls");
+        assert_eq!(
+            sink.call_count(),
+            3,
+            "5 records with batch=2 → 3 commit calls"
+        );
         assert_eq!(records_committed(&metrics), 5);
 
         std::fs::remove_dir_all(dir).ok();
@@ -1241,8 +1467,14 @@ mod tests {
         drop(tx);
         handle.join().unwrap();
 
-        assert!(!get_confirmed_path(&sealed).exists(), "segment must NOT be confirmed on blocked shutdown");
-        assert!(sealed.exists(), "segment must still exist after blocked shutdown");
+        assert!(
+            !get_confirmed_path(&sealed).exists(),
+            "segment must NOT be confirmed on blocked shutdown"
+        );
+        assert!(
+            sealed.exists(),
+            "segment must still exist after blocked shutdown"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

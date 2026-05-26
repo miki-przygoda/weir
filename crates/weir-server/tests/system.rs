@@ -206,16 +206,16 @@ impl ServerHandle {
             if std::os::unix::net::UnixStream::connect(&self.socket_path).is_ok() {
                 return;
             }
-            if let Some(ref mut child) = self.child {
-                if let Ok(Some(status)) = child.try_wait() {
-                    let log_path = self.tmp_dir.join("weir.log");
-                    let log = fs::read_to_string(&log_path).unwrap_or_default();
-                    panic!(
-                        "weir-server exited early with {status} before socket was ready\n\
-                         socket: {}\nlog:\n{log}",
-                        self.socket_path.display()
-                    );
-                }
+            if let Some(ref mut child) = self.child
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                let log_path = self.tmp_dir.join("weir.log");
+                let log = fs::read_to_string(&log_path).unwrap_or_default();
+                panic!(
+                    "weir-server exited early with {status} before socket was ready\n\
+                     socket: {}\nlog:\n{log}",
+                    self.socket_path.display()
+                );
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -718,17 +718,19 @@ fn metrics_endpoint_responds_with_openmetrics_content() {
 }
 
 #[test]
-fn metrics_all_16_families_registered() {
+fn metrics_all_19_families_registered() {
     let srv = ServerHandle::start("metrics_families");
     let body = srv.scrape_metrics();
 
-    // All 16 metric families must appear in the output as # HELP lines.
+    // All 19 metric families must appear in the output as # HELP lines.
     // Data lines only appear for pre-initialised gauges and histograms;
     // counter families that haven't been incremented yet show only HELP/TYPE.
     for family in [
         "weir_records_accepted",
         "weir_records_ack",
         "weir_records_nack",
+        "weir_accept_latency_seconds",
+        "weir_connection_idle_timeout",
         "weir_wab_segments",
         "weir_wab_bytes_on_disk",
         "weir_wab_fsync_duration_seconds",
@@ -738,6 +740,7 @@ fn metrics_all_16_families_registered() {
         "weir_queue_depth",
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
+        "weir_wab_unexpected_mode",
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
         "weir_drain_state",
@@ -1697,12 +1700,11 @@ fn metrics_consistent_across_crash_restart() {
 
 fn parse_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
-        if line.starts_with(prefix) {
-            if let Some(val) = line.split_whitespace().next_back() {
-                if let Ok(n) = val.parse() {
-                    return n;
-                }
-            }
+        if line.starts_with(prefix)
+            && let Some(val) = line.split_whitespace().next_back()
+            && let Ok(n) = val.parse()
+        {
+            return n;
         }
     }
     0

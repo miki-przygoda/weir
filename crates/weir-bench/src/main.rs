@@ -210,7 +210,9 @@ fn run_herd(socket: &Path, threads: usize, rpt: usize, payload: Arc<Vec<u8>>) ->
                 });
                 b.wait();
                 for _ in 0..rpt {
-                    client.push(p.as_slice(), Durability::Buffered).expect("push failed");
+                    client
+                        .push(p.as_slice(), Durability::Buffered)
+                        .expect("push failed");
                 }
             })
         })
@@ -231,7 +233,9 @@ fn run_churn(socket: &Path, rounds: usize, payload: &[u8]) -> Duration {
             eprintln!("error: cannot connect to {}: {e}", socket.display());
             std::process::exit(1);
         });
-        client.push(payload, Durability::Buffered).expect("push failed");
+        client
+            .push(payload, Durability::Buffered)
+            .expect("push failed");
     }
     t0.elapsed()
 }
@@ -290,8 +294,7 @@ fn run_bench(args: Args) {
             (Durability::Sync, "sync"),
         ] {
             eprintln!("  throughput/{name} ({} records)…", args.samples);
-            let elapsed =
-                run_throughput_single(&args.socket, durability, &payload, args.samples);
+            let elapsed = run_throughput_single(&args.socket, durability, &payload, args.samples);
             emit_throughput(
                 &bench_tag(&format!("single_thread_{name}"), d),
                 1,
@@ -307,8 +310,7 @@ fn run_bench(args: Args) {
         for &threads in &[8usize, 32, 64] {
             let rpt = (args.samples / threads).max(1);
             eprintln!("  herd/{threads} threads ({rpt} records/thread)…");
-            let elapsed =
-                run_herd(&args.socket, threads, rpt, Arc::clone(&payload_arc));
+            let elapsed = run_herd(&args.socket, threads, rpt, Arc::clone(&payload_arc));
             emit_throughput(
                 &bench_tag(&format!("thundering_herd_{threads}_threads"), d),
                 threads,

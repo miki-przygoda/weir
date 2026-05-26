@@ -29,6 +29,7 @@
 //!     simultaneously; evaluate lock-free queue alternatives
 //!   - Connection setup cost: measure and reduce Unix socket accept latency
 //!   - Batching efficiency: tune batch_size / batch_deadline_ms sweet spot
+//!
 //! Improvements are tracked by re-running this suite and comparing to the
 //! numbers committed in docs/benchmarks.md at the time.
 
@@ -170,12 +171,12 @@ impl LoadHandle {
             if UnixStream::connect(&self.socket_path).is_ok() {
                 return;
             }
-            if let Some(ref mut child) = self.child {
-                if let Ok(Some(status)) = child.try_wait() {
-                    let log =
-                        std::fs::read_to_string(self.tmp_dir.join("weir.log")).unwrap_or_default();
-                    panic!("weir-server exited early ({status})\nlog:\n{log}");
-                }
+            if let Some(ref mut child) = self.child
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                let log =
+                    std::fs::read_to_string(self.tmp_dir.join("weir.log")).unwrap_or_default();
+                panic!("weir-server exited early ({status})\nlog:\n{log}");
             }
             thread::sleep(Duration::from_millis(20));
         }

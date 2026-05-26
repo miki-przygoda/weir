@@ -1,0 +1,49 @@
+[book]
+title = "weir"
+description = "A durable, high-throughput write buffer for Rust."
+authors = ["weir contributors"]
+src = "docs"
+language = "en"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/miki-przygoda/weir"
+git-repository-icon = "fab-github"
+edit-url-template = "https://github.com/miki-przygoda/weir/edit/main/docs/{path}"
+mathjax-support = false
+no-section-label = false
+additional-css = []
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.print]
+enable = false
+
+[output.html.search]
+enable = true
+limit-results = 30
+teaser-word-count = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
+
+[rust]
+edition = "2021"
+
+# Link checking. Validates internal markdown cross-references on every
+# `mdbook build`. CI installs the mdbook-linkcheck binary; local builds
+# without it still succeed (`optional = true`).
+#
+# follow-web-links = false: external URLs (http/https) are not fetched.
+# Internal `.md` links and anchor fragments are checked.
+[output.linkcheck]
+optional = true
+follow-web-links = false
+warning-policy = "error"
+exclude = []

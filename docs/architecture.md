@@ -147,13 +147,15 @@ BlockedDeadLetterFull
 
 ### Metrics (`src/metrics/`)
 
-16 Prometheus metrics registered with a `prometheus-client` registry. `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
+19 Prometheus metrics registered with a `prometheus-client` registry. `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `weir_records_accepted_total{tier}` | counter | Records accepted from producers |
 | `weir_records_ack_total{tier}` | counter | Records acknowledged to producers |
 | `weir_records_nack_total{tier,reason}` | counter | Records rejected (Nack) |
+| `weir_accept_latency_seconds` | histogram | Time from socket accept to handler spawn |
+| `weir_connection_idle_timeout_total` | counter | Connections dropped after exceeding `connection_read_timeout_secs` mid-read (slowloris guard) |
 | `weir_wab_segments_total{state}` | counter | WAB segment transitions |
 | `weir_wab_bytes_on_disk` | gauge | WAB directory size |
 | `weir_wab_fsync_duration_seconds` | histogram | fdatasync latency |
@@ -163,12 +165,13 @@ BlockedDeadLetterFull
 | `weir_queue_depth` | gauge | Work queue occupancy |
 | `weir_recovery_records_replayed_total` | counter | Records replayed on startup |
 | `weir_recovery_segments_quarantined_total` | counter | Segments quarantined on startup |
+| `weir_wab_unexpected_mode_total` | counter | WAB segment files seen during recovery with permissions ≠ 0o600 (tampering / operator-error signal) |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size |
 | `weir_dead_letter_full_total` | counter | Distinct `BlockedDeadLetterFull` entries |
 | `weir_drain_state{state}` | gauge | Drain state (exactly one label = 1) |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Time in `BlockedDeadLetterFull`; alert target |
 
-`weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `127.0.0.1:{metrics_port}` and serves `GET /metrics` in OpenMetrics text format.
+`weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `0.0.0.0:{metrics_port}` and serves `GET /metrics` in OpenMetrics text format. The `0.0.0.0` bind is required so container-host scraping works without exec-into-container; restrict exposure via firewall / network namespace, not a localhost-only bind.
 
 ### Testing infrastructure
 

@@ -12,6 +12,9 @@ target/
 # RustRover
 .idea/
 
+# mdBook build output (CI builds and publishes; never committed)
+book/
+
 # Other
 .DS_Store
 PLAN.md

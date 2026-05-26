@@ -11,3 +11,6 @@ crc32fast = "1.4"
 # thiserror intentionally excluded: manual impl Error avoids syn/quote/proc-macro2
 # as build-time deps on a security-sensitive types crate.
 # serde intentionally excluded: payloads are opaque bytes to the core layer.
+
+[dev-dependencies]
+proptest = "1"

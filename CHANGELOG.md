@@ -10,6 +10,184 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Periodic `Sink::health()` polling**. The drain now polls health on a
+  wall-clock interval (30 s) in addition to the existing per-segment
+  polling. Covers two gaps that left `weir_sink_health{state}` stale:
+  (a) idle deployment where no segments are flowing, so health was
+  never re-checked; (b) `BlockedDeadLetterFull` state where no
+  segments are processed until cap clears. The drain's blocking
+  `drain_rx.recv()` is now a `recv_timeout` loop so the daemon
+  wakes for health checks while idle. Degraded / Down health states
+  now also log the sink-supplied reason at warn / error so operators
+  can see *why* the sink is unhappy without `--log-level debug`.
+- **`Retry-After` header honoring on the HTTP sink**. Transient responses
+  (408 / 429 / 5xx) with a `Retry-After: <seconds>` header now propagate
+  the hint through the new default-implemented `SinkError::retry_after()`
+  method. The drain uses the hint as the next retry delay instead of its
+  exponential-backoff default, capped at 5 minutes so a misbehaving
+  endpoint can't stall the drain. HTTP-date form not supported in v0 (it's
+  rare in practice and adding a date parser would inflate the dep tree).
+- **`Idempotency-Key: sha256:<hex>` header on the HTTP sink (default on)**.
+  Lets endpoints deduplicate the records that the drain re-POSTs on a
+  retry. New config option `sink_send_idempotency_key` (default true) to
+  disable for endpoints that can't tolerate the extra header. Adds the
+  `sha2` crate (RustCrypto, no system dependency).
+- **`HttpSink` — first real sink implementation**
+  (`crates/weir-server/src/sink/http.rs`). Replaces the placeholder
+  `NoopSink` as the recommended production sink. POSTs each record as an
+  `application/octet-stream` body to a configurable URL, with strict
+  transient/permanent classification:
+  - 2xx → committed
+  - 4xx (except 408 and 429) → dead-lettered with a body excerpt for
+    operator debugging
+  - 408, 429, 5xx, connect/timeout/transport failures → transient
+    (drain retries the whole segment via the existing exponential
+    backoff)
+  Holds a reusable `reqwest::Client` (rustls TLS — no system OpenSSL
+  dependency) with keep-alive pooling. Optional bearer token via
+  `WEIR_SINK_BEARER_TOKEN` env var; never sourced from config files
+  and redacted from `Debug` output. New config options
+  `sink_type` (`"noop"` | `"http"`, default `"noop"`), `sink_url`,
+  `sink_timeout_secs` (default 10, range 1-300),
+  `sink_max_batch_size` (default 100, range 1-10_000), wired through
+  CLI / env / file / defaults. 12 unit tests covering happy path,
+  every classification bucket, connect-refused, mixed batch outcomes,
+  and transient-mid-batch retry semantics. Documented in
+  `docs/operations/configuration.md` (full reference with bearer-token
+  security rationale).
+- **`sink::noop::NoopSink`** extracted from `main.rs` into its own
+  module for symmetry with the new `sink::http::HttpSink`.
+- **Hardened socket bind sequence** (`bind_hardened` in
+  `crates/weir-server/src/socket/mod.rs`). Replaces the original
+  `lstat → check → remove → bind → set_permissions` pattern with a
+  dirfd-pinned sequence: `O_PATH | O_DIRECTORY | O_NOFOLLOW` on the
+  parent, `unlinkat` for stale-socket cleanup with
+  `AT_SYMLINK_NOFOLLOW`, tightened umask (0o177) so `bind(2)` itself
+  creates the socket inode at mode 0o600 directly (no post-bind chmod
+  to redirect), and an inode-equality check between two `fstatat`
+  calls to catch a late rename swap. 9 unit tests + 1 stress test in
+  `socket::tests`. Full threat model in
+  [`docs/security/socket-bind.md`](docs/security/socket-bind.md).
+- **Slowloris guard**: new `connection_read_timeout_secs` config
+  (default 30 s, range 1–600). Wraps every `read_exact` in the
+  connection handler with `tokio::time::timeout`; idle connections
+  past the timeout are dropped silently and increment
+  `weir_connection_idle_timeout_total`. Wired through all four config
+  layers (CLI flag `--connection-read-timeout`, env
+  `WEIR_CONNECTION_READ_TIMEOUT_SECS`, TOML file, defaults). 2 unit
+  tests in `socket::connection::tests`.
+- **Startup `umask(0o077)`** in `weir-server::main`. Defense-in-depth:
+  every file-creation path in weir today specifies mode bits
+  explicitly, but a tighter daemon-wide umask means any future code
+  that forgets gets daemon-private permissions by default.
+- **WAB segment mode audit on recovery**: `audit_segment_modes` in
+  `crates/weir-server/src/wab/recovery.rs` walks each shard directory
+  during `recover_open_segments` and warns on any
+  `.wab`/`.wab.sealed`/`.wab.confirmed` file whose permissions are not
+  `0o600`. Increments `weir_wab_unexpected_mode_total`. Does not refuse
+  startup — visibility-first signal. 2 unit tests.
+- **`weir_accept_latency_seconds` histogram**: time from socket accept
+  to handler spawn. Visibility into queueing delay introduced by the
+  `Semaphore` cap, the `tokio::spawn` task creation cost, and the
+  `task::spawn_blocking` initial dispatch.
+- **Proptest suite for the wire protocol parser**
+  (`crates/weir-core/tests/proptest_envelope.rs`, 12 properties):
+  round-trip correctness for `Header` and `Envelope`, never-panic on
+  arbitrary input, specific error-path correctness (`BadMagic`,
+  `VersionMismatch`, `HeaderCrcMismatch`, `PayloadCrcMismatch`,
+  `PayloadTooLarge`, `TruncatedFrame`), and a DoS pre-allocation
+  guard (oversize `payload_len` rejected before any payload-sized
+  allocation). `proptest` added as a dev-dependency on `weir-core`.
+- **Security documentation tree** under `docs/security/`:
+  [`threat-model.md`](docs/security/threat-model.md) (trust boundary,
+  in-scope/out-of-scope threats, operator assumptions),
+  [`socket-bind.md`](docs/security/socket-bind.md) (190-line TOCTOU
+  analysis), [`container.md`](docs/security/container.md) (Dockerfile
+  review + hardening guidance + recommended `docker run`).
+- **`SECURITY.md`** at the repo root. GitHub Security tab destination
+  with reporting policy and "what counts / what does not" lists.
+- **`docs/operations/configuration.md`** — canonical configuration
+  reference. Every option: type, default, range, CLI flag, env var,
+  TOML key, what it controls, when to tune. Includes minimal-config
+  and production-config examples.
+- **`docs/getting-started/install.md`** and
+  **`docs/getting-started/quickstart.md`** — install paths (source,
+  container, planned `cargo install`) and a 5-minute first-run
+  walkthrough.
+- **`docs/README.md`** — docs sitemap and doc-conventions reference.
+
+### Changed
+
+- **`batch_size` default changed from 1000 to 256**, and
+  **`batch_deadline_ms` default changed from 100 to 1**. Backed by the
+  empirical batch-tuning sweep in
+  [`docs/benchmarks/batch-tuning.md`](docs/benchmarks/batch-tuning.md):
+  `(256, 1ms)` is the sweet spot for both latency (4–6× p50
+  improvement over the old defaults) and throughput (3–6× across every
+  concurrency level measured). Also updates `WabConfig::Default` for
+  consistency.
+- **Metrics HTTP server bind address: `127.0.0.1` → `0.0.0.0`** to
+  make the endpoint reachable from container hosts and sidecars
+  without `docker exec`. The bind is no longer the access control —
+  use firewall rules or port mapping.
+- **Dockerfile hardening** (`deploy/docker/Dockerfile`):
+  `rust:slim-bookworm` → `rust:1-slim-bookworm` (bound to Rust 1.x);
+  `cargo build` gains `--locked` flag (refuses lockfile updates
+  during build, supply-chain hardening); daemon UID/GID pinned to
+  10001 (was unspecified — drifted across rebuilds and broke
+  bind-mounted volumes); `/run/weir` and `/var/lib/weir/wab` chmodded
+  to 0o700 in the image; `STOPSIGNAL SIGTERM` made explicit;
+  `HEALTHCHECK` added using bash `/dev/tcp` against the metrics port
+  (no extra packages installed). Full review in
+  [`docs/security/container.md`](docs/security/container.md).
+- **README slimmed** from 94 lines to 56 (one-paragraph pitch + status
+  callout + quickstart command + documentation index by role + crates
+  + non-goals + license). Detail moved to dedicated docs under
+  `docs/`. Optimised for both human evaluators landing on the GitHub
+  page and AI agents loading it as initial context.
+- **`docs/architecture.md` metrics count** updated from 16 → 19 to
+  reflect three new metric families
+  (`weir_accept_latency_seconds`, `weir_connection_idle_timeout_total`,
+  `weir_wab_unexpected_mode_total`).
+- **CI clippy** bumped from `cargo clippy -- -D warnings` to
+  `cargo clippy --all-targets -- -D warnings` so integration-test
+  clippy violations fail CI instead of accumulating (six had built up
+  in `tests/load.rs` and `tests/system.rs` before this change).
+
+### Fixed
+
+- **Shutdown deadlock when a TCP scrape connection is mid-flight**:
+  the tokio runtime is now dropped before joining pipeline threads.
+  Background tokio tasks (queue depth poller, metrics server) hold
+  `QueueSender` clones; without the explicit runtime drop, the
+  pipeline join would wait for those tasks, which were waiting on
+  runtime shutdown to be triggered. Surfaces during graceful shutdown
+  with an active `/metrics` scrape connection.
+- **`bind_cleanup` race window** that allowed an attacker with write
+  access to the socket's parent directory to swap a symlink between
+  the daemon's `bind(2)` and `set_permissions` calls, leaving the
+  real socket inode at its bind-time mode (typically 0o755 under
+  umask 022) while the path-based chmod silently operated on an
+  attacker-controlled file. Fixed by `bind_hardened` (see Added).
+- **Architecture.md bind-sequence description** that still documented
+  the old, vulnerable `S_ISSOCK + chmod 0o600 after bind` pattern.
+- **`docs/architecture.md`** metrics table out of sync with code (was
+  describing 17 metrics; code had 18, then 19).
+
+### Security
+
+- TOCTOU window in socket bind closed (`bind_hardened`).
+- Slowloris DoS vector closed (`connection_read_timeout_secs`).
+- Defense-in-depth: startup umask, WAB segment mode audit.
+- Container image hardened (pinned UID, supply-chain pin guidance,
+  STOPSIGNAL, HEALTHCHECK, 0o700 on data directories).
+
+---
+
 ## [0.3.0] - 2026-05-25
 
 ### Added

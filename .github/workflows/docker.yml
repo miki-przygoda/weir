@@ -11,7 +11,125 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build:
+  # ── Build the image and verify it actually works before touching the registry ─
+  smoke:
+    name: Build & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (load into local daemon)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: false
+          load: true
+          tags: weir-server:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build weir-bench
+        run: cargo build --release -p weir-bench
+
+      - name: Smoke test
+        env:
+          # YAML literal block strips the 12-space common indent, so the env
+          # var contains clean TOML with no leading whitespace.
+          WEIR_TOML: |
+            [server]
+            socket_path       = "/run/weir/weir.sock"
+            wab_dir           = "/var/lib/weir/wab"
+            metrics_port      = 9185
+            shard_count       = 2
+            worker_count      = 2
+            batch_size        = 64
+            batch_deadline_ms = 1
+            log_level         = "info"
+        run: |
+          set -euo pipefail
+
+          SMOKE=$(mktemp -d)
+          WAB=$SMOKE/wab
+          SOCKDIR=$SMOKE/run
+          mkdir -p "$WAB" "$SOCKDIR"
+          # 777 so the container's non-root weir user can write to bind-mounts.
+          chmod 777 "$WAB" "$SOCKDIR"
+          echo "$WEIR_TOML" > "$SMOKE/weir.toml"
+
+          docker run -d \
+            --name weir-smoke \
+            -p 19185:9185 \
+            -v "$SMOKE/weir.toml:/etc/weir/weir.toml:ro" \
+            -v "$WAB:/var/lib/weir/wab" \
+            -v "$SOCKDIR:/run/weir" \
+            weir-server:smoke
+
+          echo "Waiting for socket…"
+          for i in $(seq 1 60); do
+            [ -S "$SOCKDIR/weir.sock" ] && break
+            if [ "$i" -eq 60 ]; then
+              echo "ERROR: socket not ready after 30 s"
+              docker logs weir-smoke
+              exit 1
+            fi
+            sleep 0.5
+          done
+          echo "Socket ready."
+          # Runner can't chmod a file owned by the container's weir uid;
+          # exec inside the container (runs as root) to open the socket.
+          docker exec weir-smoke chmod a+rw /run/weir/weir.sock
+
+          # Push records across all three durability tiers and verify Acks.
+          ./target/release/weir-bench \
+            --socket "$SOCKDIR/weir.sock" \
+            --samples 200 \
+            --payload 64 \
+            --only latency
+
+          # Verify key metrics are exported.
+          echo "Checking /metrics…"
+          METRICS=$(curl -sf http://127.0.0.1:19185/metrics)
+          for metric in \
+            weir_records_accepted_total \
+            weir_records_ack_total \
+            weir_wab_bytes_on_disk \
+            weir_drain_state; do
+            if echo "$METRICS" | grep -q "$metric"; then
+              echo "  ✓ $metric"
+            else
+              echo "  ✗ $metric MISSING"
+              docker logs weir-smoke
+              exit 1
+            fi
+          done
+
+          # Confirm WAB segments were written.  Use docker exec so the find
+          # runs as root inside the container (shard dirs are owned by weir).
+          WAB_COUNT=$(docker exec weir-smoke \
+            find /var/lib/weir/wab \( -name "*.wab" -o -name "*.wab.sealed" \) | wc -l)
+          if [ "$WAB_COUNT" -gt 0 ]; then
+            echo "  ✓ WAB segments on disk: $WAB_COUNT"
+          else
+            echo "  ✗ No WAB segments found"
+            docker logs weir-smoke
+            exit 1
+          fi
+
+          docker stop weir-smoke
+          echo "✓ Smoke test passed"
+
+  # ── Push to the registry only after the smoke test clears ─────────────────
+  push:
+    name: Push to registry
+    needs: smoke
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,7 +142,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -48,7 +165,7 @@ jobs:
         with:
           context: .
           file: deploy/docker/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

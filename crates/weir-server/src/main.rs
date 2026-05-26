@@ -13,51 +13,12 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use tracing::info;
 
-use config::Config;
+use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
-use sink::{CommitResult, Sink, SinkError, SinkHealth};
+use sink::http::{HttpSink, HttpSinkConfig};
+use sink::noop::NoopSink;
 use wab::WabRecord;
-use weir_core::Payload;
-
-// ── NoopSink ──────────────────────────────────────────────────────────────────
-
-/// Placeholder sink that accepts all records. Replace with a real sink
-/// implementation once downstream targets are wired up.
-struct NoopSink;
-
-#[derive(Debug)]
-struct NoopError;
-
-impl std::fmt::Display for NoopError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "noop error (unreachable)")
-    }
-}
-
-impl std::error::Error for NoopError {}
-
-impl SinkError for NoopError {
-    fn is_transient(&self) -> bool {
-        false
-    }
-}
-
-impl Sink for NoopSink {
-    type Record = Payload;
-    type Error = NoopError;
-
-    async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, NoopError> {
-        Ok(CommitResult {
-            committed: batch,
-            dead_lettered: vec![],
-        })
-    }
-
-    async fn health(&self) -> SinkHealth {
-        SinkHealth::Healthy
-    }
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -88,6 +49,25 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Tighten process umask to 0o077 immediately. Defense-in-depth: every
+    // file-creation path in weir specifies its mode bits explicitly today, so
+    // the umask is currently a no-op for daemon-created files. The tightening
+    // matters for any future code path that forgets to specify a mode — the
+    // umask makes "daemon-private" the default rather than "world-readable
+    // minus the inherited 0o022 mask".
+    //
+    // Note: bind_hardened temporarily tightens umask further (to 0o177) for
+    // the socket-create syscall and restores the previous value afterwards.
+    // That nested tightening sees the value set here as its "previous", so
+    // restoration is consistent.
+    //
+    // Safety: libc::umask is always safe; it swaps the process umask and
+    // returns the previous value. No invariants to uphold.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
+
     let config = Config::load()?;
 
     tracing_subscriber::fmt()
@@ -179,12 +159,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_retry_delay: Duration::from_millis(100),
         max_retries: MAX_RETRIES,
     };
-    let drain_handle = drain::spawn(
-        drain_rx,
-        Arc::new(NoopSink),
-        drain_config,
-        Arc::clone(&metrics),
-    );
+    // Sink selection. drain::spawn is generic over the sink type but returns
+    // the same JoinHandle<()> regardless, so both arms produce a uniform
+    // drain_handle for the join sequence later in this function.
+    let drain_handle = match config.sink_type {
+        SinkType::Noop => {
+            info!("sink: noop (records committed-and-forgotten)");
+            drain::spawn(
+                drain_rx,
+                Arc::new(NoopSink),
+                drain_config,
+                Arc::clone(&metrics),
+            )
+        }
+        SinkType::Http => {
+            let url = config
+                .sink_url
+                .clone()
+                .expect("config validation guarantees sink_url is set when sink_type = Http");
+            // Bearer token read from env at startup (never from config file).
+            // Logged only as a presence boolean — the token itself never reaches
+            // a log line.
+            let bearer_token = std::env::var("WEIR_SINK_BEARER_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .map(Arc::from);
+            info!(
+                url = %url,
+                bearer = bearer_token.is_some(),
+                timeout_secs = config.sink_timeout_secs,
+                max_batch_size = config.sink_max_batch_size,
+                "sink: http"
+            );
+            let http_cfg = HttpSinkConfig {
+                url,
+                timeout: Duration::from_secs(config.sink_timeout_secs),
+                max_batch_size: config.sink_max_batch_size,
+                bearer_token,
+                send_idempotency_key: config.sink_send_idempotency_key,
+            };
+            let sink = HttpSink::new(http_cfg).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
+            })?;
+            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+        }
+    };
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
 
@@ -195,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rt.block_on(async {
         // Bind metrics listener before starting the socket loop.
         let metrics_listener =
-            tokio::net::TcpListener::bind(("127.0.0.1", config.metrics_port)).await?;
+            tokio::net::TcpListener::bind(("0.0.0.0", config.metrics_port)).await?;
         metrics::server::spawn(metrics_listener, Arc::clone(&registry));
 
         info!(port = config.metrics_port, "metrics endpoint listening");
@@ -259,6 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_connections: config.max_connections,
                 max_payload_bytes: config.max_payload_bytes,
                 shutdown_timeout_secs: config.shutdown_timeout_secs,
+                connection_read_timeout_secs: config.connection_read_timeout_secs,
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics)).await?;
         }
@@ -278,6 +298,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bridge threads observe shard_rx Disconnected → exit → drop wab_tx.
     // WAB flushers observe wab_rx Disconnected → seal segments → exit → drop drain_tx.
     // Drain thread observes drain_rx Disconnected → drains pending segments → exits.
+    //
+    // The queue-depth background task holds a `queue_tx.clone()`. Dropping the
+    // runtime aborts that task so the clone is released — otherwise workers
+    // never observe `Disconnected` and `worker_handles.join()` deadlocks.
+    drop(rt);
 
     info!("socket layer shut down; waiting for pipeline to drain");
 

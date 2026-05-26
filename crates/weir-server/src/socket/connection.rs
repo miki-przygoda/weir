@@ -29,6 +29,11 @@ pub struct ConnectionConfig {
     /// Cap applied before allocation: `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
     /// The field already holds the effective minimum so no further clamping is needed here.
     pub max_payload_bytes: usize,
+    /// Maximum time the handler will sit in `read_exact` waiting for the next
+    /// byte. Caps slowloris-style attacks where a connected client never sends
+    /// (or sends only a partial frame) and would otherwise hold a semaphore
+    /// permit indefinitely.
+    pub read_timeout: Duration,
 }
 
 /// Handles one client connection: parses frames in a loop, queues work units,
@@ -53,15 +58,26 @@ pub async fn handle_connection(
     loop {
         // ── 1. Read header ───────────────────────────────────────────────────
         let mut header_buf = [0u8; HEADER_LEN];
-        match stream.read_exact(&mut header_buf).await {
-            Ok(_) => {}
-            Err(e)
+        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut header_buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e))
                 if e.kind() == io::ErrorKind::UnexpectedEof
                     || e.kind() == io::ErrorKind::ConnectionReset =>
             {
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                // Idle past read_timeout — slowloris guard. Bump the counter,
+                // drop the connection (which releases its semaphore permit),
+                // do not send a Nack (the client isn't reading anyway).
+                metrics.connection_idle_timeout.inc();
+                debug!(
+                    timeout_secs = config.read_timeout.as_secs(),
+                    "connection idle past read_timeout during header read; dropping"
+                );
+                return Ok(());
+            }
         }
 
         // ── 2. Decode and validate header ────────────────────────────────────
@@ -102,11 +118,34 @@ pub async fn handle_connection(
 
         // ── 4. Read payload ──────────────────────────────────────────────────
         let mut payload = vec![0u8; payload_len];
-        stream.read_exact(&mut payload).await?;
+        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                metrics.connection_idle_timeout.inc();
+                debug!(
+                    payload_len,
+                    timeout_secs = config.read_timeout.as_secs(),
+                    "connection idle past read_timeout during payload read; dropping"
+                );
+                return Ok(());
+            }
+        }
 
         // ── 5. Read and validate payload CRC ────────────────────────────────
         let mut crc_buf = [0u8; 4];
-        stream.read_exact(&mut crc_buf).await?;
+        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut crc_buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                metrics.connection_idle_timeout.inc();
+                debug!(
+                    timeout_secs = config.read_timeout.as_secs(),
+                    "connection idle past read_timeout during CRC read; dropping"
+                );
+                return Ok(());
+            }
+        }
         let expected_crc = u32::from_le_bytes(crc_buf);
         let computed_crc = crc32fast::hash(&payload);
         if expected_crc != computed_crc {
@@ -289,10 +328,11 @@ mod tests {
         WIRE_VERSION,
     };
 
-    /// Default test config: cap = MAX_PAYLOAD_HARD_CAP (no config-level restriction).
+    /// Default test config: cap = MAX_PAYLOAD_HARD_CAP, generous read timeout.
     fn test_cfg() -> ConnectionConfig {
         ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_secs(30),
         }
     }
 
@@ -415,6 +455,7 @@ mod tests {
         // Set a tight cap of 16 bytes.
         let cfg = ConnectionConfig {
             max_payload_bytes: 16,
+            read_timeout: Duration::from_secs(30),
         };
         let mut client = spawn_handler(cfg).await;
 
@@ -448,6 +489,7 @@ mod tests {
         // The effective cap is min(config, MAX_PAYLOAD_HARD_CAP).
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP + 1,
+            read_timeout: Duration::from_secs(30),
         };
         let mut client = spawn_handler(cfg).await;
 
@@ -503,5 +545,91 @@ mod tests {
         let (msg_type, payload) = read_response(&mut client).await;
         assert_eq!(msg_type, MessageType::Nack);
         assert_eq!(payload[0], NackReason::InternalError as u8);
+    }
+
+    // ── Read timeout (slowloris guard) ────────────────────────────────────────
+
+    /// A client that opens a connection and never sends a byte must be
+    /// dropped within `read_timeout`. Without this, a slow attacker can hold
+    /// a connection semaphore permit forever.
+    #[tokio::test]
+    async fn read_timeout_drops_idle_connection_before_header() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>();
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_millis(150),
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let metrics_for_check = std::sync::Arc::clone(&metrics);
+
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+
+        // The handler should return Ok within ~150ms+buffer once the
+        // read times out. We give it 1s of margin.
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        let elapsed = start.elapsed();
+        let _ = client; // keep client end alive; the server times out, not the client
+
+        let handler_result = result.expect("handler did not exit within 1s");
+        assert!(
+            handler_result.is_ok(),
+            "handler join error: {handler_result:?}"
+        );
+        let connection_result = handler_result.unwrap();
+        assert!(
+            connection_result.is_ok(),
+            "handler returned Err: {connection_result:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "handler returned before timeout elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "handler took too long after timeout: {elapsed:?}"
+        );
+        assert_eq!(
+            metrics_for_check.connection_idle_timeout.get(),
+            1,
+            "connection_idle_timeout counter must increment exactly once"
+        );
+    }
+
+    /// A client that sends a valid header then stalls during the payload
+    /// read must also be dropped within `read_timeout`. Same threat model as
+    /// the header-stall case; tests the second of the three read sites.
+    #[tokio::test]
+    async fn read_timeout_drops_idle_connection_during_payload() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>();
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_millis(150),
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let metrics_for_check = std::sync::Arc::clone(&metrics);
+
+        // Send a header advertising a 1024-byte payload, then send NOTHING.
+        let header = Header::new(MessageType::Push, Durability::Sync, 0, 1024).encode();
+        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+        client.write_all(&header).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("handler did not exit within 1s")
+            .expect("handler task panicked");
+        // The handler may return Ok (clean drop after timeout) or Err
+        // (UnexpectedEof if the client end is dropped). The timeout path is
+        // what we care about, observable via the counter.
+        let _ = result;
+        assert_eq!(
+            metrics_for_check.connection_idle_timeout.get(),
+            1,
+            "connection_idle_timeout counter must increment on payload-read timeout"
+        );
     }
 }
