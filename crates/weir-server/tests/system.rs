@@ -206,16 +206,16 @@ impl ServerHandle {
             if std::os::unix::net::UnixStream::connect(&self.socket_path).is_ok() {
                 return;
             }
-            if let Some(ref mut child) = self.child {
-                if let Ok(Some(status)) = child.try_wait() {
-                    let log_path = self.tmp_dir.join("weir.log");
-                    let log = fs::read_to_string(&log_path).unwrap_or_default();
-                    panic!(
-                        "weir-server exited early with {status} before socket was ready\n\
-                         socket: {}\nlog:\n{log}",
-                        self.socket_path.display()
-                    );
-                }
+            if let Some(ref mut child) = self.child
+                && let Ok(Some(status)) = child.try_wait()
+            {
+                let log_path = self.tmp_dir.join("weir.log");
+                let log = fs::read_to_string(&log_path).unwrap_or_default();
+                panic!(
+                    "weir-server exited early with {status} before socket was ready\n\
+                     socket: {}\nlog:\n{log}",
+                    self.socket_path.display()
+                );
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -1698,12 +1698,11 @@ fn metrics_consistent_across_crash_restart() {
 
 fn parse_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
-        if line.starts_with(prefix) {
-            if let Some(val) = line.split_whitespace().next_back() {
-                if let Ok(n) = val.parse() {
-                    return n;
-                }
-            }
+        if line.starts_with(prefix)
+            && let Some(val) = line.split_whitespace().next_back()
+            && let Ok(n) = val.parse()
+        {
+            return n;
         }
     }
     0
