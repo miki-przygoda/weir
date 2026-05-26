@@ -41,13 +41,13 @@ docs are planned for the next docs phase.
   option: default, range, CLI flag, env var, TOML key, what it
   controls, and when to tune. Plus minimal-config and production-config
   examples. *(canonical reference; ~470 lines)*
-- *tuning.md* — operator-facing tuning guide. *(planned, Phase 2)*
-- *observability.md* — metrics catalogue + alert recipes + Grafana
+- *Tuning guide* — operator-facing tuning guide. *(planned, Phase 2)*
+- *Observability* — metrics catalogue + alert recipes + Grafana
   dashboard JSON. *(planned, Phase 2)*
-- *deployment.md* — systemd unit, Kubernetes manifest, sidecar
-  pattern. *(planned, Phase 2)*
-- *disaster-recovery.md* — sink down, disk full, dead-letter full,
-  crash scenarios. *(planned, Phase 2)*
+- *Deployment* — systemd unit, Kubernetes manifest, sidecar pattern.
+  *(planned, Phase 2)*
+- *Disaster recovery* — sink down, disk full, dead-letter full, crash
+  scenarios. *(planned, Phase 2)*
 
 ---
 
@@ -62,7 +62,7 @@ the on-disk WAB layout.
 - [**wab_format.md**](wab_format.md) — WAB segment binary format,
   `.confirmed` sidecar, crash-recovery algorithm, segment lifecycle
   (active → sealed → confirmed → deleted).
-- *writing-a-client.md* — practical client-implementation tutorial.
+- *Writing a client* — practical client-implementation tutorial.
   *(planned, Phase 3)*
 
 ---
@@ -99,7 +99,7 @@ review. The reporting policy is at the repo root.
   Dockerfile review: pinned UID, supply-chain considerations, what the
   image deliberately does **not** do, recommended `docker run`
   invocation with cap-drop and read-only filesystem.
-- [**../SECURITY.md**](../SECURITY.md) — Vulnerability reporting policy.
+- [**SECURITY.md**](https://github.com/miki-przygoda/weir/blob/main/SECURITY.md) — Vulnerability reporting policy (lives at repo root for GitHub's Security tab integration).
 
 ---
 

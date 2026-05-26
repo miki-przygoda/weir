@@ -34,9 +34,16 @@ expand = true
 heading-split-level = 3
 
 [rust]
-edition = "2024"
+edition = "2021"
 
-# Note: link-checking is intentionally not enabled here. The mdbook-linkcheck
-# plugin would need to be installed in CI separately; for now the docs/ tree
-# is small enough that link breakage is caught in PR review. Revisit if/when
-# the doc count justifies the extra CI dep.
+# Link checking. Validates internal markdown cross-references on every
+# `mdbook build`. CI installs the mdbook-linkcheck binary; local builds
+# without it still succeed (`optional = true`).
+#
+# follow-web-links = false: external URLs (http/https) are not fetched.
+# Internal `.md` links and anchor fragments are checked.
+[output.linkcheck]
+optional = true
+follow-web-links = false
+warning-policy = "error"
+exclude = []

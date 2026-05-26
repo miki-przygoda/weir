@@ -42,7 +42,18 @@ jobs:
         with:
           mdbook-version: "0.4.40"
 
-      - name: Build book
+      # mdbook-linkcheck validates internal markdown cross-references and
+      # anchor fragments on every build. follow-web-links = false in book.toml
+      # keeps it offline; broken `.md` links or anchors fail the build.
+      - name: Install mdbook-linkcheck
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/v0.7.7/mdbook-linkcheck.x86_64-unknown-linux-gnu.zip -o /tmp/linkcheck.zip
+          unzip -o /tmp/linkcheck.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/mdbook-linkcheck"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build book (with link checking)
         run: mdbook build
 
       - name: Upload Pages artifact

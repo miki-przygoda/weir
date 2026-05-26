@@ -172,8 +172,8 @@ the right knob.
 ### Batching
 
 The batch tuning data is in [batch-tuning.md](../benchmarks/batch-tuning.md);
-the tuning **guide** is in [tuning.md](tuning.md). Defaults below are
-the sweet spot found by the empirical sweep.
+an operator-facing tuning **guide** is planned for Phase 2. Defaults below
+are the sweet spot found by the empirical sweep.
 
 #### `batch_size`
 
@@ -280,8 +280,8 @@ between sends (60–300s).
 
 **Operational note**: alert on
 `rate(weir_connection_idle_timeout_total[5m]) > 0` to detect potential
-slowloris activity or buggy clients. See
-[observability](observability.md) for alert recipes.
+slowloris activity or buggy clients. The full alert-recipe doc is
+planned for Phase 2.
 
 ---
 
@@ -398,7 +398,7 @@ when the dead-letter directory shares a disk with the WAB and you
 want a hard cap before WAB writes fail.
 
 **Operational note**: alert on `weir_drain_state{state="blocked_dead_letter_full"} == 1`.
-See [observability](observability.md).
+Alert-recipe details land with the Phase 2 observability doc.
 
 ---
 
@@ -530,10 +530,12 @@ log_level = "info"
 
 - [Quickstart](../getting-started/quickstart.md) — the fastest path to a
   running daemon, with a minimal config inline.
-- [Tuning guide](tuning.md) — *(not yet written — Phase 2)*
-- [Observability](observability.md) — *(not yet written — Phase 2)*
+- *Tuning guide* — planned for Phase 2; operator-facing guide on
+  picking values for your workload (vs the data dump in batch-tuning).
+- *Observability* — planned for Phase 2; metrics catalogue with alert
+  thresholds and Grafana dashboard JSON.
 - [Batch tuning data](../benchmarks/batch-tuning.md) — the empirical
   sweep behind the `(256, 1ms)` default.
-- [`deploy/docker/weir.toml.example`](../../deploy/docker/weir.toml.example) —
-  every option with its default and matching env var, kept in sync with
-  this reference.
+- [`deploy/docker/weir.toml.example`](https://github.com/miki-przygoda/weir/blob/main/deploy/docker/weir.toml.example)
+  — every option with its default and matching env var, kept in sync
+  with this reference.
