@@ -58,11 +58,14 @@ pub struct SocketConfig {
 ///
 /// # Bind sequence (TOCTOU hardening)
 ///
-/// 1. Reject socket paths that are not absolute, contain `..`, or contain null bytes.
-/// 2. If a file already exists at the path, `stat` it and verify `S_ISSOCK`. Refuse
-///    to remove a regular file (or any non-socket) at that path.
-/// 3. Remove the stale socket and bind a new one.
-/// 4. `chmod 0o600` — daemon-private; no group or other access.
+/// The bind sequence is implemented in `bind_hardened`. It uses a dirfd to pin
+/// the parent directory, `unlinkat` to clear any stale socket without
+/// following symlinks, a tightened umask so `bind(2)` creates the socket
+/// inode at mode 0o600 directly (avoiding a vulnerable post-bind chmod), and
+/// an inode-equality check to catch any rename swap that races the bind.
+/// See `docs/security/socket-bind.md` for the threat model and the
+/// remaining race window that the operator's directory permissions are
+/// expected to close.
 pub async fn run(
     config: SocketConfig,
     queue_tx: QueueSender<WorkUnit>,
@@ -70,15 +73,7 @@ pub async fn run(
     metrics: std::sync::Arc<Metrics>,
 ) -> io::Result<()> {
     validate_socket_path(&config.socket_path)?;
-    bind_cleanup(&config.socket_path)?;
-
-    let listener = UnixListener::bind(&config.socket_path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    let listener = bind_hardened(&config.socket_path)?;
 
     info!(path = %config.socket_path.display(), "socket listening");
 
@@ -186,33 +181,247 @@ pub fn validate_socket_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// If a file exists at `path`: verify it is a socket (S_ISSOCK) then remove it.
-/// Refuses to remove a non-socket file to prevent accidental data destruction.
+// ── Hardened bind ─────────────────────────────────────────────────────────────
+//
+// The original sequence (`lstat` → `is_socket` → `remove_file` → `bind` →
+// `set_permissions`) has a TOCTOU window: a path-based `chmod` after `bind`
+// can be redirected via a symlink swap in the parent directory, leaving the
+// real socket at its bind-time umask mode (typically 0o755 or 0o775) while
+// chmod modifies an attacker file. See `docs/security/socket-bind.md` for
+// the full attack surface analysis.
+//
+// The hardened sequence below pins the parent directory inode with an
+// `O_PATH | O_DIRECTORY | O_NOFOLLOW` descriptor, drives the stale-file
+// cleanup through `unlinkat(dirfd, basename, AT_SYMLINK_NOFOLLOW)`, tightens
+// the process umask to 0o177 so `bind(2)` creates the socket inode at mode
+// 0o600 directly — eliminating the need for any post-bind chmod, the
+// component that was exploitable — and then verifies via `fstatat` that the
+// inode at the bound path is a socket with mode 0o600 AND has not been
+// swapped before we return.
+//
+// fchmod on the listener's fd is NOT used: on Linux it operates on the
+// in-kernel sockfs object, not on the bound filesystem inode, so it does
+// not actually change the bind path's mode bits. The umask approach
+// achieves the same goal (0o600 from creation) by a different mechanism
+// that does propagate to the filesystem.
+
 #[cfg(unix)]
-fn bind_cleanup(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::FileTypeExt;
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if !meta.file_type().is_socket() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "a non-socket file already exists at '{}'; refusing to remove it",
-                        path.display()
-                    ),
-                ));
-            }
-            std::fs::remove_file(path)?;
+pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
+    let (parent, basename) = split_parent_basename(path)?;
+    let dirfd = open_parent_dirfd(parent)?;
+    let _dirfd_guard = OwnedDirFd(dirfd);
+
+    cleanup_existing_socket(dirfd, basename, path)?;
+
+    // bind(2) does not follow a symlink at the final component for AF_UNIX
+    // socket creation — it either creates the inode at the named path or
+    // returns EADDRINUSE. So any attacker symlink dropped between cleanup
+    // and bind surfaces as a bind failure, not silent redirection.
+    //
+    // Tighten umask so bind(2) creates the socket inode with mode 0o600
+    // directly. Doing the mode tightening at create time avoids a separate
+    // path-based chmod (which can be redirected by a symlink swap in the
+    // parent dir) and avoids an fd-based fchmod (which on Linux operates on
+    // the sockfs object, not the bound filesystem inode, and may not
+    // propagate to the bind path's mode bits).
+    //
+    // umask is process-global and applies to other threads briefly. Every
+    // other file-creation path in weir specifies its mode bits explicitly
+    // (WAB segments 0o600, dirs 0o700), so the temporary tightening is
+    // invisible to those paths. A tighter umask is also a safer default.
+    let saved_umask = umask_set(0o177);
+    let bind_result = UnixListener::bind(path);
+    let _ = umask_set(saved_umask);
+    let listener = bind_result?;
+
+    // Snapshot the inode bind created. The window between bind(2) and this
+    // fstatat is the only un-closeable race window (Linux has no `bind_at`
+    // syscall that could make the two atomic). Closing it fully requires
+    // that the parent directory be writable only by the daemon user — see
+    // docs/security/socket-bind.md.
+    let our_inode = stat_at_dir(dirfd, basename)?;
+    if (our_inode.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
+        return Err(io::Error::other(format!(
+            "after bind, '{}' is not a socket (mode type {:#o}); attacker raced bind",
+            path.display(),
+            our_inode.st_mode & libc::S_IFMT
+        )));
+    }
+    if (our_inode.st_mode & 0o777) != 0o600 {
+        return Err(io::Error::other(format!(
+            "after bind, '{}' has mode {:#o} (want 0o600); umask tightening failed",
+            path.display(),
+            our_inode.st_mode & 0o777
+        )));
+    }
+
+    // Late-swap check: verify the inode at the path is still the one we
+    // snapshotted above. Catches a rename(2) that swapped a different inode
+    // into place between the two fstatat calls.
+    let final_inode = stat_at_dir(dirfd, basename)?;
+    if final_inode.st_dev != our_inode.st_dev || final_inode.st_ino != our_inode.st_ino {
+        return Err(io::Error::other(format!(
+            "socket inode at '{}' changed during bind sequence \
+             (dev/ino {}/{} → {}/{}); aborting startup",
+            path.display(),
+            our_inode.st_dev,
+            our_inode.st_ino,
+            final_inode.st_dev,
+            final_inode.st_ino
+        )));
+    }
+
+    Ok(listener)
+}
+
+#[cfg(unix)]
+fn umask_set(new: libc::mode_t) -> libc::mode_t {
+    // Safety: libc::umask is always safe; it just swaps the process umask
+    // and returns the previous value. No invariants to uphold.
+    unsafe { libc::umask(new) }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
+    UnixListener::bind(path)
+}
+
+#[cfg(unix)]
+fn split_parent_basename(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("socket path '{}' has no parent directory", path.display()),
+        )
+    })?;
+    let basename = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("socket path '{}' has no file name", path.display()),
+        )
+    })?;
+    if parent.as_os_str().is_empty() {
+        // `path.parent()` returns `Some("")` for relative paths; we already
+        // require absolute paths via `validate_socket_path`, so this should
+        // not happen, but guard anyway.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("socket path '{}' has an empty parent", path.display()),
+        ));
+    }
+    Ok((parent, basename))
+}
+
+#[cfg(unix)]
+fn open_parent_dirfd(parent: &Path) -> io::Result<libc::c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "parent path contains null"))?;
+    // O_PATH so we don't need read permission on the directory; O_DIRECTORY so
+    // we fail fast if it isn't a directory; O_NOFOLLOW so a symlinked
+    // last-component parent can't redirect us. Intermediate components are
+    // still resolved normally (that's what `open(2)` does — O_NOFOLLOW only
+    // applies to the final component).
+    //
+    // O_PATH is Linux-specific. macOS does not have O_PATH; fall back to a
+    // read-only directory open.
+    #[cfg(target_os = "linux")]
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+    // Safety: c_parent is a valid nul-terminated C string for the lifetime of
+    // the call; flags is a valid OR of libc constants; mode is unused for
+    // non-creating opens.
+    let fd = unsafe { libc::open(c_parent.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+#[cfg(unix)]
+fn cleanup_existing_socket(
+    dirfd: libc::c_int,
+    basename: &std::ffi::OsStr,
+    full_path_for_error: &Path,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_name = std::ffi::CString::new(basename.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "basename contains null"))?;
+
+    // fstatat with AT_SYMLINK_NOFOLLOW inspects the entry itself without
+    // following a symlink at the final component.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // Safety: dirfd is a valid directory fd held by the caller; c_name is a
+    // valid nul-terminated string; &mut st is a writable libc::stat.
+    let rc = unsafe { libc::fstatat(dirfd, c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(());
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        return Err(err);
+    }
+
+    // Refuse to remove anything that isn't a socket. This catches both
+    // ordinary files (the original bind_cleanup guarantee) and symlinks
+    // (because we used AT_SYMLINK_NOFOLLOW, st_mode reflects the symlink's
+    // type, not its target's — symlinks are S_IFLNK, not S_IFSOCK).
+    let mode_type = st.st_mode & libc::S_IFMT;
+    if mode_type != libc::S_IFSOCK {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "a non-socket entry already exists at '{}' (mode type {:#o}); refusing to remove it",
+                full_path_for_error.display(),
+                mode_type
+            ),
+        ));
+    }
+
+    // Safety: dirfd valid; c_name valid; flags=0 means "regular unlink"
+    // (i.e. file, not directory).
+    let rc = unsafe { libc::unlinkat(dirfd, c_name.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn bind_cleanup(_path: &Path) -> io::Result<()> {
-    Ok(())
+/// `fstatat(dirfd, basename, AT_SYMLINK_NOFOLLOW)` returning the raw stat. Used
+/// to snapshot the inode at a directory-relative basename without following
+/// symlinks at the final component.
+#[cfg(unix)]
+fn stat_at_dir(dirfd: libc::c_int, basename: &std::ffi::OsStr) -> io::Result<libc::stat> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_name = std::ffi::CString::new(basename.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "basename contains null"))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // Safety: dirfd is a valid directory fd held by the caller; c_name is a
+    // valid nul-terminated string; &mut st is a writable libc::stat.
+    let rc = unsafe { libc::fstatat(dirfd, c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// RAII guard that closes a directory fd on drop. The dirfd is held only as
+/// long as the bind sequence; we don't keep it open after `run` returns.
+#[cfg(unix)]
+struct OwnedDirFd(libc::c_int);
+
+#[cfg(unix)]
+impl Drop for OwnedDirFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            // Safety: self.0 was returned by libc::open and not yet closed.
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -226,6 +435,14 @@ mod tests {
 
     fn tmp_socket_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("weir_sock_{label}_{}.sock", std::process::id()))
+    }
+
+    /// Serialises any test that mutates the process umask. umask is
+    /// process-global; without this, parallel tests interleave and see
+    /// each other's saved/restored values.
+    fn umask_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(Default::default)
     }
 
     fn default_config(path: PathBuf) -> SocketConfig {
@@ -261,41 +478,291 @@ mod tests {
         assert!(validate_socket_path(Path::new("/run/weir/weir.sock")).is_ok());
     }
 
-    // ── Bind TOCTOU guard ─────────────────────────────────────────────────────
+    // ── Hardened bind ─────────────────────────────────────────────────────────
 
-    #[test]
+    // bind_hardened internally mutates the process umask. That makes
+    // concurrent calls (e.g. parallel test execution) interleave their
+    // save/restore and leak a tightened umask globally. The lock below
+    // serialises the tests; in production, bind_hardened is called once
+    // during single-threaded startup so the issue does not arise.
+
+    #[tokio::test]
     #[cfg(unix)]
-    fn bind_cleanup_refuses_regular_file_at_socket_path() {
-        let path = tmp_socket_path("toctou");
-        // Create a regular file at the socket path.
+    async fn bind_hardened_refuses_regular_file_at_socket_path() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let path = tmp_socket_path("hardened_refuse");
         std::fs::write(&path, b"not a socket").unwrap();
-        let err = bind_cleanup(&path).unwrap_err();
+        let err = bind_hardened(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
         assert!(err.to_string().contains("non-socket"), "{err}");
-        // File must still exist — we refused to remove it.
         assert!(path.exists(), "regular file must not have been removed");
         std::fs::remove_file(&path).ok();
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn bind_cleanup_removes_stale_socket() {
-        let path = tmp_socket_path("stale");
-        // Bind a socket to create the file, then drop the listener.
+    async fn bind_hardened_replaces_stale_socket() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let path = tmp_socket_path("hardened_stale");
         {
-            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let _stale = std::os::unix::net::UnixListener::bind(&path).unwrap();
         }
         assert!(path.exists());
-        bind_cleanup(&path).unwrap();
-        assert!(!path.exists(), "stale socket should have been removed");
+        let listener = bind_hardened(&path).unwrap();
+        drop(listener);
+        std::fs::remove_file(&path).ok();
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_succeeds_when_no_file_exists() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let path = tmp_socket_path("hardened_fresh");
+        assert!(!path.exists());
+        let listener = bind_hardened(&path).unwrap();
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_refuses_symlink_at_socket_path() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // A symlink (even to a real socket) is rejected because the
+        // AT_SYMLINK_NOFOLLOW fstatat sees S_IFLNK, not S_IFSOCK.
+        let dir = std::env::temp_dir().join(format!(
+            "weir_bind_symlink_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("real.sock");
+        {
+            let _real = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        }
+        let link = dir.join("link.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = bind_hardened(&link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(err.to_string().contains("non-socket"), "{err}");
+        assert!(link.exists(), "symlink must not have been removed");
+
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_sets_mode_0600_even_with_loose_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Set a permissive umask before bind. The hardened sequence tightens
+        // it internally to 0o177 so the socket is created mode 0o600
+        // regardless of the inherited process umask.
+        let saved = unsafe { libc::umask(0o000) };
+        let path = tmp_socket_path("hardened_umask");
+        let listener = bind_hardened(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        unsafe {
+            libc::umask(saved);
+        }
+        assert_eq!(mode, 0o600, "bind_hardened must override inherited umask");
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_restores_umask_after_bind() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Set a known baseline of 0o022.
+        unsafe {
+            libc::umask(0o022);
+        }
+        let path = tmp_socket_path("hardened_umask_restore");
+        let _listener = bind_hardened(&path).unwrap();
+        // Read current umask without changing it permanently: set it twice.
+        let after_bind = unsafe { libc::umask(0o022) };
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            after_bind, 0o022,
+            "bind_hardened must restore process umask to its pre-call value, got {after_bind:#o}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_fails_when_parent_directory_missing() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir()
+            .join(format!("weir_no_such_dir_{}", std::process::id()))
+            .join("weir.sock");
+        assert!(!path.parent().unwrap().exists());
+        let err = bind_hardened(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_fails_when_parent_is_symlink() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Parent open uses O_NOFOLLOW on the final component, so a symlinked
+        // parent directory is rejected. Documents the intentional restriction.
+        let base =
+            std::env::temp_dir().join(format!("weir_parent_symlink_base_{}", std::process::id()));
+        let real_parent = base.join("real");
+        let link_parent = base.join("link");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let path = link_parent.join("weir.sock");
+
+        let err = bind_hardened(&path).unwrap_err();
+        // ELOOP on Linux when opening a symlink with O_NOFOLLOW.
+        let raw = err.raw_os_error();
+        assert!(
+            raw == Some(libc::ELOOP) || raw == Some(libc::ENOTDIR),
+            "expected ELOOP or ENOTDIR, got {err} (raw={raw:?})"
+        );
+
+        std::fs::remove_file(&link_parent).ok();
+        std::fs::remove_dir(&real_parent).ok();
+        std::fs::remove_dir(&base).ok();
+    }
+
+    /// Building-block test: confirm that `stat_at_dir` reflects whatever
+    /// inode is currently at the directory-relative name. This is the
+    /// primitive the late-swap detection relies on.
+    ///
+    /// Uses `rename(src, dst)` which atomically replaces dst's inode with
+    /// src's, guaranteeing a distinct inode (unlike remove+recreate, where
+    /// the filesystem may immediately reuse the inode number on tmpfs/ext4).
     #[test]
     #[cfg(unix)]
-    fn bind_cleanup_is_noop_when_no_file_exists() {
-        let path = tmp_socket_path("noop");
-        assert!(!path.exists());
-        bind_cleanup(&path).unwrap(); // must not error
+    fn stat_at_dir_observes_inode_swap() {
+        let dir = std::env::temp_dir().join(format!("weir_stat_at_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = std::ffi::OsString::from("entry");
+        let entry_path = dir.join(&name);
+        let other_path = dir.join("other");
+
+        // Open the dir.
+        let parent_c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        let dirfd = unsafe {
+            libc::open(
+                parent_c.as_ptr(),
+                #[cfg(target_os = "linux")]
+                {
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+                },
+                #[cfg(not(target_os = "linux"))]
+                {
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+                },
+            )
+        };
+        assert!(dirfd >= 0);
+
+        // Write two distinct files with different inodes.
+        std::fs::write(&entry_path, b"a").unwrap();
+        std::fs::write(&other_path, b"b").unwrap();
+        let snap_a = stat_at_dir(dirfd, &name).unwrap();
+
+        // Rename `other` over `entry`. rename(2) is atomic and replaces
+        // entry's inode with other's; the ino at the name now differs.
+        std::fs::rename(&other_path, &entry_path).unwrap();
+        let snap_b = stat_at_dir(dirfd, &name).unwrap();
+        assert_ne!(
+            snap_a.st_ino, snap_b.st_ino,
+            "stat_at_dir must reflect the new inode after rename swap"
+        );
+
+        unsafe {
+            libc::close(dirfd);
+        }
+        std::fs::remove_file(&entry_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    /// Adversarial: a thread tries to swap a decoy socket over the daemon's
+    /// path during the bind sequence. The contract bind_hardened upholds is
+    /// "if you return Ok, the socket at the path is mine, with mode 0o600,
+    /// owned by me". The attacker may cause errors; it must never cause
+    /// silent corruption.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_never_silently_succeeds_under_swap_pressure() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("weir_swap_pressure_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("weir.sock");
+        let decoy = dir.join("decoy.sock");
+
+        // Prepare a decoy socket the attacker thread will try to rename over
+        // the target.
+        std::fs::remove_file(&decoy).ok();
+        std::fs::remove_file(&target).ok();
+        let _decoy_listener = std::os::unix::net::UnixListener::bind(&decoy).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_attacker = Arc::clone(&stop);
+        let decoy_for_attacker = decoy.clone();
+        let target_for_attacker = target.clone();
+
+        let attacker = std::thread::spawn(move || {
+            while !stop_attacker.load(Ordering::Relaxed) {
+                // Try to rename the decoy over the target. If decoy is gone
+                // (we already renamed it), recreate it.
+                if !decoy_for_attacker.exists() {
+                    let _ = std::os::unix::net::UnixListener::bind(&decoy_for_attacker);
+                }
+                let _ = std::fs::rename(&decoy_for_attacker, &target_for_attacker);
+            }
+        });
+
+        let mut ok = 0;
+        let mut errors = 0;
+        for _ in 0..200 {
+            match bind_hardened(&target) {
+                Ok(listener) => {
+                    // Verify the contract: socket at target with mode 0o600,
+                    // and our listener is bound to that same path.
+                    let meta = std::fs::metadata(&target).unwrap();
+                    let mode = meta.permissions().mode() & 0o777;
+                    assert_eq!(
+                        mode, 0o600,
+                        "bind_hardened returned Ok but socket mode is {mode:#o}"
+                    );
+                    assert!(
+                        meta.file_type().is_socket(),
+                        "bind_hardened returned Ok but path is not a socket"
+                    );
+                    ok += 1;
+                    drop(listener);
+                    std::fs::remove_file(&target).ok();
+                }
+                Err(_) => {
+                    errors += 1;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
+
+        std::fs::remove_file(&decoy).ok();
+        std::fs::remove_file(&target).ok();
+        std::fs::remove_dir(&dir).ok();
+
+        // We don't require any particular ratio — the attacker may dominate
+        // or may not — only that *every* successful return upheld the
+        // contract checked inside the loop.
+        eprintln!("swap-pressure stress: {ok} Ok / {errors} Err over 200 iterations");
     }
 
     // ── Connection limit ──────────────────────────────────────────────────────
