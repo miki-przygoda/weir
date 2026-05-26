@@ -142,10 +142,16 @@ fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
 }
 
 fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
-    let (healthy, degraded, down) = match health {
+    let (healthy, degraded, down) = match &health {
         SinkHealth::Healthy => (1.0, 0.0, 0.0),
-        SinkHealth::Degraded(_) => (0.0, 1.0, 0.0),
-        SinkHealth::Down(_) => (0.0, 0.0, 1.0),
+        SinkHealth::Degraded(reason) => {
+            warn!(reason = %reason, "sink health: degraded");
+            (0.0, 1.0, 0.0)
+        }
+        SinkHealth::Down(reason) => {
+            error!(reason = %reason, "sink health: down");
+            (0.0, 0.0, 1.0)
+        }
     };
     metrics
         .sink_health
@@ -200,9 +206,19 @@ fn drain_thread<S: Sink>(
                 let segment = if let Some(p) = pending.pop_front() {
                     p
                 } else {
-                    match drain_rx.recv() {
-                        Ok(p) => p,
-                        Err(_) => break 'outer,
+                    // Wait for a new segment, but wake every
+                    // HEALTH_POLL_INTERVAL to refresh sink health so the
+                    // gauge stays current even on an idle daemon. Channel
+                    // closure (all WAB flushers exited) still ends the loop.
+                    loop {
+                        match drain_rx.recv_timeout(HEALTH_POLL_INTERVAL) {
+                            Ok(p) => break p,
+                            Err(RecvTimeoutError::Timeout) => {
+                                let health = rt.block_on(sink.health());
+                                set_sink_health(&metrics, health);
+                            }
+                            Err(RecvTimeoutError::Disconnected) => break 'outer,
+                        }
                     }
                 };
 
@@ -295,6 +311,14 @@ fn drain_thread<S: Sink>(
                 metrics
                     .dead_letter_bytes_on_disk
                     .set(dead_letter.total_bytes() as f64);
+
+                // Refresh sink health every wake-cycle. Operators monitoring
+                // weir_sink_health need to know if the sink came back up
+                // while we were waiting on dead-letter headroom; without
+                // this poll the gauge would be stuck at whatever value the
+                // last segment commit produced.
+                let health = rt.block_on(sink.health());
+                set_sink_health(&metrics, health);
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
                     // Headroom available — retry the preserved segment from the beginning.
                     metrics.dead_letter_blocked_duration.set(0.0);
@@ -340,6 +364,13 @@ fn transition_from_draining(
         ProcessResult::BlockedDeadLetter => enter_blocked(segment, metrics),
     }
 }
+
+/// How often the drain polls `Sink::health()` while idle (waiting on the
+/// channel) or while blocked on a full dead-letter directory. Keeps the
+/// `weir_sink_health{state}` gauge fresh even when no segments are flowing.
+/// Not currently configurable; 30 s matches the default
+/// `dead_letter_check_interval_secs` for symmetry.
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Picks the next retry delay. If the sink supplied a `Retry-After`-style
 /// hint, honour it; otherwise fall back to `default` (typically the

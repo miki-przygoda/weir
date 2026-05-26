@@ -82,7 +82,6 @@ pub struct CommitResult<R> {
 
 /// Coarse health signal from `Sink::health`.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub enum SinkHealth {
     Healthy,
     Degraded(String),
@@ -112,7 +111,10 @@ pub trait Sink: Send + Sync + 'static {
         1000
     }
 
-    /// Periodic health probe. Surfaced via metrics; queried by the main loop.
-    #[allow(dead_code)]
+    /// Periodic health probe. Called by the drain (a) after every segment
+    /// commit attempt and (b) on a wall-clock interval (default every 30 s)
+    /// so the `weir_sink_health{state}` gauge keeps moving even when no
+    /// segments are flowing. Implementations should keep this cheap — a
+    /// single HEAD or ping is the typical pattern.
     async fn health(&self) -> SinkHealth;
 }

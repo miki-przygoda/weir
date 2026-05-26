@@ -14,6 +14,16 @@ changes are tracked separately under **Wire protocol** below.
 
 ### Added
 
+- **Periodic `Sink::health()` polling**. The drain now polls health on a
+  wall-clock interval (30 s) in addition to the existing per-segment
+  polling. Covers two gaps that left `weir_sink_health{state}` stale:
+  (a) idle deployment where no segments are flowing, so health was
+  never re-checked; (b) `BlockedDeadLetterFull` state where no
+  segments are processed until cap clears. The drain's blocking
+  `drain_rx.recv()` is now a `recv_timeout` loop so the daemon
+  wakes for health checks while idle. Degraded / Down health states
+  now also log the sink-supplied reason at warn / error so operators
+  can see *why* the sink is unhappy without `--log-level debug`.
 - **`Retry-After` header honoring on the HTTP sink**. Transient responses
   (408 / 429 / 5xx) with a `Retry-After: <seconds>` header now propagate
   the hint through the new default-implemented `SinkError::retry_after()`
