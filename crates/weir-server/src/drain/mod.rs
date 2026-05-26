@@ -93,15 +93,17 @@ enum DrainState {
 enum ProcessResult {
     /// Segment fully processed. Confirm and delete it.
     Confirmed { record_count: u64 },
-    /// Sink returned a transient error. Retry the segment.
-    Transient,
+    /// Sink returned a transient error. Retry the segment after `retry_after`
+    /// (if the sink supplied a hint, e.g. an HTTP Retry-After header) or
+    /// after the drain's exponential-backoff delay (if `None`).
+    Transient { retry_after: Option<Duration> },
     /// Dead-letter cap would be exceeded. Block until capacity frees.
     BlockedDeadLetter,
 }
 
 enum BatchResult {
     Ok,
-    Transient,
+    Transient { retry_after: Option<Duration> },
     Blocked,
 }
 
@@ -246,11 +248,13 @@ fn drain_thread<S: Sink>(
                             confirm_and_delete(&segment, record_count, &metrics);
                             DrainState::Draining
                         }
-                        ProcessResult::Transient => DrainState::RetryingTransient {
-                            segment,
-                            retries_left: retries_left - 1,
-                            next_delay: next_delay * 2,
-                        },
+                        ProcessResult::Transient { retry_after } => {
+                            DrainState::RetryingTransient {
+                                segment,
+                                retries_left: retries_left - 1,
+                                next_delay: next_retry_delay(next_delay * 2, retry_after),
+                            }
+                        }
                         ProcessResult::BlockedDeadLetter => enter_blocked(segment, &metrics),
                     }
                 }
@@ -328,13 +332,23 @@ fn transition_from_draining(
             confirm_and_delete(&segment, record_count, metrics);
             DrainState::Draining
         }
-        ProcessResult::Transient => DrainState::RetryingTransient {
+        ProcessResult::Transient { retry_after } => DrainState::RetryingTransient {
             segment,
             retries_left: config.max_retries,
-            next_delay: config.base_retry_delay,
+            next_delay: next_retry_delay(config.base_retry_delay, retry_after),
         },
         ProcessResult::BlockedDeadLetter => enter_blocked(segment, metrics),
     }
+}
+
+/// Picks the next retry delay. If the sink supplied a `Retry-After`-style
+/// hint, honour it; otherwise fall back to `default` (typically the
+/// exponential-backoff value). Caps at 5 minutes regardless of source so a
+/// misbehaving server can't stall the drain indefinitely.
+fn next_retry_delay(default: Duration, hint: Option<Duration>) -> Duration {
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+    let chosen = hint.unwrap_or(default);
+    chosen.min(MAX_RETRY_DELAY)
 }
 
 fn enter_blocked(segment: PathBuf, metrics: &Metrics) -> DrainState {
@@ -396,7 +410,9 @@ async fn process_segment<S: Sink>(
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
             match commit_batch(&full_batch, sink, config, metrics, dead_letter).await {
                 BatchResult::Ok => {}
-                BatchResult::Transient => return ProcessResult::Transient,
+                BatchResult::Transient { retry_after } => {
+                    return ProcessResult::Transient { retry_after };
+                }
                 BatchResult::Blocked => return ProcessResult::BlockedDeadLetter,
             }
         }
@@ -405,7 +421,9 @@ async fn process_segment<S: Sink>(
     if !batch.is_empty() {
         match commit_batch(&batch, sink, config, metrics, dead_letter).await {
             BatchResult::Ok => {}
-            BatchResult::Transient => return ProcessResult::Transient,
+            BatchResult::Transient { retry_after } => {
+                return ProcessResult::Transient { retry_after };
+            }
             BatchResult::Blocked => return ProcessResult::BlockedDeadLetter,
         }
     }
@@ -486,8 +504,13 @@ async fn commit_batch<S: Sink>(
                     outcome: Outcome::retried,
                 })
                 .inc_by(payloads.len() as u64);
-            warn!(error = %e, "drain: transient sink error; will retry segment");
-            BatchResult::Transient
+            let retry_after = e.retry_after();
+            warn!(
+                error = %e,
+                retry_after_secs = retry_after.map(|d| d.as_secs()),
+                "drain: transient sink error; will retry segment"
+            );
+            BatchResult::Transient { retry_after }
         }
 
         Err(e) => {
@@ -586,6 +609,41 @@ mod tests {
             atomic::{AtomicU64, Ordering},
         },
     };
+
+    // ── next_retry_delay (Retry-After honoring) ─────────────────────────────
+
+    #[test]
+    fn next_retry_delay_uses_hint_when_present() {
+        // Hint overrides the default — the server knows its load better
+        // than our exponential backoff does.
+        let default = Duration::from_millis(100);
+        let hint = Some(Duration::from_secs(5));
+        assert_eq!(next_retry_delay(default, hint), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn next_retry_delay_falls_back_to_default_without_hint() {
+        let default = Duration::from_millis(500);
+        assert_eq!(next_retry_delay(default, None), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn next_retry_delay_caps_at_5_minutes() {
+        // A malicious or misbehaving server could send a huge Retry-After;
+        // we cap so the drain isn't stalled indefinitely.
+        let hint = Some(Duration::from_secs(86_400)); // 1 day
+        assert_eq!(
+            next_retry_delay(Duration::from_millis(100), hint),
+            Duration::from_secs(300)
+        );
+        // Same cap applies to the default path (exponential backoff can
+        // theoretically run away too).
+        let default = Duration::from_secs(10_000);
+        assert_eq!(
+            next_retry_delay(default, None),
+            Duration::from_secs(300)
+        );
+    }
     use weir_core::Payload;
 
     // ── Mock sink ─────────────────────────────────────────────────────────────

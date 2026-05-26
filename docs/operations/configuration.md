@@ -470,11 +470,19 @@ is expected to return:
 Network-layer failures (connect refused, DNS failure, timeout) are
 treated as transient.
 
+**Retry-After honoring**: when the endpoint returns a transient
+status (408, 429, or 5xx) with a `Retry-After: <seconds>` header,
+the drain uses that value as the next retry delay instead of its
+exponential-backoff default. Only the delay-seconds form is parsed
+in v0; HTTP-date form is silently ignored (no header parsed → drain
+uses its default). The delay is capped at 5 minutes regardless of
+header value so a misbehaving endpoint can't stall the drain.
+
 **Idempotency**: the drain guarantees at-least-once delivery per
-segment, so the endpoint **must** handle duplicates gracefully
-(idempotency key, upsert, dedup). This is documented in the `Sink`
-trait and applies to every sink, but is especially relevant for HTTP
-endpoints where retries cross a network boundary.
+segment, so the endpoint **must** handle duplicates gracefully.
+weir helps by sending `Idempotency-Key: sha256:<hex>` by default
+(see `sink_send_idempotency_key` below); endpoints that prefer
+their own dedup scheme can disable the header.
 
 ---
 

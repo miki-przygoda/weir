@@ -26,6 +26,13 @@
 //!   the drain retries the whole segment. Per-record idempotency is the
 //!   endpoint's responsibility (documented in the sink trait).
 //!
+//! # Retry-After
+//!
+//! Transient responses (408/429/5xx) may carry a `Retry-After` header. The
+//! delay-seconds form is parsed and propagated to the drain via
+//! `SinkError::retry_after()`, which honours it as the next retry delay
+//! (capped at 5 minutes). The HTTP-date form is not parsed in v0.
+//!
 //! # Why one POST per record (for now)
 //!
 //! Simple endpoint contract: any HTTP server that accepts a POST body
@@ -146,8 +153,23 @@ impl HttpSink {
         }
 
         if classify_status_transient(status) {
-            debug!(status = %status, "sink POST returned transient HTTP status");
-            return Err(HttpSinkError::TransientStatus(status));
+            // Honour Retry-After if present. Delay-seconds form only — the
+            // HTTP-date form is rare in practice and adding a date parser
+            // would inflate the dep tree.
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_retry_after_seconds);
+            debug!(
+                status = %status,
+                retry_after_secs = retry_after.map(|d| d.as_secs()),
+                "sink POST returned transient HTTP status"
+            );
+            return Err(HttpSinkError::TransientStatus {
+                status,
+                retry_after,
+            });
         }
 
         // Permanent. Capture a short body excerpt for the dead-letter reason
@@ -190,6 +212,22 @@ fn payload_idempotency_key(payload: &[u8]) -> String {
 
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
+/// Parses the delay-seconds form of an HTTP `Retry-After` header value.
+/// Returns `None` for the HTTP-date form (not supported in v0), values that
+/// fail to parse, and unreasonable values (zero or > 3600 seconds — the
+/// drain caps at this anyway, and clamping here keeps the log line honest).
+fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
+    let trimmed = value.trim();
+    let secs: u64 = trimmed.parse().ok()?;
+    // 0 is technically valid but indistinguishable from "no hint"; clamp.
+    // 3600s (1 hour) upper bound — anything longer is the endpoint asking us
+    // to give up. We honour the cap; the drain has its own MAX_RETRIES.
+    if !(1..=3600).contains(&secs) {
+        return None;
+    }
+    Some(Duration::from_secs(secs))
+}
+
 /// Returns true if the HTTP status code should be classified as transient
 /// (the drain should retry) vs permanent (dead-letter).
 fn classify_status_transient(status: StatusCode) -> bool {
@@ -205,8 +243,13 @@ fn classify_status_transient(status: StatusCode) -> bool {
 pub enum HttpSinkError {
     /// reqwest transport error (connect, timeout, body send). Always transient.
     Transport(String),
-    /// HTTP status code in the transient bucket (408/429/5xx).
-    TransientStatus(StatusCode),
+    /// HTTP status code in the transient bucket (408/429/5xx). `retry_after`
+    /// carries the parsed `Retry-After` header value if the server sent one
+    /// (delay-seconds form only; HTTP-date form is not parsed in v0).
+    TransientStatus {
+        status: StatusCode,
+        retry_after: Option<Duration>,
+    },
     /// HTTP status code in the permanent bucket (4xx except 408/429).
     PermanentStatus {
         status: StatusCode,
@@ -218,9 +261,17 @@ impl std::fmt::Display for HttpSinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HttpSinkError::Transport(e) => write!(f, "http sink transport error: {e}"),
-            HttpSinkError::TransientStatus(s) => {
-                write!(f, "http sink transient status: {s}")
-            }
+            HttpSinkError::TransientStatus {
+                status,
+                retry_after,
+            } => match retry_after {
+                Some(d) => write!(
+                    f,
+                    "http sink transient status: {status} (Retry-After: {}s)",
+                    d.as_secs()
+                ),
+                None => write!(f, "http sink transient status: {status}"),
+            },
             HttpSinkError::PermanentStatus {
                 status,
                 body_excerpt,
@@ -238,8 +289,15 @@ impl SinkError for HttpSinkError {
     fn is_transient(&self) -> bool {
         matches!(
             self,
-            HttpSinkError::Transport(_) | HttpSinkError::TransientStatus(_)
+            HttpSinkError::Transport(_) | HttpSinkError::TransientStatus { .. }
         )
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            HttpSinkError::TransientStatus { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 }
 
@@ -477,7 +535,9 @@ mod tests {
         let sink = HttpSink::new(cfg(&url)).unwrap();
         let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
         assert!(err.is_transient(), "500 must be transient: {err}");
-        assert!(matches!(err, HttpSinkError::TransientStatus(s) if s.as_u16() == 500));
+        assert!(
+            matches!(err, HttpSinkError::TransientStatus { status, .. } if status.as_u16() == 500)
+        );
     }
 
     #[tokio::test]
@@ -692,6 +752,80 @@ mod tests {
             "Idempotency-Key header should be absent when disabled, found:\n{}",
             headers[0]
         );
+    }
+
+    // ── Retry-After header tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_retry_after_accepts_integer_seconds() {
+        assert_eq!(parse_retry_after_seconds("5"), Some(Duration::from_secs(5)));
+        assert_eq!(
+            parse_retry_after_seconds(" 30 "),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_unparseable_values() {
+        // HTTP-date form is not supported; should silently return None
+        // rather than fail the request.
+        assert_eq!(
+            parse_retry_after_seconds("Fri, 31 Dec 1999 23:59:59 GMT"),
+            None
+        );
+        assert_eq!(parse_retry_after_seconds("abc"), None);
+        assert_eq!(parse_retry_after_seconds(""), None);
+        assert_eq!(parse_retry_after_seconds("-1"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_clamps_unreasonable_values() {
+        // 0 is technically valid but indistinguishable from "no hint".
+        assert_eq!(parse_retry_after_seconds("0"), None);
+        // Anything above 1 hour is the endpoint asking us to give up.
+        assert_eq!(parse_retry_after_seconds("3601"), None);
+        assert_eq!(
+            parse_retry_after_seconds("3600"),
+            Some(Duration::from_secs(3600))
+        );
+    }
+
+    #[tokio::test]
+    async fn http_429_with_retry_after_propagates_hint() {
+        let (url, _counter) = spawn_mock_server(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nRetry-After: 7\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        assert!(err.is_transient());
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn http_503_without_retry_after_returns_none() {
+        let (url, _counter) = spawn_mock_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        assert!(err.is_transient());
+        assert_eq!(err.retry_after(), None);
+    }
+
+    #[tokio::test]
+    async fn http_429_with_malformed_retry_after_returns_none() {
+        // Endpoint returns garbage in the header. Should NOT fail the
+        // request — just lose the hint.
+        let (url, _counter) = spawn_mock_server(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nRetry-After: tomorrow\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        assert!(err.is_transient());
+        assert_eq!(err.retry_after(), None);
     }
 
     #[tokio::test]

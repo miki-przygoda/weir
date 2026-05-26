@@ -60,6 +60,14 @@ impl SinkRecord for Payload {
 /// - **Permanent**: the record is dead-lettered and the segment is confirmed.
 pub trait SinkError: Send + Sync + std::error::Error + 'static {
     fn is_transient(&self) -> bool;
+
+    /// Hint from the sink about how long to wait before retrying, e.g. parsed
+    /// from an HTTP `Retry-After` header on a 429 / 503 response. The drain
+    /// uses this in place of its exponential-backoff delay when present
+    /// (subject to a sanity cap). Default: no hint.
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 /// The result of a successful `Sink::commit` call.

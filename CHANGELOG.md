@@ -14,6 +14,18 @@ changes are tracked separately under **Wire protocol** below.
 
 ### Added
 
+- **`Retry-After` header honoring on the HTTP sink**. Transient responses
+  (408 / 429 / 5xx) with a `Retry-After: <seconds>` header now propagate
+  the hint through the new default-implemented `SinkError::retry_after()`
+  method. The drain uses the hint as the next retry delay instead of its
+  exponential-backoff default, capped at 5 minutes so a misbehaving
+  endpoint can't stall the drain. HTTP-date form not supported in v0 (it's
+  rare in practice and adding a date parser would inflate the dep tree).
+- **`Idempotency-Key: sha256:<hex>` header on the HTTP sink (default on)**.
+  Lets endpoints deduplicate the records that the drain re-POSTs on a
+  retry. New config option `sink_send_idempotency_key` (default true) to
+  disable for endpoints that can't tolerate the extra header. Adds the
+  `sha2` crate (RustCrypto, no system dependency).
 - **`HttpSink` — first real sink implementation**
   (`crates/weir-server/src/sink/http.rs`). Replaces the placeholder
   `NoopSink` as the recommended production sink. POSTs each record as an
