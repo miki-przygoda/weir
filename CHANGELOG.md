@@ -10,7 +10,7 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
-## [Unreleased]
+## [0.4.0] - 2026-05-26
 
 ### Added
 
