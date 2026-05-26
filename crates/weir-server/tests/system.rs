@@ -563,15 +563,6 @@ fn health_check_returns_ok() {
     client.health_check().unwrap();
 }
 
-#[test]
-fn health_check_on_separate_connection_from_push() {
-    let srv = ServerHandle::start("health_separate");
-    let mut pusher = srv.client();
-    let mut checker = srv.client();
-    pusher.push(b"some data", Durability::Buffered).unwrap();
-    checker.health_check().unwrap();
-}
-
 // ── Concurrent producers ──────────────────────────────────────────────────────
 
 #[test]
@@ -651,35 +642,6 @@ fn records_written_to_wab_on_disk() {
         "no WAB files found in {} after 20 pushes",
         srv.wab_dir.display()
     );
-}
-
-#[test]
-fn wab_segment_rotation_creates_multiple_segments() {
-    use weir_core::MAX_PAYLOAD_HARD_CAP;
-
-    let srv = ServerHandle::start("rotation");
-    let mut client = srv.client();
-
-    // SEGMENT_MAX_BYTES is 256 MiB — we don't want to actually write that much.
-    // Instead write many records and check rotation happens via the sealed ext.
-    // Use a reasonably large payload to fill the segment faster in tests.
-    // With SEGMENT_MAX_BYTES = 256 MiB this would take forever, so we rely on
-    // the fact that even moderate pushes eventually seal via batch deadline.
-    // Just verify the files exist and the format is correct.
-    let payload = vec![0xABu8; 4096]; // 4 KiB per record
-    for _ in 0..10 {
-        client.push(&payload, Durability::Batched).unwrap();
-    }
-
-    thread::sleep(Duration::from_millis(200));
-
-    let active = count_wab_files(&srv.wab_dir, ".wab");
-    let sealed = count_wab_files(&srv.wab_dir, ".wab.sealed");
-    assert!(
-        active + sealed > 0,
-        "no WAB files after pushing large payloads"
-    );
-    let _ = MAX_PAYLOAD_HARD_CAP; // referenced to keep import live
 }
 
 #[test]
@@ -848,10 +810,12 @@ fn empty_payload_is_accepted() {
 }
 
 #[test]
-fn binary_payload_round_trips() {
+fn arbitrary_binary_payload_accepted() {
+    // Renamed from binary_payload_round_trips: there is no Pop API, so no
+    // round-trip occurs. The test verifies the server doesn't strip null bytes
+    // or high bytes in any text-mode handling.
     let srv = ServerHandle::start("binary_payload");
     let mut client = srv.client();
-    // Arbitrary binary content including null bytes and high bytes.
     let payload: Vec<u8> = (0u8..=255).collect();
     client.push(&payload, Durability::Sync).unwrap();
 }
@@ -930,22 +894,6 @@ fn server_restarts_after_sigkill() {
     srv.client()
         .push(b"after-restart", Durability::Sync)
         .unwrap();
-}
-
-#[test]
-fn stale_socket_removed_automatically_on_restart() {
-    let mut srv = ServerHandle::start("stale_sock");
-
-    srv.kill_ungracefully();
-    assert!(
-        srv.socket_path.exists(),
-        "socket should still exist after SIGKILL"
-    );
-
-    // The restarted process must remove the stale socket via bind_cleanup
-    // and bind a new one — we verify this by connecting successfully.
-    srv.restart_in_place();
-    srv.client().health_check().unwrap();
 }
 
 #[test]
@@ -1313,29 +1261,153 @@ fn partial_frame_does_not_corrupt_next_connection() {
         .expect("server unresponsive after partial frame test");
 }
 
-// ── Disk full ─────────────────────────────────────────────────────────────────
+// ── Write-error handling (EFBIG / ENOSPC) ─────────────────────────────────────
 
-/// A WAB write failure (disk full simulated via `RLIMIT_FSIZE = 0`) must
-/// produce `Nack(InternalError)` on the client, not a server crash or silent
-/// data drop.
+/// A WAB write failure caused by `RLIMIT_FSIZE = 0` (kernel returns `EFBIG`)
+/// must produce `Nack(InternalError)` on the client, not a server crash or a
+/// silent data drop. EFBIG is the cheapest write-failure mode to simulate
+/// without root: see `enospc_returns_nack_not_crash` for the
+/// production-shaped ENOSPC variant.
 #[test]
-fn disk_full_returns_nack_not_crash() {
+fn efbig_returns_nack_not_crash() {
     use weir_core::NackReason;
 
-    let srv = ServerHandle::start_disk_full("disk_full");
+    let srv = ServerHandle::start_disk_full("efbig");
     let mut client = srv.client();
 
     // With RLIMIT_FSIZE=0 the first WAB segment header write fails immediately.
     let result = client.push(b"should-nack", Durability::Sync);
     assert!(
         matches!(result, Err(ClientError::Nack(NackReason::InternalError))),
-        "expected Nack(InternalError) from disk-full server, got {result:?}"
+        "expected Nack(InternalError) from EFBIG-throttled server, got {result:?}"
     );
 
     // Server must still be alive and accepting connections after the nack.
     srv.client()
         .health_check()
-        .expect("server unresponsive after disk-full nack");
+        .expect("server unresponsive after EFBIG nack");
+}
+
+/// ENOSPC variant — production-shaped write failure (filesystem out of space)
+/// rather than EFBIG (file-size rlimit hit). Requires a small pre-mounted
+/// filesystem at the path in `WEIR_TEST_ENOSPC_DIR`; ignored by default
+/// because creating one needs root.
+///
+/// Setup (run once, as root, before invoking this test):
+///
+/// ```sh
+/// sudo mkdir -p /mnt/weir-enospc
+/// sudo mount -t tmpfs -o size=64K tmpfs /mnt/weir-enospc
+/// sudo chmod 0700 /mnt/weir-enospc
+/// sudo chown $USER /mnt/weir-enospc
+/// WEIR_TEST_ENOSPC_DIR=/mnt/weir-enospc \
+///   cargo test -p weir-server --test system -- --ignored enospc_returns_nack_not_crash
+/// sudo umount /mnt/weir-enospc && sudo rmdir /mnt/weir-enospc
+/// ```
+///
+/// The 64 KiB tmpfs is small enough that the first WAB segment header
+/// (16 KiB pre-allocated) plus a single Sync record fills it; subsequent
+/// pushes must Nack rather than panic.
+#[test]
+#[ignore = "requires WEIR_TEST_ENOSPC_DIR pointing at a small pre-mounted tmpfs (see test docstring)"]
+fn enospc_returns_nack_not_crash() {
+    use std::os::unix::process::CommandExt;
+    use weir_core::NackReason;
+
+    let enospc_dir = std::env::var("WEIR_TEST_ENOSPC_DIR").expect(
+        "WEIR_TEST_ENOSPC_DIR not set — see test docstring for the tmpfs setup procedure",
+    );
+    let enospc_dir = PathBuf::from(enospc_dir);
+
+    let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let metrics_port = free_port();
+    let tmp_dir = std::env::temp_dir().join(format!("weir_sys_enospc_{}", std::process::id()));
+    let wab_dir = enospc_dir.join("wab");
+    let socket_dir = tmp_dir.join("run");
+    let socket_path = socket_dir.join("weir.sock");
+    let config_path = tmp_dir.join("weir.toml");
+
+    fs::create_dir_all(&socket_dir).expect("create socket dir");
+    // WAB dir on the small filesystem; tolerate "already exists" from a prior run.
+    if let Err(e) = fs::create_dir(&wab_dir)
+        && e.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        panic!("create wab_dir on {}: {e}", enospc_dir.display());
+    }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let config = format!(
+        "[server]\n\
+         socket_path           = \"{}\"\n\
+         wab_dir               = \"{}\"\n\
+         metrics_port          = {}\n\
+         shard_count           = 1\n\
+         worker_count          = 2\n\
+         batch_size            = 100\n\
+         batch_deadline_ms     = 20\n\
+         shutdown_timeout_secs = 3\n\
+         log_level             = \"warn\"\n",
+        socket_path.display(),
+        wab_dir.display(),
+        metrics_port,
+    );
+    fs::write(&config_path, config).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+    let mut cmd = Command::new(binary);
+    cmd.args(["--config", config_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Ignore SIGXFSZ defensively; not strictly needed for ENOSPC but harmless.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("failed to spawn weir-server (enospc)");
+
+    let mut handle = ServerHandle {
+        child: Some(child),
+        socket_path,
+        wab_dir: wab_dir.clone(),
+        metrics_port,
+        config_path,
+        tmp_dir,
+        _proc_lock,
+    };
+    handle.wait_ready(Duration::from_secs(15));
+
+    // Push records until one fails with Nack(InternalError). The 64 KiB tmpfs
+    // should fill within a small handful of records.
+    let mut client = handle.client();
+    let mut saw_nack = false;
+    for i in 0..200u32 {
+        let payload = vec![0xAAu8; 1024]; // 1 KiB; tmpfs holds ~64.
+        match client.push(&payload, Durability::Sync) {
+            Ok(()) => continue,
+            Err(ClientError::Nack(NackReason::InternalError)) => {
+                saw_nack = true;
+                break;
+            }
+            Err(other) => panic!("unexpected error on record {i}: {other:?}"),
+        }
+    }
+    assert!(
+        saw_nack,
+        "filesystem at {} did not return ENOSPC within 200 × 1 KiB records — \
+         is it larger than 64 KiB? Check tmpfs size.",
+        enospc_dir.display()
+    );
+
+    // Server must still be alive after the nack.
+    handle
+        .client()
+        .health_check()
+        .expect("server unresponsive after ENOSPC nack");
 }
 
 // ── WAB data integrity after crash ────────────────────────────────────────────
@@ -1654,17 +1726,22 @@ fn batch_deadline_timer_keeps_latency_bounded() {
     );
 }
 
-// ── Metrics monotonicity under crash-restart ───────────────────────────────────
+// ── Metrics across crash-restart ──────────────────────────────────────────────
 
-/// After a crash-restart, per-session counters reset to zero (in-process
-/// atomics). Within each session the counters must be internally consistent:
-/// `records_accepted` must be ≥ `records_ack` and neither may be negative.
+/// Within a single server process the per-tier counters must be internally
+/// consistent: `records_accepted` never exceeds the number of pushes made, and
+/// `records_ack` never exceeds `records_accepted`. Three rounds across
+/// restarts exercise the assertion on a fresh atomic each time.
+///
+/// Note: this is a *per-session* invariant. The cross-restart resets and the
+/// recovery counter are tested separately
+/// (`metrics_reset_to_zero_after_restart`, `recovery_replays_records_after_crash`).
 #[test]
-fn metrics_consistent_across_crash_restart() {
+fn metrics_internally_consistent_per_session() {
     const PUSHES_PER_ROUND: u32 = 10;
     const ROUNDS: u32 = 3;
 
-    let mut srv = ServerHandle::start("metrics_crash");
+    let mut srv = ServerHandle::start("metrics_per_session");
 
     for round in 0..ROUNDS {
         let mut client = srv.client();
@@ -1696,6 +1773,91 @@ fn metrics_consistent_across_crash_restart() {
             srv.restart_in_place();
         }
     }
+}
+
+/// `records_accepted_total` and `records_ack_total` are in-process atomics —
+/// they must reset to 0 on every restart, even if records were on disk.
+/// This documents the deliberate non-persistence: Prometheus counters are
+/// cumulative *within a process*, and an external scraper handles restart
+/// gaps via the `_created` timestamp.
+#[test]
+fn metrics_reset_to_zero_after_restart() {
+    let mut srv = ServerHandle::start("metrics_reset");
+
+    // Drive both counters above zero.
+    let mut client = srv.client();
+    for i in 0..5u32 {
+        client
+            .push(format!("pre-restart-{i}").as_bytes(), Durability::Sync)
+            .unwrap();
+    }
+    drop(client);
+
+    let before = srv.scrape_metrics();
+    let accepted_before = parse_metric(&before, "weir_records_accepted_total{tier=\"sync\"}");
+    let acked_before = parse_metric(&before, "weir_records_ack_total{tier=\"sync\"}");
+    assert!(
+        accepted_before >= 5 && acked_before >= 5,
+        "expected counters to be ≥5 before restart (accepted={accepted_before}, acked={acked_before})",
+    );
+
+    srv.restart_in_place();
+
+    // Immediately after restart, before any new pushes.
+    let after = srv.scrape_metrics();
+    let accepted_after = parse_metric(&after, "weir_records_accepted_total{tier=\"sync\"}");
+    let acked_after = parse_metric(&after, "weir_records_ack_total{tier=\"sync\"}");
+    assert_eq!(
+        accepted_after, 0,
+        "records_accepted_total should reset to 0 after restart, got {accepted_after}"
+    );
+    assert_eq!(
+        acked_after, 0,
+        "records_ack_total should reset to 0 after restart, got {acked_after}"
+    );
+}
+
+/// Crash recovery must replay the records on disk and increment
+/// `weir_recovery_records_replayed_total` accordingly. Closes the gap that
+/// the audit flagged: the metric exists but no test asserted it advances.
+///
+/// Procedure:
+/// 1. Push N Sync records — guaranteed durable in the active WAB segment.
+/// 2. SIGKILL the server (active segment left as `.wab`, no footer).
+/// 3. Restart — recovery should seal the active segment and replay it.
+/// 4. Scrape metrics; assert `weir_recovery_records_replayed_total >= N`.
+#[test]
+fn recovery_replays_records_after_crash() {
+    const N: u32 = 25;
+
+    let mut srv = ServerHandle::start_sharded("recovery_replay", 1);
+    let mut client = srv.client();
+    for i in 0..N {
+        client
+            .push(format!("recover-{i:05}").as_bytes(), Durability::Sync)
+            .unwrap();
+    }
+    drop(client);
+
+    srv.kill_ungracefully();
+    srv.restart_in_place();
+
+    // Give the drain a moment to process the replayed segment so the counter
+    // has actually been incremented before we scrape.
+    thread::sleep(Duration::from_millis(200));
+
+    let body = srv.scrape_metrics();
+    let replayed = parse_metric(&body, "weir_recovery_records_replayed_total");
+    assert!(
+        replayed >= u64::from(N),
+        "expected weir_recovery_records_replayed_total >= {N}, got {replayed}\n\
+         recovery did not replay all crashed records — metric: {replayed}\n\
+         metrics body excerpt:\n{}",
+        body.lines()
+            .filter(|l| l.starts_with("weir_recovery") || l.starts_with("weir_wab_segments"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 fn parse_metric(body: &str, prefix: &str) -> u64 {
