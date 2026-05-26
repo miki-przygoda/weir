@@ -258,7 +258,7 @@ can raise it up to the hard ceiling.
 - **Type**: u64 (seconds)
 - **Default**: `30`
 - **Range**: 1–600
-- **CLI**: `--connection-read-timeout <n>`
+- **CLI**: `--connection-read-timeout-secs <n>`
 - **Env**: `WEIR_CONNECTION_READ_TIMEOUT_SECS`
 - **TOML**: `connection_read_timeout_secs`
 
@@ -341,7 +341,7 @@ to allow multiple weir instances on one host.
 - **Type**: u64 (seconds)
 - **Default**: `30`
 - **Range**: 1+ (no upper cap)
-- **CLI**: `--shutdown-timeout <n>`
+- **CLI**: `--shutdown-timeout-secs <n>`
 - **Env**: `WEIR_SHUTDOWN_TIMEOUT_SECS`
 - **TOML**: `shutdown_timeout_secs`
 

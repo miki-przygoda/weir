@@ -9,21 +9,31 @@ USAGE:
     weir-server [OPTIONS]
 
 OPTIONS:
-    --config <path>                        Config file path [default: /etc/weir/weir.toml]
-    --socket <path>                        Unix socket path [env: WEIR_SOCKET_PATH]
-    --wab-dir <path>                       WAB directory [env: WEIR_WAB_DIR]
-    --shard-count <n>                      Number of WAB shards (1-256) [default: 1]
-    --worker-count <n>                     Worker thread count (1-64) [default: 2]
-    --batch-size <n>                       Records per flush batch (1-100000) [default: 1000]
-    --batch-deadline-ms <n>               Max batch accumulation time ms (1-60000) [default: 100]
-    --max-connections <n>                  Connection cap (1-512) [default: 256]
-    --max-payload-bytes <n>                Payload cap in bytes [default: 16777216]
-    --metrics-port <port>                  Prometheus metrics port [default: 9185]
-    --shutdown-timeout <secs>              Graceful shutdown timeout [default: 30]
-    --dead-letter-max-bytes <n>            Dead-letter dir size cap [default: 1073741824]
-    --dead-letter-check-interval-secs <n>  Blocked-state wake interval (1-3600) [default: 30]
-    --log-level <level>                    Log level (trace/debug/info/warn/error) [default: info]
-    -h, --help                             Print this help and exit
+    --config <path>                          Config file path [default: /etc/weir/weir.toml]
+    --socket-path <path>                     Unix socket path [env: WEIR_SOCKET_PATH]
+    --wab-dir <path>                         WAB directory [env: WEIR_WAB_DIR]
+    --shard-count <n>                        Number of WAB shards (1-256) [default: 1]
+    --worker-count <n>                       Worker thread count (1-64) [default: 2]
+    --batch-size <n>                         Records per flush batch (1-100000) [default: 256]
+    --batch-deadline-ms <n>                  Batch accumulation time ms (1-60000) [default: 1]
+    --max-connections <n>                    Connection cap (1-512) [default: 256]
+    --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
+    --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
+    --metrics-port <port>                    Prometheus metrics port [default: 9185]
+    --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
+    --sink-type <type>                       Sink: noop | http [default: noop]
+    --sink-url <url>                         Sink URL (required if type=http)
+    --sink-timeout-secs <secs>               Per-request sink timeout (1-300) [default: 10]
+    --sink-max-batch-size <n>                Sink commit batch cap (1-10000) [default: 100]
+    --dead-letter-max-bytes <n>              Dead-letter dir size cap [default: 1073741824]
+    --dead-letter-check-interval-secs <n>    Blocked-state wake interval (1-3600) [default: 30]
+    --log-level <level>                      Log level (trace/debug/info/warn/error) [default: info]
+    -h, --help                               Print this help and exit
+
+ENVIRONMENT:
+    Every option above can be set via WEIR_<UPPER_SNAKE_NAME>.
+    WEIR_SINK_BEARER_TOKEN is env-only (never sourced from --sink-* flags
+    or the config file).
 ";
 
 pub(super) fn parse() -> Result<(PartialConfig, PathBuf), ConfigError> {
@@ -44,7 +54,9 @@ pub(super) fn parse_from(
         .unwrap_or_else(|| PathBuf::from("/etc/weir/weir.toml"));
 
     let partial = PartialConfig {
-        socket_path: pargs.opt_value_from_str("--socket").map_err(pico_err)?,
+        socket_path: pargs
+            .opt_value_from_str("--socket-path")
+            .map_err(pico_err)?,
         wab_dir: pargs.opt_value_from_str("--wab-dir").map_err(pico_err)?,
         shard_count: pargs
             .opt_value_from_str("--shard-count")
@@ -66,10 +78,10 @@ pub(super) fn parse_from(
             .opt_value_from_str("--metrics-port")
             .map_err(pico_err)?,
         shutdown_timeout_secs: pargs
-            .opt_value_from_str("--shutdown-timeout")
+            .opt_value_from_str("--shutdown-timeout-secs")
             .map_err(pico_err)?,
         connection_read_timeout_secs: pargs
-            .opt_value_from_str("--connection-read-timeout")
+            .opt_value_from_str("--connection-read-timeout-secs")
             .map_err(pico_err)?,
         sink_type: pargs.opt_value_from_str("--sink-type").map_err(pico_err)?,
         sink_url: pargs.opt_value_from_str("--sink-url").map_err(pico_err)?,
