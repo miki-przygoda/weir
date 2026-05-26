@@ -45,8 +45,8 @@ impl Default for WabConfig {
     fn default() -> Self {
         WabConfig {
             shard_count: 1,
-            batch_size: 1000,
-            batch_deadline: Duration::from_millis(100),
+            batch_size: 256,
+            batch_deadline: Duration::from_millis(1),
         }
     }
 }

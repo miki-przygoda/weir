@@ -154,10 +154,12 @@ impl Config {
         let worker_count = merge!(worker_count).unwrap_or(2);
         check_range("worker_count", worker_count, 1, 64)?;
 
-        let batch_size = merge!(batch_size).unwrap_or(1_000);
+        // Defaults from docs/benchmarks/batch-tuning.md: (256, 1ms) is the sweet
+        // spot for both latency and throughput across the sweep grid.
+        let batch_size = merge!(batch_size).unwrap_or(256);
         check_range("batch_size", batch_size, 1, 100_000)?;
 
-        let batch_deadline_ms = merge!(batch_deadline_ms).unwrap_or(100);
+        let batch_deadline_ms = merge!(batch_deadline_ms).unwrap_or(1);
         check_range("batch_deadline_ms", batch_deadline_ms as usize, 1, 60_000)?;
 
         let max_connections = merge!(max_connections).unwrap_or(256);
@@ -353,8 +355,8 @@ mod tests {
         let c = layers_with_wab(dir.clone()).unwrap();
         assert_eq!(c.shard_count, 1);
         assert_eq!(c.worker_count, 2);
-        assert_eq!(c.batch_size, 1_000);
-        assert_eq!(c.batch_deadline_ms, 100);
+        assert_eq!(c.batch_size, 256);
+        assert_eq!(c.batch_deadline_ms, 1);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
