@@ -23,7 +23,7 @@ pub use connection::{ConnectionConfig, handle_connection};
 use std::{
     io,
     path::{Component, Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -100,6 +100,7 @@ pub async fn run(
                 break;
             }
             res = listener.accept() => {
+                let accept_start = Instant::now();
                 match res {
                     Ok((stream, _addr)) => {
                         let permit = match sem.clone().try_acquire_owned() {
@@ -123,6 +124,7 @@ pub async fn run(
                                 warn!(error = %e, "connection closed with error");
                             }
                         });
+                        metrics.accept_latency.observe(accept_start.elapsed().as_secs_f64());
                     }
                     Err(e) => {
                         error!(error = %e, "accept error");

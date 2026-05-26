@@ -120,6 +120,7 @@ pub(crate) struct Metrics {
     pub records_accepted: Family<TierLabel, Counter<u64, AtomicU64>>,
     pub records_ack: Family<TierLabel, Counter<u64, AtomicU64>>,
     pub records_nack: Family<NackLabel, Counter<u64, AtomicU64>>,
+    pub accept_latency: Histogram,
 
     // ── WAB ───────────────────────────────────────────────────────────────────
     pub wab_segments: Family<SegmentStateLabel, Counter<u64, AtomicU64>>,
@@ -181,6 +182,11 @@ impl Metrics {
             Family::<NackLabel, Counter<u64, AtomicU64>>::default(),
             "weir_records_nack",
             "Total records rejected (Nack), by durability tier and rejection reason"
+        );
+        let accept_latency = reg!(
+            Histogram::new(LATENCY_BUCKETS.iter().copied()),
+            "weir_accept_latency_seconds",
+            "Wall-clock time from socket accept to spawn of the connection handler"
         );
         let wab_segments = reg!(
             Family::<SegmentStateLabel, Counter<u64, AtomicU64>>::default(),
@@ -257,6 +263,7 @@ impl Metrics {
             records_accepted,
             records_ack,
             records_nack,
+            accept_latency,
             wab_segments,
             wab_bytes_on_disk,
             wab_fsync_duration,
