@@ -88,6 +88,25 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Tighten process umask to 0o077 immediately. Defense-in-depth: every
+    // file-creation path in weir specifies its mode bits explicitly today, so
+    // the umask is currently a no-op for daemon-created files. The tightening
+    // matters for any future code path that forgets to specify a mode — the
+    // umask makes "daemon-private" the default rather than "world-readable
+    // minus the inherited 0o022 mask".
+    //
+    // Note: bind_hardened temporarily tightens umask further (to 0o177) for
+    // the socket-create syscall and restores the previous value afterwards.
+    // That nested tightening sees the value set here as its "previous", so
+    // restoration is consistent.
+    //
+    // Safety: libc::umask is always safe; it swaps the process umask and
+    // returns the previous value. No invariants to uphold.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
+
     let config = Config::load()?;
 
     tracing_subscriber::fmt()
