@@ -516,6 +516,35 @@ default 100 is a balanced point for most deployments.
 
 ---
 
+#### `sink_send_idempotency_key`
+
+- **Type**: bool
+- **Default**: `true`
+- **CLI**: `--sink-send-idempotency-key <bool>`
+- **Env**: `WEIR_SINK_SEND_IDEMPOTENCY_KEY`
+- **TOML**: `sink_send_idempotency_key`
+
+Whether to send `Idempotency-Key: sha256:<lowercase-hex>` with each HTTP
+sink request.
+
+**Why it matters**: the drain's at-least-once delivery contract means
+records can be re-POSTed if a transient failure mid-batch causes the
+drain to retry the whole segment. The endpoint needs to dedupe to
+avoid double-writes. The key is a pure hash of the payload, so the
+same payload always produces the same key — exactly the property
+endpoint-side dedup needs.
+
+**Format**: `sha256:` prefix + 64-char lowercase hex digest. The
+prefix lets endpoints distinguish weir's scheme from other key sources
+and lets us swap algorithms in future (e.g. `blake3:...`) without
+breaking parsers.
+
+**When to disable**: only if the endpoint can't tolerate the extra
+header (strict CORS, header allow-lists). In that case the endpoint
+must implement its own dedup — usually by hashing the body server-side.
+
+---
+
 #### `WEIR_SINK_BEARER_TOKEN` (env-only)
 
 - **Type**: string

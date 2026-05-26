@@ -25,6 +25,7 @@ OPTIONS:
     --sink-url <url>                         Sink URL (required if type=http)
     --sink-timeout-secs <secs>               Per-request sink timeout (1-300) [default: 10]
     --sink-max-batch-size <n>                Sink commit batch cap (1-10000) [default: 100]
+    --sink-send-idempotency-key <bool>       Send Idempotency-Key header (http) [default: true]
     --dead-letter-max-bytes <n>              Dead-letter dir size cap [default: 1073741824]
     --dead-letter-check-interval-secs <n>    Blocked-state wake interval (1-3600) [default: 30]
     --log-level <level>                      Log level (trace/debug/info/warn/error) [default: info]
@@ -90,6 +91,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         sink_max_batch_size: pargs
             .opt_value_from_str("--sink-max-batch-size")
+            .map_err(pico_err)?,
+        sink_send_idempotency_key: pargs
+            .opt_value_from_str("--sink-send-idempotency-key")
             .map_err(pico_err)?,
         dead_letter_max_bytes: pargs
             .opt_value_from_str("--dead-letter-max-bytes")

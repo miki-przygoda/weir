@@ -196,6 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 timeout: Duration::from_secs(config.sink_timeout_secs),
                 max_batch_size: config.sink_max_batch_size,
                 bearer_token,
+                send_idempotency_key: config.sink_send_idempotency_key,
             };
             let sink = HttpSink::new(http_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))

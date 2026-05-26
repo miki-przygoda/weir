@@ -108,6 +108,7 @@ pub(crate) struct PartialConfig {
     pub sink_url: Option<String>,
     pub sink_timeout_secs: Option<u64>,
     pub sink_max_batch_size: Option<usize>,
+    pub sink_send_idempotency_key: Option<bool>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
@@ -140,6 +141,7 @@ pub struct Config {
     pub sink_url: Option<String>,
     pub sink_timeout_secs: u64,
     pub sink_max_batch_size: usize,
+    pub sink_send_idempotency_key: bool,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -259,6 +261,11 @@ impl Config {
         let sink_max_batch_size = merge!(sink_max_batch_size).unwrap_or(100);
         check_range("sink_max_batch_size", sink_max_batch_size, 1, 10_000)?;
 
+        // Default true: at-least-once delivery means retries re-POST records
+        // that may have been accepted; the Idempotency-Key header lets the
+        // endpoint dedupe without computing the hash itself.
+        let sink_send_idempotency_key = merge!(sink_send_idempotency_key).unwrap_or(true);
+
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
@@ -300,6 +307,7 @@ impl Config {
             sink_url,
             sink_timeout_secs,
             sink_max_batch_size,
+            sink_send_idempotency_key,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,
@@ -433,6 +441,7 @@ mod tests {
         assert_eq!(c.sink_url, None);
         assert_eq!(c.sink_timeout_secs, 10);
         assert_eq!(c.sink_max_batch_size, 100);
+        assert!(c.sink_send_idempotency_key);
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");

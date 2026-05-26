@@ -97,6 +97,13 @@ sink_timeout_secs = 10
 # Env: WEIR_SINK_MAX_BATCH_SIZE
 sink_max_batch_size = 100
 
+# Send `Idempotency-Key: sha256:<hex>` of the payload with each HTTP request
+# so the endpoint can dedupe retries. The drain delivers at-least-once per
+# segment, so retries re-POST records that may have already been accepted.
+# Set false only if your endpoint can't tolerate the extra header.
+# Env: WEIR_SINK_SEND_IDEMPOTENCY_KEY
+sink_send_idempotency_key = true
+
 # Bearer token for the HTTP sink. NEVER set this in the config file —
 # it must come from the environment so it doesn't end up in version control,
 # logs, or container image layers.

@@ -8,6 +8,11 @@
 //!   serialisation, no encoding, no framing — endpoints decide what to do
 //!   with the bytes.
 //! - `Content-Type: application/octet-stream`.
+//! - `Idempotency-Key: sha256:<hex>` of the payload, unless explicitly
+//!   disabled via `send_idempotency_key = false`. The drain guarantees
+//!   at-least-once delivery per segment, so retries re-POST records that
+//!   may have already been accepted; the idempotency key lets the endpoint
+//!   deduplicate without computing the hash itself.
 //! - Optional `Authorization: Bearer <token>` if `WEIR_SINK_BEARER_TOKEN`
 //!   was set at startup (token never appears in config files or logs).
 //! - Per-request timeout via `sink_timeout_secs`.
@@ -32,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::{Client, StatusCode};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use weir_core::Payload;
 
@@ -50,6 +56,11 @@ pub struct HttpSinkConfig {
     /// never sourced from the config file. Wrapped in `Arc` so the value can be
     /// shared without copying.
     pub bearer_token: Option<Arc<str>>,
+    /// Send `Idempotency-Key: sha256:<hex>` with each request so the endpoint
+    /// can deduplicate retries that follow the drain's at-least-once contract.
+    /// Default: true. Set false only if your endpoint can't tolerate the
+    /// extra header (e.g. strict CORS, header allow-lists).
+    pub send_idempotency_key: bool,
 }
 
 impl std::fmt::Debug for HttpSinkConfig {
@@ -62,6 +73,7 @@ impl std::fmt::Debug for HttpSinkConfig {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("send_idempotency_key", &self.send_idempotency_key)
             .finish()
     }
 }
@@ -102,12 +114,17 @@ impl HttpSink {
         let mut req = self
             .client
             .post(&self.config.url)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(payload.to_vec());
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+
+        if self.config.send_idempotency_key {
+            req = req.header("Idempotency-Key", payload_idempotency_key(payload));
+        }
 
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token.as_ref());
         }
+
+        let req = req.body(payload.to_vec());
 
         let resp = match req.send().await {
             Ok(r) => r,
@@ -149,6 +166,29 @@ impl HttpSink {
         })
     }
 }
+
+/// Computes the `Idempotency-Key` header value for a payload.
+///
+/// Format: `sha256:<lowercase-hex>` — the prefix lets the endpoint
+/// distinguish our scheme from other key sources and switch on the algorithm
+/// if we add more (e.g. blake3) in the future. Pure function of the payload:
+/// the same bytes always produce the same key, which is exactly the property
+/// the drain's at-least-once retry semantics need.
+fn payload_idempotency_key(payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for byte in digest {
+        // Manual hex avoids pulling in the `hex` crate.
+        out.push(HEX_CHARS[(byte >> 4) as usize] as char);
+        out.push(HEX_CHARS[(byte & 0xf) as usize] as char);
+    }
+    out
+}
+
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
 /// Returns true if the HTTP status code should be classified as transient
 /// (the drain should retry) vs permanent (dead-letter).
@@ -379,6 +419,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_batch_size: 100,
             bearer_token: None,
+            send_idempotency_key: true,
         }
     }
 
@@ -521,6 +562,136 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_transient());
+    }
+
+    // ── Idempotency key tests ─────────────────────────────────────────────
+
+    #[test]
+    fn idempotency_key_is_deterministic() {
+        // The whole point: same payload always produces the same key. Without
+        // this property the endpoint can't dedupe retries.
+        let key1 = payload_idempotency_key(b"hello, weir");
+        let key2 = payload_idempotency_key(b"hello, weir");
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn idempotency_key_differs_for_different_payloads() {
+        let key1 = payload_idempotency_key(b"hello, weir");
+        let key2 = payload_idempotency_key(b"hello, world");
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn idempotency_key_has_expected_shape() {
+        let key = payload_idempotency_key(b"");
+        // Empty input's SHA-256 is a well-known constant; this asserts the
+        // hex encoding is correct, lowercase, and the prefix is present.
+        assert_eq!(
+            key,
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// Spawns a mock server that captures the first request's header block
+    /// into `captured`, then returns 200 OK. Used to assert on what headers
+    /// the sink actually sent.
+    async fn spawn_header_capture_server(
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = Arc::clone(&captured);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let mut header_end = None;
+                    while header_end.is_none() {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = find_double_crlf(&buf) {
+                                    header_end = Some(pos);
+                                }
+                            }
+                        }
+                    }
+                    let headers = String::from_utf8_lossy(&buf[..header_end.unwrap()])
+                        .to_string();
+                    captured.lock().unwrap().push(headers);
+                    // Drain the body so the client doesn't see ECONNRESET.
+                    let content_length = {
+                        let s = captured.lock().unwrap();
+                        let last = s.last().unwrap();
+                        parse_content_length(last).unwrap_or(0)
+                    };
+                    let already_have = buf.len().saturating_sub(header_end.unwrap() + 4);
+                    let mut remaining = content_length.saturating_sub(already_have);
+                    while remaining > 0 {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => remaining = remaining.saturating_sub(n),
+                        }
+                    }
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        url
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_header_sent_by_default() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let url = spawn_header_capture_server(Arc::clone(&captured)).await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        sink.commit(vec![b"hello, weir".to_vec()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 1);
+        let expected_key = payload_idempotency_key(b"hello, weir");
+        assert!(
+            headers[0]
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")
+                    && line.contains(&expected_key)),
+            "no Idempotency-Key header with expected value found in:\n{}",
+            headers[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_header_omitted_when_disabled() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let url = spawn_header_capture_server(Arc::clone(&captured)).await;
+        let mut c = cfg(&url);
+        c.send_idempotency_key = false;
+        let sink = HttpSink::new(c).unwrap();
+        sink.commit(vec![b"hello, weir".to_vec()]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 1);
+        assert!(
+            !headers[0]
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")),
+            "Idempotency-Key header should be absent when disabled, found:\n{}",
+            headers[0]
+        );
     }
 
     #[tokio::test]

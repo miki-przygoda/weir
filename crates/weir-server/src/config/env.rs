@@ -19,6 +19,7 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         sink_url: env_string("WEIR_SINK_URL")?,
         sink_timeout_secs: env_parse("WEIR_SINK_TIMEOUT_SECS")?,
         sink_max_batch_size: env_parse("WEIR_SINK_MAX_BATCH_SIZE")?,
+        sink_send_idempotency_key: env_parse("WEIR_SINK_SEND_IDEMPOTENCY_KEY")?,
         dead_letter_max_bytes: env_parse("WEIR_DEAD_LETTER_MAX_BYTES")?,
         dead_letter_check_interval_secs: env_parse("WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS")?,
         log_level: env_string("WEIR_LOG_LEVEL")?,
