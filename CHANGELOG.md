@@ -10,6 +10,137 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Hardened socket bind sequence** (`bind_hardened` in
+  `crates/weir-server/src/socket/mod.rs`). Replaces the original
+  `lstat → check → remove → bind → set_permissions` pattern with a
+  dirfd-pinned sequence: `O_PATH | O_DIRECTORY | O_NOFOLLOW` on the
+  parent, `unlinkat` for stale-socket cleanup with
+  `AT_SYMLINK_NOFOLLOW`, tightened umask (0o177) so `bind(2)` itself
+  creates the socket inode at mode 0o600 directly (no post-bind chmod
+  to redirect), and an inode-equality check between two `fstatat`
+  calls to catch a late rename swap. 9 unit tests + 1 stress test in
+  `socket::tests`. Full threat model in
+  [`docs/security/socket-bind.md`](docs/security/socket-bind.md).
+- **Slowloris guard**: new `connection_read_timeout_secs` config
+  (default 30 s, range 1–600). Wraps every `read_exact` in the
+  connection handler with `tokio::time::timeout`; idle connections
+  past the timeout are dropped silently and increment
+  `weir_connection_idle_timeout_total`. Wired through all four config
+  layers (CLI flag `--connection-read-timeout`, env
+  `WEIR_CONNECTION_READ_TIMEOUT_SECS`, TOML file, defaults). 2 unit
+  tests in `socket::connection::tests`.
+- **Startup `umask(0o077)`** in `weir-server::main`. Defense-in-depth:
+  every file-creation path in weir today specifies mode bits
+  explicitly, but a tighter daemon-wide umask means any future code
+  that forgets gets daemon-private permissions by default.
+- **WAB segment mode audit on recovery**: `audit_segment_modes` in
+  `crates/weir-server/src/wab/recovery.rs` walks each shard directory
+  during `recover_open_segments` and warns on any
+  `.wab`/`.wab.sealed`/`.wab.confirmed` file whose permissions are not
+  `0o600`. Increments `weir_wab_unexpected_mode_total`. Does not refuse
+  startup — visibility-first signal. 2 unit tests.
+- **`weir_accept_latency_seconds` histogram**: time from socket accept
+  to handler spawn. Visibility into queueing delay introduced by the
+  `Semaphore` cap, the `tokio::spawn` task creation cost, and the
+  `task::spawn_blocking` initial dispatch.
+- **Proptest suite for the wire protocol parser**
+  (`crates/weir-core/tests/proptest_envelope.rs`, 12 properties):
+  round-trip correctness for `Header` and `Envelope`, never-panic on
+  arbitrary input, specific error-path correctness (`BadMagic`,
+  `VersionMismatch`, `HeaderCrcMismatch`, `PayloadCrcMismatch`,
+  `PayloadTooLarge`, `TruncatedFrame`), and a DoS pre-allocation
+  guard (oversize `payload_len` rejected before any payload-sized
+  allocation). `proptest` added as a dev-dependency on `weir-core`.
+- **Security documentation tree** under `docs/security/`:
+  [`threat-model.md`](docs/security/threat-model.md) (trust boundary,
+  in-scope/out-of-scope threats, operator assumptions),
+  [`socket-bind.md`](docs/security/socket-bind.md) (190-line TOCTOU
+  analysis), [`container.md`](docs/security/container.md) (Dockerfile
+  review + hardening guidance + recommended `docker run`).
+- **`SECURITY.md`** at the repo root. GitHub Security tab destination
+  with reporting policy and "what counts / what does not" lists.
+- **`docs/operations/configuration.md`** — canonical configuration
+  reference. Every option: type, default, range, CLI flag, env var,
+  TOML key, what it controls, when to tune. Includes minimal-config
+  and production-config examples.
+- **`docs/getting-started/install.md`** and
+  **`docs/getting-started/quickstart.md`** — install paths (source,
+  container, planned `cargo install`) and a 5-minute first-run
+  walkthrough.
+- **`docs/README.md`** — docs sitemap and doc-conventions reference.
+
+### Changed
+
+- **`batch_size` default changed from 1000 to 256**, and
+  **`batch_deadline_ms` default changed from 100 to 1**. Backed by the
+  empirical batch-tuning sweep in
+  [`docs/benchmarks/batch-tuning.md`](docs/benchmarks/batch-tuning.md):
+  `(256, 1ms)` is the sweet spot for both latency (4–6× p50
+  improvement over the old defaults) and throughput (3–6× across every
+  concurrency level measured). Also updates `WabConfig::Default` for
+  consistency.
+- **Metrics HTTP server bind address: `127.0.0.1` → `0.0.0.0`** to
+  make the endpoint reachable from container hosts and sidecars
+  without `docker exec`. The bind is no longer the access control —
+  use firewall rules or port mapping.
+- **Dockerfile hardening** (`deploy/docker/Dockerfile`):
+  `rust:slim-bookworm` → `rust:1-slim-bookworm` (bound to Rust 1.x);
+  `cargo build` gains `--locked` flag (refuses lockfile updates
+  during build, supply-chain hardening); daemon UID/GID pinned to
+  10001 (was unspecified — drifted across rebuilds and broke
+  bind-mounted volumes); `/run/weir` and `/var/lib/weir/wab` chmodded
+  to 0o700 in the image; `STOPSIGNAL SIGTERM` made explicit;
+  `HEALTHCHECK` added using bash `/dev/tcp` against the metrics port
+  (no extra packages installed). Full review in
+  [`docs/security/container.md`](docs/security/container.md).
+- **README slimmed** from 94 lines to 56 (one-paragraph pitch + status
+  callout + quickstart command + documentation index by role + crates
+  + non-goals + license). Detail moved to dedicated docs under
+  `docs/`. Optimised for both human evaluators landing on the GitHub
+  page and AI agents loading it as initial context.
+- **`docs/architecture.md` metrics count** updated from 16 → 19 to
+  reflect three new metric families
+  (`weir_accept_latency_seconds`, `weir_connection_idle_timeout_total`,
+  `weir_wab_unexpected_mode_total`).
+- **CI clippy** bumped from `cargo clippy -- -D warnings` to
+  `cargo clippy --all-targets -- -D warnings` so integration-test
+  clippy violations fail CI instead of accumulating (six had built up
+  in `tests/load.rs` and `tests/system.rs` before this change).
+
+### Fixed
+
+- **Shutdown deadlock when a TCP scrape connection is mid-flight**:
+  the tokio runtime is now dropped before joining pipeline threads.
+  Background tokio tasks (queue depth poller, metrics server) hold
+  `QueueSender` clones; without the explicit runtime drop, the
+  pipeline join would wait for those tasks, which were waiting on
+  runtime shutdown to be triggered. Surfaces during graceful shutdown
+  with an active `/metrics` scrape connection.
+- **`bind_cleanup` race window** that allowed an attacker with write
+  access to the socket's parent directory to swap a symlink between
+  the daemon's `bind(2)` and `set_permissions` calls, leaving the
+  real socket inode at its bind-time mode (typically 0o755 under
+  umask 022) while the path-based chmod silently operated on an
+  attacker-controlled file. Fixed by `bind_hardened` (see Added).
+- **Architecture.md bind-sequence description** that still documented
+  the old, vulnerable `S_ISSOCK + chmod 0o600 after bind` pattern.
+- **`docs/architecture.md`** metrics table out of sync with code (was
+  describing 17 metrics; code had 18, then 19).
+
+### Security
+
+- TOCTOU window in socket bind closed (`bind_hardened`).
+- Slowloris DoS vector closed (`connection_read_timeout_secs`).
+- Defense-in-depth: startup umask, WAB segment mode audit.
+- Container image hardened (pinned UID, supply-chain pin guidance,
+  STOPSIGNAL, HEALTHCHECK, 0o700 on data directories).
+
+---
+
 ## [0.3.0] - 2026-05-25
 
 ### Added
