@@ -278,6 +278,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bridge threads observe shard_rx Disconnected → exit → drop wab_tx.
     // WAB flushers observe wab_rx Disconnected → seal segments → exit → drop drain_tx.
     // Drain thread observes drain_rx Disconnected → drains pending segments → exits.
+    //
+    // The queue-depth background task holds a `queue_tx.clone()`. Dropping the
+    // runtime aborts that task so the clone is released — otherwise workers
+    // never observe `Disconnected` and `worker_handles.join()` deadlocks.
+    drop(rt);
 
     info!("socket layer shut down; waiting for pipeline to drain");
 
