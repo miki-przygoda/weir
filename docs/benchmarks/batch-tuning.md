@@ -80,20 +80,44 @@ Change `Config::from_layers` defaults to `batch_size = 256`,
 `batch_deadline_ms = 1`. This:
 - Brings defaults in line with what the project actually exercises in CI
 - Lands a ~6× p50 latency improvement for any operator who runs with defaults
-- Costs ~zero throughput at low load (small batches still flush at the
-  size cap when traffic is heavy; the deadline only matters when traffic is
-  light)
+- **Improves** throughput by 3-6× across every concurrency level measured —
+  the throughput companion sweep below shows no scenario where the current
+  default beats (256, 1ms)
 
-This recommendation is left unimplemented in this commit so the change can be
-reviewed and applied independently with its own discussion of throughput
-implications under sustained load (which this sweep did not measure — the
-weir-bench throughput scenarios should be re-run before changing defaults).
+Applied in the commit that follows this doc.
+
+## Throughput companion sweep
+
+Same 5 configs × 3 trials, but `weir-bench --only throughput` and `--only herd`
+(5000 samples per scenario, 256 B payload). Median RPS across the 3 trials per
+scenario.
+
+### Single-thread
+
+| Config (bs/dl)   | sync RPS | buffered RPS |
+|---|---:|---:|
+| 64 / 1ms         |   486 |   738 |
+| 64 / 5ms         |   159 |   185 |
+| **256 / 1ms**    | **506** | **754** |
+| 256 / 5ms        |   162 |   185 |
+| 1000 / 10ms      |    86 |    95 |
+
+### Concurrent (thundering herd)
+
+| Config (bs/dl)   |  8 threads | 32 threads | 64 threads |
+|---|---:|---:|---:|
+| 64 / 1ms         |  5081 | 12849 | 15351 |
+| 64 / 5ms         |  1428 |  4884 |  8191 |
+| **256 / 1ms**    | **5033** | **12889** | **16986** |
+| 256 / 5ms        |  1440 |  4780 |  8131 |
+| 1000 / 10ms      |   749 |  2654 |  4779 |
+
+(256, 1ms) leads or ties on every scenario; (1000, 10ms) is 3-6× worse on
+every concurrency level. The throughput data agrees with the latency data:
+no axis on which the (1000, 10ms) default beats (256, 1ms).
 
 ## Out of scope for this sweep
 
-- Throughput scenarios (`weir-bench --only throughput / herd / churn`). The
-  `batch_size` parameter mostly matters under sustained load — that's the next
-  experiment.
 - Larger payloads. 256 B is the load-test default but production records may be
   larger.
 - Different `shard_count` / `worker_count`. Held fixed at (2, 2) to isolate the
