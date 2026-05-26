@@ -20,7 +20,8 @@
 
 - [Internals](architecture.md)
 - [Benchmarks](benchmarks.md)
-    - [Latest results](benchmarks/latest.md)
+    - [Latest results (CI)](benchmarks/latest.md)
+    - [Bare-metal results](benchmarks/bare-metal.md)
     - [Per-version history](benchmarks/history.md)
     - [Environments](benchmarks/environments.md)
     - [Batch-tuning sweep](benchmarks/batch-tuning.md)

@@ -1,11 +1,23 @@
 # Benchmark Environments
 
+weir publishes numbers from two distinct environments. They answer different
+questions and have different regression gates.
+
+| Surface | Source | Catches | Gate |
+|--------|--------|---------|------|
+| [`latest.md`](latest.md), [`history.md`](history.md) | CI (`ubuntu-latest`, 2 vCPU) | Order-of-magnitude regressions: missing `#[inline]`, accidental allocation on the hot path, an O(n²) loop in the WAB encode | >10× drop or any scenario going from non-zero to zero |
+| [`bare-metal.md`](bare-metal.md) | Operator-run script, named hardware | Real performance regressions visible to a deployer | >10% drop in single-thread RPS, >20% increase in `Sync` p99, any saturation level regressing from `ok` to dropped I/O |
+
+The CI gate is below the noise floor of the bare-metal numbers and
+vice-versa. Performance claims in the README, release notes, or any
+external comparison must cite [`bare-metal.md`](bare-metal.md), not
+[`latest.md`](latest.md).
+
 ## CI environment
 
-All numbers in [`latest.md`](latest.md) and [`history.md`](history.md) are
-produced on GitHub Actions `ubuntu-latest` runners (2 vCPUs, ~7 GB RAM).
-The `load` CI job runs 5 passes at each of two batch deadlines (1 ms and 2 ms)
-and averages the results.
+GitHub Actions `ubuntu-latest` runners: 2 vCPUs, ~7 GB RAM. The `load` CI
+job runs 5 passes at each of two batch deadlines (1 ms and 2 ms) and
+averages the results into [`latest.md`](latest.md).
 
 Relevant constraints:
 - **2 vCPUs** — multi-threaded scenarios (thundering herd, saturation ramp) are
@@ -15,6 +27,16 @@ Relevant constraints:
   values from CI are unreliable; p95 and below are generally stable.
 - **No CPU pinning** — weir-server pins workers starting at core 2; on a 2-core
   runner this lands on the same cores as the OS scheduler.
+
+## Bare-metal environment
+
+Captured by running [`deploy/run_bare_metal_bench.sh`](../../deploy/run_bare_metal_bench.sh)
+on the target machine and committing the output to
+[`bare-metal.md`](bare-metal.md). The script records CPU model, kernel,
+filesystem, mount options, block-device model, governor, SMT/turbo state,
+and the relevant `vm.dirty_*` sysctls so two runs can be meaningfully
+compared. See [`bare-metal.md`](bare-metal.md) for the full capture
+procedure and when to re-run.
 
 ## Local environment
 
