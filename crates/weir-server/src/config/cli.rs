@@ -68,6 +68,9 @@ pub(super) fn parse_from(
         shutdown_timeout_secs: pargs
             .opt_value_from_str("--shutdown-timeout")
             .map_err(pico_err)?,
+        connection_read_timeout_secs: pargs
+            .opt_value_from_str("--connection-read-timeout")
+            .map_err(pico_err)?,
         dead_letter_max_bytes: pargs
             .opt_value_from_str("--dead-letter-max-bytes")
             .map_err(pico_err)?,

@@ -83,6 +83,7 @@ pub(crate) struct PartialConfig {
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
     pub shutdown_timeout_secs: Option<u64>,
+    pub connection_read_timeout_secs: Option<u64>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
@@ -110,6 +111,7 @@ pub struct Config {
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
     pub shutdown_timeout_secs: u64,
+    pub connection_read_timeout_secs: u64,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -197,6 +199,19 @@ impl Config {
             });
         }
 
+        // Per-connection read timeout. Caps how long a connection handler can
+        // sit in read_exact waiting for the next byte. Without this a slow or
+        // silent client can hold a semaphore permit indefinitely (slowloris).
+        // Default 30 s is generous for legitimate clients doing batched
+        // sends but cuts off a stalled connection promptly.
+        let connection_read_timeout_secs = merge!(connection_read_timeout_secs).unwrap_or(30);
+        check_range(
+            "connection_read_timeout_secs",
+            connection_read_timeout_secs as usize,
+            1,
+            600,
+        )?;
+
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
@@ -233,6 +248,7 @@ impl Config {
             max_payload_bytes,
             metrics_port,
             shutdown_timeout_secs,
+            connection_read_timeout_secs,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,
@@ -361,6 +377,7 @@ mod tests {
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
         assert_eq!(c.shutdown_timeout_secs, 30);
+        assert_eq!(c.connection_read_timeout_secs, 30);
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");

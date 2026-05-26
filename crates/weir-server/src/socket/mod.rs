@@ -49,6 +49,9 @@ pub struct SocketConfig {
     /// How long to wait for in-flight connections to finish after the shutdown
     /// signal is received before aborting them.
     pub shutdown_timeout_secs: u64,
+    /// Per-connection idle read timeout in seconds. Caps slowloris-style
+    /// connections that never send (or stall mid-frame).
+    pub connection_read_timeout_secs: u64,
 }
 
 /// Binds a Unix socket, accepts connections, and drives the frame-parsing layer.
@@ -82,6 +85,7 @@ pub async fn run(
         .min(weir_core::MAX_PAYLOAD_HARD_CAP);
     let conn_cfg = ConnectionConfig {
         max_payload_bytes: effective_cap,
+        read_timeout: Duration::from_secs(config.connection_read_timeout_secs),
     };
     let sem = std::sync::Arc::new(Semaphore::new(config.max_connections));
     let mut join_set: JoinSet<()> = JoinSet::new();
@@ -451,6 +455,7 @@ mod tests {
             max_connections: 16,
             max_payload_bytes: weir_core::MAX_PAYLOAD_HARD_CAP,
             shutdown_timeout_secs: 5,
+            connection_read_timeout_secs: 30,
         }
     }
 
@@ -776,6 +781,7 @@ mod tests {
             max_connections: 1,
             max_payload_bytes: weir_core::MAX_PAYLOAD_HARD_CAP,
             shutdown_timeout_secs: 2,
+            connection_read_timeout_secs: 30,
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();

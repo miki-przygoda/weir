@@ -259,6 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_connections: config.max_connections,
                 max_payload_bytes: config.max_payload_bytes,
                 shutdown_timeout_secs: config.shutdown_timeout_secs,
+                connection_read_timeout_secs: config.connection_read_timeout_secs,
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics)).await?;
         }
