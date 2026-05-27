@@ -3,6 +3,7 @@ members = [
     "crates/weir-core",
     "crates/weir-server",
     "crates/weir-client",
+    "crates/weir-testkit",
 ]
 resolver = "2"
 

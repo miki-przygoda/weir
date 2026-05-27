@@ -1,7 +1,7 @@
 //! System integration tests — exercises the real `weir-server` binary.
 //!
-//! Each test uses `ServerHandle` to spawn the binary, wait for the socket to
-//! be ready, and clean everything up on drop (even on panic). Tests are
+//! Each test uses [`WeirServer`] (from `weir-testkit`) to spawn the binary,
+//! wait for the socket to be ready, and clean everything up on drop. Tests are
 //! independent: each gets its own temp directory, socket path, WAB dir, and
 //! metrics port so they can run in parallel without interference.
 //!
@@ -21,11 +21,10 @@
 
 use std::{
     fs,
-    net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -34,412 +33,8 @@ use std::{
 
 use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
+use weir_testkit::{free_port, process_lock, weir_server};
 
-// ── Process serialiser ────────────────────────────────────────────────────────
-//
-// Each test holds this lock for its entire lifetime via `ServerHandle`.
-// This means at most one server process is alive at a time regardless of
-// `--test-threads`, which prevents OS resource exhaustion on dev machines and
-// CI runners without requiring callers to remember `--test-threads=1`.
-
-fn process_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(Default::default)
-}
-
-// ── Port allocator ────────────────────────────────────────────────────────────
-
-/// Asks the OS for a free TCP port. The listener is dropped immediately (brief
-/// TOCTOU window, but acceptable in tests — far safer than a fixed range that
-/// clashes with stale processes from previous runs).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind port 0")
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-// ── ServerHandle ──────────────────────────────────────────────────────────────
-
-/// Owns a running `weir-server` process and its associated temp directories.
-///
-/// Cleans up (SIGTERM + wait + rm temp dir) on drop. The binary path comes
-/// from `env!("CARGO_BIN_EXE_weir-server")` — Cargo resolves this at compile
-/// time to the binary being tested in the current profile.
-struct ServerHandle {
-    child: Option<Child>,
-    pub socket_path: PathBuf,
-    pub wab_dir: PathBuf,
-    pub metrics_port: u16,
-    config_path: PathBuf,
-    tmp_dir: PathBuf,
-    /// Held for the lifetime of the handle to serialise process spawning.
-    _proc_lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl ServerHandle {
-    /// Starts a fresh weir-server instance and blocks until the socket is ready.
-    ///
-    /// `tag` is used to name the temp directory (helps with post-mortem debugging).
-    fn start(tag: &str) -> Self {
-        Self::start_impl(tag, 1)
-    }
-
-    /// Like `start`, but configures `shard_count` WAB shards.
-    fn start_sharded(tag: &str, shard_count: usize) -> Self {
-        Self::start_impl(tag, shard_count)
-    }
-
-    fn start_impl(tag: &str, shard_count: usize) -> Self {
-        let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let metrics_port = free_port();
-        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
-        let wab_dir = tmp_dir.join("wab");
-        let socket_dir = tmp_dir.join("run");
-        let socket_path = socket_dir.join("weir.sock");
-        let config_path = tmp_dir.join("weir.toml");
-        let log_path = tmp_dir.join("weir.log");
-
-        fs::create_dir_all(&wab_dir).unwrap();
-        fs::create_dir_all(&socket_dir).unwrap();
-        // WAB dir must be mode 0o700.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-
-        // Write a minimal config.
-        let config = format!(
-            "[server]\n\
-             socket_path           = \"{}\"\n\
-             wab_dir               = \"{}\"\n\
-             metrics_port          = {}\n\
-             shard_count           = {}\n\
-             worker_count          = 2\n\
-             batch_size            = 100\n\
-             batch_deadline_ms     = 20\n\
-             shutdown_timeout_secs = 3\n\
-             log_level             = \"warn\"\n",
-            socket_path.display(),
-            wab_dir.display(),
-            metrics_port,
-            shard_count,
-        );
-        fs::write(&config_path, config).unwrap();
-
-        let log_file = fs::File::create(&log_path).unwrap();
-        let binary = env!("CARGO_BIN_EXE_weir-server");
-        let child = Command::new(binary)
-            .args(["--config", config_path.to_str().unwrap()])
-            .stdout(Stdio::from(log_file.try_clone().unwrap()))
-            .stderr(Stdio::from(log_file))
-            .spawn()
-            .expect("failed to spawn weir-server");
-
-        let mut handle = Self {
-            child: Some(child),
-            socket_path,
-            wab_dir,
-            metrics_port,
-            config_path,
-            tmp_dir,
-            _proc_lock,
-        };
-
-        // Wait up to 15 s for the socket to appear.
-        handle.wait_ready(Duration::from_secs(15));
-        handle
-    }
-
-    /// Kills the server immediately with SIGKILL. The socket and temp files remain
-    /// on disk. Used to simulate a crash for crash-recovery tests.
-    fn kill_ungracefully(&mut self) {
-        if let Some(ref mut child) = self.child {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
-            }
-            let _ = child.wait();
-            self.child = None;
-        }
-    }
-
-    /// Kills the server with SIGKILL then restarts it with the same config.
-    ///
-    /// Simulates crash recovery: `bind_cleanup` in the socket layer detects and
-    /// removes the stale socket left behind by the crash.
-    fn restart_in_place(&mut self) {
-        self.kill_ungracefully();
-
-        // Append to existing log so both runs appear in diagnostics.
-        let log_path = self.tmp_dir.join("weir.log");
-        let log_file = fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&log_path)
-            .unwrap();
-
-        let binary = env!("CARGO_BIN_EXE_weir-server");
-        let child = Command::new(binary)
-            .args(["--config", self.config_path.to_str().unwrap()])
-            .stdout(Stdio::from(log_file.try_clone().unwrap()))
-            .stderr(Stdio::from(log_file))
-            .spawn()
-            .expect("failed to respawn weir-server");
-
-        self.child = Some(child);
-        self.wait_ready(Duration::from_secs(15));
-    }
-
-    /// Blocks until the server is ready to accept connections.
-    ///
-    /// Uses an actual connect attempt rather than checking file existence — this
-    /// correctly handles crash-restart scenarios where a stale socket file from
-    /// the previous run is still on disk but nobody is listening yet.
-    ///
-    /// Also detects early process exit and prints the log for diagnostics.
-    fn wait_ready(&mut self, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if std::os::unix::net::UnixStream::connect(&self.socket_path).is_ok() {
-                return;
-            }
-            if let Some(ref mut child) = self.child
-                && let Ok(Some(status)) = child.try_wait()
-            {
-                let log_path = self.tmp_dir.join("weir.log");
-                let log = fs::read_to_string(&log_path).unwrap_or_default();
-                panic!(
-                    "weir-server exited early with {status} before socket was ready\n\
-                     socket: {}\nlog:\n{log}",
-                    self.socket_path.display()
-                );
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        let log_path = self.tmp_dir.join("weir.log");
-        let log = fs::read_to_string(&log_path).unwrap_or_default();
-        panic!(
-            "weir-server did not become ready within {:?}: {}\nlog:\n{log}",
-            timeout,
-            self.socket_path.display()
-        );
-    }
-
-    /// Returns a connected WeirClient.
-    fn client(&self) -> WeirClient {
-        WeirClient::connect(&self.socket_path)
-            .unwrap_or_else(|e| panic!("failed to connect to {}: {e}", self.socket_path.display()))
-    }
-
-    /// Returns the metrics URL for this instance.
-    fn metrics_url(&self) -> String {
-        format!("http://127.0.0.1:{}/metrics", self.metrics_port)
-    }
-
-    /// Fetches /metrics and returns the body as a string.
-    fn scrape_metrics(&self) -> String {
-        ureq::get(&self.metrics_url())
-            .call()
-            .expect("metrics request failed")
-            .into_string()
-            .expect("metrics body read failed")
-    }
-
-    /// Sends SIGTERM, waits for the process to exit, and returns how long it
-    /// took. Does NOT remove the temp directory — Drop handles cleanup — so
-    /// callers can inspect WAB files after the process has exited.
-    fn sigterm(&mut self) -> Duration {
-        let t = Instant::now();
-        if let Some(ref mut child) = self.child {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-            }
-            let _ = child.wait();
-            self.child = None;
-        }
-        t.elapsed()
-    }
-
-    /// Sends SIGTERM and waits for the process to exit cleanly.
-    fn shutdown(mut self) {
-        if let Some(ref mut child) = self.child {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-            }
-            let _ = child.wait();
-        }
-        self.child = None; // prevent Drop from double-killing
-        let _ = fs::remove_dir_all(&self.tmp_dir);
-    }
-
-    /// Starts the server with `RLIMIT_FSIZE = 0` so every WAB write fails with
-    /// `EFBIG`. `SIGXFSZ` is ignored in the child so the signal does not kill
-    /// the process; instead writes return an error that the server surfaces as
-    /// `Nack(InternalError)`.
-    ///
-    /// stdout/stderr are silenced (`/dev/null`) because the log file itself
-    /// would also fail to write under `RLIMIT_FSIZE = 0`.
-    fn start_disk_full(tag: &str) -> Self {
-        use std::os::unix::process::CommandExt;
-
-        let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let metrics_port = free_port();
-        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
-        let wab_dir = tmp_dir.join("wab");
-        let socket_dir = tmp_dir.join("run");
-        let socket_path = socket_dir.join("weir.sock");
-        let config_path = tmp_dir.join("weir.toml");
-
-        fs::create_dir_all(&wab_dir).unwrap();
-        fs::create_dir_all(&socket_dir).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-
-        let config = format!(
-            "[server]\n\
-             socket_path           = \"{}\"\n\
-             wab_dir               = \"{}\"\n\
-             metrics_port          = {}\n\
-             shard_count           = 1\n\
-             worker_count          = 2\n\
-             batch_size            = 100\n\
-             batch_deadline_ms     = 20\n\
-             shutdown_timeout_secs = 3\n\
-             log_level             = \"warn\"\n",
-            socket_path.display(),
-            wab_dir.display(),
-            metrics_port,
-        );
-        fs::write(&config_path, config).unwrap();
-
-        let binary = env!("CARGO_BIN_EXE_weir-server");
-        let mut cmd = Command::new(binary);
-        cmd.args(["--config", config_path.to_str().unwrap()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-                let rl = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                libc::setrlimit(libc::RLIMIT_FSIZE, &rl);
-                Ok(())
-            });
-        }
-
-        let child = cmd
-            .spawn()
-            .expect("failed to spawn weir-server (disk-full)");
-
-        let mut handle = Self {
-            child: Some(child),
-            socket_path,
-            wab_dir,
-            metrics_port,
-            config_path,
-            tmp_dir,
-            _proc_lock,
-        };
-
-        handle.wait_ready(Duration::from_secs(15));
-        handle
-    }
-
-    /// Starts the server with `RLIMIT_NOFILE` capped at `nofile_limit`.
-    ///
-    /// This lets tests verify the server degrades gracefully (refuses new
-    /// connections, does not crash) when it runs out of file descriptors.
-    /// The server is otherwise identical to a `start()` instance.
-    fn start_with_nofile_limit(tag: &str, nofile_limit: u64) -> Self {
-        use std::os::unix::process::CommandExt;
-
-        let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let metrics_port = free_port();
-        let tmp_dir = std::env::temp_dir().join(format!("weir_sys_{}_{}", tag, std::process::id()));
-        let wab_dir = tmp_dir.join("wab");
-        let socket_dir = tmp_dir.join("run");
-        let socket_path = socket_dir.join("weir.sock");
-        let config_path = tmp_dir.join("weir.toml");
-
-        fs::create_dir_all(&wab_dir).unwrap();
-        fs::create_dir_all(&socket_dir).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-
-        let config = format!(
-            "[server]\n\
-             socket_path           = \"{}\"\n\
-             wab_dir               = \"{}\"\n\
-             metrics_port          = {}\n\
-             shard_count           = 1\n\
-             worker_count          = 2\n\
-             batch_size            = 100\n\
-             batch_deadline_ms     = 20\n\
-             shutdown_timeout_secs = 3\n\
-             log_level             = \"warn\"\n",
-            socket_path.display(),
-            wab_dir.display(),
-            metrics_port,
-        );
-        fs::write(&config_path, config).unwrap();
-
-        let binary = env!("CARGO_BIN_EXE_weir-server");
-        let mut cmd = Command::new(binary);
-        cmd.args(["--config", config_path.to_str().unwrap()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        unsafe {
-            cmd.pre_exec(move || {
-                let rl = libc::rlimit {
-                    rlim_cur: nofile_limit,
-                    rlim_max: nofile_limit,
-                };
-                libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
-                Ok(())
-            });
-        }
-
-        let child = cmd
-            .spawn()
-            .expect("failed to spawn weir-server (nofile-limit)");
-
-        let mut handle = Self {
-            child: Some(child),
-            socket_path,
-            wab_dir,
-            metrics_port,
-            config_path,
-            tmp_dir,
-            _proc_lock,
-        };
-
-        handle.wait_ready(Duration::from_secs(15));
-        handle
-    }
-}
-
-impl Drop for ServerHandle {
-    fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let _ = fs::remove_dir_all(&self.tmp_dir);
-    }
-}
 
 // Helper: sum all file bytes under a directory tree.
 fn wab_dir_bytes(dir: &Path) -> u64 {
@@ -496,7 +91,7 @@ fn read_wab_bytes(dir: &Path) -> Vec<u8> {
 
 #[test]
 fn smoke_single_push_ack() {
-    let srv = ServerHandle::start("smoke");
+    let srv = weir_server!("smoke").start();
     let mut client = srv.client();
     client.push(b"hello weir", Durability::Sync).unwrap();
 }
@@ -511,7 +106,7 @@ fn all_durability_tiers_behave_per_contract() {
     // syscall — a deterministic differential between the tiers.
     const N_PER_TIER: u32 = 10;
 
-    let srv = ServerHandle::start("durability");
+    let srv = weir_server!("durability").start();
     let mut client = srv.client();
 
     let read_fsync_count = || -> u64 {
@@ -578,7 +173,7 @@ fn all_durability_tiers_behave_per_contract() {
 
 #[test]
 fn health_check_returns_ok() {
-    let srv = ServerHandle::start("health");
+    let srv = weir_server!("health").start();
     let mut client = srv.client();
     client.health_check().unwrap();
 }
@@ -590,7 +185,7 @@ fn concurrent_producers_all_acked() {
     const THREADS: usize = 8;
     const RECORDS_PER_THREAD: usize = 100;
 
-    let srv = ServerHandle::start("concurrent");
+    let srv = weir_server!("concurrent").start();
     let socket_path = srv.socket_path.clone();
 
     let handles: Vec<_> = (0..THREADS)
@@ -642,7 +237,7 @@ fn many_connections_open_simultaneously() {
     // test, which is not what this test should be guarding against.
     const CONN_COUNT: usize = 200;
 
-    let srv = ServerHandle::start("many_conns");
+    let srv = weir_server!("many_conns").start();
 
     // Open all connections first, then push from each, to exercise the
     // semaphore-based connection cap under load.
@@ -663,7 +258,7 @@ fn many_connections_open_simultaneously() {
 
 #[test]
 fn records_written_to_wab_on_disk() {
-    let srv = ServerHandle::start("wab_disk");
+    let srv = weir_server!("wab_disk").start();
     let mut client = srv.client();
 
     for i in 0..20u32 {
@@ -689,7 +284,7 @@ fn wab_writes_nonzero_bytes_to_disk_after_sync_pushes() {
     // Verify bytes are physically written to the WAB directory.
     // (The weir_wab_bytes_on_disk metric gauge is not yet wired to the pipeline;
     //  this test checks the filesystem directly instead.)
-    let srv = ServerHandle::start("wab_bytes");
+    let srv = weir_server!("wab_bytes").start();
     let mut client = srv.client();
     for _ in 0..20 {
         client
@@ -709,7 +304,7 @@ fn wab_writes_nonzero_bytes_to_disk_after_sync_pushes() {
 
 #[test]
 fn metrics_endpoint_responds_with_openmetrics_content() {
-    let srv = ServerHandle::start("metrics_up");
+    let srv = weir_server!("metrics_up").start();
     let body = srv.scrape_metrics();
     assert!(!body.is_empty(), "metrics endpoint returned empty body");
     // OpenMetrics text format always ends with EOF marker.
@@ -721,7 +316,7 @@ fn metrics_endpoint_responds_with_openmetrics_content() {
 
 #[test]
 fn metrics_all_19_families_registered() {
-    let srv = ServerHandle::start("metrics_families");
+    let srv = weir_server!("metrics_families").start();
     let body = srv.scrape_metrics();
 
     // All 19 metric families must appear in the output as # HELP lines.
@@ -757,7 +352,7 @@ fn metrics_all_19_families_registered() {
 
 #[test]
 fn drain_state_shows_draining_and_not_blocked() {
-    let srv = ServerHandle::start("drain_state");
+    let srv = weir_server!("drain_state").start();
     let body = srv.scrape_metrics();
 
     // weir_drain_state is pre-initialised so all label values appear on the
@@ -778,7 +373,7 @@ fn drain_state_shows_draining_and_not_blocked() {
 
 #[test]
 fn sink_health_shows_healthy_via_noop_sink() {
-    let srv = ServerHandle::start("sink_health");
+    let srv = weir_server!("sink_health").start();
     let body = srv.scrape_metrics();
 
     // NoopSink always reports Healthy; weir_sink_health is pre-initialised.
@@ -805,7 +400,7 @@ fn server_shuts_down_cleanly_on_sigterm() {
     // any duration short of cargo's per-test timeout would pass.
     const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
-    let mut srv = ServerHandle::start("shutdown");
+    let mut srv = weir_server!("shutdown").start();
     let mut client = srv.client();
     client.push(b"before-shutdown", Durability::Sync).unwrap();
     drop(client);
@@ -820,7 +415,7 @@ fn server_shuts_down_cleanly_on_sigterm() {
 
 #[test]
 fn server_exits_and_socket_disappears_after_sigterm() {
-    let srv = ServerHandle::start("socket_gone");
+    let srv = weir_server!("socket_gone").start();
     let socket_path = srv.socket_path.clone();
 
     assert!(socket_path.exists(), "socket should exist before shutdown");
@@ -842,7 +437,7 @@ fn new_connection_accepted_after_previous_client_drops() {
     // max_connections proves the permit returns reliably every time.
     const ROUNDS: usize = 100;
 
-    let srv = ServerHandle::start("reconnect");
+    let srv = weir_server!("reconnect").start();
     for round in 0..ROUNDS {
         let mut c = srv.client();
         c.push(
@@ -865,7 +460,7 @@ fn new_connection_accepted_after_previous_client_drops() {
 
 #[test]
 fn empty_payload_is_accepted() {
-    let srv = ServerHandle::start("empty_payload");
+    let srv = weir_server!("empty_payload").start();
     let mut client = srv.client();
     client.push(b"", Durability::Sync).unwrap();
 }
@@ -875,7 +470,7 @@ fn arbitrary_binary_payload_accepted() {
     // Renamed from binary_payload_round_trips: there is no Pop API, so no
     // round-trip occurs. The test verifies the server doesn't strip null bytes
     // or high bytes in any text-mode handling.
-    let srv = ServerHandle::start("binary_payload");
+    let srv = weir_server!("binary_payload").start();
     let mut client = srv.client();
     let payload: Vec<u8> = (0u8..=255).collect();
     client.push(&payload, Durability::Sync).unwrap();
@@ -886,9 +481,9 @@ fn payload_size_boundary_enforced() {
     // Strengthened from `large_payload_accepted`: the original test pushed
     // 1 MiB and called it done. A bug at the 16 MiB boundary would never
     // be exposed by a 1 MiB push. This version tests the actual limit.
-    use weir_core::{MAX_PAYLOAD_HARD_CAP, NackReason};
+    use weir_core::MAX_PAYLOAD_HARD_CAP;
 
-    let srv = ServerHandle::start("payload_boundary");
+    let srv = weir_server!("payload_boundary").start();
 
     // Exactly at the cap: must succeed. Uses Batched so we don't wait for
     // a 16 MiB fsync — the property under test is the size acceptance
@@ -978,7 +573,7 @@ fn payload_size_boundary_enforced() {
 fn sustained_load_1000_records_single_client() {
     const N: u64 = 1000;
 
-    let srv = ServerHandle::start("sustained");
+    let srv = weir_server!("sustained").start();
     let mut client = srv.client();
     for i in 0..N {
         client
@@ -1010,7 +605,7 @@ fn mixed_durability_under_concurrent_load() {
     const THREADS: usize = 6;
     const RECORDS: usize = 50;
 
-    let srv = ServerHandle::start("mixed_load");
+    let srv = weir_server!("mixed_load").start();
     let socket_path = srv.socket_path.clone();
 
     let tiers = [Durability::Sync, Durability::Batched, Durability::Buffered];
@@ -1073,7 +668,7 @@ fn server_restarts_after_sigkill() {
     // (recovery, bind_cleanup, segment scan) for an unreasonable time.
     const RESTART_BUDGET: Duration = Duration::from_secs(10);
 
-    let mut srv = ServerHandle::start("crash_restart");
+    let mut srv = weir_server!("crash_restart").start();
     srv.client()
         .push(b"before-crash", Durability::Sync)
         .unwrap();
@@ -1108,7 +703,7 @@ fn wab_data_preserved_across_crash_restart() {
     // must be ≥ this value; "preserved" cannot mean "bytes on disk" alone,
     // because a recovery pass that quarantines every segment would leave
     // the bytes intact while losing every record.
-    let mut srv = ServerHandle::start("wab_crash");
+    let mut srv = weir_server!("wab_crash").start();
     let mut client = srv.client();
     let mut acked: u32 = 0;
     for i in 0..N {
@@ -1260,7 +855,7 @@ fn readonly_wab_dir_prevents_startup() {
 
 #[test]
 fn shard_directories_created_on_disk() {
-    let srv = ServerHandle::start_sharded("shard_dirs", 3);
+    let srv = weir_server!("shard_dirs").shard_count(3).start();
     let mut client = srv.client();
     client
         .push(b"trigger-shard-creation", Durability::Sync)
@@ -1294,7 +889,7 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
     const RECORDS_PER_THREAD: usize = 50;
     const SHARD_COUNT: usize = 4;
 
-    let srv = ServerHandle::start_sharded("multi_shard_conc", SHARD_COUNT);
+    let srv = weir_server!("multi_shard_conc").shard_count(SHARD_COUNT).start();
     let socket_path = srv.socket_path.clone();
 
     let handles: Vec<_> = (0..THREADS)
@@ -1349,7 +944,7 @@ fn graceful_shutdown_under_load() {
     // shutdown_timeout_secs=3 in config + buffer for process exit overhead.
     const MAX_SHUTDOWN_SECS: u64 = 8;
 
-    let mut srv = ServerHandle::start("shutdown_load");
+    let mut srv = weir_server!("shutdown_load").start();
 
     let ok_count = Arc::new(AtomicU64::new(0));
     let io_err_count = Arc::new(AtomicU64::new(0));
@@ -1447,7 +1042,7 @@ fn stalled_client_does_not_block_other_connections() {
     const CONCURRENT_RECORDS: usize = 50;
     const CONCURRENT_DEADLINE: Duration = Duration::from_secs(5);
 
-    let srv = ServerHandle::start("stall_isolation");
+    let srv = weir_server!("stall_isolation").start();
 
     // Pre-encode one Push frame for the stalled client to send.
     let payload = b"stall";
@@ -1514,7 +1109,7 @@ fn partial_frame_does_not_corrupt_next_connection() {
     use std::{io::Write, os::unix::net::UnixStream as RawStream};
     use weir_core::{Envelope, HEADER_LEN, Header, MessageType};
 
-    let srv = ServerHandle::start("partial_frame");
+    let srv = weir_server!("partial_frame").start();
 
     // Build a valid Push frame with a 64-byte payload.
     let payload = vec![0xabu8; 64];
@@ -1560,7 +1155,24 @@ fn partial_frame_does_not_corrupt_next_connection() {
 fn efbig_returns_nack_not_crash() {
     use weir_core::NackReason;
 
-    let srv = ServerHandle::start_disk_full("efbig");
+    // RLIMIT_FSIZE = 0 makes every WAB write fail with EFBIG. SIGXFSZ is
+    // ignored so the signal doesn't kill the process; writes return an
+    // error that the server surfaces as Nack(InternalError). stdout/stderr
+    // are silenced because the log file itself would also fail to write.
+    let srv = unsafe {
+        weir_server!("efbig")
+            .silence_logs()
+            .pre_exec(|| {
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                let rl = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &rl);
+                Ok(())
+            })
+    }
+    .start();
     let mut client = srv.client();
 
     // With RLIMIT_FSIZE=0 the first WAB segment header write fails immediately.
@@ -1599,75 +1211,31 @@ fn efbig_returns_nack_not_crash() {
 #[test]
 #[ignore = "requires WEIR_TEST_ENOSPC_DIR pointing at a small pre-mounted tmpfs (see test docstring)"]
 fn enospc_returns_nack_not_crash() {
-    use std::os::unix::process::CommandExt;
     use weir_core::NackReason;
 
     let enospc_dir = std::env::var("WEIR_TEST_ENOSPC_DIR").expect(
         "WEIR_TEST_ENOSPC_DIR not set — see test docstring for the tmpfs setup procedure",
     );
     let enospc_dir = PathBuf::from(enospc_dir);
-
-    let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let metrics_port = free_port();
-    let tmp_dir = std::env::temp_dir().join(format!("weir_sys_enospc_{}", std::process::id()));
     let wab_dir = enospc_dir.join("wab");
-    let socket_dir = tmp_dir.join("run");
-    let socket_path = socket_dir.join("weir.sock");
-    let config_path = tmp_dir.join("weir.toml");
 
-    fs::create_dir_all(&socket_dir).expect("create socket dir");
     // WAB dir on the small filesystem; tolerate "already exists" from a prior run.
     if let Err(e) = fs::create_dir(&wab_dir)
         && e.kind() != std::io::ErrorKind::AlreadyExists
     {
         panic!("create wab_dir on {}: {e}", enospc_dir.display());
     }
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    }
 
-    let config = format!(
-        "[server]\n\
-         socket_path           = \"{}\"\n\
-         wab_dir               = \"{}\"\n\
-         metrics_port          = {}\n\
-         shard_count           = 1\n\
-         worker_count          = 2\n\
-         batch_size            = 100\n\
-         batch_deadline_ms     = 20\n\
-         shutdown_timeout_secs = 3\n\
-         log_level             = \"warn\"\n",
-        socket_path.display(),
-        wab_dir.display(),
-        metrics_port,
-    );
-    fs::write(&config_path, config).unwrap();
-
-    let binary = env!("CARGO_BIN_EXE_weir-server");
-    let mut cmd = Command::new(binary);
-    cmd.args(["--config", config_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // Ignore SIGXFSZ defensively; not strictly needed for ENOSPC but harmless.
-    unsafe {
-        cmd.pre_exec(|| {
+    // Spawn with the WAB on the tmpfs, but everything else (socket, log,
+    // config) on the regular tmp dir. SIGXFSZ ignored defensively in the
+    // pre_exec hook — not strictly needed for ENOSPC but harmless.
+    let handle = unsafe {
+        weir_server!("enospc").wab_dir(&wab_dir).pre_exec(|| {
             libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
             Ok(())
-        });
+        })
     }
-    let child = cmd.spawn().expect("failed to spawn weir-server (enospc)");
-
-    let mut handle = ServerHandle {
-        child: Some(child),
-        socket_path,
-        wab_dir: wab_dir.clone(),
-        metrics_port,
-        config_path,
-        tmp_dir,
-        _proc_lock,
-    };
-    handle.wait_ready(Duration::from_secs(15));
+    .start();
 
     // Push records until one fails with Nack(InternalError). The 64 KiB tmpfs
     // should fill within a small handful of records.
@@ -1710,7 +1278,7 @@ fn enospc_returns_nack_not_crash() {
 fn wab_data_integrity_after_crash() {
     const N: usize = 50;
 
-    let mut srv = ServerHandle::start_sharded("wab_integrity", 1);
+    let mut srv = weir_server!("wab_integrity").shard_count(1).start();
     let mut client = srv.client();
 
     let mut acked: Vec<Vec<u8>> = Vec::new();
@@ -1757,7 +1325,7 @@ fn wab_data_integrity_after_crash() {
 fn socket_takeover_does_not_corrupt_wab_data() {
     const N: usize = 20;
 
-    let srv_a = ServerHandle::start("socket_takeover");
+    let srv_a = weir_server!("socket_takeover").start();
     let mut client = srv_a.client();
 
     for i in 0..N {
@@ -1851,7 +1419,19 @@ fn fd_limit_exhaustion_does_not_crash_server() {
     const NOFILE_LIMIT: u64 = 128;
     const FLOOD_CONNS: usize = 200;
 
-    let srv = ServerHandle::start_with_nofile_limit("fd_limit", NOFILE_LIMIT);
+    // RLIMIT_NOFILE caps the daemon's fd budget. The pre_exec hook installs
+    // it just before exec so it survives into the daemon process.
+    let srv = unsafe {
+        weir_server!("fd_limit").pre_exec(move || {
+            let rl = libc::rlimit {
+                rlim_cur: NOFILE_LIMIT,
+                rlim_max: NOFILE_LIMIT,
+            };
+            libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+            Ok(())
+        })
+    }
+    .start();
 
     // Flood the server with raw connections and keep them open. The audit
     // recommended asserting ≥1 connect refused as proof the fd limit was
@@ -1902,7 +1482,7 @@ fn fd_limit_exhaustion_does_not_crash_server() {
 fn records_accepted_counter_increments_after_sync_pushes() {
     const N: u32 = 10;
 
-    let srv = ServerHandle::start("metrics_accepted");
+    let srv = weir_server!("metrics_accepted").start();
     let mut client = srv.client();
     for i in 0..N {
         client
@@ -1922,7 +1502,7 @@ fn records_accepted_counter_increments_after_sync_pushes() {
 fn records_ack_counter_increments_after_sync_pushes() {
     const N: u32 = 7;
 
-    let srv = ServerHandle::start("metrics_ack");
+    let srv = weir_server!("metrics_ack").start();
     let mut client = srv.client();
     for i in 0..N {
         client
@@ -1951,7 +1531,7 @@ fn per_shard_records_appear_in_submission_order() {
     const N: usize = 30;
 
     // Single shard: all records go to the same WAB file, so order is preserved.
-    let srv = ServerHandle::start_sharded("ordering", 1);
+    let srv = weir_server!("ordering").shard_count(1).start();
     let mut client = srv.client();
 
     for i in 0..N {
@@ -2008,7 +1588,7 @@ fn concurrent_producers_to_same_shard_preserve_per_producer_order() {
     const N_PRODUCERS: usize = 4;
     const N_RECORDS: usize = 50;
 
-    let srv = ServerHandle::start_sharded("concurrent_ordering", 1);
+    let srv = weir_server!("concurrent_ordering").shard_count(1).start();
     let socket_path = srv.socket_path.clone();
 
     let handles: Vec<_> = (0..N_PRODUCERS)
@@ -2083,7 +1663,7 @@ fn batch_deadline_timer_keeps_latency_bounded() {
     // are order-of-magnitude, not 10% drift.
     const TAIL_CEILING: Duration = Duration::from_millis(DEADLINE_MS * 5); // 100 ms
 
-    let srv = ServerHandle::start("deadline_accuracy");
+    let srv = weir_server!("deadline_accuracy").start();
     let mut client = srv.client();
     let mut latencies: Vec<Duration> = Vec::with_capacity(SAMPLES);
 
@@ -2141,7 +1721,7 @@ fn metrics_internally_consistent_per_session() {
     const PUSHES_PER_ROUND: u32 = 10;
     const ROUNDS: u32 = 3;
 
-    let mut srv = ServerHandle::start("metrics_per_session");
+    let mut srv = weir_server!("metrics_per_session").start();
 
     for round in 0..ROUNDS {
         let mut client = srv.client();
@@ -2182,7 +1762,7 @@ fn metrics_internally_consistent_per_session() {
 /// gaps via the `_created` timestamp.
 #[test]
 fn metrics_reset_to_zero_after_restart() {
-    let mut srv = ServerHandle::start("metrics_reset");
+    let mut srv = weir_server!("metrics_reset").start();
 
     // Drive both counters above zero.
     let mut client = srv.client();
@@ -2230,7 +1810,7 @@ fn metrics_reset_to_zero_after_restart() {
 fn recovery_replays_records_after_crash() {
     const N: u32 = 25;
 
-    let mut srv = ServerHandle::start_sharded("recovery_replay", 1);
+    let mut srv = weir_server!("recovery_replay").shard_count(1).start();
     let mut client = srv.client();
     for i in 0..N {
         client
@@ -2288,78 +1868,26 @@ fn recovery_replays_records_after_crash() {
 #[test]
 #[ignore = "requires WEIR_TEST_MYSQL_URL pointing at a running MySQL with a prepared schema (see docstring)"]
 fn mysql_sink_end_to_end() {
-    use std::os::unix::process::CommandExt;
-
     const N: u32 = 100;
 
     let mysql_url = std::env::var("WEIR_TEST_MYSQL_URL").expect(
         "WEIR_TEST_MYSQL_URL not set — see the test docstring for the docker-compose recipe",
     );
 
-    // Spawn weir-server with sink_type = mysql, pointing at the live server.
-    let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let metrics_port = free_port();
-    let tmp_dir = std::env::temp_dir().join(format!("weir_sys_mysql_{}", std::process::id()));
-    let wab_dir = tmp_dir.join("wab");
-    let socket_dir = tmp_dir.join("run");
-    let socket_path = socket_dir.join("weir.sock");
-    let config_path = tmp_dir.join("weir.toml");
-    let log_path = tmp_dir.join("weir.log");
-
-    fs::create_dir_all(&wab_dir).unwrap();
-    fs::create_dir_all(&socket_dir).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
     // sink_type = mysql; URL passed via env so credentials never touch the
-    // config file (production-shaped — see the operations docs).
-    let config = format!(
-        "[server]\n\
-         socket_path           = \"{}\"\n\
-         wab_dir               = \"{}\"\n\
-         metrics_port          = {}\n\
-         shard_count           = 1\n\
-         worker_count          = 2\n\
-         batch_size            = 200\n\
-         batch_deadline_ms     = 5\n\
-         shutdown_timeout_secs = 5\n\
-         sink_type             = \"mysql\"\n\
-         sink_max_batch_size   = 1000\n\
-         sink_mysql_table      = \"weir_records\"\n\
-         sink_mysql_column     = \"payload\"\n\
-         sink_mysql_insert_mode = \"ignore\"\n\
-         log_level             = \"warn\"\n",
-        socket_path.display(),
-        wab_dir.display(),
-        metrics_port,
-    );
-    fs::write(&config_path, config).unwrap();
-
-    let log_file = fs::File::create(&log_path).unwrap();
-    let binary = env!("CARGO_BIN_EXE_weir-server");
-    let mut cmd = Command::new(binary);
-    cmd.args(["--config", config_path.to_str().unwrap()])
+    // config file (production-shaped — see the operations docs). Other
+    // mysql-specific knobs ride along via extra_config.
+    let handle = weir_server!("mysql")
+        .batch_size(200)
+        .batch_deadline_ms(5)
+        .shutdown_timeout_secs(5)
         .env("WEIR_SINK_URL", &mysql_url)
-        .stdout(Stdio::from(log_file.try_clone().unwrap()))
-        .stderr(Stdio::from(log_file));
-    // Make sure pre_exec hooks are not inherited from previous test infrastructure.
-    unsafe {
-        cmd.pre_exec(|| Ok(()));
-    }
-    let child = cmd.spawn().expect("failed to spawn weir-server (mysql)");
-
-    let mut handle = ServerHandle {
-        child: Some(child),
-        socket_path,
-        wab_dir,
-        metrics_port,
-        config_path,
-        tmp_dir,
-        _proc_lock,
-    };
-    handle.wait_ready(Duration::from_secs(15));
+        .extra_config("sink_type             = \"mysql\"")
+        .extra_config("sink_max_batch_size   = 1000")
+        .extra_config("sink_mysql_table      = \"weir_records\"")
+        .extra_config("sink_mysql_column     = \"payload\"")
+        .extra_config("sink_mysql_insert_mode = \"ignore\"")
+        .start();
 
     let mut client = handle.client();
     for i in 0..N {

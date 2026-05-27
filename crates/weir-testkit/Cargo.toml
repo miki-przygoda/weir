@@ -1,0 +1,12 @@
+[package]
+name = "weir-testkit"
+description = "Test harness for spawning and driving weir-server in integration tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+weir-client = { path = "../weir-client" }
+libc = "0.2"

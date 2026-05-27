@@ -2405,6 +2405,15 @@ dependencies = [
  "ureq",
  "weir-client",
  "weir-core",
+ "weir-testkit",
+]
+
+[[package]]
+name = "weir-testkit"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "weir-client",
 ]
 
 [[package]]

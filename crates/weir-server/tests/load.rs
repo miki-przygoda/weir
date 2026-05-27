@@ -37,12 +37,9 @@
 
 use std::{
     io::Write,
-    net::TcpListener,
     os::unix::net::UnixStream,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
     sync::{
-        Arc, Barrier, OnceLock,
+        Arc, Barrier,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
@@ -51,21 +48,9 @@ use std::{
 
 use weir_client::{ClientError, WeirClient};
 use weir_core::{Durability, Envelope, Header, MessageType};
+use weir_testkit::weir_server;
 
-// ── Process serialiser ─────────────────────────────────────────────────────
-
-fn process_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(Default::default)
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind port 0")
-        .local_addr()
-        .unwrap()
-        .port()
-}
+// ── Bench-deadline tag ─────────────────────────────────────────────────────
 
 /// Reads `WEIR_BENCH_DEADLINE` from the environment (default: 1).
 /// CI sets this to 1 and 2 in successive passes to populate the comparison.
@@ -80,167 +65,6 @@ fn bench_deadline_ms() -> u64 {
 /// e.g. `"single_thread_buffered_d1ms"`.
 fn bench_tag(base: &str) -> String {
     format!("{base}_d{}ms", bench_deadline_ms())
-}
-
-// ── LoadHandle ─────────────────────────────────────────────────────────────
-//
-// Lighter than system.rs's ServerHandle: no crash-recovery plumbing, no
-// metrics scraping. `batch_deadline_ms` is read from `WEIR_BENCH_DEADLINE`
-// so the same binary can be driven at different deadline values by CI.
-
-struct LoadHandle {
-    child: Option<Child>,
-    pub socket_path: PathBuf,
-    pub deadline_ms: u64,
-    pub metrics_port: u16,
-    tmp_dir: PathBuf,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-/// Optional overrides for the compression-ratio scenario. Other scenarios use
-/// the daemon's default segment size + a sensible sink batch cap.
-#[derive(Default)]
-struct LoadOptions {
-    /// If set, written into the TOML as `wab_segment_max_bytes`. Used by the
-    /// compression-ratio scenario to seal segments under bench-scale load.
-    wab_segment_max_bytes: Option<u64>,
-    /// If set, written into the TOML as `sink_max_batch_size`. Used by the
-    /// compression-ratio scenario to make sure the drain reads each segment
-    /// in one (or very few) `Sink::commit()` calls.
-    sink_max_batch_size: Option<usize>,
-}
-
-impl LoadHandle {
-    fn start(tag: &str) -> Self {
-        Self::start_impl(tag, 256, LoadOptions::default())
-    }
-
-    /// Start with a deliberately low `max_connections` cap so the ramp test
-    /// can exercise connection-drop behaviour without needing hundreds of threads.
-    fn start_capped(tag: &str, max_connections: usize) -> Self {
-        Self::start_impl(tag, max_connections, LoadOptions::default())
-    }
-
-    /// Start with the segment threshold and sink batch cap tuned for the
-    /// compression-ratio scenario. See `compression_ratio_records_per_commit`
-    /// for why the defaults aren't used here.
-    fn start_with_options(tag: &str, opts: LoadOptions) -> Self {
-        Self::start_impl(tag, 256, opts)
-    }
-
-    fn start_impl(tag: &str, max_connections: usize, opts: LoadOptions) -> Self {
-        let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let deadline_ms = bench_deadline_ms();
-        let metrics_port = free_port();
-        let tmp_dir =
-            std::env::temp_dir().join(format!("weir_load_{}_{}", tag, std::process::id()));
-        let wab_dir = tmp_dir.join("wab");
-        let socket_dir = tmp_dir.join("run");
-        let socket_path = socket_dir.join("weir.sock");
-        let config_path = tmp_dir.join("weir.toml");
-        let log_path = tmp_dir.join("weir.log");
-
-        std::fs::create_dir_all(&wab_dir).unwrap();
-        std::fs::create_dir_all(&socket_dir).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wab_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
-
-        let mut config = format!(
-            "[server]\n\
-             socket_path       = \"{}\"\n\
-             wab_dir           = \"{}\"\n\
-             metrics_port      = {}\n\
-             shard_count       = 4\n\
-             worker_count      = 4\n\
-             batch_size        = 64\n\
-             batch_deadline_ms = {}\n\
-             max_connections   = {}\n\
-             log_level         = \"error\"\n",
-            socket_path.display(),
-            wab_dir.display(),
-            metrics_port,
-            deadline_ms,
-            max_connections,
-        );
-        if let Some(b) = opts.wab_segment_max_bytes {
-            config.push_str(&format!("wab_segment_max_bytes = {b}\n"));
-        }
-        if let Some(n) = opts.sink_max_batch_size {
-            config.push_str(&format!("sink_max_batch_size   = {n}\n"));
-        }
-        std::fs::write(&config_path, &config).unwrap();
-
-        let log_file = std::fs::File::create(&log_path).unwrap();
-        let binary = env!("CARGO_BIN_EXE_weir-server");
-        let child = Command::new(binary)
-            .args(["--config", config_path.to_str().unwrap()])
-            .stdout(Stdio::from(log_file.try_clone().unwrap()))
-            .stderr(Stdio::from(log_file))
-            .spawn()
-            .expect("failed to spawn weir-server");
-
-        let mut handle = Self {
-            child: Some(child),
-            socket_path,
-            deadline_ms,
-            metrics_port,
-            tmp_dir,
-            _lock,
-        };
-        handle.wait_ready(Duration::from_secs(15));
-        handle
-    }
-
-    /// Fetches `/metrics` from the in-process Prometheus exposition server.
-    /// Used by the compression-ratio scenario to read the
-    /// `weir_sink_commit_records_total{outcome="committed"}` and
-    /// `weir_sink_commit_duration_seconds_count` counters.
-    fn scrape_metrics(&self) -> String {
-        let url = format!("http://127.0.0.1:{}/metrics", self.metrics_port);
-        ureq::get(&url)
-            .call()
-            .expect("metrics request failed")
-            .into_string()
-            .expect("metrics body read failed")
-    }
-
-    fn wait_ready(&mut self, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if UnixStream::connect(&self.socket_path).is_ok() {
-                return;
-            }
-            if let Some(ref mut child) = self.child
-                && let Ok(Some(status)) = child.try_wait()
-            {
-                let log =
-                    std::fs::read_to_string(self.tmp_dir.join("weir.log")).unwrap_or_default();
-                panic!("weir-server exited early ({status})\nlog:\n{log}");
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        let log = std::fs::read_to_string(self.tmp_dir.join("weir.log")).unwrap_or_default();
-        panic!(
-            "weir-server not ready within {timeout:?}: {}\nlog:\n{log}",
-            self.socket_path.display()
-        );
-    }
-
-    fn client(&self) -> WeirClient {
-        WeirClient::connect(&self.socket_path).expect("connect")
-    }
-}
-
-impl Drop for LoadHandle {
-    fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let _ = std::fs::remove_dir_all(&self.tmp_dir);
-    }
 }
 
 // ── Output helpers ─────────────────────────────────────────────────────────
@@ -281,7 +105,7 @@ fn emit_latency(scenario: &str, samples: usize, sorted_us: &[u64]) {
 // All N threads connect first, then synchronise on a barrier so their first
 // push() calls hit the server at the same instant.
 
-fn thundering_herd(srv: &LoadHandle, n_threads: usize, records_per_thread: usize) -> Duration {
+fn thundering_herd(srv: &weir_testkit::WeirServer, n_threads: usize, records_per_thread: usize) -> Duration {
     let barrier = Arc::new(Barrier::new(n_threads + 1));
     let socket = srv.socket_path.clone();
 
@@ -316,7 +140,7 @@ struct LevelResult {
     duration: Duration,
 }
 
-fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> LevelResult {
+fn run_ramp_level(srv: &weir_testkit::WeirServer, n_threads: usize, duration: Duration) -> LevelResult {
     let acks = Arc::new(AtomicU64::new(0));
     let nacks = Arc::new(AtomicU64::new(0));
     let io_errors = Arc::new(AtomicU64::new(0));
@@ -382,7 +206,7 @@ fn run_ramp_level(srv: &LoadHandle, n_threads: usize, duration: Duration) -> Lev
 #[test]
 fn baseline_single_thread_throughput_buffered() {
     const RECORDS: usize = 1_000;
-    let srv = LoadHandle::start("single_buffered");
+    let srv = weir_server!("single_buffered").bench_preset().start();
     let mut client = srv.client();
 
     let t0 = Instant::now();
@@ -398,7 +222,7 @@ fn baseline_single_thread_throughput_buffered() {
 #[test]
 fn baseline_single_thread_throughput_sync() {
     const RECORDS: usize = 500;
-    let srv = LoadHandle::start("single_sync");
+    let srv = weir_server!("single_sync").bench_preset().start();
     let mut client = srv.client();
 
     let t0 = Instant::now();
@@ -414,7 +238,7 @@ fn baseline_single_thread_throughput_sync() {
 #[test]
 fn baseline_latency_percentiles_sync() {
     const SAMPLES: usize = 500;
-    let srv = LoadHandle::start("latency_sync");
+    let srv = weir_server!("latency_sync").bench_preset().start();
     let mut client = srv.client();
 
     let mut us: Vec<u64> = Vec::with_capacity(SAMPLES);
@@ -432,7 +256,7 @@ fn baseline_latency_percentiles_sync() {
 #[test]
 fn baseline_latency_percentiles_batched() {
     const SAMPLES: usize = 500;
-    let srv = LoadHandle::start("latency_batched");
+    let srv = weir_server!("latency_batched").bench_preset().start();
     let mut client = srv.client();
 
     let mut us: Vec<u64> = Vec::with_capacity(SAMPLES);
@@ -450,7 +274,7 @@ fn baseline_latency_percentiles_batched() {
 #[test]
 fn baseline_latency_percentiles_buffered() {
     const SAMPLES: usize = 500;
-    let srv = LoadHandle::start("latency_buffered");
+    let srv = weir_server!("latency_buffered").bench_preset().start();
     let mut client = srv.client();
 
     let mut us: Vec<u64> = Vec::with_capacity(SAMPLES);
@@ -469,7 +293,7 @@ fn baseline_latency_percentiles_buffered() {
 fn thundering_herd_8_threads() {
     const THREADS: usize = 8;
     const RECORDS_PER_THREAD: usize = 200;
-    let srv = LoadHandle::start("herd_8");
+    let srv = weir_server!("herd_8").bench_preset().start();
     let elapsed = thundering_herd(&srv, THREADS, RECORDS_PER_THREAD);
     emit_throughput(
         &bench_tag("thundering_herd_8_threads"),
@@ -484,7 +308,7 @@ fn thundering_herd_8_threads() {
 fn thundering_herd_32_threads() {
     const THREADS: usize = 32;
     const RECORDS_PER_THREAD: usize = 100;
-    let srv = LoadHandle::start("herd_32");
+    let srv = weir_server!("herd_32").bench_preset().start();
     let elapsed = thundering_herd(&srv, THREADS, RECORDS_PER_THREAD);
     emit_throughput(
         &bench_tag("thundering_herd_32_threads"),
@@ -499,7 +323,7 @@ fn thundering_herd_32_threads() {
 fn thundering_herd_64_threads() {
     const THREADS: usize = 64;
     const RECORDS_PER_THREAD: usize = 50;
-    let srv = LoadHandle::start("herd_64");
+    let srv = weir_server!("herd_64").bench_preset().start();
     let elapsed = thundering_herd(&srv, THREADS, RECORDS_PER_THREAD);
     emit_throughput(
         &bench_tag("thundering_herd_64_threads"),
@@ -513,7 +337,7 @@ fn thundering_herd_64_threads() {
 #[test]
 fn connection_churn() {
     const ROUNDS: usize = 100;
-    let srv = LoadHandle::start("conn_churn");
+    let srv = weir_server!("conn_churn").bench_preset().start();
 
     let t0 = Instant::now();
     for _ in 0..ROUNDS {
@@ -546,8 +370,8 @@ fn ramp_to_saturation() {
     const LEVEL_DURATION: Duration = Duration::from_secs(3);
     const LEVELS: &[usize] = &[8, 16, 32, 48, 64, 96];
 
-    let srv = LoadHandle::start_capped("ramp", MAX_CONN);
-    let d = srv.deadline_ms;
+    let srv = weir_server!("ramp").bench_preset().max_connections(MAX_CONN).start();
+    let d = srv.batch_deadline_ms;
 
     println!(
         "\n{:<10} {:>10} {:>10} {:>8} {:>8} {:>12}",
@@ -603,8 +427,8 @@ fn fire_and_forget_overload() {
     const THREADS: usize = 32;
     const BLAST_DURATION: Duration = Duration::from_secs(5);
 
-    let srv = LoadHandle::start("fire_forget");
-    let d = srv.deadline_ms;
+    let srv = weir_server!("fire_forget").bench_preset().start();
+    let d = srv.batch_deadline_ms;
 
     let frames_sent = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -700,13 +524,11 @@ fn compression_ratio_records_per_commit() {
     const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
     const STABLE_ROUNDS: u32 = 3;
 
-    let srv = LoadHandle::start_with_options(
-        "compression_ratio",
-        LoadOptions {
-            wab_segment_max_bytes: Some(SEGMENT_MAX_BYTES),
-            sink_max_batch_size: Some(SINK_MAX_BATCH),
-        },
-    );
+    let srv = weir_server!("compression_ratio")
+        .bench_preset()
+        .extra_config(format!("wab_segment_max_bytes = {SEGMENT_MAX_BYTES}"))
+        .extra_config(format!("sink_max_batch_size   = {SINK_MAX_BATCH}"))
+        .start();
 
     let payload = vec![0xAAu8; RECORD_BYTES];
     let mut client = srv.client();
@@ -760,7 +582,7 @@ fn compression_ratio_records_per_commit() {
     );
 
     let ratio = committed as f64 / commit_count.max(1) as f64;
-    let d = srv.deadline_ms;
+    let d = srv.batch_deadline_ms;
     println!(
         "BENCH: {{\"scenario\":\"compression_ratio_d{d}ms\",\"records_committed\":{committed},\
          \"sink_commits\":{commit_count},\"records_per_commit\":{ratio:.2},\

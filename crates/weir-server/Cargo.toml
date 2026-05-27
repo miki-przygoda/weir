@@ -53,4 +53,5 @@ mysql_async = { version = "0.34", default-features = false, features = [
 
 [dev-dependencies]
 weir-client = { path = "../weir-client" }
+weir-testkit = { path = "../weir-testkit" }
 ureq = "2"
