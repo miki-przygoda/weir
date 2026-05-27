@@ -279,27 +279,6 @@ fn records_written_to_wab_on_disk() {
     );
 }
 
-#[test]
-fn wab_writes_nonzero_bytes_to_disk_after_sync_pushes() {
-    // Verify bytes are physically written to the WAB directory.
-    // (The weir_wab_bytes_on_disk metric gauge is not yet wired to the pipeline;
-    //  this test checks the filesystem directly instead.)
-    let srv = weir_server!("wab_bytes").start();
-    let mut client = srv.client();
-    for _ in 0..20 {
-        client
-            .push(b"gauge-test-payload", Durability::Sync)
-            .unwrap();
-    }
-    thread::sleep(Duration::from_millis(150));
-
-    let total = wab_dir_bytes(&srv.wab_dir);
-    assert!(
-        total > 0,
-        "WAB directory should contain > 0 bytes after 20 Sync writes, got {total}"
-    );
-}
-
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
@@ -315,39 +294,75 @@ fn metrics_endpoint_responds_with_openmetrics_content() {
 }
 
 #[test]
-fn metrics_all_19_families_registered() {
+fn metrics_all_families_registered() {
     let srv = weir_server!("metrics_families").start();
     let body = srv.scrape_metrics();
 
-    // All 19 metric families must appear in the output as # HELP lines.
+    // Every metric family must appear as a `# HELP weir_<name>` line.
     // Data lines only appear for pre-initialised gauges and histograms;
     // counter families that haven't been incremented yet show only HELP/TYPE.
-    for family in [
+    //
+    // The list below is the SINGLE source of truth for what /metrics is
+    // expected to expose. The test additionally asserts the count of
+    // distinct `# HELP weir_` lines matches the list length, so adding a
+    // new metric to `metrics/mod.rs` without updating this list fails
+    // here loudly — preventing the "test passes because we forgot to
+    // assert on the new metric" failure mode.
+    let expected: &[&str] = &[
+        // Wire/socket layer
         "weir_records_accepted",
         "weir_records_ack",
         "weir_records_nack",
         "weir_accept_latency_seconds",
         "weir_connection_idle_timeout",
+        "weir_connection_rejected_peer_uid",
+        "weir_connections_aborted_at_shutdown",
+        "weir_ack_timeout",
+        // WAB
         "weir_wab_segments",
         "weir_wab_bytes_on_disk",
         "weir_wab_fsync_duration_seconds",
+        "weir_wab_flusher_panics",
+        "weir_wab_fsync_failures",
+        // Sink / drain
         "weir_sink_commit_duration_seconds",
         "weir_sink_commit_records",
         "weir_sink_health",
         "weir_queue_depth",
+        // Recovery
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
         "weir_wab_unexpected_mode",
+        // Dead letter
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
         "weir_drain_state",
         "weir_dead_letter_blocked_duration_seconds",
-    ] {
+    ];
+
+    for family in expected {
         assert!(
             body.contains(&format!("# HELP {family}")),
             "metric family not registered in /metrics: {family}"
         );
     }
+
+    // Count the actual `# HELP weir_` lines and assert it matches the list
+    // length. This is the "drift detector": a new metric added without
+    // updating the expected list fails here.
+    let actual_help_count = body
+        .lines()
+        .filter(|l| l.starts_with("# HELP weir_"))
+        .count();
+    assert_eq!(
+        actual_help_count,
+        expected.len(),
+        "metric family count mismatch: /metrics has {actual_help_count} \
+         `# HELP weir_` lines but the expected list has {}. \
+         Did a new metric land in metrics/mod.rs without being added to \
+         this test? Diff the two sets to find which one.",
+        expected.len()
+    );
 }
 
 #[test]
