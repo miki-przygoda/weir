@@ -14,6 +14,36 @@ changes are tracked separately under **Wire protocol** below.
 
 ### Added
 
+- **`weir-testkit` crate** (`crates/weir-testkit/`, `publish = false`). New
+  workspace member that consolidates the test harness previously duplicated
+  across `tests/system.rs` and `tests/load.rs`. Exposes a `WeirServer` handle
+  + `WeirServerBuilder` covering all the spawn variants (`shard_count`,
+  `worker_count`, `batch_size`, `batch_deadline_ms`, `max_connections`,
+  `shutdown_timeout_secs`, `log_level`, `extra_config(line)`, `env(k,v)`,
+  `wab_dir(path)`, `silence_logs()`, `unsafe pre_exec(closure)`,
+  `bench_preset()`), plus `process_lock()` and `free_port()` helpers and
+  a `weir_server!(tag)` macro that wires `env!("CARGO_BIN_EXE_weir-server")`
+  at the call site. Refactor net: -766 LOC across `system.rs`/`load.rs`,
+  +703 LOC in testkit, identical on-disk + on-wire behaviour.
+- **`WeirClient::from_stream`** constructor in `crates/weir-client`. Wraps
+  an already-connected `UnixStream` instead of opening one via `connect`.
+  Used by the new client proptest harness (`UnixStream::pair`) and useful
+  in production for callers managing their own connection setup (systemd
+  socket activation, pre-authenticated file descriptors). One-liner; no
+  behavioural change to `connect`.
+- **Property-based tests for `WeirClient` response handling**
+  (`crates/weir-client/tests/proptest_client.rs`). 5 tests (3 proptest
+  properties × 256 cases + 2 deterministic regressions). Property: arbitrary
+  byte sequences from the daemon must never make `push` / `health_check`
+  panic. Complements weir-core's existing proptest_envelope.rs which proves
+  the decoder is panic-free at the type level.
+- **Four more reference frame vectors** in
+  `crates/weir-core/tests/reference_frames.rs`: `Nack(VersionMismatch)` with
+  the daemon-version byte, `Nack(BadHeaderCrc)`, `HealthCheck`,
+  `HealthCheckResponse`. Total reference-frame coverage: 9 byte-exact
+  assertions covering every shape the wire protocol defines. Non-Rust
+  client implementers can copy any of the `REFERENCE_*` constants verbatim
+  into their own test suite.
 - **`MySqlSink` — first IOPS-compression sink**
   (`crates/weir-server/src/sink/mysql.rs`). Writes a whole batch with one
   multi-row `INSERT` statement: N records → 1 prepared statement → 1
@@ -127,6 +157,85 @@ changes are tracked separately under **Wire protocol** below.
     excess workers idle; operators should set
     `worker_count == shard_count` for full parallelism.
 
+- **fsync errors are now observable** (audit MED finding,
+  `wab/mod.rs::flush_batch`). The two `writer.fsync_current().is_ok()`
+  callsites discarded the underlying `io::Error`, leaving operators with
+  no signal when the kernel buffered a write but couldn't push it to
+  stable storage ("fsyncgate" hazard). Extracted a `fsync_observed`
+  helper that emits a `tracing::error!` with `shard_id` + the
+  `io::Error` string, and increments a new `weir_wab_fsync_failures`
+  counter whose help text explicitly tells operators non-zero values
+  are alertable. Behaviour on failure is unchanged (record nacked,
+  segment continues); the change is purely observability.
+
+- **`ack_rx.await` is now bounded by `ACK_TIMEOUT` (30s)** (audit LOW
+  finding, correctness F5, `socket/connection.rs`). The handler's wait
+  on the WAB ack channel was unbounded. A flusher that hadn't panicked
+  but was wedged (stuck on a slow fsync, lock contention, kernel I/O
+  stall) would never fire its oneshot, and the connection handler
+  would sit in `.await` forever — holding a semaphore permit, blocking
+  new connections, with no signal to operators. Now wraps the await in
+  `tokio::time::timeout`; on elapse the producer receives
+  `Nack(InternalError)` and the new `weir_ack_timeout` counter
+  increments. `ACK_TIMEOUT` is plumbed through `ConnectionConfig` so
+  tests pass tight values (100ms) without mocking the clock. The
+  daemon's default 30s shutdown timeout has enough headroom to drain
+  ack-timeouts naturally.
+
+- **Graceful shutdown drain** (audit MED finding, correctness F8,
+  `socket/mod.rs`). The previous shutdown sequence waited up to
+  `shutdown_timeout_secs` for join_set to drain, then
+  `join_set.abort_all()`'d whatever remained. Aborted tasks were torn
+  down mid-await: a task awaiting `ack_rx` had its oneshot Receiver
+  dropped, so even if the flusher subsequently wrote the record, the
+  producer never received an ack/nack and could not tell whether the
+  push had been durably accepted. Replaced with a `tokio::sync::watch`
+  broadcast: every connection handler races its `read_exact` against
+  the watch in a biased select, so idle connections exit immediately
+  on shutdown signal and active connections complete their current
+  request (capped by `ACK_TIMEOUT`) before exiting on the next loop
+  iteration. `abort_all` becomes an emergency fallback with its own
+  `weir_connections_aborted_at_shutdown` counter. New
+  `idle_connection_exits_promptly_on_shutdown` test pins that an idle
+  connection exits in <500ms even though `read_timeout` is 30s.
+
+- **`compute_wab_bytes_on_disk` moved to `spawn_blocking`** (audit LOW
+  finding, `main.rs`). The 5-second background scanner did `read_dir`
+  + `metadata` per entry synchronously on a tokio worker. With many
+  shards or many segments per shard, the walk blocked the runtime in
+  proportion to segment count. Now wrapped in `tokio::task::spawn_blocking`.
+
+### Security
+
+- **Metrics endpoint defaults to `127.0.0.1`** (audit MED finding,
+  `main.rs` + `metrics/server.rs`). Previously bound to `0.0.0.0` and
+  was reachable from anything that could route to the daemon's metrics
+  port. On multi-tenant hosts that leaked decode-error oracles
+  (`weir_records_nack{reason=...}`) and internal sizing
+  (`weir_connection_idle_timeout`, `weir_max_payload_bytes`) to the
+  LAN. New config knobs: `metrics_bind` (default `127.0.0.1`; set to
+  `0.0.0.0` to expose intentionally) and `metrics_max_connections`
+  (default 8, range 1-1024). Server holds an `Arc<Semaphore>` and
+  `try_acquire_owned`s per connection; cap-exhausted scrapes drop
+  immediately rather than queueing.
+
+- **`SO_PEERCRED` check on accept** (audit MED finding,
+  `socket/peer.rs` (new) + `socket/mod.rs`). Defense-in-depth on top of
+  the socket file's `0o600` mode: if those bits are loosened by
+  operator error, or a peer reaches the socket some other way, the
+  daemon now refuses the connection unless the peer's effective uid
+  matches the daemon's. New `peer_uid_check: bool` config knob
+  (default `true`); new `weir_connection_rejected_peer_uid` counter.
+  Platform impls in `socket/peer.rs` use Linux's `SO_PEERCRED` →
+  `libc::ucred` and macOS's `getpeereid`. Operators with multi-uid
+  producer setups can opt out, but the default is the secure one.
+
+- **CRC32 algorithm doc clarifies it's integrity, not authentication**
+  (`docs/wire_protocol.md`). One paragraph in the CRC32 section
+  explicitly states the algorithm is keyless, anyone with socket
+  access can compute a valid CRC for any payload, and the trust
+  boundary is the socket file's `0o600` mode — not the CRC.
+
 ### Changed
 
 - **Multi-shard routing now actually fans out across connections.** The
@@ -167,6 +276,82 @@ changes are tracked separately under **Wire protocol** below.
   `chmod 0o000` it asserts on actually bites. Was silently broken in
   rootful containers.
 
+- **Refactor pass on `weir-server`'s connection layer.** Four contained
+  cleanups, each behind a separate commit and verified against the full
+  test suite:
+  - **`NackReason` mapping unified** (`socket/connection.rs`). Two
+    parallel match tables on `DecodeError` collapsed into one function
+    returning `(WireNack, MetricNack, &'static [u8])`. Adding a new
+    `DecodeError` variant now touches one match instead of three files.
+  - **Server-side framing collapsed onto `Envelope::encode`**
+    (`socket/connection.rs`). `send_ack` / `send_nack` / the
+    HealthCheck-response arm previously hand-assembled the frame
+    (3 `write_all` calls each); now use the same single-write
+    encode path the client and load tests already used. One syscall
+    per response instead of 2-3.
+  - **`MysqlInsertMode` deduped against `sink::mysql::InsertMode`**
+    (`config/mod.rs` + `main.rs`). Two parallel enums with a one-shot
+    manual `match` between them collapsed into one. Config now stores
+    `sink::mysql::InsertMode` directly; the bridge in `main.rs` is gone.
+  - **`.confirmed` sidecar I/O extracted to `drain/confirmed.rs`**
+    (`drain/mod.rs` → 1481 → 1430 LOC). The four sidecar functions
+    (`write_confirmed_file`, `confirmed_path`, `read_sealed_at_nanos`,
+    `confirm_and_delete`) live in a new 83-line file with module-level
+    docs explaining the crash semantics. State machine, drain loop, and
+    retry helper stay in `mod.rs` adjacent to the doc-comment diagram
+    they're documented in.
+
+- **Sink error types migrated to `thiserror`.** `NoopError`,
+  `HttpSinkError`, `HttpSinkBuildError`, `MySqlSinkBuildError`,
+  `MySqlSinkError` previously hand-rolled `Display` + `Error`. Replaced
+  with `#[derive(thiserror::Error)]` + per-variant `#[error("...")]`
+  attributes. Net -40 LOC across the three sink files; public API
+  byte-identical (same variant names, same Display output, same
+  `SinkError::is_transient` / `retry_after` impls). Added `#[from]` on
+  `HttpSinkBuildError::ClientBuild(reqwest::Error)` for ergonomic `?`
+  propagation. `weir-core` deliberately keeps its hand-rolled impls
+  (the comment in its Cargo.toml explains the security-sensitive
+  trade-off); `weir-server` already pulls syn/quote/proc-macro2
+  transitively via reqwest and mysql_async, so the build-time cost in
+  weir-server is zero.
+
+- **Dead-code cleanup.** Seven `#[allow(dead_code)]` markers triaged:
+  4 methods deleted (`QueueSender::is_empty`, `QueueSender::partitions`,
+  `WabSegment::bytes_written`, `WabSegment::path`); 2 moved under
+  `#[cfg(test)]` (`QueueSender::push`, `WabSegment::record_count`);
+  1 field (`Batch::shard_id`) kept with an explanatory docstring.
+
+- **`tests/system.rs` audit pass.** Deleted
+  `wab_writes_nonzero_bytes_to_disk_after_sync_pushes` (strict subset
+  of `records_written_to_wab_on_disk`). Renamed
+  `metrics_all_19_families_registered` →
+  `metrics_all_families_registered` and refreshed its expected list
+  (5 metrics from this branch's earlier work were missing). Added a
+  drift-detector that counts `# HELP weir_` lines vs the expected list
+  length so a future metric added without updating the test fails
+  loudly with a "did a new metric land?" message.
+
+- **Pedantic clippy triage.** Two real lints fixed:
+  `clippy::zombie_processes` (one site in `tests/system.rs` where
+  `child.wait()` ran on only one branch of the loop's exit) and 5
+  `clippy::manual_let_else` sites modernized to `let … else`. The
+  other 300+ pedantic warnings (cast family on intentional u32→usize,
+  doc_markdown on wire-format tables, missing_errors_doc) are
+  documented in the commit as intentionally not addressed.
+
+### Removed
+
+- **`weir-bench` crate deleted; bench coverage consolidated on
+  `crates/weir-server/tests/load.rs`.** The standalone binary
+  duplicated the load suite (same `BENCH:` JSONL format consumed by
+  `deploy/avg_benchmarks.py`); the CI bench job and the bare-metal
+  script had already diverged (bare-metal used `cargo test --test load`,
+  CI used the binary). CI bench job rewritten to use
+  `cargo test --release --test load -- --nocapture | grep '^BENCH: '`.
+  Docker smoke test uses the existing `push_simple` example from
+  `weir-client/examples/`. `Dockerfile` simplified (one less crate
+  to copy + stub). Net: -359 LOC from the binary + ~80 across docs/CI.
+
 ### Added (tests)
 
 - **`recovery_replays_records_after_crash`**: closes the audit gap that
@@ -191,6 +376,13 @@ changes are tracked separately under **Wire protocol** below.
   the encoder on every `cargo test` — the doc and code can't drift
   silently. Implementers can copy the constants verbatim into a non-Rust
   test suite to confirm byte-identical encoding.
+
+- **CHANGELOG entry for this branch.** This `[Unreleased]` section now
+  records every commit on the post-v0.4 branch (~30 commits): the three
+  HIGH-severity audit fixes, the seven-fix security pass, four refactor
+  cleanups, `weir-testkit` extraction, `weir-bench` removal, reference
+  frame coverage expansion, client proptest, `thiserror` migration, and
+  the clippy triage. Sequenced by section rather than chronologically.
 
 ### Infrastructure
 
