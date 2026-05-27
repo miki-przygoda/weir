@@ -43,16 +43,15 @@ pub(crate) fn spawn(
 async fn serve(listener: TcpListener, registry: Arc<Registry>, max_connections: usize) {
     let semaphore = Arc::new(Semaphore::new(max_connections));
     loop {
-        let (stream, _peer) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(_) => return,
+        let Ok((stream, _peer)) = listener.accept().await else {
+            return;
         };
         // try_acquire_owned never blocks; if the cap is reached we drop the
         // connection immediately. Prometheus will retry on its next scrape
         // interval — no scraper holds a connection waiting.
-        let permit = match Arc::clone(&semaphore).try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => continue, // stream drops here → kernel closes the connection
+        let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+            // stream drops here → kernel closes the connection
+            continue;
         };
         let registry = Arc::clone(&registry);
         tokio::spawn(async move {

@@ -165,13 +165,13 @@ pub async fn run(
                                 }
                             }
                         }
-                        let permit = match sem.clone().try_acquire_owned() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                warn!("connection limit ({}) reached; dropping connection", config.max_connections);
-                                drop(stream);
-                                continue;
-                            }
+                        let Ok(permit) = sem.clone().try_acquire_owned() else {
+                            warn!(
+                                "connection limit ({}) reached; dropping connection",
+                                config.max_connections
+                            );
+                            drop(stream);
+                            continue;
                         };
                         let tx = queue_tx.clone();
                         let mut cfg = conn_cfg_template.clone();

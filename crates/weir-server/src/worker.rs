@@ -17,8 +17,10 @@ pub struct Batch {
     /// set by every batch-producing path so a test can assert routing
     /// correctness (`single_worker_batches_on_deadline` does) and a future
     /// per-shard tracing/metric story has the data it needs without
-    /// re-plumbing.
-    #[expect(dead_code, reason = "diagnostic-only; test asserts on this")]
+    /// re-plumbing. `#[expect(dead_code)]` won't work here because the test
+    /// compilation pass DOES read the field; using `#[allow]` so production
+    /// builds stay quiet and test builds don't trip `unfulfilled_lint_expectations`.
+    #[allow(dead_code)]
     pub shard_id: u32,
     pub records: Vec<WorkUnit>,
 }

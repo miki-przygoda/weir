@@ -842,16 +842,21 @@ fn readonly_wab_dir_prevents_startup() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut exit_status = None;
     while Instant::now() < deadline {
-        if let Ok(Some(status)) = child.try_wait() {
-            exit_status = Some(status);
-            break;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
         }
-        thread::sleep(Duration::from_millis(20));
     }
     if exit_status.is_none() {
         let _ = child.kill();
-        let _ = child.wait();
     }
+    // Idempotent if try_wait already reaped; this satisfies clippy's
+    // zombie_processes lint by ensuring wait() runs on every code path.
+    let _ = child.wait();
 
     // Restore permissions so cleanup can remove the directory.
     fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).ok();
@@ -972,9 +977,8 @@ fn graceful_shutdown_under_load() {
             let unexpected = Arc::clone(&unexpected_count);
             let path = srv.socket_path.clone();
             thread::spawn(move || {
-                let mut client = match WeirClient::connect(&path) {
-                    Ok(c) => c,
-                    Err(_) => return, // server already gone
+                let Ok(mut client) = WeirClient::connect(&path) else {
+                    return; // server already gone
                 };
                 loop {
                     match client.push(b"shutdown-load", Durability::Sync) {

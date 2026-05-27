@@ -159,12 +159,9 @@ fn run_ramp_level(srv: &weir_testkit::WeirServer, n_threads: usize, duration: Du
             thread::spawn(move || {
                 let conn = WeirClient::connect(&path);
                 b.wait();
-                let mut client = match conn {
-                    Ok(c) => c,
-                    Err(_) => {
-                        io_errs.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
+                let Ok(mut client) = conn else {
+                    io_errs.fetch_add(1, Ordering::Relaxed);
+                    return;
                 };
                 while !stop.load(Ordering::Relaxed) {
                     match client.push(b"ramp", Durability::Buffered) {
@@ -451,9 +448,8 @@ fn fire_and_forget_overload() {
             let path = srv.socket_path.clone();
 
             thread::spawn(move || {
-                let mut stream = match UnixStream::connect(&path) {
-                    Ok(s) => s,
-                    Err(_) => return,
+                let Ok(mut stream) = UnixStream::connect(&path) else {
+                    return;
                 };
                 // Short write timeout: don't block the thread indefinitely when
                 // the kernel send buffer is full; treat it as backpressure and exit.

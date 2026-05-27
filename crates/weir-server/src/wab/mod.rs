@@ -365,12 +365,9 @@ fn flush_batch(
 
     for record in batch.drain(..) {
         // write_record returns Some(sealed_path) when the segment rotated.
-        let rotation = match writer.write_record(&record.payload) {
-            Err(_) => {
-                let _ = record.ack_tx.send(false);
-                continue;
-            }
-            Ok(maybe_sealed) => maybe_sealed,
+        let Ok(rotation) = writer.write_record(&record.payload) else {
+            let _ = record.ack_tx.send(false);
+            continue;
         };
 
         if let Some(sealed) = rotation {
