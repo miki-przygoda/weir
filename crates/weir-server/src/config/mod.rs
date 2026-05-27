@@ -76,6 +76,7 @@ pub enum SinkType {
     Noop,
     Http,
     Mysql,
+    Postgres,
 }
 
 impl SinkType {
@@ -84,10 +85,12 @@ impl SinkType {
             "noop" => Ok(SinkType::Noop),
             "http" => Ok(SinkType::Http),
             "mysql" => Ok(SinkType::Mysql),
+            "postgres" => Ok(SinkType::Postgres),
             other => Err(ConfigError::InvalidValue {
                 field: "sink_type",
                 reason: format!(
-                    "'{other}' is not a valid sink type; expected 'noop', 'http', or 'mysql'"
+                    "'{other}' is not a valid sink type; expected 'noop', 'http', \
+                     'mysql', or 'postgres'"
                 ),
             }),
         }
@@ -109,6 +112,25 @@ fn parse_mysql_insert_mode(s: &str) -> Result<crate::sink::mysql::InsertMode, Co
             field: "sink_mysql_insert_mode",
             reason: format!(
                 "'{other}' is not a valid insert mode; expected 'ignore' or 'plain'"
+            ),
+        }),
+    }
+}
+
+/// Parses the `sink_postgres_insert_mode` config string into the sink-layer
+/// enum. Mirror of [`parse_mysql_insert_mode`] for the Postgres sink.
+fn parse_postgres_insert_mode(
+    s: &str,
+) -> Result<crate::sink::postgres::InsertMode, ConfigError> {
+    use crate::sink::postgres::InsertMode;
+    match s {
+        "on_conflict_do_nothing" => Ok(InsertMode::OnConflictDoNothing),
+        "plain" => Ok(InsertMode::Plain),
+        other => Err(ConfigError::InvalidValue {
+            field: "sink_postgres_insert_mode",
+            reason: format!(
+                "'{other}' is not a valid insert mode; expected \
+                 'on_conflict_do_nothing' or 'plain'"
             ),
         }),
     }
@@ -141,6 +163,9 @@ pub(crate) struct PartialConfig {
     pub sink_mysql_table: Option<String>,
     pub sink_mysql_column: Option<String>,
     pub sink_mysql_insert_mode: Option<String>,
+    pub sink_postgres_table: Option<String>,
+    pub sink_postgres_column: Option<String>,
+    pub sink_postgres_insert_mode: Option<String>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
@@ -209,6 +234,9 @@ pub struct Config {
     pub sink_mysql_table: String,
     pub sink_mysql_column: String,
     pub sink_mysql_insert_mode: crate::sink::mysql::InsertMode,
+    pub sink_postgres_table: String,
+    pub sink_postgres_column: String,
+    pub sink_postgres_insert_mode: crate::sink::postgres::InsertMode,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -353,8 +381,10 @@ impl Config {
         let sink_type = SinkType::parse(&sink_type_str)?;
 
         let sink_url = merge!(sink_url);
-        if matches!(sink_type, SinkType::Http | SinkType::Mysql)
-            && sink_url.as_deref().unwrap_or("").is_empty()
+        if matches!(
+            sink_type,
+            SinkType::Http | SinkType::Mysql | SinkType::Postgres
+        ) && sink_url.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::InvalidValue {
                 field: "sink_url",
@@ -363,6 +393,7 @@ impl Config {
                     match sink_type {
                         SinkType::Http => "http",
                         SinkType::Mysql => "mysql",
+                        SinkType::Postgres => "postgres",
                         SinkType::Noop => unreachable!(),
                     }
                 ),
@@ -389,6 +420,19 @@ impl Config {
         let sink_mysql_insert_mode_str =
             merge!(sink_mysql_insert_mode).unwrap_or_else(|| "ignore".to_string());
         let sink_mysql_insert_mode = parse_mysql_insert_mode(&sink_mysql_insert_mode_str)?;
+
+        // Postgres sink: same identifier-validation story as MySQL; happens
+        // inside PostgresSink::new at startup. Default insert mode is
+        // `on_conflict_do_nothing` (idempotent under crash-recovery retries
+        // when paired with a UNIQUE constraint).
+        let sink_postgres_table =
+            merge!(sink_postgres_table).unwrap_or_else(|| "weir_records".to_string());
+        let sink_postgres_column =
+            merge!(sink_postgres_column).unwrap_or_else(|| "payload".to_string());
+        let sink_postgres_insert_mode_str = merge!(sink_postgres_insert_mode)
+            .unwrap_or_else(|| "on_conflict_do_nothing".to_string());
+        let sink_postgres_insert_mode =
+            parse_postgres_insert_mode(&sink_postgres_insert_mode_str)?;
 
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
@@ -439,6 +483,9 @@ impl Config {
             sink_mysql_table,
             sink_mysql_column,
             sink_mysql_insert_mode,
+            sink_postgres_table,
+            sink_postgres_column,
+            sink_postgres_insert_mode,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,
@@ -858,7 +905,10 @@ mod tests {
         let err = Config::from_layers(
             PartialConfig {
                 wab_dir: Some(dir.clone()),
-                sink_type: Some("postgres".into()),
+                // Was "postgres" — now a valid sink type. Pick something
+                // that won't ever be a real backend name to keep the test
+                // forward-stable.
+                sink_type: Some("definitely-not-a-real-sink".into()),
                 ..PartialConfig::empty()
             },
             PartialConfig::empty(),
@@ -872,6 +922,7 @@ mod tests {
         assert!(msg.contains("noop"), "{msg}");
         assert!(msg.contains("http"), "{msg}");
         assert!(msg.contains("mysql"), "{msg}");
+        assert!(msg.contains("postgres"), "{msg}");
         fs::remove_dir_all(dir).ok();
     }
 

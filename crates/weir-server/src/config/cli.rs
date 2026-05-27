@@ -129,6 +129,15 @@ pub(super) fn parse_from(
         sink_mysql_insert_mode: pargs
             .opt_value_from_str("--sink-mysql-insert-mode")
             .map_err(pico_err)?,
+        sink_postgres_table: pargs
+            .opt_value_from_str("--sink-postgres-table")
+            .map_err(pico_err)?,
+        sink_postgres_column: pargs
+            .opt_value_from_str("--sink-postgres-column")
+            .map_err(pico_err)?,
+        sink_postgres_insert_mode: pargs
+            .opt_value_from_str("--sink-postgres-insert-mode")
+            .map_err(pico_err)?,
         dead_letter_max_bytes: pargs
             .opt_value_from_str("--dead-letter-max-bytes")
             .map_err(pico_err)?,

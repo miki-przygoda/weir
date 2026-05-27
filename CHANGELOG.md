@@ -84,6 +84,29 @@ The five commits making up this pass:
 
 ### Added
 
+- **`PostgresSink` — Postgres counterpart to the MySQL sink**
+  (`crates/weir-server/src/sink/postgres.rs`). Direct mirror of
+  `MySqlSink`'s shape: multi-row INSERT, identifier validation,
+  transient/permanent error classification, pooled connections, health
+  probe. Replaces MySQL idioms with their Postgres equivalents —
+  `ON CONFLICT DO NOTHING` in place of `INSERT IGNORE`, `$N`
+  positional parameters in place of `?`, double-quoted identifiers in
+  place of backticks, SQLSTATE-based transient classification (`40P01`
+  `deadlock_detected`, `55P03` `lock_not_available`, `57014`
+  `query_canceled`, `57P01`/`57P02`/`57P03` shutdown family, `23505`
+  `unique_violation` under Plain mode only). Driver is `tokio-postgres`
+  with a `deadpool-postgres` pool (max 4 connections). New config knobs
+  `sink_postgres_table` / `sink_postgres_column` /
+  `sink_postgres_insert_mode` mirror the existing MySQL ones; `sink_url`
+  carries the `postgres://user:pass@host:5432/db` connection string and
+  is required when `sink_type = "postgres"`. 15 unit tests cover
+  identifier validation, password redaction, SQL generation in both
+  insert modes, and SQLSTATE classification.
+  - **TLS deliberately omitted in v1** — the initial sink ships with a
+    `NoTls` connector to keep the dependency surface minimal. Cleartext
+    is fine on private networks; deployments that need TLS should plumb
+    a TLS-terminating proxy in front of the Postgres server. Native TLS
+    via `tokio-postgres-rustls` is a planned follow-up.
 - **Startup advisory for `shard_count` / `worker_count` vs core count**
   (`crates/weir-server/src/main.rs::advise_agent_count`). On boot the
   daemon compares the configured agent count against

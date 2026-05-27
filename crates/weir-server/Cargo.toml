@@ -55,6 +55,15 @@ mysql_async = { version = "0.34", default-features = false, features = [
     "minimal-rust",
     "rustls-tls",
 ] }
+# Postgres sink: tokio-postgres + deadpool-postgres for connection pooling.
+# Mirrors the MySQL sink's pool-based connection model. No TLS feature yet
+# — Postgres-over-TLS belongs in a follow-up so the initial sink ships with
+# a minimal dep surface; cleartext is fine on private networks where
+# postgres typically lives, and the `sink_url` opt-in is required anyway.
+tokio-postgres = "0.7"
+deadpool-postgres = { version = "0.14", default-features = false, features = [
+    "rt_tokio_1",
+] }
 
 [dev-dependencies]
 weir-client = { path = "../weir-client" }

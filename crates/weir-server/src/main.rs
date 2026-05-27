@@ -19,6 +19,7 @@ use models::WorkUnit;
 use sink::http::{HttpSink, HttpSinkConfig};
 use sink::mysql::{MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
+use sink::postgres::{PostgresSink, PostgresSinkConfig};
 use wab::WabRecord;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -252,6 +253,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let sink = MySqlSink::new(mysql_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build MySQL sink: {e}"))
+            })?;
+            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+        }
+        SinkType::Postgres => {
+            let url = config
+                .sink_url
+                .clone()
+                .expect("config validation guarantees sink_url is set when sink_type = Postgres");
+            info!(
+                // URL omitted from the log line for the same reason as MySQL.
+                table = %config.sink_postgres_table,
+                column = %config.sink_postgres_column,
+                insert_mode = ?config.sink_postgres_insert_mode,
+                timeout_secs = config.sink_timeout_secs,
+                max_batch_size = config.sink_max_batch_size,
+                "sink: postgres"
+            );
+            let pg_cfg = PostgresSinkConfig {
+                url,
+                table: config.sink_postgres_table.clone(),
+                column: config.sink_postgres_column.clone(),
+                insert_mode: config.sink_postgres_insert_mode,
+                max_batch_size: config.sink_max_batch_size,
+                timeout: Duration::from_secs(config.sink_timeout_secs),
+            };
+            let sink = PostgresSink::new(pg_cfg).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
             })?;
             drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
         }

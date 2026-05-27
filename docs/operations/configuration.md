@@ -459,31 +459,32 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ### Sink selection
 
-Weir ships with three built-in sinks:
+Weir ships with four built-in sinks:
 
 | `sink_type` | What it does | When to use |
 |------------|--------------|------|
 | `"noop"` | accepts every record, forwards nothing | soak-testing the daemon pipeline; integration tests |
 | `"http"` | POSTs each record to `sink_url`; one round-trip per record | endpoints that already accept POST bodies |
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
+| `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
 
 #### `sink_type`
 
-- **Type**: string (`"noop"`, `"http"`, or `"mysql"`)
+- **Type**: string (`"noop"`, `"http"`, `"mysql"`, or `"postgres"`)
 - **Default**: `"noop"`
 - **CLI**: `--sink-type <value>`
 - **Env**: `WEIR_SINK_TYPE`
 - **TOML**: `sink_type`
 
-**When to change**: set to `"http"` or `"mysql"` once a real downstream
-is available; leave at `"noop"` until then.
+**When to change**: set to `"http"`, `"mysql"`, or `"postgres"` once a
+real downstream is available; leave at `"noop"` until then.
 
 ---
 
 #### `sink_url`
 
 - **Type**: URL string
-- **Default**: none (required when `sink_type` is `"http"` or `"mysql"`)
+- **Default**: none (required when `sink_type` is `"http"`, `"mysql"`, or `"postgres"`)
 - **Validation**: parsed at startup; invalid URLs fail fast.
 - **CLI**: `--sink-url <url>`
 - **Env**: `WEIR_SINK_URL`
@@ -491,8 +492,9 @@ is available; leave at `"noop"` until then.
 
 For `sink_type = "http"`: the endpoint that receives one POST per
 record. For `sink_type = "mysql"`: the `mysql://user:password@host:port/db`
-connection URL — **set this via `WEIR_SINK_URL`, not the TOML file**, so
-credentials never land on disk.
+connection URL. For `sink_type = "postgres"`: the
+`postgres://user:password@host:port/database` connection URL. **Set this
+via `WEIR_SINK_URL`, not the TOML file**, so credentials never land on disk.
 
 For HTTP, the body is the raw payload bytes; `Content-Type` is
 `application/octet-stream`. The endpoint is expected to return:
@@ -695,6 +697,99 @@ The MySQL URL contains credentials. **Always** supply it via
 impl redacts the password before logging, but a TOML file on disk has
 no such protection. weir uses rustls — no system OpenSSL dependency —
 so TLS to a managed database "just works" with `mysql+tls://...` URLs.
+
+---
+
+### Sink: Postgres (`sink_type = "postgres"`)
+
+The Postgres sink is the direct counterpart to the MySQL sink — same
+multi-row INSERT shape, `ON CONFLICT DO NOTHING` in place of
+`INSERT IGNORE` for idempotency, SQLSTATE-based error classification in
+place of MySQL error codes. Driver is `tokio-postgres` with a small
+connection pool (`deadpool-postgres`, max 4 connections).
+
+#### Reference schema
+
+```sql
+CREATE TABLE weir_records (
+    id BIGSERIAL PRIMARY KEY,
+    payload BYTEA NOT NULL,
+    payload_sha256 BYTEA GENERATED ALWAYS AS (sha256(payload)) STORED,
+    UNIQUE (payload_sha256)
+);
+```
+
+The `UNIQUE (payload_sha256)` constraint pairs with the default
+`sink_postgres_insert_mode = "on_conflict_do_nothing"` so crash-recovery
+retries are idempotent: duplicate inserts are silently dropped by the
+server, no consumer-side dedup required.
+
+#### `sink_postgres_table`
+
+- **Type**: identifier (`[A-Za-z_][A-Za-z0-9_]{0,62}`, ≤ 63 chars to fit
+  Postgres's `NAMEDATALEN - 1` limit)
+- **Default**: `"weir_records"`
+- **Validation**: at startup; rejected configurations include illegal
+  characters, leading digits, length > 63.
+- **CLI**: `--sink-postgres-table <name>`
+- **Env**: `WEIR_SINK_POSTGRES_TABLE`
+- **TOML**: `sink_postgres_table`
+
+The strict identifier rule means the sink builds SQL via `format!` with
+no escaping logic — there is no SQL injection vector through this knob.
+
+---
+
+#### `sink_postgres_column`
+
+- **Type**: identifier (same rules as `sink_postgres_table`)
+- **Default**: `"payload"`
+- **CLI**: `--sink-postgres-column <name>`
+- **Env**: `WEIR_SINK_POSTGRES_COLUMN`
+- **TOML**: `sink_postgres_column`
+
+---
+
+#### `sink_postgres_insert_mode`
+
+- **Type**: string (`"on_conflict_do_nothing"` or `"plain"`)
+- **Default**: `"on_conflict_do_nothing"`
+- **CLI**: `--sink-postgres-insert-mode <mode>`
+- **Env**: `WEIR_SINK_POSTGRES_INSERT_MODE`
+- **TOML**: `sink_postgres_insert_mode`
+
+| Mode | INSERT phrasing | Idempotent under crash recovery? |
+|------|------------------|----------------------------------|
+| `on_conflict_do_nothing` (default) | `INSERT INTO t (col) VALUES ($1), ($2), … ON CONFLICT DO NOTHING` | yes, if the table has a `UNIQUE` constraint |
+| `plain` | `INSERT INTO t (col) VALUES ($1), ($2), …` | no — duplicates surface as SQLSTATE `23505` and trigger a transient-retry loop until the operator removes the dup manually |
+
+#### Error classification
+
+| Postgres SQLSTATE | Classification | What weir does |
+|--------------------|----------------|----------------|
+| connection / pool / IO failures | transient | retry the segment |
+| `40P01` `deadlock_detected` | transient | retry |
+| `55P03` `lock_not_available` | transient | retry |
+| `57014` `query_canceled` | transient | retry |
+| `57P01` `admin_shutdown`, `57P02` `crash_shutdown`, `57P03` `cannot_connect_now` | transient | retry |
+| `23505` `unique_violation` (Plain mode only) | transient | retry |
+| `42P01` `undefined_table`, `42703` `undefined_column`, `42601` `syntax_error`, `28P01` `invalid_password` | permanent | dead-letter the batch with the server-supplied message |
+| anything else | permanent | dead-letter the batch |
+
+#### Credentials and TLS
+
+The Postgres URL contains credentials. **Always** supply it via
+`WEIR_SINK_URL` rather than the TOML file. The `PostgresSinkConfig`
+Debug impl redacts the password before logging.
+
+**TLS is not yet supported by the Postgres sink** — the initial sink
+ships with a `NoTls` connector to keep the dependency surface minimal.
+Cleartext is acceptable on private networks where Postgres typically
+lives (e.g. a unix-domain socket bridge or a VPC-internal endpoint).
+For TLS-required deployments, plumb a TLS-terminating proxy
+(stunnel, ghostunnel, pgbouncer with TLS to the upstream) in front of
+the Postgres server. Native TLS support is a planned follow-up via
+`tokio-postgres-rustls`.
 
 ---
 

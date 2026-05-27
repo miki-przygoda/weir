@@ -9,6 +9,9 @@
 //! - [`mysql::MySqlSink`] — writes a whole batch with one multi-row
 //!   `INSERT` statement. The IOPS-compression sink: N records → 1 statement
 //!   → 1 server-side commit. Use when `sink_type = "mysql"`.
+//! - [`postgres::PostgresSink`] — Postgres counterpart to the MySQL sink.
+//!   Same multi-row INSERT shape, `ON CONFLICT DO NOTHING` in place of
+//!   `INSERT IGNORE` for idempotency. Use when `sink_type = "postgres"`.
 //!
 //! A `Sink` receives batches of records from the drain and commits them to a
 //! downstream store. Implementations decide their own connection management and
@@ -33,6 +36,7 @@
 pub mod http;
 pub mod mysql;
 pub mod noop;
+pub mod postgres;
 
 use weir_core::Payload;
 
