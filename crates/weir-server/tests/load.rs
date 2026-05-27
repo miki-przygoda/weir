@@ -599,6 +599,56 @@ fn compression_ratio_records_per_commit() {
     );
 }
 
+/// Sweeps `agent_count` (= shard_count = worker_count) across a range and
+/// runs the herd_64 workload at each. The peak of the resulting throughput
+/// curve tells us the ideal agent:core ratio on the host. Used to derive
+/// the startup recommendation surfaced via tracing.
+///
+/// Each `(agent_count)` is run 3 trials and the median is reported.
+/// Ignored by default — this is investigation tooling, not a regression
+/// bench. Run explicitly with `--ignored sweep_agent_count_vs_throughput`.
+#[test]
+#[ignore = "investigation-only; run explicitly with --ignored"]
+fn sweep_agent_count_vs_throughput() {
+    const THREADS: usize = 64;
+    const RECORDS_PER_THREAD: usize = 100;
+    const TRIALS: usize = 3;
+    let agent_counts = [1usize, 2, 3, 4, 6, 8];
+
+    let cores = num_cpus_avail();
+    eprintln!("\n=== agent_count sweep on {} cores ===", cores);
+    eprintln!("scenario: herd of {} threads × {} Sync records each", THREADS, RECORDS_PER_THREAD);
+    eprintln!();
+    eprintln!("agents | median RPS | min      | max      | agents/cores");
+    eprintln!("-------|-----------:|---------:|---------:|-------------");
+
+    for n in agent_counts {
+        let mut trials_rps: Vec<u64> = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            // Fresh server per trial so per-shard state doesn't carry over.
+            let srv = weir_server!("sweep")
+                .bench_preset()
+                .shard_count(n)
+                .worker_count(n)
+                .start();
+            let elapsed = thundering_herd(&srv, THREADS, RECORDS_PER_THREAD);
+            let rps = ((THREADS * RECORDS_PER_THREAD) as f64 / elapsed.as_secs_f64()) as u64;
+            trials_rps.push(rps);
+        }
+        trials_rps.sort_unstable();
+        let median = trials_rps[trials_rps.len() / 2];
+        let min = *trials_rps.first().unwrap();
+        let max = *trials_rps.last().unwrap();
+        let ratio = n as f64 / cores as f64;
+        eprintln!("{:>6} | {:>10} | {:>8} | {:>8} | {:.2}", n, median, min, max, ratio);
+    }
+    eprintln!();
+}
+
+fn num_cpus_avail() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
 fn parse_load_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
         if line.starts_with(prefix)

@@ -86,6 +86,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "weir starting"
     );
 
+    // ── Concurrency-vs-cores advisory ─────────────────────────────────────────
+    // Each shard runs a flusher thread; each worker runs a worker thread.
+    // Together those threads form the "agent" pool that does the real per-
+    // record work. Too many agents on too few cores degrades throughput
+    // (context-switching costs + shrinks the records-per-fsync ratio because
+    // producers can't run concurrently); too few agents leaves storage-side
+    // fsync parallelism unused.
+    //
+    // The recommendation here is advisory only — the operator always
+    // overrides via shard_count / worker_count config. It exists because the
+    // current defaults (shard_count = 1, worker_count = 2) won't be a good
+    // fit for most production-sized machines, and the empirical sweet spot
+    // is non-obvious enough that we'd rather surface it than make users
+    // discover it by benchmarking.
+    advise_agent_count(config.shard_count, config.worker_count);
+
     // ── Metrics ───────────────────────────────────────────────────────────────
 
     let (metrics_struct, registry) = metrics::Metrics::new();
@@ -376,4 +392,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("weir shut down cleanly");
     Ok(())
+}
+
+/// Logs a recommendation if `shard_count` / `worker_count` look unusual
+/// for the host's core count. Advisory only — operator config wins.
+///
+/// **Empirical basis.** A sweep on a 4-core sandbox (herd of 64 producers
+/// × Sync records, `tests/load.rs::sweep_agent_count_vs_throughput`) showed:
+///
+/// | agent_count | median RPS  | vs cores |
+/// |-------------|-------------|----------|
+/// | 1           | 29 k (peak) | 0.25     |
+/// | 2           | 26 k        | 0.50     |
+/// | 3           | 23 k (low)  | 0.75     |
+/// | 4 (default) | 25 k        | 1.00     |
+/// | 6           | 25 k        | 1.50     |
+/// | 8           | 25 k        | 2.00     |
+///
+/// Why the peak is so low: each agent = one worker thread + one flusher
+/// thread, and on a 4-core machine those threads compete with the tokio
+/// runtime workers and the accept loop. Fewer agents also means a fatter
+/// group fsync (more concurrent producers' records share one batch),
+/// which is the dominant win on Sync workloads.
+///
+/// Heuristic: reserve ~2 cores for the tokio runtime / accept loop / OS,
+/// give each remaining core a 2-thread budget for one agent. So
+/// `recommended = max(1, (cores - 2) / 2)`. Validated at 4 cores; should
+/// extrapolate sensibly but isn't proven on high-core production hardware.
+fn advise_agent_count(shard_count: usize, worker_count: usize) {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    if cores == 0 {
+        return; // Couldn't probe the system; skip the advisory.
+    }
+
+    let recommended = recommended_agent_count(cores);
+    // Use the larger of the two as the "agent count" proxy because each
+    // contributes one OS thread per unit.
+    let actual = shard_count.max(worker_count);
+
+    if actual > 2 * recommended {
+        tracing::warn!(
+            cores,
+            shard_count,
+            worker_count,
+            recommended_agent_count = recommended,
+            "shard_count/worker_count is significantly above the recommended value for this \
+             core count. Each agent uses a worker thread + a flusher thread; on machines \
+             where 2 × agent_count > cores you'll likely see CPU contention reduce throughput \
+             and shrink the records-per-fsync ratio. This is advisory — override via config \
+             if you've measured your workload."
+        );
+    } else if recommended >= 4 && actual * 4 < recommended {
+        tracing::info!(
+            cores,
+            shard_count,
+            worker_count,
+            recommended_agent_count = recommended,
+            "shard_count/worker_count is well below the recommended value for this core \
+             count. On systems with parallel-fsync-capable storage (NVMe RAID, virtualised \
+             block devices) raising it can unlock additional throughput. This is advisory — \
+             override via config if you've measured your workload."
+        );
+    }
+}
+
+/// Recommended `agent_count` (= shard_count = worker_count for a balanced
+/// config) given the host's logical core count. See [`advise_agent_count`]
+/// for the empirical derivation.
+fn recommended_agent_count(cores: usize) -> usize {
+    // Reserve ~2 cores for tokio runtime + accept + OS; budget each
+    // remaining core for one agent's two threads (worker + flusher).
+    cores.saturating_sub(2).max(2) / 2
+}
+
+#[cfg(test)]
+mod tuning_tests {
+    use super::recommended_agent_count;
+
+    #[test]
+    fn recommended_agent_count_scales_with_cores() {
+        // Minimum is 1 — single-core hosts still need an agent.
+        assert_eq!(recommended_agent_count(1), 1);
+        assert_eq!(recommended_agent_count(2), 1);
+        // 4-core sandbox peak in the sweep was at agent_count=1.
+        assert_eq!(recommended_agent_count(4), 1);
+        // 8-core: 6 cores available for agents / 2 threads each = 3.
+        assert_eq!(recommended_agent_count(8), 3);
+        // 16-core: 14 / 2 = 7.
+        assert_eq!(recommended_agent_count(16), 7);
+        // 32-core: 30 / 2 = 15.
+        assert_eq!(recommended_agent_count(32), 15);
+    }
 }
