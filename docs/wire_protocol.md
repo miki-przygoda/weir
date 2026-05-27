@@ -114,6 +114,14 @@ The CRC's empty-input value is `0x00000000` (a CRC over zero bytes
 returns the all-zero post-XOR value). A `HealthCheckResponse` frame
 therefore ends with the four bytes `00 00 00 00`.
 
+**CRC32 guards against accidental corruption, not malicious tampering.**
+Anyone with read/write access to the daemon's Unix socket can craft a
+frame with a valid header and payload CRC; the algorithm has no key
+and is publicly defined. The trust boundary is the socket file's mode
+(`0o600` — see [Socket setup](#socket-setup) below), not the CRC. Treat
+producers as authenticated by filesystem permissions, not by any
+property of the wire frame itself.
+
 ## Connection lifecycle
 
 Each connection is a serial request/response stream — the server reads
