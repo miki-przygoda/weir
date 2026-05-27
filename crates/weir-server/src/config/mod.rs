@@ -93,25 +93,23 @@ impl SinkType {
     }
 }
 
-/// MySQL `INSERT` phrasing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MysqlInsertMode {
-    Ignore,
-    Plain,
-}
-
-impl MysqlInsertMode {
-    fn parse(s: &str) -> Result<Self, ConfigError> {
-        match s {
-            "ignore" => Ok(MysqlInsertMode::Ignore),
-            "plain" => Ok(MysqlInsertMode::Plain),
-            other => Err(ConfigError::InvalidValue {
-                field: "sink_mysql_insert_mode",
-                reason: format!(
-                    "'{other}' is not a valid insert mode; expected 'ignore' or 'plain'"
-                ),
-            }),
-        }
+/// Parses the `sink_mysql_insert_mode` config string into the sink-layer enum.
+///
+/// `InsertMode` lives in `sink::mysql` (where the variants are used to phrase
+/// SQL); this function is the config-layer adapter that turns user-facing
+/// strings into that enum so the config doesn't have to maintain a parallel
+/// copy of the variants.
+fn parse_mysql_insert_mode(s: &str) -> Result<crate::sink::mysql::InsertMode, ConfigError> {
+    use crate::sink::mysql::InsertMode;
+    match s {
+        "ignore" => Ok(InsertMode::Ignore),
+        "plain" => Ok(InsertMode::Plain),
+        other => Err(ConfigError::InvalidValue {
+            field: "sink_mysql_insert_mode",
+            reason: format!(
+                "'{other}' is not a valid insert mode; expected 'ignore' or 'plain'"
+            ),
+        }),
     }
 }
 
@@ -182,7 +180,7 @@ pub struct Config {
     pub sink_send_idempotency_key: bool,
     pub sink_mysql_table: String,
     pub sink_mysql_column: String,
-    pub sink_mysql_insert_mode: MysqlInsertMode,
+    pub sink_mysql_insert_mode: crate::sink::mysql::InsertMode,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -338,7 +336,7 @@ impl Config {
         let sink_mysql_column = merge!(sink_mysql_column).unwrap_or_else(|| "payload".to_string());
         let sink_mysql_insert_mode_str =
             merge!(sink_mysql_insert_mode).unwrap_or_else(|| "ignore".to_string());
-        let sink_mysql_insert_mode = MysqlInsertMode::parse(&sink_mysql_insert_mode_str)?;
+        let sink_mysql_insert_mode = parse_mysql_insert_mode(&sink_mysql_insert_mode_str)?;
 
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
@@ -523,7 +521,7 @@ mod tests {
         assert!(c.sink_send_idempotency_key);
         assert_eq!(c.sink_mysql_table, "weir_records");
         assert_eq!(c.sink_mysql_column, "payload");
-        assert_eq!(c.sink_mysql_insert_mode, MysqlInsertMode::Ignore);
+        assert_eq!(c.sink_mysql_insert_mode, crate::sink::mysql::InsertMode::Ignore);
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");
@@ -752,15 +750,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.sink_type, SinkType::Mysql);
-        assert_eq!(c.sink_mysql_insert_mode, MysqlInsertMode::Ignore);
+        assert_eq!(c.sink_mysql_insert_mode, crate::sink::mysql::InsertMode::Ignore);
         fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn sink_mysql_insert_mode_parses() {
         for (input, expected) in [
-            ("ignore", MysqlInsertMode::Ignore),
-            ("plain", MysqlInsertMode::Plain),
+            ("ignore", crate::sink::mysql::InsertMode::Ignore),
+            ("plain", crate::sink::mysql::InsertMode::Plain),
         ] {
             let dir = tmp_dir(&format!("mysql_mode_{input}"));
             let c = Config::from_layers(

@@ -13,11 +13,11 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use tracing::info;
 
-use config::{Config, MysqlInsertMode, SinkType};
+use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
 use sink::http::{HttpSink, HttpSinkConfig};
-use sink::mysql::{InsertMode, MySqlSink, MySqlSinkConfig};
+use sink::mysql::{MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
 use wab::WabRecord;
 
@@ -213,10 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .sink_url
                 .clone()
                 .expect("config validation guarantees sink_url is set when sink_type = Mysql");
-            let insert_mode = match config.sink_mysql_insert_mode {
-                MysqlInsertMode::Ignore => InsertMode::Ignore,
-                MysqlInsertMode::Plain => InsertMode::Plain,
-            };
+            let insert_mode = config.sink_mysql_insert_mode;
             info!(
                 // URL omitted from the log line — it contains credentials.
                 // The MySqlSink Debug impl redacts the password, but logging
