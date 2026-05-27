@@ -22,6 +22,10 @@ OPTIONS:
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
     --metrics-port <port>                    Prometheus metrics port [default: 9185]
+    --metrics-bind <addr>                    Metrics bind IP (use 0.0.0.0 to expose
+                                               on the network) [default: 127.0.0.1]
+    --metrics-max-connections <n>            Concurrent metrics scrapes cap
+                                               (1-1024) [default: 8]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
     --sink-type <type>                       Sink: noop | http | mysql [default: noop]
     --sink-url <url>                         Sink URL (required if type=http or mysql)
@@ -87,6 +91,12 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         metrics_port: pargs
             .opt_value_from_str("--metrics-port")
+            .map_err(pico_err)?,
+        metrics_bind: pargs
+            .opt_value_from_str("--metrics-bind")
+            .map_err(pico_err)?,
+        metrics_max_connections: pargs
+            .opt_value_from_str("--metrics-max-connections")
             .map_err(pico_err)?,
         shutdown_timeout_secs: pargs
             .opt_value_from_str("--shutdown-timeout-secs")

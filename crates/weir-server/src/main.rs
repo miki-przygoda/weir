@@ -248,12 +248,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     rt.block_on(async {
-        // Bind metrics listener before starting the socket loop.
+        // Bind metrics listener before starting the socket loop. Default
+        // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the
+        // security reasoning around exposing this surface on the network.
         let metrics_listener =
-            tokio::net::TcpListener::bind(("0.0.0.0", config.metrics_port)).await?;
-        metrics::server::spawn(metrics_listener, Arc::clone(&registry));
+            tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port)).await?;
+        metrics::server::spawn(
+            metrics_listener,
+            Arc::clone(&registry),
+            config.metrics_max_connections,
+        );
 
-        info!(port = config.metrics_port, "metrics endpoint listening");
+        info!(
+            bind = %config.metrics_bind,
+            port = config.metrics_port,
+            max_connections = config.metrics_max_connections,
+            "metrics endpoint listening"
+        );
 
         // Background: poll queue depth every 500 ms.
         let queue_tx_bg = queue_tx.clone();

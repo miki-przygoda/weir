@@ -10,6 +10,7 @@ mod file;
 
 use std::{
     fmt,
+    net::IpAddr,
     path::{Component, Path, PathBuf},
 };
 
@@ -127,6 +128,8 @@ pub(crate) struct PartialConfig {
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
+    pub metrics_bind: Option<String>,
+    pub metrics_max_connections: Option<usize>,
     pub shutdown_timeout_secs: Option<u64>,
     pub connection_read_timeout_secs: Option<u64>,
     pub sink_type: Option<String>,
@@ -171,6 +174,19 @@ pub struct Config {
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
+    /// IP address the metrics HTTP endpoint binds to. Default `127.0.0.1`
+    /// — localhost-only so an operator who runs weir on a multi-tenant host
+    /// doesn't accidentally expose internal counters to the LAN. Override to
+    /// `0.0.0.0` (or a specific interface) only after deciding that the
+    /// metrics surface is safe to publish: the `weir_records_nack` family by
+    /// reason exposes a decode-error oracle, and there is no authentication.
+    pub metrics_bind: IpAddr,
+    /// Cap on concurrent metrics-endpoint connections. Default 8 — a scrape
+    /// is a single request/response, and a real Prometheus deployment never
+    /// runs more than a handful of scrapers in parallel. Bounds the
+    /// fork-bomb surface so a misconfigured (or hostile) client can't spawn
+    /// unbounded tokio tasks against the endpoint.
+    pub metrics_max_connections: usize,
     pub shutdown_timeout_secs: u64,
     pub connection_read_timeout_secs: u64,
     pub sink_type: SinkType,
@@ -274,6 +290,28 @@ impl Config {
             });
         }
 
+        // Default 127.0.0.1: localhost-only. See Config::metrics_bind docs for
+        // the security reasoning. Operators who want LAN-visible metrics must
+        // explicitly set "0.0.0.0" (or a specific interface address).
+        let metrics_bind_str = merge!(metrics_bind).unwrap_or_else(|| "127.0.0.1".to_string());
+        let metrics_bind = metrics_bind_str.parse::<IpAddr>().map_err(|_| {
+            ConfigError::InvalidValue {
+                field: "metrics_bind",
+                reason: format!(
+                    "'{metrics_bind_str}' is not a valid IP address (expected e.g. \
+                     '127.0.0.1', '0.0.0.0', '::1', or a specific interface address)"
+                ),
+            }
+        })?;
+
+        let metrics_max_connections = merge!(metrics_max_connections).unwrap_or(8);
+        check_range(
+            "metrics_max_connections",
+            metrics_max_connections,
+            1,
+            1024,
+        )?;
+
         let shutdown_timeout_secs = merge!(shutdown_timeout_secs).unwrap_or(30);
         if shutdown_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
@@ -374,6 +412,8 @@ impl Config {
             max_connections,
             max_payload_bytes,
             metrics_port,
+            metrics_bind,
+            metrics_max_connections,
             shutdown_timeout_secs,
             connection_read_timeout_secs,
             sink_type,
