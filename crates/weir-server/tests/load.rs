@@ -92,22 +92,43 @@ struct LoadHandle {
     child: Option<Child>,
     pub socket_path: PathBuf,
     pub deadline_ms: u64,
+    pub metrics_port: u16,
     tmp_dir: PathBuf,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
+/// Optional overrides for the compression-ratio scenario. Other scenarios use
+/// the daemon's default segment size + a sensible sink batch cap.
+#[derive(Default)]
+struct LoadOptions {
+    /// If set, written into the TOML as `wab_segment_max_bytes`. Used by the
+    /// compression-ratio scenario to seal segments under bench-scale load.
+    wab_segment_max_bytes: Option<u64>,
+    /// If set, written into the TOML as `sink_max_batch_size`. Used by the
+    /// compression-ratio scenario to make sure the drain reads each segment
+    /// in one (or very few) `Sink::commit()` calls.
+    sink_max_batch_size: Option<usize>,
+}
+
 impl LoadHandle {
     fn start(tag: &str) -> Self {
-        Self::start_impl(tag, 256)
+        Self::start_impl(tag, 256, LoadOptions::default())
     }
 
     /// Start with a deliberately low `max_connections` cap so the ramp test
     /// can exercise connection-drop behaviour without needing hundreds of threads.
     fn start_capped(tag: &str, max_connections: usize) -> Self {
-        Self::start_impl(tag, max_connections)
+        Self::start_impl(tag, max_connections, LoadOptions::default())
     }
 
-    fn start_impl(tag: &str, max_connections: usize) -> Self {
+    /// Start with the segment threshold and sink batch cap tuned for the
+    /// compression-ratio scenario. See `compression_ratio_records_per_commit`
+    /// for why the defaults aren't used here.
+    fn start_with_options(tag: &str, opts: LoadOptions) -> Self {
+        Self::start_impl(tag, 256, opts)
+    }
+
+    fn start_impl(tag: &str, max_connections: usize, opts: LoadOptions) -> Self {
         let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
         let deadline_ms = bench_deadline_ms();
         let metrics_port = free_port();
@@ -126,7 +147,7 @@ impl LoadHandle {
             std::fs::set_permissions(&wab_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
 
-        let config = format!(
+        let mut config = format!(
             "[server]\n\
              socket_path       = \"{}\"\n\
              wab_dir           = \"{}\"\n\
@@ -143,6 +164,12 @@ impl LoadHandle {
             deadline_ms,
             max_connections,
         );
+        if let Some(b) = opts.wab_segment_max_bytes {
+            config.push_str(&format!("wab_segment_max_bytes = {b}\n"));
+        }
+        if let Some(n) = opts.sink_max_batch_size {
+            config.push_str(&format!("sink_max_batch_size   = {n}\n"));
+        }
         std::fs::write(&config_path, &config).unwrap();
 
         let log_file = std::fs::File::create(&log_path).unwrap();
@@ -158,11 +185,25 @@ impl LoadHandle {
             child: Some(child),
             socket_path,
             deadline_ms,
+            metrics_port,
             tmp_dir,
             _lock,
         };
         handle.wait_ready(Duration::from_secs(15));
         handle
+    }
+
+    /// Fetches `/metrics` from the in-process Prometheus exposition server.
+    /// Used by the compression-ratio scenario to read the
+    /// `weir_sink_commit_records_total{outcome="committed"}` and
+    /// `weir_sink_commit_duration_seconds_count` counters.
+    fn scrape_metrics(&self) -> String {
+        let url = format!("http://127.0.0.1:{}/metrics", self.metrics_port);
+        ureq::get(&url)
+            .call()
+            .expect("metrics request failed")
+            .into_string()
+            .expect("metrics body read failed")
     }
 
     fn wait_ready(&mut self, timeout: Duration) {
@@ -629,4 +670,125 @@ fn fire_and_forget_overload() {
         health.health_check().is_ok(),
         "server became unresponsive after fire-and-forget overload ({total} frames sent)"
     );
+}
+
+// ── Compression ratio (records per Sink::commit call) ──────────────────────────
+//
+// The headline IOPS-compression claim: N client pushes are collapsed into M
+// downstream sink commits, where M < N. This scenario configures the daemon
+// so segments seal at bench-scale volume, drives push traffic, scrapes the
+// Prometheus counters once the drain has worked through everything, and
+// emits a single BENCH line with the literal ratio.
+//
+// Configuration choices:
+//   - `wab_segment_max_bytes = 64 KiB`: small enough that ~150 × 256 B
+//     records seal one segment (and the test pushes enough to seal several).
+//   - `sink_max_batch_size = 10_000`: bigger than any plausible segment so
+//     the drain delivers each sealed segment to the sink in one commit().
+//
+// Property assertion: `records_committed / commit_count ≥ 10`. The number is
+// conservative — on a clean run the observed ratio is much higher — but
+// resistant to noisy CI runners and the rare case where a flush deadline
+// triggers an extra small batch.
+
+#[test]
+fn compression_ratio_records_per_commit() {
+    const N_RECORDS: usize = 5_000;
+    const RECORD_BYTES: usize = 256;
+    const SEGMENT_MAX_BYTES: u64 = 64 * 1024;
+    const SINK_MAX_BATCH: usize = 10_000;
+    const DRAIN_DEADLINE: Duration = Duration::from_secs(20);
+    const STABLE_ROUNDS: u32 = 3;
+
+    let srv = LoadHandle::start_with_options(
+        "compression_ratio",
+        LoadOptions {
+            wab_segment_max_bytes: Some(SEGMENT_MAX_BYTES),
+            sink_max_batch_size: Some(SINK_MAX_BATCH),
+        },
+    );
+
+    let payload = vec![0xAAu8; RECORD_BYTES];
+    let mut client = srv.client();
+    for i in 0..N_RECORDS {
+        client
+            .push(&payload, Durability::Sync)
+            .unwrap_or_else(|e| panic!("push {i} failed: {e}"));
+    }
+    drop(client);
+
+    // Wait for the committed counter to plateau. We don't require all
+    // N_RECORDS to be committed — the last segment is typically still active
+    // (and therefore not yet seen by the drain) when the test stops pushing.
+    // The compression-ratio measurement is meaningful as long as we've
+    // committed most records and the counter has stabilised.
+    let mut prev_committed = u64::MAX;
+    let mut stable = 0u32;
+    let deadline = Instant::now() + DRAIN_DEADLINE;
+    let (committed, commit_count) = loop {
+        thread::sleep(Duration::from_millis(200));
+        let body = srv.scrape_metrics();
+        let committed = parse_load_metric(
+            &body,
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        );
+        let commit_count = parse_load_metric(&body, "weir_sink_commit_duration_seconds_count");
+
+        if committed == prev_committed && commit_count > 0 {
+            stable += 1;
+            if stable >= STABLE_ROUNDS {
+                break (committed, commit_count);
+            }
+        } else {
+            stable = 0;
+            prev_committed = committed;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "drain did not reach a stable committed count within {DRAIN_DEADLINE:?}; \
+                 last seen: {committed} committed in {commit_count} commits"
+            );
+        }
+    };
+
+    // Sanity floor: we should have committed the bulk of what we pushed.
+    // Anything less than half points at a broken drain, not a healthy plateau.
+    assert!(
+        committed >= (N_RECORDS as u64) / 2,
+        "expected ≥{} committed records, only saw {committed} — drain is not flowing",
+        N_RECORDS / 2,
+    );
+
+    let ratio = committed as f64 / commit_count.max(1) as f64;
+    let d = srv.deadline_ms;
+    println!(
+        "BENCH: {{\"scenario\":\"compression_ratio_d{d}ms\",\"records_committed\":{committed},\
+         \"sink_commits\":{commit_count},\"records_per_commit\":{ratio:.2},\
+         \"segment_max_bytes\":{SEGMENT_MAX_BYTES},\"record_bytes\":{RECORD_BYTES}}}"
+    );
+
+    assert!(
+        ratio >= 10.0,
+        "expected ≥10:1 records-per-commit IOPS compression, got {ratio:.1}:1 \
+         ({committed} records / {commit_count} commits at {SEGMENT_MAX_BYTES} B/segment)"
+    );
+
+    // Server must still be responsive after the run.
+    let mut health = srv.client();
+    assert!(
+        health.health_check().is_ok(),
+        "server became unresponsive after compression-ratio scenario"
+    );
+}
+
+fn parse_load_metric(body: &str, prefix: &str) -> u64 {
+    for line in body.lines() {
+        if line.starts_with(prefix)
+            && let Some(val) = line.split_whitespace().next_back()
+            && let Ok(n) = val.parse()
+        {
+            return n;
+        }
+    }
+    0
 }
