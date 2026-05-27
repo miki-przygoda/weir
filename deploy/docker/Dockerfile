@@ -13,19 +13,16 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/weir-core/Cargo.toml    crates/weir-core/Cargo.toml
 COPY crates/weir-server/Cargo.toml  crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml  crates/weir-client/Cargo.toml
-COPY crates/weir-bench/Cargo.toml   crates/weir-bench/Cargo.toml
 
 # Stub sources so Cargo can resolve the workspace and compile dependencies.
 RUN mkdir -p \
         crates/weir-core/src \
         crates/weir-server/src \
-        crates/weir-client/src \
-        crates/weir-bench/src && \
+        crates/weir-client/src && \
     echo 'fn main(){}' > crates/weir-server/src/main.rs && \
     touch \
         crates/weir-core/src/lib.rs \
-        crates/weir-client/src/lib.rs \
-        crates/weir-bench/src/main.rs
+        crates/weir-client/src/lib.rs
 
 # --locked enforces that Cargo.lock is used verbatim; cargo refuses to update
 # it during the build. Without --locked, a transient lockfile-resolution issue

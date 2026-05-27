@@ -35,8 +35,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build weir-bench
-        run: cargo build --release -p weir-bench
+      - name: Build push_simple example
+        # Replaces the smoke-test usage that previously lived in weir-bench.
+        # push_simple sends records across all three durability tiers and
+        # exits non-zero on any nack, which is exactly what the smoke test
+        # needs to confirm the container is wired up correctly.
+        run: cargo build --release -p weir-client --example push_simple
 
       - name: Smoke test
         env:
@@ -87,11 +91,11 @@ jobs:
           docker exec weir-smoke chmod a+rw /run/weir/weir.sock
 
           # Push records across all three durability tiers and verify Acks.
-          ./target/release/weir-bench \
+          # 60 × 3 tiers = 180 pushes, close to the 200-sample latency suite
+          # the legacy bench binary ran. push_simple exits non-zero on any nack.
+          ./target/release/examples/push_simple \
             --socket "$SOCKDIR/weir.sock" \
-            --samples 200 \
-            --payload 64 \
-            --only latency
+            --count 60
 
           # Verify key metrics are exported.
           echo "Checking /metrics…"

@@ -70,8 +70,15 @@ s, see `shutdown_timeout_secs`).
 
 ```bash
 cargo build --release -p weir-client    # client library (lib)
-cargo build --release -p weir-bench     # standalone benchmark binary
-cargo build --release                   # all four crates
+cargo build --release                   # all three crates
+```
+
+To exercise the daemon end-to-end without writing producer code, build and
+run the `push_simple` example:
+
+```bash
+cargo run --release -p weir-client --example push_simple -- \
+    --socket /run/weir/weir.sock --count 5
 ```
 
 `weir-core` (wire protocol types) is built transitively.

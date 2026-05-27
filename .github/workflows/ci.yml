@@ -73,7 +73,7 @@ jobs:
           fi
 
   bench:
-    name: weir-bench
+    name: bench (tests/load)
     runs-on: ubuntu-latest
     needs: test
     timeout-minutes: 15
@@ -82,56 +82,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binaries
-        run: cargo build --release -p weir-server -p weir-bench
-
-      - name: Run weir-bench
+      - name: Run bench (tests/load)
+        # tests/load.rs spawns its own weir-server, runs every benchmark
+        # scenario, and emits the same `BENCH:` JSONL format that
+        # avg_benchmarks.py consumes — so the renderer below is unchanged.
+        # Three trials per deadline to average out single-run noise.
         run: |
           set -euo pipefail
-
-          TMPDIR=$(mktemp -d)
-          WAB=$TMPDIR/wab
-          RUN=$TMPDIR/run
-          mkdir -p "$WAB" "$RUN"
-          chmod 700 "$WAB"
-          METRICS_PORT=$(python3 -c \
-            "import socket; s=socket.socket(); s.bind(('',0)); \
-             print(s.getsockname()[1]); s.close()")
-          SOCK=$RUN/weir.sock
-
-          {
-            printf '[server]\n'
-            printf 'socket_path       = "%s"\n' "$SOCK"
-            printf 'wab_dir           = "%s"\n' "$WAB"
-            printf 'metrics_port      = %s\n'   "$METRICS_PORT"
-            printf 'shard_count       = 4\n'
-            printf 'worker_count      = 4\n'
-            printf 'batch_size        = 64\n'
-            printf 'batch_deadline_ms = 1\n'
-            printf 'log_level         = "error"\n'
-          } > "$TMPDIR/weir.toml"
-
-          ./target/release/weir-server --config "$TMPDIR/weir.toml" &
-          SERVER_PID=$!
-          trap 'kill $SERVER_PID 2>/dev/null; rm -rf "$TMPDIR"' EXIT
-
-          echo "Waiting for socket…"
-          for i in $(seq 1 30); do
-            [ -S "$SOCK" ] && break
-            if [ "$i" -eq 30 ]; then
-              echo "ERROR: weir-server did not start"
-              exit 1
-            fi
-            sleep 0.2
-          done
-          echo "Socket ready."
-
           for run in 1 2 3; do
             echo "--- bench run $run ---"
-            WEIR_BENCH_DEADLINE=1 ./target/release/weir-bench \
-              --socket "$SOCK" \
-              --samples 3000 \
-              --payload 256 \
+            WEIR_BENCH_DEADLINE=1 \
+              cargo test --release -p weir-server --test load -- --nocapture 2>/dev/null \
+              | grep '^BENCH: ' \
               >> bench_results.jsonl
           done
 

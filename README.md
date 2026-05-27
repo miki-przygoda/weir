@@ -61,8 +61,7 @@ amortises downstream cost via bulk drain.
 |---------------|-----------|------------------------------------------------------------------------------------------------------|
 | `weir-core`   | lib       | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`. Cross-platform.              |
 | `weir-server` | bin + lib | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
-| `weir-client` | lib       | Client library. Connects over a Unix socket, sends Push/HealthCheck frames, returns typed errors.    |
-| `weir-bench`  | bin       | Standalone benchmark binary.                                                                          |
+| `weir-client` | lib       | Client library. Connects over a Unix socket, sends Push/HealthCheck frames, returns typed errors. Ships two examples (`push_simple`, `health_check`). Benchmark coverage lives in `weir-server/tests/load.rs`. |
 
 ## Non-goals (v1)
 

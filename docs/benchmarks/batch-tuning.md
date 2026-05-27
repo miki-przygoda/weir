@@ -18,12 +18,12 @@ ordering between configs is the takeaway**.
 For each (`batch_size`, `batch_deadline_ms`) point:
 
 1. Fresh `wab_dir`, fresh `weir-server` process per trial
-2. `weir-bench --samples 1000 --payload 256 --only latency` → 3 trials
+2. `cargo test --release -p weir-server --test load -- --nocapture` → 3 trials
 3. Median across trials per percentile
 
 Fixed parameters: `shard_count=2`, `worker_count=2`, payload 256 B, 1000 samples.
 
-`weir-bench` reports three latency scenarios per run: `sync` (request →
+`tests/load.rs` reports three latency scenarios per run: `sync` (request →
 fsync → ack), `batched` (request → flush-or-deadline → ack), `buffered`
 (request → in-memory ack, no durability).
 
@@ -88,9 +88,9 @@ Applied in the commit that follows this doc.
 
 ## Throughput companion sweep
 
-Same 5 configs × 3 trials, but `weir-bench --only throughput` and `--only herd`
-(5000 samples per scenario, 256 B payload). Median RPS across the 3 trials per
-scenario.
+Same 5 configs × 3 trials, but using the `baseline_*_throughput*` and
+`thundering_herd_*` scenarios in `tests/load.rs` (5000 samples per
+scenario, 256 B payload). Median RPS across the 3 trials per scenario.
 
 ### Single-thread
 
