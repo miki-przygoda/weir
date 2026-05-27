@@ -73,12 +73,23 @@ pub struct ConnectionConfig {
 ///
 /// Any validation failure sends the appropriate Nack and closes the connection.
 pub async fn handle_connection(
-    mut stream: UnixStream,
+    stream: UnixStream,
     queue_tx: QueueSender<WorkUnit>,
     config: ConnectionConfig,
     metrics: Arc<Metrics>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
+    // Wrap the stream in a BufReader so the typical Push frame (header +
+    // payload + CRC) — which the client writes in a single write_all and
+    // the kernel delivers in one packet — comes off the socket in one
+    // read syscall instead of three. Writes still go to the underlying
+    // stream via `stream.get_mut()` so ack/nack responses don't sit in
+    // a write buffer.
+    //
+    // 8 KiB default capacity fits the common case (16 B header + payload
+    // up to ~8 KiB + 4 B CRC) without bumping per-connection memory much.
+    // Larger payloads will issue a follow-up read, same as before.
+    let mut stream = tokio::io::BufReader::new(stream);
     loop {
         // ── Shutdown check ──────────────────────────────────────────────────
         // If the daemon is shutting down, exit cleanly between frames so the
@@ -126,7 +137,7 @@ pub async fn handle_connection(
             Ok(h) => h,
             Err(e) => {
                 let (wire, metric, extra) = nack_for_decode_error(&e);
-                send_nack(&mut stream, wire, extra).await?;
+                send_nack(stream.get_mut(), wire, extra).await?;
                 metrics
                     .records_nack
                     .get_or_create(&NackLabel {
@@ -146,7 +157,7 @@ pub async fn handle_connection(
         let cap = config.max_payload_bytes.min(MAX_PAYLOAD_HARD_CAP);
         if payload_len > cap {
             let tv = durability_to_tier(header.durability);
-            send_nack(&mut stream, WireNack::PayloadTooLarge, &[]).await?;
+            send_nack(stream.get_mut(), WireNack::PayloadTooLarge, &[]).await?;
             metrics
                 .records_nack
                 .get_or_create(&NackLabel {
@@ -191,7 +202,7 @@ pub async fn handle_connection(
         let computed_crc = crc32fast::hash(&payload);
         if expected_crc != computed_crc {
             let tv = durability_to_tier(header.durability);
-            send_nack(&mut stream, WireNack::BadPayloadCrc, &[]).await?;
+            send_nack(stream.get_mut(), WireNack::BadPayloadCrc, &[]).await?;
             metrics
                 .records_nack
                 .get_or_create(&NackLabel {
@@ -211,7 +222,7 @@ pub async fn handle_connection(
                     .get_or_create(&TierLabel { tier: tv.clone() })
                     .inc();
                 handle_push(
-                    &mut stream,
+                    stream.get_mut(),
                     queue_tx.clone(),
                     header.durability,
                     payload,
@@ -224,12 +235,13 @@ pub async fn handle_connection(
             }
             MessageType::HealthCheck => {
                 stream
+                    .get_mut()
                     .write_all(healthcheck_response_frame_bytes())
                     .await?;
             }
             _ => {
                 debug!(msg_type = ?header.message_type, "unexpected message type from client");
-                send_nack(&mut stream, WireNack::InternalError, &[]).await?;
+                send_nack(stream.get_mut(), WireNack::InternalError, &[]).await?;
                 metrics
                     .records_nack
                     .get_or_create(&NackLabel {
