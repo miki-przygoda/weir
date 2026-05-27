@@ -25,6 +25,7 @@
     - [Per-version history](benchmarks/history.md)
     - [Environments](benchmarks/environments.md)
     - [Batch-tuning sweep](benchmarks/batch-tuning.md)
+    - [Agent count vs cores](benchmarks/agent-count-tuning.md)
 
 # Security
 

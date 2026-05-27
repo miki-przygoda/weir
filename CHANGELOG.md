@@ -12,8 +12,95 @@ changes are tracked separately under **Wire protocol** below.
 
 ## [Unreleased]
 
+### Performance
+
+This release ships a focused optimisation pass on the push hot path.
+Sandbox numbers (4-core; not CI-bare-metal) across 3-trial medians,
+baseline vs after the full series:
+
+| Scenario                | Baseline RPS | After RPS  | Improvement |
+|-------------------------|-------------:|-----------:|:-----------:|
+| single_thread_buffered  |          732 |     ~5,900 | **8.0×**    |
+| single_thread_sync      |          432 |     ~1,150 | **2.7×**    |
+| thundering_herd_8       |        2,091 |     ~2,810 | 1.34×       |
+| thundering_herd_32      |        1,774 |    ~10,790 | **6.1×**    |
+| thundering_herd_64      |        2,643 |    ~19,900 | **7.5×**    |
+
+Sandbox absolute values are lower than the CI bare-metal numbers in
+`docs/benchmarks/latest.md` (which were captured before this work);
+the *relative* multipliers above are the meaningful signal until CI
+republishes on the next merge.
+
+The five commits making up this pass:
+
+- **`perf(connection): try_push fast path + cached Ack/HealthCheck frames`** —
+  `handle_push` used to wrap every successful queue push in
+  `task::spawn_blocking` so the tokio worker wouldn't stall on a
+  potentially-blocking `crossbeam::Sender::send`. But crossbeam's send is
+  wait-free when the partition has capacity (the steady-state case under
+  normal load). Now: try the non-blocking `try_push` first; only fall
+  back to `spawn_blocking + push_timeout` when the partition is genuinely
+  full. Separately, the 20-byte `Ack` frame and `HealthCheckResponse`
+  frame are entirely constant — memoised once via `OnceLock` so the
+  steady-state ack path writes a borrowed `&'static [u8]` instead of
+  allocating + CRC-ing + encoding identical bytes per response.
+- **`perf(wab): group-fsync Sync records within a batch (was per-record)`** —
+  the largest single lever. `flush_batch` used to fsync once per Sync
+  record, which made Sync's per-record contract the bottleneck whenever
+  multiple producers were hitting the same shard. Sync's contract is
+  "fsync before ack" — NOT "fsync syscall per record" — and one fsync at
+  the end of the batch covers every record written during it, so the
+  contract is upheld with up to `batch_size×` fewer fsyncs under
+  concurrent Sync load. Single-producer Sync is unchanged (a serial push
+  pattern keeps batch size = 1 per fsync by construction).
+- **`perf(worker): eager drain + adaptive coalesce window`** — two
+  iterations landed: first a fixed-50 μs window after the wait-free drain
+  (un-bounds single-thread RPS from the batch deadline), then an adaptive
+  variant that predicts whether to wait by remembering whether the
+  previous batch had ≥ 2 records. Bench-validated single_thread_buffered
+  improves ~8×; multi-producer batching stays intact thanks to the
+  prediction (self-correcting — one bad batch flips the predictor back).
+- **`perf(connection): wrap socket reads in BufReader`** — every Push
+  used three `read_exact` syscalls (header, payload, CRC) where the
+  kernel typically buffers the whole frame from a single client
+  `write_all` into one packet. `BufReader` collapses those to one
+  syscall in the common case.
+- **`chore(profile): release profile uses lto = "fat" + codegen-units = 1`** —
+  standard production-release hygiene. Small gain on this codebase
+  (the hot path is syscall-bound, which LTO can't optimise) but
+  defensible for production-released binaries. `panic = "abort"`
+  deliberately NOT enabled — would break the F15 flusher panic
+  supervisor (`catch_unwind` requires unwinding panics).
+
+### Changed
+
+- **`Sync` durability now group-fsyncs at the batch boundary** instead of
+  per-record. The wire contract (ack ⇒ durable) is unchanged: every Sync
+  ack still fires only after a fsync covering that record completes. The
+  observable difference is metric-shaped: under concurrent Sync load,
+  `weir_wab_fsync_duration_seconds_count` increments slower (records per
+  fsync rises from ~1 to up to `batch_size`). Single-producer serial Sync
+  is unaffected — the batch only ever holds one record.
+
 ### Added
 
+- **Startup advisory for `shard_count` / `worker_count` vs core count**
+  (`crates/weir-server/src/main.rs::advise_agent_count`). On boot the
+  daemon compares the configured agent count against
+  `recommended_agent_count(cores) = max(2, cores - 2) / 2` and emits a
+  `WARN` (if oversubscribed by 2×+) or `INFO` (if under-utilising by 4×+
+  on a host with ≥ 4 recommended agents). Advisory only — daemon starts
+  normally regardless; operator config wins. Empirical basis is a sweep
+  in `tests/load.rs::sweep_agent_count_vs_throughput` (ignored by
+  default, run with `--ignored`): on a 4-core sandbox the
+  Sync-herd-64 peak sits at `agent_count = 1`, **14% above** the current
+  bench-preset default of 4. Two compounding effects: ~2 OS threads per
+  agent compete with the tokio runtime once `agent_count ≥ cores`, and
+  fewer shards mean each flusher sees more concurrent producers per
+  group-fsync (records_per_fsync went from ~7 at 4 agents to ~60 at 1
+  agent in the investigation trace). Heuristic validated at 4 cores;
+  extrapolates linearly but unproven at higher core counts — labelled
+  honestly in the advisory's source comment.
 - **`weir-testkit` crate** (`crates/weir-testkit/`, `publish = false`). New
   workspace member that consolidates the test harness previously duplicated
   across `tests/system.rs` and `tests/load.rs`. Exposes a `WeirServer` handle

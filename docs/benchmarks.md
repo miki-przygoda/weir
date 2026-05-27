@@ -14,10 +14,19 @@ throughput ceiling.
 | [latest.md](benchmarks/latest.md) | Full results from the most recent CI run — throughput comparison, per-tier latency tables, saturation ramp |
 | [history.md](benchmarks/history.md) | One row per CI run on `main` — headline Sync RPS, Sync p99, Buffered p50, and ramp peak over time |
 | [environments.md](benchmarks/environments.md) | How CI and local numbers differ, what is safe to compare across environments, and how to run the suite locally |
+| [batch-tuning.md](benchmarks/batch-tuning.md) | `batch_size` × `batch_deadline_ms` sweep informing the current defaults |
+| [agent-count-tuning.md](benchmarks/agent-count-tuning.md) | `shard_count` / `worker_count` sweep informing the startup advisory; cores-vs-agents heuristic |
 
 ---
 
 ## Headline numbers (latest CI run)
+
+> **⚠ Pre-perf-pass.** Numbers below are from 2026-05-25, before the
+> 2026-05-27 optimisation pass. See [latest.md][l] for the indicative
+> post-perf-pass sandbox numbers and the pending CI refresh. Until CI
+> reruns, treat these as a lower bound.
+>
+> [l]: benchmarks/latest.md
 
 > See [latest.md](benchmarks/latest.md) for the full tables and
 > [history.md](benchmarks/history.md) for the trend over time.

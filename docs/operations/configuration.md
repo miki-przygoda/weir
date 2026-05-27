@@ -144,6 +144,12 @@ do not increase fsync throughput — they fight for the same disk queue.
 On NVMe with high parallel write depth, 2–4 shards may improve aggregate
 throughput. Default `1` is correct for most deployments.
 
+The daemon emits a startup advisory if `shard_count` / `worker_count`
+looks unusual for the host's core count. See
+[Agent count vs cores](../benchmarks/agent-count-tuning.md) for the
+empirical sweep and the heuristic the advisory is based on; the rule
+of thumb is `max(2, cores - 2) / 2`.
+
 ---
 
 #### `worker_count`
