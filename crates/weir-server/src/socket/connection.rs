@@ -77,11 +77,29 @@ pub async fn handle_connection(
     queue_tx: QueueSender<WorkUnit>,
     config: ConnectionConfig,
     metrics: Arc<Metrics>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     loop {
+        // ── Shutdown check ──────────────────────────────────────────────────
+        // If the daemon is shutting down, exit cleanly between frames so the
+        // connection task drops its semaphore permit and the JoinSet drain
+        // can complete. Doing the check HERE (not mid-await) means the
+        // current frame, if any, has already been acked or nacked.
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
         // ── 1. Read header ───────────────────────────────────────────────────
         let mut header_buf = [0u8; HEADER_LEN];
-        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut header_buf)).await {
+        let read_result = tokio::select! {
+            biased;
+            res = tokio::time::timeout(config.read_timeout, stream.read_exact(&mut header_buf)) => res,
+            // Shutdown fires → exit immediately so an idle connection does
+            // not wait out read_timeout. The header has not been consumed
+            // yet so there's no in-flight request to ack/nack.
+            _ = shutdown_rx.changed() => return Ok(()),
+        };
+        match read_result {
             Ok(Ok(_)) => {}
             Ok(Err(e))
                 if e.kind() == io::ErrorKind::UnexpectedEof
@@ -383,6 +401,18 @@ mod tests {
         }
     }
 
+    /// Watch receiver wired to a sender that's leaked into a static so the
+    /// receiver never sees a `changed()` event. Tests that don't exercise
+    /// shutdown pass this; the value is permanently `false`.
+    fn never_shutdown_rx() -> tokio::sync::watch::Receiver<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        // Leak the sender so the channel can't be closed (a closed sender
+        // would cause shutdown_rx.changed() to return Err — also a valid
+        // exit signal — which we don't want in tests).
+        Box::leak(Box::new(tx));
+        rx
+    }
+
     /// Spawns a connection handler with a queue that immediately acks every WorkUnit.
     /// Returns the client-side stream.
     async fn spawn_handler(cfg: ConnectionConfig) -> UnixStream {
@@ -400,7 +430,7 @@ mod tests {
             }
         });
 
-        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
         client
     }
 
@@ -610,7 +640,7 @@ mod tests {
             }
         });
 
-        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
 
         let mut client = client;
         let t0 = std::time::Instant::now();
@@ -644,7 +674,7 @@ mod tests {
         let cfg = test_cfg();
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
-        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
 
         let mut client = client;
         client.write_all(&push_frame(b"data")).await.unwrap();
@@ -673,7 +703,7 @@ mod tests {
         let metrics_for_check = std::sync::Arc::clone(&metrics);
 
         let start = std::time::Instant::now();
-        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
 
         // The handler should return Ok within ~150ms+buffer once the
         // read times out. We give it 1s of margin.
@@ -725,7 +755,7 @@ mod tests {
 
         // Send a header advertising a 1024-byte payload, then send NOTHING.
         let header = Header::new(MessageType::Push, Durability::Sync, 0, 1024).encode();
-        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
         client.write_all(&header).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(1), handle)

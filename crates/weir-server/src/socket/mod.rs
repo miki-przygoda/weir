@@ -103,6 +103,12 @@ pub async fn run(
     let sem = std::sync::Arc::new(Semaphore::new(config.max_connections));
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown_rx);
+
+    // Broadcasts shutdown to every in-flight handler so they can exit
+    // cleanly between frames instead of being abort_all'd mid-await. Sender
+    // stays here; each spawned handler clones the receiver. When shutdown
+    // fires we send true; handlers see it on their next read-loop iteration.
+    let (handler_shutdown_tx, handler_shutdown_rx) = tokio::sync::watch::channel(false);
     // Round-robin connection counter for shard_id assignment. Wraps via
     // modulo at each use; the counter itself can grow without bound for
     // ~600 years of acceptances at 1M/s, so no overflow handling needed.
@@ -172,9 +178,10 @@ pub async fn run(
                         let n = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         cfg.shard_id = (n % shard_count) as u32;
                         let m = std::sync::Arc::clone(&metrics);
+                        let handler_shutdown = handler_shutdown_rx.clone();
                         join_set.spawn(async move {
                             let _permit = permit;
-                            if let Err(e) = handle_connection(stream, tx, cfg, m).await
+                            if let Err(e) = handle_connection(stream, tx, cfg, m, handler_shutdown).await
                                 && e.kind() != io::ErrorKind::UnexpectedEof
                                 && e.kind() != io::ErrorKind::ConnectionReset
                                 && e.kind() != io::ErrorKind::BrokenPipe
@@ -192,7 +199,18 @@ pub async fn run(
         }
     }
 
-    // Drain in-flight connections within the configured timeout.
+    // Broadcast shutdown to every in-flight handler so they exit at the
+    // top of their next read-loop iteration (after acking any push they
+    // were processing). Doing this BEFORE the drain timeout means most
+    // handlers complete naturally; abort_all becomes the emergency fallback.
+    let _ = handler_shutdown_tx.send(true);
+
+    // Drain in-flight connections within the configured timeout. With
+    // handler_shutdown signalling, idle handlers exit immediately on the
+    // next loop check; active handlers exit after their current push
+    // completes (ack/nack capped by ACK_TIMEOUT). The timeout should be
+    // >= ACK_TIMEOUT + buffer so legitimate in-flight work completes
+    // before abort_all is reached.
     let timeout = Duration::from_secs(config.shutdown_timeout_secs);
     match time::timeout(timeout, drain_join_set(&mut join_set)).await {
         Ok(()) => {
@@ -202,8 +220,12 @@ pub async fn run(
             error!(
                 remaining = join_set.len(),
                 timeout_secs = config.shutdown_timeout_secs,
-                "socket manager: shutdown timeout reached; aborting remaining connections"
+                "socket manager: shutdown timeout reached; aborting remaining connections \
+                 — producers of those records may see no ack/nack response"
             );
+            metrics
+                .connections_aborted_at_shutdown
+                .inc_by(join_set.len() as u64);
             join_set.abort_all();
         }
     }
@@ -872,6 +894,48 @@ mod tests {
     }
 
     // ── Graceful shutdown ─────────────────────────────────────────────────────
+
+    /// An idle connection (no in-flight push) must exit quickly when the
+    /// daemon receives a shutdown signal — without waiting out the
+    /// per-connection read_timeout. The handler races stream.read_exact
+    /// against shutdown_rx.changed(); when shutdown fires the read side of
+    /// the select wins immediately. Without that race, idle connections
+    /// would sit in read_exact until read_timeout (30s default), and
+    /// shutdown would have to abort_all them.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn idle_connection_exits_promptly_on_shutdown() {
+        let path = tmp_socket_path("shutdown_idle");
+        let mut cfg = default_config(path.clone());
+        cfg.connection_read_timeout_secs = 30; // long, to prove the race wins
+        cfg.shutdown_timeout_secs = 2;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let _rx = queue_rx.get(0); // keep receiver alive
+
+        let run_handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Open an idle connection — never send any bytes.
+        let _conn = UnixStream::connect(&path).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let t0 = Instant::now();
+        shutdown_tx.send(()).unwrap();
+        time::timeout(Duration::from_millis(500), run_handle)
+            .await
+            .expect("run() should complete well before read_timeout")
+            .expect("task should not panic")
+            .expect("run() should return Ok");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "idle connection delayed shutdown: {elapsed:?} \
+             (read_timeout is 30s; shutdown must NOT wait that out)"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 
     #[tokio::test]
     #[cfg(unix)]

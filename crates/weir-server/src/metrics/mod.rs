@@ -132,6 +132,13 @@ pub(crate) struct Metrics {
     /// healthy deployment; non-zero suggests an attempted bypass of the
     /// socket file's mode bits or a misconfigured producer.
     pub connection_rejected_peer_uid: Counter<u64, AtomicU64>,
+    /// Counts in-flight connections that were force-aborted because they
+    /// didn't drain within `shutdown_timeout_secs`. Each aborted connection
+    /// may correspond to a push whose record was written to the WAB but
+    /// whose producer never received an ack/nack — at-least-once retry
+    /// territory. Non-zero values mean shutdown_timeout_secs is too tight
+    /// for the deployment's tail latency.
+    pub connections_aborted_at_shutdown: Counter<u64, AtomicU64>,
     /// Counts pushes that were nacked because the WAB ack channel did not
     /// fire within `ACK_TIMEOUT`. Triggered by a wedged flusher (stuck on
     /// a slow fsync, lock contention, etc.) — not by a normal slow disk.
@@ -233,6 +240,14 @@ impl Metrics {
             "Connections refused by the peer-credential check (peer uid != daemon uid, \
              or credential lookup failed). Any non-zero value suggests an attempted \
              bypass of the socket file's 0o600 mode or a misconfigured producer."
+        );
+        let connections_aborted_at_shutdown = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_connections_aborted_at_shutdown",
+            "Connections force-aborted at shutdown because they didn't drain within \
+             shutdown_timeout_secs. Each may correspond to a push whose record was \
+             written to the WAB but whose producer never received an ack/nack. \
+             Increase shutdown_timeout_secs if this is non-zero on graceful shutdown."
         );
         let ack_timeout = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -341,6 +356,7 @@ impl Metrics {
             accept_latency,
             connection_idle_timeout,
             connection_rejected_peer_uid,
+            connections_aborted_at_shutdown,
             ack_timeout,
             wab_segments,
             wab_bytes_on_disk,
