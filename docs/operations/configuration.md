@@ -225,6 +225,34 @@ the timer cost itself. See
 
 ---
 
+#### `wab_segment_max_bytes`
+
+- **Type**: u64 (bytes)
+- **Default**: `268435456` (256 MiB)
+- **Range**: 4096 – 4294967296 (4 KiB – 4 GiB)
+- **CLI**: `--wab-segment-max-bytes <n>`
+- **Env**: `WEIR_WAB_SEGMENT_MAX_BYTES`
+- **TOML**: `wab_segment_max_bytes`
+
+The size threshold at which the WAB flusher seals the active segment
+and opens a fresh one. The sealed segment is forwarded to the drain
+for sink commit; until a segment seals, its records are durable on
+disk but invisible to the sink.
+
+**Effect**: smaller values trigger more frequent drain → sink activity
+and faster failure isolation (a corrupt segment only affects records
+in that window); larger values reduce the per-rotation overhead and
+batch more records into each `Sink::commit` call. The 256 MiB default
+balances both for production workloads.
+
+**When to tune**: lower for storage-constrained deployments (e.g.
+embedded boxes with ≤ 1 GiB available for WAB), or in tests that
+need to demonstrate sink-side behaviour without pushing 256 MiB of
+data. Higher if you have spare disk and want to amortise the seal
+cost over more records.
+
+---
+
 ### Connection limits
 
 #### `max_connections`
@@ -425,42 +453,43 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ### Sink selection
 
-Weir ships with two built-in sinks. The `noop` sink is the default; the
-`http` sink POSTs each record to a configurable URL with transient /
-permanent error classification.
+Weir ships with three built-in sinks:
+
+| `sink_type` | What it does | When to use |
+|------------|--------------|------|
+| `"noop"` | accepts every record, forwards nothing | soak-testing the daemon pipeline; integration tests |
+| `"http"` | POSTs each record to `sink_url`; one round-trip per record | endpoints that already accept POST bodies |
+| `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 
 #### `sink_type`
 
-- **Type**: string (`"noop"` or `"http"`)
+- **Type**: string (`"noop"`, `"http"`, or `"mysql"`)
 - **Default**: `"noop"`
 - **CLI**: `--sink-type <value>`
 - **Env**: `WEIR_SINK_TYPE`
 - **TOML**: `sink_type`
 
-Which built-in sink to run.
-
-- `"noop"` — accepts every record, forwards nothing. Use for soak-testing
-  the daemon pipeline without a downstream, or as a known-good sink in
-  integration tests.
-- `"http"` — POSTs records to `sink_url`. See classification rules below.
-
-**When to change**: set to `"http"` once a real downstream is available;
-leave at `"noop"` until then.
+**When to change**: set to `"http"` or `"mysql"` once a real downstream
+is available; leave at `"noop"` until then.
 
 ---
 
 #### `sink_url`
 
 - **Type**: URL string
-- **Default**: none (required when `sink_type = "http"`)
+- **Default**: none (required when `sink_type` is `"http"` or `"mysql"`)
 - **Validation**: parsed at startup; invalid URLs fail fast.
 - **CLI**: `--sink-url <url>`
 - **Env**: `WEIR_SINK_URL`
 - **TOML**: `sink_url`
 
-The HTTP endpoint that receives one POST per record. The body is the raw
-payload bytes; `Content-Type` is `application/octet-stream`. The endpoint
-is expected to return:
+For `sink_type = "http"`: the endpoint that receives one POST per
+record. For `sink_type = "mysql"`: the `mysql://user:password@host:port/db`
+connection URL — **set this via `WEIR_SINK_URL`, not the TOML file**, so
+credentials never land on disk.
+
+For HTTP, the body is the raw payload bytes; `Content-Type` is
+`application/octet-stream`. The endpoint is expected to return:
 
 - **2xx** for accepted records → committed
 - **4xx (except 408, 429)** for rejected records → dead-lettered
@@ -572,6 +601,94 @@ Containers should source the token from a secrets manager (Kubernetes
 
 The token is also redacted from `HttpSinkConfig`'s `Debug` impl so it
 never reaches a log line via accidental `?config` interpolation.
+
+---
+
+### MySQL sink
+
+The MySQL sink writes a whole batch with one multi-row `INSERT` statement.
+This is the IOPS-compression sink: N records pushed into the daemon
+become one prepared statement on one server-side commit.
+
+**Schema contract**: the sink does not auto-create the target table.
+Provision it before pointing weir at the database. The minimal table:
+
+```sql
+CREATE TABLE weir_records (
+  id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  payload VARBINARY(16384) NOT NULL,
+  ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_payload (payload(255))
+);
+```
+
+The `UNIQUE` constraint pairs with the default `sink_mysql_insert_mode =
+"ignore"`: at-least-once retries that re-insert a payload are silently
+dropped by the server, no consumer-side dedup required.
+
+#### `sink_mysql_table`
+
+- **Type**: identifier (`[A-Za-z_][A-Za-z0-9_]{0,63}`)
+- **Default**: `"weir_records"`
+- **CLI**: `--sink-mysql-table <name>`
+- **Env**: `WEIR_SINK_MYSQL_TABLE`
+- **TOML**: `sink_mysql_table`
+
+Target table for the multi-row INSERT. Validated at startup; characters
+outside the allowed identifier set fail fast (the sink does not escape
+identifiers — it validates them, which is a strict subset of MySQL's
+backtick-quoted form and leaves zero SQL-injection surface).
+
+#### `sink_mysql_column`
+
+- **Type**: identifier (same rules as `sink_mysql_table`)
+- **Default**: `"payload"`
+- **CLI**: `--sink-mysql-column <name>`
+- **Env**: `WEIR_SINK_MYSQL_COLUMN`
+- **TOML**: `sink_mysql_column`
+
+Column that receives the payload bytes. Must be a `VARBINARY` or `BLOB`
+column wide enough to hold the largest payload weir accepts (capped
+elsewhere by `max_payload_bytes`).
+
+#### `sink_mysql_insert_mode`
+
+- **Type**: string (`"ignore"` or `"plain"`)
+- **Default**: `"ignore"`
+- **CLI**: `--sink-mysql-insert-mode <mode>`
+- **Env**: `WEIR_SINK_MYSQL_INSERT_MODE`
+- **TOML**: `sink_mysql_insert_mode`
+
+How to phrase the INSERT statement.
+
+- `"ignore"` → `INSERT IGNORE INTO ...`. Duplicate-key errors are
+  silently dropped by the server. The recommended default: pair with a
+  `UNIQUE` constraint on the payload (or a hash of it) so crash-recovery
+  retries are idempotent without consumer-side dedup.
+- `"plain"` → `INSERT INTO ...`. Duplicates surface as `ER_DUP_ENTRY`
+  (code 1062) and are classified as transient — the drain retries the
+  segment. Use only if duplicate rows in the target table are tolerable.
+
+#### Error classification
+
+| MySQL error | Classification | What weir does |
+|------------|----------------|----------------|
+| connection / pool / IO failures | transient | retry the segment |
+| 1205 `ER_LOCK_WAIT_TIMEOUT` | transient | retry |
+| 1213 `ER_LOCK_DEADLOCK` | transient | retry |
+| 1290 `ER_OPTION_PREVENTS_STATEMENT` (e.g. `--read-only`) | transient | retry |
+| 1317 `ER_QUERY_INTERRUPTED` | transient | retry |
+| 1062 `ER_DUP_ENTRY` (Plain mode only) | transient | retry |
+| 1064 `ER_PARSE_ERROR`, 1146 `ER_NO_SUCH_TABLE`, 1054 `ER_BAD_FIELD_ERROR`, 1045/1044 access denied | permanent | dead-letter the batch with the server-supplied message |
+| anything else | permanent | dead-letter the batch |
+
+#### Credentials and TLS
+
+The MySQL URL contains credentials. **Always** supply it via
+`WEIR_SINK_URL` rather than the TOML file. The `MySqlSinkConfig` Debug
+impl redacts the password before logging, but a TOML file on disk has
+no such protection. weir uses rustls — no system OpenSSL dependency —
+so TLS to a managed database "just works" with `mysql+tls://...` URLs.
 
 ---
 

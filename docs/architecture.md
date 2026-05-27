@@ -108,6 +108,20 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - `SinkRecord` trait decouples the drain's `Payload` bytes from the sink's own record type; pass-through implementation (`impl SinkRecord for Payload`) is provided.
 - `SinkHealth` (`Healthy / Degraded / Down`) is surfaced via the `weir_sink_health` gauge; queried per-segment by the drain and on a 30 s wall-clock interval so the gauge stays current during idle deployment and `BlockedDeadLetterFull`. Degraded / Down states log the sink-supplied reason at `warn` / `error`.
 
+**Built-in sinks** (`sink_type` config value):
+
+| `sink_type` | Module | Records per `commit()` | Use |
+|------------|--------|--------------------|-----|
+| `noop` | `sink::noop::NoopSink` | accepts all, forwards nothing | soak-testing the daemon pipeline |
+| `http` | `sink::http::HttpSink` | one HTTP POST **per record** | endpoints that already accept POST bodies |
+| `mysql` | `sink::mysql::MySqlSink` | one multi-row `INSERT` **per batch** | the IOPS-compression downstream |
+
+The `mysql` sink is the one that delivers on the headline claim: N
+records push → 1 INSERT statement → 1 server-side commit. The
+compression ratio is surfaced by the `compression_ratio_records_per_commit`
+load-suite scenario and is observable in production via
+`weir_sink_commit_records_total / weir_sink_commit_duration_seconds_count`.
+
 ### Drain (`src/drain/`)
 
 Reads sealed segments via `SegmentReader`, forwards records to the sink in sub-batches respecting `Sink::max_batch_size()`, writes `.confirmed` sidecars, and deletes sealed segments after confirmation.

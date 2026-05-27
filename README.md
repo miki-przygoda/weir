@@ -10,11 +10,13 @@ user-implemented `Sink`. WAB segments are not reclaimed until the sink
 confirms the batch. On restart, any unconfirmed segments are replayed
 automatically.
 
-> **Status — pre-v1.** Pipeline, security hardening, and the first
-> real sink (HTTP) are complete. Two built-in sinks: `noop` for
-> soak-testing and `http` for production use (POST per record,
-> transient/permanent classification). Wire protocol and WAB on-disk
-> format are versioned and stable. **Not yet on crates.io.**
+> **Status — pre-v1.** Pipeline, security hardening, and two real
+> sinks complete. Three built-in sinks: `noop` for soak-testing,
+> `http` (POST per record, transient/permanent classification), and
+> `mysql` (one multi-row `INSERT` per batch — the IOPS-compression
+> sink: N records → 1 statement → 1 server-side commit). Wire
+> protocol and WAB on-disk format are versioned and stable.
+> **Not yet on crates.io.**
 
 ## Quickstart
 

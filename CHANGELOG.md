@@ -10,6 +10,96 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`MySqlSink` — first IOPS-compression sink**
+  (`crates/weir-server/src/sink/mysql.rs`). Writes a whole batch with one
+  multi-row `INSERT` statement: N records → 1 prepared statement → 1
+  server-side commit. This is the headline claim weir was extracted to
+  deliver; `HttpSink` (one POST per record) was a stepping stone, not the
+  destination. Features:
+  - `INSERT IGNORE` by default so at-least-once retries are idempotent
+    against a `UNIQUE`-constrained target table; opt out via
+    `sink_mysql_insert_mode = "plain"`.
+  - Connection URL read from env (`WEIR_SINK_URL`), redacted from `Debug`,
+    never sourced from the TOML file. rustls-only TLS (no system OpenSSL).
+  - Table/column identifiers validated to
+    `[A-Za-z_][A-Za-z0-9_]{0,63}` at build time — single source of truth,
+    zero SQL-injection surface via configuration.
+  - Conservative transient/permanent classification (1205/1213/1290/1317
+    transient; 1062 transient in `plain` mode only; everything else
+    permanent and dead-lettered with the server-supplied message).
+  - Per-query timeout, surfaced as its own `MySqlSinkError::Timeout`
+    variant so the drain can distinguish "endpoint slow" from "endpoint
+    broken".
+  - 17 unit tests + an `#[ignore]`'d `mysql_sink_end_to_end` system test
+    gated on `WEIR_TEST_MYSQL_URL` (docker-compose recipe in the test
+    docstring).
+  - Dep cost: `mysql_async 0.34` with `default-features = false +
+    ["minimal-rust", "rustls-tls"]`.
+- **`compression_ratio_records_per_commit` load-suite scenario**
+  (`crates/weir-server/tests/load.rs`). Configures the daemon so segments
+  seal under bench load, pushes 5000 records, polls Prometheus until the
+  committed counter plateaus, and emits a single BENCH line with the
+  literal ratio. Asserts ≥ 10× compression (observed locally: 249×).
+- **`wab_segment_max_bytes` config knob**. The WAB segment rotation
+  threshold is now configurable end-to-end (CLI / env / TOML); default
+  remains 256 MiB. Range 4 KiB – 4 GiB. Required for the compression
+  scenario to demonstrate the ratio at bench scale; useful in production
+  for storage-constrained deployments and high-volume deployments that
+  want to amortise the seal cost over more records.
+- **Configuration reference now documents three sinks** (`noop` / `http` /
+  `mysql`), with a comparison table, MySQL-specific subsection including
+  the recommended schema, error-classification table, and credential
+  guidance.
+- **System test suite audited** (`docs/testing/test-audit.md`). Per-test
+  analysis of all 41 system tests against the "what regression does this
+  prevent?" question. Verdicts: KEEP 25 / STRENGTHEN 10 / DELETE 3 /
+  RENAME 2 / REWRITE 1.
+
+### Changed
+
+- **System test suite refactored from audit findings**: 3 theatre tests
+  deleted (`health_check_on_separate_connection_from_push`,
+  `wab_segment_rotation_creates_multiple_segments`,
+  `stale_socket_removed_automatically_on_restart`); 2 renamed
+  (`binary_payload_round_trips` →
+  `arbitrary_binary_payload_accepted`,
+  `disk_full_returns_nack_not_crash` →
+  `efbig_returns_nack_not_crash`); 1 split into two strict-assertion
+  tests (`metrics_consistent_across_crash_restart` →
+  `metrics_internally_consistent_per_session` +
+  `metrics_reset_to_zero_after_restart`).
+- **`readonly_wab_dir_prevents_startup` is now harness-portable**: spawns
+  the child with `setuid(65534)` when the test runner is root so the
+  `chmod 0o000` it asserts on actually bites. Was silently broken in
+  rootful containers.
+
+### Added (tests)
+
+- **`recovery_replays_records_after_crash`**: closes the audit gap that
+  `weir_recovery_records_replayed_total` was registered but never
+  asserted by any test.
+- **`enospc_returns_nack_not_crash`** (`#[ignore]`'d, requires
+  `WEIR_TEST_ENOSPC_DIR` pointing at a small pre-mounted tmpfs): the
+  production-shaped variant of the EFBIG test; setup recipe in the
+  docstring.
+
+### Infrastructure
+
+- **`docs/benchmarks/bare-metal.md` scaffold** plus
+  **`deploy/run_bare_metal_bench.sh`** — script captures CPU / kernel /
+  filesystem / device / governor / SMT / turbo / dirty-page state and
+  runs the load suite 5× at each of two batch deadlines, producing a
+  self-contained markdown doc on stdout. Regression policy now split
+  explicitly between CI (order-of-magnitude floor) and bare-metal
+  (ship gate: 10% RPS / 20% p99 / any saturation level loss).
+  Documented in `docs/benchmarks/environments.md`.
+
+---
+
 ## [0.4.0] - 2026-05-26
 
 ### Added
