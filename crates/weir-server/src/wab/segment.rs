@@ -29,6 +29,14 @@ pub struct WabSegment {
     data_bytes: u64,
     /// CRC32 accumulator over all file bytes written before the sentinel.
     file_crc_hasher: CrcHasher,
+    /// Set when a `write_record` call returned an error after partially writing
+    /// to the underlying file. The OS file offset has advanced past stray bytes
+    /// that the in-memory `bytes_written` / `file_crc_hasher` accounting did not
+    /// see, so any further writes to this segment would interleave good records
+    /// with the unaccounted garbage and produce a CRC mismatch at drain time.
+    /// Once set, `write_record` refuses further writes; the caller (`ShardWriter`)
+    /// drops the segment and opens a fresh one.
+    poisoned: bool,
 }
 
 impl WabSegment {
@@ -63,6 +71,7 @@ impl WabSegment {
             record_count: 0,
             data_bytes: 0,
             file_crc_hasher: hasher,
+            poisoned: false,
         };
 
         seg.file.write_all(&header)?;
@@ -76,6 +85,11 @@ impl WabSegment {
     /// Uses checked arithmetic throughout: a panic here means the segment has grown
     /// beyond addressable bounds, which is unrecoverable.
     pub fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "segment is poisoned by a previous partial write",
+            ));
+        }
         let payload_len = u32::try_from(payload.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -104,9 +118,19 @@ impl WabSegment {
         let len_bytes = payload_len.to_le_bytes();
         let crc_bytes = crc32.to_le_bytes();
 
-        self.file.write_all(&len_bytes)?;
-        self.file.write_all(&crc_bytes)?;
-        self.file.write_all(payload)?;
+        // The three write_alls form one atomic logical record. If any one
+        // fails after another has written bytes, the OS file offset has
+        // advanced past stray bytes that the in-memory accounting below
+        // won't see — poison the segment so subsequent writes are refused.
+        if let Err(e) = self
+            .file
+            .write_all(&len_bytes)
+            .and_then(|_| self.file.write_all(&crc_bytes))
+            .and_then(|_| self.file.write_all(payload))
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
 
         self.file_crc_hasher.update(&len_bytes);
         self.file_crc_hasher.update(&crc_bytes);
@@ -262,11 +286,29 @@ impl ShardWriter {
     /// Returns `Some(sealed_path)` if the write caused the segment to hit the rotation
     /// threshold and be sealed. The caller is responsible for sending the sealed path
     /// to the drain channel.
+    ///
+    /// On write error, drops the active segment so the next call opens a fresh one.
+    /// The orphaned file is left on disk; crash recovery seals it and the drain
+    /// reader stops at the first invalid record — records written successfully
+    /// before the failure remain drainable.
     pub fn write_record(&mut self, payload: &[u8]) -> io::Result<Option<PathBuf>> {
         self.ensure_open()?;
-        let seg = self.active.as_mut().expect("ensure_open guarantees Some");
-        seg.write_record(payload)?;
-        if seg.should_rotate(self.segment_max_bytes) {
+        if let Err(e) = self
+            .active
+            .as_mut()
+            .expect("ensure_open guarantees Some")
+            .write_record(payload)
+        {
+            // The segment is poisoned (or its create() left it half-headered).
+            // Drop it so the next write opens a fresh segment.
+            self.active = None;
+            return Err(e);
+        }
+        let should_rotate = self
+            .active
+            .as_ref()
+            .is_some_and(|s| s.should_rotate(self.segment_max_bytes));
+        if should_rotate {
             let sealed = self.active.take().unwrap().seal()?;
             return Ok(Some(sealed));
         }
@@ -379,6 +421,71 @@ mod tests {
             sealed,
             PathBuf::from("/wab/shard_00/seg_00000001.wab.sealed")
         );
+    }
+
+    #[test]
+    fn poisoned_segment_refuses_subsequent_writes() {
+        // Simulates the post-partial-write state by setting the flag directly
+        // (the real trigger — write_all returning Err mid-record — is hard to
+        // induce deterministically without a tmpfs; see
+        // `tests/system.rs::enospc_returns_nack_not_crash` for the integration
+        // variant).
+        let dir = tmp_dir("poison_refuse");
+        let path = dir.join("seg_00000001.wab");
+        let mut seg = WabSegment::create(&path, 0).unwrap();
+        seg.write_record(b"valid").unwrap();
+        seg.poisoned = true;
+        let err = seg
+            .write_record(b"after-poison")
+            .expect_err("write after poison must fail");
+        assert!(
+            err.to_string().contains("poisoned"),
+            "error message should mention poisoning; got: {err}"
+        );
+        let _ = seg.seal();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn shardwriter_drops_segment_after_write_error() {
+        // After an inner WabSegment returns Err from write_record, ShardWriter
+        // must drop its `active` segment so the next call opens a fresh file
+        // with a new counter — otherwise subsequent writes would interleave
+        // with the stray bytes from the failed write.
+        let dir = tmp_dir("shardwriter_drop");
+        let mut writer = ShardWriter::new(0, dir.clone(), 1024 * 1024);
+        writer.write_record(b"first").unwrap();
+        let active_path_before = writer
+            .active
+            .as_ref()
+            .expect("segment open after first write")
+            .path
+            .clone();
+
+        // Poison the inner segment so the next write_record fails.
+        writer.active.as_mut().unwrap().poisoned = true;
+        writer
+            .write_record(b"poisoned")
+            .expect_err("write to poisoned segment must fail");
+        assert!(
+            writer.active.is_none(),
+            "active segment must be dropped after write error"
+        );
+
+        // The next write opens a fresh segment with a different file path.
+        writer.write_record(b"recovered").unwrap();
+        let active_path_after = writer
+            .active
+            .as_ref()
+            .expect("segment open after recovery")
+            .path
+            .clone();
+        assert_ne!(
+            active_path_before, active_path_after,
+            "recovery must open a new segment file, not reuse the poisoned one"
+        );
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
