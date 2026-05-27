@@ -12,3 +12,20 @@ version = "0.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/miki-przygoda/weir"
+
+# Release-profile tuning for production builds and the load suite.
+# - lto = "fat": cross-crate inlining. Build time ~2-3× slower; runtime
+#   typically 5-15% faster on hot paths (the WAB / drain / socket
+#   pipelines particularly benefit from inlining across crate boundaries).
+# - codegen-units = 1: single LLVM compilation unit per crate. Lets the
+#   optimiser see the entire crate at once. Same build-time/runtime
+#   trade as LTO, complementary effect.
+#
+# panic = "abort" intentionally NOT set: the flusher supervisor
+# (wab/mod.rs::run_with_panic_supervision) relies on `catch_unwind` to
+# observe panics, which requires unwinding panics. With panic = "abort"
+# the process would die on flusher panic instead of bumping the
+# `weir_wab_flusher_panics` metric.
+[profile.release]
+lto = "fat"
+codegen-units = 1
