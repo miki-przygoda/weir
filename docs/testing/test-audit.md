@@ -6,7 +6,6 @@ File audited: `crates/weir-server/tests/system.rs` (1711 lines, 41 `#[test]` fun
 
 - **Total tests:** 41
 - **Verdicts:** KEEP 25 / STRENGTHEN 10 / DELETE 3 / RENAME 2 / REWRITE 1
-- **Environment fragility:** `readonly_wab_dir_prevents_startup` (system.rs:934) fails when the test runner is root because root bypasses `chmod 0o000`. CI runners are non-root so it passes there, but it silently regresses in any rootful container. Worth gating on `nix::unistd::geteuid() != 0` with a `println!("skipped (running as root)")` rather than letting it fail.
 - **Top findings:**
   1. The suite over-tests "happy path acks succeed" (≈10 tests assert nothing more than `push().unwrap()`) and under-tests recovery: `wab_data_preserved_across_crash_restart` only checks that *bytes exist* post-restart, never that recovery actually replayed/sealed them — the `weir_recovery_records_replayed` metric is registered but never asserted by any test in this file.
   2. The four flagged tests are weaker than their names imply. `disk_full_returns_nack_not_crash` tests EFBIG, not ENOSPC; `metrics_consistent_across_crash_restart` does not assert any cross-restart invariant; `server_restarts_after_sigkill` and `wab_data_integrity_after_crash` overlap heavily (the former is a strict subset of the latter once you discount the trivial post-restart push). `stalled_client_does_not_block_other_connections` is the strongest test in the suite — confirmed.
