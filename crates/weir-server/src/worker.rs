@@ -47,6 +47,15 @@ impl Worker {
     }
 
     fn run(mut self, work_rx: Receiver<WorkUnit>, batch_deadline: Duration) {
+        // Coalesce window — after the wait-free drain returns empty, wait
+        // this long for one more record before flushing. Catches concurrent
+        // producers whose acks complete within microseconds of each other
+        // (the "burst arriving with skew" pattern) without paying the full
+        // batch_deadline tax. 50μs is small enough that single-thread RPS
+        // ceiling is ~20k yet large enough to coalesce realistic
+        // multi-producer bursts on a healthy machine.
+        const COALESCE_WINDOW: Duration = Duration::from_micros(50);
+
         loop {
             match work_rx.recv_timeout(batch_deadline) {
                 Ok(unit) => {
@@ -55,6 +64,39 @@ impl Worker {
                     if self.buffers[shard].len() >= self.batch_size {
                         self.flush_shard(shard);
                     }
+                    // Phase 1: wait-free drain of anything immediately in the
+                    // queue. Catches the records that already arrived during
+                    // our recv_timeout wait.
+                    while self.any_buffer_below_batch_size() {
+                        match work_rx.try_recv() {
+                            Ok(unit) => {
+                                let shard = (unit.shard_id as usize) % self.buffers.len();
+                                self.buffers[shard].push(unit);
+                                if self.buffers[shard].len() >= self.batch_size {
+                                    self.flush_shard(shard);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // Phase 2: short coalesce window. Multi-producer bursts
+                    // arrive with skew measured in microseconds — wait
+                    // briefly so we don't flush a half-batch just because the
+                    // wait-free drain happened to race with a producer's
+                    // next push.
+                    while self.any_buffer_below_batch_size() {
+                        match work_rx.recv_timeout(COALESCE_WINDOW) {
+                            Ok(unit) => {
+                                let shard = (unit.shard_id as usize) % self.buffers.len();
+                                self.buffers[shard].push(unit);
+                                if self.buffers[shard].len() >= self.batch_size {
+                                    self.flush_shard(shard);
+                                }
+                            }
+                            Err(_) => break, // window elapsed; flush what we have
+                        }
+                    }
+                    self.flush_all();
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     self.flush_all();
@@ -65,6 +107,14 @@ impl Worker {
                 }
             }
         }
+    }
+
+    /// Returns true if any shard's buffer has room left before hitting
+    /// `batch_size`. Used as the inner-loop drain guard so we never overrun
+    /// the batch-size ceiling — if every buffer is already at the ceiling,
+    /// continuing the drain just wastes a try_recv.
+    fn any_buffer_below_batch_size(&self) -> bool {
+        self.buffers.iter().any(|b| b.len() < self.batch_size)
     }
 
     /// Flushes one shard's buffer. Swaps in a fresh pre-allocated buffer so
