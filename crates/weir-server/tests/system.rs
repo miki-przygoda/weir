@@ -1884,6 +1884,148 @@ fn recovery_replays_records_after_crash() {
     );
 }
 
+// ── MySQL sink integration ────────────────────────────────────────────────────
+
+/// End-to-end check that records pushed to a daemon configured with
+/// `sink_type = "mysql"` arrive in the configured table — and arrive there
+/// as one multi-row INSERT per batch, demonstrating the IOPS-compression
+/// story.
+///
+/// Ignored by default because it requires a running MySQL server reachable
+/// at the URL in `WEIR_TEST_MYSQL_URL`. Setup, e.g. with Docker:
+///
+/// ```sh
+/// docker run --rm -d --name weir-test-mysql \
+///   -e MYSQL_ROOT_PASSWORD=test \
+///   -e MYSQL_DATABASE=weir_test \
+///   -p 3306:3306 mysql:8.0
+/// # Wait ~10s for mysqld to come up.
+/// docker exec weir-test-mysql mysql -ptest weir_test -e "
+///   CREATE TABLE weir_records (
+///     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+///     payload VARBINARY(4096) NOT NULL,
+///     UNIQUE KEY(payload(255))
+///   );"
+/// WEIR_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:3306/weir_test \
+///   cargo test -p weir-server --test system -- --ignored mysql_sink_end_to_end
+/// ```
+#[test]
+#[ignore = "requires WEIR_TEST_MYSQL_URL pointing at a running MySQL with a prepared schema (see docstring)"]
+fn mysql_sink_end_to_end() {
+    use std::os::unix::process::CommandExt;
+
+    const N: u32 = 100;
+
+    let mysql_url = std::env::var("WEIR_TEST_MYSQL_URL").expect(
+        "WEIR_TEST_MYSQL_URL not set — see the test docstring for the docker-compose recipe",
+    );
+
+    // Spawn weir-server with sink_type = mysql, pointing at the live server.
+    let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let metrics_port = free_port();
+    let tmp_dir = std::env::temp_dir().join(format!("weir_sys_mysql_{}", std::process::id()));
+    let wab_dir = tmp_dir.join("wab");
+    let socket_dir = tmp_dir.join("run");
+    let socket_path = socket_dir.join("weir.sock");
+    let config_path = tmp_dir.join("weir.toml");
+    let log_path = tmp_dir.join("weir.log");
+
+    fs::create_dir_all(&wab_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    // sink_type = mysql; URL passed via env so credentials never touch the
+    // config file (production-shaped — see the operations docs).
+    let config = format!(
+        "[server]\n\
+         socket_path           = \"{}\"\n\
+         wab_dir               = \"{}\"\n\
+         metrics_port          = {}\n\
+         shard_count           = 1\n\
+         worker_count          = 2\n\
+         batch_size            = 200\n\
+         batch_deadline_ms     = 5\n\
+         shutdown_timeout_secs = 5\n\
+         sink_type             = \"mysql\"\n\
+         sink_max_batch_size   = 1000\n\
+         sink_mysql_table      = \"weir_records\"\n\
+         sink_mysql_column     = \"payload\"\n\
+         sink_mysql_insert_mode = \"ignore\"\n\
+         log_level             = \"warn\"\n",
+        socket_path.display(),
+        wab_dir.display(),
+        metrics_port,
+    );
+    fs::write(&config_path, config).unwrap();
+
+    let log_file = fs::File::create(&log_path).unwrap();
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+    let mut cmd = Command::new(binary);
+    cmd.args(["--config", config_path.to_str().unwrap()])
+        .env("WEIR_SINK_URL", &mysql_url)
+        .stdout(Stdio::from(log_file.try_clone().unwrap()))
+        .stderr(Stdio::from(log_file));
+    // Make sure pre_exec hooks are not inherited from previous test infrastructure.
+    unsafe {
+        cmd.pre_exec(|| Ok(()));
+    }
+    let child = cmd.spawn().expect("failed to spawn weir-server (mysql)");
+
+    let mut handle = ServerHandle {
+        child: Some(child),
+        socket_path,
+        wab_dir,
+        metrics_port,
+        config_path,
+        tmp_dir,
+        _proc_lock,
+    };
+    handle.wait_ready(Duration::from_secs(15));
+
+    let mut client = handle.client();
+    for i in 0..N {
+        client
+            .push(format!("mysql-rec-{i:05}").as_bytes(), Durability::Sync)
+            .unwrap_or_else(|e| panic!("push {i}: {e}"));
+    }
+    drop(client);
+
+    // Give the drain a moment to drain the sealed segment into MySQL.
+    thread::sleep(Duration::from_secs(2));
+
+    let body = handle.scrape_metrics();
+    let committed = parse_metric(
+        &body,
+        "weir_sink_commit_records_total{outcome=\"committed\"}",
+    );
+    let commit_count = parse_metric(&body, "weir_sink_commit_duration_seconds_count");
+
+    assert!(
+        committed >= u64::from(N),
+        "expected ≥{N} committed records, got {committed}\nmetrics excerpt:\n{}",
+        body.lines()
+            .filter(|l| l.starts_with("weir_sink_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        commit_count > 0,
+        "expected at least one Sink::commit() call to have been recorded"
+    );
+    // The point of MySqlSink: many records per commit. With N=100 and the
+    // drain reading whole sealed segments at once, ratio should be ≥ 10×.
+    // Loose bound so the test isn't flaky on tiny-batch edge cases.
+    let ratio = committed as f64 / commit_count as f64;
+    assert!(
+        ratio >= 10.0,
+        "expected ≥10:1 records-per-commit IOPS compression, got {ratio:.1}:1 \
+         ({committed} records / {commit_count} commits)"
+    );
+}
+
 fn parse_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
         if line.starts_with(prefix)

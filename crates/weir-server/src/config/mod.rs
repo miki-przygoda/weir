@@ -74,6 +74,7 @@ impl std::error::Error for ConfigError {
 pub enum SinkType {
     Noop,
     Http,
+    Mysql,
 }
 
 impl SinkType {
@@ -81,9 +82,34 @@ impl SinkType {
         match s {
             "noop" => Ok(SinkType::Noop),
             "http" => Ok(SinkType::Http),
+            "mysql" => Ok(SinkType::Mysql),
             other => Err(ConfigError::InvalidValue {
                 field: "sink_type",
-                reason: format!("'{other}' is not a valid sink type; expected 'noop' or 'http'"),
+                reason: format!(
+                    "'{other}' is not a valid sink type; expected 'noop', 'http', or 'mysql'"
+                ),
+            }),
+        }
+    }
+}
+
+/// MySQL `INSERT` phrasing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MysqlInsertMode {
+    Ignore,
+    Plain,
+}
+
+impl MysqlInsertMode {
+    fn parse(s: &str) -> Result<Self, ConfigError> {
+        match s {
+            "ignore" => Ok(MysqlInsertMode::Ignore),
+            "plain" => Ok(MysqlInsertMode::Plain),
+            other => Err(ConfigError::InvalidValue {
+                field: "sink_mysql_insert_mode",
+                reason: format!(
+                    "'{other}' is not a valid insert mode; expected 'ignore' or 'plain'"
+                ),
             }),
         }
     }
@@ -109,6 +135,9 @@ pub(crate) struct PartialConfig {
     pub sink_timeout_secs: Option<u64>,
     pub sink_max_batch_size: Option<usize>,
     pub sink_send_idempotency_key: Option<bool>,
+    pub sink_mysql_table: Option<String>,
+    pub sink_mysql_column: Option<String>,
+    pub sink_mysql_insert_mode: Option<String>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
@@ -142,6 +171,9 @@ pub struct Config {
     pub sink_timeout_secs: u64,
     pub sink_max_batch_size: usize,
     pub sink_send_idempotency_key: bool,
+    pub sink_mysql_table: String,
+    pub sink_mysql_column: String,
+    pub sink_mysql_insert_mode: MysqlInsertMode,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -248,10 +280,19 @@ impl Config {
         let sink_type = SinkType::parse(&sink_type_str)?;
 
         let sink_url = merge!(sink_url);
-        if sink_type == SinkType::Http && sink_url.as_deref().unwrap_or("").is_empty() {
+        if matches!(sink_type, SinkType::Http | SinkType::Mysql)
+            && sink_url.as_deref().unwrap_or("").is_empty()
+        {
             return Err(ConfigError::InvalidValue {
                 field: "sink_url",
-                reason: "sink_url must be set when sink_type = \"http\"".into(),
+                reason: format!(
+                    "sink_url must be set when sink_type = {:?}",
+                    match sink_type {
+                        SinkType::Http => "http",
+                        SinkType::Mysql => "mysql",
+                        SinkType::Noop => unreachable!(),
+                    }
+                ),
             });
         }
 
@@ -265,6 +306,16 @@ impl Config {
         // that may have been accepted; the Idempotency-Key header lets the
         // endpoint dedupe without computing the hash itself.
         let sink_send_idempotency_key = merge!(sink_send_idempotency_key).unwrap_or(true);
+
+        // MySQL sink: identifier validation happens inside MySqlSink::new at
+        // startup (strict [A-Za-z_][A-Za-z0-9_]{0,63} rule, single source of
+        // truth so future identifier-policy changes only touch one file).
+        let sink_mysql_table =
+            merge!(sink_mysql_table).unwrap_or_else(|| "weir_records".to_string());
+        let sink_mysql_column = merge!(sink_mysql_column).unwrap_or_else(|| "payload".to_string());
+        let sink_mysql_insert_mode_str =
+            merge!(sink_mysql_insert_mode).unwrap_or_else(|| "ignore".to_string());
+        let sink_mysql_insert_mode = MysqlInsertMode::parse(&sink_mysql_insert_mode_str)?;
 
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
@@ -308,6 +359,9 @@ impl Config {
             sink_timeout_secs,
             sink_max_batch_size,
             sink_send_idempotency_key,
+            sink_mysql_table,
+            sink_mysql_column,
+            sink_mysql_insert_mode,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,
@@ -442,6 +496,9 @@ mod tests {
         assert_eq!(c.sink_timeout_secs, 10);
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
+        assert_eq!(c.sink_mysql_table, "weir_records");
+        assert_eq!(c.sink_mysql_column, "payload");
+        assert_eq!(c.sink_mysql_insert_mode, MysqlInsertMode::Ignore);
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");
@@ -580,6 +637,110 @@ mod tests {
             err.to_string().contains("dead_letter_check_interval_secs"),
             "{err}"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Sink: MySQL ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sink_type_mysql_requires_url() {
+        let dir = tmp_dir("mysql_no_url");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some("mysql".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sink_url"), "{err}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sink_type_mysql_accepts_url() {
+        let dir = tmp_dir("mysql_url");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some("mysql".into()),
+                sink_url: Some("mysql://u:p@host/db".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.sink_type, SinkType::Mysql);
+        assert_eq!(c.sink_mysql_insert_mode, MysqlInsertMode::Ignore);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sink_mysql_insert_mode_parses() {
+        for (input, expected) in [
+            ("ignore", MysqlInsertMode::Ignore),
+            ("plain", MysqlInsertMode::Plain),
+        ] {
+            let dir = tmp_dir(&format!("mysql_mode_{input}"));
+            let c = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    sink_type: Some("mysql".into()),
+                    sink_url: Some("mysql://u:p@h/d".into()),
+                    sink_mysql_insert_mode: Some(input.into()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .unwrap();
+            assert_eq!(c.sink_mysql_insert_mode, expected);
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn sink_mysql_insert_mode_rejects_garbage() {
+        let dir = tmp_dir("mysql_bad_mode");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some("mysql".into()),
+                sink_url: Some("mysql://u:p@h/d".into()),
+                sink_mysql_insert_mode: Some("upsert".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sink_mysql_insert_mode"), "{err}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unknown_sink_type_rejected_with_helpful_message() {
+        let dir = tmp_dir("bad_sink_type");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some("postgres".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sink_type"), "{msg}");
+        // Error should mention all valid options so the operator knows their
+        // recourse without grepping source.
+        assert!(msg.contains("noop"), "{msg}");
+        assert!(msg.contains("http"), "{msg}");
+        assert!(msg.contains("mysql"), "{msg}");
         fs::remove_dir_all(dir).ok();
     }
 

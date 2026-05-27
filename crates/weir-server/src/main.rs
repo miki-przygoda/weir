@@ -13,10 +13,11 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use tracing::info;
 
-use config::{Config, SinkType};
+use config::{Config, MysqlInsertMode, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
 use sink::http::{HttpSink, HttpSinkConfig};
+use sink::mysql::{InsertMode, MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
 use wab::WabRecord;
 
@@ -200,6 +201,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let sink = HttpSink::new(http_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
+            })?;
+            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+        }
+        SinkType::Mysql => {
+            let url = config
+                .sink_url
+                .clone()
+                .expect("config validation guarantees sink_url is set when sink_type = Mysql");
+            let insert_mode = match config.sink_mysql_insert_mode {
+                MysqlInsertMode::Ignore => InsertMode::Ignore,
+                MysqlInsertMode::Plain => InsertMode::Plain,
+            };
+            info!(
+                // URL omitted from the log line — it contains credentials.
+                // The MySqlSink Debug impl redacts the password, but logging
+                // even the user component here gives operators no information
+                // they can't get from `weir-server --help` plus their config.
+                table = %config.sink_mysql_table,
+                column = %config.sink_mysql_column,
+                insert_mode = ?config.sink_mysql_insert_mode,
+                timeout_secs = config.sink_timeout_secs,
+                max_batch_size = config.sink_max_batch_size,
+                "sink: mysql"
+            );
+            let mysql_cfg = MySqlSinkConfig {
+                url,
+                table: config.sink_mysql_table.clone(),
+                column: config.sink_mysql_column.clone(),
+                insert_mode,
+                max_batch_size: config.sink_max_batch_size,
+                timeout: Duration::from_secs(config.sink_timeout_secs),
+            };
+            let sink = MySqlSink::new(mysql_cfg).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("failed to build MySQL sink: {e}"))
             })?;
             drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
         }

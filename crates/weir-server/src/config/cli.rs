@@ -21,11 +21,14 @@ OPTIONS:
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
     --metrics-port <port>                    Prometheus metrics port [default: 9185]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
-    --sink-type <type>                       Sink: noop | http [default: noop]
-    --sink-url <url>                         Sink URL (required if type=http)
+    --sink-type <type>                       Sink: noop | http | mysql [default: noop]
+    --sink-url <url>                         Sink URL (required if type=http or mysql)
     --sink-timeout-secs <secs>               Per-request sink timeout (1-300) [default: 10]
     --sink-max-batch-size <n>                Sink commit batch cap (1-10000) [default: 100]
     --sink-send-idempotency-key <bool>       Send Idempotency-Key header (http) [default: true]
+    --sink-mysql-table <name>                MySQL target table [default: weir_records]
+    --sink-mysql-column <name>               MySQL target column [default: payload]
+    --sink-mysql-insert-mode <mode>          MySQL: ignore | plain [default: ignore]
     --dead-letter-max-bytes <n>              Dead-letter dir size cap [default: 1073741824]
     --dead-letter-check-interval-secs <n>    Blocked-state wake interval (1-3600) [default: 30]
     --log-level <level>                      Log level (trace/debug/info/warn/error) [default: info]
@@ -34,7 +37,9 @@ OPTIONS:
 ENVIRONMENT:
     Every option above can be set via WEIR_<UPPER_SNAKE_NAME>.
     WEIR_SINK_BEARER_TOKEN is env-only (never sourced from --sink-* flags
-    or the config file).
+    or the config file). For sink_type = \"mysql\", set the URL — which
+    contains credentials — via WEIR_SINK_URL rather than the TOML file
+    so secrets never land on disk.
 ";
 
 pub(super) fn parse() -> Result<(PartialConfig, PathBuf), ConfigError> {
@@ -94,6 +99,15 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         sink_send_idempotency_key: pargs
             .opt_value_from_str("--sink-send-idempotency-key")
+            .map_err(pico_err)?,
+        sink_mysql_table: pargs
+            .opt_value_from_str("--sink-mysql-table")
+            .map_err(pico_err)?,
+        sink_mysql_column: pargs
+            .opt_value_from_str("--sink-mysql-column")
+            .map_err(pico_err)?,
+        sink_mysql_insert_mode: pargs
+            .opt_value_from_str("--sink-mysql-insert-mode")
             .map_err(pico_err)?,
         dead_letter_max_bytes: pargs
             .opt_value_from_str("--dead-letter-max-bytes")
