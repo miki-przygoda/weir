@@ -64,6 +64,14 @@ impl WeirClient {
         Ok(Self { stream })
     }
 
+    /// Wraps an already-connected [`UnixStream`]. Useful for callers that
+    /// manage their own connection setup (systemd socket activation,
+    /// pre-authenticated file descriptors passed from a parent process,
+    /// `UnixStream::pair`-based test harnesses).
+    pub fn from_stream(stream: UnixStream) -> Self {
+        Self { stream }
+    }
+
     /// Pushes `payload` to the daemon with the given `durability` tier.
     ///
     /// Blocks until the daemon replies. On `Ack` the record is durably stored
