@@ -10,8 +10,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use crc32fast::Hasher as CrcHasher;
 
 use super::format::{
-    EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, SEGMENT_MAX_BYTES, build_segment_footer,
-    build_segment_header, build_sentinel, unix_nanos_now,
+    EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, build_segment_footer, build_segment_header,
+    build_sentinel, unix_nanos_now,
 };
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
@@ -142,9 +142,11 @@ impl WabSegment {
         platform_fsync(&self.file)
     }
 
-    /// Returns true if the segment has reached or exceeded `SEGMENT_MAX_BYTES`.
-    pub fn should_rotate(&self) -> bool {
-        self.bytes_written >= SEGMENT_MAX_BYTES
+    /// Returns true if the segment has reached or exceeded the configured
+    /// rotation threshold. The threshold is owned by `ShardWriter` so a single
+    /// `WabSegment` instance can be reused under different policies (e.g. tests).
+    pub fn should_rotate(&self, max_bytes: u64) -> bool {
+        self.bytes_written >= max_bytes
     }
 
     #[allow(dead_code)]
@@ -218,15 +220,19 @@ pub struct ShardWriter {
     shard_dir: PathBuf,
     /// Counter used to name the next segment file (incremented on each rotation).
     next_counter: u64,
+    /// Bytes threshold at which the active segment is sealed and rotated.
+    /// Set via `WabConfig::segment_max_bytes` at flusher-thread spawn time.
+    segment_max_bytes: u64,
     active: Option<WabSegment>,
 }
 
 impl ShardWriter {
-    pub fn new(shard_id: u16, shard_dir: PathBuf) -> Self {
+    pub fn new(shard_id: u16, shard_dir: PathBuf, segment_max_bytes: u64) -> Self {
         ShardWriter {
             shard_id,
             shard_dir,
             next_counter: 1,
+            segment_max_bytes,
             active: None,
         }
     }
@@ -260,7 +266,7 @@ impl ShardWriter {
         self.ensure_open()?;
         let seg = self.active.as_mut().expect("ensure_open guarantees Some");
         seg.write_record(payload)?;
-        if seg.should_rotate() {
+        if seg.should_rotate(self.segment_max_bytes) {
             let sealed = self.active.take().unwrap().seal()?;
             return Ok(Some(sealed));
         }
@@ -353,13 +359,14 @@ mod tests {
 
     #[test]
     fn wab_segment_should_rotate_at_threshold() {
+        const TEST_THRESHOLD: u64 = 1024;
         let dir = tmp_dir("rotate");
         let path = dir.join("seg_00000001.wab");
         let mut seg = WabSegment::create(&path, 0).unwrap();
-        assert!(!seg.should_rotate());
-        // Artificially set bytes_written to the threshold.
-        seg.bytes_written = SEGMENT_MAX_BYTES;
-        assert!(seg.should_rotate());
+        assert!(!seg.should_rotate(TEST_THRESHOLD));
+        seg.bytes_written = TEST_THRESHOLD;
+        assert!(seg.should_rotate(TEST_THRESHOLD));
+        assert!(seg.should_rotate(TEST_THRESHOLD - 1));
         let _ = seg.seal();
         fs::remove_dir_all(dir).ok();
     }

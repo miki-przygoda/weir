@@ -106,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shard_count: config.shard_count,
         batch_size: config.batch_size,
         batch_deadline: Duration::from_millis(config.batch_deadline_ms),
+        segment_max_bytes: config.wab_segment_max_bytes,
     };
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),

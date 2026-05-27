@@ -16,6 +16,8 @@ OPTIONS:
     --worker-count <n>                       Worker thread count (1-64) [default: 2]
     --batch-size <n>                         Records per flush batch (1-100000) [default: 256]
     --batch-deadline-ms <n>                  Batch accumulation time ms (1-60000) [default: 1]
+    --wab-segment-max-bytes <n>              WAB segment rotation threshold (4096-4294967296)
+                                               [default: 268435456 (256 MiB)]
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
@@ -73,6 +75,9 @@ pub(super) fn parse_from(
         batch_size: pargs.opt_value_from_str("--batch-size").map_err(pico_err)?,
         batch_deadline_ms: pargs
             .opt_value_from_str("--batch-deadline-ms")
+            .map_err(pico_err)?,
+        wab_segment_max_bytes: pargs
+            .opt_value_from_str("--wab-segment-max-bytes")
             .map_err(pico_err)?,
         max_connections: pargs
             .opt_value_from_str("--max-connections")

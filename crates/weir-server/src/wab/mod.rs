@@ -39,6 +39,11 @@ pub struct WabConfig {
     pub batch_size: usize,
     /// Maximum time to accumulate a batch before flushing.
     pub batch_deadline: Duration,
+    /// Rotation threshold in bytes. The active segment is sealed and a new one
+    /// opened once `bytes_written` reaches this value. Default 256 MiB matches
+    /// the historical hard-coded behaviour; tests and storage-constrained
+    /// deployments may set it lower.
+    pub segment_max_bytes: u64,
 }
 
 impl Default for WabConfig {
@@ -47,6 +52,7 @@ impl Default for WabConfig {
             shard_count: 1,
             batch_size: 256,
             batch_deadline: Duration::from_millis(1),
+            segment_max_bytes: crate::wab::format::SEGMENT_MAX_BYTES,
         }
     }
 }
@@ -115,6 +121,7 @@ pub fn spawn(
         let metrics_clone = Arc::clone(&metrics);
         let batch_size = config.batch_size;
         let batch_deadline = config.batch_deadline;
+        let segment_max_bytes = config.segment_max_bytes;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
 
         let handle = thread::Builder::new()
@@ -127,6 +134,7 @@ pub fn spawn(
                     drain_clone,
                     batch_size,
                     batch_deadline,
+                    segment_max_bytes,
                     core_id,
                     metrics_clone,
                 );
@@ -205,6 +213,7 @@ fn flusher_thread(
     drain_tx: Sender<PathBuf>,
     batch_size: usize,
     batch_deadline: Duration,
+    segment_max_bytes: u64,
     core_id: Option<core_affinity::CoreId>,
     metrics: Arc<Metrics>,
 ) {
@@ -232,7 +241,7 @@ fn flusher_thread(
     }
 
     // Startup warmup
-    let mut writer = ShardWriter::new(shard_id, shard_dir);
+    let mut writer = ShardWriter::new(shard_id, shard_dir, segment_max_bytes);
     if let Err(e) = writer.scan_and_advance_counter() {
         warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
     }

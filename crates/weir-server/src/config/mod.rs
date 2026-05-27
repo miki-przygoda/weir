@@ -125,6 +125,7 @@ pub(crate) struct PartialConfig {
     pub worker_count: Option<usize>,
     pub batch_size: Option<usize>,
     pub batch_deadline_ms: Option<u64>,
+    pub wab_segment_max_bytes: Option<u64>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
@@ -161,6 +162,7 @@ pub struct Config {
     pub worker_count: usize,
     pub batch_size: usize,
     pub batch_deadline_ms: u64,
+    pub wab_segment_max_bytes: u64,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
@@ -225,6 +227,20 @@ impl Config {
 
         let batch_deadline_ms = merge!(batch_deadline_ms).unwrap_or(1);
         check_range("batch_deadline_ms", batch_deadline_ms as usize, 1, 60_000)?;
+
+        // Default 256 MiB matches the historical hard-coded behaviour.
+        // Lower bound 4 KiB so the segment header (one page) fits;
+        // upper bound 4 GiB so a single sealed segment can't exceed 32-bit
+        // file-offset assumptions downstream.
+        let wab_segment_max_bytes = merge!(wab_segment_max_bytes).unwrap_or(256 * 1024 * 1024);
+        if !(4096..=4 * 1024 * 1024 * 1024).contains(&wab_segment_max_bytes) {
+            return Err(ConfigError::InvalidValue {
+                field: "wab_segment_max_bytes",
+                reason: format!(
+                    "{wab_segment_max_bytes} is outside the supported range [4096, 4294967296]"
+                ),
+            });
+        }
 
         let max_connections = merge!(max_connections).unwrap_or(256);
         check_range("max_connections", max_connections, 1, 512)?;
@@ -349,6 +365,7 @@ impl Config {
             worker_count,
             batch_size,
             batch_deadline_ms,
+            wab_segment_max_bytes,
             max_connections,
             max_payload_bytes,
             metrics_port,
@@ -486,6 +503,7 @@ mod tests {
         assert_eq!(c.worker_count, 2);
         assert_eq!(c.batch_size, 256);
         assert_eq!(c.batch_deadline_ms, 1);
+        assert_eq!(c.wab_segment_max_bytes, 256 * 1024 * 1024);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
@@ -637,6 +655,59 @@ mod tests {
             err.to_string().contains("dead_letter_check_interval_secs"),
             "{err}"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── wab_segment_max_bytes ─────────────────────────────────────────────────
+
+    #[test]
+    fn wab_segment_max_bytes_below_minimum_rejected() {
+        let dir = tmp_dir("seg_too_small");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_segment_max_bytes: Some(4095),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wab_segment_max_bytes"), "{err}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_segment_max_bytes_above_maximum_rejected() {
+        let dir = tmp_dir("seg_too_big");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_segment_max_bytes: Some(4 * 1024 * 1024 * 1024 + 1),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wab_segment_max_bytes"), "{err}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_segment_max_bytes_accepts_in_range_values() {
+        let dir = tmp_dir("seg_ok");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_segment_max_bytes: Some(64 * 1024),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.wab_segment_max_bytes, 64 * 1024);
         fs::remove_dir_all(dir).ok();
     }
 
