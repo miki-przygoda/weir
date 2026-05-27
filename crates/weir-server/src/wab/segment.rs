@@ -173,12 +173,10 @@ impl WabSegment {
         self.bytes_written >= max_bytes
     }
 
-    #[allow(dead_code)]
-    pub fn bytes_written(&self) -> u64 {
-        self.bytes_written
-    }
-
-    #[allow(dead_code)]
+    /// Number of records written so far. Test-only accessor — production
+    /// code reads the in-memory counter directly during `seal()` to write
+    /// the segment footer.
+    #[cfg(test)]
     pub fn record_count(&self) -> u64 {
         self.record_count
     }
@@ -206,11 +204,6 @@ impl WabSegment {
         std::fs::rename(&self.path, &sealed_path)?;
 
         Ok(sealed_path)
-    }
-
-    #[allow(dead_code)]
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 

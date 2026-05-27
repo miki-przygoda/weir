@@ -13,7 +13,12 @@ const WORKER_CORE_START: usize = 2;
 /// `ack_tx` inside each `WorkUnit` is carried intact; the WAB drain resolves
 /// it after the record is durably written.
 pub struct Batch {
-    #[allow(dead_code)]
+    /// Diagnostic tag — never read in production today, but the field is
+    /// set by every batch-producing path so a test can assert routing
+    /// correctness (`single_worker_batches_on_deadline` does) and a future
+    /// per-shard tracing/metric story has the data it needs without
+    /// re-plumbing.
+    #[expect(dead_code, reason = "diagnostic-only; test asserts on this")]
     pub shard_id: u32,
     pub records: Vec<WorkUnit>,
 }

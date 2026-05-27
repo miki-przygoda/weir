@@ -50,33 +50,19 @@ pub fn new<T>(partitions: usize) -> (QueueSender<T>, QueueReceiver<T>) {
 }
 
 impl<T> QueueSender<T> {
-    /// Pushes a work unit onto the partition selected by `partition_key`,
-    /// blocking the calling thread until a slot is available.
-    ///
-    /// If every `QueueReceiver` clone has been dropped, the unit is silently
-    /// discarded — the caller is in the shutdown path and the socket listener
-    /// will be closed imminently.
-    #[allow(dead_code)]
-    pub fn push(&self, partition_key: usize, unit: T) {
-        let idx = partition_key % self.txs.len();
-        self.txs[idx].send(unit).ok();
-    }
-
-    /// Total in-flight count summed across every partition.
-    #[allow(dead_code)]
+    /// Total in-flight count summed across every partition. Used by the
+    /// `weir_queue_depth` metric poll task.
     pub fn len(&self) -> usize {
         self.txs.iter().map(|t| t.len()).sum()
     }
 
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.txs.iter().all(|t| t.is_empty())
-    }
-
-    /// Number of partitions this sender routes to.
-    #[allow(dead_code)]
-    pub fn partitions(&self) -> usize {
-        self.txs.len()
+    /// Blocking push, test-only. Production code routes through
+    /// `push_timeout` (below) so a saturated queue surfaces as
+    /// `Nack(InternalError)` instead of an indefinite stall.
+    #[cfg(test)]
+    pub fn push(&self, partition_key: usize, unit: T) {
+        let idx = partition_key % self.txs.len();
+        self.txs[idx].send(unit).ok();
     }
 
     /// Attempts to push a work unit to the partition selected by
