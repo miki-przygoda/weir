@@ -387,11 +387,7 @@ fn flush_batch(
 
         match record.durability {
             Durability::Sync => {
-                let t = Instant::now();
-                let ok = writer.fsync_current().is_ok();
-                metrics
-                    .wab_fsync_duration
-                    .observe(t.elapsed().as_secs_f64());
+                let ok = fsync_observed(writer, shard_id, metrics);
                 let _ = record.ack_tx.send(ok);
             }
             Durability::Batched => {
@@ -406,13 +402,36 @@ fn flush_batch(
 
     // Group fsync for all Batched records in this flush.
     if need_fsync {
-        let t = Instant::now();
-        let ok = writer.fsync_current().is_ok();
-        metrics
-            .wab_fsync_duration
-            .observe(t.elapsed().as_secs_f64());
+        let ok = fsync_observed(writer, shard_id, metrics);
         for ack_tx in batched_acks {
             let _ = ack_tx.send(ok);
+        }
+    }
+}
+
+/// Fsyncs the active segment, observing the duration and recording any error
+/// through both a tracing log line (so operators see the underlying
+/// io::Error string) and a Prometheus counter (so the failure rate is
+/// alertable). Returns the bool the caller propagates to ack_tx.
+fn fsync_observed(writer: &mut ShardWriter, shard_id: u16, metrics: &Arc<Metrics>) -> bool {
+    let t = Instant::now();
+    let result = writer.fsync_current();
+    metrics
+        .wab_fsync_duration
+        .observe(t.elapsed().as_secs_f64());
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                shard = shard_id,
+                error = %e,
+                "WAB fsync failed — durability hazard; the record cannot be \
+                 guaranteed durable on stable storage. Producer receives \
+                 Nack(InternalError); operator should investigate the \
+                 underlying disk/filesystem."
+            );
+            metrics.wab_fsync_failures.inc();
+            false
         }
     }
 }

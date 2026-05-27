@@ -136,6 +136,13 @@ pub(crate) struct Metrics {
     /// restarts — any non-zero value requires operator attention. Check logs
     /// for the shard_id and panic payload.
     pub wab_flusher_panics: Counter<u64, AtomicU64>,
+    /// fsync / fdatasync calls that returned an error. A non-zero value is a
+    /// durability hazard: the kernel buffered the write but couldn't push it
+    /// to stable storage. Producers whose records were in the failed fsync
+    /// receive Nack(InternalError); on Linux a second fsync after EIO may
+    /// succeed but the data is generally lost ("fsyncgate"). Check logs for
+    /// the shard_id and error string.
+    pub wab_fsync_failures: Counter<u64, AtomicU64>,
 
     // ── Sink / drain ──────────────────────────────────────────────────────────
     pub sink_commit_duration: Histogram,
@@ -230,6 +237,14 @@ impl Metrics {
              restarts. Any non-zero value requires operator attention; check logs \
              for the shard_id and panic payload."
         );
+        let wab_fsync_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_fsync_failures",
+            "fsync/fdatasync calls that returned an error. Durability hazard: \
+             the kernel buffered the write but couldn't push it to stable storage. \
+             Producers whose records were in the failed fsync receive \
+             Nack(InternalError). Check logs for the shard_id and error string."
+        );
         let sink_commit_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),
             "weir_sink_commit_duration_seconds",
@@ -302,6 +317,7 @@ impl Metrics {
             wab_bytes_on_disk,
             wab_fsync_duration,
             wab_flusher_panics,
+            wab_fsync_failures,
             sink_commit_duration,
             sink_commit_records,
             sink_health,
