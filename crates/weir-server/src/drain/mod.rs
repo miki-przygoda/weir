@@ -25,11 +25,11 @@
 //! recovery will skip the segment (confirmed), and the orphan sealed file can be
 //! cleaned up on the next startup.
 
+mod confirmed;
 pub mod dead_letter;
 
 use std::{
     collections::VecDeque,
-    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -41,16 +41,14 @@ use weir_core::Payload;
 
 use crate::{
     metrics::{
-        DrainStateLabel, DrainStateValue, Metrics, Outcome, OutcomeLabel, SegmentState,
-        SegmentStateLabel, SinkHealthLabel, SinkHealthState,
+        DrainStateLabel, DrainStateValue, Metrics, Outcome, OutcomeLabel, SinkHealthLabel,
+        SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth, SinkRecord},
-    wab::{
-        SegmentReader,
-        format::{EXT_CONFIRMED, EXT_SEALED, SEGMENT_FOOTER_LEN, build_confirmed, unix_nanos_now},
-    },
+    wab::SegmentReader,
 };
 
+use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -392,19 +390,6 @@ fn enter_blocked(segment: PathBuf, metrics: &Metrics) -> DrainState {
     }
 }
 
-fn confirm_and_delete(sealed: &Path, record_count: u64, metrics: &Metrics) {
-    write_confirmed_file(sealed, record_count);
-    if let Err(e) = std::fs::remove_file(sealed) {
-        warn!(path = %sealed.display(), error = %e, "drain: failed to delete confirmed segment");
-    }
-    metrics
-        .wab_segments
-        .get_or_create(&SegmentStateLabel {
-            state: SegmentState::confirmed,
-        })
-        .inc();
-}
-
 // ── Segment processing ────────────────────────────────────────────────────────
 
 async fn process_segment<S: Sink>(
@@ -586,43 +571,6 @@ fn estimated_write_bytes(payloads: &[Payload]) -> u64 {
     payloads.iter().map(|p| p.len() as u64 + 8).sum()
 }
 
-// ── Confirmed file helpers ────────────────────────────────────────────────────
-
-fn write_confirmed_file(sealed: &Path, record_count: u64) {
-    let confirmed = confirmed_path(sealed);
-    let sealed_at = read_sealed_at_nanos(sealed).unwrap_or(0);
-    let bytes = build_confirmed(sealed_at, record_count, unix_nanos_now());
-    if let Err(e) = std::fs::write(&confirmed, bytes) {
-        error!(
-            path = %confirmed.display(),
-            error = %e,
-            "drain: failed to write .confirmed file; segment will be replayed on restart"
-        );
-    }
-}
-
-fn confirmed_path(sealed: &Path) -> PathBuf {
-    let s = sealed.to_string_lossy();
-    let base = s.strip_suffix(EXT_SEALED).unwrap_or(&s);
-    PathBuf::from(format!("{base}{EXT_CONFIRMED}"))
-}
-
-/// Reads the `sealed_at` timestamp from the segment footer (last 32 bytes of the file).
-/// Returns 0 on any read failure — the field is informational only.
-fn read_sealed_at_nanos(path: &Path) -> io::Result<i64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len < (SEGMENT_FOOTER_LEN as u64 + 4) {
-        return Ok(0);
-    }
-    file.seek(SeekFrom::End(-(SEGMENT_FOOTER_LEN as i64)))?;
-    let mut footer = [0u8; SEGMENT_FOOTER_LEN];
-    file.read_exact(&mut footer)?;
-    // sealed_at is at footer bytes [20..28] — see wab_format.md.
-    Ok(i64::from_le_bytes(footer[20..28].try_into().unwrap()))
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -780,6 +728,7 @@ mod tests {
     }
 
     fn segments_confirmed(m: &Metrics) -> u64 {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
         m.wab_segments
             .get_or_create(&SegmentStateLabel {
                 state: SegmentState::confirmed,
@@ -866,7 +815,7 @@ mod tests {
     }
 
     fn get_confirmed_path(sealed: &Path) -> PathBuf {
-        confirmed_path(sealed)
+        super::confirmed::confirmed_path(sealed)
     }
 
     // ── CommitResult ──────────────────────────────────────────────────────────
