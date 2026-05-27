@@ -23,6 +23,18 @@ use crate::{
 /// socket connections open indefinitely.
 pub const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long `handle_connection` waits on the WAB ack oneshot before giving up
+/// and nacking. Bounds the blast radius of a wedged flusher (one that hasn't
+/// panicked but is stuck on a slow fsync, lock contention, etc.) so it can't
+/// hold a connection's semaphore permit forever.
+///
+/// 30s is well above any healthy fsync (microseconds on SSD, ~100ms on
+/// contended rotational disk) but short enough that an operator who hits this
+/// timeout investigates rather than ignores. A producer whose record fires
+/// the timeout receives Nack(InternalError); the record may still be durably
+/// written by the eventual flusher completion — at-least-once semantics.
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Per-connection configuration derived from the server config.
 #[derive(Clone)]
 pub struct ConnectionConfig {
@@ -34,6 +46,10 @@ pub struct ConnectionConfig {
     /// (or sends only a partial frame) and would otherwise hold a semaphore
     /// permit indefinitely.
     pub read_timeout: Duration,
+    /// Maximum time the handler will wait on the WAB ack oneshot. See
+    /// [`ACK_TIMEOUT`] for the production default and rationale; tests
+    /// override this to a short value so they don't need to mock the clock.
+    pub ack_timeout: Duration,
     /// Target shard for every WorkUnit pushed on this connection. The accept
     /// loop in `socket::run` assigns this round-robin (counter % shard_count)
     /// at connection time so a multi-shard config (shard_count > 1) actually
@@ -183,6 +199,7 @@ pub async fn handle_connection(
                     payload,
                     tv,
                     config.shard_id,
+                    config.ack_timeout,
                     &metrics,
                 )
                 .await?;
@@ -216,6 +233,7 @@ async fn handle_push(
     payload: Vec<u8>,
     tv: TierValue,
     shard_id: u32,
+    ack_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -247,15 +265,33 @@ async fn handle_push(
         return Ok(());
     }
 
-    match ack_rx.await {
-        Ok(true) => {
+    match tokio::time::timeout(ack_timeout, ack_rx).await {
+        Ok(Ok(true)) => {
             metrics
                 .records_ack
                 .get_or_create(&TierLabel { tier: tv })
                 .inc();
             send_ack(stream).await
         }
-        _ => {
+        Ok(_) => {
+            // Flusher fired ack with `false` (write/fsync error) or dropped
+            // the sender (panic). Either way: InternalError nack.
+            send_nack(stream, WireNack::InternalError, &[]).await?;
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: tv,
+                    reason: MetricNack::internal_error,
+                })
+                .inc();
+            Ok(())
+        }
+        Err(_elapsed) => {
+            // ACK_TIMEOUT exceeded. The flusher is wedged (not panicked —
+            // a panic would have dropped the sender, which is the Ok(_)
+            // branch above). The record may still get written; producer
+            // sees Nack(InternalError) and retries on a fresh connection.
+            metrics.ack_timeout.inc();
             send_nack(stream, WireNack::InternalError, &[]).await?;
             metrics
                 .records_nack
@@ -342,6 +378,7 @@ mod tests {
         ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_secs(30),
             shard_id: 0,
         }
     }
@@ -466,6 +503,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: 16,
             read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_secs(30),
             shard_id: 0,
         };
         let mut client = spawn_handler(cfg).await;
@@ -501,6 +539,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP + 1,
             read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_secs(30),
             shard_id: 0,
         };
         let mut client = spawn_handler(cfg).await;
@@ -542,6 +581,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_timeout_nacks_when_flusher_does_not_respond() {
+        // Simulates a wedged flusher: the receiver gets the WorkUnit but
+        // never fires ack_tx. The handler must give up after ack_timeout
+        // and Nack(InternalError), and the ack_timeout counter must
+        // increment exactly once.
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_millis(100), // tight bound so the test is fast
+            shard_id: 0,
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let metrics_for_check = std::sync::Arc::clone(&metrics);
+
+        // Never-acker: receives the unit and parks the ack_tx forever (a
+        // wedged flusher that hasn't panicked). The Vec keeps the ack_tx
+        // alive so the handler's await sees a pending oneshot, not a
+        // dropped sender.
+        std::thread::spawn(move || {
+            let rx = queue_rx.get(0);
+            let mut parked: Vec<tokio::sync::oneshot::Sender<bool>> = Vec::new();
+            while let Ok(unit) = rx.recv() {
+                parked.push(unit.ack_tx);
+            }
+        });
+
+        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics));
+
+        let mut client = client;
+        let t0 = std::time::Instant::now();
+        client.write_all(&push_frame(b"data")).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        let elapsed = t0.elapsed();
+
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::InternalError as u8);
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "nack returned before ack_timeout elapsed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "nack returned too long after ack_timeout: {elapsed:?}"
+        );
+        assert_eq!(
+            metrics_for_check.ack_timeout.get(),
+            1,
+            "ack_timeout counter must increment exactly once on timeout"
+        );
+    }
+
+    #[tokio::test]
     async fn queue_saturated_returns_internal_error_nack() {
         // Drop the receiver immediately so push_timeout returns Disconnected at once.
         let (client, server) = UnixStream::pair().unwrap();
@@ -571,6 +665,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
+            ack_timeout: Duration::from_secs(30),
             shard_id: 0,
         };
         let (m, _reg) = crate::metrics::Metrics::new();
@@ -621,6 +716,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
+            ack_timeout: Duration::from_secs(30),
             shard_id: 0,
         };
         let (m, _reg) = crate::metrics::Metrics::new();

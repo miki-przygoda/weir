@@ -92,6 +92,7 @@ pub async fn run(
     let conn_cfg_template = ConnectionConfig {
         max_payload_bytes: effective_cap,
         read_timeout: Duration::from_secs(config.connection_read_timeout_secs),
+        ack_timeout: crate::socket::connection::ACK_TIMEOUT,
         shard_id: 0, // overridden per connection below
     };
     let sem = std::sync::Arc::new(Semaphore::new(config.max_connections));
