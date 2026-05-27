@@ -89,6 +89,198 @@ The server decodes in this order to minimise DoS surface. **This order is mandat
 
 ---
 
+## CRC32 algorithm
+
+The two CRC fields use the **CRC-32 / ISO 3309** variant — the same
+algorithm as zlib, PNG, and Ethernet. Concretely:
+
+| Parameter | Value |
+|-----------|-------|
+| Width | 32 bits |
+| Polynomial | `0x04C11DB7` |
+| Initial value | `0xFFFFFFFF` |
+| Reflect input bytes | yes |
+| Reflect output | yes |
+| Final XOR | `0xFFFFFFFF` |
+
+This is the algorithm exposed by the Rust [`crc32fast`](https://crates.io/crates/crc32fast)
+crate (`crc32fast::hash(bytes) -> u32`), Python's `zlib.crc32`,
+Go's `hash/crc32.IEEETable`, and Java's `java.util.zip.CRC32`. It is
+**not** CRC-32C (Castagnoli, polynomial `0x1EDC6F41`) — using
+CRC-32C will produce frames the daemon rejects with
+`BadHeaderCrc` or `BadPayloadCrc`.
+
+The CRC's empty-input value is `0x00000000` (a CRC over zero bytes
+returns the all-zero post-XOR value). A `HealthCheckResponse` frame
+therefore ends with the four bytes `00 00 00 00`.
+
+## Connection lifecycle
+
+Each connection is a serial request/response stream — the server reads
+one frame at a time on a given connection, processes it, and writes
+the response before reading the next frame. A client **may** write
+multiple Push frames back-to-back without waiting for each Ack
+(pipelining at the kernel level), but the server still processes them
+in order and emits one response per request, in submission order. The
+in-flight depth is bounded by the kernel socket buffer.
+
+When the server closes a connection mid-stream the client should treat
+in-flight Pushes (those without a matching Ack/Nack received yet) as
+**unknown outcomes** — they may or may not have been durably written
+depending on where in the pipeline the close happened. Retry on a
+fresh connection.
+
+### When the server keeps the connection open
+
+| Event | Connection |
+|-------|-----------|
+| Push → Ack | open |
+| Push → Nack(InternalError) | open — queue saturation, transient |
+| HealthCheck → HealthCheckResponse | open |
+
+### When the server closes the connection
+
+| Event | Connection |
+|-------|-----------|
+| Push with bad magic | closed after Nack(BadMagic) |
+| Push with unknown version | closed after Nack(VersionMismatch) |
+| Push with bad header CRC | closed after Nack(BadHeaderCrc) |
+| Push with `payload_len > cap` | closed after Nack(PayloadTooLarge) |
+| Push with bad payload CRC | closed after Nack(BadPayloadCrc) |
+| Idle past `connection_read_timeout_secs` mid-frame | closed silently (slowloris guard); no Nack |
+
+Validation-failure closes are deliberate — once the framing has
+desynced (bad magic, bad CRC) the server cannot trust subsequent
+bytes on the same connection.
+
+## Socket setup
+
+- The daemon binds an `AF_UNIX SOCK_STREAM` socket at the path in
+  `socket_path` (default `/run/weir/weir.sock`).
+- The socket file is created with mode `0o600` — only the daemon's
+  uid can connect. Producers must run as the same uid (or root).
+- The parent directory must exist before the daemon starts; the
+  daemon does not create it.
+- There is no in-band handshake. Producers connect and immediately
+  send a Push (or HealthCheck) frame.
+
+## Worked examples
+
+The byte sequences below are real — they're asserted against the
+encoder in [`crates/weir-core/tests/reference_frames.rs`](../crates/weir-core/tests/reference_frames.rs).
+A client implementation that produces these exact bytes is
+wire-compatible with the daemon.
+
+### Push of a 5-byte payload (`"hello"`), Sync durability
+
+```text
+Offset  Hex bytes                                          Field
+──────  ─────────────────────────────────────────────────  ───────────────────
+ 0      57 45 49 52                                        magic = "WEIR"
+ 4      01                                                 version = 1
+ 5      01                                                 message_type = Push
+ 6      01                                                 durability = Sync
+ 7      00                                                 flags
+ 8      05 00 00 00                                        payload_len = 5
+12      66 ad 7d 3c                                        header_crc32
+16      68 65 6c 6c 6f                                     payload = "hello"
+21      86 a6 10 36                                        payload_crc32
+```
+
+Total: 25 bytes on the wire.
+
+The header CRC covers bytes `[0..12]` (everything from the magic
+through the payload-length field). The payload CRC covers exactly
+the payload bytes (5 in this case).
+
+### Ack response
+
+The daemon's Ack frame is fixed: zero-length payload, all-zero
+payload CRC, header CRC computed over the same first 12 bytes.
+
+```text
+Offset  Hex bytes                                          Field
+──────  ─────────────────────────────────────────────────  ───────────────────
+ 0      57 45 49 52                                        magic = "WEIR"
+ 4      01                                                 version = 1
+ 5      02                                                 message_type = Ack
+ 6      01                                                 durability = Sync (filler)
+ 7      00                                                 flags
+ 8      00 00 00 00                                        payload_len = 0
+12      c9 47 4b 3a                                        header_crc32
+16      00 00 00 00                                        payload_crc32 (empty payload)
+```
+
+Total: 20 bytes. The `durability` byte on the response is always
+`0x01` (Sync) regardless of the original request's tier — the server
+populates it to a fixed value. Clients reading responses can ignore
+it.
+
+### Nack response — `PayloadTooLarge`
+
+Nack payloads carry the `NackReason` byte (see table above). For
+`PayloadTooLarge` the payload is exactly one byte (`0x04`).
+
+```text
+Offset  Hex bytes                                          Field
+──────  ─────────────────────────────────────────────────  ───────────────────
+ 0      57 45 49 52                                        magic = "WEIR"
+ 4      01                                                 version = 1
+ 5      03                                                 message_type = Nack
+ 6      01                                                 durability = Sync (filler)
+ 7      00                                                 flags
+ 8      01 00 00 00                                        payload_len = 1
+12      18 2b 80 24                                        header_crc32
+16      04                                                 NackReason::PayloadTooLarge
+17      94 2b 6f d5                                        payload_crc32 (of [0x04])
+```
+
+Total: 21 bytes.
+
+For `VersionMismatch` the payload is two bytes:
+`[0x02, daemon_wire_version]`. All other Nack reasons send a
+single-byte payload.
+
+### HealthCheck request and response
+
+A HealthCheck request has a zero-length payload. The `durability`
+field is unused (set to anything; the server doesn't read it). The
+HealthCheckResponse mirrors the shape — zero payload, all-zero
+payload CRC.
+
+## Minimum producer checklist
+
+A non-Rust client that satisfies the following is wire-compatible:
+
+- [ ] Writes 16-byte header with little-endian multi-byte fields.
+- [ ] Computes header CRC32 over bytes `[0..12]` using the CRC-32
+      variant above (not CRC-32C).
+- [ ] Writes `payload_len` raw payload bytes after the header.
+- [ ] Writes 4-byte payload CRC32 (same algorithm) after the payload.
+- [ ] Reads 16-byte response header, then `header.payload_len`
+      response-payload bytes, then 4 response-CRC bytes.
+- [ ] Verifies the response header magic, version, and CRC before
+      consuming the payload.
+- [ ] Treats response `message_type == Nack` as failure; decodes the
+      first byte of the response payload as `NackReason`.
+- [ ] Caps `payload_len` at the daemon's `MAX_PAYLOAD_HARD_CAP`
+      (16 MiB) — sending larger frames is wasted I/O; the daemon
+      closes the connection after the Nack.
+- [ ] Handles connection close mid-stream as "in-flight requests had
+      unknown outcomes; retry on a fresh connection."
+
+## Test vectors
+
+The `tests/reference_frames.rs` test module in `weir-core` exports
+the byte sequences from the [Worked examples](#worked-examples)
+section as Rust constants and asserts the encoder produces them.
+Run `cargo test -p weir-core --test reference_frames` to confirm a
+local build matches the published wire format. Implementers of
+non-Rust clients can copy the constants directly to verify their
+encoders.
+
+---
+
 ## Version history
 
 ### v1 (current)

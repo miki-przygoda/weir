@@ -109,6 +109,21 @@ changes are tracked separately under **Wire protocol** below.
   production-shaped variant of the EFBIG test; setup recipe in the
   docstring.
 
+### Documentation
+
+- **Wire protocol now has an implementer guide.** `docs/wire_protocol.md`
+  gains four new sections targeting non-Rust client authors: the exact
+  CRC-32 variant (IEEE/ISO 3309 — *not* CRC-32C; same algorithm as zlib,
+  PNG, Ethernet, Java `CRC32`, Python `zlib.crc32`); the connection
+  lifecycle table (which events keep the connection open vs close it);
+  socket setup conventions; byte-by-byte worked examples of a Push, an
+  Ack, and a Nack; and a minimum-producer checklist. Three frame
+  test-vector constants live in
+  `crates/weir-core/tests/reference_frames.rs` and are asserted against
+  the encoder on every `cargo test` — the doc and code can't drift
+  silently. Implementers can copy the constants verbatim into a non-Rust
+  test suite to confirm byte-identical encoding.
+
 ### Infrastructure
 
 - **`docs/benchmarks/bare-metal.md` scaffold** plus
