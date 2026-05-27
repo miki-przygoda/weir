@@ -268,6 +268,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // Background: scan WAB shard dirs for on-disk byte usage every 5 s.
+        // The scan is synchronous I/O (read_dir + metadata per entry) so it
+        // runs inside spawn_blocking — putting it directly on a tokio worker
+        // would stall the runtime in proportion to the number of segments.
         let wab_dir_bg = config.wab_dir.clone();
         let metrics_w = Arc::clone(&metrics);
         tokio::spawn(async move {
@@ -275,7 +278,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                let bytes = compute_wab_bytes_on_disk(&wab_dir_bg);
+                let wab_dir = wab_dir_bg.clone();
+                let bytes = tokio::task::spawn_blocking(move || {
+                    compute_wab_bytes_on_disk(&wab_dir)
+                })
+                .await
+                .unwrap_or(0);
                 metrics_w.wab_bytes_on_disk.set(bytes as f64);
             }
         });
