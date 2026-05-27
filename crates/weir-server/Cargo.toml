@@ -31,6 +31,11 @@ pico-args = "0.5"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# thiserror is OK to add here even though weir-core deliberately excludes it
+# (see weir-core/Cargo.toml comment): weir-server already pulls syn/quote/
+# proc-macro2 via reqwest and mysql_async transitively, so the build-time
+# cost is zero. Used by the sink error types in src/sink/*.
+thiserror = "2"
 # HTTP sink uses reqwest with rustls (no system OpenSSL). default-features off
 # trims the dep surface; gzip/brotli/cookies/json/proxy are not needed for the
 # one-POST-per-record sink protocol.

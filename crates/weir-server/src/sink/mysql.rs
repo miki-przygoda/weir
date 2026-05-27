@@ -217,55 +217,36 @@ fn validate_identifier(field: &str, value: &str) -> Result<(), MySqlSinkBuildErr
 
 /// Errors that can occur during `MySqlSink::new()`. All build-time —
 /// permanent by definition, no `SinkError` impl needed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MySqlSinkBuildError {
+    #[error("mysql sink url is empty")]
     EmptyUrl,
+    #[error("mysql sink url invalid: {0}")]
     InvalidUrl(String),
+    #[error(
+        "mysql sink {field} {value:?} is not a valid identifier \
+         (must match [A-Za-z_][A-Za-z0-9_]{{0,63}})"
+    )]
     InvalidIdentifier { field: String, value: String },
 }
 
-impl std::fmt::Display for MySqlSinkBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MySqlSinkBuildError::EmptyUrl => write!(f, "mysql sink url is empty"),
-            MySqlSinkBuildError::InvalidUrl(e) => write!(f, "mysql sink url invalid: {e}"),
-            MySqlSinkBuildError::InvalidIdentifier { field, value } => write!(
-                f,
-                "mysql sink {field} {value:?} is not a valid identifier \
-                 (must match [A-Za-z_][A-Za-z0-9_]{{0,63}})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MySqlSinkBuildError {}
-
 /// Errors returned by `MySqlSink::commit`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MySqlSinkError {
     /// Connection / pool / IO failures and explicit-transient server codes.
     /// Drain retries the whole segment.
+    #[error("mysql sink transient: {0}")]
     Transient(String),
     /// Permanent error — bad schema, bad auth, syntax error, payload too
     /// large for the column. Drain dead-letters the batch with this string
     /// as the reason.
+    #[error("mysql sink permanent: {0}")]
     Permanent(String),
     /// Per-query timeout — `sink_timeout_secs` exceeded. Transient: the
     /// server is probably overloaded; backoff and retry.
+    #[error("mysql sink timeout")]
     Timeout,
 }
-
-impl std::fmt::Display for MySqlSinkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MySqlSinkError::Transient(e) => write!(f, "mysql sink transient: {e}"),
-            MySqlSinkError::Permanent(e) => write!(f, "mysql sink permanent: {e}"),
-            MySqlSinkError::Timeout => write!(f, "mysql sink timeout"),
-        }
-    }
-}
-
-impl std::error::Error for MySqlSinkError {}
 
 impl SinkError for MySqlSinkError {
     fn is_transient(&self) -> bool {

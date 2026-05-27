@@ -9,16 +9,14 @@ use super::{CommitResult, Sink, SinkError, SinkHealth};
 
 pub struct NoopSink;
 
-#[derive(Debug)]
+/// Inhabited but never constructed in the current implementation; the
+/// `Sink` trait requires an associated `Error` type even when the impl
+/// can't fail. Kept as an explicit type rather than `Infallible` so the
+/// trait's variance is exactly the same shape as the HTTP and MySQL
+/// sinks.
+#[derive(Debug, thiserror::Error)]
+#[error("noop error (unreachable)")]
 pub struct NoopError;
-
-impl std::fmt::Display for NoopError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "noop error (unreachable)")
-    }
-}
-
-impl std::error::Error for NoopError {}
 
 impl SinkError for NoopError {
     fn is_transient(&self) -> bool {

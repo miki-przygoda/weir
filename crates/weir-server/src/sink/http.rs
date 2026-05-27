@@ -239,51 +239,35 @@ fn classify_status_transient(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HttpSinkError {
     /// reqwest transport error (connect, timeout, body send). Always transient.
+    #[error("http sink transport error: {0}")]
     Transport(String),
     /// HTTP status code in the transient bucket (408/429/5xx). `retry_after`
     /// carries the parsed `Retry-After` header value if the server sent one
     /// (delay-seconds form only; HTTP-date form is not parsed in v0).
+    #[error("http sink transient status: {status}{}", fmt_retry_after(retry_after))]
     TransientStatus {
         status: StatusCode,
         retry_after: Option<Duration>,
     },
     /// HTTP status code in the permanent bucket (4xx except 408/429).
+    #[error("http sink permanent status: {status}; body: {body_excerpt}")]
     PermanentStatus {
         status: StatusCode,
         body_excerpt: String,
     },
 }
 
-impl std::fmt::Display for HttpSinkError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HttpSinkError::Transport(e) => write!(f, "http sink transport error: {e}"),
-            HttpSinkError::TransientStatus {
-                status,
-                retry_after,
-            } => match retry_after {
-                Some(d) => write!(
-                    f,
-                    "http sink transient status: {status} (Retry-After: {}s)",
-                    d.as_secs()
-                ),
-                None => write!(f, "http sink transient status: {status}"),
-            },
-            HttpSinkError::PermanentStatus {
-                status,
-                body_excerpt,
-            } => write!(
-                f,
-                "http sink permanent status: {status}; body: {body_excerpt}"
-            ),
-        }
+/// Helper used by the `TransientStatus` Display format string: appends
+/// ` (Retry-After: Ns)` when the header was present, empty otherwise.
+fn fmt_retry_after(retry_after: &Option<Duration>) -> String {
+    match retry_after {
+        Some(d) => format!(" (Retry-After: {}s)", d.as_secs()),
+        None => String::new(),
     }
 }
-
-impl std::error::Error for HttpSinkError {}
 
 impl SinkError for HttpSinkError {
     fn is_transient(&self) -> bool {
@@ -302,24 +286,15 @@ impl SinkError for HttpSinkError {
 }
 
 /// Errors that can occur during `HttpSink::new()`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HttpSinkBuildError {
+    #[error("http sink url is empty")]
     EmptyUrl,
+    #[error("http sink url invalid: {0}")]
     InvalidUrl(String),
-    ClientBuild(reqwest::Error),
+    #[error("http sink client build failed: {0}")]
+    ClientBuild(#[from] reqwest::Error),
 }
-
-impl std::fmt::Display for HttpSinkBuildError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HttpSinkBuildError::EmptyUrl => write!(f, "http sink url is empty"),
-            HttpSinkBuildError::InvalidUrl(e) => write!(f, "http sink url invalid: {e}"),
-            HttpSinkBuildError::ClientBuild(e) => write!(f, "http sink client build failed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for HttpSinkBuildError {}
 
 impl Sink for HttpSink {
     type Record = Payload;
