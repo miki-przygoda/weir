@@ -8,7 +8,7 @@ use tokio::{
 use tracing::debug;
 
 use weir_core::{
-    DecodeError, Durability, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType,
+    DecodeError, Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType,
     NackReason as WireNack, WIRE_VERSION,
 };
 
@@ -188,11 +188,10 @@ pub async fn handle_connection(
                 .await?;
             }
             MessageType::HealthCheck => {
-                let resp =
-                    Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0).encode();
-                let payload_crc = crc32fast::hash(&[]).to_le_bytes();
-                stream.write_all(&resp).await?;
-                stream.write_all(&payload_crc).await?;
+                let header =
+                    Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0);
+                let frame = Envelope::new(header, Vec::new()).encode();
+                stream.write_all(&frame).await?;
             }
             _ => {
                 debug!(msg_type = ?header.message_type, "unexpected message type from client");
@@ -315,22 +314,15 @@ async fn send_nack(stream: &mut UnixStream, reason: WireNack, extra: &[u8]) -> i
     nack_payload.push(reason as u8);
     nack_payload.extend_from_slice(extra);
 
-    let payload_len = nack_payload.len() as u32;
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0, payload_len).encode();
-    let payload_crc = crc32fast::hash(&nack_payload).to_le_bytes();
-
-    stream.write_all(&header).await?;
-    stream.write_all(&nack_payload).await?;
-    stream.write_all(&payload_crc).await?;
-    Ok(())
+    let header = Header::new(MessageType::Nack, Durability::Sync, 0, nack_payload.len() as u32);
+    let frame = Envelope::new(header, nack_payload).encode();
+    stream.write_all(&frame).await
 }
 
 async fn send_ack(stream: &mut UnixStream) -> io::Result<()> {
-    let header = Header::new(MessageType::Ack, Durability::Sync, 0, 0).encode();
-    let payload_crc = crc32fast::hash(&[]).to_le_bytes();
-    stream.write_all(&header).await?;
-    stream.write_all(&payload_crc).await?;
-    Ok(())
+    let header = Header::new(MessageType::Ack, Durability::Sync, 0, 0);
+    let frame = Envelope::new(header, Vec::new()).encode();
+    stream.write_all(&frame).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
