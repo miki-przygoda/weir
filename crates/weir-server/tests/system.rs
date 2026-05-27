@@ -574,17 +574,6 @@ fn all_durability_tiers_behave_per_contract() {
     );
 }
 
-#[test]
-fn multiple_sequential_pushes_same_connection() {
-    let srv = ServerHandle::start("sequential");
-    let mut client = srv.client();
-    for i in 0..50u32 {
-        client
-            .push(format!("record-{i:04}").as_bytes(), Durability::Batched)
-            .unwrap_or_else(|e| panic!("push #{i} failed: {e}"));
-    }
-}
-
 // ── Health check ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -627,6 +616,21 @@ fn concurrent_producers_all_acked() {
         }
     }
     assert_eq!(failures, 0, "{failures}/{THREADS} producer threads failed");
+
+    // Strengthen: a thread that silently drops half its pushes wouldn't
+    // panic but would land here with records_ack < THREADS*RECORDS_PER_THREAD.
+    // The records_ack counter is incremented *before* the Ack frame is sent
+    // (see send_ack call site in src/socket/connection.rs), so it's
+    // synchronously consistent with what the client observed.
+    let body = srv.scrape_metrics();
+    let acked = parse_metric(&body, "weir_records_ack_total{tier=\"batched\"}");
+    let expected = (THREADS * RECORDS_PER_THREAD) as u64;
+    assert_eq!(
+        acked, expected,
+        "expected {expected} batched acks, got {acked} — \
+         {} records appear to have been dropped silently",
+        expected - acked
+    );
 }
 
 #[test]
@@ -972,13 +976,33 @@ fn payload_size_boundary_enforced() {
 
 #[test]
 fn sustained_load_1000_records_single_client() {
+    const N: u64 = 1000;
+
     let srv = ServerHandle::start("sustained");
     let mut client = srv.client();
-    for i in 0..1000u32 {
+    for i in 0..N {
         client
             .push(format!("load-{i:06}").as_bytes(), Durability::Buffered)
             .unwrap_or_else(|e| panic!("record {i} failed: {e}"));
     }
+    drop(client);
+
+    // Strengthened beyond the original "push().unwrap() in a loop": verify
+    // that the accepted and ack counters reflect every record. A silent-drop
+    // regression (worker pool drops on contention, batch buffer overruns,
+    // etc.) would leave the counters under N while every push().unwrap()
+    // happily passes.
+    let body = srv.scrape_metrics();
+    let accepted = parse_metric(&body, "weir_records_accepted_total{tier=\"buffered\"}");
+    let acked = parse_metric(&body, "weir_records_ack_total{tier=\"buffered\"}");
+    assert_eq!(
+        accepted, N,
+        "expected accepted == {N}, got {accepted} — records dropped before reaching the worker pool"
+    );
+    assert_eq!(
+        acked, N,
+        "expected acked == {N}, got {acked} — records dropped between accept and ack"
+    );
 }
 
 #[test]
@@ -1008,6 +1032,35 @@ fn mixed_durability_under_concurrent_load() {
 
     for h in handles {
         h.join().expect("producer thread panicked");
+    }
+
+    // Strengthened: assert each tier's ack counter matches the records
+    // pushed for that tier. With THREADS=6 and tiers cycling 3-wide,
+    // threads 0,3 push Sync (2 × RECORDS), threads 1,4 push Batched
+    // (2 × RECORDS), threads 2,5 push Buffered (2 × RECORDS).
+    //
+    // The thing this catches that the original test couldn't: a buggy
+    // tier-dispatch table that silently re-routes (e.g. all Buffered
+    // counted as Sync) or drops one tier under contention. The original
+    // panic-on-Err pattern would still pass under such a bug because
+    // the client only sees Ack/Nack, not which tier the server thinks
+    // it was.
+    let per_tier_expected = (THREADS / tiers.len() * RECORDS) as u64;
+    let body = srv.scrape_metrics();
+    for (label, _tier) in [
+        ("sync", Durability::Sync),
+        ("batched", Durability::Batched),
+        ("buffered", Durability::Buffered),
+    ] {
+        let acked = parse_metric(
+            &body,
+            &format!("weir_records_ack_total{{tier=\"{label}\"}}"),
+        );
+        assert_eq!(
+            acked, per_tier_expected,
+            "expected {per_tier_expected} acks for tier {label}, got {acked} — \
+             tier dispatch is dropping or mis-routing records"
+        );
     }
 }
 
@@ -1204,17 +1257,6 @@ fn readonly_wab_dir_prevents_startup() {
 }
 
 // ── Multi-shard correctness ───────────────────────────────────────────────────
-
-#[test]
-fn all_pushes_acked_with_multiple_shards() {
-    let srv = ServerHandle::start_sharded("multi_shard_ack", 4);
-    let mut client = srv.client();
-    for i in 0..100u32 {
-        client
-            .push(format!("shard-rec-{i:04}").as_bytes(), Durability::Batched)
-            .unwrap_or_else(|e| panic!("record {i} failed: {e}"));
-    }
-}
 
 #[test]
 fn shard_directories_created_on_disk() {

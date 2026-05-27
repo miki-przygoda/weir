@@ -85,6 +85,15 @@ changes are tracked separately under **Wire protocol** below.
   `all_durability_tiers_behave_per_contract` reads the
   `weir_wab_fsync_duration_seconds_count` histogram to verify the
   tiers differ in fsync behaviour, not just that they all return Ok).
+  Top-finding #1 (happy-path over-testing) addressed: 2 redundant
+  `push().unwrap()` loops deleted
+  (`multiple_sequential_pushes_same_connection`,
+  `all_pushes_acked_with_multiple_shards`); 3 stress tests
+  (`concurrent_producers_all_acked`,
+  `sustained_load_1000_records_single_client`,
+  `mixed_durability_under_concurrent_load`) gained per-tier ack-count
+  assertions so a silent-drop or tier-mis-routing regression now fails
+  the test instead of slipping past unwrap()s.
 - **`readonly_wab_dir_prevents_startup` is now harness-portable**: spawns
   the child with `setuid(65534)` when the test runner is root so the
   `chmod 0o000` it asserts on actually bites. Was silently broken in

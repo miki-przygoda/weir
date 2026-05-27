@@ -4,10 +4,12 @@ File audited: `crates/weir-server/tests/system.rs` (1711 lines, 41 `#[test]` fun
 
 > **Status:** every verdict has been actioned. DELETE / RENAME / REWRITE in
 > commits `ba69803`, `968afd0`, `8e94cf2`. 9 of 10 STRENGTHEN items in
-> `6f9a5a1`. The 10th STRENGTHEN
-> (`concurrent_producers_all_acked_with_multiple_shards`) blocked on the
-> socket layer hardcoding `shard_id: 0`; the router fix + reinstated
-> assertion ship together in the follow-up commit on this branch.
+> `6f9a5a1`; the 10th plus the prerequisite router fix in `cee9f6f`.
+>
+> The Top-finding #1 ("happy-path over-testing") cleanup followed: 2
+> redundant tests deleted and 3 strengthened with metric-count
+> assertions so a silent-drop regression can't pass. See the follow-up
+> commit on this branch.
 
 ## Executive summary
 
