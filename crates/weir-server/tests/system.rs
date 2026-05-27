@@ -441,33 +441,6 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Spawns weir-server with the given config and waits up to `timeout` for it
-/// to exit with a non-zero status. Returns `true` if the server failed as
-/// expected, `false` if it was still running when the timeout elapsed.
-///
-/// The caller is responsible for holding `process_lock()` while calling this.
-fn wait_for_server_failure(config_path: &Path, timeout: Duration) -> bool {
-    let binary = env!("CARGO_BIN_EXE_weir-server");
-    let mut child = Command::new(binary)
-        .args(["--config", config_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn weir-server");
-
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(Some(status)) = child.try_wait() {
-            return !status.success();
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    false
-}
-
 // Helper: sum all file bytes under a directory tree.
 fn wab_dir_bytes(dir: &Path) -> u64 {
     let Ok(rd) = fs::read_dir(dir) else { return 0 };
@@ -933,6 +906,7 @@ fn wab_data_preserved_across_crash_restart() {
 #[test]
 fn readonly_wab_dir_prevents_startup() {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
 
     let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp_dir = std::env::temp_dir().join(format!("weir_fault_ro_{}", std::process::id()));
@@ -947,6 +921,17 @@ fn readonly_wab_dir_prevents_startup() {
 
     // Remove all permissions so the server cannot create shard subdirs.
     fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // When the test harness runs as root, chmod 0o000 doesn't prevent access —
+    // root bypasses DAC. Drop privileges in the child to uid `nobody` (65534)
+    // so the permission bit actually bites. socket_dir is widened so the
+    // dropped child can bind the socket; the test target is wab_dir access,
+    // not socket creation.
+    let drop_to_nobody = unsafe { libc::geteuid() } == 0;
+    if drop_to_nobody {
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     let config = format!(
         "[server]\n\
@@ -964,15 +949,54 @@ fn readonly_wab_dir_prevents_startup() {
     );
     fs::write(&config_path, config).unwrap();
 
-    let failed = wait_for_server_failure(&config_path, Duration::from_secs(5));
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+    let mut cmd = Command::new(binary);
+    cmd.args(["--config", config_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    if drop_to_nobody {
+        unsafe {
+            cmd.pre_exec(|| {
+                // 65534 is the conventional `nobody` uid in Linux containers
+                // (busybox, Debian, Ubuntu, Alpine all default to this). If the
+                // setuid call fails (uid doesn't exist on this system), let
+                // the child exec proceed — the test will then fall back to
+                // the original behavior, which is the only thing we can do
+                // without a guaranteed-present unprivileged uid.
+                let _ = libc::setgid(65534);
+                let _ = libc::setuid(65534);
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd.spawn().expect("failed to spawn weir-server");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut exit_status = None;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            exit_status = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if exit_status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 
     // Restore permissions so cleanup can remove the directory.
     fs::set_permissions(&wab_dir, fs::Permissions::from_mode(0o700)).ok();
     fs::remove_dir_all(&tmp_dir).ok();
 
+    let failed = exit_status.map(|s| !s.success()).unwrap_or(false);
     assert!(
         failed,
-        "weir-server should fail to start when wab_dir is unreadable/unwritable"
+        "weir-server should fail to start when wab_dir is unreadable/unwritable \
+         (running {}as root)",
+        if drop_to_nobody { "originally " } else { "not " }
     );
 }
 
