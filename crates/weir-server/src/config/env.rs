@@ -16,6 +16,7 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         metrics_port: env_parse("WEIR_METRICS_PORT")?,
         metrics_bind: env_string("WEIR_METRICS_BIND")?,
         metrics_max_connections: env_parse("WEIR_METRICS_MAX_CONNECTIONS")?,
+        peer_uid_check: env_parse("WEIR_PEER_UID_CHECK")?,
         shutdown_timeout_secs: env_parse("WEIR_SHUTDOWN_TIMEOUT_SECS")?,
         connection_read_timeout_secs: env_parse("WEIR_CONNECTION_READ_TIMEOUT_SECS")?,
         sink_type: env_string("WEIR_SINK_TYPE")?,

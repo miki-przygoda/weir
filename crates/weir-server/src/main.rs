@@ -335,6 +335,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shutdown_timeout_secs: config.shutdown_timeout_secs,
                 connection_read_timeout_secs: config.connection_read_timeout_secs,
                 shard_count: config.shard_count,
+                peer_uid_check: config.peer_uid_check,
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics)).await?;
         }

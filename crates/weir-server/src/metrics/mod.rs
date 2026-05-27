@@ -126,6 +126,12 @@ pub(crate) struct Metrics {
     /// byte. Elevated values suggest slowloris-style activity or a flaky
     /// client.
     pub connection_idle_timeout: Counter<u64, AtomicU64>,
+    /// Counts connections refused by the accept loop's peer-credential check
+    /// (SO_PEERCRED on Linux, getpeereid on macOS) — peer uid did not match
+    /// the daemon's, or the credential lookup failed. Should be zero on a
+    /// healthy deployment; non-zero suggests an attempted bypass of the
+    /// socket file's mode bits or a misconfigured producer.
+    pub connection_rejected_peer_uid: Counter<u64, AtomicU64>,
     /// Counts pushes that were nacked because the WAB ack channel did not
     /// fire within `ACK_TIMEOUT`. Triggered by a wedged flusher (stuck on
     /// a slow fsync, lock contention, etc.) — not by a normal slow disk.
@@ -220,6 +226,13 @@ impl Metrics {
             "weir_connection_idle_timeout",
             "Connections dropped because the handler sat in read_exact longer than \
              connection_read_timeout_secs without receiving the next byte"
+        );
+        let connection_rejected_peer_uid = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_connection_rejected_peer_uid",
+            "Connections refused by the peer-credential check (peer uid != daemon uid, \
+             or credential lookup failed). Any non-zero value suggests an attempted \
+             bypass of the socket file's 0o600 mode or a misconfigured producer."
         );
         let ack_timeout = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -327,6 +340,7 @@ impl Metrics {
             records_nack,
             accept_latency,
             connection_idle_timeout,
+            connection_rejected_peer_uid,
             ack_timeout,
             wab_segments,
             wab_bytes_on_disk,

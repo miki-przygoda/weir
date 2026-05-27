@@ -130,6 +130,7 @@ pub(crate) struct PartialConfig {
     pub metrics_port: Option<u16>,
     pub metrics_bind: Option<String>,
     pub metrics_max_connections: Option<usize>,
+    pub peer_uid_check: Option<bool>,
     pub shutdown_timeout_secs: Option<u64>,
     pub connection_read_timeout_secs: Option<u64>,
     pub sink_type: Option<String>,
@@ -187,6 +188,17 @@ pub struct Config {
     /// fork-bomb surface so a misconfigured (or hostile) client can't spawn
     /// unbounded tokio tasks against the endpoint.
     pub metrics_max_connections: usize,
+    /// When true (default), the accept loop reads the peer's effective uid
+    /// via SO_PEERCRED (Linux) / getpeereid (macOS) and refuses connections
+    /// whose uid does not match the daemon's effective uid. Defense-in-depth
+    /// on top of the socket file's `0o600` mode: if those bits are ever
+    /// loosened by operator error or a producer reaches the socket inode
+    /// some other way, mismatched-uid connections are still refused.
+    ///
+    /// Set to false only in environments where producers legitimately run
+    /// under a different uid than the daemon AND the socket directory's
+    /// permissions are the chosen trust boundary.
+    pub peer_uid_check: bool,
     pub shutdown_timeout_secs: u64,
     pub connection_read_timeout_secs: u64,
     pub sink_type: SinkType,
@@ -312,6 +324,8 @@ impl Config {
             1024,
         )?;
 
+        let peer_uid_check = merge!(peer_uid_check).unwrap_or(true);
+
         let shutdown_timeout_secs = merge!(shutdown_timeout_secs).unwrap_or(30);
         if shutdown_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
@@ -414,6 +428,7 @@ impl Config {
             metrics_port,
             metrics_bind,
             metrics_max_connections,
+            peer_uid_check,
             shutdown_timeout_secs,
             connection_read_timeout_secs,
             sink_type,

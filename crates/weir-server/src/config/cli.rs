@@ -26,6 +26,8 @@ OPTIONS:
                                                on the network) [default: 127.0.0.1]
     --metrics-max-connections <n>            Concurrent metrics scrapes cap
                                                (1-1024) [default: 8]
+    --peer-uid-check <bool>                  Refuse connections from uids other
+                                               than the daemon's [default: true]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
     --sink-type <type>                       Sink: noop | http | mysql [default: noop]
     --sink-url <url>                         Sink URL (required if type=http or mysql)
@@ -97,6 +99,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         metrics_max_connections: pargs
             .opt_value_from_str("--metrics-max-connections")
+            .map_err(pico_err)?,
+        peer_uid_check: pargs
+            .opt_value_from_str("--peer-uid-check")
             .map_err(pico_err)?,
         shutdown_timeout_secs: pargs
             .opt_value_from_str("--shutdown-timeout-secs")

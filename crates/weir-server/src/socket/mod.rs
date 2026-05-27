@@ -17,6 +17,7 @@
 //! because the pool limit is a runtime tunable.
 
 mod connection;
+mod peer;
 
 pub use connection::{ConnectionConfig, handle_connection};
 
@@ -58,6 +59,10 @@ pub struct SocketConfig {
     /// flusher threads. With shard_count = 1 every connection gets
     /// shard_id = 0.
     pub shard_count: usize,
+    /// When true, the accept loop refuses connections whose peer effective
+    /// uid (via SO_PEERCRED / getpeereid) does not match the daemon's. See
+    /// [`Config::peer_uid_check`] for the rationale.
+    pub peer_uid_check: bool,
 }
 
 /// Binds a Unix socket, accepts connections, and drives the frame-parsing layer.
@@ -106,6 +111,11 @@ pub async fn run(
     // the local guard documents the invariant and keeps the modulo safe.
     let shard_count = config.shard_count.max(1) as u64;
 
+    // Daemon's effective uid; compared against peer uid on each accept when
+    // peer_uid_check is enabled. Read once at startup — the daemon never
+    // changes uid post-start (no setuid path).
+    let daemon_uid = unsafe { libc::geteuid() };
+
     loop {
         tokio::select! {
             biased;
@@ -117,6 +127,38 @@ pub async fn run(
                 let accept_start = Instant::now();
                 match res {
                     Ok((stream, _addr)) => {
+                        // Peer-credential check: refuse mismatched uids before
+                        // any further work. See peer.rs for the platform impls.
+                        if config.peer_uid_check {
+                            match peer::peer_uid_of(&stream) {
+                                Ok(uid) if uid == daemon_uid => {
+                                    // ok — proceed to permit / handler
+                                }
+                                Ok(uid) => {
+                                    warn!(
+                                        peer_uid = uid,
+                                        daemon_uid,
+                                        "refusing connection: peer uid does not match daemon uid"
+                                    );
+                                    metrics.connection_rejected_peer_uid.inc();
+                                    drop(stream);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    // Failed to read peer creds — fail closed.
+                                    // A non-Unix-domain socket or kernel
+                                    // refusal both manifest here; either way
+                                    // we cannot prove the peer is trusted.
+                                    warn!(
+                                        error = %e,
+                                        "refusing connection: peer credential lookup failed"
+                                    );
+                                    metrics.connection_rejected_peer_uid.inc();
+                                    drop(stream);
+                                    continue;
+                                }
+                            }
+                        }
                         let permit = match sem.clone().try_acquire_owned() {
                             Ok(p) => p,
                             Err(_) => {
@@ -474,6 +516,10 @@ mod tests {
             shutdown_timeout_secs: 5,
             connection_read_timeout_secs: 30,
             shard_count: 1,
+            // Tests connect from the same process → same uid → peer-uid
+            // check always passes. Leaving the check enabled exercises the
+            // production code path.
+            peer_uid_check: true,
         }
     }
 
@@ -801,6 +847,7 @@ mod tests {
             shutdown_timeout_secs: 2,
             connection_read_timeout_secs: 30,
             shard_count: 1,
+            peer_uid_check: true,
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
