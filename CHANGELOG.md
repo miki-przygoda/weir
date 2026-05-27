@@ -59,6 +59,74 @@ changes are tracked separately under **Wire protocol** below.
   prevent?" question. Verdicts: KEEP 25 / STRENGTHEN 10 / DELETE 3 /
   RENAME 2 / REWRITE 1.
 
+### Fixed
+
+- **Three HIGH-severity correctness fixes from the post-v0.4 audit.**
+  An exploratory audit of the post-v0.4 codebase surfaced three issues
+  that the existing test surface didn't catch. All three landed as
+  separate commits with verification, fix, unit + integration tests,
+  and honest disclosure of trade-offs:
+
+  - **Partial-write corruption (audit F1, `wab/segment.rs`).**
+    `WabSegment::write_record` issued three separate `write_all` calls
+    (payload_len, crc32, payload); on partial failure (most likely
+    ENOSPC mid-record) the OS file offset advanced past stray bytes
+    that the in-memory `bytes_written` / `file_crc_hasher` /
+    `record_count` accounting never observed. Subsequent records were
+    written at the wrong offset over garbage; the segment's
+    `file_crc32` footer didn't cover the stray bytes; the drain reader
+    stopped at the first invalid record on replay, silently dropping
+    every record that came after the partial write. Fix: added
+    `poisoned: bool` to `WabSegment`; chained the three `write_all`s
+    so any failure trips the flag; `ShardWriter::write_record` now
+    drops the active segment on error so the next write opens a fresh
+    file with a new counter. The orphaned poisoned file is left on
+    disk and re-read at crash recovery up to the first invalid
+    record — records written successfully before the failure remain
+    drainable.
+  - **Unsupervised flusher panics (audit F15, `wab/mod.rs`).**
+    `flusher_thread` was spawned without `catch_unwind`. A panic
+    (e.g. one of the five `expect("…overflow")` calls in `segment.rs`
+    triggering, however unreachable in practice) silently killed the
+    thread, dropped its `Receiver<WabRecord>`, and the corresponding
+    `Sender` held inside `WabHandle.shard_txs` became a sender-to-
+    dead-channel — every subsequent `worker.rs` batch routed to that
+    shard was silently swallowed by `.ok()`. Producers saw
+    `Nack(InternalError)` for that shard forever, with no metric, no
+    tracing log of the underlying cause, no signal to operators that
+    one shard was wedged. Fix: new `run_with_panic_supervision`
+    helper wraps every flusher in `std::panic::catch_unwind`; on
+    panic it logs the payload via `tracing::error!` with the
+    `shard_id` and increments a new
+    `weir_wab_flusher_panics` counter metric whose help text
+    explicitly tells operators "any non-zero value requires attention."
+    The shard remains offline until daemon restart (respawn would
+    require keeping the receiver outside the panic scope; left as a
+    follow-up), but the failure is now observable.
+  - **Ordering across concurrent producers on the same shard
+    (audit F3, `queue.rs` / `worker.rs` / `socket/connection.rs`).**
+    The single MPMC work queue let multiple workers race for items
+    destined for the same shard; the workers' independent per-shard
+    batch buffers could flush to the shard's flusher channel in
+    arbitrary order. Per-producer ordering was always preserved
+    (the request/response protocol blocks a producer until the
+    previous record is acked, and the ack post-dates the WAB write),
+    but cross-producer ordering on a shared shard was undefined.
+    `docs/architecture.md`'s unqualified "per-shard record ordering"
+    overpromised; the existing
+    `per_shard_records_appear_in_submission_order` system test only
+    covered single-producer. Fix: replaced the MPMC queue with N
+    partitioned sub-channels (one per worker), routed by
+    `shard_id % worker_count`. Each shard now lands in exactly one
+    worker's partition; partition receivers, intra-shard batch
+    buffers, and per-shard flusher channels are all FIFO. New system
+    test `concurrent_producers_to_same_shard_preserve_per_producer_order`
+    pins the property. Trade-off documented in the
+    `Config::worker_count` docstring: with `worker_count >
+    shard_count` (e.g. the default `shard_count=1, worker_count=2`)
+    excess workers idle; operators should set
+    `worker_count == shard_count` for full parallelism.
+
 ### Changed
 
 - **Multi-shard routing now actually fans out across connections.** The
