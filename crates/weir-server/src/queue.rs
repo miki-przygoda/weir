@@ -65,6 +65,23 @@ impl<T> QueueSender<T> {
         self.txs[idx].send(unit).ok();
     }
 
+    /// Non-blocking push to the partition selected by `partition_key`.
+    ///
+    /// Returns `Err(unit)` if the partition is full or every receiver has
+    /// been dropped. Used by the connection handler as a fast path: when
+    /// the partition has capacity (the common case under normal load) we
+    /// avoid the cross-thread hop to the blocking pool entirely. Only on
+    /// `Err` does the handler fall back to `push_timeout` via
+    /// `spawn_blocking`.
+    pub fn try_push(&self, partition_key: usize, unit: T) -> Result<(), T> {
+        let idx = partition_key % self.txs.len();
+        use crossbeam_channel::TrySendError;
+        match self.txs[idx].try_send(unit) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(u) | TrySendError::Disconnected(u)) => Err(u),
+        }
+    }
+
     /// Attempts to push a work unit to the partition selected by
     /// `partition_key`, waiting at most `timeout`.
     ///

@@ -223,10 +223,9 @@ pub async fn handle_connection(
                 .await?;
             }
             MessageType::HealthCheck => {
-                let header =
-                    Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0);
-                let frame = Envelope::new(header, Vec::new()).encode();
-                stream.write_all(&frame).await?;
+                stream
+                    .write_all(healthcheck_response_frame_bytes())
+                    .await?;
             }
             _ => {
                 debug!(msg_type = ?header.message_type, "unexpected message type from client");
@@ -266,10 +265,21 @@ async fn handle_push(
     // in the same worker's queue, preserving per-shard FIFO across multiple
     // concurrent producers. See worker::spawn_workers for the full chain.
     let partition_key = unit.shard_id as usize;
-    let push_result =
-        task::spawn_blocking(move || queue_tx.push_timeout(partition_key, unit, QUEUE_PUSH_TIMEOUT))
-            .await
-            .map_err(io::Error::other)?;
+    // Fast path: try a non-blocking push. crossbeam's MPMC send is lock-free
+    // when the partition has capacity (the common case under normal load),
+    // so we avoid the spawn_blocking cross-thread hop entirely. Only fall
+    // back to the blocking timeout path when the partition is actually full
+    // — that preserves the existing backpressure behaviour (short waits
+    // tolerated, sustained saturation nacks).
+    let push_result: Result<(), ()> = match queue_tx.try_push(partition_key, unit) {
+        Ok(()) => Ok(()),
+        Err(unit) => task::spawn_blocking(move || {
+            queue_tx.push_timeout(partition_key, unit, QUEUE_PUSH_TIMEOUT)
+        })
+        .await
+        .map_err(io::Error::other)?
+        .map_err(|_| ()),
+    };
 
     if push_result.is_err() {
         send_nack(stream, WireNack::InternalError, &[]).await?;
@@ -373,10 +383,32 @@ async fn send_nack(stream: &mut UnixStream, reason: WireNack, extra: &[u8]) -> i
     stream.write_all(&frame).await
 }
 
+/// The Ack frame's 20 bytes are entirely constant — fixed magic, fixed
+/// version, fixed message_type, zero-length payload, header CRC over the
+/// same fixed bytes, and empty-payload CRC = 0. Memoised on first call so
+/// the steady state writes a borrowed `&'static [u8]` instead of
+/// allocating + encoding + CRC-ing identical 20-byte buffers per response.
+fn ack_frame_bytes() -> &'static [u8] {
+    static ACK_FRAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    ACK_FRAME.get_or_init(|| {
+        let header = Header::new(MessageType::Ack, Durability::Sync, 0, 0);
+        Envelope::new(header, Vec::new()).encode()
+    })
+}
+
+/// Same memoisation story as [`ack_frame_bytes`] but for the
+/// `HealthCheckResponse` frame (different message_type → different header
+/// CRC, otherwise identical shape).
+fn healthcheck_response_frame_bytes() -> &'static [u8] {
+    static HEALTHCHECK_RESPONSE_FRAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    HEALTHCHECK_RESPONSE_FRAME.get_or_init(|| {
+        let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0);
+        Envelope::new(header, Vec::new()).encode()
+    })
+}
+
 async fn send_ack(stream: &mut UnixStream) -> io::Result<()> {
-    let header = Header::new(MessageType::Ack, Durability::Sync, 0, 0);
-    let frame = Envelope::new(header, Vec::new()).encode();
-    stream.write_all(&frame).await
+    stream.write_all(ack_frame_bytes()).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
