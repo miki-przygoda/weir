@@ -111,6 +111,132 @@ fn nack_payload_too_large_encodes_to_reference_bytes() {
     );
 }
 
+// ── Nack(VersionMismatch) response ────────────────────────────────────────────
+
+/// Nack frame for VersionMismatch carries a 2-byte payload: the reason byte
+/// (0x02) followed by the daemon's WIRE_VERSION. The second byte lets the
+/// client render "daemon is on vN; you are on vM" without an extra round-trip.
+/// Total 22 bytes.
+const REFERENCE_NACK_VERSION_MISMATCH: &[u8; 22] = &[
+    0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
+    0x01, // version = 1
+    0x03, // message_type = Nack (0x03)
+    0x01, // durability = Sync (filler)
+    0x00, // flags
+    0x02, 0x00, 0x00, 0x00, // payload_len = 2
+    0xf6, 0x84, 0x35, 0x36, // header_crc32
+    0x02, WIRE_VERSION, // NackReason::VersionMismatch + daemon WIRE_VERSION
+    0xeb, 0x40, 0xe8, 0x04, // payload_crc32 (of [0x02, 0x01])
+];
+
+#[test]
+fn nack_version_mismatch_encodes_to_reference_bytes() {
+    use weir_core::NackReason;
+    let header = Header::new(MessageType::Nack, Durability::Sync, 0, 2);
+    let envelope = Envelope::new(
+        header,
+        vec![NackReason::VersionMismatch as u8, WIRE_VERSION],
+    );
+    let encoded = envelope.encode();
+    assert_eq!(
+        encoded.as_slice(),
+        REFERENCE_NACK_VERSION_MISMATCH.as_slice(),
+        "encoder drifted from docs/wire_protocol.md → \
+         Nack(VersionMismatch). Either restore byte-compatibility or \
+         update the doc and this constant."
+    );
+}
+
+// ── Nack(BadHeaderCrc) response ───────────────────────────────────────────────
+
+/// Single-byte Nack payload: just the reason byte (0x03). No `extra` bytes
+/// — the client already knows the frame's header was corrupt because it's
+/// receiving this Nack. Total 21 bytes.
+const REFERENCE_NACK_BAD_HEADER_CRC: &[u8; 21] = &[
+    0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
+    0x01, // version = 1
+    0x03, // message_type = Nack (0x03)
+    0x01, // durability = Sync (filler)
+    0x00, // flags
+    0x01, 0x00, 0x00, 0x00, // payload_len = 1
+    0x18, 0x2b, 0x80, 0x24, // header_crc32 (same header as PayloadTooLarge)
+    0x03, // NackReason::BadHeaderCrc
+    0x37, 0xbe, 0x0b, 0x4b, // payload_crc32 (of [0x03])
+];
+
+#[test]
+fn nack_bad_header_crc_encodes_to_reference_bytes() {
+    use weir_core::NackReason;
+    let header = Header::new(MessageType::Nack, Durability::Sync, 0, 1);
+    let envelope = Envelope::new(header, vec![NackReason::BadHeaderCrc as u8]);
+    let encoded = envelope.encode();
+    assert_eq!(
+        encoded.as_slice(),
+        REFERENCE_NACK_BAD_HEADER_CRC.as_slice(),
+        "encoder drifted from docs/wire_protocol.md → \
+         Nack(BadHeaderCrc). Either restore byte-compatibility or \
+         update the doc and this constant."
+    );
+}
+
+// ── HealthCheck request ───────────────────────────────────────────────────────
+
+/// Client → daemon. Zero-length payload, all-zero payload CRC. The
+/// durability byte is unused (clients send Sync by convention). Total 20 bytes.
+const REFERENCE_HEALTHCHECK: &[u8; 20] = &[
+    0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
+    0x01, // version = 1
+    0x04, // message_type = HealthCheck (0x04)
+    0x01, // durability = Sync (filler)
+    0x00, // flags
+    0x00, 0x00, 0x00, 0x00, // payload_len = 0
+    0xf3, 0x72, 0x9b, 0x59, // header_crc32
+    0x00, 0x00, 0x00, 0x00, // payload_crc32 (empty payload → 0)
+];
+
+#[test]
+fn healthcheck_encodes_to_reference_bytes() {
+    let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0, 0);
+    let envelope = Envelope::new(header, Vec::new());
+    let encoded = envelope.encode();
+    assert_eq!(
+        encoded.as_slice(),
+        REFERENCE_HEALTHCHECK.as_slice(),
+        "encoder drifted from docs/wire_protocol.md → \
+         HealthCheck request. Either restore byte-compatibility or \
+         update the doc and this constant."
+    );
+}
+
+// ── HealthCheckResponse ──────────────────────────────────────────────────────
+
+/// Daemon → client. Same shape as HealthCheck but with the response
+/// message_type. Total 20 bytes.
+const REFERENCE_HEALTHCHECK_RESPONSE: &[u8; 20] = &[
+    0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
+    0x01, // version = 1
+    0x05, // message_type = HealthCheckResponse (0x05)
+    0x01, // durability = Sync (filler)
+    0x00, // flags
+    0x00, 0x00, 0x00, 0x00, // payload_len = 0
+    0x47, 0x79, 0xec, 0xff, // header_crc32
+    0x00, 0x00, 0x00, 0x00, // payload_crc32 (empty payload → 0)
+];
+
+#[test]
+fn healthcheck_response_encodes_to_reference_bytes() {
+    let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0);
+    let envelope = Envelope::new(header, Vec::new());
+    let encoded = envelope.encode();
+    assert_eq!(
+        encoded.as_slice(),
+        REFERENCE_HEALTHCHECK_RESPONSE.as_slice(),
+        "encoder drifted from docs/wire_protocol.md → \
+         HealthCheckResponse. Either restore byte-compatibility or \
+         update the doc and this constant."
+    );
+}
+
 // ── CRC algorithm spot-check ──────────────────────────────────────────────────
 
 /// Confirms the wire CRC is the IEEE/ISO-3309 variant (polynomial
