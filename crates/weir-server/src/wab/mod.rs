@@ -70,6 +70,49 @@ fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
     wab_dir.join(format!("shard_{shard_id:02}"))
 }
 
+/// Best-effort string extraction from a `catch_unwind` payload. `panic!` with
+/// a string literal lands in `&'static str`; `panic!("{}", ...)` lands in
+/// `String`. Anything else gets a placeholder so the log line still says
+/// *something*.
+fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return s;
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.as_str();
+    }
+    "<non-string panic payload>"
+}
+
+/// Wraps a flusher body in `catch_unwind` so a panic becomes an observable
+/// event (log line + metric increment) rather than a silent thread death that
+/// leaves the shard offline with no signal to operators.
+///
+/// Does NOT respawn — once a flusher panics, its receiver is dropped and the
+/// shard remains offline until the daemon restarts. Respawn would require
+/// keeping the receiver outside the panic scope and is left as a follow-up.
+///
+/// `AssertUnwindSafe`: the flusher owns its inputs (no shared mutable state
+/// across the call boundary); we accept the unwind-safety claim.
+fn run_with_panic_supervision(
+    shard_id: usize,
+    metrics_for_panic: Arc<Metrics>,
+    body: impl FnOnce(),
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    if let Err(panic_payload) = result {
+        let msg = panic_message_str(&panic_payload);
+        tracing::error!(
+            shard = shard_id,
+            panic = %msg,
+            "WAB flusher thread panicked — shard is now offline. \
+             Records routed to this shard will Nack(InternalError) \
+             until the daemon is restarted."
+        );
+        metrics_for_panic.wab_flusher_panics.inc();
+    }
+}
+
 /// Creates a directory (and all parents) with mode `0o700` on Unix.
 /// On non-Unix platforms falls back to `create_dir_all` with the process umask.
 pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
@@ -118,7 +161,8 @@ pub fn spawn(
 
         let sdir = shard_dir_path(&wab_dir, shard_id);
         let drain_clone = drain_tx.clone();
-        let metrics_clone = Arc::clone(&metrics);
+        let metrics_for_flusher = Arc::clone(&metrics);
+        let metrics_for_panic = Arc::clone(&metrics);
         let batch_size = config.batch_size;
         let batch_deadline = config.batch_deadline;
         let segment_max_bytes = config.segment_max_bytes;
@@ -127,17 +171,19 @@ pub fn spawn(
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
             .spawn(move || {
-                flusher_thread(
-                    shard_id as u16,
-                    sdir,
-                    rx,
-                    drain_clone,
-                    batch_size,
-                    batch_deadline,
-                    segment_max_bytes,
-                    core_id,
-                    metrics_clone,
-                );
+                run_with_panic_supervision(shard_id, metrics_for_panic, || {
+                    flusher_thread(
+                        shard_id as u16,
+                        sdir,
+                        rx,
+                        drain_clone,
+                        batch_size,
+                        batch_deadline,
+                        segment_max_bytes,
+                        core_id,
+                        metrics_for_flusher,
+                    );
+                });
             })
             .map_err(io::Error::other)?;
 
@@ -522,5 +568,52 @@ mod tests {
         let mut reader = SegmentReader::open(&sealed).unwrap();
         assert!(reader.next().unwrap().is_err());
         fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Panic supervision ─────────────────────────────────────────────────────
+
+    #[test]
+    fn supervisor_catches_str_panic_and_increments_metric() {
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let m = Arc::new(m);
+        run_with_panic_supervision(0, Arc::clone(&m), || panic!("boom"));
+        assert_eq!(m.wab_flusher_panics.get(), 1);
+    }
+
+    #[test]
+    fn supervisor_catches_formatted_panic_and_increments_metric() {
+        // panic!("{}", ...) lands in String, not &'static str — verify the
+        // downcast covers both shapes.
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let m = Arc::new(m);
+        let shard = 7;
+        run_with_panic_supervision(shard, Arc::clone(&m), move || {
+            panic!("panic from shard {shard}");
+        });
+        assert_eq!(m.wab_flusher_panics.get(), 1);
+    }
+
+    #[test]
+    fn supervisor_lets_clean_exit_pass_through() {
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let m = Arc::new(m);
+        run_with_panic_supervision(0, Arc::clone(&m), || { /* normal return */ });
+        assert_eq!(m.wab_flusher_panics.get(), 0);
+    }
+
+    #[test]
+    fn panic_message_str_handles_known_payload_shapes() {
+        // Construct payloads the same way `panic!` does, then box them as
+        // `dyn Any + Send` to match the catch_unwind signature.
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("static str panic");
+        assert_eq!(panic_message_str(&str_payload), "static str panic");
+
+        let string_payload: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("owned string panic"));
+        assert_eq!(panic_message_str(&string_payload), "owned string panic");
+
+        // Non-string payload — must not panic the panic-message extractor itself.
+        let int_payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(panic_message_str(&int_payload), "<non-string panic payload>");
     }
 }

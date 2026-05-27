@@ -131,6 +131,11 @@ pub(crate) struct Metrics {
     pub wab_segments: Family<SegmentStateLabel, Counter<u64, AtomicU64>>,
     pub wab_bytes_on_disk: Gauge<f64, AtomicU64>,
     pub wab_fsync_duration: Histogram,
+    /// WAB flusher thread panics. Once a flusher panics, its shard is offline
+    /// (records routed to it receive Nack(InternalError)) until the daemon
+    /// restarts — any non-zero value requires operator attention. Check logs
+    /// for the shard_id and panic payload.
+    pub wab_flusher_panics: Counter<u64, AtomicU64>,
 
     // ── Sink / drain ──────────────────────────────────────────────────────────
     pub sink_commit_duration: Histogram,
@@ -217,6 +222,14 @@ impl Metrics {
             "weir_wab_fsync_duration_seconds",
             "Wall-clock time of WAB fdatasync calls"
         );
+        let wab_flusher_panics = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_flusher_panics",
+            "WAB flusher thread panics. A panicked flusher leaves its shard offline \
+             (records routed to it receive Nack(InternalError)) until the daemon \
+             restarts. Any non-zero value requires operator attention; check logs \
+             for the shard_id and panic payload."
+        );
         let sink_commit_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),
             "weir_sink_commit_duration_seconds",
@@ -288,6 +301,7 @@ impl Metrics {
             wab_segments,
             wab_bytes_on_disk,
             wab_fsync_duration,
+            wab_flusher_panics,
             sink_commit_duration,
             sink_commit_records,
             sink_health,
