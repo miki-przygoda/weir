@@ -360,6 +360,13 @@ fn flush_batch(
     shard_id: u16,
     metrics: &Arc<Metrics>,
 ) {
+    // Sync records used to fsync per-record; now they ride the same
+    // group-fsync as Batched. Sync's contract is "fsync before ack" and
+    // a single fsync at the end of the batch covers every record written
+    // during it, so the contract still holds while the fsync rate drops
+    // by up to batch_size× under concurrent Sync load (the previous
+    // per-record fsync was the bottleneck in the herd benchmarks).
+    let mut sync_acks: Vec<oneshot::Sender<bool>> = Vec::new();
     let mut batched_acks: Vec<oneshot::Sender<bool>> = Vec::new();
     let mut need_fsync = false;
 
@@ -384,8 +391,8 @@ fn flush_batch(
 
         match record.durability {
             Durability::Sync => {
-                let ok = fsync_observed(writer, shard_id, metrics);
-                let _ = record.ack_tx.send(ok);
+                need_fsync = true;
+                sync_acks.push(record.ack_tx);
             }
             Durability::Batched => {
                 need_fsync = true;
@@ -397,10 +404,12 @@ fn flush_batch(
         }
     }
 
-    // Group fsync for all Batched records in this flush.
+    // Group fsync covering every Sync and Batched record written during
+    // this flush. One fsync per batch instead of one per Sync record;
+    // both tiers' acks fire after it completes.
     if need_fsync {
         let ok = fsync_observed(writer, shard_id, metrics);
-        for ack_tx in batched_acks {
+        for ack_tx in sync_acks.into_iter().chain(batched_acks) {
             let _ = ack_tx.send(ok);
         }
     }
