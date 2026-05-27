@@ -61,6 +61,14 @@ changes are tracked separately under **Wire protocol** below.
 
 ### Changed
 
+- **Multi-shard routing now actually fans out across connections.** The
+  socket-layer accept loop previously hardcoded `shard_id: 0` in every
+  `WorkUnit`, so `shard_count > 1` configurations spawned the extra
+  flusher threads but funnelled every record into shard 0. The accept
+  loop now assigns shard IDs round-robin (`accept_counter %
+  shard_count`); each connection is pinned to a single shard for its
+  lifetime — no per-record routing decision on the hot path. Single-shard
+  deployments are unaffected (counter `% 1` is always 0).
 - **System test suite refactored from audit findings**: 3 theatre tests
   deleted (`health_check_on_separate_connection_from_push`,
   `wab_segment_rotation_creates_multiple_segments`,
@@ -71,7 +79,12 @@ changes are tracked separately under **Wire protocol** below.
   `efbig_returns_nack_not_crash`); 1 split into two strict-assertion
   tests (`metrics_consistent_across_crash_restart` →
   `metrics_internally_consistent_per_session` +
-  `metrics_reset_to_zero_after_restart`).
+  `metrics_reset_to_zero_after_restart`). All 10 STRENGTHEN items from
+  `docs/testing/test-audit.md` actioned — each test now actually
+  exercises the property its name claims (e.g.
+  `all_durability_tiers_behave_per_contract` reads the
+  `weir_wab_fsync_duration_seconds_count` histogram to verify the
+  tiers differ in fsync behaviour, not just that they all return Ok).
 - **`readonly_wab_dir_prevents_startup` is now harness-portable**: spawns
   the child with `setuid(65534)` when the test runner is root so the
   `chmod 0o000` it asserts on actually bites. Was silently broken in

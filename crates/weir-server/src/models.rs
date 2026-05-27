@@ -6,7 +6,10 @@ use weir_core::{Durability, Payload};
 /// `ack_tx` is held intact through the batch; the WAB drain sends the ack after
 /// the record is durably written.
 pub struct WorkUnit {
-    /// Target shard, set by the socket layer (e.g. connection hash mod shard_count).
+    /// Target shard. Assigned by the socket layer's accept loop on a
+    /// round-robin basis (`accept_counter % shard_count`) so every connection
+    /// gets a single deterministic shard for its lifetime. With
+    /// `shard_count = 1` every WorkUnit lands on shard 0.
     pub shard_id: u32,
     /// Opaque payload bytes from the wire envelope.
     pub payload: Payload,

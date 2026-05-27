@@ -315,6 +315,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_payload_bytes: config.max_payload_bytes,
                 shutdown_timeout_secs: config.shutdown_timeout_secs,
                 connection_read_timeout_secs: config.connection_read_timeout_secs,
+                shard_count: config.shard_count,
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics)).await?;
         }

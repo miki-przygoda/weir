@@ -1250,8 +1250,9 @@ fn shard_directories_created_on_disk() {
 fn concurrent_producers_all_acked_with_multiple_shards() {
     const THREADS: usize = 4;
     const RECORDS_PER_THREAD: usize = 50;
+    const SHARD_COUNT: usize = 4;
 
-    let srv = ServerHandle::start_sharded("multi_shard_conc", 4);
+    let srv = ServerHandle::start_sharded("multi_shard_conc", SHARD_COUNT);
     let socket_path = srv.socket_path.clone();
 
     let handles: Vec<_> = (0..THREADS)
@@ -1273,12 +1274,23 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
         h.join().expect("producer thread panicked");
     }
 
-    // NOTE: the audit recommended asserting work landed in ≥2 shard
-    // directories. That requires the socket layer to actually route
-    // connections across shards, which it currently does not (shard_id is
-    // hardcoded to 0 in src/socket/connection.rs:handle_push). The
-    // strengthening lands in the follow-up commit that fixes the router;
-    // this commit leaves the test as it was so the suite stays green.
+    // Without the assertion below the test would be indistinguishable from
+    // `concurrent_producers_all_acked` — a buggy router that always picked
+    // shard 0 would still pass. Walk the per-shard directories and confirm
+    // work actually fanned out. With round-robin assignment by connection
+    // counter and 4 concurrent connections, all 4 shards should see data.
+    let mut shards_with_data = 0usize;
+    for shard_id in 0..SHARD_COUNT {
+        let shard_dir = srv.wab_dir.join(format!("shard_{shard_id:02}"));
+        if wab_dir_bytes(&shard_dir) > 0 {
+            shards_with_data += 1;
+        }
+    }
+    assert!(
+        shards_with_data >= 2,
+        "expected records to land in ≥2 shard directories, only {shards_with_data} of \
+         {SHARD_COUNT} have data — connection-to-shard routing is collapsed"
+    );
 }
 
 // ── Graceful shutdown under load ──────────────────────────────────────────────

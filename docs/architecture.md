@@ -68,6 +68,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 
 - Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, `chmod 0o600` after bind).
 - Accepts connections up to `max_connections` (Semaphore-gated; over-cap streams are dropped immediately).
+- Assigns each accepted connection a `shard_id` round-robin (`accept_counter % shard_count`). Every WorkUnit pushed on that connection inherits the same shard_id, so a connection is pinned to one WAB flusher for its lifetime — no per-record routing decision on the hot path.
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
 - `QueueSender::push_timeout` is used with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.

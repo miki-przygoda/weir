@@ -34,6 +34,13 @@ pub struct ConnectionConfig {
     /// (or sends only a partial frame) and would otherwise hold a semaphore
     /// permit indefinitely.
     pub read_timeout: Duration,
+    /// Target shard for every WorkUnit pushed on this connection. The accept
+    /// loop in `socket::run` assigns this round-robin (counter % shard_count)
+    /// at connection time so a multi-shard config (shard_count > 1) actually
+    /// fans out work across the per-shard WAB flusher threads. With
+    /// shard_count = 1 every connection gets shard_id = 0, which matches the
+    /// pre-multi-shard behaviour.
+    pub shard_id: u32,
 }
 
 /// Handles one client connection: parses frames in a loop, queues work units,
@@ -175,6 +182,7 @@ pub async fn handle_connection(
                     header.durability,
                     payload,
                     tv,
+                    config.shard_id,
                     &metrics,
                 )
                 .await?;
@@ -208,11 +216,12 @@ async fn handle_push(
     durability: Durability,
     payload: Vec<u8>,
     tv: TierValue,
+    shard_id: u32,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let unit = WorkUnit {
-        shard_id: 0,
+        shard_id,
         payload,
         durability,
         ack_tx,
@@ -333,6 +342,7 @@ mod tests {
         ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_secs(30),
+            shard_id: 0,
         }
     }
 
@@ -456,6 +466,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: 16,
             read_timeout: Duration::from_secs(30),
+            shard_id: 0,
         };
         let mut client = spawn_handler(cfg).await;
 
@@ -490,6 +501,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP + 1,
             read_timeout: Duration::from_secs(30),
+            shard_id: 0,
         };
         let mut client = spawn_handler(cfg).await;
 
@@ -559,6 +571,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
+            shard_id: 0,
         };
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
@@ -608,6 +621,7 @@ mod tests {
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
+            shard_id: 0,
         };
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);

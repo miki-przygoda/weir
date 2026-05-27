@@ -52,6 +52,12 @@ pub struct SocketConfig {
     /// Per-connection idle read timeout in seconds. Caps slowloris-style
     /// connections that never send (or stall mid-frame).
     pub connection_read_timeout_secs: u64,
+    /// Total number of WAB shards. The accept loop assigns each new
+    /// connection a shard_id by round-robin (counter % shard_count) so
+    /// multi-shard deployments actually fan work across all per-shard
+    /// flusher threads. With shard_count = 1 every connection gets
+    /// shard_id = 0.
+    pub shard_count: usize,
 }
 
 /// Binds a Unix socket, accepts connections, and drives the frame-parsing layer.
@@ -83,13 +89,21 @@ pub async fn run(
     let effective_cap = config
         .max_payload_bytes
         .min(weir_core::MAX_PAYLOAD_HARD_CAP);
-    let conn_cfg = ConnectionConfig {
+    let conn_cfg_template = ConnectionConfig {
         max_payload_bytes: effective_cap,
         read_timeout: Duration::from_secs(config.connection_read_timeout_secs),
+        shard_id: 0, // overridden per connection below
     };
     let sem = std::sync::Arc::new(Semaphore::new(config.max_connections));
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown_rx);
+    // Round-robin connection counter for shard_id assignment. Wraps via
+    // modulo at each use; the counter itself can grow without bound for
+    // ~600 years of acceptances at 1M/s, so no overflow handling needed.
+    let conn_counter = std::sync::atomic::AtomicU64::new(0);
+    // Guard against shard_count = 0 — Config validation enforces ≥ 1, but
+    // the local guard documents the invariant and keeps the modulo safe.
+    let shard_count = config.shard_count.max(1) as u64;
 
     loop {
         tokio::select! {
@@ -111,7 +125,9 @@ pub async fn run(
                             }
                         };
                         let tx = queue_tx.clone();
-                        let cfg = conn_cfg.clone();
+                        let mut cfg = conn_cfg_template.clone();
+                        let n = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        cfg.shard_id = (n % shard_count) as u32;
                         let m = std::sync::Arc::clone(&metrics);
                         join_set.spawn(async move {
                             let _permit = permit;
@@ -456,6 +472,7 @@ mod tests {
             max_payload_bytes: weir_core::MAX_PAYLOAD_HARD_CAP,
             shutdown_timeout_secs: 5,
             connection_read_timeout_secs: 30,
+            shard_count: 1,
         }
     }
 
@@ -782,6 +799,7 @@ mod tests {
             max_payload_bytes: weir_core::MAX_PAYLOAD_HARD_CAP,
             shutdown_timeout_secs: 2,
             connection_read_timeout_secs: 30,
+            shard_count: 1,
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
