@@ -91,13 +91,13 @@ pub async fn handle_connection(
         let header = match Header::decode(&header_buf) {
             Ok(h) => h,
             Err(e) => {
-                let reason = decode_err_to_metric_nack(&e);
-                send_decode_nack(&mut stream, &e).await?;
+                let (wire, metric, extra) = nack_for_decode_error(&e);
+                send_nack(&mut stream, wire, extra).await?;
                 metrics
                     .records_nack
                     .get_or_create(&NackLabel {
                         tier: TierValue::sync,
-                        reason,
+                        reason: metric,
                     })
                     .inc();
                 return Ok(());
@@ -278,12 +278,31 @@ fn durability_to_tier(d: Durability) -> TierValue {
     }
 }
 
-fn decode_err_to_metric_nack(e: &DecodeError) -> MetricNack {
+/// Single source of truth mapping a [`DecodeError`] to the three pieces of
+/// information every nack site needs: the wire-level [`WireNack`] variant
+/// (sent on the socket), the Prometheus-label [`MetricNack`] variant
+/// (incremented on `records_nack`), and the extra bytes that accompany the
+/// reason byte in the Nack payload.
+///
+/// Adding a new `DecodeError` variant now requires touching only this one
+/// match — the previous design had two parallel tables (`decode_err_to_metric_nack`
+/// and `send_decode_nack`) that could drift independently.
+fn nack_for_decode_error(e: &DecodeError) -> (WireNack, MetricNack, &'static [u8]) {
     match e {
-        DecodeError::BadMagic => MetricNack::bad_magic,
-        DecodeError::VersionMismatch { .. } => MetricNack::version_mismatch,
-        DecodeError::HeaderCrcMismatch { .. } => MetricNack::bad_header_crc,
-        _ => MetricNack::internal_error,
+        DecodeError::BadMagic => (WireNack::BadMagic, MetricNack::bad_magic, &[]),
+        // Second byte is the daemon's WIRE_VERSION so the client can render
+        // "daemon is on wire protocol v{WIRE_VERSION}; this client is on vN."
+        DecodeError::VersionMismatch { .. } => (
+            WireNack::VersionMismatch,
+            MetricNack::version_mismatch,
+            &[WIRE_VERSION],
+        ),
+        DecodeError::HeaderCrcMismatch { .. } => (
+            WireNack::BadHeaderCrc,
+            MetricNack::bad_header_crc,
+            &[],
+        ),
+        _ => (WireNack::InternalError, MetricNack::internal_error, &[]),
     }
 }
 
@@ -312,22 +331,6 @@ async fn send_ack(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_all(&header).await?;
     stream.write_all(&payload_crc).await?;
     Ok(())
-}
-
-/// Maps a `DecodeError` to the appropriate Nack.
-async fn send_decode_nack(stream: &mut UnixStream, err: &DecodeError) -> io::Result<()> {
-    match err {
-        DecodeError::BadMagic => send_nack(stream, WireNack::BadMagic, &[]).await,
-        DecodeError::VersionMismatch { .. } => {
-            // Second byte is the daemon's WIRE_VERSION so the client can produce
-            // a human-readable "upgrade the daemon / downgrade the client" message.
-            send_nack(stream, WireNack::VersionMismatch, &[WIRE_VERSION]).await
-        }
-        DecodeError::HeaderCrcMismatch { .. } => {
-            send_nack(stream, WireNack::BadHeaderCrc, &[]).await
-        }
-        _ => send_nack(stream, WireNack::InternalError, &[]).await,
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
