@@ -802,8 +802,8 @@ mod tests {
             shard_count: 1,
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
-        let _rx = queue_rx.get(); // keep receiver alive
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let _rx = queue_rx.get(0); // keep receiver alive
 
         tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -831,7 +831,7 @@ mod tests {
         let path = tmp_socket_path("shutdown");
         let cfg = default_config(path.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
 
         let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -858,7 +858,7 @@ mod tests {
             let path = tmp_socket_path("perms");
             let cfg = default_config(path.clone());
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            let (queue_tx, _) = queue::new::<WorkUnit>();
+            let (queue_tx, _) = queue::new::<WorkUnit>(1);
 
             tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
             tokio::time::sleep(Duration::from_millis(30)).await;

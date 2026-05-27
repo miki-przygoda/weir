@@ -94,8 +94,17 @@ impl Worker {
     }
 }
 
-/// Spawns `worker_count` worker threads, each consuming from the shared queue
-/// and routing work units into per-shard batch buffers.
+/// Spawns `worker_count` worker threads. Each worker owns one queue partition
+/// (`worker_idx == partition_idx`) and routes the units it pulls into
+/// per-shard batch buffers.
+///
+/// **Per-shard ordering**: the connection layer pushes each record with
+/// `partition_key = shard_id`, so every record destined for a given shard
+/// lands in the same partition and is handled by a single worker. The
+/// partition receiver is FIFO, the worker's intra-shard buffer is FIFO, and
+/// the shard's flusher channel is FIFO — so a record acked to a producer is
+/// guaranteed to reach the per-shard WAB writer ahead of any record acked
+/// later for the same shard, even across multiple concurrent connections.
 ///
 /// Returns one `Receiver<Batch>` per shard (consumed by the WAB drain) and
 /// one `JoinHandle` per worker. Workers exit cleanly when all `QueueSender`
@@ -119,9 +128,16 @@ pub fn spawn_workers(
         shard_rxs.push(rx);
     }
 
+    assert_eq!(
+        queue_rx.partitions(),
+        worker_count,
+        "worker count must equal queue partition count — every worker owns \
+         exactly one partition so per-shard FIFO is preserved"
+    );
+
     let mut handles = Vec::with_capacity(worker_count);
     for worker_idx in 0..worker_count {
-        let work_rx = queue_rx.get();
+        let work_rx = queue_rx.get(worker_idx);
         let txs = shard_txs.clone();
         let core_id = if core_ids.is_empty() {
             None
@@ -277,11 +293,11 @@ mod tests {
 
     #[test]
     fn single_worker_batches_on_deadline() {
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(20));
 
         let (unit, _ack) = make_unit(0, b"hello");
-        queue_tx.push(unit);
+        queue_tx.push(0, unit);
 
         let batch = batch_rxs[0]
             .recv_timeout(Duration::from_millis(200))
@@ -298,7 +314,7 @@ mod tests {
 
     #[test]
     fn batch_flushes_at_batch_size() {
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let batch_size = 3;
         // 60s deadline — flush must be triggered by batch-full, not timeout.
         let (batch_rxs, handles) =
@@ -306,7 +322,7 @@ mod tests {
 
         for _ in 0..batch_size {
             let (unit, _) = make_unit(0, b"x");
-            queue_tx.push(unit);
+            queue_tx.push(0, unit);
         }
 
         let batch = batch_rxs[0]
@@ -322,12 +338,12 @@ mod tests {
 
     #[test]
     fn pending_batches_flushed_on_sender_drop() {
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         // 60s deadline — flush must be triggered by disconnect, not timeout.
         let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 100, Duration::from_secs(60));
 
         let (unit, _) = make_unit(0, b"pending");
-        queue_tx.push(unit);
+        queue_tx.push(0, unit);
         drop(queue_tx); // triggers Disconnected in the worker
 
         let batch = batch_rxs[0]
@@ -343,7 +359,7 @@ mod tests {
 
     #[test]
     fn spawn_workers_returns_correct_counts() {
-        let (_queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (_queue_tx, queue_rx) = queue::new::<WorkUnit>(2);
         let (batch_rxs, handles) = spawn_workers(&queue_rx, 3, 2, 100, Duration::from_millis(10));
         assert_eq!(batch_rxs.len(), 3);
         assert_eq!(handles.len(), 2);
@@ -356,7 +372,7 @@ mod tests {
 
     #[test]
     fn worker_exits_cleanly_after_disconnect() {
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (_batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(10));
 
         drop(queue_tx);

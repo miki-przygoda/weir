@@ -94,7 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Queue ─────────────────────────────────────────────────────────────────
 
-    let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+    // One queue partition per worker. Pushes are routed by shard_id so every
+    // record for a given shard lands on a single worker's partition — see
+    // worker::spawn_workers for the per-shard FIFO invariant.
+    let (queue_tx, queue_rx) = queue::new::<WorkUnit>(config.worker_count);
 
     // ── Drain channel ─────────────────────────────────────────────────────────
 

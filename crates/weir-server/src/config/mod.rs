@@ -159,6 +159,13 @@ pub struct Config {
     /// Absolute canonicalized path to the WAB directory (must exist at startup).
     pub wab_dir: PathBuf,
     pub shard_count: usize,
+    /// Number of worker threads draining the work queue. The queue is
+    /// partitioned by `shard_id`, so each shard is owned by exactly one
+    /// worker (`worker_idx = shard_id % worker_count`). For best throughput
+    /// set `worker_count == shard_count` — values above `shard_count` leave
+    /// the excess workers idle (no shard ever routes to them), values below
+    /// share a worker across multiple shards (still correct, lower
+    /// parallelism per shard).
     pub worker_count: usize,
     pub batch_size: usize,
     pub batch_deadline_ms: u64,

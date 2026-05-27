@@ -1988,6 +1988,80 @@ fn per_shard_records_appear_in_submission_order() {
     }
 }
 
+/// Concurrent producers writing to the same shard must each see their own
+/// records appear in submission order in the WAB, even with worker_count > 1.
+///
+/// Single-shard, worker_count = 2 (the default). N concurrent producers each
+/// push M records identifying themselves by `(producer_id, sequence)`. After
+/// all producers finish, every producer's records must appear in ascending
+/// sequence order in the WAB bytes.
+///
+/// Pre-F3 (single MPMC queue, multiple workers racing): per-producer order is
+/// still preserved by the request/response protocol (a producer can't push the
+/// next record until the previous is acked, and the ack post-dates the WAB
+/// write). This test pins that behaviour and ensures the partition queue
+/// (which now routes shard_id → worker so each shard is owned by exactly one
+/// worker) preserves it too — the partition channel is FIFO, the worker's
+/// intra-shard buffer is FIFO, the shard's flusher channel is FIFO.
+#[test]
+fn concurrent_producers_to_same_shard_preserve_per_producer_order() {
+    const N_PRODUCERS: usize = 4;
+    const N_RECORDS: usize = 50;
+
+    let srv = ServerHandle::start_sharded("concurrent_ordering", 1);
+    let socket_path = srv.socket_path.clone();
+
+    let handles: Vec<_> = (0..N_PRODUCERS)
+        .map(|producer_id| {
+            let sock = socket_path.clone();
+            std::thread::spawn(move || {
+                let mut client = weir_client::WeirClient::connect(&sock)
+                    .expect("client connect");
+                for seq in 0..N_RECORDS {
+                    let payload = format!("p{producer_id:02}-s{seq:05}").into_bytes();
+                    client
+                        .push(&payload, Durability::Sync)
+                        .unwrap_or_else(|e| panic!("push p{producer_id} s{seq}: {e:?}"));
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("producer thread panicked");
+    }
+
+    // Flush + give the server a beat to seal whatever's still active.
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after concurrent pushes");
+
+    let wab_bytes = read_wab_bytes(&srv.wab_dir);
+    assert!(!wab_bytes.is_empty(), "WAB must have data after pushes");
+
+    for producer_id in 0..N_PRODUCERS {
+        let mut prev_offset: Option<usize> = None;
+        for seq in 0..N_RECORDS {
+            let payload = format!("p{producer_id:02}-s{seq:05}").into_bytes();
+            let offset = wab_bytes
+                .windows(payload.len())
+                .position(|w| w == payload.as_slice())
+                .unwrap_or_else(|| {
+                    panic!("payload p{producer_id:02}-s{seq:05} not found in WAB bytes")
+                });
+            if let Some(prev) = prev_offset {
+                assert!(
+                    offset > prev,
+                    "producer {producer_id} record {seq} at offset {offset} appears \
+                     before its own predecessor at offset {prev} — per-producer \
+                     submission order not preserved"
+                );
+            }
+            prev_offset = Some(offset);
+        }
+    }
+}
+
 // ── Batch deadline timer accuracy ─────────────────────────────────────────────
 
 /// With `batch_deadline_ms = 20`, each individual Sync push must complete

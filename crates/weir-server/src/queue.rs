@@ -2,66 +2,103 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 
-/// Bounded MPMC queue capacity. The socket layer blocks on `push` when the
-/// channel is full, providing backpressure that signals producers to slow
-/// down rather than growing unboundedly or silently dropping records.
+/// Total work-queue capacity, split evenly across partitions in [`new`].
 pub const QUEUE_CAPACITY: usize = 65_536;
 
-/// Send half of the work queue. Cheap to clone — all clones share the same
-/// underlying bounded channel. Drop all clones to close the channel and
-/// propagate the shutdown signal to every worker `Receiver`.
-pub struct QueueSender<T> {
-    tx: Sender<T>,
-}
-
-/// Receive half of the work queue. Call `get()` once per worker thread to
-/// hand each worker its own `Receiver` clone from the shared MPMC channel.
-pub struct QueueReceiver<T> {
-    rx: Receiver<T>,
-}
-
-/// Creates a bounded MPMC work queue with `QUEUE_CAPACITY` slots.
+/// Send half of the work queue. Internally a fixed set of bounded sub-channels
+/// — one per partition — selected at push time by a caller-supplied key. The
+/// partition is the unit of FIFO ordering: any two records pushed with the
+/// same key are delivered to the same receiver in submission order.
 ///
-/// Dropping all `QueueSender` clones closes the channel; every `Receiver`
-/// clone returned by `get()` will observe `RecvError::Disconnected` once the
-/// in-flight items are drained, propagating the shutdown signal to workers.
-pub fn new<T>() -> (QueueSender<T>, QueueReceiver<T>) {
-    let (tx, rx) = crossbeam_channel::bounded(QUEUE_CAPACITY);
-    (QueueSender { tx }, QueueReceiver { rx })
+/// Cheap to clone — every clone shares the same underlying sub-channels.
+/// Dropping all clones closes every sub-channel and propagates shutdown to
+/// every worker `Receiver`.
+pub struct QueueSender<T> {
+    txs: Vec<Sender<T>>,
+}
+
+/// Receive half of the work queue. One `Receiver` per partition; each worker
+/// owns one partition's receiver and never sees records from any other.
+pub struct QueueReceiver<T> {
+    rxs: Vec<Receiver<T>>,
+}
+
+/// Creates a bounded partitioned work queue with `partitions` independent
+/// sub-channels totalling `QUEUE_CAPACITY` slots.
+///
+/// The sender routes each push to `partition_key % partitions`. The receiver
+/// hands out one `Receiver` per partition via [`QueueReceiver::get`].
+///
+/// Dropping all `QueueSender` clones closes every sub-channel; every
+/// `Receiver` will observe `Disconnected` once its in-flight items are
+/// drained, propagating the shutdown signal to workers.
+///
+/// # Panics
+///
+/// Panics if `partitions == 0`. Callers must validate before calling.
+pub fn new<T>(partitions: usize) -> (QueueSender<T>, QueueReceiver<T>) {
+    assert!(partitions >= 1, "queue must have at least one partition");
+    let per_partition = (QUEUE_CAPACITY / partitions).max(1);
+    let mut txs = Vec::with_capacity(partitions);
+    let mut rxs = Vec::with_capacity(partitions);
+    for _ in 0..partitions {
+        let (tx, rx) = crossbeam_channel::bounded(per_partition);
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    (QueueSender { txs }, QueueReceiver { rxs })
 }
 
 impl<T> QueueSender<T> {
-    /// Pushes a work unit onto the queue, blocking the calling thread until a
-    /// slot is available.
+    /// Pushes a work unit onto the partition selected by `partition_key`,
+    /// blocking the calling thread until a slot is available.
     ///
-    /// This is the intentional backpressure point: the socket handler blocks
-    /// here under load rather than allocating unboundedly or dropping records.
-    /// If all `QueueReceiver` clones have been dropped (workers exited), the
-    /// unit is silently discarded — the caller is in the shutdown path and the
-    /// socket listener will be closed imminently.
+    /// If every `QueueReceiver` clone has been dropped, the unit is silently
+    /// discarded — the caller is in the shutdown path and the socket listener
+    /// will be closed imminently.
     #[allow(dead_code)]
-    pub fn push(&self, unit: T) {
-        self.tx.send(unit).ok();
+    pub fn push(&self, partition_key: usize, unit: T) {
+        let idx = partition_key % self.txs.len();
+        self.txs[idx].send(unit).ok();
     }
 
-    /// Returns the number of items currently buffered in the channel.
+    /// Total in-flight count summed across every partition.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.tx.len()
+        self.txs.iter().map(|t| t.len()).sum()
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.tx.is_empty()
+        self.txs.iter().all(|t| t.is_empty())
     }
 
-    /// Attempts to push a work unit within `timeout`.
+    /// Number of partitions this sender routes to.
+    #[allow(dead_code)]
+    pub fn partitions(&self) -> usize {
+        self.txs.len()
+    }
+
+    /// Attempts to push a work unit to the partition selected by
+    /// `partition_key`, waiting at most `timeout`.
     ///
-    /// Returns `Err(unit)` if the channel is full for the entire duration or all
-    /// receivers have disconnected. The socket layer uses this to nack rather
-    /// than block indefinitely when the queue is saturated or workers have exited.
-    pub fn push_timeout(&self, unit: T, timeout: Duration) -> Result<(), T> {
-        match self.tx.send_timeout(unit, timeout) {
+    /// Returns `Err(unit)` if the chosen partition is full for the entire
+    /// duration or all of its receivers have been dropped. The socket layer
+    /// uses this to nack rather than block indefinitely when a partition is
+    /// saturated.
+    ///
+    /// **Per-shard ordering**: records produced with the same `partition_key`
+    /// land on the same sub-channel, so a single producer's records on a
+    /// given shard arrive at the worker in submission order even when
+    /// other producers are concurrently pushing to the same shard.
+    pub fn push_timeout(
+        &self,
+        partition_key: usize,
+        unit: T,
+        timeout: Duration,
+    ) -> Result<(), T> {
+        let idx = partition_key % self.txs.len();
+        match self.txs[idx].send_timeout(unit, timeout) {
             Ok(()) => Ok(()),
             Err(SendTimeoutError::Timeout(u) | SendTimeoutError::Disconnected(u)) => Err(u),
         }
@@ -71,19 +108,23 @@ impl<T> QueueSender<T> {
 impl<T> Clone for QueueSender<T> {
     fn clone(&self) -> Self {
         QueueSender {
-            tx: self.tx.clone(),
+            txs: self.txs.clone(),
         }
     }
 }
 
 impl<T> QueueReceiver<T> {
-    /// Returns a `Receiver` clone for one worker thread.
+    /// Returns the `Receiver` for a specific partition.
     ///
-    /// Each worker should call this once during setup. All returned receivers
-    /// share the same MPMC channel — any sender push is delivered to exactly
-    /// one receiver (fair work distribution with no duplication).
-    pub fn get(&self) -> Receiver<T> {
-        self.rx.clone()
+    /// Each worker should call this once with its own worker index (typically
+    /// `worker_idx == partition`). Records pushed with `partition_key == idx`
+    /// arrive at the returned receiver in submission order.
+    pub fn get(&self, partition: usize) -> Receiver<T> {
+        self.rxs[partition].clone()
+    }
+
+    pub fn partitions(&self) -> usize {
+        self.rxs.len()
     }
 }
 
@@ -93,62 +134,67 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    /// Test-only constructor with a custom capacity so blocking behaviour can
-    /// be exercised without filling 65_536 slots.
-    fn new_with_capacity<T>(cap: usize) -> (QueueSender<T>, QueueReceiver<T>) {
-        let (tx, rx) = crossbeam_channel::bounded(cap);
-        (QueueSender { tx }, QueueReceiver { rx })
+    /// Test-only constructor that lets a test override the per-partition
+    /// capacity so blocking behaviour can be exercised without filling
+    /// `QUEUE_CAPACITY / partitions` slots.
+    fn new_with_capacity<T>(partitions: usize, per_partition_cap: usize) -> (QueueSender<T>, QueueReceiver<T>) {
+        let mut txs = Vec::with_capacity(partitions);
+        let mut rxs = Vec::with_capacity(partitions);
+        for _ in 0..partitions {
+            let (tx, rx) = crossbeam_channel::bounded(per_partition_cap);
+            txs.push(tx);
+            rxs.push(rx);
+        }
+        (QueueSender { txs }, QueueReceiver { rxs })
     }
 
     #[test]
     fn push_and_get_basic_send_receive() {
-        let (tx, rx) = new::<u32>();
-        let recv = rx.get();
-        tx.push(42u32);
+        let (tx, rx) = new::<u32>(1);
+        let recv = rx.get(0);
+        tx.push(0, 42u32);
         assert_eq!(recv.recv().unwrap(), 42);
     }
 
     #[test]
-    fn len_reflects_in_flight_count() {
-        let (tx, rx) = new::<u32>();
-        let _recv = rx.get(); // keep receiver alive so push does not discard
+    fn len_reflects_in_flight_count_across_partitions() {
+        let (tx, rx) = new::<u32>(2);
+        let _r0 = rx.get(0);
+        let _r1 = rx.get(1);
         assert_eq!(tx.len(), 0);
-        tx.push(1);
-        tx.push(2);
-        tx.push(3);
+        tx.push(0, 1); // partition 0
+        tx.push(1, 2); // partition 1
+        tx.push(2, 3); // partition 0 (2 % 2)
         assert_eq!(tx.len(), 3);
     }
 
     #[test]
     fn dropping_sender_disconnects_receiver() {
-        let (tx, rx) = new::<u32>();
-        let recv = rx.get();
+        let (tx, rx) = new::<u32>(1);
+        let recv = rx.get(0);
         drop(tx);
-        // No senders remain — recv must observe Disconnected.
         assert!(recv.recv().is_err());
     }
 
     #[test]
-    fn queue_blocks_producer_at_capacity() {
-        let (tx, rx) = new_with_capacity::<u32>(2);
-        let recv = rx.get();
+    fn queue_blocks_producer_at_partition_capacity() {
+        let (tx, rx) = new_with_capacity::<u32>(1, 2);
+        let recv = rx.get(0);
 
-        tx.push(1);
-        tx.push(2); // channel now full
+        tx.push(0, 1);
+        tx.push(0, 2); // partition now full
 
-        // A third push must block. Run it on a separate thread.
         let tx2 = tx.clone();
         let handle = thread::spawn(move || {
-            tx2.push(3); // blocks until consumer frees a slot
+            tx2.push(0, 3); // blocks until consumer frees a slot
         });
 
         thread::sleep(Duration::from_millis(20));
         assert!(
             !handle.is_finished(),
-            "producer should be blocked on a full queue"
+            "producer should be blocked on a full partition"
         );
 
-        // Drain one slot — producer should unblock.
         assert_eq!(recv.recv().unwrap(), 1);
         handle
             .join()
@@ -157,54 +203,74 @@ mod tests {
 
     #[test]
     fn push_timeout_returns_unit_when_full_and_timeout_expires() {
-        let (tx, _rx) = new_with_capacity::<u32>(1);
-        tx.push(1); // fill the channel
-        let result = tx.push_timeout(2, Duration::from_millis(20));
-        assert!(
-            result.is_err(),
-            "push_timeout should time out on a full channel"
-        );
-        assert_eq!(
-            result.unwrap_err(),
-            2,
-            "returned item should be the original unit"
-        );
+        let (tx, _rx) = new_with_capacity::<u32>(1, 1);
+        tx.push(0, 1);
+        let result = tx.push_timeout(0, 2, Duration::from_millis(20));
+        assert!(result.is_err(), "push_timeout should time out");
+        assert_eq!(result.unwrap_err(), 2);
     }
 
     #[test]
     fn push_timeout_succeeds_when_slot_available() {
-        let (tx, rx) = new_with_capacity::<u32>(2);
-        let _recv = rx.get();
-        assert!(tx.push_timeout(42, Duration::from_millis(20)).is_ok());
+        let (tx, rx) = new_with_capacity::<u32>(1, 2);
+        let _r = rx.get(0);
+        assert!(tx.push_timeout(0, 42, Duration::from_millis(20)).is_ok());
     }
 
     #[test]
     fn push_timeout_returns_unit_when_disconnected() {
-        let (tx, rx) = new_with_capacity::<u32>(1);
-        drop(rx); // drop all receivers
-        let result = tx.push_timeout(99, Duration::from_millis(20));
+        let (tx, rx) = new_with_capacity::<u32>(1, 1);
+        drop(rx);
+        let result = tx.push_timeout(0, 99, Duration::from_millis(20));
         assert_eq!(result.unwrap_err(), 99);
     }
 
     #[test]
-    fn multiple_receivers_share_channel() {
-        let (tx, rx) = new::<u32>();
-        let recv_a = rx.get();
-        let recv_b = rx.get();
-
-        tx.push(10);
-        tx.push(20);
-
-        // Drain both receivers. Each item is delivered to exactly one receiver
-        // with no duplication and no loss — total must be exactly [10, 20].
-        let mut items = Vec::new();
-        while let Ok(v) = recv_a.try_recv() {
-            items.push(v);
+    fn partition_isolation_preserves_order_per_key() {
+        // The whole point of partitioning: items pushed with the same key
+        // arrive at the same receiver in submission order, regardless of
+        // what concurrent producers are doing on other keys.
+        let (tx, rx) = new::<u32>(4);
+        let recv0 = rx.get(0);
+        // Push 50 items to partition 0 interleaved with pushes to other
+        // partitions. The partition-0 receiver must see them in submission order.
+        for i in 0..50u32 {
+            tx.push(0, i);                 // partition 0
+            tx.push(1, 1000 + i);          // partition 1
+            tx.push(2, 2000 + i);          // partition 2
         }
-        while let Ok(v) = recv_b.try_recv() {
-            items.push(v);
+        let mut seen: Vec<u32> = Vec::new();
+        while let Ok(v) = recv0.try_recv() {
+            seen.push(v);
         }
-        items.sort_unstable();
-        assert_eq!(items, vec![10, 20]);
+        assert_eq!(
+            seen,
+            (0..50u32).collect::<Vec<_>>(),
+            "partition 0 receiver must see exactly its own pushes in submission order"
+        );
+    }
+
+    #[test]
+    fn partition_key_modulus_routes_correctly() {
+        let (tx, rx) = new::<u32>(3);
+        let r0 = rx.get(0);
+        let r1 = rx.get(1);
+        let r2 = rx.get(2);
+        tx.push(0, 10);  // partition 0
+        tx.push(1, 20);  // partition 1
+        tx.push(2, 30);  // partition 2
+        tx.push(3, 40);  // partition 0 (3 % 3)
+        tx.push(4, 50);  // partition 1 (4 % 3)
+        assert_eq!(r0.try_recv().unwrap(), 10);
+        assert_eq!(r0.try_recv().unwrap(), 40);
+        assert_eq!(r1.try_recv().unwrap(), 20);
+        assert_eq!(r1.try_recv().unwrap(), 50);
+        assert_eq!(r2.try_recv().unwrap(), 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one partition")]
+    fn new_panics_with_zero_partitions() {
+        let _ = new::<u32>(0);
     }
 }

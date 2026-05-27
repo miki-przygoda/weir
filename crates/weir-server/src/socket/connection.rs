@@ -227,9 +227,14 @@ async fn handle_push(
         ack_tx,
     };
 
-    let push_result = task::spawn_blocking(move || queue_tx.push_timeout(unit, QUEUE_PUSH_TIMEOUT))
-        .await
-        .map_err(io::Error::other)?;
+    // Partition by shard_id so every record destined for a given shard lands
+    // in the same worker's queue, preserving per-shard FIFO across multiple
+    // concurrent producers. See worker::spawn_workers for the full chain.
+    let partition_key = unit.shard_id as usize;
+    let push_result =
+        task::spawn_blocking(move || queue_tx.push_timeout(partition_key, unit, QUEUE_PUSH_TIMEOUT))
+            .await
+            .map_err(io::Error::other)?;
 
     if push_result.is_err() {
         send_nack(stream, WireNack::InternalError, &[]).await?;
@@ -350,14 +355,14 @@ mod tests {
     /// Returns the client-side stream.
     async fn spawn_handler(cfg: ConnectionConfig) -> UnixStream {
         let (client, server) = UnixStream::pair().unwrap();
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
 
         // Auto-acker: blocking crossbeam recv must run on an OS thread, not in a
         // tokio task — blocking a tokio worker thread stalls the entire runtime.
         std::thread::spawn(move || {
-            let rx = queue_rx.get();
+            let rx = queue_rx.get(0);
             while let Ok(unit) = rx.recv() {
                 let _ = unit.ack_tx.send(true);
             }
@@ -545,7 +550,7 @@ mod tests {
     async fn queue_saturated_returns_internal_error_nack() {
         // Drop the receiver immediately so push_timeout returns Disconnected at once.
         let (client, server) = UnixStream::pair().unwrap();
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         drop(queue_rx); // no receivers → Disconnected on first push
         let cfg = test_cfg();
         let (m, _reg) = crate::metrics::Metrics::new();
@@ -567,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn read_timeout_drops_idle_connection_before_header() {
         let (client, server) = UnixStream::pair().unwrap();
-        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
@@ -617,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn read_timeout_drops_idle_connection_during_payload() {
         let (mut client, server) = UnixStream::pair().unwrap();
-        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
