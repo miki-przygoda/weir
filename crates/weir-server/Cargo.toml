@@ -43,6 +43,13 @@ reqwest = { version = "0.12", default-features = false, features = [
 # can deduplicate retries that follow the drain's at-least-once contract.
 # RustCrypto pure-Rust SHA-2, no system dependency.
 sha2 = "0.10"
+# MySQL sink: async client with pooling. default-features = false drops
+# native-tls / flate2 / time-related features; we only need the connection,
+# the protocol, and rustls for TLS to production servers.
+mysql_async = { version = "0.34", default-features = false, features = [
+    "minimal-rust",
+    "rustls-tls",
+] }
 
 [dev-dependencies]
 weir-client = { path = "../weir-client" }

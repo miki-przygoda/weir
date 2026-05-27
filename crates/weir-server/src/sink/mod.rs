@@ -6,6 +6,9 @@
 //!   without a real downstream.
 //! - [`http::HttpSink`] — POSTs each record to a configurable URL with
 //!   transient/permanent error classification. Use when `sink_type = "http"`.
+//! - [`mysql::MySqlSink`] — writes a whole batch with one multi-row
+//!   `INSERT` statement. The IOPS-compression sink: N records → 1 statement
+//!   → 1 server-side commit. Use when `sink_type = "mysql"`.
 //!
 //! A `Sink` receives batches of records from the drain and commits them to a
 //! downstream store. Implementations decide their own connection management and
@@ -28,6 +31,7 @@
 //! caller if they need type erasure.
 
 pub mod http;
+pub mod mysql;
 pub mod noop;
 
 use weir_core::Payload;
