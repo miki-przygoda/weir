@@ -24,6 +24,7 @@
     - [Bare-metal results](benchmarks/bare-metal.md)
     - [Per-version history](benchmarks/history.md)
     - [Environments](benchmarks/environments.md)
+    - [weir-bench tool](benchmarks/weir-bench.md)
     - [Batch-tuning sweep](benchmarks/batch-tuning.md)
 
 # Security

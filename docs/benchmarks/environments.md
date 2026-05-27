@@ -65,6 +65,14 @@ done
 python3 deploy/avg_benchmarks.py load_results.jsonl docs/benchmarks/latest.md
 ```
 
+## Driving a running daemon with weir-bench
+
+For ad-hoc capture against a daemon you've started yourself (custom
+config, profiler attached, non-default sink), use the standalone
+[`weir-bench`](weir-bench.md) binary. It connects to a Unix socket
+and emits the same `BENCH:` JSONL format the in-tree load suite uses,
+so the renderer is shared.
+
 ## What to compare
 
 - **Cross-commit regressions** — run the suite on the same machine before and
