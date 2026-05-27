@@ -2,6 +2,15 @@
 
 File audited: `crates/weir-server/tests/system.rs` (1711 lines, 41 `#[test]` functions).
 
+> **Status:** the DELETE / RENAME / REWRITE verdicts have been actioned
+> (see commits `ba69803`, `968afd0`, `8e94cf2`). The STRENGTHEN verdicts
+> are actioned in the follow-up commit on this branch — 9 of 10 land
+> directly; the 10th (`concurrent_producers_all_acked_with_multiple_shards`,
+> "assert work landed in ≥2 shard directories") is blocked on a separate
+> fix to `src/socket/connection.rs` where `shard_id` is currently
+> hardcoded to 0, contradicting the architecture doc. That fix and the
+> reinstated assertion ship as their own feature commit.
+
 ## Executive summary
 
 - **Total tests:** 41
