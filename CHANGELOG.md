@@ -210,6 +210,50 @@ The five commits making up this pass:
   findings summary now strikes through the closed items. Audit
   remains useful as a record of what was found and what was done.
 
+### Added (tooling)
+
+- **`fuzz/` directory + cargo-fuzz infrastructure for the trust-boundary
+  parsers.** Two coverage-guided fuzz targets ship the on-disk and
+  on-wire byte parsers — both reach attacker-controlled bytes (the
+  WAB confirmed-file is on-disk-trustworthy only as long as the host
+  isn't compromised, and the wire envelope decoder reads every byte
+  off an unauthenticated socket):
+  - **`wab_confirmed`** —
+    `weir_server::wab::format::parse_confirmed`. Reached at startup
+    by the drain's directory scan and at runtime by confirmation
+    writes.
+  - **`envelope_parse`** — `weir_core::Envelope::decode`. Every
+    connected client gets to feed this function arbitrary bytes.
+
+  Property under test (both targets): never panic on any input.
+  Errors are expected for most random inputs; panics are not.
+
+  The existing proptest harness in
+  `crates/weir-core/tests/reference_frames.rs` covers the
+  *round-trip* direction (encode → decode of valid envelopes
+  yields the original); the fuzz targets cover the *inverse*
+  (arbitrary input never panics, regardless of whether it
+  round-trips).
+
+  **`docs/testing/fuzzing.md`** ships as operator-facing
+  documentation: how to install nightly + cargo-fuzz, how to
+  invoke each target, how to seed a corpus from existing
+  reference frames, and what's deliberately deferred (CI
+  integration, the SegmentReader target — see the doc for
+  rationale).
+
+  Cargo-fuzz needs nightly Rust, so the fuzz crate lives outside
+  the workspace (`fuzz/Cargo.toml` declares its own
+  `[workspace]`) and stable users invoking `cargo build` from
+  the repo root don't get pulled into nightly.
+
+  A minimal `weir-server` library facade
+  (`crates/weir-server/src/lib.rs`) was added to expose the
+  format parsers to the fuzz crate without leaking
+  internal types. The surface is deliberately narrow — only
+  `wab::format` — to keep the production binary's
+  `pub(crate)` boundary intact.
+
 ### Changed
 
 - **WAB flusher: panic respawn replaces "offline until daemon restart."**

@@ -1,0 +1,54 @@
+[package]
+name = "weir-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Standalone workspace so the fuzz crate doesn't pull `weir-server` into a
+# nightly toolchain when stable users invoke `cargo build` from the repo
+# root. `cargo +nightly fuzz` runs only inside this directory.
+[workspace]
+members = ["."]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Depend on weir-server by path so the fuzz targets can call the format
+# parsers directly via the narrow library facade in `src/lib.rs`. The
+# facade exposes only `wab::format::parse_confirmed` plus its
+# supporting types — none of the sink, drain, or socket runtime code
+# is reachable from this build.
+weir-server = { path = "../crates/weir-server" }
+weir-core = { path = "../crates/weir-core" }
+
+[[bin]]
+name = "wab_confirmed"
+path = "fuzz_targets/wab_confirmed.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "envelope_parse"
+path = "fuzz_targets/envelope_parse.rs"
+test = false
+doc = false
+
+# A `wab_segment_reader` target would round out the on-disk coverage by
+# fuzzing `SegmentReader::open + iterate` against arbitrary bytes, but
+# `SegmentReader` lives in `weir-server::wab::mod.rs` next to types
+# that aren't `pub`-clean for external use (the `Metrics` handle is
+# `pub(crate)`). Exposing it via the library facade either re-introduces
+# the visibility-leak warnings or requires extracting the parsing into
+# `wab/format.rs`. Both options are reasonable follow-ups; this commit
+# ships the infrastructure with the two surfaces that are already
+# library-shaped — the on-disk `parse_confirmed` and the wire-format
+# `Envelope::decode`.
+
+# Release profile mirrors the workspace's tuning: cargo-fuzz uses
+# `--release` by default for both performance AND for closer-to-prod
+# code generation. lto isn't enabled in fuzzing because it slows down
+# the build-edit cycle without changing what's reachable.
+[profile.release]
+debug = 1
