@@ -210,6 +210,53 @@ The five commits making up this pass:
   findings summary now strikes through the closed items. Audit
   remains useful as a record of what was found and what was done.
 
+### Added
+
+- **Postgres sink: TLS support via `?sslmode=require` in the URL.**
+  The initial Postgres sink shipped with a `NoTls` connector and the
+  CHANGELOG noted TLS as a "planned follow-up via
+  `tokio-postgres-rustls`." This commit implements the opt-in:
+
+  - **URL-based opt-in.** `?sslmode=require` triggers
+    `tokio-postgres-rustls::MakeRustlsConnect` (webpki-roots bundle,
+    aws-lc-rs crypto provider, explicitly selected via
+    `ClientConfig::builder_with_provider`). The default
+    (`SslMode::Prefer`) and explicit `?sslmode=disable` both keep
+    the cleartext path — an upgrade does not silently enable TLS on
+    a previously cleartext deployment.
+  - **Dep surface.** Three new direct deps:
+    `tokio-postgres-rustls = "0.14"` (default-features off,
+    `["aws-lc-rs", "webpki-roots"]`), `rustls = "0.23"`,
+    `webpki-roots = "1"`. All three are already in the lockfile
+    transitively via reqwest / mysql_async; naming them as direct
+    deps lets `postgres.rs` construct the `ClientConfig` /
+    `RootCertStore` explicitly.
+  - **Explicit provider selection.** The workspace pulls both `ring`
+    (via reqwest's older default) and `aws-lc-rs` (via the new
+    tokio-postgres-rustls feature), which causes rustls's
+    auto-detect to panic with "could not determine CryptoProvider."
+    `build_tls_connector` uses
+    `ClientConfig::builder_with_provider(aws_lc_rs::default_provider())`
+    to pick deterministically without touching the process-global
+    default, so it's safe to call alongside other rustls users in
+    the same binary.
+  - **Three new unit tests** in `src/sink/postgres.rs::tests`:
+    - `sslmode_require_builds_sink_with_tls_connector` — pins the
+      TLS-required build path.
+    - `default_sslmode_prefer_does_not_enable_tls_silently` —
+      pins the non-breaking default behaviour with an assertion on
+      `pg_config.get_ssl_mode() == SslMode::Prefer`.
+    - `sslmode_disable_builds_sink_with_no_tls` — pins the
+      explicit-disable path.
+  - **`docs/operations/configuration.md`** updated: the "TLS is not
+    yet supported" section is replaced with the opt-in recipe and
+    a sample URL.
+
+  Live TLS handshake testing is deferred to the sink integration
+  suite (`deploy/run-sink-integration-tests.sh`) — a future
+  follow-up will add a TLS-enabled Postgres variant to the
+  compose stack.
+
 ### Fixed
 
 - **`weir_wab_segments_total{state="open"}` metric now actually

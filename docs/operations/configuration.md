@@ -782,14 +782,33 @@ The Postgres URL contains credentials. **Always** supply it via
 `WEIR_SINK_URL` rather than the TOML file. The `PostgresSinkConfig`
 Debug impl redacts the password before logging.
 
-**TLS is not yet supported by the Postgres sink** — the initial sink
-ships with a `NoTls` connector to keep the dependency surface minimal.
-Cleartext is acceptable on private networks where Postgres typically
-lives (e.g. a unix-domain socket bridge or a VPC-internal endpoint).
-For TLS-required deployments, plumb a TLS-terminating proxy
-(stunnel, ghostunnel, pgbouncer with TLS to the upstream) in front of
-the Postgres server. Native TLS support is a planned follow-up via
-`tokio-postgres-rustls`.
+**TLS support: opt-in via `?sslmode=require` in the URL.** The Postgres
+sink uses `tokio-postgres-rustls` (webpki-roots, aws-lc-rs) when the
+URL's `sslmode` query parameter is `require`, and `NoTls` otherwise.
+Opt-in semantics rather than auto-detect: an upgrade does not silently
+enable TLS on a previously-cleartext deployment.
+
+```toml
+# Cleartext (default; safe for private networks):
+WEIR_SINK_URL=postgres://user:pw@10.0.0.5:5432/weir
+
+# TLS required:
+WEIR_SINK_URL=postgres://user:pw@db.example.com:5432/weir?sslmode=require
+```
+
+Cert verification uses the Mozilla root store bundled via
+`webpki-roots` — no host-system CA configuration required. The aws-lc-rs
+crypto provider is explicitly selected (the same one weir uses for
+mysql+tls and for outbound reqwest TLS), keeping the binary's
+code-signing surface at one provider.
+
+For cleartext deployments without operator control over `sslmode` (e.g.
+a managed Postgres URL that omits it), the tokio-postgres default
+`sslmode=prefer` is treated as cleartext — `sslmode=require` is the
+explicit opt-in. A TLS-terminating proxy (stunnel, ghostunnel,
+pgbouncer with TLS upstream) remains a valid option for deployments
+that need certificate-pinning or client-auth — neither is wired up
+by the in-process connector yet.
 
 ---
 

@@ -56,14 +56,33 @@ mysql_async = { version = "0.34", default-features = false, features = [
     "rustls-tls",
 ] }
 # Postgres sink: tokio-postgres + deadpool-postgres for connection pooling.
-# Mirrors the MySQL sink's pool-based connection model. No TLS feature yet
-# — Postgres-over-TLS belongs in a follow-up so the initial sink ships with
-# a minimal dep surface; cleartext is fine on private networks where
-# postgres typically lives, and the `sink_url` opt-in is required anyway.
+# Mirrors the MySQL sink's pool-based connection model.
 tokio-postgres = "0.7"
 deadpool-postgres = { version = "0.14", default-features = false, features = [
     "rt_tokio_1",
 ] }
+# Postgres TLS connector — opt-in via the URL's `?sslmode=require` query
+# parameter. aws-lc-rs is already the workspace's crypto provider (via
+# reqwest's rustls and mysql_async); webpki-roots gives a bundled CA
+# store so the sink doesn't depend on the host's system CA configuration.
+# default-features = false keeps the dep surface tight; the explicit
+# features pin both choices.
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = [
+    "aws-lc-rs",
+    "webpki-roots",
+] }
+# rustls and webpki-roots are already in the workspace transitively (via
+# reqwest, mysql_async, tokio-postgres-rustls). Naming them here as direct
+# deps lets postgres.rs construct the `ClientConfig` + `RootCertStore`
+# explicitly. Default features kept ON: rustls's defaults pull in
+# `aws_lc_rs` (the workspace crypto provider), `tls12`, `logging`,
+# `prefer-post-quantum`, and `std` — all desirable for a server binary.
+# default-features = false caused a "could not determine CryptoProvider"
+# panic at `ClientConfig::builder()` time because cargo's feature
+# unification across the multiple rustls dependents didn't carry
+# `aws_lc_rs` through to OUR builder call site.
+rustls = "0.23"
+webpki-roots = "1"
 
 [dev-dependencies]
 weir-client = { path = "../weir-client" }

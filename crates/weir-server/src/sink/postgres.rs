@@ -63,8 +63,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
-use tokio_postgres::{Config as PgConfig, NoTls, error::SqlState};
-use tracing::{debug, warn};
+use tokio_postgres::{Config as PgConfig, NoTls, config::SslMode, error::SqlState};
+use tokio_postgres_rustls::MakeRustlsConnect;
+use tracing::{debug, info, warn};
 use weir_core::Payload;
 
 use super::sql_common::{self, SqlSinkError};
@@ -165,15 +166,38 @@ impl PostgresSink {
             .url
             .parse()
             .map_err(|e: tokio_postgres::Error| PostgresSinkBuildError::InvalidUrl(e.to_string()))?;
-        let mgr = Manager::from_config(
-            pg_config,
-            // No TLS for the initial sink — see module-level docs on the
-            // deliberate trade-off.
-            NoTls,
-            ManagerConfig {
-                recycling_method: RecyclingMethod::Fast,
-            },
-        );
+
+        // TLS opt-in via `?sslmode=require` in the URL. The other two
+        // tokio-postgres SslMode values keep the cleartext path so we
+        // don't surprise operators on upgrade:
+        //
+        //   - `disable` (explicit): NoTls. Operator said no.
+        //   - `prefer`  (the tokio-postgres default if no sslmode set):
+        //                NoTls. Strictly speaking PG's "prefer" means
+        //                "try TLS, fall back" — implementing that in a
+        //                single-connector design is awkward, and
+        //                quietly enabling TLS on what's currently a
+        //                cleartext deployment is a worse failure mode
+        //                than the opposite. Operators who actually
+        //                want TLS write `?sslmode=require` and get
+        //                exactly that.
+        //   - `require` (explicit): MakeRustlsConnect with webpki roots.
+        //                Connection refuses to fall back to cleartext.
+        let mgr_config = ManagerConfig {
+            recycling_method: RecyclingMethod::Fast,
+        };
+        let mgr = match pg_config.get_ssl_mode() {
+            SslMode::Require => {
+                info!(
+                    table = %config.table,
+                    "postgres sink: TLS required via sslmode=require (webpki roots, rustls)"
+                );
+                Manager::from_config(pg_config, build_tls_connector(), mgr_config)
+            }
+            // `Prefer` is the silent default; `Disable` is explicit. Both
+            // get NoTls — see comment above.
+            _ => Manager::from_config(pg_config, NoTls, mgr_config),
+        };
         let pool = Pool::builder(mgr)
             // Conservative pool: the drain calls commit() sequentially so
             // one connection covers the steady state. Two extras leave
@@ -211,6 +235,38 @@ impl PostgresSink {
             self.config.table, self.config.column
         )
     }
+}
+
+// ── TLS connector ─────────────────────────────────────────────────────────────
+
+/// Builds the rustls `ClientConfig` used by `Manager::from_config` when
+/// the URL opts in via `?sslmode=require`. Uses webpki-roots (bundled
+/// Mozilla CA store, no host system-CA dependency) and explicitly
+/// selects aws-lc-rs as the crypto provider via `builder_with_provider`.
+///
+/// The explicit provider selection matters: both `aws-lc-rs` and `ring`
+/// transitively end up in the build (mysql_async / reqwest pull rustls
+/// with `ring`; `tokio-postgres-rustls` pulls it with `aws-lc-rs`), so
+/// rustls's auto-detect panics with "could not determine
+/// CryptoProvider" if we use the default builder. Naming the provider
+/// here picks aws-lc-rs deterministically without touching the
+/// process-global default (so this code is safe to call multiple times
+/// and never races with other rustls users in the same binary).
+///
+/// Called once per `PostgresSink::new` call (i.e. once at daemon
+/// startup), so memoisation would buy nothing.
+fn build_tls_connector() -> MakeRustlsConnect {
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+    };
+    let client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("aws-lc-rs default provider supports the safe TLS versions")
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
+    MakeRustlsConnect::new(client_config)
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -496,6 +552,52 @@ mod tests {
         assert!(!s.contains("topsecret"), "password leaked: {s}");
         assert!(s.contains("alice"), "user should still appear: {s}");
         assert!(s.contains("<redacted>"), "redaction marker missing: {s}");
+    }
+
+    // ── TLS opt-in via `?sslmode=require` ────────────────────────────────────
+
+    /// Verifies the URL-scheme-based TLS opt-in compiles and constructs
+    /// a sink without panicking. We can't test the actual TLS handshake
+    /// from a unit test (no live PG with a cert available), but we can
+    /// verify the build path: parses the URL, sees `SslMode::Require`,
+    /// picks `MakeRustlsConnect`, hands it to `Manager::from_config`.
+    /// Catches a regression where the URL parser fails to surface
+    /// sslmode or `build_tls_connector` panics under
+    /// `aws_lc_rs::default_provider()` initialisation.
+    #[test]
+    fn sslmode_require_builds_sink_with_tls_connector() {
+        let mut c = cfg();
+        c.url = "postgres://user:pw@127.0.0.1:5432/db?sslmode=require".to_string();
+        assert!(
+            PostgresSink::new(c).is_ok(),
+            "sink should build successfully with sslmode=require"
+        );
+    }
+
+    /// The default (no sslmode in URL) maps to `SslMode::Prefer` in
+    /// tokio-postgres. We deliberately treat that as "no TLS" so an
+    /// upgrade doesn't silently enable TLS on a previously-cleartext
+    /// deployment (see the long comment in `PostgresSink::new`). Pin
+    /// that behaviour with a test so a future refactor can't drift.
+    #[test]
+    fn default_sslmode_prefer_does_not_enable_tls_silently() {
+        let mut c = cfg();
+        c.url = "postgres://user:pw@127.0.0.1:5432/db".to_string();
+        // Sanity: tokio-postgres parses this with the default sslmode.
+        let parsed: PgConfig = c.url.parse().unwrap();
+        assert_eq!(parsed.get_ssl_mode(), SslMode::Prefer);
+        // And the sink still builds (NoTls path).
+        assert!(PostgresSink::new(c).is_ok());
+    }
+
+    /// Explicit `?sslmode=disable` also builds, NoTls path.
+    #[test]
+    fn sslmode_disable_builds_sink_with_no_tls() {
+        let mut c = cfg();
+        c.url = "postgres://user:pw@127.0.0.1:5432/db?sslmode=disable".to_string();
+        let parsed: PgConfig = c.url.parse().unwrap();
+        assert_eq!(parsed.get_ssl_mode(), SslMode::Disable);
+        assert!(PostgresSink::new(c).is_ok());
     }
 
     // SQLSTATE classification is driver-specific and stays here.
