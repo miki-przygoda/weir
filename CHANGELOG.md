@@ -82,6 +82,49 @@ The five commits making up this pass:
   fsync rises from ~1 to up to `batch_size`). Single-producer serial Sync
   is unaffected — the batch only ever holds one record.
 
+### Refactored
+
+- **Shared SQL-sink infrastructure** (`crates/weir-server/src/sink/sql_common.rs`).
+  Extracted from the now-near-twin `mysql.rs` and `postgres.rs` modules:
+  - `validate_identifier(field, value, max_len)` — strict
+    `[A-Za-z_][A-Za-z0-9_]{0,max_len-1}` validation, parametric on
+    dialect (MySQL = 64, Postgres = 63). Single source of truth for the
+    chokepoint that makes `format!("INSERT INTO {table} ...")` safe;
+    drift between the two sinks here would be a SQL-injection vector.
+    Per-sink build-error enums adopt a 3-line `From<InvalidIdentifier>`
+    impl and supply their own `IDENTIFIER_MAX_LEN` constant.
+  - `redact_password(url)` — URL password redaction used by both sinks'
+    `Debug` impls. Identical implementation in both, now identical
+    type. Drift here would leak credentials into log lines.
+  - `SqlSinkError` — the runtime `commit()` error returned by both
+    sinks. Same `Transient` / `Permanent` / `Timeout` shape as the old
+    per-sink enums. The new enum's variants carry
+    `driver: &'static str` so error messages still distinguish
+    `"mysql sink transient: …"` from `"postgres sink transient: …"`.
+    No external code names the old per-sink error types (the drain
+    consumes sinks via `Sink::Error`), so collapsing them was a clean
+    rename behind the abstraction.
+  - Comprehensive shared test coverage moved here: identifier
+    validation including a 16-case injection-attempt sweep, redaction
+    of both `mysql://` and `postgres://` URLs, malformed-URL safety,
+    URL-encoded password redaction, and driver-tag preservation in
+    `SqlSinkError`'s `Display`.
+
+  The driver-specific glue stays per-sink: the `classify` function
+  (different `mysql_async::Error` vs `tokio_postgres::Error` shapes),
+  the transient-codes table (MySQL error numbers vs Postgres
+  SQLSTATEs), the `Sink` trait impl, the SQL-string builder, the
+  config struct, the build-error enum's per-driver extras (Postgres'
+  `PoolBuild` variant).
+
+  Net production-code delta: −119 LOC across the two sinks, +147 LOC
+  in `sql_common`, so +28 LOC; the future-payoff is that the next SQL
+  sink (ClickHouse, SQLite, …) lands as ~150 LOC of driver glue
+  instead of ~600 LOC of copy-pasted infrastructure.
+
+  321 tests pass (up from 315: 6 new sql_common tests for coverage
+  not present in either sink before).
+
 ### Added
 
 - **`PostgresSink` — Postgres counterpart to the MySQL sink**

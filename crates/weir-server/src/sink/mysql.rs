@@ -52,7 +52,18 @@ use mysql_async::{Pool, prelude::Queryable};
 use tracing::{debug, warn};
 use weir_core::Payload;
 
+use super::sql_common::{self, SqlSinkError};
 use super::{CommitResult, Sink, SinkError, SinkHealth};
+
+/// Static driver tag used by [`SqlSinkError`] variants emitted from this
+/// module. Keeps `"mysql sink ..."` consistent in log lines without
+/// repeating the literal at every classify-site.
+const DRIVER: &str = "mysql";
+
+/// MySQL's identifier length limit (per its docs — quoted identifiers up
+/// to 64 characters). Drives the `max_len` argument to
+/// [`sql_common::validate_identifier`].
+const IDENTIFIER_MAX_LEN: usize = 64;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -97,7 +108,7 @@ pub struct MySqlSinkConfig {
 impl std::fmt::Debug for MySqlSinkConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MySqlSinkConfig")
-            .field("url", &redact_password(&self.url))
+            .field("url", &sql_common::redact_password(&self.url))
             .field("table", &self.table)
             .field("column", &self.column)
             .field("insert_mode", &self.insert_mode)
@@ -105,26 +116,6 @@ impl std::fmt::Debug for MySqlSinkConfig {
             .field("timeout", &self.timeout)
             .finish()
     }
-}
-
-/// Best-effort password redaction for log lines. Matches
-/// `scheme://user:PASSWORD@host` and replaces `PASSWORD` with `<redacted>`.
-/// If the URL doesn't match that shape we return it unchanged.
-fn redact_password(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let rest = &url[scheme_end + 3..];
-    let Some(at) = rest.find('@') else {
-        return url.to_string();
-    };
-    let creds = &rest[..at];
-    let Some(colon) = creds.find(':') else {
-        return url.to_string();
-    };
-    let user = &creds[..colon];
-    let tail = &rest[at..];
-    format!("{}://{}:<redacted>{}", &url[..scheme_end], user, tail)
 }
 
 // ── Sink ──────────────────────────────────────────────────────────────────────
@@ -151,8 +142,10 @@ impl MySqlSink {
         if config.url.is_empty() {
             return Err(MySqlSinkBuildError::EmptyUrl);
         }
-        validate_identifier("table", &config.table)?;
-        validate_identifier("column", &config.column)?;
+        sql_common::validate_identifier("table", &config.table, IDENTIFIER_MAX_LEN)
+            .map_err(MySqlSinkBuildError::from)?;
+        sql_common::validate_identifier("column", &config.column, IDENTIFIER_MAX_LEN)
+            .map_err(MySqlSinkBuildError::from)?;
         let opts = mysql_async::Opts::from_url(&config.url)
             .map_err(|e| MySqlSinkBuildError::InvalidUrl(e.to_string()))?;
         let pool = Pool::new(opts);
@@ -182,37 +175,6 @@ impl MySqlSink {
     }
 }
 
-/// MySQL identifiers used in the sink must be pure ASCII alphanumerics plus
-/// underscore, starting with a letter or underscore, ≤ 64 chars. This is a
-/// strict subset of what MySQL allows in backtick-quoted form, and the
-/// strictness is intentional: validating here means the sink can build SQL
-/// strings via `format!` with no escaping logic to get wrong.
-fn validate_identifier(field: &str, value: &str) -> Result<(), MySqlSinkBuildError> {
-    if value.is_empty() || value.len() > 64 {
-        return Err(MySqlSinkBuildError::InvalidIdentifier {
-            field: field.to_string(),
-            value: value.to_string(),
-        });
-    }
-    let mut chars = value.chars();
-    let first = chars.next().unwrap();
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(MySqlSinkBuildError::InvalidIdentifier {
-            field: field.to_string(),
-            value: value.to_string(),
-        });
-    }
-    for c in chars {
-        if !(c.is_ascii_alphanumeric() || c == '_') {
-            return Err(MySqlSinkBuildError::InvalidIdentifier {
-                field: field.to_string(),
-                value: value.to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during `MySqlSink::new()`. All build-time —
@@ -230,55 +192,37 @@ pub enum MySqlSinkBuildError {
     InvalidIdentifier { field: String, value: String },
 }
 
-/// Errors returned by `MySqlSink::commit`.
-#[derive(Debug, thiserror::Error)]
-pub enum MySqlSinkError {
-    /// Connection / pool / IO failures and explicit-transient server codes.
-    /// Drain retries the whole segment.
-    #[error("mysql sink transient: {0}")]
-    Transient(String),
-    /// Permanent error — bad schema, bad auth, syntax error, payload too
-    /// large for the column. Drain dead-letters the batch with this string
-    /// as the reason.
-    #[error("mysql sink permanent: {0}")]
-    Permanent(String),
-    /// Per-query timeout — `sink_timeout_secs` exceeded. Transient: the
-    /// server is probably overloaded; backoff and retry.
-    #[error("mysql sink timeout")]
-    Timeout,
-}
-
-impl SinkError for MySqlSinkError {
-    fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            MySqlSinkError::Transient(_) | MySqlSinkError::Timeout
-        )
+impl From<sql_common::InvalidIdentifier> for MySqlSinkBuildError {
+    fn from(e: sql_common::InvalidIdentifier) -> Self {
+        MySqlSinkBuildError::InvalidIdentifier {
+            field: e.field,
+            value: e.value,
+        }
     }
 }
 
 /// Classify a `mysql_async::Error` into the drain-facing transient /
 /// permanent buckets. Public for unit testing.
-pub(crate) fn classify(err: mysql_async::Error) -> MySqlSinkError {
+pub(crate) fn classify(err: mysql_async::Error) -> SqlSinkError {
     use mysql_async::Error as E;
     match err {
         // Network / pool / driver-level IO: always transient.
-        E::Io(e) => MySqlSinkError::Transient(format!("io: {e}")),
-        E::Driver(e) => MySqlSinkError::Transient(format!("driver: {e}")),
+        E::Io(e) => SqlSinkError::transient(DRIVER, format!("io: {e}")),
+        E::Driver(e) => SqlSinkError::transient(DRIVER, format!("driver: {e}")),
         // URL parse errors are permanent (config error).
-        E::Url(e) => MySqlSinkError::Permanent(format!("url: {e}")),
+        E::Url(e) => SqlSinkError::permanent(DRIVER, format!("url: {e}")),
         // Server-reported errors. Code 0 should not happen but if it does,
         // treat as permanent so we don't loop forever.
         E::Server(srv) => {
             let code = srv.code;
             let msg = srv.message.clone();
             if is_transient_server_code(code) {
-                MySqlSinkError::Transient(format!("server {code}: {msg}"))
+                SqlSinkError::transient(DRIVER, format!("server {code}: {msg}"))
             } else {
-                MySqlSinkError::Permanent(format!("server {code}: {msg}"))
+                SqlSinkError::permanent(DRIVER, format!("server {code}: {msg}"))
             }
         }
-        E::Other(e) => MySqlSinkError::Permanent(format!("other: {e}")),
+        E::Other(e) => SqlSinkError::permanent(DRIVER, format!("other: {e}")),
     }
 }
 
@@ -301,12 +245,12 @@ pub(crate) fn is_transient_server_code(code: u16) -> bool {
 
 impl Sink for MySqlSink {
     type Record = Payload;
-    type Error = MySqlSinkError;
+    type Error = SqlSinkError;
 
     async fn commit(
         &self,
         batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, MySqlSinkError> {
+    ) -> Result<CommitResult<Payload>, SqlSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult {
                 committed: Vec::new(),
@@ -358,7 +302,7 @@ impl Sink for MySqlSink {
                     Err(e)
                 }
             }
-            Err(_elapsed) => Err(MySqlSinkError::Timeout),
+            Err(_elapsed) => Err(SqlSinkError::timeout(DRIVER)),
         }
     }
 
@@ -416,39 +360,41 @@ mod tests {
         ));
     }
 
+    // The full identifier-validation matrix lives in
+    // `sql_common::tests` (driver-agnostic). The two tests below verify
+    // the per-sink WIRING — that `MySqlSink::new` calls
+    // `sql_common::validate_identifier` with `IDENTIFIER_MAX_LEN = 64`
+    // and that failures map to `MySqlSinkBuildError::InvalidIdentifier`
+    // via the `From` impl.
+
     #[test]
-    fn valid_identifiers_accepted() {
-        assert!(validate_identifier("t", "weir_records").is_ok());
-        assert!(validate_identifier("t", "_internal").is_ok());
-        assert!(validate_identifier("t", "T123").is_ok());
-        assert!(validate_identifier("t", "a").is_ok());
-        // 64 chars (MySQL's identifier length limit).
-        let max = "a".repeat(64);
-        assert!(validate_identifier("t", &max).is_ok());
+    fn invalid_identifier_maps_to_mysql_build_error() {
+        let mut c = cfg();
+        c.table = "1bad".to_string();
+        let err = MySqlSink::new(c).unwrap_err();
+        match err {
+            MySqlSinkBuildError::InvalidIdentifier { field, value } => {
+                assert_eq!(field, "table");
+                assert_eq!(value, "1bad");
+            }
+            other => panic!("expected InvalidIdentifier, got {other:?}"),
+        }
     }
 
     #[test]
-    fn injection_attempts_rejected_by_identifier_validation() {
-        // The whole point of identifier validation is to make these unrepresentable.
-        for bad in [
-            "",
-            " ",
-            "1starts_with_digit",
-            "has space",
-            "has`backtick",
-            "has-hyphen",
-            "has;semi",
-            "has\"quote",
-            "has'quote",
-            "has--comment",
-            "drop_table; DROP TABLE x",
-            &"a".repeat(65),
-        ] {
-            assert!(
-                validate_identifier("t", bad).is_err(),
-                "identifier {bad:?} should have been rejected"
-            );
-        }
+    fn identifier_length_limit_is_64_for_mysql() {
+        let mut c = cfg();
+        // 64 chars accepted (MySQL identifier limit).
+        c.table = "a".repeat(64);
+        assert!(MySqlSink::new(c).is_ok());
+
+        let mut c = cfg();
+        // 65 chars rejected.
+        c.table = "a".repeat(65);
+        assert!(matches!(
+            MySqlSink::new(c).unwrap_err(),
+            MySqlSinkBuildError::InvalidIdentifier { .. }
+        ));
     }
 
     #[test]
@@ -490,20 +436,9 @@ mod tests {
         assert!(sink.build_insert_sql(1).contains("`blob_data`"));
     }
 
-    #[test]
-    fn redact_password_replaces_secret() {
-        let url = "mysql://alice:s3cret@db.example.com:3306/weir";
-        let r = redact_password(url);
-        assert!(!r.contains("s3cret"), "password leaked: {r}");
-        assert!(r.contains("alice"));
-        assert!(r.contains("db.example.com"));
-    }
-
-    #[test]
-    fn redact_password_leaves_unauthenticated_urls_alone() {
-        let url = "mysql://localhost:3306/weir";
-        assert_eq!(redact_password(url), url);
-    }
+    // Direct `redact_password` coverage lives in `sql_common::tests`.
+    // We still verify here that `MySqlSinkConfig::Debug` actually
+    // CALLS the redactor — i.e. the wiring is correct.
 
     #[test]
     fn debug_impl_does_not_leak_password() {
@@ -568,19 +503,9 @@ mod tests {
         c.timeout = Duration::from_millis(50);
         let sink = MySqlSink::new(c).unwrap();
         let err = sink.commit(vec![b"hello".to_vec()]).await.unwrap_err();
-        assert!(matches!(err, MySqlSinkError::Timeout), "got: {err}");
+        assert!(matches!(err, SqlSinkError::Timeout { .. }), "got: {err}");
         assert!(err.is_transient());
-    }
-
-    #[test]
-    fn permanent_error_is_not_transient() {
-        let e = MySqlSinkError::Permanent("syntax".into());
-        assert!(!e.is_transient());
-    }
-
-    #[test]
-    fn transient_error_is_transient() {
-        let e = MySqlSinkError::Transient("io".into());
-        assert!(e.is_transient());
+        // Driver context survives into the Display string.
+        assert!(format!("{err}").contains("mysql"), "got: {err}");
     }
 }

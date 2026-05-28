@@ -37,6 +37,7 @@ pub mod http;
 pub mod mysql;
 pub mod noop;
 pub mod postgres;
+mod sql_common;
 
 use weir_core::Payload;
 

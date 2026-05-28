@@ -67,7 +67,18 @@ use tokio_postgres::{Config as PgConfig, NoTls, error::SqlState};
 use tracing::{debug, warn};
 use weir_core::Payload;
 
+use super::sql_common::{self, SqlSinkError};
 use super::{CommitResult, Sink, SinkError, SinkHealth};
+
+/// Static driver tag used by [`SqlSinkError`] variants emitted from this
+/// module. Counterpart to `mysql::DRIVER` — keeps `"postgres sink ..."`
+/// consistent in log lines.
+const DRIVER: &str = "postgres";
+
+/// Postgres's identifier length limit (`NAMEDATALEN - 1`).
+/// Drives the `max_len` argument to
+/// [`sql_common::validate_identifier`].
+const IDENTIFIER_MAX_LEN: usize = 63;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -112,7 +123,7 @@ pub struct PostgresSinkConfig {
 impl std::fmt::Debug for PostgresSinkConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresSinkConfig")
-            .field("url", &redact_password(&self.url))
+            .field("url", &sql_common::redact_password(&self.url))
             .field("table", &self.table)
             .field("column", &self.column)
             .field("insert_mode", &self.insert_mode)
@@ -120,26 +131,6 @@ impl std::fmt::Debug for PostgresSinkConfig {
             .field("timeout", &self.timeout)
             .finish()
     }
-}
-
-/// Best-effort password redaction for log lines. Matches
-/// `scheme://user:PASSWORD@host` and replaces `PASSWORD` with `<redacted>`.
-/// If the URL doesn't match that shape we return it unchanged.
-fn redact_password(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let rest = &url[scheme_end + 3..];
-    let Some(at) = rest.find('@') else {
-        return url.to_string();
-    };
-    let creds = &rest[..at];
-    let Some(colon) = creds.find(':') else {
-        return url.to_string();
-    };
-    let user = &creds[..colon];
-    let tail = &rest[at..];
-    format!("{}://{}:<redacted>{}", &url[..scheme_end], user, tail)
 }
 
 // ── Sink ──────────────────────────────────────────────────────────────────────
@@ -166,8 +157,10 @@ impl PostgresSink {
         if config.url.is_empty() {
             return Err(PostgresSinkBuildError::EmptyUrl);
         }
-        validate_identifier("table", &config.table)?;
-        validate_identifier("column", &config.column)?;
+        sql_common::validate_identifier("table", &config.table, IDENTIFIER_MAX_LEN)
+            .map_err(PostgresSinkBuildError::from)?;
+        sql_common::validate_identifier("column", &config.column, IDENTIFIER_MAX_LEN)
+            .map_err(PostgresSinkBuildError::from)?;
         let pg_config: PgConfig = config
             .url
             .parse()
@@ -220,38 +213,6 @@ impl PostgresSink {
     }
 }
 
-/// Postgres identifiers used in the sink must be pure ASCII alphanumerics
-/// plus underscore, starting with a letter or underscore, ≤ 63 chars (PG's
-/// `NAMEDATALEN - 1` limit). Strict subset of what PG allows in
-/// double-quoted form — same rationale as `mysql::validate_identifier`:
-/// validating here means the sink can build SQL strings via `format!` with
-/// no escaping logic to get wrong.
-fn validate_identifier(field: &str, value: &str) -> Result<(), PostgresSinkBuildError> {
-    if value.is_empty() || value.len() > 63 {
-        return Err(PostgresSinkBuildError::InvalidIdentifier {
-            field: field.to_string(),
-            value: value.to_string(),
-        });
-    }
-    let mut chars = value.chars();
-    let first = chars.next().unwrap();
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(PostgresSinkBuildError::InvalidIdentifier {
-            field: field.to_string(),
-            value: value.to_string(),
-        });
-    }
-    for c in chars {
-        if !(c.is_ascii_alphanumeric() || c == '_') {
-            return Err(PostgresSinkBuildError::InvalidIdentifier {
-                field: field.to_string(),
-                value: value.to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during `PostgresSink::new()`. All build-time —
@@ -271,36 +232,18 @@ pub enum PostgresSinkBuildError {
     PoolBuild(String),
 }
 
-/// Errors returned by `PostgresSink::commit`.
-#[derive(Debug, thiserror::Error)]
-pub enum PostgresSinkError {
-    /// Connection / pool / IO failures and explicit-transient server codes.
-    /// Drain retries the whole segment.
-    #[error("postgres sink transient: {0}")]
-    Transient(String),
-    /// Permanent error — bad schema, bad auth, syntax error, payload too
-    /// large for the column. Drain dead-letters the batch with this string
-    /// as the reason.
-    #[error("postgres sink permanent: {0}")]
-    Permanent(String),
-    /// Per-query timeout — `sink_timeout_secs` exceeded. Transient: the
-    /// server is probably overloaded; backoff and retry.
-    #[error("postgres sink timeout")]
-    Timeout,
-}
-
-impl SinkError for PostgresSinkError {
-    fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            PostgresSinkError::Transient(_) | PostgresSinkError::Timeout
-        )
+impl From<sql_common::InvalidIdentifier> for PostgresSinkBuildError {
+    fn from(e: sql_common::InvalidIdentifier) -> Self {
+        PostgresSinkBuildError::InvalidIdentifier {
+            field: e.field,
+            value: e.value,
+        }
     }
 }
 
 /// Classify a `tokio_postgres::Error` into the drain-facing transient /
 /// permanent buckets. Public for unit testing.
-pub(crate) fn classify(err: tokio_postgres::Error) -> PostgresSinkError {
+pub(crate) fn classify(err: tokio_postgres::Error) -> SqlSinkError {
     // Server-reported errors carry a SQLSTATE we can inspect; everything
     // else is treated as connection / IO and therefore transient. PG's
     // error model is much flatter than mysql_async's — we lean on the
@@ -309,14 +252,14 @@ pub(crate) fn classify(err: tokio_postgres::Error) -> PostgresSinkError {
         let code = db_err.code();
         let msg = db_err.message().to_string();
         if is_transient_sqlstate(code) {
-            PostgresSinkError::Transient(format!("server {}: {msg}", code.code()))
+            SqlSinkError::transient(DRIVER, format!("server {}: {msg}", code.code()))
         } else {
-            PostgresSinkError::Permanent(format!("server {}: {msg}", code.code()))
+            SqlSinkError::permanent(DRIVER, format!("server {}: {msg}", code.code()))
         }
     } else {
         // No DbError ⇒ wire/IO/protocol layer. Transient by default; the
         // pool will reconnect on the next commit.
-        PostgresSinkError::Transient(format!("io: {err}"))
+        SqlSinkError::transient(DRIVER, format!("io: {err}"))
     }
 }
 
@@ -340,12 +283,12 @@ pub(crate) fn is_transient_sqlstate(state: &SqlState) -> bool {
 
 impl Sink for PostgresSink {
     type Record = Payload;
-    type Error = PostgresSinkError;
+    type Error = SqlSinkError;
 
     async fn commit(
         &self,
         batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, PostgresSinkError> {
+    ) -> Result<CommitResult<Payload>, SqlSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult {
                 committed: Vec::new(),
@@ -359,7 +302,7 @@ impl Sink for PostgresSink {
             let client = self.pool.get().await.map_err(|e| {
                 // Pool errors (no available connection, timeout fetching
                 // one, backend unreachable) are categorically transient.
-                PostgresSinkError::Transient(format!("pool: {e}"))
+                SqlSinkError::transient(DRIVER, format!("pool: {e}"))
             })?;
             // tokio-postgres takes parameters as `&[&(dyn ToSql + Sync)]`.
             // We need a Vec of `&[u8]` first, then a Vec of references to
@@ -407,7 +350,7 @@ impl Sink for PostgresSink {
                     Err(e)
                 }
             }
-            Err(_elapsed) => Err(PostgresSinkError::Timeout),
+            Err(_elapsed) => Err(SqlSinkError::timeout(DRIVER)),
         }
     }
 
@@ -538,30 +481,24 @@ mod tests {
         );
     }
 
+    // Direct `redact_password` coverage lives in `sql_common::tests`
+    // (including special-char and missing-credentials cases). The single
+    // test below verifies `PostgresSinkConfig::Debug` actually CALLS the
+    // shared redactor — i.e. the wiring is correct.
+
     #[test]
-    fn debug_redacts_password() {
-        let c = cfg();
+    fn debug_impl_does_not_leak_password() {
+        let c = PostgresSinkConfig {
+            url: "postgres://alice:topsecret@db.example.com:5432/weir".into(),
+            ..cfg()
+        };
         let s = format!("{c:?}");
-        assert!(!s.contains("pw"), "password leaked: {s}");
+        assert!(!s.contains("topsecret"), "password leaked: {s}");
+        assert!(s.contains("alice"), "user should still appear: {s}");
         assert!(s.contains("<redacted>"), "redaction marker missing: {s}");
     }
 
-    #[test]
-    fn debug_redacts_password_with_special_chars() {
-        let mut c = cfg();
-        c.url = "postgres://user:p%40ss%21@host/db".to_string();
-        let s = format!("{c:?}");
-        assert!(!s.contains("p%40ss%21"), "password leaked: {s}");
-    }
-
-    #[test]
-    fn debug_handles_url_without_credentials() {
-        let mut c = cfg();
-        c.url = "postgres://host/db".to_string();
-        let s = format!("{c:?}");
-        // No credentials to redact; URL should appear unchanged.
-        assert!(s.contains("postgres://host/db"));
-    }
+    // SQLSTATE classification is driver-specific and stays here.
 
     #[test]
     fn transient_sqlstates_are_transient() {
@@ -583,13 +520,32 @@ mod tests {
         assert!(!is_transient_sqlstate(&SqlState::INVALID_PASSWORD));
     }
 
+    // Driver-tag wiring: a `Timeout`/`Transient` produced from this
+    // module carries `driver = "postgres"` so log lines preserve the
+    // backend identifier. (`SqlSinkError`'s `is_transient` semantics are
+    // tested in `sql_common::tests`; here we only verify the wiring.)
+
     #[test]
-    fn postgres_sink_error_transient_classification() {
-        let t = PostgresSinkError::Transient("io".to_string());
-        let p = PostgresSinkError::Permanent("bad schema".to_string());
-        let to = PostgresSinkError::Timeout;
-        assert!(t.is_transient());
-        assert!(to.is_transient());
-        assert!(!p.is_transient());
+    fn timeout_error_carries_postgres_driver_tag() {
+        let err = SqlSinkError::timeout(DRIVER);
+        assert!(err.is_transient());
+        assert!(
+            format!("{err}").starts_with("postgres "),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_identifier_maps_to_postgres_build_error() {
+        let mut c = cfg();
+        c.table = "1bad".to_string();
+        let err = PostgresSink::new(c).unwrap_err();
+        match err {
+            PostgresSinkBuildError::InvalidIdentifier { field, value } => {
+                assert_eq!(field, "table");
+                assert_eq!(value, "1bad");
+            }
+            other => panic!("expected InvalidIdentifier, got {other:?}"),
+        }
     }
 }
