@@ -7,12 +7,15 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use std::sync::Arc;
+
 use crc32fast::Hasher as CrcHasher;
 
 use super::format::{
     EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, build_segment_footer, build_segment_header,
     build_sentinel, unix_nanos_now,
 };
+use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
 /// An active WAB segment file. Owns the file handle and tracks write accounting.
@@ -241,16 +244,31 @@ pub struct ShardWriter {
     /// Set via `WabConfig::segment_max_bytes` at flusher-thread spawn time.
     segment_max_bytes: u64,
     active: Option<WabSegment>,
+    /// Metrics handle so `ensure_open` can bump the
+    /// `weir_wab_segments_total{state="open"}` counter every time a new
+    /// segment file is created. The other state transitions (sealed,
+    /// confirmed, quarantined) are already incremented at their
+    /// respective lifecycle points (`flush_batch`, `confirmed::*`,
+    /// `recovery::*`); the open state was registered but never wired —
+    /// this field closes that gap so operators get a complete
+    /// open → sealed → confirmed / quarantined transition count.
+    metrics: Arc<Metrics>,
 }
 
 impl ShardWriter {
-    pub fn new(shard_id: u16, shard_dir: PathBuf, segment_max_bytes: u64) -> Self {
+    pub fn new(
+        shard_id: u16,
+        shard_dir: PathBuf,
+        segment_max_bytes: u64,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         ShardWriter {
             shard_id,
             shard_dir,
             next_counter: 1,
             segment_max_bytes,
             active: None,
+            metrics,
         }
     }
 
@@ -333,6 +351,15 @@ impl ShardWriter {
                 .checked_add(1)
                 .expect("segment counter overflow");
             self.active = Some(WabSegment::create(&path, self.shard_id)?);
+            // Newly opened segment — bump the `open` state counter so the
+            // open → sealed → confirmed/quarantined transition story is
+            // observable end to end via `weir_wab_segments_total{state="..."}`.
+            self.metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::open,
+                })
+                .inc();
         }
         Ok(())
     }
@@ -446,7 +473,8 @@ mod tests {
         // with a new counter — otherwise subsequent writes would interleave
         // with the stray bytes from the failed write.
         let dir = tmp_dir("shardwriter_drop");
-        let mut writer = ShardWriter::new(0, dir.clone(), 1024 * 1024);
+        let metrics = Arc::new(Metrics::new().0);
+        let mut writer = ShardWriter::new(0, dir.clone(), 1024 * 1024, metrics);
         writer.write_record(b"first").unwrap();
         let active_path_before = writer
             .active
@@ -489,6 +517,52 @@ mod tests {
         let too_large = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
         assert!(seg.write_record(&too_large).is_err());
         let _ = seg.seal();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Regression: `weir_wab_segments_total{state="open"}` was registered in
+    /// `metrics/mod.rs` but never incremented (the other three states —
+    /// sealed, confirmed, quarantined — were wired at their respective
+    /// lifecycle points). This test pins the new wiring: every time
+    /// `ensure_open` creates a fresh segment, the `open` counter moves.
+    #[test]
+    fn open_segment_counter_increments_when_ensure_open_creates_segment() {
+        let dir = tmp_dir("open_counter");
+        let metrics = Arc::new(Metrics::new().0);
+        // Tiny segment_max_bytes so a single write rotates and creates a
+        // second segment — this exercises ensure_open twice in one
+        // writer's lifetime (initial + post-rotation).
+        let mut writer = ShardWriter::new(0, dir.clone(), 32, Arc::clone(&metrics));
+
+        let open_counter = || -> u64 {
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::open,
+                })
+                .get()
+        };
+
+        let before = open_counter();
+        writer.write_record(b"first").unwrap();
+        let after_first = open_counter();
+        assert_eq!(
+            after_first - before,
+            1,
+            "first write should have opened one segment"
+        );
+
+        // Second write triggers rotation (segment_max_bytes=32 exceeded
+        // after the first record's overhead). Opening the replacement
+        // segment must also bump the counter.
+        writer.write_record(b"second").unwrap();
+        let after_second = open_counter();
+        assert_eq!(
+            after_second - after_first,
+            1,
+            "post-rotation write should have opened a second segment"
+        );
+
         fs::remove_dir_all(dir).ok();
     }
 }

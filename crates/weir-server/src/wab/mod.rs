@@ -287,7 +287,12 @@ fn flusher_thread(
     }
 
     // Startup warmup
-    let mut writer = ShardWriter::new(shard_id, shard_dir, segment_max_bytes);
+    let mut writer = ShardWriter::new(
+        shard_id,
+        shard_dir,
+        segment_max_bytes,
+        Arc::clone(&metrics),
+    );
     if let Err(e) = writer.scan_and_advance_counter() {
         warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
     }

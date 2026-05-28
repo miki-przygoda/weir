@@ -125,6 +125,38 @@ The five commits making up this pass:
   321 tests pass (up from 315: 6 new sql_common tests for coverage
   not present in either sink before).
 
+### Fixed
+
+- **`weir_wab_segments_total{state="open"}` metric now actually
+  increments**
+  (`crates/weir-server/src/wab/segment.rs::ShardWriter::ensure_open`).
+  The counter has been registered in `metrics/mod.rs` since the
+  metric set was introduced but was never wired — the other three
+  states (`sealed`, `confirmed`, `quarantined`) bump at their
+  respective lifecycle points (`flush_batch`, drain confirmation,
+  recovery quarantine) but `open` had no caller. `ShardWriter::new`
+  now takes an `Arc<Metrics>`, and `ensure_open` bumps the counter
+  every time a new segment file is created. Closes the
+  open → sealed → confirmed/quarantined observability gap so
+  operators get a complete state-transition count. New unit test
+  `open_segment_counter_increments_when_ensure_open_creates_segment`
+  pins the wiring.
+
+- **Stale `validate_path` duplication note in
+  `docs/architecture.md`.** The doc claimed `validate_path` lived in
+  both `src/config/mod.rs` (canonical) and `src/wab/mod.rs` (local
+  copy "with a TODO to consolidate"). A grep confirms only the
+  canonical version actually exists; the WAB-side copy was removed
+  long ago. The doc paragraph has been updated to reflect the
+  current single-source-of-truth reality.
+
+- **Stale `TODO(perf)` comment in `tests/load.rs`** removed. It
+  listed planned improvement areas (end-to-end latency,
+  thundering-herd queue contention, batching efficiency, connection
+  setup cost) all of which were addressed by the post-v0.4
+  performance pass. Future perf work belongs in the CHANGELOG, not
+  inline in the load-test module-doc.
+
 ### Added
 
 - **`PostgresSink` — Postgres counterpart to the MySQL sink**

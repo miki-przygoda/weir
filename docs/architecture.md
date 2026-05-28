@@ -99,7 +99,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - One flusher thread per shard; each holds an active `WabSegment`.
 - Three durability tiers, all upholding "ack ⇒ durable": `Sync` and `Batched` both group-fdatasync at the batch boundary before acking every record in the batch; `Buffered` acks after the in-memory write with no fsync. (The historical distinction was "Sync = one fdatasync per record, Batched = one fdatasync per batch" — both now share the batch-boundary fsync, since one fsync at the end of the batch covers every record written during it. Single-producer serial workloads see no difference because the batch holds one record anyway; under concurrent producers, Sync amortises into the group fsync just like Batched.)
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
-- Path validation (`validate_path`) exists in both `src/wab/mod.rs` (local copy, with a TODO to consolidate) and `src/config/mod.rs` (canonical version). The `config` version is used for `wab_dir` and `socket_path` at load time; the WAB module's local copy is used at spawn time as a belt-and-suspenders check.
+- Path validation (`validate_path`) is consolidated in `src/config/mod.rs` and used for `wab_dir` and `socket_path` at config-load time. The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
 
 ### Sink (`src/sink/`)
 

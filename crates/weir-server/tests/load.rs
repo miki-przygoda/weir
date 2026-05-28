@@ -21,17 +21,12 @@
 //! `load_results.jsonl`. Scenario names include a `_d{N}ms` suffix so
 //! `deploy/avg_benchmarks.py` can render a side-by-side comparison table.
 //!
-//! # Performance work
-//!
-//! TODO(perf): these numbers are the starting baseline. Planned improvement areas:
-//!   - End-to-end latency: reduce socket-recv → WAB-fsync → Ack round-trip
-//!   - Thundering-herd throughput: profile queue contention when N threads push
-//!     simultaneously; evaluate lock-free queue alternatives
-//!   - Connection setup cost: measure and reduce Unix socket accept latency
-//!   - Batching efficiency: tune batch_size / batch_deadline_ms sweet spot
-//!
 //! Improvements are tracked by re-running this suite and comparing to the
-//! numbers committed in docs/benchmarks.md at the time.
+//! numbers committed in `docs/benchmarks/latest.md` at the time. The
+//! [post-v0.4 perf pass](../../../CHANGELOG.md) addressed the original
+//! performance-improvement TODO list (end-to-end latency, thundering-herd
+//! queue contention, batching efficiency); future improvements are
+//! catalogued in the CHANGELOG rather than inline here.
 
 #![cfg(unix)]
 
