@@ -210,6 +210,41 @@ The five commits making up this pass:
   findings summary now strikes through the closed items. Audit
   remains useful as a record of what was found and what was done.
 
+### Changed
+
+- **WAB flusher: panic respawn replaces "offline until daemon restart."**
+  Previously, a panic inside the flusher loop ran through
+  `run_with_panic_supervision` (`crates/weir-server/src/wab/mod.rs:87`)
+  which logged + incremented `weir_wab_flusher_panics` and then let
+  the thread die. The shard stayed offline (every record routed to it
+  Nack-ing) until daemon restart — the CHANGELOG explicitly marked
+  respawn as a follow-up.
+
+  Now: the supervisor wraps the body in `catch_unwind` AND a respawn
+  loop bounded by `MAX_FLUSHER_RESPAWNS = 10` with linear backoff
+  (10 ms × attempt). Channels, paths, and the metrics handle live in
+  the outer scope and are cloned for each attempt — crossbeam
+  channels share a queue under `Clone`, so in-flight `WabRecord`s
+  buffered in the bounded queue survive the panic and the respawned
+  flusher drains them in the original order. After 10 unsuccessful
+  respawns the shard goes permanently offline (the previous behaviour,
+  just delayed by ~0.5 s of attempts) and the final log promotes to
+  `error` level.
+
+  Failure-mode hierarchy:
+  - Transient panic (rare): logged at `warn`, metric bumped, flusher
+    respawns and steady state recovers within a few hundred ms.
+  - Deterministic panic (logical bug in the flusher): every respawn
+    panics on the same condition, the cap trips, the shard goes
+    offline with a single loud `error` log. Identical end state to
+    the pre-respawn implementation.
+
+  Tests: `flusher_panic_respawn_recovers_within_cap` exercises the
+  recoverable path (3 transient panics, then clean); the existing
+  `supervisor_catches_*` tests are adapted to the new body-factory
+  shape. New `flusher_panic_loop_caps_out_after_max_respawns` proves
+  the loop terminates and that the metric records every attempt.
+
 ### Added
 
 - **Postgres sink: TLS support via `?sslmode=require` in the URL.**

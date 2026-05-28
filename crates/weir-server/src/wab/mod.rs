@@ -84,32 +84,93 @@ fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
     "<non-string panic payload>"
 }
 
-/// Wraps a flusher body in `catch_unwind` so a panic becomes an observable
-/// event (log line + metric increment) rather than a silent thread death that
-/// leaves the shard offline with no signal to operators.
+/// Maximum number of times a single shard's flusher will be respawned
+/// after panicking before we give up and leave the shard offline. Each
+/// respawn bumps `weir_wab_flusher_panics` and emits a warn-level log
+/// with the panic payload and the attempt number; reaching the cap
+/// promotes the final log to error-level so it's visible in any
+/// reasonable log retention window.
 ///
-/// Does NOT respawn — once a flusher panics, its receiver is dropped and the
-/// shard remains offline until the daemon restarts. Respawn would require
-/// keeping the receiver outside the panic scope and is left as a follow-up.
+/// The cap exists to bound damage from a runaway loop — a flusher
+/// that panics deterministically on every record would otherwise spin
+/// forever, burning CPU and producing an unbounded log stream. With
+/// the cap, the shard goes permanently offline (Nack-everything) after
+/// `MAX_FLUSHER_RESPAWNS` attempts; the previous behaviour (offline
+/// after the first panic) is the upper bound of how-bad-can-it-get.
+pub(crate) const MAX_FLUSHER_RESPAWNS: u32 = 10;
+
+/// Wraps a flusher body in `catch_unwind` and, on panic, respawns the
+/// flusher up to `MAX_FLUSHER_RESPAWNS` times. Each respawn:
+///   - bumps `weir_wab_flusher_panics`,
+///   - logs the panic payload + attempt at warn level,
+///   - sleeps `attempt * 100 ms` before the next attempt (linear
+///     backoff, capped by the respawn cap itself).
 ///
-/// `AssertUnwindSafe`: the flusher owns its inputs (no shared mutable state
-/// across the call boundary); we accept the unwind-safety claim.
-fn run_with_panic_supervision(
-    shard_id: usize,
-    metrics_for_panic: Arc<Metrics>,
-    body: impl FnOnce(),
-) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
-    if let Err(panic_payload) = result {
-        let msg = panic_message_str(&panic_payload);
-        tracing::error!(
-            shard = shard_id,
-            panic = %msg,
-            "WAB flusher thread panicked — shard is now offline. \
-             Records routed to this shard will Nack(InternalError) \
-             until the daemon is restarted."
-        );
-        metrics_for_panic.wab_flusher_panics.inc();
+/// On reaching the cap, the shard is left offline — records routed to
+/// it Nack(InternalError) until daemon restart, the same end state as
+/// the original non-respawning implementation, just delayed by N
+/// attempts.
+///
+/// `body_factory` is invoked once per attempt to produce a fresh closure
+/// so the caller can clone any per-attempt state (channels are
+/// `Clone`able shared handles, so the SAME channels feed every
+/// attempt — a panicking flusher does not lose in-flight records,
+/// they sit in the bounded queue until the respawned flusher drains
+/// them).
+///
+/// `AssertUnwindSafe`: the flusher's only shared mutable state across
+/// the call boundary is via `Arc<Metrics>` (atomic counters) and the
+/// crossbeam channels (lock-free, panic-safe). We accept the
+/// unwind-safety claim — matching the previous implementation's
+/// rationale.
+fn run_with_panic_supervision<F, B>(shard_id: usize, metrics: Arc<Metrics>, mut body_factory: F)
+where
+    F: FnMut() -> B,
+    B: FnOnce(),
+{
+    let mut attempt: u32 = 0;
+    loop {
+        let body = body_factory();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        match result {
+            // Clean exit (channel disconnected at daemon shutdown) —
+            // the supervisor is done, NOT a panic.
+            Ok(()) => return,
+            Err(panic_payload) => {
+                let msg = panic_message_str(&panic_payload);
+                metrics.wab_flusher_panics.inc();
+                attempt += 1;
+                if attempt > MAX_FLUSHER_RESPAWNS {
+                    tracing::error!(
+                        shard = shard_id,
+                        attempts = attempt - 1,
+                        panic = %msg,
+                        "WAB flusher panicked {MAX_FLUSHER_RESPAWNS} times — \
+                         shard now PERMANENTLY offline. Records routed to \
+                         this shard will Nack(InternalError) until the \
+                         daemon is restarted."
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    shard = shard_id,
+                    attempt,
+                    panic = %msg,
+                    "WAB flusher panicked — respawning (attempt {attempt} of {MAX_FLUSHER_RESPAWNS})"
+                );
+                // Linear backoff: 10 ms × attempt. Worst-case total
+                // sleep across the full respawn loop is
+                // sum(10..=100 ms) ≈ 550 ms — fast enough to keep
+                // the cap-out test snappy, slow enough that a
+                // deterministically-panicking flusher doesn't melt
+                // a core. Production impact is minimal: real flusher
+                // panics are from logical bugs that respawning won't
+                // fix, so the loop's job is mostly to surface a
+                // clean "now permanently offline" log line within
+                // about a second.
+                thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+            }
+        }
     }
 }
 
@@ -171,18 +232,31 @@ pub fn spawn(
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
             .spawn(move || {
+                // All per-attempt inputs are kept in the OUTER scope so a
+                // panic inside `catch_unwind` doesn't drop them. The body
+                // factory clones the channel / Arc / PathBuf handles for
+                // each attempt — channel clones share the same queue, so
+                // records buffered in the bounded WabRecord queue survive
+                // a flusher panic and are drained by the respawned
+                // flusher in the same order.
                 run_with_panic_supervision(shard_id, metrics_for_panic, || {
-                    flusher_thread(
-                        shard_id as u16,
-                        sdir,
-                        rx,
-                        drain_clone,
-                        batch_size,
-                        batch_deadline,
-                        segment_max_bytes,
-                        core_id,
-                        metrics_for_flusher,
-                    );
+                    let sdir = sdir.clone();
+                    let rx = rx.clone();
+                    let drain_clone = drain_clone.clone();
+                    let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
+                    move || {
+                        flusher_thread(
+                            shard_id as u16,
+                            sdir,
+                            rx,
+                            drain_clone,
+                            batch_size,
+                            batch_deadline,
+                            segment_max_bytes,
+                            core_id,
+                            metrics_for_flusher,
+                        );
+                    }
                 });
             })
             .map_err(io::Error::other)?;
@@ -602,23 +676,56 @@ mod tests {
 
     // ── Panic supervision ─────────────────────────────────────────────────────
 
+    /// Helper: build a body factory that panics on the first N attempts
+    /// (with `panic_payload`) and returns cleanly on attempt N+1. Lets
+    /// the existing panic-catching tests stay one-panic shaped while
+    /// the new respawn tests dial N up.
+    fn panic_then_recover_factory(
+        n_panics: u32,
+        panic_payload: &'static str,
+    ) -> impl FnMut() -> Box<dyn FnOnce() + Send> {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        move || {
+            let counter = std::sync::Arc::clone(&counter);
+            let payload = panic_payload;
+            Box::new(move || {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < n_panics {
+                    panic!("{payload}");
+                }
+                // clean return on the (n_panics + 1)th attempt
+            })
+        }
+    }
+
     #[test]
     fn supervisor_catches_str_panic_and_increments_metric() {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
-        run_with_panic_supervision(0, Arc::clone(&m), || panic!("boom"));
+        // One panic then clean recovery — verify the supervisor caught
+        // it and bumped the metric exactly once.
+        run_with_panic_supervision(0, Arc::clone(&m), panic_then_recover_factory(1, "boom"));
         assert_eq!(m.wab_flusher_panics.get(), 1);
     }
 
     #[test]
     fn supervisor_catches_formatted_panic_and_increments_metric() {
         // panic!("{}", ...) lands in String, not &'static str — verify the
-        // downcast covers both shapes.
+        // downcast covers both shapes. The dynamic-string case is now
+        // tested via `panic_then_recover_factory` (the payload is a
+        // &'static str but the panic macro materialises it through the
+        // formatter path, producing a String payload).
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
         let shard = 7;
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         run_with_panic_supervision(shard, Arc::clone(&m), move || {
-            panic!("panic from shard {shard}");
+            let counter = std::sync::Arc::clone(&counter);
+            move || {
+                if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    panic!("panic from shard {shard}");
+                }
+            }
         });
         assert_eq!(m.wab_flusher_panics.get(), 1);
     }
@@ -627,8 +734,60 @@ mod tests {
     fn supervisor_lets_clean_exit_pass_through() {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
-        run_with_panic_supervision(0, Arc::clone(&m), || { /* normal return */ });
+        run_with_panic_supervision(0, Arc::clone(&m), || {
+            || { /* normal return on first attempt */ }
+        });
         assert_eq!(m.wab_flusher_panics.get(), 0);
+    }
+
+    /// Three transient panics then a clean recovery. Verifies the
+    /// supervisor respawns the flusher rather than leaving the shard
+    /// offline after the first panic (the pre-respawn behaviour). The
+    /// metric records every panic — three of them — but the loop
+    /// continues past each and ultimately terminates cleanly.
+    #[test]
+    fn flusher_panic_respawn_recovers_within_cap() {
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let m = Arc::new(m);
+        run_with_panic_supervision(
+            0,
+            Arc::clone(&m),
+            panic_then_recover_factory(3, "transient boom"),
+        );
+        assert_eq!(
+            m.wab_flusher_panics.get(),
+            3,
+            "metric should record every panic, not just the first"
+        );
+    }
+
+    /// A flusher that panics deterministically on every attempt — the
+    /// supervisor must give up after `MAX_FLUSHER_RESPAWNS` retries
+    /// rather than spinning forever. Verifies the cap-out terminates
+    /// the loop and that the panic metric reflects every attempt.
+    /// Note the wall-clock budget: linear backoff totals
+    /// sum(10..=100 ms) ≈ 550 ms.
+    #[test]
+    fn flusher_panic_loop_caps_out_after_max_respawns() {
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let m = Arc::new(m);
+        let start = std::time::Instant::now();
+        run_with_panic_supervision(0, Arc::clone(&m), || {
+            // Every attempt panics — never recovers.
+            || panic!("persistent panic")
+        });
+        let elapsed = start.elapsed();
+        assert_eq!(
+            m.wab_flusher_panics.get(),
+            u64::from(MAX_FLUSHER_RESPAWNS + 1),
+            "metric records initial attempt plus each respawn before cap-out"
+        );
+        // Sanity: the loop did exit within a reasonable time. If the
+        // cap stopped working the test would hang.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "respawn loop should terminate within ~1 s, took {elapsed:?}"
+        );
     }
 
     #[test]
