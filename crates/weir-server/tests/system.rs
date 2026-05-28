@@ -1949,6 +1949,98 @@ fn mysql_sink_end_to_end() {
     );
 }
 
+/// End-to-end check that records pushed to a daemon configured with
+/// `sink_type = "postgres"` arrive in the configured table via a single
+/// multi-row INSERT per batch — the Postgres counterpart of
+/// `mysql_sink_end_to_end`.
+///
+/// Ignored by default because it requires a running PostgreSQL server
+/// reachable at the URL in `WEIR_TEST_POSTGRES_URL`. The runner script
+/// `scripts/run-sink-integration-tests.sh` brings up a docker-compose
+/// stack with the right schema pre-seeded; manual setup with Docker:
+///
+/// ```sh
+/// docker run --rm -d --name weir-test-postgres \
+///   -e POSTGRES_PASSWORD=test \
+///   -e POSTGRES_DB=weir_test \
+///   -p 5432:5432 postgres:16
+/// # Wait ~5s for postgres to come up.
+/// docker exec weir-test-postgres psql -U postgres weir_test -c "
+///   CREATE TABLE weir_records (
+///     id BIGSERIAL PRIMARY KEY,
+///     payload BYTEA NOT NULL,
+///     payload_sha256 BYTEA GENERATED ALWAYS AS (sha256(payload)) STORED,
+///     UNIQUE (payload_sha256)
+///   );"
+/// WEIR_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:5432/weir_test \
+///   cargo test -p weir-server --test system -- --ignored postgres_sink_end_to_end
+/// ```
+#[test]
+#[ignore = "requires WEIR_TEST_POSTGRES_URL pointing at a running Postgres with a prepared schema (see docstring)"]
+fn postgres_sink_end_to_end() {
+    const N: u32 = 100;
+
+    let postgres_url = std::env::var("WEIR_TEST_POSTGRES_URL").expect(
+        "WEIR_TEST_POSTGRES_URL not set — see the test docstring for the docker-compose recipe",
+    );
+
+    // sink_type = postgres; URL passed via env so credentials never touch
+    // the config file (production-shaped — see the operations docs). The
+    // postgres-specific knobs are mirror images of the mysql ones above
+    // (different defaults, same shape).
+    let handle = weir_server!("postgres")
+        .batch_size(200)
+        .batch_deadline_ms(5)
+        .shutdown_timeout_secs(5)
+        .env("WEIR_SINK_URL", &postgres_url)
+        .extra_config("sink_type                 = \"postgres\"")
+        .extra_config("sink_max_batch_size       = 1000")
+        .extra_config("sink_postgres_table       = \"weir_records\"")
+        .extra_config("sink_postgres_column      = \"payload\"")
+        .extra_config("sink_postgres_insert_mode = \"on_conflict_do_nothing\"")
+        .start();
+
+    let mut client = handle.client();
+    for i in 0..N {
+        client
+            .push(format!("postgres-rec-{i:05}").as_bytes(), Durability::Sync)
+            .unwrap_or_else(|e| panic!("push {i}: {e}"));
+    }
+    drop(client);
+
+    // Give the drain a moment to drain the sealed segment into Postgres.
+    thread::sleep(Duration::from_secs(2));
+
+    let body = handle.scrape_metrics();
+    let committed = parse_metric(
+        &body,
+        "weir_sink_commit_records_total{outcome=\"committed\"}",
+    );
+    let commit_count = parse_metric(&body, "weir_sink_commit_duration_seconds_count");
+
+    assert!(
+        committed >= u64::from(N),
+        "expected ≥{N} committed records, got {committed}\nmetrics excerpt:\n{}",
+        body.lines()
+            .filter(|l| l.starts_with("weir_sink_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        commit_count > 0,
+        "expected at least one Sink::commit() call to have been recorded"
+    );
+    // Same IOPS-compression assertion as the MySQL test — the Postgres
+    // sink shares the multi-row INSERT shape, so the records-per-commit
+    // ratio should be in the same ballpark.
+    let ratio = committed as f64 / commit_count as f64;
+    assert!(
+        ratio >= 10.0,
+        "expected ≥10:1 records-per-commit IOPS compression, got {ratio:.1}:1 \
+         ({committed} records / {commit_count} commits)"
+    );
+}
+
 fn parse_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
         if line.starts_with(prefix)

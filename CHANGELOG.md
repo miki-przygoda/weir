@@ -127,6 +127,40 @@ The five commits making up this pass:
 
 ### Added (tests)
 
+- **`postgres_sink_end_to_end` + docker-compose harness for the SQL
+  sink integration suite.** The Postgres sink shipped without an
+  end-to-end test against a real Postgres (the MySQL sink had one,
+  `#[ignore]`-marked); the recent SQL-sink refactor commit
+  (`bf5f047`) flagged the docker-compose harness as a "clean
+  follow-up." This commit closes both:
+  - **`postgres_sink_end_to_end`** (`crates/weir-server/tests/system.rs`)
+    mirrors `mysql_sink_end_to_end`: 100 Sync pushes, asserts the
+    sink committed all of them and did so with ≥10:1 records-per-commit
+    IOPS compression. `#[ignore]`-marked; reads `WEIR_TEST_POSTGRES_URL`.
+  - **`deploy/docker/test/docker-compose.yml`** (new) — a separate
+    compose file (not entangled with the deployment example at
+    `deploy/docker/docker-compose.yml`) that spins up `mysql:8.0` on
+    `127.0.0.1:33306` and `postgres:16` on `127.0.0.1:55432` with
+    the reference schemas pre-seeded from
+    `init-mysql.sql` / `init-postgres.sql`. Healthchecks gate the
+    runner script on init-completion.
+  - **`deploy/run-sink-integration-tests.sh`** (new) — brings up the
+    compose stack, polls each service's `docker compose ps`
+    health status (timeout: 120 s per service), exports
+    `WEIR_TEST_MYSQL_URL` and `WEIR_TEST_POSTGRES_URL`, runs both
+    ignored tests via `cargo test -- --ignored --exact`, tears
+    down on exit via `trap`. `RELEASE=1` env var switches to a
+    release build (matches CI).
+  - **`docs/testing/sink-integration.md`** (new) — operator-facing
+    guide: quickstart, what the runner does, manual-setup
+    fallback, what's deliberately out of scope (CI wiring,
+    TLS-enabled containers).
+
+  CI wiring (a `.github/workflows/sink-integration.yml`) is
+  deliberately deferred — adds GitHub Actions service-container
+  complexity that deserves its own review. The harness ships
+  locally-runnable today.
+
 - **Three drain-pipeline end-to-end tests + extended `MockSink`
   introspection** (`crates/weir-server/src/drain/mod.rs::tests`). The
   existing `MockSink` was canned (returned pre-baked

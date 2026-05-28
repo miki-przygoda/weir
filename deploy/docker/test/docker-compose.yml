@@ -1,0 +1,64 @@
+# docker-compose for sink integration tests.
+#
+# Brings up MySQL and PostgreSQL with pre-seeded `weir_records` schemas
+# matching the reference schemas in `docs/operations/configuration.md`.
+# Used by `scripts/run-sink-integration-tests.sh` to back the
+# `--ignored` `*_sink_end_to_end` tests in `tests/system.rs`.
+#
+# Deliberately separate from `deploy/docker/docker-compose.yml` (which is
+# the deployment EXAMPLE, not a test rig): different lifecycle, different
+# port choices (127.0.0.1-only), different schema-init expectations.
+#
+# Bring up:
+#   docker compose -f deploy/docker/test/docker-compose.yml up -d
+# Bring down:
+#   docker compose -f deploy/docker/test/docker-compose.yml down -v
+#
+# Healthchecks are configured so the runner script can wait for both
+# services to be ready before exporting the env vars and running the
+# tests — see scripts/run-sink-integration-tests.sh for the wait logic.
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: weir-test-mysql
+    # 127.0.0.1-only so the test rig doesn't accidentally expose itself
+    # on a network. The test client connects via the host port.
+    ports:
+      - "127.0.0.1:33306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: test
+      MYSQL_DATABASE: weir_test
+    volumes:
+      # Auto-runs every *.sql / *.sh in alphabetic order on first start.
+      - ./init-mysql.sql:/docker-entrypoint-initdb.d/00-weir-records.sql:ro
+    healthcheck:
+      # `mysqladmin ping` over the local socket: succeeds once the server
+      # is accepting connections AND the init script has finished
+      # (the entrypoint blocks the server's TCP listener until init
+      # is done, so a successful ping implies the schema is ready).
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-ptest"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  postgres:
+    image: postgres:16
+    container_name: weir-test-postgres
+    ports:
+      - "127.0.0.1:55432:5432"
+    environment:
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: weir_test
+    volumes:
+      - ./init-postgres.sql:/docker-entrypoint-initdb.d/00-weir-records.sql:ro
+    healthcheck:
+      # `pg_isready` returns 0 once postgres is accepting connections.
+      # The postgres image's init-script lifecycle also gates the
+      # external TCP listener on init completion, same story as mysql.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d weir_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
