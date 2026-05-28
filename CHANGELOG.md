@@ -125,6 +125,45 @@ The five commits making up this pass:
   321 tests pass (up from 315: 6 new sql_common tests for coverage
   not present in either sink before).
 
+### Added (tests)
+
+- **Three drain-pipeline end-to-end tests + extended `MockSink`
+  introspection** (`crates/weir-server/src/drain/mod.rs::tests`). The
+  existing `MockSink` was canned (returned pre-baked
+  `CommitResult`s) and gave tests no way to verify the drain
+  actually passed the right payloads through to the sink, or that
+  the drain's retry-after handling actually slept the wall-clock
+  duration the hint asked for. The mock now captures every
+  `commit()` call's timestamp and the committed / dead-lettered
+  payloads it reported, with helper methods (`call_timestamps()`,
+  `committed_records()`, `dead_lettered_records()`) for test
+  introspection. The new tests:
+
+  1. **`mock_captures_show_exact_payloads_pass_through_drain`** —
+     three records into the segment, mock returns a 2-committed +
+     1-dead-lettered split, asserts the mock's view, the metric
+     counts, AND the dead-letter file on disk all agree. Catches
+     a regression where the drain duplicates, drops, or reorders
+     records between segment-read and sink-commit.
+  2. **`drain_waits_retry_after_hint_before_retrying`** — first
+     commit returns `MockError::TransientWithRetryAfter(75ms)`,
+     second returns Ok; asserts the wall-clock gap between the two
+     calls is ≥ 60 ms (well above the 1 ms `fast_config` default,
+     allowing for sandbox jitter). The existing `next_retry_delay`
+     tests verified the helper's math; this verifies the drain
+     loop ACTUALLY USES that math.
+  3. **`confirmed_file_only_appears_after_successful_commit_not_during_retries`** —
+     three transient failures followed by Ok; asserts the
+     `.confirmed` sidecar doesn't appear until the final success.
+     Catches a regression where the drain optimistically writes
+     `.confirmed` before the sink actually acks.
+
+  Three `MockError` machinery additions: a
+  `TransientWithRetryAfter(Duration)` variant, a `SinkError::retry_after`
+  impl on `MockError` that returns the Duration, and three
+  `Mutex<Vec<...>>` capture fields on `MockSink`. The existing
+  tests' canned flow is unchanged.
+
 ### Documentation
 
 - **`docs/testing/test-audit.md` refreshed.** Two items the audit

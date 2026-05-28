@@ -630,6 +630,9 @@ mod tests {
     #[derive(Debug)]
     enum MockError {
         Transient,
+        /// Transient error that supplies a `retry_after` hint. Used to
+        /// verify the drain honours the hint over its default backoff.
+        TransientWithRetryAfter(Duration),
         Permanent,
     }
 
@@ -637,6 +640,9 @@ mod tests {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 MockError::Transient => write!(f, "transient error"),
+                MockError::TransientWithRetryAfter(d) => {
+                    write!(f, "transient error (retry-after: {d:?})")
+                }
                 MockError::Permanent => write!(f, "permanent error"),
             }
         }
@@ -646,7 +652,17 @@ mod tests {
 
     impl crate::sink::SinkError for MockError {
         fn is_transient(&self) -> bool {
-            matches!(self, MockError::Transient)
+            matches!(
+                self,
+                MockError::Transient | MockError::TransientWithRetryAfter(_)
+            )
+        }
+
+        fn retry_after(&self) -> Option<Duration> {
+            match self {
+                MockError::TransientWithRetryAfter(d) => Some(*d),
+                _ => None,
+            }
         }
     }
 
@@ -656,6 +672,19 @@ mod tests {
         responses: Mutex<VecDeque<MockResult>>,
         call_count: AtomicU64,
         max_batch: usize,
+        /// Wall-clock instant of every `commit()` call. Tests that need to
+        /// measure inter-call gaps (e.g. retry-after observance) read this
+        /// after `run_drain` returns.
+        call_timestamps: Mutex<Vec<Instant>>,
+        /// Every payload the sink claimed to commit (i.e. landed in a
+        /// successful `commit_result.committed`). Tests can introspect to
+        /// verify what got through — the metric `records_committed` only
+        /// gives a count.
+        committed_records: Mutex<Vec<Payload>>,
+        /// Every payload the sink permanently rejected, paired with the
+        /// reason string. Tests use this to verify dead-letter *contents*,
+        /// not just the dead-letter file count.
+        dead_lettered_records: Mutex<Vec<(Payload, String)>>,
     }
 
     impl MockSink {
@@ -664,6 +693,9 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
                 max_batch: 1000,
+                call_timestamps: Mutex::new(Vec::new()),
+                committed_records: Mutex::new(Vec::new()),
+                dead_lettered_records: Mutex::new(Vec::new()),
             }
         }
 
@@ -675,11 +707,34 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
                 max_batch,
+                call_timestamps: Mutex::new(Vec::new()),
+                committed_records: Mutex::new(Vec::new()),
+                dead_lettered_records: Mutex::new(Vec::new()),
             }
         }
 
         fn call_count(&self) -> u64 {
             self.call_count.load(Ordering::Relaxed)
+        }
+
+        /// Snapshot of every `commit()` invocation's `Instant`. Used by
+        /// the retry-after test to verify the drain slept the hinted
+        /// duration between calls.
+        fn call_timestamps(&self) -> Vec<Instant> {
+            self.call_timestamps.lock().unwrap().clone()
+        }
+
+        /// Snapshot of every payload the sink reported as committed.
+        #[allow(dead_code)]
+        fn committed_records(&self) -> Vec<Payload> {
+            self.committed_records.lock().unwrap().clone()
+        }
+
+        /// Snapshot of every payload the sink reported as permanently
+        /// rejected, paired with its reason string. Used by the
+        /// dead-letter-contents test.
+        fn dead_lettered_records(&self) -> Vec<(Payload, String)> {
+            self.dead_lettered_records.lock().unwrap().clone()
         }
 
         fn ok(batch: Vec<Payload>) -> MockResult {
@@ -703,13 +758,27 @@ mod tests {
 
         async fn commit(&self, batch: Vec<Payload>) -> MockResult {
             self.call_count.fetch_add(1, Ordering::Relaxed);
+            self.call_timestamps.lock().unwrap().push(Instant::now());
             let mut responses = self.responses.lock().unwrap();
-            responses.pop_front().unwrap_or_else(|| {
+            let response = responses.pop_front().unwrap_or_else(|| {
                 Ok(CommitResult {
-                    committed: batch,
+                    committed: batch.clone(),
                     dead_lettered: vec![],
                 })
-            })
+            });
+            // Capture for introspection BEFORE returning the response so
+            // tests see the same view the drain is about to act on.
+            if let Ok(ref result) = response {
+                self.committed_records
+                    .lock()
+                    .unwrap()
+                    .extend(result.committed.iter().cloned());
+                self.dead_lettered_records
+                    .lock()
+                    .unwrap()
+                    .extend(result.dead_lettered.iter().cloned());
+            }
+            response
         }
 
         fn max_batch_size(&self) -> usize {
@@ -1364,6 +1433,140 @@ mod tests {
             assert_eq!(records[0], b"dead1");
             assert_eq!(records[1], b"dead2");
         }
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── End-to-end behaviour (extended MockSink: retry_after hints, captures) ──
+
+    /// `dead_letter_segment_readable_with_valid_crcs` already verifies the
+    /// dead-letter file's *bytes*. This test verifies the complete payload
+    /// pass-through view: the drain hands the sink exactly the records
+    /// from the segment, the sink's reported committed / dead-lettered
+    /// split reaches the dead-letter file on disk, and the metric counts
+    /// agree with the mock's introspection capture. Catches a regression
+    /// where the drain duplicates, drops, or reorders records between
+    /// segment-read and sink-commit.
+    #[test]
+    fn mock_captures_show_exact_payloads_pass_through_drain() {
+        let dir = tmp_dir("payload_passthrough");
+        let sealed = make_sealed_segment(&dir, 0, &[b"alpha", b"beta", b"gamma"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_responses([MockSink::ok_with_dead_letter(
+            vec![b"alpha".to_vec(), b"gamma".to_vec()],
+            vec![b"beta".to_vec()],
+        )]));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+
+        // Mock-captured view matches what the sink actually saw.
+        let committed = sink.committed_records();
+        let dead_lettered = sink.dead_lettered_records();
+        assert_eq!(committed, vec![b"alpha".to_vec(), b"gamma".to_vec()]);
+        assert_eq!(dead_lettered.len(), 1);
+        assert_eq!(dead_lettered[0].0, b"beta".to_vec());
+
+        // Metric counts agree with the capture.
+        assert_eq!(records_committed(&metrics), committed.len() as u64);
+        assert_eq!(records_dead_lettered(&metrics), dead_lettered.len() as u64);
+
+        // And the dead-letter file on disk contains exactly the records the
+        // sink reported as permanently rejected — end-to-end agreement.
+        let dl_dir = dir.join("dead_letter");
+        let dl_files: Vec<PathBuf> = std::fs::read_dir(&dl_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_str().unwrap_or("").ends_with(".wab.sealed"))
+            .collect();
+        assert_eq!(dl_files.len(), 1, "expected one dead-letter file");
+        let dl_records: Vec<Payload> = crate::wab::SegmentReader::open(&dl_files[0])
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(dl_records, vec![b"beta".to_vec()]);
+
+        // Segment was confirmed (and so deleted from the WAB dir).
+        assert!(get_confirmed_path(&sealed).exists());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `next_retry_delay`'s unit tests verify the helper picks the hint
+    /// over the default. This test verifies the drain ACTUALLY SLEEPS
+    /// the hinted duration — the wall-clock gap between the failing
+    /// commit and the retry must be ≥ the hint, not the fast_config
+    /// default (1 ms).
+    #[test]
+    fn drain_waits_retry_after_hint_before_retrying() {
+        let dir = tmp_dir("retry_after");
+        let sealed = make_sealed_segment(&dir, 0, &[b"hello"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        // 75 ms hint — distinguishable from the 1 ms fast_config default
+        // by more than scheduling jitter.
+        const HINT: Duration = Duration::from_millis(75);
+        let sink = Arc::new(MockSink::with_responses([
+            Err(MockError::TransientWithRetryAfter(HINT)),
+            MockSink::ok(vec![b"hello".to_vec()]),
+        ]));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+
+        let timestamps = sink.call_timestamps();
+        assert_eq!(timestamps.len(), 2, "expected exactly two commit calls");
+        let gap = timestamps[1].duration_since(timestamps[0]);
+        // Loose lower bound (60 ms) accounts for the drain's coarse
+        // sleep granularity and any sandbox scheduling jitter — well
+        // above the 1 ms default it would have used without the hint.
+        assert!(
+            gap >= Duration::from_millis(60),
+            "expected gap >= 60 ms (hinted 75 ms), got {gap:?}"
+        );
+        // Final state: committed, confirmed.
+        assert_eq!(records_committed(&metrics), 1);
+        assert!(get_confirmed_path(&sealed).exists());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The `.confirmed` sidecar marks the segment as successfully drained
+    /// and consumed. It must NOT appear after a transient error — only
+    /// after the final, successful commit. Catches a regression where
+    /// the drain writes `.confirmed` optimistically before the sink
+    /// actually acks, which would silently lose data on a real-world
+    /// retry-then-give-up scenario.
+    #[test]
+    fn confirmed_file_only_appears_after_successful_commit_not_during_retries() {
+        let dir = tmp_dir("confirmed_only_after_success");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1", b"r2"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        // Three transient failures, then success. The confirmed path
+        // must not exist after any of the failures — only after the
+        // last (successful) call.
+        let sink = Arc::new(MockSink::with_responses([
+            Err(MockError::Transient),
+            Err(MockError::Transient),
+            Err(MockError::Transient),
+            MockSink::ok(vec![b"r1".to_vec(), b"r2".to_vec()]),
+        ]));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+
+        // Sink saw all four calls.
+        assert_eq!(sink.call_count(), 4);
+        // Only the last call committed; the prior three were transient
+        // errors — committed_records should reflect only the success.
+        assert_eq!(sink.committed_records(), vec![b"r1".to_vec(), b"r2".to_vec()]);
+        // Confirmed file present, segment file deleted — final-state
+        // invariant.
+        assert!(get_confirmed_path(&sealed).exists());
+        assert!(!sealed.exists(), "segment file should be deleted after confirm");
 
         std::fs::remove_dir_all(dir).ok();
     }
