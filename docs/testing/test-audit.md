@@ -16,8 +16,8 @@ File audited: `crates/weir-server/tests/system.rs` (1711 lines, 41 `#[test]` fun
 - **Total tests:** 41
 - **Verdicts:** KEEP 25 / STRENGTHEN 10 / DELETE 3 / RENAME 2 / REWRITE 1
 - **Top findings:**
-  1. The suite over-tests "happy path acks succeed" (≈10 tests assert nothing more than `push().unwrap()`) and under-tests recovery: `wab_data_preserved_across_crash_restart` only checks that *bytes exist* post-restart, never that recovery actually replayed/sealed them — the `weir_recovery_records_replayed` metric is registered but never asserted by any test in this file.
-  2. The four flagged tests are weaker than their names imply. `disk_full_returns_nack_not_crash` tests EFBIG, not ENOSPC; `metrics_consistent_across_crash_restart` does not assert any cross-restart invariant; `server_restarts_after_sigkill` and `wab_data_integrity_after_crash` overlap heavily (the former is a strict subset of the latter once you discount the trivial post-restart push). `stalled_client_does_not_block_other_connections` is the strongest test in the suite — confirmed.
+  1. ~~Recovery is under-tested.~~ **Closed:** `wab_data_preserved_across_crash_restart` now asserts `weir_recovery_records_replayed_total >= acked_count` post-restart (system.rs:757–767), so a recovery pass that silently quarantined every segment would now fail the test.
+  2. ~~`disk_full_returns_nack_not_crash` tests EFBIG, not ENOSPC.~~ **Closed:** the EFBIG test was renamed to `efbig_returns_nack_not_crash` (system.rs:1174) and a real `enospc_returns_nack_not_crash` was added alongside it (system.rs:1232, `#[ignore]`-marked because it needs a pre-mounted tmpfs). The remaining flagged-test items (`metrics_consistent_across_crash_restart`, the `server_restarts_after_sigkill` / `wab_data_integrity_after_crash` overlap, and `stalled_client_does_not_block_other_connections` being the strongest test) still stand as documented.
   3. Several tests pass even if the feature they "test" is broken: `wab_segment_rotation_creates_multiple_segments` never observes rotation (writes 40 KiB into a 256 MiB segment); `all_durability_tiers_acked` cannot distinguish Sync from Buffered since it never inspects timing or fsync; `health_check_on_separate_connection_from_push` is indistinguishable from two unrelated health checks.
 
 ---
@@ -174,11 +174,11 @@ File audited: `crates/weir-server/tests/system.rs` (1711 lines, 41 `#[test]` fun
 - **Verdict:** DELETE
 - **Notes:** Strict subset of `server_restarts_after_sigkill` minus the pre-crash push. The "pushed nothing" angle adds no coverage.
 
-### `wab_data_preserved_across_crash_restart` — system.rs:951
-- **Asserts:** WAB bytes equal before/after SIGKILL, and `> 0` after restart.
-- **Regression prevented:** A startup-time WAB scrub that wipes good segments.
-- **Verdict:** STRENGTHEN
-- **Notes:** The "preserved" claim is much weaker than verified: it checks total byte count, not that records replay or that the recovery pass classifies them as valid. With `weir_recovery_records_replayed` registered as a metric, this test should scrape it post-restart and assert `>= acked_count`. As written, a recovery pass that quarantines every segment but leaves the files on disk would pass this test.
+### `wab_data_preserved_across_crash_restart` — system.rs:714
+- **Asserts:** WAB bytes equal before/after SIGKILL, `> 0` after restart, **and** `weir_recovery_records_replayed_total >= acked_count` post-restart.
+- **Regression prevented:** A startup-time WAB scrub that wipes good segments, **plus** a recovery pass that silently quarantines every segment (bytes intact, records lost).
+- **Verdict:** KEEP (was STRENGTHEN — the metric-scrape recommendation has since been implemented; see lines 757–767 of the test)
+- **Notes:** Audit's STRENGTHEN recommendation is now implemented. The `weir_recovery_records_replayed_total >= acked` assertion catches the "every segment quarantined" failure mode that the byte-count check alone could not.
 
 ## Fault injection
 
@@ -229,11 +229,17 @@ File audited: `crates/weir-server/tests/system.rs` (1711 lines, 41 `#[test]` fun
 
 ## Disk full
 
-### `disk_full_returns_nack_not_crash` — system.rs:1322 *(flagged)*
+### `efbig_returns_nack_not_crash` — system.rs:1174
 - **Asserts:** With `RLIMIT_FSIZE=0`, the first Sync push returns `Nack(InternalError)`; server stays healthy.
 - **Regression prevented:** A WAB write error path that panics or silently acks. That property is real and important.
-- **Verdict:** RENAME (and consider adding a real ENOSPC variant)
-- **Notes:** The name lies — this is EFBIG (write would exceed file-size limit), not ENOSPC (no space on device). The two error paths can diverge: EFBIG hits in the write syscall on the first byte over the limit, ENOSPC also hits in `fallocate`/`fsync`. **Recommendation:** rename this to `efbig_returns_nack_not_crash` (truthful) and add a separate `enospc_returns_nack_not_crash` that mounts a fixed-size tmpfs (or a loop device with a small backing file) and fills it. ENOSPC is the production scenario this test should be modeling; EFBIG just happens to be cheap to simulate without root. If only one can exist, the tmpfs variant is more valuable — EFBIG is essentially never hit in production deployments.
+- **Verdict:** KEEP (was "RENAME and consider adding ENOSPC variant" — both done)
+- **Notes:** Renamed from the misleading `disk_full_returns_nack_not_crash` (this is EFBIG — write would exceed file-size limit — not ENOSPC). The ENOSPC variant has been added as a sibling test below.
+
+### `enospc_returns_nack_not_crash` — system.rs:1232 *(`#[ignore]`, requires setup)*
+- **Asserts:** Same property as `efbig_returns_nack_not_crash` (Nack on first push, server healthy) but exercises the production scenario — a real filesystem-out-of-space rather than a per-process file-size rlimit.
+- **Regression prevented:** A WAB write error path that diverges between EFBIG and ENOSPC. The two can hit at different syscalls (EFBIG in the first over-budget `write`, ENOSPC also in `fallocate`/`fsync`).
+- **Verdict:** KEEP
+- **Notes:** `#[ignore]`-marked because it needs a small pre-mounted tmpfs at `WEIR_TEST_ENOSPC_DIR`; setup recipe is in the test's docstring. Audit closed for the original "add an ENOSPC variant" recommendation.
 
 ## WAB data integrity after crash
 

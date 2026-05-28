@@ -125,6 +125,18 @@ The five commits making up this pass:
   321 tests pass (up from 315: 6 new sql_common tests for coverage
   not present in either sink before).
 
+### Documentation
+
+- **`docs/testing/test-audit.md` refreshed.** Two items the audit
+  flagged as STRENGTHEN / RENAME-with-ENOSPC-variant have since been
+  implemented in code (the `weir_recovery_records_replayed_total`
+  assertion in `wab_data_preserved_across_crash_restart`, and the
+  `efbig_returns_nack_not_crash` rename + `enospc_returns_nack_not_crash`
+  sibling test). The audit doc still carried the original
+  recommendations as if pending; verdicts updated to KEEP and the top
+  findings summary now strikes through the closed items. Audit
+  remains useful as a record of what was found and what was done.
+
 ### Fixed
 
 - **`weir_wab_segments_total{state="open"}` metric now actually
