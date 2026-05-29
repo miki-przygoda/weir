@@ -100,10 +100,7 @@ impl WeirServer {
     /// Returns the PID of the child process. Panics if the child has been
     /// reaped (after `shutdown` / `sigterm` / `kill_ungracefully`).
     pub fn child_pid(&self) -> u32 {
-        self.child
-            .as_ref()
-            .expect("child has been reaped")
-            .id()
+        self.child.as_ref().expect("child has been reaped").id()
     }
 
     // ── Network helpers ──────────────────────────────────────────────────────
@@ -111,9 +108,8 @@ impl WeirServer {
     /// Opens a fresh [`WeirClient`] connection. Panics if the daemon refuses
     /// the connection — the caller should be sure the daemon is healthy.
     pub fn client(&self) -> WeirClient {
-        WeirClient::connect(&self.socket_path).unwrap_or_else(|e| {
-            panic!("failed to connect to {}: {e}", self.socket_path.display())
-        })
+        WeirClient::connect(&self.socket_path)
+            .unwrap_or_else(|e| panic!("failed to connect to {}: {e}", self.socket_path.display()))
     }
 
     pub fn metrics_url(&self) -> String {
@@ -373,11 +369,8 @@ impl WeirServerBuilder {
     pub fn start(self) -> WeirServer {
         let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
         let metrics_port = free_port();
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "weir_test_{}_{}",
-            self.tag,
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("weir_test_{}_{}", self.tag, std::process::id()));
         let wab_dir = self
             .wab_dir_override
             .clone()

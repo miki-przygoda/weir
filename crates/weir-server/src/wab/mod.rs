@@ -361,12 +361,7 @@ fn flusher_thread(
     }
 
     // Startup warmup
-    let mut writer = ShardWriter::new(
-        shard_id,
-        shard_dir,
-        segment_max_bytes,
-        Arc::clone(&metrics),
-    );
+    let mut writer = ShardWriter::new(shard_id, shard_dir, segment_max_bytes, Arc::clone(&metrics));
     if let Err(e) = writer.scan_and_advance_counter() {
         warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
     }
@@ -803,6 +798,9 @@ mod tests {
 
         // Non-string payload — must not panic the panic-message extractor itself.
         let int_payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(panic_message_str(&int_payload), "<non-string panic payload>");
+        assert_eq!(
+            panic_message_str(&int_payload),
+            "<non-string panic payload>"
+        );
     }
 }

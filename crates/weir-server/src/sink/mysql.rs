@@ -159,9 +159,7 @@ impl MySqlSink {
     /// for unit testing; do not call from the hot path (commit() already
     /// inlines this).
     pub(crate) fn build_insert_sql(&self, n: usize) -> String {
-        let placeholders: String = std::iter::repeat_n("(?)", n)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders: String = std::iter::repeat_n("(?)", n).collect::<Vec<_>>().join(", ");
         let verb = match self.config.insert_mode {
             InsertMode::Ignore => "INSERT IGNORE INTO",
             InsertMode::Plain => "INSERT INTO",
@@ -237,7 +235,7 @@ pub(crate) fn is_transient_server_code(code: u16) -> bool {
             | 1213  // ER_LOCK_DEADLOCK
             | 1290  // ER_OPTION_PREVENTS_STATEMENT (server in --read-only)
             | 1317  // ER_QUERY_INTERRUPTED
-            | 1062  // ER_DUP_ENTRY — see module docs (Plain mode only)
+            | 1062 // ER_DUP_ENTRY — see module docs (Plain mode only)
     )
 }
 
@@ -247,10 +245,7 @@ impl Sink for MySqlSink {
     type Record = Payload;
     type Error = SqlSinkError;
 
-    async fn commit(
-        &self,
-        batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, SqlSinkError> {
+    async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, SqlSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult {
                 committed: Vec::new(),
@@ -290,10 +285,7 @@ impl Sink for MySqlSink {
                         error = %reason,
                         "mysql sink permanently rejected batch; dead-lettering"
                     );
-                    let dead_lettered = batch
-                        .into_iter()
-                        .map(|r| (r, reason.clone()))
-                        .collect();
+                    let dead_lettered = batch.into_iter().map(|r| (r, reason.clone())).collect();
                     Ok(CommitResult {
                         committed: Vec::new(),
                         dead_lettered,

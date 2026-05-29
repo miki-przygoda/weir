@@ -35,7 +35,10 @@ const REFERENCE_PUSH_HELLO_SYNC: &[u8; 25] = &[
 #[test]
 fn push_hello_sync_encodes_to_reference_bytes() {
     let header = Header::new(MessageType::Push, Durability::Sync, 0, 5);
-    assert_eq!(header.version, WIRE_VERSION, "test assumes WIRE_VERSION = 1");
+    assert_eq!(
+        header.version, WIRE_VERSION,
+        "test assumes WIRE_VERSION = 1"
+    );
     let envelope = Envelope::new(header, b"hello".to_vec());
     let encoded = envelope.encode();
     assert_eq!(
@@ -118,15 +121,28 @@ fn nack_payload_too_large_encodes_to_reference_bytes() {
 /// client render "daemon is on vN; you are on vM" without an extra round-trip.
 /// Total 22 bytes.
 const REFERENCE_NACK_VERSION_MISMATCH: &[u8; 22] = &[
-    0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
+    0x57,
+    0x45,
+    0x49,
+    0x52, // magic = "WEIR"
     0x01, // version = 1
     0x03, // message_type = Nack (0x03)
     0x01, // durability = Sync (filler)
     0x00, // flags
-    0x02, 0x00, 0x00, 0x00, // payload_len = 2
-    0xf6, 0x84, 0x35, 0x36, // header_crc32
-    0x02, WIRE_VERSION, // NackReason::VersionMismatch + daemon WIRE_VERSION
-    0xeb, 0x40, 0xe8, 0x04, // payload_crc32 (of [0x02, 0x01])
+    0x02,
+    0x00,
+    0x00,
+    0x00, // payload_len = 2
+    0xf6,
+    0x84,
+    0x35,
+    0x36, // header_crc32
+    0x02,
+    WIRE_VERSION, // NackReason::VersionMismatch + daemon WIRE_VERSION
+    0xeb,
+    0x40,
+    0xe8,
+    0x04, // payload_crc32 (of [0x02, 0x01])
 ];
 
 #[test]

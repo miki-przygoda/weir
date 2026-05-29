@@ -100,7 +100,11 @@ fn emit_latency(scenario: &str, samples: usize, sorted_us: &[u64]) {
 // All N threads connect first, then synchronise on a barrier so their first
 // push() calls hit the server at the same instant.
 
-fn thundering_herd(srv: &weir_testkit::WeirServer, n_threads: usize, records_per_thread: usize) -> Duration {
+fn thundering_herd(
+    srv: &weir_testkit::WeirServer,
+    n_threads: usize,
+    records_per_thread: usize,
+) -> Duration {
     let barrier = Arc::new(Barrier::new(n_threads + 1));
     let socket = srv.socket_path.clone();
 
@@ -135,7 +139,11 @@ struct LevelResult {
     duration: Duration,
 }
 
-fn run_ramp_level(srv: &weir_testkit::WeirServer, n_threads: usize, duration: Duration) -> LevelResult {
+fn run_ramp_level(
+    srv: &weir_testkit::WeirServer,
+    n_threads: usize,
+    duration: Duration,
+) -> LevelResult {
     let acks = Arc::new(AtomicU64::new(0));
     let nacks = Arc::new(AtomicU64::new(0));
     let io_errors = Arc::new(AtomicU64::new(0));
@@ -362,7 +370,10 @@ fn ramp_to_saturation() {
     const LEVEL_DURATION: Duration = Duration::from_secs(3);
     const LEVELS: &[usize] = &[8, 16, 32, 48, 64, 96];
 
-    let srv = weir_server!("ramp").bench_preset().max_connections(MAX_CONN).start();
+    let srv = weir_server!("ramp")
+        .bench_preset()
+        .max_connections(MAX_CONN)
+        .start();
     let d = srv.batch_deadline_ms;
 
     println!(
@@ -612,7 +623,10 @@ fn sweep_agent_count_vs_throughput() {
 
     let cores = num_cpus_avail();
     eprintln!("\n=== agent_count sweep on {} cores ===", cores);
-    eprintln!("scenario: herd of {} threads × {} Sync records each", THREADS, RECORDS_PER_THREAD);
+    eprintln!(
+        "scenario: herd of {} threads × {} Sync records each",
+        THREADS, RECORDS_PER_THREAD
+    );
     eprintln!();
     eprintln!("agents | median RPS | min      | max      | agents/cores");
     eprintln!("-------|-----------:|---------:|---------:|-------------");
@@ -635,13 +649,18 @@ fn sweep_agent_count_vs_throughput() {
         let min = *trials_rps.first().unwrap();
         let max = *trials_rps.last().unwrap();
         let ratio = n as f64 / cores as f64;
-        eprintln!("{:>6} | {:>10} | {:>8} | {:>8} | {:.2}", n, median, min, max, ratio);
+        eprintln!(
+            "{:>6} | {:>10} | {:>8} | {:>8} | {:.2}",
+            n, median, min, max, ratio
+        );
     }
     eprintln!();
 }
 
 fn num_cpus_avail() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 fn parse_load_metric(body: &str, prefix: &str) -> u64 {

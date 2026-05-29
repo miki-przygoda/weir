@@ -175,15 +175,14 @@ mod tests {
         // closes the connection. The client sees EOF on first read.
         let mut conn2 = TcpStream::connect(addr).await.unwrap();
         let mut buf = [0u8; 256];
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            conn2.read(&mut buf),
-        )
-        .await
-        .expect("conn2 read should not block — server should close immediately")
-        .expect("conn2 read should not error");
+        let read =
+            tokio::time::timeout(std::time::Duration::from_millis(500), conn2.read(&mut buf))
+                .await
+                .expect("conn2 read should not block — server should close immediately")
+                .expect("conn2 read should not error");
         assert_eq!(
-            read, 0,
+            read,
+            0,
             "conn2 should see EOF (0 bytes) — got {read} bytes: {:?}",
             &buf[..read]
         );

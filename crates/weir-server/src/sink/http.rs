@@ -631,9 +631,7 @@ mod tests {
     /// Spawns a mock server that captures the first request's header block
     /// into `captured`, then returns 200 OK. Used to assert on what headers
     /// the sink actually sent.
-    async fn spawn_header_capture_server(
-        captured: Arc<std::sync::Mutex<Vec<String>>>,
-    ) -> String {
+    async fn spawn_header_capture_server(captured: Arc<std::sync::Mutex<Vec<String>>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/");
@@ -659,8 +657,7 @@ mod tests {
                             }
                         }
                     }
-                    let headers = String::from_utf8_lossy(&buf[..header_end.unwrap()])
-                        .to_string();
+                    let headers = String::from_utf8_lossy(&buf[..header_end.unwrap()]).to_string();
                     captured.lock().unwrap().push(headers);
                     // Drain the body so the client doesn't see ECONNRESET.
                     let content_length = {
@@ -699,10 +696,10 @@ mod tests {
         assert_eq!(headers.len(), 1);
         let expected_key = payload_idempotency_key(b"hello, weir");
         assert!(
-            headers[0]
-                .lines()
-                .any(|line| line.to_ascii_lowercase().starts_with("idempotency-key:")
-                    && line.contains(&expected_key)),
+            headers[0].lines().any(|line| line
+                .to_ascii_lowercase()
+                .starts_with("idempotency-key:")
+                && line.contains(&expected_key)),
             "no Idempotency-Key header with expected value found in:\n{}",
             headers[0]
         );

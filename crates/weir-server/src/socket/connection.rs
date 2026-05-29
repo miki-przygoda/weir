@@ -255,6 +255,13 @@ pub async fn handle_connection(
     }
 }
 
+// 8 args — clippy's threshold is 7. Grouping these into a `PushCtx`
+// struct is mechanically possible but doesn't improve call-site
+// readability: each field is a distinct concept the caller already
+// has separately (`queue_tx`, `metrics`, etc. are top-level handles
+// in the connection loop; bundling them just adds a constructor
+// roundtrip). The fn body uses each argument once.
+#[allow(clippy::too_many_arguments)]
 async fn handle_push(
     stream: &mut UnixStream,
     queue_tx: QueueSender<WorkUnit>,
@@ -372,11 +379,9 @@ fn nack_for_decode_error(e: &DecodeError) -> (WireNack, MetricNack, &'static [u8
             MetricNack::version_mismatch,
             &[WIRE_VERSION],
         ),
-        DecodeError::HeaderCrcMismatch { .. } => (
-            WireNack::BadHeaderCrc,
-            MetricNack::bad_header_crc,
-            &[],
-        ),
+        DecodeError::HeaderCrcMismatch { .. } => {
+            (WireNack::BadHeaderCrc, MetricNack::bad_header_crc, &[])
+        }
         _ => (WireNack::InternalError, MetricNack::internal_error, &[]),
     }
 }
@@ -390,7 +395,12 @@ async fn send_nack(stream: &mut UnixStream, reason: WireNack, extra: &[u8]) -> i
     nack_payload.push(reason as u8);
     nack_payload.extend_from_slice(extra);
 
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0, nack_payload.len() as u32);
+    let header = Header::new(
+        MessageType::Nack,
+        Durability::Sync,
+        0,
+        nack_payload.len() as u32,
+    );
     let frame = Envelope::new(header, nack_payload).encode();
     stream.write_all(&frame).await
 }
@@ -474,7 +484,13 @@ mod tests {
             }
         });
 
-        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            never_shutdown_rx(),
+        ));
         client
     }
 
@@ -684,7 +700,13 @@ mod tests {
             }
         });
 
-        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            never_shutdown_rx(),
+        ));
 
         let mut client = client;
         let t0 = std::time::Instant::now();
@@ -718,7 +740,13 @@ mod tests {
         let cfg = test_cfg();
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
-        tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            never_shutdown_rx(),
+        ));
 
         let mut client = client;
         client.write_all(&push_frame(b"data")).await.unwrap();
@@ -747,7 +775,13 @@ mod tests {
         let metrics_for_check = std::sync::Arc::clone(&metrics);
 
         let start = std::time::Instant::now();
-        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
+        let handle = tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            never_shutdown_rx(),
+        ));
 
         // The handler should return Ok within ~150ms+buffer once the
         // read times out. We give it 1s of margin.
@@ -799,7 +833,13 @@ mod tests {
 
         // Send a header advertising a 1024-byte payload, then send NOTHING.
         let header = Header::new(MessageType::Push, Durability::Sync, 0, 1024).encode();
-        let handle = tokio::spawn(handle_connection(server, queue_tx, cfg, metrics, never_shutdown_rx()));
+        let handle = tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            never_shutdown_rx(),
+        ));
         client.write_all(&header).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(1), handle)

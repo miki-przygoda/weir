@@ -110,18 +110,14 @@ fn parse_mysql_insert_mode(s: &str) -> Result<crate::sink::mysql::InsertMode, Co
         "plain" => Ok(InsertMode::Plain),
         other => Err(ConfigError::InvalidValue {
             field: "sink_mysql_insert_mode",
-            reason: format!(
-                "'{other}' is not a valid insert mode; expected 'ignore' or 'plain'"
-            ),
+            reason: format!("'{other}' is not a valid insert mode; expected 'ignore' or 'plain'"),
         }),
     }
 }
 
 /// Parses the `sink_postgres_insert_mode` config string into the sink-layer
 /// enum. Mirror of [`parse_mysql_insert_mode`] for the Postgres sink.
-fn parse_postgres_insert_mode(
-    s: &str,
-) -> Result<crate::sink::postgres::InsertMode, ConfigError> {
+fn parse_postgres_insert_mode(s: &str) -> Result<crate::sink::postgres::InsertMode, ConfigError> {
     use crate::sink::postgres::InsertMode;
     match s {
         "on_conflict_do_nothing" => Ok(InsertMode::OnConflictDoNothing),
@@ -334,23 +330,19 @@ impl Config {
         // the security reasoning. Operators who want LAN-visible metrics must
         // explicitly set "0.0.0.0" (or a specific interface address).
         let metrics_bind_str = merge!(metrics_bind).unwrap_or_else(|| "127.0.0.1".to_string());
-        let metrics_bind = metrics_bind_str.parse::<IpAddr>().map_err(|_| {
-            ConfigError::InvalidValue {
-                field: "metrics_bind",
-                reason: format!(
-                    "'{metrics_bind_str}' is not a valid IP address (expected e.g. \
+        let metrics_bind =
+            metrics_bind_str
+                .parse::<IpAddr>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    field: "metrics_bind",
+                    reason: format!(
+                        "'{metrics_bind_str}' is not a valid IP address (expected e.g. \
                      '127.0.0.1', '0.0.0.0', '::1', or a specific interface address)"
-                ),
-            }
-        })?;
+                    ),
+                })?;
 
         let metrics_max_connections = merge!(metrics_max_connections).unwrap_or(8);
-        check_range(
-            "metrics_max_connections",
-            metrics_max_connections,
-            1,
-            1024,
-        )?;
+        check_range("metrics_max_connections", metrics_max_connections, 1, 1024)?;
 
         let peer_uid_check = merge!(peer_uid_check).unwrap_or(true);
 
@@ -431,8 +423,7 @@ impl Config {
             merge!(sink_postgres_column).unwrap_or_else(|| "payload".to_string());
         let sink_postgres_insert_mode_str = merge!(sink_postgres_insert_mode)
             .unwrap_or_else(|| "on_conflict_do_nothing".to_string());
-        let sink_postgres_insert_mode =
-            parse_postgres_insert_mode(&sink_postgres_insert_mode_str)?;
+        let sink_postgres_insert_mode = parse_postgres_insert_mode(&sink_postgres_insert_mode_str)?;
 
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
@@ -623,7 +614,10 @@ mod tests {
         assert!(c.sink_send_idempotency_key);
         assert_eq!(c.sink_mysql_table, "weir_records");
         assert_eq!(c.sink_mysql_column, "payload");
-        assert_eq!(c.sink_mysql_insert_mode, crate::sink::mysql::InsertMode::Ignore);
+        assert_eq!(
+            c.sink_mysql_insert_mode,
+            crate::sink::mysql::InsertMode::Ignore
+        );
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");
@@ -852,7 +846,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.sink_type, SinkType::Mysql);
-        assert_eq!(c.sink_mysql_insert_mode, crate::sink::mysql::InsertMode::Ignore);
+        assert_eq!(
+            c.sink_mysql_insert_mode,
+            crate::sink::mysql::InsertMode::Ignore
+        );
         fs::remove_dir_all(dir).ok();
     }
 

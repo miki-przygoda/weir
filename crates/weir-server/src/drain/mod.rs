@@ -262,13 +262,11 @@ fn drain_thread<S: Sink>(
                             confirm_and_delete(&segment, record_count, &metrics);
                             DrainState::Draining
                         }
-                        ProcessResult::Transient { retry_after } => {
-                            DrainState::RetryingTransient {
-                                segment,
-                                retries_left: retries_left - 1,
-                                next_delay: next_retry_delay(next_delay * 2, retry_after),
-                            }
-                        }
+                        ProcessResult::Transient { retry_after } => DrainState::RetryingTransient {
+                            segment,
+                            retries_left: retries_left - 1,
+                            next_delay: next_retry_delay(next_delay * 2, retry_after),
+                        },
                         ProcessResult::BlockedDeadLetter => enter_blocked(segment, &metrics),
                     }
                 }
@@ -618,10 +616,7 @@ mod tests {
         // Same cap applies to the default path (exponential backoff can
         // theoretically run away too).
         let default = Duration::from_secs(10_000);
-        assert_eq!(
-            next_retry_delay(default, None),
-            Duration::from_secs(300)
-        );
+        assert_eq!(next_retry_delay(default, None), Duration::from_secs(300));
     }
     use weir_core::Payload;
 
@@ -1459,7 +1454,13 @@ mod tests {
             vec![b"beta".to_vec()],
         )]));
         let metrics = noop_metrics();
-        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+        run_drain(
+            rx,
+            tx,
+            sink.clone(),
+            fast_config(dir.clone()),
+            metrics.clone(),
+        );
 
         // Mock-captured view matches what the sink actually saw.
         let committed = sink.committed_records();
@@ -1514,7 +1515,13 @@ mod tests {
             MockSink::ok(vec![b"hello".to_vec()]),
         ]));
         let metrics = noop_metrics();
-        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+        run_drain(
+            rx,
+            tx,
+            sink.clone(),
+            fast_config(dir.clone()),
+            metrics.clone(),
+        );
 
         let timestamps = sink.call_timestamps();
         assert_eq!(timestamps.len(), 2, "expected exactly two commit calls");
@@ -1556,17 +1563,29 @@ mod tests {
             MockSink::ok(vec![b"r1".to_vec(), b"r2".to_vec()]),
         ]));
         let metrics = noop_metrics();
-        run_drain(rx, tx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+        run_drain(
+            rx,
+            tx,
+            sink.clone(),
+            fast_config(dir.clone()),
+            metrics.clone(),
+        );
 
         // Sink saw all four calls.
         assert_eq!(sink.call_count(), 4);
         // Only the last call committed; the prior three were transient
         // errors — committed_records should reflect only the success.
-        assert_eq!(sink.committed_records(), vec![b"r1".to_vec(), b"r2".to_vec()]);
+        assert_eq!(
+            sink.committed_records(),
+            vec![b"r1".to_vec(), b"r2".to_vec()]
+        );
         // Confirmed file present, segment file deleted — final-state
         // invariant.
         assert!(get_confirmed_path(&sealed).exists());
-        assert!(!sealed.exists(), "segment file should be deleted after confirm");
+        assert!(
+            !sealed.exists(),
+            "segment file should be deleted after confirm"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

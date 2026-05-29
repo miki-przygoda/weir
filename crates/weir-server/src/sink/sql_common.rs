@@ -264,7 +264,10 @@ mod tests {
         let r = redact_password(url);
         assert!(!r.contains("s3cret"), "password leaked: {r}");
         assert!(r.contains("alice"), "user should still appear: {r}");
-        assert!(r.contains("db.example.com"), "host should still appear: {r}");
+        assert!(
+            r.contains("db.example.com"),
+            "host should still appear: {r}"
+        );
         assert!(r.contains("<redacted>"), "redaction marker missing: {r}");
     }
 
@@ -282,7 +285,10 @@ mod tests {
     fn redact_password_leaves_unauthenticated_urls_alone() {
         // No user:pass@ component → nothing to redact, URL returned
         // unchanged. (Important: must NOT crash on malformed inputs.)
-        assert_eq!(redact_password("mysql://localhost:3306/weir"), "mysql://localhost:3306/weir");
+        assert_eq!(
+            redact_password("mysql://localhost:3306/weir"),
+            "mysql://localhost:3306/weir"
+        );
         assert_eq!(redact_password("postgres://host/db"), "postgres://host/db");
     }
 
@@ -321,7 +327,10 @@ mod tests {
         let t = SqlSinkError::timeout("mysql");
 
         assert_eq!(format!("{m}"), "mysql sink transient: io: connection reset");
-        assert_eq!(format!("{p}"), "postgres sink permanent: syntax error at $1");
+        assert_eq!(
+            format!("{p}"),
+            "postgres sink permanent: syntax error at $1"
+        );
         assert_eq!(format!("{t}"), "mysql sink timeout");
     }
 }

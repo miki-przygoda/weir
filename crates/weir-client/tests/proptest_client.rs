@@ -91,7 +91,10 @@ fn push_on_empty_response_returns_err_not_panic() {
     let mut client = paired_client(Vec::new());
     let result = client.push(b"hi", Durability::Sync);
     assert!(
-        matches!(result, Err(ClientError::Io(_)) | Err(ClientError::Protocol(_))),
+        matches!(
+            result,
+            Err(ClientError::Io(_)) | Err(ClientError::Protocol(_))
+        ),
         "expected Io or Protocol error on empty response, got {result:?}"
     );
 }
@@ -104,7 +107,10 @@ fn push_on_truncated_header_returns_err_not_panic() {
     let mut client = paired_client(truncated);
     let result = client.push(b"hi", Durability::Sync);
     assert!(
-        matches!(result, Err(ClientError::Io(_)) | Err(ClientError::Protocol(_))),
+        matches!(
+            result,
+            Err(ClientError::Io(_)) | Err(ClientError::Protocol(_))
+        ),
         "expected Io or Protocol error on truncated header, got {result:?}"
     );
 }

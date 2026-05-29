@@ -94,12 +94,7 @@ impl<T> QueueSender<T> {
     /// land on the same sub-channel, so a single producer's records on a
     /// given shard arrive at the worker in submission order even when
     /// other producers are concurrently pushing to the same shard.
-    pub fn push_timeout(
-        &self,
-        partition_key: usize,
-        unit: T,
-        timeout: Duration,
-    ) -> Result<(), T> {
+    pub fn push_timeout(&self, partition_key: usize, unit: T, timeout: Duration) -> Result<(), T> {
         let idx = partition_key % self.txs.len();
         match self.txs[idx].send_timeout(unit, timeout) {
             Ok(()) => Ok(()),
@@ -140,7 +135,10 @@ mod tests {
     /// Test-only constructor that lets a test override the per-partition
     /// capacity so blocking behaviour can be exercised without filling
     /// `QUEUE_CAPACITY / partitions` slots.
-    fn new_with_capacity<T>(partitions: usize, per_partition_cap: usize) -> (QueueSender<T>, QueueReceiver<T>) {
+    fn new_with_capacity<T>(
+        partitions: usize,
+        per_partition_cap: usize,
+    ) -> (QueueSender<T>, QueueReceiver<T>) {
         let mut txs = Vec::with_capacity(partitions);
         let mut rxs = Vec::with_capacity(partitions);
         for _ in 0..partitions {
@@ -238,9 +236,9 @@ mod tests {
         // Push 50 items to partition 0 interleaved with pushes to other
         // partitions. The partition-0 receiver must see them in submission order.
         for i in 0..50u32 {
-            tx.push(0, i);                 // partition 0
-            tx.push(1, 1000 + i);          // partition 1
-            tx.push(2, 2000 + i);          // partition 2
+            tx.push(0, i); // partition 0
+            tx.push(1, 1000 + i); // partition 1
+            tx.push(2, 2000 + i); // partition 2
         }
         let mut seen: Vec<u32> = Vec::new();
         while let Ok(v) = recv0.try_recv() {
@@ -259,11 +257,11 @@ mod tests {
         let r0 = rx.get(0);
         let r1 = rx.get(1);
         let r2 = rx.get(2);
-        tx.push(0, 10);  // partition 0
-        tx.push(1, 20);  // partition 1
-        tx.push(2, 30);  // partition 2
-        tx.push(3, 40);  // partition 0 (3 % 3)
-        tx.push(4, 50);  // partition 1 (4 % 3)
+        tx.push(0, 10); // partition 0
+        tx.push(1, 20); // partition 1
+        tx.push(2, 30); // partition 2
+        tx.push(3, 40); // partition 0 (3 % 3)
+        tx.push(4, 50); // partition 1 (4 % 3)
         assert_eq!(r0.try_recv().unwrap(), 10);
         assert_eq!(r0.try_recv().unwrap(), 40);
         assert_eq!(r1.try_recv().unwrap(), 20);

@@ -35,7 +35,6 @@ use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
 use weir_testkit::{free_port, process_lock, weir_server};
 
-
 // Helper: sum all file bytes under a directory tree.
 fn wab_dir_bytes(dir: &Path) -> u64 {
     let Ok(rd) = fs::read_dir(dir) else { return 0 };
@@ -221,7 +220,8 @@ fn concurrent_producers_all_acked() {
     let acked = parse_metric(&body, "weir_records_ack_total{tier=\"batched\"}");
     let expected = (THREADS * RECORDS_PER_THREAD) as u64;
     assert_eq!(
-        acked, expected,
+        acked,
+        expected,
         "expected {expected} batched acks, got {acked} — \
          {} records appear to have been dropped silently",
         expected - acked
@@ -564,9 +564,8 @@ fn payload_size_boundary_enforced() {
             !payload.is_empty(),
             "nack response had zero-length payload — no room for reason byte"
         );
-        let reason = NackReason::try_from(payload[0]).unwrap_or_else(|e| {
-            panic!("invalid NackReason byte {}: {e}", payload[0])
-        });
+        let reason = NackReason::try_from(payload[0])
+            .unwrap_or_else(|e| panic!("invalid NackReason byte {}: {e}", payload[0]));
         assert_eq!(
             reason,
             NackReason::PayloadTooLarge,
@@ -867,7 +866,11 @@ fn readonly_wab_dir_prevents_startup() {
         failed,
         "weir-server should fail to start when wab_dir is unreadable/unwritable \
          (running {}as root)",
-        if drop_to_nobody { "originally " } else { "not " }
+        if drop_to_nobody {
+            "originally "
+        } else {
+            "not "
+        }
     );
 }
 
@@ -909,7 +912,9 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
     const RECORDS_PER_THREAD: usize = 50;
     const SHARD_COUNT: usize = 4;
 
-    let srv = weir_server!("multi_shard_conc").shard_count(SHARD_COUNT).start();
+    let srv = weir_server!("multi_shard_conc")
+        .shard_count(SHARD_COUNT)
+        .start();
     let socket_path = srv.socket_path.clone();
 
     let handles: Vec<_> = (0..THREADS)
@@ -1179,17 +1184,15 @@ fn efbig_returns_nack_not_crash() {
     // error that the server surfaces as Nack(InternalError). stdout/stderr
     // are silenced because the log file itself would also fail to write.
     let srv = unsafe {
-        weir_server!("efbig")
-            .silence_logs()
-            .pre_exec(|| {
-                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
-                let rl = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                libc::setrlimit(libc::RLIMIT_FSIZE, &rl);
-                Ok(())
-            })
+        weir_server!("efbig").silence_logs().pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_FSIZE, &rl);
+            Ok(())
+        })
     }
     .start();
     let mut client = srv.client();
@@ -1232,9 +1235,8 @@ fn efbig_returns_nack_not_crash() {
 fn enospc_returns_nack_not_crash() {
     use weir_core::NackReason;
 
-    let enospc_dir = std::env::var("WEIR_TEST_ENOSPC_DIR").expect(
-        "WEIR_TEST_ENOSPC_DIR not set — see test docstring for the tmpfs setup procedure",
-    );
+    let enospc_dir = std::env::var("WEIR_TEST_ENOSPC_DIR")
+        .expect("WEIR_TEST_ENOSPC_DIR not set — see test docstring for the tmpfs setup procedure");
     let enospc_dir = PathBuf::from(enospc_dir);
     let wab_dir = enospc_dir.join("wab");
 
@@ -1614,8 +1616,7 @@ fn concurrent_producers_to_same_shard_preserve_per_producer_order() {
         .map(|producer_id| {
             let sock = socket_path.clone();
             std::thread::spawn(move || {
-                let mut client = weir_client::WeirClient::connect(&sock)
-                    .expect("client connect");
+                let mut client = weir_client::WeirClient::connect(&sock).expect("client connect");
                 for seq in 0..N_RECORDS {
                     let payload = format!("p{producer_id:02}-s{seq:05}").into_bytes();
                     client

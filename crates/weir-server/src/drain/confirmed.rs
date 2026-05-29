@@ -14,8 +14,8 @@
 //! "already drained, orphan file on disk" state — safe; an operator can
 //! clean it up at any time.
 
-use std::path::{Path, PathBuf};
 use std::io;
+use std::path::{Path, PathBuf};
 
 use tracing::{error, warn};
 

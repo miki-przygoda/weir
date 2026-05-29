@@ -162,10 +162,9 @@ impl PostgresSink {
             .map_err(PostgresSinkBuildError::from)?;
         sql_common::validate_identifier("column", &config.column, IDENTIFIER_MAX_LEN)
             .map_err(PostgresSinkBuildError::from)?;
-        let pg_config: PgConfig = config
-            .url
-            .parse()
-            .map_err(|e: tokio_postgres::Error| PostgresSinkBuildError::InvalidUrl(e.to_string()))?;
+        let pg_config: PgConfig = config.url.parse().map_err(|e: tokio_postgres::Error| {
+            PostgresSinkBuildError::InvalidUrl(e.to_string())
+        })?;
 
         // TLS opt-in via `?sslmode=require` in the URL. The other two
         // tokio-postgres SslMode values keep the cleartext path so we
@@ -257,7 +256,7 @@ impl PostgresSink {
 /// startup), so memoisation would buy nothing.
 fn build_tls_connector() -> MakeRustlsConnect {
     let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
     let client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
@@ -332,7 +331,7 @@ pub(crate) fn is_transient_sqlstate(state: &SqlState) -> bool {
         || state == &SqlState::ADMIN_SHUTDOWN         // 57P01
         || state == &SqlState::CRASH_SHUTDOWN         // 57P02
         || state == &SqlState::CANNOT_CONNECT_NOW     // 57P03
-        || state == &SqlState::UNIQUE_VIOLATION       // 23505 — see module docs (Plain mode only)
+        || state == &SqlState::UNIQUE_VIOLATION // 23505 — see module docs (Plain mode only)
 }
 
 // ── Sink trait impl ───────────────────────────────────────────────────────────
@@ -341,10 +340,7 @@ impl Sink for PostgresSink {
     type Record = Payload;
     type Error = SqlSinkError;
 
-    async fn commit(
-        &self,
-        batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, SqlSinkError> {
+    async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, SqlSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult {
                 committed: Vec::new(),
@@ -394,10 +390,7 @@ impl Sink for PostgresSink {
                         error = %reason,
                         "postgres sink permanently rejected batch; dead-lettering"
                     );
-                    let dead_lettered = batch
-                        .into_iter()
-                        .map(|r| (r, reason.clone()))
-                        .collect();
+                    let dead_lettered = batch.into_iter().map(|r| (r, reason.clone())).collect();
                     Ok(CommitResult {
                         committed: Vec::new(),
                         dead_lettered,
@@ -631,10 +624,7 @@ mod tests {
     fn timeout_error_carries_postgres_driver_tag() {
         let err = SqlSinkError::timeout(DRIVER);
         assert!(err.is_transient());
-        assert!(
-            format!("{err}").starts_with("postgres "),
-            "got: {err}"
-        );
+        assert!(format!("{err}").starts_with("postgres "), "got: {err}");
     }
 
     #[test]
