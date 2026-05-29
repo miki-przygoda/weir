@@ -21,6 +21,7 @@
 
 use std::{
     fs,
+    io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -241,9 +242,26 @@ fn many_connections_open_simultaneously() {
 
     // Open all connections first, then push from each, to exercise the
     // semaphore-based connection cap under load.
+    //
+    // On macOS kern.ipc.somaxconn=128 caps the listen backlog. A tight connect
+    // loop can fill it faster than the server's accept loop drains it, causing
+    // ECONNREFUSED. Retry with a 1 ms back-off until the server catches up or
+    // the 5-second deadline expires.
     let clients: Vec<WeirClient> = (0..CONN_COUNT)
         .map(|i| {
-            WeirClient::connect(&srv.socket_path).unwrap_or_else(|e| panic!("connect {i}: {e}"))
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match WeirClient::connect(&srv.socket_path) {
+                    Ok(c) => break c,
+                    Err(ClientError::Io(ref e))
+                        if e.kind() == io::ErrorKind::ConnectionRefused
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("connect {i}: {e}"),
+                }
+            }
         })
         .collect();
 
