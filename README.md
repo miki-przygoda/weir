@@ -10,12 +10,15 @@ user-implemented `Sink`. WAB segments are not reclaimed until the sink
 confirms the batch. On restart, any unconfirmed segments are replayed
 automatically.
 
-> **Status — pre-v1.** Pipeline, security hardening, and two real
-> sinks complete. Three built-in sinks: `noop` for soak-testing,
-> `http` (POST per record, transient/permanent classification), and
-> `mysql` (one multi-row `INSERT` per batch — the IOPS-compression
-> sink: N records → 1 statement → 1 server-side commit). Wire
-> protocol and WAB on-disk format are versioned and stable.
+> **Status — pre-v1.** Pipeline, security hardening, and the SQL
+> sink line are complete. Four built-in sinks: `noop` for soak-testing,
+> `http` (POST per record, transient/permanent classification),
+> `mysql` (multi-row `INSERT` per batch — the IOPS-compression sink:
+> N records → 1 statement → 1 server-side commit), and `postgres`
+> (the same shape with `ON CONFLICT DO NOTHING`, TLS opt-in via
+> `?sslmode=require`). WAB flusher panics are supervised and respawned
+> (capped at 10 attempts before the shard goes offline). Wire protocol
+> and WAB on-disk format are versioned and stable.
 > **Not yet on crates.io.**
 
 ## Quickstart
@@ -42,6 +45,7 @@ entry point. The structure:
 | **Protocol**       | [wire format](docs/wire_protocol.md), [WAB format](docs/wab_format.md)    |
 | **Architecture**   | [internals](docs/architecture.md), [benchmarks](docs/benchmarks.md)       |
 | **Security**       | [threat model](docs/security/threat-model.md), [socket-bind hardening](docs/security/socket-bind.md), [container hardening](docs/security/container.md) — reporting policy at [SECURITY.md](SECURITY.md) |
+| **Testing**        | [system-test audit](docs/testing/test-audit.md) (verdicts on all 41 system tests), [sink integration suite](docs/testing/sink-integration.md) (docker-compose runner for the SQL sinks), [fuzzing](docs/testing/fuzzing.md) (`cargo-fuzz` targets for the trust-boundary parsers) |
 
 The full version history is in [CHANGELOG.md](CHANGELOG.md).
 

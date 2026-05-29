@@ -32,3 +32,9 @@
 - [Threat model](security/threat-model.md)
 - [Socket bind hardening](security/socket-bind.md)
 - [Container hardening](security/container.md)
+
+# Testing
+
+- [System-test audit](testing/test-audit.md)
+- [Sink integration suite](testing/sink-integration.md)
+- [Fuzzing](testing/fuzzing.md)

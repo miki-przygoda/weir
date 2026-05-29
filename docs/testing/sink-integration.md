@@ -82,7 +82,10 @@ WEIR_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:3306/weir_test \
   GitHub Actions needs a service-container setup and is enough
   complexity that it deserves its own PR — `.github/workflows/sink-integration.yml`
   is a clean follow-up when someone wants it.
-- **TLS-enabled containers.** The Postgres sink defaults to `NoTls`
-  (see CHANGELOG); the test stack doesn't enable TLS. A future TLS
-  variant of the postgres compose service is a separate
-  follow-up tied to the planned `tokio-postgres-rustls` work.
+- **TLS-enabled containers.** The Postgres sink supports TLS via
+  `?sslmode=require` (see
+  [Configuration → Postgres](../operations/configuration.md), but
+  the test compose stack runs without TLS so the runner doesn't
+  need a CA-trusted cert. A TLS-enabled `postgres-tls` service
+  alongside the existing `postgres` one is a clean follow-up
+  that would exercise the handshake path end-to-end.

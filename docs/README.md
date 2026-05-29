@@ -103,6 +103,28 @@ review. The reporting policy is at the repo root.
 
 ---
 
+## Testing
+
+The unit + system + load test suites in `crates/weir-server/tests/` are
+the day-to-day coverage. The docs below describe the larger-grained
+test infrastructure that runs separately:
+
+- [**testing/test-audit.md**](testing/test-audit.md) — Verdicts on
+  every test in `tests/system.rs` (KEEP / STRENGTHEN / DELETE /
+  RENAME / REWRITE), with notes on what each guards against. The
+  reference document when adding or removing a system test.
+- [**testing/sink-integration.md**](testing/sink-integration.md) —
+  How to run the MySQL + Postgres end-to-end tests against real
+  databases via the docker-compose harness at
+  `deploy/docker/test/` (one-command runner:
+  `bash deploy/run-sink-integration-tests.sh`).
+- [**testing/fuzzing.md**](testing/fuzzing.md) — `cargo-fuzz` setup
+  and target catalogue. Currently two coverage-guided targets
+  for the trust-boundary parsers (`wab_confirmed`,
+  `envelope_parse`); needs nightly Rust.
+
+---
+
 ## Benchmarks
 
 - [**benchmarks.md**](benchmarks.md) — Hub doc.
