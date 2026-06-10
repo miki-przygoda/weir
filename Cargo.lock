@@ -3002,6 +3002,7 @@ name = "weir-testkit"
 version = "0.4.0"
 dependencies = [
  "libc",
+ "rcgen",
  "weir-client",
 ]
 
