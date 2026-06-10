@@ -75,6 +75,12 @@ pub struct SocketConfig {
 /// Returns when `shutdown_rx` fires or is dropped. Before returning, waits up to
 /// `config.shutdown_timeout_secs` for all in-flight connections to finish.
 ///
+/// `sem` is the shared connection-cap semaphore. Both the Unix listener and the
+/// TCP+mTLS listener (when enabled) receive a clone of the SAME `Arc<Semaphore>`
+/// so the combined cap across both transports is `Semaphore::new(max_connections)`,
+/// not 2×max_connections. The caller is responsible for creating the semaphore
+/// with the desired global cap and cloning it into each listener.
+///
 /// # Bind sequence (TOCTOU hardening)
 ///
 /// The bind sequence is implemented in `bind_hardened`. It uses a dirfd to pin
@@ -90,6 +96,7 @@ pub async fn run(
     queue_tx: QueueSender<WorkUnit>,
     shutdown_rx: oneshot::Receiver<()>,
     metrics: std::sync::Arc<Metrics>,
+    sem: std::sync::Arc<Semaphore>,
 ) -> io::Result<()> {
     validate_socket_path(&config.socket_path)?;
     let listener = bind_hardened(&config.socket_path)?;
@@ -105,7 +112,6 @@ pub async fn run(
         ack_timeout: crate::socket::connection::ACK_TIMEOUT,
         shard_id: 0, // overridden per connection below
     };
-    let sem = std::sync::Arc::new(Semaphore::new(config.max_connections));
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown_rx);
 
@@ -880,7 +886,8 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let _rx = queue_rx.get(0); // keep receiver alive
 
-        tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics(), sem));
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // First connection fills the cap.
@@ -918,7 +925,8 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let _rx = queue_rx.get(0); // keep receiver alive
 
-        let run_handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        let run_handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics(), sem));
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // Open an idle connection — never send any bytes.
@@ -950,7 +958,8 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
 
-        let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics(), sem));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         shutdown_tx.send(()).unwrap();
@@ -977,7 +986,8 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let (queue_tx, _) = queue::new::<WorkUnit>(1);
 
-            tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics()));
+            let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+            tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics(), sem));
             tokio::time::sleep(Duration::from_millis(30)).await;
 
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();

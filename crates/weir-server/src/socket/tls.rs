@@ -22,7 +22,6 @@ pub enum TlsConfigError {
     },
     NoCertsFound(String),
     NoPrivateKey(String),
-    EmptyCaStore(String),
     Verifier(String),
     Rustls(rustls::Error),
 }
@@ -33,7 +32,6 @@ impl std::fmt::Display for TlsConfigError {
             Self::Io { path, source } => write!(f, "reading '{path}': {source}"),
             Self::NoCertsFound(p) => write!(f, "no certificates found in '{p}'"),
             Self::NoPrivateKey(p) => write!(f, "no private key found in '{p}'"),
-            Self::EmptyCaStore(p) => write!(f, "CA file '{p}' yielded no usable roots"),
             Self::Verifier(e) => write!(f, "building client-cert verifier: {e}"),
             Self::Rustls(e) => write!(f, "rustls: {e}"),
         }
@@ -96,11 +94,9 @@ pub fn build_server_config(
             .add(ca)
             .map_err(|e| TlsConfigError::Verifier(e.to_string()))?;
     }
-    if roots.is_empty() {
-        return Err(TlsConfigError::EmptyCaStore(
-            client_ca_path.display().to_string(),
-        ));
-    }
+    // `load_certs` already returns `NoCertsFound` if the CA file has no certs,
+    // so after a successful `load_certs(client_ca_path)?` the loop always adds
+    // ≥1 root — `roots.is_empty()` can never be true here.
 
     // `builder_with_provider` requires the client cert verifier to use the same
     // provider as the server config.  Both calls below pass the aws-lc-rs

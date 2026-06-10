@@ -1,7 +1,9 @@
 //! TCP accept loop with mutual TLS (feature = "tls").
 //!
-//! Mirrors the Unix accept loop ([`super::run`]): a per-listener connection-limit
-//! semaphore, round-robin shard assignment, and a graceful-shutdown watch
+//! Mirrors the Unix accept loop ([`super::run`]): shares a global connection-limit
+//! semaphore (passed in by the caller; the same `Arc<Semaphore>` is also given to
+//! the Unix loop so the combined cap across both transports is exactly
+//! `max_connections`), round-robin shard assignment, and a graceful-shutdown watch
 //! channel managed entirely inside `run`. The difference is the transport: this
 //! loop accepts TCP and requires a mutual-TLS handshake (a CA-signed client
 //! certificate) — completed under a handshake timeout — before the shared
@@ -51,11 +53,11 @@ use crate::{
 /// Configuration for the TCP+mTLS accept loop. Mirrors the relevant subset of
 /// [`super::SocketConfig`] plus the TLS handshake timeout.
 pub struct TcpConfig {
-    /// Maximum concurrent connections for THIS listener. The TCP loop creates
-    /// its own [`Semaphore`] internally, so when both the Unix and TCP listeners
-    /// are active the total across both transports can reach 2 × max_connections.
-    /// Each transport is independently bounded. Unifying the cap into a single
-    /// global semaphore shared across transports is a deliberate Task 9 follow-up.
+    /// Informational copy of the global max_connections limit. Used in the
+    /// "connection limit reached" warning log. The actual semaphore that enforces
+    /// the cap is passed as `sem` to [`run`] and is SHARED with the Unix listener
+    /// — so the combined connection count across both transports is bounded by
+    /// `max_connections`, not 2×max_connections.
     pub max_connections: usize,
     /// Per-connection payload cap in bytes. Effective cap is
     /// `min(max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
@@ -76,13 +78,13 @@ pub struct TcpConfig {
 /// Binds nothing — accepts on the already-bound `listener` (see module docs for
 /// the bound-addr rationale) — and drives the TCP+mTLS frame-parsing layer.
 ///
-/// `sem` is THIS listener's own connection-cap semaphore (the Unix loop uses a
-/// separate semaphore, so both transports combined can admit up to
-/// 2 × `config.max_connections` concurrent connections until Task 9 unifies
-/// them). The handler-shutdown watch channel is created internally, mirroring
-/// the Unix loop: after the accept loop breaks, `handler_shutdown_tx.send(true)`
-/// fires BEFORE the drain so idle handlers exit promptly without waiting out
-/// `connection_read_timeout_secs`.
+/// `sem` is the SHARED connection-cap semaphore (same `Arc<Semaphore>` as the
+/// Unix listener). Both transports draw permits from the same pool, so the
+/// combined cap across Unix + TCP is exactly `config.max_connections` — not
+/// 2×max_connections. The handler-shutdown watch channel is created internally,
+/// mirroring the Unix loop: after the accept loop breaks,
+/// `handler_shutdown_tx.send(true)` fires BEFORE the drain so idle handlers exit
+/// promptly without waiting out `connection_read_timeout_secs`.
 ///
 /// Returns when `shutdown_rx` fires or is dropped, after draining in-flight
 /// connections within `shutdown_timeout_secs`.
@@ -139,9 +141,9 @@ pub async fn run(
                 let accept_start = Instant::now();
                 match res {
                     Ok((stream, peer_addr)) => {
-                        // Acquire a permit from THIS listener's semaphore. When
-                        // this listener's per-transport connection cap is reached,
-                        // drop the connection immediately.
+                        // Acquire a permit from the shared semaphore. This is the
+                        // same Arc<Semaphore> as the Unix listener — the combined
+                        // cap across both transports is config.max_connections.
                         let Ok(permit) = sem.clone().try_acquire_owned() else {
                             warn!(
                                 %peer_addr,

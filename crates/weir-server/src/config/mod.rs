@@ -244,17 +244,19 @@ pub struct Config {
     /// TCP listen address for the mTLS listener (e.g. `0.0.0.0:7100`).
     /// `None` ⇒ no TCP listener; Unix-only. When `Some`, the three `tls_*`
     /// paths are required and the binary must be built with `--features tls`.
-    // Fields consumed by the TCP accept loop (Task 7+); not yet read in this
-    // crate so suppress the lint until the consumer lands.
-    #[allow(dead_code)]
+    // These fields are read by the `#[cfg(feature = "tls")]` TCP block in
+    // main.rs. On the default (no-tls) build that block is compiled out, so
+    // the fields are unused and the lint must be suppressed for that build
+    // only. On tls builds they ARE read, so no suppression is needed there.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tcp_bind: Option<SocketAddr>,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_cert_path: Option<PathBuf>,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_key_path: Option<PathBuf>,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_client_ca_path: Option<PathBuf>,
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_handshake_timeout_secs: u64,
 }
 

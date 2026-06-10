@@ -394,12 +394,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Shutdown coordination: signal handler → shutdown_tx → socket::run exits.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // ONE shared connection-cap semaphore for ALL listeners (Unix + TCP).
+        // Both listeners clone this Arc, so the COMBINED cap across all transports
+        // is exactly max_connections — not 2×max_connections as it would be with
+        // two independent semaphores.
+        let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+
         // Optional TCP+mTLS listener (feature = "tls"). It runs its own accept
         // loop concurrently with the Unix loop, feeding the SAME pipeline via a
-        // cloned queue_tx. Each listener owns an independent connection-limit
-        // semaphore and an independent graceful-shutdown watch — the Unix loop's
-        // machinery is untouched (it remains the single, heavily-tested path).
-        // Unifying the cap across both transports is a follow-up (Task 9).
+        // cloned queue_tx. Both listeners share `conn_sem` above so the combined
+        // connection cap is the single global max_connections value.
         //
         // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
         // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
@@ -446,7 +450,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-                    let tcp_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
                     let tcp_queue_tx = queue_tx.clone();
                     let tcp_metrics = Arc::clone(&metrics);
 
@@ -456,6 +459,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // `tls.current()` call.
                     spawn_tls_reload_task(tls.clone(), Arc::clone(&metrics));
 
+                    // Pass a clone of the shared semaphore so Unix + TCP draw
+                    // from the same permit pool — true global cap.
+                    let tcp_sem = Arc::clone(&conn_sem);
                     tokio::spawn(async move {
                         // tcp::run owns the handler-shutdown watch internally and
                         // signals handlers BEFORE draining — no extra plumbing needed here.
@@ -519,7 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shard_count: config.shard_count,
                 peer_uid_check: config.peer_uid_check,
             };
-            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics)).await?;
+            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
         }
         #[cfg(not(unix))]
         {
