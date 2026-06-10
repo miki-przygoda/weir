@@ -1,6 +1,6 @@
 # Benchmark Results
 
-Last updated: 2026-05-25 09:55 UTC  
+Last updated: 2026-06-10 18:39 UTC  
 Averaged over: 5 CI run(s) per deadline  
 Server config: `shard_count=4`, `batch_size=64`
 
@@ -8,52 +8,43 @@ Server config: `shard_count=4`, `batch_size=64`
 > effort. Changes that move throughput down or latency up by more than
 > ~10% should be investigated before merging.
 
-> **⚠ Pending refresh — CI numbers below are pre-perf-work (2026-05-25).**
-> The 2026-05-27 perf pass (see the CHANGELOG) shipped five
-> optimisations that improved sandbox throughput 6–8× on multi-producer
-> Sync workloads. CI bare-metal numbers will refresh on the next merge
-> to `main`. Until then, treat the CI tables below as "lower bound" —
-> the real production numbers will be meaningfully higher. The sandbox
-> numbers are summarised at the bottom of this file as an indicative
-> reference, clearly labelled as not-CI-bare-metal.
-
 ## Throughput — deadline comparison
 
 | Scenario | RPS (1ms) | ±σ (1ms) | RPS (2ms) | ±σ (2ms) | d1ms/d2ms |
 |----------|---------|------- | ---------|------- | ---------|
-| single_thread_buffered | 829 | ±3 | 452 | ±1 | **1.83×** |
-| single_thread_sync | 650 | ±18 | 394 | ±0 | **1.65×** |
-| thundering_herd_8_threads | 2,527 | ±15 | 1,667 | ±16 | **1.52×** |
-| thundering_herd_32_threads | 2,932 | ±111 | 2,548 | ±43 | **1.15×** |
-| thundering_herd_64_threads | 3,031 | ±31 | 2,795 | ±36 | **1.08×** |
-| connection_churn | 790 | ±16 | 444 | ±0 | **1.78×** |
-| fire_and_forget_overload | 2,675 | ±0 | 2,675 | ±0 | **1.00×** |
+| single_thread_buffered | 12,525 | ±1,209 | 12,049 | ±462 | **1.04×** |
+| single_thread_sync | 1,933 | ±73 | 1,956 | ±68 | **0.99×** |
+| thundering_herd_8_threads | 6,050 | ±243 | 5,855 | ±240 | **1.03×** |
+| thundering_herd_32_threads | 22,275 | ±899 | 21,406 | ±1,948 | **1.04×** |
+| thundering_herd_64_threads | 30,814 | ±1,586 | 28,665 | ±1,339 | **1.07×** |
+| connection_churn | 6,046 | ±856 | 6,299 | ±403 | **0.96×** |
+| fire_and_forget_overload | 3,557 | ±31 | 3,548 | ±36 | **1.00×** |
 
 ## Latency — single thread, `batch_deadline_ms=1`
 
 | Metric | Sync | Batched | Buffered |
 |--------|------- | ------- | -------|
-| Min | 1.4 ms | 1.4 ms | 1.1 ms |
-| Mean | 1.5 ms | 1.5 ms | 1.2 ms |
-| p50 | 1.5 ms | 1.5 ms | 1.2 ms |
-| p75 | 1.5 ms | 1.5 ms | 1.2 ms |
-| p95 | 1.6 ms | 1.6 ms | 1.2 ms |
-| p99 | 2.0 ms | 2.2 ms | 1.3 ms |
-| p99.9 | 3.2 ms | 3.6 ms | 1.5 ms |
-| Max | 3.2 ms | 3.6 ms | 1.5 ms |
+| Min | 297 µs | 295 µs | 44 µs |
+| Mean | 496 µs | 520 µs | 81 µs |
+| p50 | 439 µs | 447 µs | 74 µs |
+| p75 | 537 µs | 547 µs | 87 µs |
+| p95 | 850 µs | 851 µs | 122 µs |
+| p99 | 1.5 ms | 1.8 ms | 222 µs |
+| p99.9 | 2.5 ms | 6.8 ms | 1.1 ms |
+| Max | 2.5 ms | 6.8 ms | 1.1 ms |
 
 ## Latency — single thread, `batch_deadline_ms=2`
 
 | Metric | Sync | Batched | Buffered |
 |--------|------- | ------- | -------|
-| Min | 2.4 ms | 2.4 ms | 2.1 ms |
-| Mean | 2.5 ms | 2.5 ms | 2.2 ms |
-| p50 | 2.5 ms | 2.5 ms | 2.2 ms |
-| p75 | 2.5 ms | 2.5 ms | 2.2 ms |
-| p95 | 2.6 ms | 2.6 ms | 2.3 ms |
-| p99 | 3.1 ms | 3.0 ms | 2.3 ms |
-| p99.9 | 4.5 ms | 4.8 ms | 2.5 ms |
-| Max | 4.5 ms | 4.8 ms | 2.5 ms |
+| Min | 307 µs | 295 µs | 46 µs |
+| Mean | 508 µs | 521 µs | 87 µs |
+| p50 | 443 µs | 455 µs | 83 µs |
+| p75 | 542 µs | 562 µs | 93 µs |
+| p95 | 821 µs | 864 µs | 131 µs |
+| p99 | 1.7 ms | 1.7 ms | 200 µs |
+| p99.9 | 5.3 ms | 5.4 ms | 598 µs |
+| Max | 5.3 ms | 5.4 ms | 598 µs |
 
 
 ## Saturation Ramp
@@ -63,39 +54,12 @@ Server config: `shard_count=4`, `batch_size=64`
 
 | Threads | RPS (d1ms) | RPS (d2ms) | I/O drops | Status |
 |---------|-------- | --------|-----------|--------|
-| 8 | 4,850 | 2,706 | 0 | ok |
-| 16 | 8,229 | 4,758 | 0 | ok |
-| 32 | 13,517 | 8,009 | 0 | ok |
-| 48 | 17,298 | 10,724 | 0 | ok |
-| 64 | 17,268 | 10,552 | 16 | **SATURATED** ← |
-| 96 | 17,281 | 10,613 | 48 | SATURATED |
-
----
-
-## Indicative numbers from the 2026-05-27 perf pass
-
-> **Source: 4-core sandbox (Linux 6.18.5 container), 3-trial medians, full
-> bench suite. NOT CI bare metal — sandbox absolute values are lower than
-> CI's by ~30%, but the relative improvement is meaningful.** Captured to
-> show the trajectory until CI republishes on the next merge to `main`.
-
-| Scenario                | Pre-perf-pass | Post-perf-pass | Sandbox Δ   |
-|-------------------------|--------------:|---------------:|:-----------:|
-| single_thread_buffered  |           732 |         ~5,900 | **8.0×**    |
-| single_thread_sync      |           432 |         ~1,150 | **2.7×**    |
-| thundering_herd_8       |         2,091 |         ~2,810 | 1.34×       |
-| thundering_herd_32      |         1,774 |        ~10,790 | **6.1×**    |
-| thundering_herd_64      |         2,643 |        ~19,900 | **7.5×**    |
-
-Single-thread Buffered latency p50 dropped from ~1.2 ms to ~160 μs (the
-batch deadline is no longer the latency floor when the queue is otherwise
-quiet). Single-thread Sync p50 is roughly unchanged (~0.9–1.1 ms) — Sync
-is fsync-bound and the per-fsync wall is the same; the throughput win on
-Sync comes from the herd scenarios where group-fsync amortisation kicks in.
-
-The CI tables above will update to comparable improvements (likely
-larger in absolute terms — bare metal has more cores → bigger group-fsync
-amortisation → more parallel agents available) on the next merge.
+| 8 | 16,981 | 17,068 | 0 | ok |
+| 16 | 28,762 | 30,139 | 0 | ok |
+| 32 | 43,259 | 43,347 | 0 | ok |
+| 48 | 47,492 | 49,237 | 0 | **SATURATED** ← |
+| 64 | 47,978 | 49,739 | 16 | SATURATED |
+| 96 | 48,713 | 49,445 | 48 | SATURATED |
 
 ---
 *Generated by `deploy/avg_benchmarks.py`*
