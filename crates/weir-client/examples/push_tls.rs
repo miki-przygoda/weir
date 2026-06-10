@@ -13,14 +13,14 @@
 //!
 //! Build without the feature to see a usage hint instead.
 
-#[cfg(not(feature = "tls"))]
+#[cfg(not(all(unix, feature = "tls")))]
 fn main() {
     eprintln!("push_tls requires --features tls.");
     eprintln!("Run: cargo run -p weir-client --features tls --example push_tls -- [options]");
     std::process::exit(1);
 }
 
-#[cfg(feature = "tls")]
+#[cfg(all(unix, feature = "tls"))]
 fn main() {
     use std::{path::PathBuf, time::Instant};
 

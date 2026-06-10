@@ -1120,7 +1120,10 @@ mod tests {
             },
         )
         .expect_err("tcp_bind without tls feature must fail");
-        assert!(err.to_string().contains("tls"), "{err}");
+        // Assert the error names the missing FEATURE specifically, so this test
+        // isolates the compile-time feature guard from the "path missing" error
+        // (which would also contain the substring "tls").
+        assert!(err.to_string().contains("feature"), "{err}");
         fs::remove_dir_all(dir).ok();
     }
 }
