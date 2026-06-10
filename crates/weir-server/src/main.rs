@@ -48,6 +48,54 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
     total
 }
 
+// ── TLS SIGHUP reload task ────────────────────────────────────────────────────
+
+/// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
+///
+/// The task is fail-safe: if `reload()` returns `Err`, the old `ServerConfig`
+/// is retained and an error is logged. Both outcomes increment the
+/// `tls_config_reloads` counter with the appropriate label so operators can
+/// alert on sustained reload failures.
+#[cfg(feature = "tls")]
+fn spawn_tls_reload_task(
+    tls: crate::socket::tls::ReloadableServerConfig,
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
+) {
+    use crate::metrics::{TlsReloadLabel, TlsReloadOutcome};
+    use tokio::signal::unix::{SignalKind, signal};
+    tokio::spawn(async move {
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGHUP handler; cert reload disabled");
+                return;
+            }
+        };
+        while hup.recv().await.is_some() {
+            match tls.reload() {
+                Ok(()) => {
+                    metrics
+                        .tls_config_reloads
+                        .get_or_create(&TlsReloadLabel {
+                            outcome: TlsReloadOutcome::ok,
+                        })
+                        .inc();
+                    tracing::info!("SIGHUP: TLS certificates reloaded");
+                }
+                Err(e) => {
+                    metrics
+                        .tls_config_reloads
+                        .get_or_create(&TlsReloadLabel {
+                            outcome: TlsReloadOutcome::failed,
+                        })
+                        .inc();
+                    tracing::error!(error = %e, "SIGHUP: TLS reload failed; keeping previous certs");
+                }
+            }
+        }
+    });
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -401,6 +449,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let tcp_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
                     let tcp_queue_tx = queue_tx.clone();
                     let tcp_metrics = Arc::clone(&metrics);
+
+                    // Spawn SIGHUP reload task before moving `tls` into tcp::run.
+                    // The clone shares the same inner ArcSwap so a reload from the
+                    // SIGHUP task is immediately visible to the accept loop's
+                    // `tls.current()` call.
+                    spawn_tls_reload_task(tls.clone(), Arc::clone(&metrics));
 
                     tokio::spawn(async move {
                         // tcp::run owns the handler-shutdown watch internally and

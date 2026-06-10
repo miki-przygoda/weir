@@ -135,7 +135,12 @@ pub struct TlsReloadLabel {
 }
 
 /// TLS config reload outcome. Lowercase to match Prometheus naming conventions.
-#[allow(non_camel_case_types, dead_code)]
+///
+/// Constructed by the SIGHUP reload task (`spawn_tls_reload_task`, feature = "tls"); on
+/// the default Unix-only build the variants are never constructed, so the
+/// dead-code lint is suppressed only there.
+#[allow(non_camel_case_types)]
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum TlsReloadOutcome {
     ok,
@@ -187,8 +192,11 @@ pub(crate) struct Metrics {
     /// dead-code lint is suppressed only there.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_handshake_failures: Family<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>,
-    /// SIGHUP TLS config reloads, by outcome. Always compiled; stays at zero without the tls feature.
-    #[allow(dead_code)]
+    /// SIGHUP TLS config reloads, by outcome. Always compiled and registered;
+    /// incremented by the SIGHUP reload task (`spawn_tls_reload_task`, feature = "tls").
+    /// On the default (Unix-only) build the field is never read, so the
+    /// dead-code lint is suppressed only there.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_config_reloads: Family<TlsReloadLabel, Counter<u64, AtomicU64>>,
 
     // ── WAB ───────────────────────────────────────────────────────────────────

@@ -7,11 +7,6 @@
 //!
 //! Crypto provider: aws-lc-rs, explicitly, to match the rest of the workspace.
 
-// This module's public surface is consumed by the TCP accept loop (Task 7) and
-// SIGHUP handler (Task 8), neither of which is wired up yet.  Suppress the
-// dead-code lint for now so clippy stays green during the incremental rollout.
-#![allow(dead_code)]
-
 use std::{fs::File, io::BufReader, path::Path, sync::Arc};
 
 use arc_swap::ArcSwap;
@@ -266,5 +261,21 @@ mod tests {
         assert!(r.reload().is_ok());
         let after = r.current();
         assert!(!Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn reload_failure_keeps_serving() {
+        let (ca, cert, key) = gen_ca_and_leaf();
+        let ca_p = write_tmp(&ca, "rf_ca.pem");
+        let cert_p = write_tmp(&cert, "rf_cert.pem");
+        let key_p = write_tmp(&key, "rf_key.pem");
+        let r = ReloadableServerConfig::load(cert_p.clone(), key_p, ca_p).unwrap();
+        let before = r.current();
+        std::fs::write(&cert_p, b"not a cert").unwrap();
+        assert!(r.reload().is_err());
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &r.current()),
+            "failed reload must retain old config"
+        );
     }
 }
