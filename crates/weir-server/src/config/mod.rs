@@ -80,6 +80,8 @@ pub enum SinkType {
     Mysql,
     #[cfg(feature = "postgres-sink")]
     Postgres,
+    #[cfg(feature = "clickhouse-sink")]
+    ClickHouse,
 }
 
 impl SinkType {
@@ -113,11 +115,20 @@ impl SinkType {
                          this binary was built without it"
                     .to_string(),
             }),
+            #[cfg(feature = "clickhouse-sink")]
+            "clickhouse" => Ok(SinkType::ClickHouse),
+            #[cfg(not(feature = "clickhouse-sink"))]
+            "clickhouse" => Err(ConfigError::InvalidValue {
+                field: "sink_type",
+                reason: "sink_type 'clickhouse' requires the 'clickhouse-sink' feature; \
+                         this binary was built without it"
+                    .to_string(),
+            }),
             other => Err(ConfigError::InvalidValue {
                 field: "sink_type",
                 reason: format!(
                     "'{other}' is not a valid sink type; expected 'noop', 'http', \
-                     'mysql', or 'postgres'"
+                     'mysql', 'postgres', or 'clickhouse'"
                 ),
             }),
         }
@@ -197,6 +208,12 @@ pub(crate) struct PartialConfig {
     pub sink_postgres_column: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: Option<String>,
+    #[cfg(feature = "clickhouse-sink")]
+    pub sink_clickhouse_database: Option<String>,
+    #[cfg(feature = "clickhouse-sink")]
+    pub sink_clickhouse_table: Option<String>,
+    #[cfg(feature = "clickhouse-sink")]
+    pub sink_clickhouse_column: Option<String>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
@@ -308,6 +325,12 @@ pub struct Config {
     pub sink_postgres_column: String,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: crate::sink::postgres::InsertMode,
+    #[cfg(feature = "clickhouse-sink")]
+    pub sink_clickhouse_database: String,
+    #[cfg(feature = "clickhouse-sink")]
+    pub sink_clickhouse_table: String,
+    #[cfg(feature = "clickhouse-sink")]
+    pub sink_clickhouse_column: String,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
@@ -489,6 +512,14 @@ impl Config {
                 reason: "sink_url must be set when sink_type = \"postgres\"".to_string(),
             });
         }
+        #[cfg(feature = "clickhouse-sink")]
+        if matches!(sink_type, SinkType::ClickHouse) && sink_url.as_deref().unwrap_or("").is_empty()
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_url",
+                reason: "sink_url must be set when sink_type = \"clickhouse\"".to_string(),
+            });
+        }
 
         let sink_timeout_secs = merge!(sink_timeout_secs).unwrap_or(10);
         check_range("sink_timeout_secs", sink_timeout_secs as usize, 1, 300)?;
@@ -530,6 +561,18 @@ impl Config {
             .unwrap_or_else(|| "on_conflict_do_nothing".to_string());
         #[cfg(feature = "postgres-sink")]
         let sink_postgres_insert_mode = parse_postgres_insert_mode(&sink_postgres_insert_mode_str)?;
+
+        // ClickHouse sink: HTTP RowBinary inserts; identifier validation happens
+        // inside ClickHouseSink::new at startup. Defaults mirror the SQL sinks.
+        #[cfg(feature = "clickhouse-sink")]
+        let sink_clickhouse_database =
+            merge!(sink_clickhouse_database).unwrap_or_else(|| "default".to_string());
+        #[cfg(feature = "clickhouse-sink")]
+        let sink_clickhouse_table =
+            merge!(sink_clickhouse_table).unwrap_or_else(|| "weir_records".to_string());
+        #[cfg(feature = "clickhouse-sink")]
+        let sink_clickhouse_column =
+            merge!(sink_clickhouse_column).unwrap_or_else(|| "payload".to_string());
 
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
@@ -638,6 +681,12 @@ impl Config {
             sink_postgres_column,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_insert_mode,
+            #[cfg(feature = "clickhouse-sink")]
+            sink_clickhouse_database,
+            #[cfg(feature = "clickhouse-sink")]
+            sink_clickhouse_table,
+            #[cfg(feature = "clickhouse-sink")]
+            sink_clickhouse_column,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,

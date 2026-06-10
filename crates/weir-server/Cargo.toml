@@ -6,7 +6,9 @@ http-sink = ["dep:reqwest", "dep:sha2"]
 mysql-sink = ["dep:mysql_async", "_sql-sink"]
 # PostgreSQL sink: writes batches via multi-row INSERT.
 postgres-sink = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:rustls", "_sql-sink"]
-# Internal: the shared sql_common module used by mysql-sink + postgres-sink.
+# ClickHouse sink: HTTP RowBinary batch inserts with a content-derived dedup token.
+clickhouse-sink = ["dep:reqwest", "dep:sha2", "_sql-sink"]
+# Internal: the shared sql_common module used by mysql-sink + postgres-sink + clickhouse-sink.
 _sql-sink = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.

@@ -45,6 +45,12 @@ struct RawServer {
     sink_postgres_column: Option<String>,
     #[cfg(feature = "postgres-sink")]
     sink_postgres_insert_mode: Option<String>,
+    #[cfg(feature = "clickhouse-sink")]
+    sink_clickhouse_database: Option<String>,
+    #[cfg(feature = "clickhouse-sink")]
+    sink_clickhouse_table: Option<String>,
+    #[cfg(feature = "clickhouse-sink")]
+    sink_clickhouse_column: Option<String>,
     dead_letter_max_bytes: Option<u64>,
     dead_letter_check_interval_secs: Option<u64>,
     log_level: Option<String>,
@@ -87,6 +93,9 @@ const KNOWN_SERVER_KEYS: &[&str] = &[
     "sink_postgres_table",
     "sink_postgres_column",
     "sink_postgres_insert_mode",
+    "sink_clickhouse_database",
+    "sink_clickhouse_table",
+    "sink_clickhouse_column",
     "dead_letter_max_bytes",
     "dead_letter_check_interval_secs",
     "log_level",
@@ -155,6 +164,12 @@ pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
         sink_postgres_column: s.sink_postgres_column,
         #[cfg(feature = "postgres-sink")]
         sink_postgres_insert_mode: s.sink_postgres_insert_mode,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_database: s.sink_clickhouse_database,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_table: s.sink_clickhouse_table,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_column: s.sink_clickhouse_column,
         dead_letter_max_bytes: s.dead_letter_max_bytes,
         dead_letter_check_interval_secs: s.dead_letter_check_interval_secs,
         log_level: s.log_level,

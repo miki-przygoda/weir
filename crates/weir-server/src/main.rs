@@ -16,6 +16,8 @@ use tracing::info;
 use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
+#[cfg(feature = "clickhouse-sink")]
+use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
 #[cfg(feature = "http-sink")]
 use sink::http::{HttpSink, HttpSinkConfig};
 #[cfg(feature = "mysql-sink")]
@@ -334,6 +336,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let sink = PostgresSink::new(pg_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
+            })?;
+            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+        }
+        #[cfg(feature = "clickhouse-sink")]
+        SinkType::ClickHouse => {
+            let url = config
+                .sink_url
+                .clone()
+                .expect("config validation guarantees sink_url is set when sink_type = ClickHouse");
+            info!(
+                // URL omitted from the log line — it may carry credentials.
+                database = %config.sink_clickhouse_database,
+                table = %config.sink_clickhouse_table,
+                column = %config.sink_clickhouse_column,
+                timeout_secs = config.sink_timeout_secs,
+                max_batch_size = config.sink_max_batch_size,
+                "sink: clickhouse"
+            );
+            let ch_cfg = ClickHouseSinkConfig {
+                url,
+                database: config.sink_clickhouse_database.clone(),
+                table: config.sink_clickhouse_table.clone(),
+                column: config.sink_clickhouse_column.clone(),
+                max_batch_size: config.sink_max_batch_size,
+                timeout: Duration::from_secs(config.sink_timeout_secs),
+            };
+            let sink = ClickHouseSink::new(ch_cfg).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("failed to build ClickHouse sink: {e}"))
             })?;
             drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
         }

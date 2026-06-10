@@ -35,6 +35,8 @@
 //! `dyn Sink` with AFIT requires boxing the returned futures, which is left to the
 //! caller if they need type erasure.
 
+#[cfg(feature = "clickhouse-sink")]
+pub mod clickhouse;
 #[cfg(feature = "http-sink")]
 pub mod http;
 #[cfg(feature = "mysql-sink")]
