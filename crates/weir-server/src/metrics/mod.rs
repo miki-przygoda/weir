@@ -109,6 +109,44 @@ pub enum DrainStateValue {
     blocked_dead_letter_full,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TlsHandshakeFailureLabel {
+    pub reason: TlsHandshakeFailureReason,
+}
+
+/// TLS handshake failure reason. Lowercase snake_case to match Prometheus naming conventions.
+///
+/// Constructed by the TCP+mTLS accept loop (`socket::tcp`, feature = "tls"); on
+/// the default Unix-only build the variants are never constructed, so the
+/// dead-code lint is suppressed only there.
+#[allow(non_camel_case_types)]
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum TlsHandshakeFailureReason {
+    no_client_cert,
+    bad_cert,
+    timeout,
+    other,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct TlsReloadLabel {
+    pub outcome: TlsReloadOutcome,
+}
+
+/// TLS config reload outcome. Lowercase to match Prometheus naming conventions.
+///
+/// Constructed by the SIGHUP reload task (`spawn_tls_reload_task`, feature = "tls"); on
+/// the default Unix-only build the variants are never constructed, so the
+/// dead-code lint is suppressed only there.
+#[allow(non_camel_case_types)]
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum TlsReloadOutcome {
+    ok,
+    failed,
+}
+
 // ── Metrics struct ────────────────────────────────────────────────────────────
 
 /// All Prometheus metrics for the weir daemon.
@@ -146,6 +184,20 @@ pub(crate) struct Metrics {
     /// panicked; check `weir_wab_fsync_duration_seconds` for tail latency
     /// and `weir_wab_flusher_panics` for hard failures.
     pub ack_timeout: Counter<u64, AtomicU64>,
+
+    // ── TLS ───────────────────────────────────────────────────────────────────
+    /// TLS handshakes rejected, by reason. Always compiled and registered;
+    /// incremented by the TCP+mTLS accept loop (`socket::tcp`, feature = "tls").
+    /// On the default (Unix-only) build the field is never read, so the
+    /// dead-code lint is suppressed only there.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tls_handshake_failures: Family<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>,
+    /// SIGHUP TLS config reloads, by outcome. Always compiled and registered;
+    /// incremented by the SIGHUP reload task (`spawn_tls_reload_task`, feature = "tls").
+    /// On the default (Unix-only) build the field is never read, so the
+    /// dead-code lint is suppressed only there.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tls_config_reloads: Family<TlsReloadLabel, Counter<u64, AtomicU64>>,
 
     // ── WAB ───────────────────────────────────────────────────────────────────
     pub wab_segments: Family<SegmentStateLabel, Counter<u64, AtomicU64>>,
@@ -256,6 +308,16 @@ impl Metrics {
              ACK_TIMEOUT. Indicates a wedged flusher (slow fsync, lock contention) \
              that hasn't panicked. Investigate alongside weir_wab_fsync_duration_seconds."
         );
+        let tls_handshake_failures = reg!(
+            Family::<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_tls_handshake_failures",
+            "TLS handshakes rejected, by reason"
+        );
+        let tls_config_reloads = reg!(
+            Family::<TlsReloadLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_tls_config_reloads",
+            "SIGHUP TLS config reloads, by outcome"
+        );
         let wab_segments = reg!(
             Family::<SegmentStateLabel, Counter<u64, AtomicU64>>::default(),
             "weir_wab_segments",
@@ -358,6 +420,8 @@ impl Metrics {
             connection_rejected_peer_uid,
             connections_aborted_at_shutdown,
             ack_timeout,
+            tls_handshake_failures,
+            tls_config_reloads,
             wab_segments,
             wab_bytes_on_disk,
             wab_fsync_duration,
@@ -462,6 +526,8 @@ mod tests {
             "weir_records_accepted",
             "weir_records_ack",
             "weir_records_nack",
+            "weir_tls_handshake_failures",
+            "weir_tls_config_reloads",
             "weir_wab_segments",
             "weir_wab_bytes_on_disk",
             "weir_wab_fsync_duration_seconds",

@@ -914,10 +914,159 @@ sink_max_batch_size = 200
 log_level = "info"
 ```
 
+## TCP + mutual TLS
+
+> **Requires `--features tls`** — the `tls` feature on `weir-server` (and
+> `weir-client`) is **off by default**. A build without `--features tls` has
+> no TCP listener and the five keys below are not recognised. Enabling
+> `tcp_bind` without building with the feature is a startup error.
+
+TLS is **mandatory** on the TCP path. Setting `tcp_bind` without a valid TLS
+configuration (or without building with `--features tls`) is a **fatal startup
+error** — weir never exposes a plaintext TCP socket. The three cert-path keys
+are **required** whenever `tcp_bind` is set; omitting any one of them is a
+startup error.
+
+The Unix and TCP listeners share **one** global connection semaphore sized
+`max_connections`. The total concurrent connections across **both** transports
+is bounded by `max_connections`, not 2×. Tune accordingly.
+
+For a full operator guide including CA setup, cert rotation, and monitoring,
+see [TCP + mutual TLS](tcp-mtls.md).
+
+#### `tcp_bind`
+
+- **Type**: socket address, e.g. `0.0.0.0:7100` or `[::]:7100`
+- **Default**: none (TCP listener disabled; Unix socket only)
+- **CLI**: `--tcp-bind <addr>`
+- **Env**: `WEIR_TCP_BIND`
+- **TOML**: `tcp_bind`
+
+The address and port for the TCP listener. When unset (the default), the
+daemon operates Unix-socket-only and the four TLS keys below are ignored.
+When set, all four TLS keys become required; missing any one is a startup
+error.
+
+**Operational notes**:
+
+- Bind to `0.0.0.0:7100` to accept from any interface, or to a specific
+  interface address to limit exposure. Restrict inbound access with host
+  firewall rules independent of the bind address.
+- The TCP listener runs concurrently with the Unix socket and feeds the
+  same pipeline.
+- The connection cap is shared with the Unix listener; see `max_connections`.
+
+---
+
+#### `tls_cert_path`
+
+- **Type**: absolute path to a PEM-encoded TLS server certificate (may be a
+  full chain)
+- **Default**: none (required when `tcp_bind` is set)
+- **CLI**: `--tls-cert <path>`
+- **Env**: `WEIR_TLS_CERT`
+- **TOML**: `tls_cert_path`
+
+Path to the server's TLS certificate file. The file must be readable by the
+daemon at startup and on every SIGHUP reload.
+
+**When to tune**: update the path when rotating to a new certificate chain.
+After updating, send SIGHUP to reload TLS material without dropping
+connections (see SIGHUP cert rotation in [TCP + mutual TLS](tcp-mtls.md)).
+
+---
+
+#### `tls_key_path`
+
+- **Type**: absolute path to the PEM-encoded private key for `tls_cert_path`
+- **Default**: none (required when `tcp_bind` is set)
+- **CLI**: `--tls-key <path>`
+- **Env**: `WEIR_TLS_KEY`
+- **TOML**: `tls_key_path`
+
+Path to the private key that pairs with `tls_cert_path`.
+
+**Operational notes**:
+
+- Restrict this file to mode `0o400` owned by the daemon's user. The daemon
+  reads it at startup and on SIGHUP; no other process should be able to read
+  it.
+- Supply via env var (`WEIR_TLS_KEY`) in container environments where secrets
+  management injects a file path at runtime.
+
+---
+
+#### `tls_client_ca_path`
+
+- **Type**: absolute path to a PEM-encoded CA certificate
+- **Default**: none (required when `tcp_bind` is set)
+- **CLI**: `--tls-client-ca <path>`
+- **Env**: `WEIR_TLS_CLIENT_CA`
+- **TOML**: `tls_client_ca_path`
+
+Path to the Certificate Authority that signs client certificates. Every TCP
+client must present a certificate signed by this CA during the TLS handshake.
+Anonymous or cert-less clients are rejected at the handshake level
+(`weir_tls_handshake_failures_total{reason="no_client_cert"}`).
+
+The **trust model is CA-issuance**: issuing a client cert from this CA is the
+act of authorizing that producer. To revoke a client, rotate the CA (CRL/OCSP
+are out of scope; see [TCP + mutual TLS](tcp-mtls.md) for the rationale).
+
+**When to tune**: when rotating the client CA as part of a revocation or
+re-keying procedure. Update the path and send SIGHUP.
+
+---
+
+#### `tls_handshake_timeout_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `10`
+- **Range**: 1+ (no upper cap)
+- **CLI**: `--tls-handshake-timeout-secs <n>`
+- **Env**: `WEIR_TLS_HANDSHAKE_TIMEOUT_SECS`
+- **TOML**: `tls_handshake_timeout_secs`
+
+Maximum time the daemon waits for a TLS handshake to complete on a new TCP
+connection. **Slowloris guard for the TLS path**: a TCP client that opens a
+connection but stalls during the handshake holds a semaphore permit (from
+`max_connections`) for at most this many seconds before being dropped. Drops
+increment `weir_tls_handshake_failures_total{reason="timeout"}`.
+
+The semaphore permit is acquired **before** the handshake begins, so a flood
+of stalled TCP connections is bounded by `max_connections` regardless of
+handshake progress.
+
+**When to tune**: lower for high-throughput deployments where a 10s stall
+indicates a problem; raise if clients are on high-latency links where
+legitimate handshakes approach the default. The existing per-frame
+`connection_read_timeout_secs` continues to apply after the handshake
+completes.
+
+---
+
+### TLS metrics
+
+Two metric families are added by the `tls` feature:
+
+| Metric | Type | Labels | What it tracks |
+|--------|------|--------|----------------|
+| `weir_tls_handshake_failures_total` | counter | `reason` ∈ {`no_client_cert`, `bad_cert`, `timeout`, `other`} | TLS handshakes that failed before a connection was established |
+| `weir_tls_config_reloads_total` | counter | `outcome` ∈ {`ok`, `failed`} | SIGHUP-triggered TLS cert/key/CA reload attempts |
+
+Alert on `rate(weir_tls_handshake_failures_total[5m]) > 0` (especially
+`reason="no_client_cert"` or `reason="bad_cert"`) to detect unauthorised
+connection attempts. Alert on
+`weir_tls_config_reloads_total{outcome="failed"}` to detect cert rotation
+failures.
+
+---
+
 ## Limitations
 
-- **No hot reload**: config is read once at startup. SIGHUP is not
-  handled. Configuration changes require a restart.
+- **No hot reload (except TLS material)**: config is read once at startup.
+  SIGHUP reloads **TLS cert/key/CA only** — all other configuration changes
+  require a daemon restart.
 - **No per-shard tuning**: `batch_size` and `batch_deadline_ms` apply
   uniformly to every shard. Workloads where shards have very different
   load profiles cannot tune them independently.

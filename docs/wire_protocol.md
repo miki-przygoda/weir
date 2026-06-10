@@ -175,7 +175,7 @@ bytes on the same connection.
 ## Worked examples
 
 The byte sequences below are real — they're asserted against the
-encoder in [`crates/weir-core/tests/reference_frames.rs`](../crates/weir-core/tests/reference_frames.rs).
+encoder in `crates/weir-core/tests/reference_frames.rs`.
 A client implementation that produces these exact bytes is
 wire-compatible with the daemon.
 

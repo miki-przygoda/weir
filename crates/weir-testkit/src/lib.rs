@@ -24,6 +24,7 @@
 //! one thread effectively.
 
 mod harness;
+pub mod tls;
 mod util;
 
 pub use harness::{WeirServer, WeirServerBuilder};

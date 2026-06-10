@@ -1,3 +1,9 @@
+[features]
+default = []
+# TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
+# unless explicitly built with --features tls.
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:arc-swap", "dep:x509-parser"]
+
 [package]
 name = "weir-server"
 description = "The weir daemon"
@@ -83,8 +89,19 @@ tokio-postgres-rustls = { version = "0.14", default-features = false, features =
 # `aws_lc_rs` through to OUR builder call site.
 rustls = "0.23"
 webpki-roots = "1"
+# TLS listener (feature = "tls"). tokio-rustls 0.26 tracks rustls 0.23.
+# Pinned to the aws-lc-rs crypto provider already used across the workspace.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+# Hot-reloadable ServerConfig (SIGHUP cert rotation without dropping conns).
+arc-swap = { version = "1", optional = true }
+# Client-cert CN extraction for tracing spans.
+x509-parser = { version = "0.16", optional = true }
 
 [dev-dependencies]
 weir-client = { path = "../weir-client" }
 weir-testkit = { path = "../weir-testkit" }
 ureq = "2"
+# Generates throwaway CA / server / client certs for the TLS integration tests.
+rcgen = "0.13"

@@ -40,6 +40,13 @@ OPTIONS:
     --dead-letter-max-bytes <n>              Dead-letter dir size cap [default: 1073741824]
     --dead-letter-check-interval-secs <n>    Blocked-state wake interval (1-3600) [default: 30]
     --log-level <level>                      Log level (trace/debug/info/warn/error) [default: info]
+    --tcp-bind <addr>                        TCP listen address for the mTLS listener
+                                               (e.g. '0.0.0.0:7100'). Requires --features tls
+                                               and the three --tls-* path flags. [default: none]
+    --tls-cert <path>                        Path to the server TLS certificate (PEM)
+    --tls-key <path>                         Path to the server TLS private key (PEM)
+    --tls-client-ca <path>                   Path to the client CA certificate for mTLS (PEM)
+    --tls-handshake-timeout-secs <n>         TLS handshake timeout in seconds [default: 10]
     -h, --help                               Print this help and exit
 
 ENVIRONMENT:
@@ -145,6 +152,15 @@ pub(super) fn parse_from(
             .opt_value_from_str("--dead-letter-check-interval-secs")
             .map_err(pico_err)?,
         log_level: pargs.opt_value_from_str("--log-level").map_err(pico_err)?,
+        tcp_bind: pargs.opt_value_from_str("--tcp-bind").map_err(pico_err)?,
+        tls_cert_path: pargs.opt_value_from_str("--tls-cert").map_err(pico_err)?,
+        tls_key_path: pargs.opt_value_from_str("--tls-key").map_err(pico_err)?,
+        tls_client_ca_path: pargs
+            .opt_value_from_str("--tls-client-ca")
+            .map_err(pico_err)?,
+        tls_handshake_timeout_secs: pargs
+            .opt_value_from_str("--tls-handshake-timeout-secs")
+            .map_err(pico_err)?,
     };
 
     let remaining = pargs.finish();

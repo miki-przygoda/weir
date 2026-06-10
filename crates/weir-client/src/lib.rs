@@ -21,3 +21,9 @@ mod unix;
 
 #[cfg(unix)]
 pub use unix::{ClientError, WeirClient};
+
+#[cfg(all(unix, feature = "tls"))]
+mod tls;
+
+#[cfg(all(unix, feature = "tls"))]
+pub use tls::{ClientTlsConfig, TlsStream};

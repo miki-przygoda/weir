@@ -10,3 +10,4 @@ publish = false
 [dependencies]
 weir-client = { path = "../weir-client" }
 libc = "0.2"
+rcgen = "0.13"

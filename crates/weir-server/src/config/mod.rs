@@ -10,7 +10,7 @@ mod file;
 
 use std::{
     fmt,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
 };
 
@@ -165,6 +165,11 @@ pub(crate) struct PartialConfig {
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub log_level: Option<String>,
+    pub tcp_bind: Option<String>,
+    pub tls_cert_path: Option<PathBuf>,
+    pub tls_key_path: Option<PathBuf>,
+    pub tls_client_ca_path: Option<PathBuf>,
+    pub tls_handshake_timeout_secs: Option<u64>,
 }
 
 impl PartialConfig {
@@ -236,6 +241,23 @@ pub struct Config {
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     pub log_level: String,
+    /// TCP listen address for the mTLS listener (e.g. `0.0.0.0:7100`).
+    /// `None` ⇒ no TCP listener; Unix-only. When `Some`, the three `tls_*`
+    /// paths are required and the binary must be built with `--features tls`.
+    // These fields are read by the `#[cfg(feature = "tls")]` TCP block in
+    // main.rs. On the default (no-tls) build that block is compiled out, so
+    // the fields are unused and the lint must be suppressed for that build
+    // only. On tls builds they ARE read, so no suppression is needed there.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tcp_bind: Option<SocketAddr>,
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tls_cert_path: Option<PathBuf>,
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tls_key_path: Option<PathBuf>,
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tls_client_ca_path: Option<PathBuf>,
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub tls_handshake_timeout_secs: u64,
 }
 
 impl Config {
@@ -450,6 +472,55 @@ impl Config {
 
         let log_level = merge!(log_level).unwrap_or_else(|| "info".into());
 
+        // ── TCP + TLS ────────────────────────────────────────────────────────────
+        let tcp_bind_str = merge!(tcp_bind);
+        let tls_cert_path = merge!(tls_cert_path);
+        let tls_key_path = merge!(tls_key_path);
+        let tls_client_ca_path = merge!(tls_client_ca_path);
+        let tls_handshake_timeout_secs = merge!(tls_handshake_timeout_secs).unwrap_or(10);
+
+        let tcp_bind = match tcp_bind_str {
+            None => None,
+            Some(s) => {
+                let addr = s.parse::<SocketAddr>().map_err(|_| ConfigError::InvalidValue {
+                    field: "tcp_bind",
+                    reason: format!(
+                        "'{s}' is not a valid socket address (expected e.g. '0.0.0.0:7100' or '[::]:7100')"
+                    ),
+                })?;
+                if !cfg!(feature = "tls") {
+                    return Err(ConfigError::InvalidValue {
+                        field: "tcp_bind",
+                        reason: "tcp_bind is set but this binary was built without the 'tls' \
+                                 feature; rebuild with --features tls \
+                                 (plaintext TCP is never exposed)"
+                            .to_string(),
+                    });
+                }
+                // Validate each required TLS path field individually so we
+                // can produce `&'static str` field names for ConfigError.
+                macro_rules! require_tls_path {
+                    ($fname:literal, $opt:expr) => {{
+                        let path = $opt.as_ref().ok_or(ConfigError::InvalidValue {
+                            field: $fname,
+                            reason: concat!($fname, " is required when tcp_bind is set")
+                                .to_string(),
+                        })?;
+                        if !path.exists() {
+                            return Err(ConfigError::InvalidValue {
+                                field: $fname,
+                                reason: format!("{} '{}' does not exist", $fname, path.display()),
+                            });
+                        }
+                    }};
+                }
+                require_tls_path!("tls_cert_path", tls_cert_path);
+                require_tls_path!("tls_key_path", tls_key_path);
+                require_tls_path!("tls_client_ca_path", tls_client_ca_path);
+                Some(addr)
+            }
+        };
+
         Ok(Config {
             socket_path,
             wab_dir,
@@ -480,6 +551,11 @@ impl Config {
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             log_level,
+            tcp_bind,
+            tls_cert_path,
+            tls_key_path,
+            tls_client_ca_path,
+            tls_handshake_timeout_secs,
         })
     }
 }
@@ -971,5 +1047,83 @@ mod tests {
             file::read(Path::new("/weir_test_no_such_config_file_xyzzy_12345.toml")).unwrap();
         assert!(result.shard_count.is_none());
         assert!(result.wab_dir.is_none());
+    }
+
+    // ── TCP + TLS config ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tcp_bind_invalid_addr_is_rejected() {
+        let dir = tmp_dir("tcp_bad_addr");
+        let mut cli = PartialConfig::empty();
+        cli.tcp_bind = Some("not-an-addr".to_string());
+        let err = Config::from_layers(
+            cli,
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect_err("bad addr must fail");
+        assert!(err.to_string().contains("tcp_bind"), "{err}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn no_tcp_bind_defaults_to_unix_only() {
+        let dir = tmp_dir("tcp_none");
+        let cfg = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert!(cfg.tcp_bind.is_none());
+        assert_eq!(cfg.tls_handshake_timeout_secs, 10);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tcp_bind_without_tls_paths_is_rejected() {
+        let dir = tmp_dir("tcp_no_certs");
+        let mut cli = PartialConfig::empty();
+        cli.tcp_bind = Some("127.0.0.1:7100".to_string());
+        let err = Config::from_layers(
+            cli,
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect_err("tcp_bind without certs must fail");
+        assert!(err.to_string().contains("tls_cert_path"), "{err}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn tcp_bind_without_tls_feature_is_rejected() {
+        let dir = tmp_dir("tcp_no_feature");
+        let mut cli = PartialConfig::empty();
+        cli.tcp_bind = Some("127.0.0.1:7100".to_string());
+        let err = Config::from_layers(
+            cli,
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect_err("tcp_bind without tls feature must fail");
+        // Assert the error names the missing FEATURE specifically, so this test
+        // isolates the compile-time feature guard from the "path missing" error
+        // (which would also contain the substring "tls").
+        assert!(err.to_string().contains("feature"), "{err}");
+        fs::remove_dir_all(dir).ok();
     }
 }

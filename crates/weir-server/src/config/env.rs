@@ -33,6 +33,11 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         dead_letter_max_bytes: env_parse("WEIR_DEAD_LETTER_MAX_BYTES")?,
         dead_letter_check_interval_secs: env_parse("WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS")?,
         log_level: env_string("WEIR_LOG_LEVEL")?,
+        tcp_bind: env_string("WEIR_TCP_BIND")?,
+        tls_cert_path: env_path("WEIR_TLS_CERT")?,
+        tls_key_path: env_path("WEIR_TLS_KEY")?,
+        tls_client_ca_path: env_path("WEIR_TLS_CLIENT_CA")?,
+        tls_handshake_timeout_secs: env_parse("WEIR_TLS_HANDSHAKE_TIMEOUT_SECS")?,
     })
 }
 

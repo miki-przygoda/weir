@@ -48,6 +48,54 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
     total
 }
 
+// ── TLS SIGHUP reload task ────────────────────────────────────────────────────
+
+/// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
+///
+/// The task is fail-safe: if `reload()` returns `Err`, the old `ServerConfig`
+/// is retained and an error is logged. Both outcomes increment the
+/// `tls_config_reloads` counter with the appropriate label so operators can
+/// alert on sustained reload failures.
+#[cfg(feature = "tls")]
+fn spawn_tls_reload_task(
+    tls: crate::socket::tls::ReloadableServerConfig,
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
+) {
+    use crate::metrics::{TlsReloadLabel, TlsReloadOutcome};
+    use tokio::signal::unix::{SignalKind, signal};
+    tokio::spawn(async move {
+        let mut hup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGHUP handler; cert reload disabled");
+                return;
+            }
+        };
+        while hup.recv().await.is_some() {
+            match tls.reload() {
+                Ok(()) => {
+                    metrics
+                        .tls_config_reloads
+                        .get_or_create(&TlsReloadLabel {
+                            outcome: TlsReloadOutcome::ok,
+                        })
+                        .inc();
+                    tracing::info!("SIGHUP: TLS certificates reloaded");
+                }
+                Err(e) => {
+                    metrics
+                        .tls_config_reloads
+                        .get_or_create(&TlsReloadLabel {
+                            outcome: TlsReloadOutcome::failed,
+                        })
+                        .inc();
+                    tracing::error!(error = %e, "SIGHUP: TLS reload failed; keeping previous certs");
+                }
+            }
+        }
+    });
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -346,6 +394,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Shutdown coordination: signal handler → shutdown_tx → socket::run exits.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // ONE shared connection-cap semaphore for ALL listeners (Unix + TCP).
+        // Both listeners clone this Arc, so the COMBINED cap across all transports
+        // is exactly max_connections — not 2×max_connections as it would be with
+        // two independent semaphores.
+        let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+
+        // Optional TCP+mTLS listener (feature = "tls"). It runs its own accept
+        // loop concurrently with the Unix loop, feeding the SAME pipeline via a
+        // cloned queue_tx. Both listeners share `conn_sem` above so the combined
+        // connection cap is the single global max_connections value.
+        //
+        // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
+        // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
+        #[cfg(feature = "tls")]
+        let tcp_shutdown_tx = {
+            use socket::tcp::{self, TcpConfig};
+            use socket::tls::ReloadableServerConfig;
+
+            match config.tcp_bind {
+                Some(bind_addr) => {
+                    // Config validation guarantees the three tls_* paths are
+                    // present whenever tcp_bind is set, so these expects can't
+                    // fire on a validated Config.
+                    let cert = config
+                        .tls_cert_path
+                        .clone()
+                        .expect("config validation guarantees tls_cert_path when tcp_bind is set");
+                    let key = config
+                        .tls_key_path
+                        .clone()
+                        .expect("config validation guarantees tls_key_path when tcp_bind is set");
+                    let ca = config.tls_client_ca_path.clone().expect(
+                        "config validation guarantees tls_client_ca_path when tcp_bind is set",
+                    );
+
+                    let tls = ReloadableServerConfig::load(cert, key, ca).map_err(|e| {
+                        std::io::Error::other(format!("failed to load TLS config: {e}"))
+                    })?;
+
+                    // Bind in the caller so a bad bind address fails startup
+                    // (rather than the spawned accept task) — see socket::tcp
+                    // module docs on the bound-addr design.
+                    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+                    let actual_addr = listener.local_addr()?;
+                    info!(addr = %actual_addr, "TCP+mTLS listener bound");
+
+                    let tcp_config = TcpConfig {
+                        max_connections: config.max_connections,
+                        max_payload_bytes: config.max_payload_bytes,
+                        shard_count: config.shard_count,
+                        shutdown_timeout_secs: config.shutdown_timeout_secs,
+                        connection_read_timeout_secs: config.connection_read_timeout_secs,
+                        handshake_timeout_secs: config.tls_handshake_timeout_secs,
+                    };
+
+                    let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                    let tcp_queue_tx = queue_tx.clone();
+                    let tcp_metrics = Arc::clone(&metrics);
+
+                    // Spawn SIGHUP reload task before moving `tls` into tcp::run.
+                    // The clone shares the same inner ArcSwap so a reload from the
+                    // SIGHUP task is immediately visible to the accept loop's
+                    // `tls.current()` call.
+                    spawn_tls_reload_task(tls.clone(), Arc::clone(&metrics));
+
+                    // Pass a clone of the shared semaphore so Unix + TCP draw
+                    // from the same permit pool — true global cap.
+                    let tcp_sem = Arc::clone(&conn_sem);
+                    tokio::spawn(async move {
+                        // tcp::run owns the handler-shutdown watch internally and
+                        // signals handlers BEFORE draining — no extra plumbing needed here.
+                        let res = tcp::run(
+                            tcp_config,
+                            listener,
+                            tls,
+                            tcp_queue_tx,
+                            tcp_sem,
+                            tcp_shutdown_rx,
+                            tcp_metrics,
+                        )
+                        .await;
+                        if let Err(e) = res {
+                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
+                        }
+                    });
+
+                    Some(tcp_shutdown_tx)
+                }
+                None => None,
+            }
+        };
+
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -365,6 +505,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("failed to install Ctrl-C handler");
                 info!("received Ctrl-C, initiating shutdown");
             }
+            #[cfg(feature = "tls")]
+            if let Some(tx) = tcp_shutdown_tx {
+                let _ = tx.send(());
+            }
             let _ = shutdown_tx.send(());
         });
 
@@ -381,7 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 shard_count: config.shard_count,
                 peer_uid_check: config.peer_uid_check,
             };
-            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics)).await?;
+            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
         }
         #[cfg(not(unix))]
         {

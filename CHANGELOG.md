@@ -10,7 +10,78 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
-## [Unreleased]
+## [0.5.0] - 2026-06-10
+
+### Added
+
+- **TCP listener with mandatory mutual TLS** (`weir-server --features tls`).
+  Remote producers across an untrusted network can now connect over TCP using
+  rustls (aws-lc-rs provider). Key properties:
+
+  - **Mutual TLS — client cert required.** Every TCP client must present a
+    certificate signed by the configured CA (`tls_client_ca_path`). Anonymous
+    or cert-less clients are rejected at the TLS handshake. Trust model: CA
+    issuance is the gate — issuing a client cert from the CA authorises that
+    producer.
+  - **Plaintext TCP is never exposed.** Setting `tcp_bind` without a complete
+    TLS configuration is a fatal startup error; the daemon never opens a
+    cleartext TCP socket.
+  - **Concurrent with the Unix socket.** The TCP listener runs alongside the
+    existing Unix socket listener and feeds the same pipeline. Both listeners
+    share **one** global connection semaphore sized `max_connections`, so the
+    total concurrent connections across both transports is bounded by
+    `max_connections` (not 2×).
+  - **Handshake-slowloris guard.** `tls_handshake_timeout_secs` (default 10s)
+    bounds TLS-handshake duration; the connection permit is held across the
+    handshake so a flood of stalled TCP connections is bounded by the existing
+    connection cap.
+  - **Wire protocol unchanged.** TLS wraps the existing weir frame protocol
+    byte-for-byte. The on-wire format, CRC checks, payload caps, and frame
+    semantics are identical to the Unix socket path.
+  - **Default-off.** The feature is behind a `tls` Cargo feature on
+    `weir-server` (and `weir-client`). A standard `cargo build` produces a
+    Unix-only binary with no TLS code compiled in.
+
+  **New config keys** (all follow the standard CLI > env > TOML > default
+  merge order):
+
+  | TOML key | CLI flag | Env var | Default |
+  |----------|----------|---------|---------|
+  | `tcp_bind` | `--tcp-bind` | `WEIR_TCP_BIND` | none (TCP disabled) |
+  | `tls_cert_path` | `--tls-cert` | `WEIR_TLS_CERT` | none (required when `tcp_bind` set) |
+  | `tls_key_path` | `--tls-key` | `WEIR_TLS_KEY` | none (required when `tcp_bind` set) |
+  | `tls_client_ca_path` | `--tls-client-ca` | `WEIR_TLS_CLIENT_CA` | none (required when `tcp_bind` set) |
+  | `tls_handshake_timeout_secs` | `--tls-handshake-timeout-secs` | `WEIR_TLS_HANDSHAKE_TIMEOUT_SECS` | `10` |
+
+  **SIGHUP cert rotation.** `kill -HUP <pid>` reloads the TLS cert, key, and
+  CA from the configured paths without dropping active connections. Reload is
+  fail-safe: on any error (missing file, invalid PEM) the daemon keeps serving
+  the previous TLS configuration, logs an error, and increments
+  `weir_tls_config_reloads_total{outcome="failed"}`. A successful reload
+  increments `{outcome="ok"}`. **SIGHUP reloads TLS material only** — all
+  other configuration stays read-once-at-startup.
+
+  **New metrics** (added by the `tls` feature):
+
+  - `weir_tls_handshake_failures_total{reason}` — reason ∈ {`no_client_cert`,
+    `bad_cert`, `timeout`, `other`}.
+  - `weir_tls_config_reloads_total{outcome}` — outcome ∈ {`ok`, `failed`}.
+
+- **`WeirClient::connect_tls`** (`weir-client --features tls`). Mutual-TLS
+  client connector. `connect_tls(addr, ClientTlsConfig { client_cert,
+  client_key, ca_cert, server_name, default_durability })` opens a TLS
+  connection to a `weir-server` TCP listener, presenting the client cert and
+  validating the server cert against the provided CA. The `server_name` must
+  match a SAN in the server certificate.
+
+- **Per-connection durability default** (`weir-client`). `connect_with_default`
+  and `ClientTlsConfig.default_durability` set a per-connection fallback
+  durability tier. `client.push_default(payload)` uses that tier without
+  repeating the argument per-push; `client.set_default_durability(tier)`
+  updates it at runtime. Plain `push(payload, tier)` is unchanged.
+
+- **`crates/weir-client/examples/push_tls.rs`** — runnable example of a TLS
+  client pushing records to a TCP-enabled daemon.
 
 ### Performance
 
@@ -1120,5 +1191,6 @@ The five commits making up this pass:
 
 ---
 
+[0.5.0]: https://github.com/miki-przygoda/weir/compare/v0.4.0...v0.5.0
 [0.3.0]: https://github.com/miki-przygoda/weir/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/miki-przygoda/weir/compare/v0.1.0...v0.2.0

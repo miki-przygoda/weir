@@ -10,6 +10,7 @@
 # Operations
 
 - [Configuration reference](operations/configuration.md)
+- [TCP + mutual TLS](operations/tcp-mtls.md)
 
 # Protocol
 
