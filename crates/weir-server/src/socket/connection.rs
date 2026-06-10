@@ -510,8 +510,17 @@ mod tests {
         env.encode()
     }
 
-    /// Reads one response frame from the stream, returning its MessageType and payload.
-    async fn read_response(stream: &mut UnixStream) -> (MessageType, Vec<u8>) {
+    /// Reads one complete response frame (header + payload + 4-byte payload
+    /// CRC) from any async-read stream, returning its MessageType and payload.
+    ///
+    /// Generic over the transport so the same helper drains the full 20-byte
+    /// Ack frame whether the test runs over a `UnixStream` or an in-memory
+    /// `tokio::io::duplex` pipe (see
+    /// `handle_connection_works_over_non_unix_stream`).
+    async fn read_response<R>(stream: &mut R) -> (MessageType, Vec<u8>)
+    where
+        R: AsyncRead + Unpin,
+    {
         let mut header_buf = [0u8; HEADER_LEN];
         stream.read_exact(&mut header_buf).await.unwrap();
         let header = Header::decode(&header_buf).unwrap();
@@ -830,8 +839,6 @@ mod tests {
     /// flow.
     #[tokio::test]
     async fn handle_connection_works_over_non_unix_stream() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let (mut client, server) = tokio::io::duplex(64 * 1024);
 
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
@@ -864,10 +871,12 @@ mod tests {
         let frame = push_frame(b"hello");
         client.write_all(&frame).await.unwrap();
 
-        let mut resp_buf = [0u8; HEADER_LEN];
-        client.read_exact(&mut resp_buf).await.unwrap();
-        let resp_header = Header::decode(&resp_buf).unwrap();
-        assert_eq!(resp_header.message_type, MessageType::Ack);
+        // Drain the FULL 20-byte Ack frame (header + empty payload + CRC) via
+        // the generic read_response helper — confirms the generic transport
+        // refactor handles the complete response, not just the header.
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Ack);
+        assert!(payload.is_empty(), "Ack frame carries no payload");
 
         drop(client);
         handle.await.unwrap().unwrap();

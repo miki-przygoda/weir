@@ -32,6 +32,12 @@ pub struct WeirServer {
     pub tmp_dir: PathBuf,
     /// Loopback port the metrics endpoint is bound to.
     pub metrics_port: u16,
+    /// `127.0.0.1:<port>` the TCP+mTLS listener was configured to bind, if the
+    /// builder was given a [`tls`](WeirServerBuilder::tls) fixture. `None` for
+    /// Unix-only servers. The port is pre-allocated by the harness (via
+    /// `free_port()` under the process lock) and written into the daemon's
+    /// config, so it is known before the child starts.
+    pub tcp_addr: Option<std::net::SocketAddr>,
     /// `batch_deadline_ms` value the daemon was launched with — handy for
     /// bench scenarios that name themselves after the deadline.
     pub batch_deadline_ms: u64,
@@ -71,6 +77,21 @@ pub struct WeirServerBuilder {
     /// `tmp_dir/wab`. Used by tests that need the WAB on a separate
     /// filesystem (e.g. a pre-mounted small tmpfs for ENOSPC testing).
     wab_dir_override: Option<PathBuf>,
+    /// When set, the daemon is configured with a TCP+mTLS listener using these
+    /// server cert / key / client-CA PEM paths (taken from a `TlsFixture`). The
+    /// harness pre-allocates the loopback port inside `start()` and writes
+    /// `tcp_bind` into the generated config; the resulting bound address is
+    /// surfaced via [`WeirServer::tcp_addr`]. Requires a `weir-server` binary
+    /// built with `--features tls` (the integration tests are, via
+    /// `CARGO_BIN_EXE_weir-server`).
+    tls_paths: Option<TlsPaths>,
+}
+
+/// Server-side TLS material paths copied out of a `TlsFixture`.
+struct TlsPaths {
+    server_cert: PathBuf,
+    server_key: PathBuf,
+    client_ca: PathBuf,
 }
 
 impl WeirServer {
@@ -94,6 +115,7 @@ impl WeirServer {
             pre_exec: None,
             env: Vec::new(),
             wab_dir_override: None,
+            tls_paths: None,
         }
     }
 
@@ -114,6 +136,15 @@ impl WeirServer {
 
     pub fn metrics_url(&self) -> String {
         format!("http://127.0.0.1:{}/metrics", self.metrics_port)
+    }
+
+    /// The `127.0.0.1:<port>` the TCP+mTLS listener is bound to. Panics if the
+    /// server was started without a [`tls`](WeirServerBuilder::tls) fixture
+    /// (Unix-only). The port is pre-allocated by the harness and written into
+    /// the daemon's config, so it is valid as soon as `wait_ready` returns.
+    pub fn tcp_addr(&self) -> std::net::SocketAddr {
+        self.tcp_addr
+            .expect("server was not started with a TLS fixture; call .tls(&fixture) on the builder")
     }
 
     /// Scrapes `/metrics` and returns the body as a string. Uses a hand-rolled
@@ -337,6 +368,24 @@ impl WeirServerBuilder {
         self
     }
 
+    /// Enables a TCP+mTLS listener on the daemon, using the server cert/key and
+    /// client-CA from `fixture` (see [`crate::tls::TlsFixture`]). The harness
+    /// allocates a loopback port and writes `tcp_bind` + the three `tls_*` paths
+    /// into the generated config; the bound address is then available via
+    /// [`WeirServer::tcp_addr`].
+    ///
+    /// Requires the `weir-server` binary to be built with `--features tls`. The
+    /// `weir-server` integration tests run under that feature so
+    /// `CARGO_BIN_EXE_weir-server` already points at a tls-enabled binary.
+    pub fn tls(mut self, fixture: &crate::tls::TlsFixture) -> Self {
+        self.tls_paths = Some(TlsPaths {
+            server_cert: fixture.server_cert_path.clone(),
+            server_key: fixture.server_key_path.clone(),
+            client_ca: fixture.ca_cert_path.clone(),
+        });
+        self
+    }
+
     /// Install a `Command::pre_exec` callback that runs in the child between
     /// fork and exec. Used for `RLIMIT_*` setup, signal-mask tweaks, etc.
     ///
@@ -369,6 +418,15 @@ impl WeirServerBuilder {
     pub fn start(self) -> WeirServer {
         let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
         let metrics_port = free_port();
+
+        // Pre-allocate the TCP+mTLS port (if requested) under the same held
+        // process lock as metrics_port, so two concurrent harness starts can't
+        // be handed the same port by the kernel. The daemon binds this exact
+        // address; the bound address is surfaced via WeirServer::tcp_addr.
+        let tcp_addr: Option<std::net::SocketAddr> = self.tls_paths.as_ref().map(|_| {
+            let port = free_port();
+            std::net::SocketAddr::from(([127, 0, 0, 1], port))
+        });
         let tmp_dir =
             std::env::temp_dir().join(format!("weir_test_{}_{}", self.tag, std::process::id()));
         let wab_dir = self
@@ -422,6 +480,19 @@ impl WeirServerBuilder {
                 config.push('\n');
             }
         }
+        // TCP+mTLS listener config (when a TLS fixture was supplied).
+        if let (Some(addr), Some(tls)) = (tcp_addr, self.tls_paths.as_ref()) {
+            config.push_str(&format!(
+                "tcp_bind              = \"{}\"\n\
+                 tls_cert_path         = \"{}\"\n\
+                 tls_key_path          = \"{}\"\n\
+                 tls_client_ca_path    = \"{}\"\n",
+                addr,
+                tls.server_cert.display(),
+                tls.server_key.display(),
+                tls.client_ca.display(),
+            ));
+        }
         std::fs::write(&config_path, &config).unwrap();
 
         let binary_path = self.binary_path.expect(
@@ -460,6 +531,7 @@ impl WeirServerBuilder {
             config_path,
             tmp_dir,
             metrics_port,
+            tcp_addr,
             batch_deadline_ms: self.batch_deadline_ms,
             _proc_lock,
         };

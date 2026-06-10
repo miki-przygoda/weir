@@ -115,7 +115,12 @@ pub struct TlsHandshakeFailureLabel {
 }
 
 /// TLS handshake failure reason. Lowercase snake_case to match Prometheus naming conventions.
-#[allow(non_camel_case_types, dead_code)]
+///
+/// Constructed by the TCP+mTLS accept loop (`socket::tcp`, feature = "tls"); on
+/// the default Unix-only build the variants are never constructed, so the
+/// dead-code lint is suppressed only there.
+#[allow(non_camel_case_types)]
+#[cfg_attr(not(feature = "tls"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum TlsHandshakeFailureReason {
     no_client_cert,
@@ -176,8 +181,11 @@ pub(crate) struct Metrics {
     pub ack_timeout: Counter<u64, AtomicU64>,
 
     // ── TLS ───────────────────────────────────────────────────────────────────
-    /// TLS handshakes rejected, by reason. Always compiled; stays at zero without the tls feature.
-    #[allow(dead_code)]
+    /// TLS handshakes rejected, by reason. Always compiled and registered;
+    /// incremented by the TCP+mTLS accept loop (`socket::tcp`, feature = "tls").
+    /// On the default (Unix-only) build the field is never read, so the
+    /// dead-code lint is suppressed only there.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_handshake_failures: Family<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>,
     /// SIGHUP TLS config reloads, by outcome. Always compiled; stays at zero without the tls feature.
     #[allow(dead_code)]

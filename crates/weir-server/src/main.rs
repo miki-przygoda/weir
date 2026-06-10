@@ -346,6 +346,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Shutdown coordination: signal handler → shutdown_tx → socket::run exits.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
+        // Optional TCP+mTLS listener (feature = "tls"). It runs its own accept
+        // loop concurrently with the Unix loop, feeding the SAME pipeline via a
+        // cloned queue_tx. Each listener owns an independent connection-limit
+        // semaphore and an independent graceful-shutdown watch — the Unix loop's
+        // machinery is untouched (it remains the single, heavily-tested path).
+        // Unifying the cap across both transports is a follow-up (Task 9).
+        //
+        // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
+        // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
+        #[cfg(feature = "tls")]
+        let tcp_shutdown_tx = {
+            use socket::tcp::{self, TcpConfig};
+            use socket::tls::ReloadableServerConfig;
+
+            match config.tcp_bind {
+                Some(bind_addr) => {
+                    // Config validation guarantees the three tls_* paths are
+                    // present whenever tcp_bind is set, so these expects can't
+                    // fire on a validated Config.
+                    let cert = config
+                        .tls_cert_path
+                        .clone()
+                        .expect("config validation guarantees tls_cert_path when tcp_bind is set");
+                    let key = config
+                        .tls_key_path
+                        .clone()
+                        .expect("config validation guarantees tls_key_path when tcp_bind is set");
+                    let ca = config.tls_client_ca_path.clone().expect(
+                        "config validation guarantees tls_client_ca_path when tcp_bind is set",
+                    );
+
+                    let tls = ReloadableServerConfig::load(cert, key, ca).map_err(|e| {
+                        std::io::Error::other(format!("failed to load TLS config: {e}"))
+                    })?;
+
+                    // Bind in the caller so a bad bind address fails startup
+                    // (rather than the spawned accept task) — see socket::tcp
+                    // module docs on the bound-addr design.
+                    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+                    let actual_addr = listener.local_addr()?;
+                    info!(addr = %actual_addr, "TCP+mTLS listener bound");
+
+                    let tcp_config = TcpConfig {
+                        max_connections: config.max_connections,
+                        max_payload_bytes: config.max_payload_bytes,
+                        shard_count: config.shard_count,
+                        shutdown_timeout_secs: config.shutdown_timeout_secs,
+                        connection_read_timeout_secs: config.connection_read_timeout_secs,
+                        handshake_timeout_secs: config.tls_handshake_timeout_secs,
+                    };
+
+                    let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                    let (tcp_handler_tx, tcp_handler_rx) = tokio::sync::watch::channel(false);
+                    let tcp_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+                    let tcp_queue_tx = queue_tx.clone();
+                    let tcp_metrics = Arc::clone(&metrics);
+
+                    tokio::spawn(async move {
+                        let res = tcp::run(
+                            tcp_config,
+                            listener,
+                            tls,
+                            tcp_queue_tx,
+                            tcp_sem,
+                            tcp_shutdown_rx,
+                            tcp_handler_rx,
+                            tcp_metrics,
+                        )
+                        .await;
+                        // Once the TCP accept loop stops accepting, broadcast to
+                        // its in-flight handlers so they exit between frames.
+                        let _ = tcp_handler_tx.send(true);
+                        if let Err(e) = res {
+                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
+                        }
+                    });
+
+                    Some(tcp_shutdown_tx)
+                }
+                None => None,
+            }
+        };
+
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -364,6 +447,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await
                     .expect("failed to install Ctrl-C handler");
                 info!("received Ctrl-C, initiating shutdown");
+            }
+            #[cfg(feature = "tls")]
+            if let Some(tx) = tcp_shutdown_tx {
+                let _ = tx.send(());
             }
             let _ = shutdown_tx.send(());
         });
