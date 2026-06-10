@@ -10,7 +10,7 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
-## [Unreleased]
+## [0.5.0] - 2026-06-10
 
 ### Added
 
@@ -1191,5 +1191,6 @@ The five commits making up this pass:
 
 ---
 
+[0.5.0]: https://github.com/miki-przygoda/weir/compare/v0.4.0...v0.5.0
 [0.3.0]: https://github.com/miki-przygoda/weir/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/miki-przygoda/weir/compare/v0.1.0...v0.2.0
