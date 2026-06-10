@@ -10,6 +10,24 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **ClickHouse sink** (feature `clickhouse-sink`, opt-in) — HTTP
+  `INSERT … FORMAT RowBinary` batch inserts via reqwest, with a content-derived
+  sha256 `insert_deduplication_token` per batch so a crash-replayed byte-identical
+  batch is deduplicated by a `Replicated*MergeTree` engine. Reuses `sql_common`
+  (identifier validation, password redaction, `SqlSinkError`). Config:
+  `sink_type = "clickhouse"`, `sink_clickhouse_{database,table,column}`.
+- **Sinks are now feature-gated** — `http-sink`, `mysql-sink`, `postgres-sink`,
+  `clickhouse-sink` (`noop` is always compiled). `default = ["http-sink",
+  "mysql-sink", "postgres-sink"]`, so the default daemon build is unchanged;
+  library consumers can trim the dependency tree with `default-features = false`.
+  Requesting an unbuilt sink via `sink_type` now fails with a clear
+  "requires the 'X-sink' feature" error. crates.io metadata
+  (`keywords`/`categories`/docs.rs) added to the published crates.
+
 ## [0.5.0] - 2026-06-10
 
 ### Added

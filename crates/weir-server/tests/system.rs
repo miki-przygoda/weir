@@ -2062,6 +2062,86 @@ fn postgres_sink_end_to_end() {
     );
 }
 
+/// ClickHouse sink end-to-end. Requires a running ClickHouse reachable over
+/// HTTP with a `default.weir_records (payload String)` table (a dedup-capable
+/// engine is recommended so replayed batches don't duplicate — see the
+/// `init-clickhouse.sql` rig). Spin up the docker-compose stack and run:
+///
+/// ```text
+/// docker compose -f deploy/docker/test/docker-compose.yml up -d
+/// WEIR_TEST_CLICKHOUSE_URL=http://127.0.0.1:18123 \
+///   cargo test -p weir-server --features clickhouse-sink --test system \
+///   -- --ignored clickhouse_sink_end_to_end
+/// ```
+///
+/// The sink sends a deterministic sha256 `insert_deduplication_token` per batch,
+/// so a crash-replayed byte-identical batch is deduplicated by ClickHouse — that
+/// property is unit-tested at the token level (`dedup_token_*`); here we verify
+/// the end-to-end RowBinary insert path and the IOPS-compression ratio.
+#[test]
+#[ignore = "requires WEIR_TEST_CLICKHOUSE_URL pointing at a running ClickHouse with a weir_records table (see docstring)"]
+#[cfg(feature = "clickhouse-sink")]
+fn clickhouse_sink_end_to_end() {
+    const N: u32 = 100;
+
+    let clickhouse_url = std::env::var("WEIR_TEST_CLICKHOUSE_URL").expect(
+        "WEIR_TEST_CLICKHOUSE_URL not set — see the test docstring for the docker-compose recipe",
+    );
+
+    // sink_type = clickhouse; URL via env so credentials never touch the config
+    // file. N records → one RowBinary HTTP insert (the IOPS-compression story).
+    let handle = weir_server!("clickhouse")
+        .batch_size(200)
+        .batch_deadline_ms(5)
+        .shutdown_timeout_secs(5)
+        .env("WEIR_SINK_URL", &clickhouse_url)
+        .extra_config("sink_type              = \"clickhouse\"")
+        .extra_config("sink_max_batch_size    = 1000")
+        .extra_config("sink_clickhouse_table  = \"weir_records\"")
+        .extra_config("sink_clickhouse_column = \"payload\"")
+        .start();
+
+    let mut client = handle.client();
+    for i in 0..N {
+        client
+            .push(
+                format!("clickhouse-rec-{i:05}").as_bytes(),
+                Durability::Sync,
+            )
+            .unwrap_or_else(|e| panic!("push {i}: {e}"));
+    }
+    drop(client);
+
+    // Give the drain a moment to flush the sealed segment into ClickHouse.
+    thread::sleep(Duration::from_secs(2));
+
+    let body = handle.scrape_metrics();
+    let committed = parse_metric(
+        &body,
+        "weir_sink_commit_records_total{outcome=\"committed\"}",
+    );
+    let commit_count = parse_metric(&body, "weir_sink_commit_duration_seconds_count");
+
+    assert!(
+        committed >= u64::from(N),
+        "expected ≥{N} committed records, got {committed}\nmetrics excerpt:\n{}",
+        body.lines()
+            .filter(|l| l.starts_with("weir_sink_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        commit_count > 0,
+        "expected at least one Sink::commit() call to have been recorded"
+    );
+    let ratio = committed as f64 / commit_count as f64;
+    assert!(
+        ratio >= 10.0,
+        "expected ≥10:1 records-per-commit IOPS compression, got {ratio:.1}:1 \
+         ({committed} records / {commit_count} commits)"
+    );
+}
+
 fn parse_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
         if line.starts_with(prefix)

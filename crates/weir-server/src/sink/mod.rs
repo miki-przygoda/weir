@@ -14,6 +14,10 @@
 //!   counterpart to the MySQL sink. Same multi-row INSERT shape,
 //!   `ON CONFLICT DO NOTHING` in place of `INSERT IGNORE` for idempotency.
 //!   Use when `sink_type = "postgres"`.
+//! - [`clickhouse::ClickHouseSink`] — feature `clickhouse-sink`; HTTP
+//!   `INSERT … FORMAT RowBinary` batch inserts with a sha256
+//!   `insert_deduplication_token` for replay safety. Use when
+//!   `sink_type = "clickhouse"`.
 //!
 //! A `Sink` receives batches of records from the drain and commits them to a
 //! downstream store. Implementations decide their own connection management and

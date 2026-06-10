@@ -812,6 +812,62 @@ by the in-process connector yet.
 
 ---
 
+### Sink: ClickHouse (`sink_type = "clickhouse"`)
+
+Requires the `clickhouse-sink` build feature. The sink sends one HTTP
+`INSERT INTO {database}.{table} ({column}) FORMAT RowBinary` request per
+batch to ClickHouse's HTTP interface (default `:8123`), with the batch
+encoded as length-prefixed bytes into a single `String` column. N records →
+one request → one ClickHouse block — the same IOPS compression as the SQL
+sinks. `sink_url` carries `http://[user:password@]host:8123` (credentials
+sent as HTTP basic auth, redacted in logs).
+
+#### `sink_clickhouse_database`
+
+- **Type**: string · **Default**: `default`
+- **CLI**: `--sink-clickhouse-database` · **Env**: `WEIR_SINK_CLICKHOUSE_DATABASE` · **TOML**: `sink_clickhouse_database`
+
+#### `sink_clickhouse_table`
+
+- **Type**: string · **Default**: `weir_records`
+- **CLI**: `--sink-clickhouse-table` · **Env**: `WEIR_SINK_CLICKHOUSE_TABLE` · **TOML**: `sink_clickhouse_table`
+
+#### `sink_clickhouse_column`
+
+- **Type**: string · **Default**: `payload`
+- **CLI**: `--sink-clickhouse-column` · **Env**: `WEIR_SINK_CLICKHOUSE_COLUMN` · **TOML**: `sink_clickhouse_column`
+
+#### Idempotency (dedup token)
+
+The drain is at-least-once per segment, so a crash mid-commit replays the
+batch. ClickHouse has no `ON CONFLICT`; instead the sink sends a
+deterministic `insert_deduplication_token = sha256(batch)` on each insert,
+so a replayed byte-identical batch is deduplicated by ClickHouse **provided
+the target table uses a dedup-capable engine** — a `Replicated*MergeTree`
+(where `insert_deduplicate` is on by default) or a `MergeTree` with
+`non_replicated_deduplication_window` set. Mind the dedup window (default
+last ~100 blocks). If the engine isn't dedup-capable, the token is harmless
+and dedup falls back to your table design.
+
+Reference schema:
+
+```sql
+CREATE TABLE weir_records (payload String)
+ENGINE = MergeTree ORDER BY tuple()
+SETTINGS non_replicated_deduplication_window = 100;
+```
+
+#### Error classification
+
+| ClickHouse response | Classification | What weir does |
+|---------------------|----------------|----------------|
+| connect / DNS / network reset | transient | retry the segment |
+| HTTP 5xx | transient | retry |
+| request timeout (`sink_timeout_secs`) | timeout (transient) | retry |
+| HTTP 4xx (bad query, auth, unknown table) | permanent | dead-letter the batch |
+
+---
+
 ### Logging
 
 #### `log_level`

@@ -2946,7 +2946,7 @@ dependencies = [
 
 [[package]]
 name = "weir-client"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crc32fast",
  "proptest",
@@ -2958,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "crc32fast",
  "proptest",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "weir-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "arc-swap",
  "core_affinity",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "weir-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "libc",
  "rcgen",

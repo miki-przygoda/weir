@@ -11,12 +11,14 @@ confirms the batch. On restart, any unconfirmed segments are replayed
 automatically.
 
 > **Status — pre-v1.** Pipeline, security hardening, and the SQL
-> sink line are complete. Four built-in sinks: `noop` for soak-testing,
+> sink line are complete. Five built-in sinks (feature-gated; `noop`
+> always compiled): `noop` for soak-testing,
 > `http` (POST per record, transient/permanent classification),
 > `mysql` (multi-row `INSERT` per batch — the IOPS-compression sink:
-> N records → 1 statement → 1 server-side commit), and `postgres`
+> N records → 1 statement → 1 server-side commit), `postgres`
 > (the same shape with `ON CONFLICT DO NOTHING`, TLS opt-in via
-> `?sslmode=require`). WAB flusher panics are supervised and respawned
+> `?sslmode=require`), and `clickhouse` (HTTP `RowBinary` inserts with a
+> sha256 `insert_deduplication_token` for replay safety). WAB flusher panics are supervised and respawned
 > (capped at 10 attempts before the shard goes offline). Wire protocol
 > and WAB on-disk format are versioned and stable.
 > **Not yet on crates.io.**
