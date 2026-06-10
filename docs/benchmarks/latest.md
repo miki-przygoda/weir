@@ -9,15 +9,13 @@ Server config: `shard_count=4`, `batch_size=64`
 > ~10% should be investigated before merging.
 
 > **⚠ Pending refresh — CI numbers below are pre-perf-work (2026-05-25).**
-> The 2026-05-27 perf pass (see [CHANGELOG][unreleased]) shipped five
+> The 2026-05-27 perf pass (see the CHANGELOG) shipped five
 > optimisations that improved sandbox throughput 6–8× on multi-producer
 > Sync workloads. CI bare-metal numbers will refresh on the next merge
 > to `main`. Until then, treat the CI tables below as "lower bound" —
 > the real production numbers will be meaningfully higher. The sandbox
 > numbers are summarised at the bottom of this file as an indicative
 > reference, clearly labelled as not-CI-bare-metal.
->
-> [unreleased]: ../../CHANGELOG.md#unreleased
 
 ## Throughput — deadline comparison
 

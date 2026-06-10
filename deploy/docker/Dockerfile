@@ -13,16 +13,22 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/weir-core/Cargo.toml    crates/weir-core/Cargo.toml
 COPY crates/weir-server/Cargo.toml  crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml  crates/weir-client/Cargo.toml
+# weir-testkit is a workspace member (test-only harness). Cargo must read its
+# manifest to resolve the workspace even when building only weir-server, so its
+# Cargo.toml + a stub lib are required here despite not shipping in the image.
+COPY crates/weir-testkit/Cargo.toml crates/weir-testkit/Cargo.toml
 
 # Stub sources so Cargo can resolve the workspace and compile dependencies.
 RUN mkdir -p \
         crates/weir-core/src \
         crates/weir-server/src \
-        crates/weir-client/src && \
+        crates/weir-client/src \
+        crates/weir-testkit/src && \
     echo 'fn main(){}' > crates/weir-server/src/main.rs && \
     touch \
         crates/weir-core/src/lib.rs \
-        crates/weir-client/src/lib.rs
+        crates/weir-client/src/lib.rs \
+        crates/weir-testkit/src/lib.rs
 
 # --locked enforces that Cargo.lock is used verbatim; cargo refuses to update
 # it during the build. Without --locked, a transient lockfile-resolution issue

@@ -10,7 +10,7 @@ This page holds the numbers captured on a real machine with named
 hardware. They are the ship gate.
 
 > **Status:** awaiting first capture. Run
-> [`deploy/run_bare_metal_bench.sh`](../../deploy/run_bare_metal_bench.sh)
+> `deploy/run_bare_metal_bench.sh`
 > on the target machine and replace this section with the script's
 > output.
 

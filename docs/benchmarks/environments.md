@@ -30,7 +30,7 @@ Relevant constraints:
 
 ## Bare-metal environment
 
-Captured by running [`deploy/run_bare_metal_bench.sh`](../../deploy/run_bare_metal_bench.sh)
+Captured by running `deploy/run_bare_metal_bench.sh`
 on the target machine and committing the output to
 [`bare-metal.md`](bare-metal.md). The script records CPU model, kernel,
 filesystem, mount options, block-device model, governor, SMT/turbo state,
