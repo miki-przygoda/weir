@@ -20,8 +20,7 @@
 #![cfg(unix)]
 
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
