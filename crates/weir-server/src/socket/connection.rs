@@ -1,8 +1,7 @@
 use std::{io, sync::Arc, time::Duration};
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     task,
 };
 use tracing::debug;
@@ -72,13 +71,16 @@ pub struct ConnectionConfig {
 /// 7. Await ack, send `Ack` or `Nack(InternalError)` back to client.
 ///
 /// Any validation failure sends the appropriate Nack and closes the connection.
-pub async fn handle_connection(
-    stream: UnixStream,
+pub async fn handle_connection<S>(
+    stream: S,
     queue_tx: QueueSender<WorkUnit>,
     config: ConnectionConfig,
     metrics: Arc<Metrics>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // Wrap the stream in a BufReader so the typical Push frame (header +
     // payload + CRC) — which the client writes in a single write_all and
     // the kernel delivers in one packet — comes off the socket in one
@@ -262,8 +264,8 @@ pub async fn handle_connection(
 // in the connection loop; bundling them just adds a constructor
 // roundtrip). The fn body uses each argument once.
 #[allow(clippy::too_many_arguments)]
-async fn handle_push(
-    stream: &mut UnixStream,
+async fn handle_push<S>(
+    stream: &mut S,
     queue_tx: QueueSender<WorkUnit>,
     durability: Durability,
     payload: Vec<u8>,
@@ -271,7 +273,10 @@ async fn handle_push(
     shard_id: u32,
     ack_timeout: Duration,
     metrics: &Arc<Metrics>,
-) -> io::Result<()> {
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let unit = WorkUnit {
         shard_id,
@@ -390,7 +395,11 @@ fn nack_for_decode_error(e: &DecodeError) -> (WireNack, MetricNack, &'static [u8
 ///
 /// For `VersionMismatch`, pass `extra = &[WIRE_VERSION]` so the client can
 /// produce: "daemon is on wire protocol v{WIRE_VERSION}; this client is on vN."
-async fn send_nack(stream: &mut UnixStream, reason: WireNack, extra: &[u8]) -> io::Result<()> {
+async fn send_nack<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    reason: WireNack,
+    extra: &[u8],
+) -> io::Result<()> {
     let mut nack_payload = Vec::with_capacity(1 + extra.len());
     nack_payload.push(reason as u8);
     nack_payload.extend_from_slice(extra);
@@ -429,7 +438,7 @@ fn healthcheck_response_frame_bytes() -> &'static [u8] {
     })
 }
 
-async fn send_ack(stream: &mut UnixStream) -> io::Result<()> {
+async fn send_ack<S: AsyncWrite + Unpin>(stream: &mut S) -> io::Result<()> {
     stream.write_all(ack_frame_bytes()).await
 }
 
@@ -812,6 +821,56 @@ mod tests {
             1,
             "connection_idle_timeout counter must increment exactly once"
         );
+    }
+
+    /// Proves that `handle_connection` works over any `AsyncRead + AsyncWrite +
+    /// Unpin + Send` transport, not just `UnixStream`. Uses a
+    /// `tokio::io::duplex` in-memory pipe as the transport. A passing test
+    /// here confirms the generic refactor doesn't break the happy-path Push→Ack
+    /// flow.
+    #[tokio::test]
+    async fn handle_connection_works_over_non_unix_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_secs(5),
+            ack_timeout: Duration::from_millis(500),
+            shard_id: 0,
+        };
+
+        // Auto-acker: blocking recv must run on an OS thread so it doesn't
+        // stall the tokio runtime (same pattern as spawn_handler above).
+        std::thread::spawn(move || {
+            let rx = queue_rx.get(0);
+            while let Ok(unit) = rx.recv() {
+                let _ = unit.ack_tx.send(true);
+            }
+        });
+
+        let handle = tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            never_shutdown_rx(),
+        ));
+
+        let frame = push_frame(b"hello");
+        client.write_all(&frame).await.unwrap();
+
+        let mut resp_buf = [0u8; HEADER_LEN];
+        client.read_exact(&mut resp_buf).await.unwrap();
+        let resp_header = Header::decode(&resp_buf).unwrap();
+        assert_eq!(resp_header.message_type, MessageType::Ack);
+
+        drop(client);
+        handle.await.unwrap().unwrap();
     }
 
     /// A client that sends a valid header then stalls during the payload
