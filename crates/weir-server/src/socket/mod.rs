@@ -795,7 +795,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn bind_hardened_never_silently_succeeds_under_swap_pressure() {
-        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -833,18 +833,28 @@ mod tests {
         for _ in 0..200 {
             match bind_hardened(&target) {
                 Ok(listener) => {
-                    // Verify the contract: socket at target with mode 0o600,
-                    // and our listener is bound to that same path.
-                    let meta = std::fs::metadata(&target).unwrap();
-                    let mode = meta.permissions().mode() & 0o777;
-                    assert_eq!(
-                        mode, 0o600,
-                        "bind_hardened returned Ok but socket mode is {mode:#o}"
-                    );
-                    assert!(
-                        meta.file_type().is_socket(),
-                        "bind_hardened returned Ok but path is not a socket"
-                    );
+                    // Under swap pressure we cannot race-free re-stat the path:
+                    // the attacker may rename the decoy (mode 0o755) over it
+                    // between bind_hardened returning and our check, so a
+                    // path-based stat would read the decoy, not the socket we
+                    // bound. On Linux, fstat on the held fd reports the file mode
+                    // race-free, so we assert the 0o600 contract there. On macOS,
+                    // fstat on a Unix-socket fd reports the socket-object mode
+                    // (0o666), not the file mode, so the under-pressure mode
+                    // check is skipped on macOS; the deterministic clean bind
+                    // after the loop (below) covers the 0o600 guarantee on both.
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                        let rc = unsafe { libc::fstat(listener.as_raw_fd(), &mut st) };
+                        assert_eq!(rc, 0, "fstat on the bound listener failed");
+                        let mode = st.st_mode & 0o777;
+                        assert_eq!(
+                            mode, 0o600,
+                            "bind_hardened returned Ok but socket mode is {mode:#o}"
+                        );
+                    }
                     ok += 1;
                     drop(listener);
                     std::fs::remove_file(&target).ok();
@@ -856,6 +866,19 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         attacker.join().unwrap();
+
+        // Deterministic verification with the attacker stopped (no contention):
+        // a clean bind_hardened produces a 0o600 socket file at `target`. With
+        // nothing swapping the path, the path-based stat is race-free, so this
+        // asserts the umask→0o600 guarantee portably (Linux and macOS).
+        std::fs::remove_file(&target).ok();
+        let clean = bind_hardened(&target).expect("clean bind after swap pressure must succeed");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "clean bind_hardened produced socket mode {mode:#o}"
+        );
+        drop(clean);
 
         std::fs::remove_file(&decoy).ok();
         std::fs::remove_file(&target).ok();
