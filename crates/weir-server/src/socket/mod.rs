@@ -833,28 +833,15 @@ mod tests {
         for _ in 0..200 {
             match bind_hardened(&target) {
                 Ok(listener) => {
-                    // Under swap pressure we cannot race-free re-stat the path:
-                    // the attacker may rename the decoy (mode 0o755) over it
-                    // between bind_hardened returning and our check, so a
-                    // path-based stat would read the decoy, not the socket we
-                    // bound. On Linux, fstat on the held fd reports the file mode
-                    // race-free, so we assert the 0o600 contract there. On macOS,
-                    // fstat on a Unix-socket fd reports the socket-object mode
-                    // (0o666), not the file mode, so the under-pressure mode
-                    // check is skipped on macOS; the deterministic clean bind
-                    // after the loop (below) covers the 0o600 guarantee on both.
-                    #[cfg(target_os = "linux")]
-                    {
-                        use std::os::unix::io::AsRawFd;
-                        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                        let rc = unsafe { libc::fstat(listener.as_raw_fd(), &mut st) };
-                        assert_eq!(rc, 0, "fstat on the bound listener failed");
-                        let mode = st.st_mode & 0o777;
-                        assert_eq!(
-                            mode, 0o600,
-                            "bind_hardened returned Ok but socket mode is {mode:#o}"
-                        );
-                    }
+                    // Under swap pressure the socket FILE's mode cannot be
+                    // verified race-free: a path stat may read the attacker's
+                    // swapped-in decoy, and fstat on a Unix-socket fd reports the
+                    // kernel's socket-object mode (0o777 on Linux, 0o666 on
+                    // macOS), not the bound file's mode. So under pressure we
+                    // only assert bind_hardened stays sound — it returns without
+                    // panicking and hands back a usable listener. The 0o600
+                    // file-mode contract is verified by the deterministic clean
+                    // bind after the loop, with the attacker stopped.
                     ok += 1;
                     drop(listener);
                     std::fs::remove_file(&target).ok();

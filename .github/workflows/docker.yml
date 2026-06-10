@@ -51,6 +51,10 @@ jobs:
             socket_path       = "/run/weir/weir.sock"
             wab_dir           = "/var/lib/weir/wab"
             metrics_port      = 9185
+            # Bind metrics to 0.0.0.0 inside the container so Docker's
+            # `-p 19185:9185` forward (which reaches the container via its
+            # external interface, not loopback) can serve the host curl below.
+            metrics_bind      = "0.0.0.0"
             shard_count       = 2
             worker_count      = 2
             batch_size        = 64
