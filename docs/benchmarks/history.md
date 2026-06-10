@@ -11,3 +11,4 @@ Ramp peak = highest throughput level before connection-cap saturation kicks in.
 | 0.3.0 | 2026-05-25 | 5 | 692 | 1.7 ms | 1.2 ms | 17,316 |
 | 0.3.0 | 2026-05-25 | 5 | 650 | 2.0 ms | 1.2 ms | 17,298 |
 | 0.5.0 | 2026-06-10 | 5 | 1,933 | 1.5 ms | 74 µs | 47,492 |
+| 0.5.0 | 2026-06-10 | 5 | 3,216 | 687 µs | 40 µs | 83,857 |
