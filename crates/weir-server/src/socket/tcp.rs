@@ -1,11 +1,11 @@
 //! TCP accept loop with mutual TLS (feature = "tls").
 //!
-//! Mirrors the Unix accept loop ([`super::run`]): a shared connection-limit
+//! Mirrors the Unix accept loop ([`super::run`]): a per-listener connection-limit
 //! semaphore, round-robin shard assignment, and a graceful-shutdown watch
-//! channel. The difference is the transport: this loop accepts TCP and requires
-//! a mutual-TLS handshake (a CA-signed client certificate) — completed under a
-//! handshake timeout — before the shared [`handle_connection`] sees a single
-//! byte of application data.
+//! channel managed entirely inside `run`. The difference is the transport: this
+//! loop accepts TCP and requires a mutual-TLS handshake (a CA-signed client
+//! certificate) — completed under a handshake timeout — before the shared
+//! [`handle_connection`] sees a single byte of application data.
 //!
 //! # Bound-addr design
 //!
@@ -51,9 +51,11 @@ use crate::{
 /// Configuration for the TCP+mTLS accept loop. Mirrors the relevant subset of
 /// [`super::SocketConfig`] plus the TLS handshake timeout.
 pub struct TcpConfig {
-    /// Maximum concurrent connections. Shares the SAME semaphore as the Unix
-    /// loop when both listeners run, so this value is informational here — the
-    /// permit count is owned by the caller-provided [`Semaphore`].
+    /// Maximum concurrent connections for THIS listener. The TCP loop creates
+    /// its own [`Semaphore`] internally, so when both the Unix and TCP listeners
+    /// are active the total across both transports can reach 2 × max_connections.
+    /// Each transport is independently bounded. Unifying the cap into a single
+    /// global semaphore shared across transports is a deliberate Task 9 follow-up.
     pub max_connections: usize,
     /// Per-connection payload cap in bytes. Effective cap is
     /// `min(max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
@@ -74,11 +76,16 @@ pub struct TcpConfig {
 /// Binds nothing — accepts on the already-bound `listener` (see module docs for
 /// the bound-addr rationale) — and drives the TCP+mTLS frame-parsing layer.
 ///
-/// `sem`, `queue_tx`, `metrics`, and `handler_shutdown_rx` are shared with the
-/// Unix accept loop so the two listeners enforce one global connection cap and
-/// one shutdown broadcast. Returns when `shutdown_rx` fires or is dropped, after
-/// draining in-flight connections within `shutdown_timeout_secs`.
-#[allow(clippy::too_many_arguments)]
+/// `sem` is THIS listener's own connection-cap semaphore (the Unix loop uses a
+/// separate semaphore, so both transports combined can admit up to
+/// 2 × `config.max_connections` concurrent connections until Task 9 unifies
+/// them). The handler-shutdown watch channel is created internally, mirroring
+/// the Unix loop: after the accept loop breaks, `handler_shutdown_tx.send(true)`
+/// fires BEFORE the drain so idle handlers exit promptly without waiting out
+/// `connection_read_timeout_secs`.
+///
+/// Returns when `shutdown_rx` fires or is dropped, after draining in-flight
+/// connections within `shutdown_timeout_secs`.
 pub async fn run(
     config: TcpConfig,
     listener: TcpListener,
@@ -86,7 +93,6 @@ pub async fn run(
     queue_tx: QueueSender<WorkUnit>,
     sem: Arc<Semaphore>,
     shutdown_rx: oneshot::Receiver<()>,
-    handler_shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
 ) -> std::io::Result<()> {
     let local_addr = listener.local_addr()?;
@@ -102,6 +108,14 @@ pub async fn run(
         shard_id: 0, // overridden per connection below
     };
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+
+    // Broadcasts shutdown to every in-flight handler so they can exit cleanly
+    // between frames instead of being abort_all'd mid-await. Sender stays here;
+    // each spawned handler clones the receiver. After the accept loop breaks we
+    // send true BEFORE the drain — mirroring the Unix loop — so idle handlers
+    // exit immediately on their next read-loop iteration rather than waiting out
+    // connection_read_timeout_secs.
+    let (handler_shutdown_tx, handler_shutdown_rx) = watch::channel(false);
 
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown_rx);
@@ -125,8 +139,8 @@ pub async fn run(
                 let accept_start = Instant::now();
                 match res {
                     Ok((stream, peer_addr)) => {
-                        // Acquire a permit from the SHARED semaphore. When the
-                        // global connection cap is reached (across Unix + TCP),
+                        // Acquire a permit from THIS listener's semaphore. When
+                        // this listener's per-transport connection cap is reached,
                         // drop the connection immediately.
                         let Ok(permit) = sem.clone().try_acquire_owned() else {
                             warn!(
@@ -224,10 +238,17 @@ pub async fn run(
         }
     }
 
-    // Drain in-flight connections within the configured timeout. The shared
-    // handler_shutdown watch (signalled by the Unix loop's owner, see main.rs /
-    // the harness) lets idle handlers exit promptly; here we only wait for the
-    // JoinSet to empty, then abort whatever remains.
+    // Broadcast shutdown to every in-flight handler so they exit at the top of
+    // their next read-loop iteration (after acking any push they were
+    // processing). Doing this BEFORE the drain timeout means most handlers
+    // complete naturally; abort_all becomes the emergency fallback.
+    let _ = handler_shutdown_tx.send(true);
+
+    // Drain in-flight connections within the configured timeout. With
+    // handler_shutdown signalling, idle handlers exit immediately on the next
+    // loop check; active handlers exit after their current push completes
+    // (ack/nack capped by ACK_TIMEOUT). The timeout should be >= ACK_TIMEOUT +
+    // buffer so legitimate in-flight work completes before abort_all is reached.
     let timeout = Duration::from_secs(config.shutdown_timeout_secs);
     match time::timeout(timeout, drain_join_set(&mut join_set)).await {
         Ok(()) => {
@@ -264,12 +285,24 @@ fn classify_handshake_error(e: &std::io::Error) -> TlsHandshakeFailureReason {
         TlsHandshakeFailureReason::no_client_cert
     } else if msg.contains("InvalidCertificate")
         || msg.contains("UnknownIssuer")
+        || msg.contains("UnknownCA")
+        || msg.contains("unknown ca")
+        || msg.contains("BadCertificate")
+        || msg.contains("bad certificate")
+        || msg.contains("DecryptError")
+        || msg.contains("decrypt error")
         || msg.contains("Expired")
         || msg.contains("expired")
+        || msg.contains("CertificateExpired")
         || msg.contains("BadEncoding")
         || msg.contains("NotValidForName")
     {
-        // Client cert was presented but rejected (wrong CA, expired, malformed).
+        // Client cert was presented but rejected: wrong CA (UnknownIssuer /
+        // UnknownCA / DecryptError alert), expired (Expired / CertificateExpired),
+        // or otherwise malformed (BadCertificate / BadEncoding / NotValidForName).
+        // rustls 0.23 sends a DecryptError fatal alert when WebPki path
+        // validation fails due to a wrong-CA cert, so that string must live in
+        // this bucket rather than falling through to `other`.
         TlsHandshakeFailureReason::bad_cert
     } else {
         TlsHandshakeFailureReason::other
@@ -320,6 +353,36 @@ mod tests {
     #[test]
     fn classify_bad_cert_expired() {
         let e = std::io::Error::other("invalid peer certificate: Expired");
+        assert_eq!(
+            classify_handshake_error(&e),
+            TlsHandshakeFailureReason::bad_cert
+        );
+    }
+
+    #[test]
+    fn classify_bad_cert_decrypt_error() {
+        // rustls 0.23 sends a DecryptError fatal alert when WebPki path
+        // validation fails for a wrong-CA client cert. Verify it lands in
+        // bad_cert, not other.
+        let e = std::io::Error::other("received fatal alert: DecryptError");
+        assert_eq!(
+            classify_handshake_error(&e),
+            TlsHandshakeFailureReason::bad_cert
+        );
+    }
+
+    #[test]
+    fn classify_bad_cert_unknown_ca() {
+        let e = std::io::Error::other("received fatal alert: UnknownCA");
+        assert_eq!(
+            classify_handshake_error(&e),
+            TlsHandshakeFailureReason::bad_cert
+        );
+    }
+
+    #[test]
+    fn classify_bad_cert_bad_certificate() {
+        let e = std::io::Error::other("received fatal alert: BadCertificate");
         assert_eq!(
             classify_handshake_error(&e),
             TlsHandshakeFailureReason::bad_cert

@@ -398,12 +398,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-                    let (tcp_handler_tx, tcp_handler_rx) = tokio::sync::watch::channel(false);
                     let tcp_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
                     let tcp_queue_tx = queue_tx.clone();
                     let tcp_metrics = Arc::clone(&metrics);
 
                     tokio::spawn(async move {
+                        // tcp::run owns the handler-shutdown watch internally and
+                        // signals handlers BEFORE draining — no extra plumbing needed here.
                         let res = tcp::run(
                             tcp_config,
                             listener,
@@ -411,13 +412,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tcp_queue_tx,
                             tcp_sem,
                             tcp_shutdown_rx,
-                            tcp_handler_rx,
                             tcp_metrics,
                         )
                         .await;
-                        // Once the TCP accept loop stops accepting, broadcast to
-                        // its in-flight handlers so they exit between frames.
-                        let _ = tcp_handler_tx.send(true);
                         if let Err(e) = res {
                             tracing::error!(error = %e, "TCP+mTLS listener exited with error");
                         }
