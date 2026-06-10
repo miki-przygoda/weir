@@ -5,11 +5,13 @@ assumptions, and explicit non-goals of the weir daemon. It is the place
 the operator should look first when deploying weir, and the place
 contributors should consult before adding a new attack surface.
 
-## Trust boundary
+## Trust boundaries
 
-Weir's access control is the **Unix domain socket file's permissions**.
-The daemon binds the socket at `socket_path` with mode 0o600. Anyone who
-can `connect(2)` to that path can push records.
+### Unix socket path
+
+Weir's access control for local producers is the **Unix domain socket file's
+permissions**. The daemon binds the socket at `socket_path` with mode 0o600.
+Anyone who can `connect(2)` to that path can push records.
 
 This means:
 
@@ -19,9 +21,35 @@ This means:
   group-readable access, set the parent directory mode appropriately and
   the daemon socket mode to 0o660 in a future config option (not yet
   implemented).
-- No application-level authentication. Every connected client is treated
-  as fully authorised. No TLS — connections are local-only by design (no
-  TCP listener in v1).
+- No application-level authentication on the Unix path. Every connected
+  client is treated as fully authorised.
+
+### TCP + mutual TLS path (optional, `--features tls`)
+
+When `tcp_bind` is configured, remote producers connect over **mandatory
+mutual TLS** (rustls, aws-lc-rs provider). The trust model differs from the
+Unix path:
+
+- **Client cert required.** Every TCP client must present a certificate
+  signed by the configured CA (`tls_client_ca_path`). Anonymous or cert-less
+  clients are rejected at the TLS handshake.
+- **Trust model: CA issuance.** Issuing a client certificate from the
+  configured CA is the act of authorising a producer. There is no
+  per-CN/SAN allowlist — CA-signed cert = authorised producer.
+- **Plaintext TCP is never exposed.** Setting `tcp_bind` without a valid TLS
+  configuration is a fatal startup error; weir never downgrades to cleartext.
+- **Shared connection cap.** The Unix and TCP listeners draw from one shared
+  semaphore (`max_connections`); the total concurrent connections across both
+  transports is bounded by `max_connections`, not 2×.
+- **Handshake-slowloris bounded.** `tls_handshake_timeout_secs` (default 10s)
+  caps how long a TCP client may stall during the handshake while holding a
+  connection permit.
+- **Revocation by CA rotation.** CRL and OCSP are out of scope (v2). To
+  revoke a client cert, rotate the CA: issue a new CA, re-issue all certs
+  from it, update `tls_client_ca_path`, send SIGHUP. The old CA is
+  immediately distrusted.
+
+See [TCP + mutual TLS](../operations/tcp-mtls.md) for the operator guide.
 
 ## In scope
 
@@ -40,6 +68,9 @@ Threats the daemon defends against:
 | WAB segment tampering (mode tightening) | `audit_segment_modes` runs at startup and warns on any `.wab`/`.wab.sealed`/`.wab.confirmed` file whose permissions are not 0o600. Increments `weir_wab_unexpected_mode_total`. |
 | Bad CRCs (header or payload) | Reject with `Nack(BadHeaderCrc \| BadPayloadCrc)` and close the connection; counter incremented. |
 | Stuck pipeline on shutdown | SIGTERM handler unwinds the pipeline in dependency order; the runtime is dropped before joining threads so background tasks holding queue sender clones don't deadlock the join. |
+| Unauthenticated remote TCP producers (`--features tls`) | Mutual TLS with CA-signed client cert required. Anonymous clients rejected at handshake; increments `weir_tls_handshake_failures_total{reason="no_client_cert"}`. |
+| TLS-handshake slowloris on TCP path (`--features tls`) | `tls_handshake_timeout_secs` (default 10s) bounds handshake duration. The connection cap semaphore permit is held across the handshake, so a flood of stalled TCP connections is bounded by `max_connections`. Increments `weir_tls_handshake_failures_total{reason="timeout"}`. |
+| Plaintext TCP fallback | Setting `tcp_bind` without a valid TLS config is a fatal startup error. The daemon never opens a plaintext TCP socket. |
 
 ## Out of scope (current non-goals)
 
@@ -48,7 +79,7 @@ deliberate architectural choices; others are future work.
 
 | Out of scope | Why / what to do instead |
 |---|---|
-| Remote producers | No TCP listener. Unix socket only. If you need remote producers, terminate them on the same host (e.g. via a sidecar that connects locally). TCP+TLS is on the v0.5 roadmap. |
+| Remote producers (unauthenticated) | TCP listener requires mutual TLS (CA-signed client cert). Anonymous TCP connections are rejected at the handshake. Plaintext TCP is never exposed. See [TCP + mutual TLS](../operations/tcp-mtls.md). |
 | Per-client authentication | Possession of socket open access = full producer authority. Filesystem permissions are the access control. |
 | Privilege drop | Daemon runs as whatever user invoked it. There is no built-in `setuid`/`setgid` to a dedicated `weir` user. Operators are expected to launch under the desired user (e.g. via systemd `User=weir`). |
 | Linux capabilities / seccomp | Not applied. Operators should sandbox the binary externally if needed (systemd `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX`, `PrivateTmp=yes`, `ProtectSystem=strict`, etc.). |
