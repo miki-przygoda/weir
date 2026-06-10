@@ -335,6 +335,9 @@ fn metrics_all_families_registered() {
         "weir_connection_rejected_peer_uid",
         "weir_connections_aborted_at_shutdown",
         "weir_ack_timeout",
+        // TLS
+        "weir_tls_handshake_failures",
+        "weir_tls_config_reloads",
         // WAB
         "weir_wab_segments",
         "weir_wab_bytes_on_disk",
