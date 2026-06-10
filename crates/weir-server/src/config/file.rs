@@ -42,6 +42,16 @@ struct RawServer {
     dead_letter_max_bytes: Option<u64>,
     dead_letter_check_interval_secs: Option<u64>,
     log_level: Option<String>,
+    #[serde(default)]
+    tcp_bind: Option<String>,
+    #[serde(default)]
+    tls_cert_path: Option<PathBuf>,
+    #[serde(default)]
+    tls_key_path: Option<PathBuf>,
+    #[serde(default)]
+    tls_client_ca_path: Option<PathBuf>,
+    #[serde(default)]
+    tls_handshake_timeout_secs: Option<u64>,
 }
 
 const KNOWN_SERVER_KEYS: &[&str] = &[
@@ -74,6 +84,11 @@ const KNOWN_SERVER_KEYS: &[&str] = &[
     "dead_letter_max_bytes",
     "dead_letter_check_interval_secs",
     "log_level",
+    "tcp_bind",
+    "tls_cert_path",
+    "tls_key_path",
+    "tls_client_ca_path",
+    "tls_handshake_timeout_secs",
 ];
 
 pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
@@ -131,6 +146,11 @@ pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
         dead_letter_max_bytes: s.dead_letter_max_bytes,
         dead_letter_check_interval_secs: s.dead_letter_check_interval_secs,
         log_level: s.log_level,
+        tcp_bind: s.tcp_bind,
+        tls_cert_path: s.tls_cert_path,
+        tls_key_path: s.tls_key_path,
+        tls_client_ca_path: s.tls_client_ca_path,
+        tls_handshake_timeout_secs: s.tls_handshake_timeout_secs,
     })
 }
 
