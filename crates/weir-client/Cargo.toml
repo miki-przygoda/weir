@@ -11,7 +11,7 @@ default = []
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]
 
 [dependencies]
-weir-core = { path = "../weir-core" }
+weir-core = { path = "../weir-core", version = "0.5.0" }
 crc32fast = "1"
 rustls = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2", optional = true }

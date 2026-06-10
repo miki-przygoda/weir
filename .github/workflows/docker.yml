@@ -51,11 +51,21 @@ jobs:
             socket_path       = "/run/weir/weir.sock"
             wab_dir           = "/var/lib/weir/wab"
             metrics_port      = 9185
+            # Bind metrics to 0.0.0.0 inside the container so Docker's
+            # `-p 19185:9185` forward (which reaches the container via its
+            # external interface, not loopback) can serve the host curl below.
+            metrics_bind      = "0.0.0.0"
             shard_count       = 2
             worker_count      = 2
             batch_size        = 64
             batch_deadline_ms = 1
             log_level         = "info"
+            # The daemon runs as user `weir` (uid 10001) in the image, but the
+            # host-built push_simple client connects as the runner's uid, so the
+            # default peer-uid check (defense-in-depth on the Unix socket) would
+            # refuse every connection. This is a deliberately cross-uid smoke
+            # test and the socket is chmod a+rw'd below, so disable it here.
+            peer_uid_check    = false
         run: |
           set -euo pipefail
 
