@@ -5,6 +5,10 @@ name: Publish docs
 # caught in review.
 
 on:
+  # Manual trigger: Actions → "Publish docs" → "Run workflow". Lets an
+  # operator deploy the site on demand (e.g. after enabling Pages, or when
+  # a main push didn't touch a watched path so the deploy didn't auto-fire).
+  workflow_dispatch:
   push:
     branches: ["main"]
     paths:
