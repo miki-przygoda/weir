@@ -2950,6 +2950,9 @@ version = "0.4.0"
 dependencies = [
  "crc32fast",
  "proptest",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
  "weir-core",
 ]
 

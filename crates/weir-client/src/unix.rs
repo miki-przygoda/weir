@@ -17,6 +17,8 @@ pub enum ClientError {
     UnknownNack(u8),
     /// The daemon's response violated the wire protocol.
     Protocol(String),
+    /// `push_default` was called but no default durability was set.
+    NoDefaultDurability,
 }
 
 impl std::fmt::Display for ClientError {
@@ -26,6 +28,9 @@ impl std::fmt::Display for ClientError {
             Self::Nack(r) => write!(f, "server nack: {r:?}"),
             Self::UnknownNack(b) => write!(f, "server nack with unknown reason {b:#04x}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            Self::NoDefaultDurability => {
+                write!(f, "push_default called but no default durability was set")
+            }
         }
     }
 }
@@ -47,29 +52,27 @@ impl From<io::Error> for ClientError {
 
 /// A synchronous blocking client for one connection to the weir daemon.
 ///
-/// The underlying [`UnixStream`] runs in blocking mode. Each method sends one
-/// request frame and reads one response frame before returning. Requests are
-/// not pipelined; for concurrent producers, create one `WeirClient` per thread.
+/// The type parameter `S` is the underlying transport. The default is
+/// [`UnixStream`] (Unix domain socket). When the `tls` feature is enabled,
+/// `S` can also be [`crate::TlsStream`] (TCP + mutual TLS).
+///
+/// The underlying stream runs in blocking mode. Each method sends one request
+/// frame and reads one response frame before returning. Requests are not
+/// pipelined; for concurrent producers, create one `WeirClient` per thread.
 ///
 /// Drop the client to close the connection. The daemon treats EOF as a clean
 /// disconnect.
-pub struct WeirClient {
-    stream: UnixStream,
+pub struct WeirClient<S = UnixStream> {
+    stream: S,
+    default_durability: Option<Durability>,
 }
 
-impl WeirClient {
-    /// Opens a connection to the weir daemon's Unix socket at `path`.
-    pub fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
-        let stream = UnixStream::connect(path.as_ref())?;
-        Ok(Self { stream })
-    }
+// ── Shared methods over any blocking Read+Write transport ──────────────────────
 
-    /// Wraps an already-connected [`UnixStream`]. Useful for callers that
-    /// manage their own connection setup (systemd socket activation,
-    /// pre-authenticated file descriptors passed from a parent process,
-    /// `UnixStream::pair`-based test harnesses).
-    pub fn from_stream(stream: UnixStream) -> Self {
-        Self { stream }
+impl<S: Read + Write> WeirClient<S> {
+    /// Sets the default durability tier used by [`push_default`][Self::push_default].
+    pub fn set_default_durability(&mut self, durability: Durability) {
+        self.default_durability = Some(durability);
     }
 
     /// Pushes `payload` to the daemon with the given `durability` tier.
@@ -96,6 +99,19 @@ impl WeirClient {
                 "expected Ack or Nack, got {other:?}"
             ))),
         }
+    }
+
+    /// Pushes at the connection's default durability tier.
+    ///
+    /// Returns [`ClientError::NoDefaultDurability`] if no default was set via
+    /// [`set_default_durability`][Self::set_default_durability] (or via a
+    /// `connect_with_default` / `connect_tls` constructor that accepted a
+    /// `default_durability`).
+    pub fn push_default(&mut self, payload: impl AsRef<[u8]>) -> Result<(), ClientError> {
+        let d = self
+            .default_durability
+            .ok_or(ClientError::NoDefaultDurability)?;
+        self.push(payload, d)
     }
 
     /// Sends a `HealthCheck` frame and returns `Ok(())` on a valid
@@ -141,6 +157,53 @@ impl WeirClient {
 
         Ok(Envelope::new(header, payload))
     }
+
+    /// Crate-internal constructor so `tls.rs` can build the struct without
+    /// going through a Unix-socket constructor.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub(crate) fn from_parts(stream: S, default_durability: Option<Durability>) -> Self {
+        Self {
+            stream,
+            default_durability,
+        }
+    }
+}
+
+// ── Unix-specific constructors ─────────────────────────────────────────────────
+
+impl WeirClient<UnixStream> {
+    /// Opens a connection to the weir daemon's Unix socket at `path`.
+    pub fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        let stream = UnixStream::connect(path.as_ref())?;
+        Ok(Self {
+            stream,
+            default_durability: None,
+        })
+    }
+
+    /// Opens a connection and sets a default durability tier in one step.
+    ///
+    /// Equivalent to calling [`connect`][Self::connect] then
+    /// [`set_default_durability`][Self::set_default_durability].
+    pub fn connect_with_default(
+        path: impl AsRef<Path>,
+        durability: Durability,
+    ) -> Result<Self, ClientError> {
+        let mut c = Self::connect(path)?;
+        c.default_durability = Some(durability);
+        Ok(c)
+    }
+
+    /// Wraps an already-connected [`UnixStream`]. Useful for callers that
+    /// manage their own connection setup (systemd socket activation,
+    /// pre-authenticated file descriptors passed from a parent process,
+    /// `UnixStream::pair`-based test harnesses).
+    pub fn from_stream(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            default_durability: None,
+        }
+    }
 }
 
 fn nack_error(payload: &[u8]) -> ClientError {
@@ -150,5 +213,54 @@ fn nack_error(payload: &[u8]) -> ClientError {
             Err(_) => ClientError::UnknownNack(b),
         },
         None => ClientError::Protocol("Nack frame had empty payload".into()),
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_default_without_default_errors() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        assert!(matches!(
+            c.push_default(b"x").unwrap_err(),
+            ClientError::NoDefaultDurability
+        ));
+    }
+
+    #[test]
+    fn set_default_durability_used_by_push_default() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        c.set_default_durability(Durability::Batched);
+
+        let reader = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut hdr = [0u8; weir_core::HEADER_LEN];
+            server_end.read_exact(&mut hdr).unwrap();
+            let h = weir_core::Header::decode(&hdr).unwrap();
+            let mut rest = vec![0u8; h.payload_len as usize + 4];
+            server_end.read_exact(&mut rest).unwrap();
+            // Send back an Ack so push_default can complete.
+            let ack = weir_core::Envelope::new(
+                weir_core::Header::new(
+                    weir_core::MessageType::Ack,
+                    weir_core::Durability::Sync,
+                    0,
+                    0,
+                ),
+                vec![],
+            )
+            .encode();
+            server_end.write_all(&ack).unwrap();
+            h.durability
+        });
+
+        c.push_default(b"hello").unwrap();
+        assert_eq!(reader.join().unwrap(), Durability::Batched);
     }
 }
