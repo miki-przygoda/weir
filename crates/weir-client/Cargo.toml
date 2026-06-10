@@ -5,13 +5,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["weir", "client", "durability", "ingestion", "ipc"]
+categories = ["network-programming", "database"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = []
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]
 
 [dependencies]
-weir-core = { path = "../weir-core", version = "0.5.0" }
+weir-core = { path = "../weir-core", version = "0.6.0" }
 crc32fast = "1"
 rustls = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2", optional = true }

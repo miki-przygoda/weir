@@ -127,21 +127,27 @@ pub(super) fn parse_from(
         sink_send_idempotency_key: pargs
             .opt_value_from_str("--sink-send-idempotency-key")
             .map_err(pico_err)?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_table: pargs
             .opt_value_from_str("--sink-mysql-table")
             .map_err(pico_err)?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_column: pargs
             .opt_value_from_str("--sink-mysql-column")
             .map_err(pico_err)?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_insert_mode: pargs
             .opt_value_from_str("--sink-mysql-insert-mode")
             .map_err(pico_err)?,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_table: pargs
             .opt_value_from_str("--sink-postgres-table")
             .map_err(pico_err)?,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_column: pargs
             .opt_value_from_str("--sink-postgres-column")
             .map_err(pico_err)?,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_insert_mode: pargs
             .opt_value_from_str("--sink-postgres-insert-mode")
             .map_err(pico_err)?,

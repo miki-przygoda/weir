@@ -24,11 +24,17 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         sink_timeout_secs: env_parse("WEIR_SINK_TIMEOUT_SECS")?,
         sink_max_batch_size: env_parse("WEIR_SINK_MAX_BATCH_SIZE")?,
         sink_send_idempotency_key: env_parse("WEIR_SINK_SEND_IDEMPOTENCY_KEY")?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_table: env_string("WEIR_SINK_MYSQL_TABLE")?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_column: env_string("WEIR_SINK_MYSQL_COLUMN")?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_insert_mode: env_string("WEIR_SINK_MYSQL_INSERT_MODE")?,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_table: env_string("WEIR_SINK_POSTGRES_TABLE")?,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_column: env_string("WEIR_SINK_POSTGRES_COLUMN")?,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_insert_mode: env_string("WEIR_SINK_POSTGRES_INSERT_MODE")?,
         dead_letter_max_bytes: env_parse("WEIR_DEAD_LETTER_MAX_BYTES")?,
         dead_letter_check_interval_secs: env_parse("WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS")?,

@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["wire-protocol", "durability", "wal", "ingestion", "buffer"]
+categories = ["network-programming", "encoding"]
 
 [dependencies]
 crc32fast = "1.4"
