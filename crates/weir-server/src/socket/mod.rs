@@ -19,6 +19,9 @@
 mod connection;
 mod peer;
 
+#[cfg(feature = "tls")]
+pub mod tls;
+
 pub use connection::{ConnectionConfig, handle_connection};
 
 use std::{
