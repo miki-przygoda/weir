@@ -6,7 +6,10 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -21,6 +24,20 @@ use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN}
 use recovery::{check_confirmed, recover_open_segments};
 use segment::ShardWriter;
 use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
+
+/// Exponential moving average update, fixed-point microseconds.
+/// alpha = 1/4 (new sample weighted 25%). Pure fn so it's unit-testable.
+///
+/// On fast NVMe (fsync ~150 µs) this converges to ~150–200 µs — close to
+/// the old fixed 200 µs constant — so there is no throughput change on
+/// local NVMe. The win shows on slower storage (cloud volumes, spinning
+/// disks) where fsync latency is higher and a fixed 200 µs window is too
+/// short, causing extra fsyncs. Throughput gain on slow storage deferred
+/// to Linux/cloud validation.
+pub(crate) fn ewma_update_us(current_us: u64, sample_us: u64) -> u64 {
+    // current*3/4 + sample/4, integer math, no overflow for realistic µs.
+    (current_us.saturating_mul(3) / 4).saturating_add(sample_us / 4)
+}
 
 /// Configuration for the WAB subsystem.
 pub struct WabConfig {
@@ -184,11 +201,16 @@ pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
 
 /// Runs crash recovery, replays sealed-but-unconfirmed segments to `drain_tx`,
 /// then spawns one flusher thread per shard.
+///
+/// `coalesce_hint` is an `Arc<AtomicU64>` holding the EWMA of fsync latency in
+/// microseconds (init 200). Each flusher thread updates it after every fsync;
+/// the worker threads read it to size their coalesce window.
 pub fn spawn(
     wab_dir: PathBuf,
     config: WabConfig,
     drain_tx: Sender<PathBuf>,
     metrics: Arc<Metrics>,
+    coalesce_hint: Arc<AtomicU64>,
 ) -> io::Result<WabHandle> {
     // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
 
@@ -219,6 +241,7 @@ pub fn spawn(
         let batch_deadline = config.batch_deadline;
         let segment_max_bytes = config.segment_max_bytes;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
+        let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
 
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
@@ -235,6 +258,7 @@ pub fn spawn(
                     let rx = rx.clone();
                     let drain_clone = drain_clone.clone();
                     let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
+                    let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
                     move || {
                         flusher_thread(
                             shard_id as u16,
@@ -246,6 +270,7 @@ pub fn spawn(
                             segment_max_bytes,
                             core_id,
                             metrics_for_flusher,
+                            coalesce_hint,
                         );
                     }
                 });
@@ -327,6 +352,7 @@ fn flusher_thread(
     segment_max_bytes: u64,
     core_id: Option<core_affinity::CoreId>,
     metrics: Arc<Metrics>,
+    coalesce_hint: Arc<AtomicU64>,
 ) {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
@@ -384,7 +410,7 @@ fn flusher_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !batches.is_empty() {
-                    flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics);
+                    flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics, &coalesce_hint);
                     record_count = 0;
                 }
                 continue;
@@ -404,7 +430,7 @@ fn flusher_thread(
             }
         }
 
-        flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics);
+        flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics, &coalesce_hint);
         record_count = 0;
     }
 
@@ -438,6 +464,7 @@ fn flush_batch(
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
     metrics: &Arc<Metrics>,
+    coalesce_hint: &Arc<AtomicU64>,
 ) {
     // Sync records used to fsync per-record; now they ride the same
     // group-fsync as Batched. Sync's contract is "fsync before ack" and
@@ -529,7 +556,7 @@ fn flush_batch(
     // this flush. One fsync per batch instead of one per Sync record;
     // both tiers' acks fire after it completes.
     if need_fsync {
-        let ok = fsync_observed(writer, shard_id, metrics);
+        let ok = fsync_observed(writer, shard_id, metrics, coalesce_hint);
         // Observe stage_total for Sync + Batched records (ack fires after fsync).
         #[cfg(feature = "bench-trace")]
         for enqueued_at in sync_ts.into_iter().chain(batched_ts) {
@@ -546,13 +573,25 @@ fn flush_batch(
 /// Fsyncs the active segment, observing the duration and recording any error
 /// through both a tracing log line (so operators see the underlying
 /// io::Error string) and a Prometheus counter (so the failure rate is
-/// alertable). Returns the bool the caller propagates to ack_tx.
-fn fsync_observed(writer: &mut ShardWriter, shard_id: u16, metrics: &Arc<Metrics>) -> bool {
+/// alertable). Updates `coalesce_hint` with an EWMA of the observed fsync
+/// duration so the worker can size its coalesce window dynamically. Returns
+/// the bool the caller propagates to ack_tx.
+fn fsync_observed(
+    writer: &mut ShardWriter,
+    shard_id: u16,
+    metrics: &Arc<Metrics>,
+    coalesce_hint: &Arc<AtomicU64>,
+) -> bool {
     let t = Instant::now();
     let result = writer.fsync_current();
+    let elapsed = t.elapsed();
+    let sample_us = elapsed.as_micros() as u64;
     metrics
         .wab_fsync_duration
-        .observe(t.elapsed().as_secs_f64());
+        .observe(elapsed.as_secs_f64());
+    // Update the shared EWMA hint (Relaxed: heuristic, not a correctness signal).
+    let cur = coalesce_hint.load(Relaxed);
+    coalesce_hint.store(ewma_update_us(cur, sample_us), Relaxed);
     match result {
         Ok(()) => true,
         Err(e) => {
@@ -856,6 +895,83 @@ mod tests {
         assert_eq!(
             panic_message_str(&int_payload),
             "<non-string panic payload>"
+        );
+    }
+
+    // ── EWMA helper ──────────────────────────────────────────────────────────
+
+    /// `ewma_update_us` converges toward a constant input. After enough
+    /// samples the EWMA should be within 10% of the constant.
+    #[test]
+    fn ewma_converges_toward_constant_input() {
+        let target = 500u64;
+        let mut cur = 200u64; // start below target
+        for _ in 0..64 {
+            cur = ewma_update_us(cur, target);
+        }
+        // After 64 updates alpha=1/4 EWMA is well within 10% of target.
+        assert!(
+            cur > target * 9 / 10 && cur < target * 11 / 10,
+            "EWMA should converge to ~{target}, got {cur}"
+        );
+    }
+
+    /// A single spike should move the EWMA by at most 25% of the spike
+    /// magnitude (alpha=1/4 → new = old*3/4 + spike*1/4).
+    #[test]
+    fn ewma_single_spike_is_dampened() {
+        let start = 200u64;
+        let spike = 2_000u64;
+        let after = ewma_update_us(start, spike);
+        // Expected: 200*3/4 + 2000/4 = 150 + 500 = 650
+        assert_eq!(after, 650, "single spike should land at 650 µs");
+        // The move is 450 out of 1800 possible = 25%; verify it's ≤ 25%.
+        let delta = after.saturating_sub(start);
+        let max_delta = (spike - start) / 4 + 1; // +1 for integer rounding
+        assert!(
+            delta <= max_delta,
+            "spike should shift EWMA by at most 25% of spike delta, but delta={delta} max={max_delta}"
+        );
+    }
+
+    /// Zero sample (degenerate: no fsync measured) should reduce the EWMA
+    /// towards zero without panic.
+    #[test]
+    fn ewma_zero_sample_does_not_panic() {
+        let result = ewma_update_us(200, 0);
+        assert_eq!(result, 150, "zero sample: 200*3/4 + 0/4 = 150");
+    }
+
+    /// Very large sample (saturating multiply guard) — must not overflow.
+    #[test]
+    fn ewma_large_values_do_not_overflow() {
+        // u64::MAX / 2 as current — saturating_mul(3) would overflow without
+        // saturation; verify the function handles it without panic.
+        let large = u64::MAX / 2;
+        let result = ewma_update_us(large, 1_000_000);
+        // We can't assert an exact value, just that it didn't panic.
+        let _ = result;
+    }
+
+    /// The worker's clamping range [50, 2000] does not clip the converged
+    /// EWMA when fsync is in the realistic NVMe range (~150–250 µs). This
+    /// documents that on fast local NVMe the window stays near the old
+    /// fixed 200 µs constant — no local throughput change expected.
+    #[test]
+    fn ewma_nvme_range_is_not_clipped() {
+        const MIN_US: u64 = 50;
+        const MAX_US: u64 = 2_000;
+        // Simulate NVMe fsync latency of 150 µs; start from the default 200.
+        let mut cur = 200u64;
+        for _ in 0..64 {
+            cur = ewma_update_us(cur, 150);
+        }
+        let clamped = cur.clamp(MIN_US, MAX_US);
+        // The converged EWMA (~150) should be within the [50, 2000] range
+        // — no clamping needed on NVMe latencies.
+        assert_eq!(
+            cur, clamped,
+            "NVMe-range EWMA ({cur} µs) should not be clipped by [50, 2000] bounds"
         );
     }
 }

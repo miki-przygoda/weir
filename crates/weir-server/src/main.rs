@@ -9,7 +9,14 @@ mod socket;
 mod wab;
 mod worker;
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::AtomicU64,
+    },
+    time::Duration,
+};
 
 use tracing::info;
 
@@ -172,6 +179,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (drain_tx, drain_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(256);
 
+    // ── Coalesce hint: shared EWMA of fsync latency ───────────────────────────
+    //
+    // Flusher threads update this after each fsync; worker threads read it once
+    // per batch to size their coalesce window. Lock-free, Relaxed ordering —
+    // it is a heuristic, not a correctness signal.
+    //
+    // Initial value 200 µs matches the old fixed COALESCE_WINDOW constant so
+    // behaviour before the first fsync is unchanged.
+    let coalesce_hint = Arc::new(AtomicU64::new(200));
+
     // ── WAB (one flusher thread per shard) ────────────────────────────────────
 
     let wab_config = wab::WabConfig {
@@ -185,6 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wab_config,
         drain_tx,
         Arc::clone(&metrics),
+        Arc::clone(&coalesce_hint),
     )?;
 
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
@@ -200,6 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.worker_count,
         config.batch_size,
         Duration::from_millis(config.batch_deadline_ms),
+        coalesce_hint,
     );
 
     // ── Drain ─────────────────────────────────────────────────────────────────
