@@ -263,8 +263,8 @@ const LATENCY_BUCKETS: &[f64] = &[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0
 /// microseconds, far below LATENCY_BUCKETS' 1 ms floor. Only used under bench-trace.
 #[cfg(feature = "bench-trace")]
 const STAGE_BUCKETS: &[f64] = &[
-    0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500,
-    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+    0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.0025, 0.005, 0.01,
+    0.025, 0.05, 0.1,
 ];
 
 impl Metrics {

@@ -799,7 +799,11 @@ fn latency_stage_breakdown() {
 
         // Mean µs per stage = sum / count * 1e6.
         let mean_us = |sum: f64, count: f64| -> f64 {
-            if count > 0.0 { sum / count * 1_000_000.0 } else { 0.0 }
+            if count > 0.0 {
+                sum / count * 1_000_000.0
+            } else {
+                0.0
+            }
         };
 
         let queue_us = mean_us(q_sum, q_count) as u64;
