@@ -85,7 +85,8 @@ impl<S: Read + Write> WeirClient<S> {
         payload: impl AsRef<[u8]>,
         durability: Durability,
     ) -> Result<(), ClientError> {
-        let payload = payload.as_ref().to_vec();
+        // copy_from_slice at the API boundary so downstream handling is zero-copy.
+        let payload = weir_core::Payload::copy_from_slice(payload.as_ref());
         let len = payload.len() as u32;
         let header = Header::new(MessageType::Push, durability, 0, len);
         let frame = Envelope::new(header, payload).encode();
@@ -140,22 +141,22 @@ impl<S: Read + Write> WeirClient<S> {
             Header::decode(&header_buf).map_err(|e| ClientError::Protocol(e.to_string()))?;
 
         let payload_len = header.payload_len as usize;
-        let mut payload = vec![0u8; payload_len];
+        let mut payload_buf = vec![0u8; payload_len];
         if payload_len > 0 {
-            self.stream.read_exact(&mut payload)?;
+            self.stream.read_exact(&mut payload_buf)?;
         }
 
         let mut crc_buf = [0u8; 4];
         self.stream.read_exact(&mut crc_buf)?;
         let expected = u32::from_le_bytes(crc_buf);
-        let computed = crc32fast::hash(&payload);
+        let computed = crc32fast::hash(&payload_buf);
         if expected != computed {
             return Err(ClientError::Protocol(format!(
                 "response payload CRC mismatch: expected {expected:#010x}, computed {computed:#010x}"
             )));
         }
 
-        Ok(Envelope::new(header, payload))
+        Ok(Envelope::new(header, payload_buf))
     }
 
     /// Crate-internal constructor so `tls.rs` can build the struct without
