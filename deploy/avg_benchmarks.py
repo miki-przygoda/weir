@@ -43,6 +43,7 @@ BASE_LATENCY_SCENARIO = "latency_sync"  # kept for single-deadline fallback
 DEADLINES = ["1ms", "2ms"]
 
 RAMP_PREFIX = "ramp_"
+RAMP_SYNC_PREFIX = "ramp_sync_"
 
 
 def parse_results(path: str) -> dict[str, list[dict]]:
@@ -238,8 +239,9 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
             lines.append(f"| {label} | {' | '.join(row_vals)} |")
 
     # ── Saturation ramp ────────────────────────────────────────────────────
+    # Buffered ramp: scenarios starting with "ramp_" but NOT "ramp_sync_".
     ramp_scenarios = sorted(
-        [s for s in groups if s.startswith(RAMP_PREFIX)],
+        [s for s in groups if s.startswith(RAMP_PREFIX) and not s.startswith(RAMP_SYNC_PREFIX)],
         key=lambda s: (
             # Sort by thread count (second token), then deadline.
             int(s.split("_")[1]) if s.split("_")[1].isdigit() else 0,
@@ -249,7 +251,7 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
     if ramp_scenarios:
         lines += [
             "",
-            "## Saturation Ramp",
+            "## Saturation Ramp — Buffered tier",
             "",
             "> Server started with `max_connections = 48`. Levels above 48 threads",
             "> trigger connection-cap exhaustion; the server must survive every level.",
@@ -314,6 +316,88 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
                 io_vals = [float(r.get("io_errors", 0)) for r in rows]
                 saturated = avg(io_vals) > 0
                 status = "**SATURATED** ←" if n == first_saturated else ("SATURATED" if saturated else "ok")
+                lines.append(
+                    f"| {n} | {fmt_rps(rps_avg(rows))}"
+                    f" | {fmt_rps(avg(ack_vals))}"
+                    f" | {fmt_rps(avg(nack_vals))}"
+                    f" | {fmt_rps(avg(io_vals))} | {status} |"
+                )
+
+    # Sync ramp: scenarios starting with "ramp_sync_".
+    ramp_sync_scenarios = sorted(
+        [s for s in groups if s.startswith(RAMP_SYNC_PREFIX)],
+        key=lambda s: (
+            # "ramp_sync_8_threads_d1ms" → thread count is the token after "sync".
+            int(s.split("_")[2]) if len(s.split("_")) > 2 and s.split("_")[2].isdigit() else 0,
+            s,
+        ),
+    )
+    if ramp_sync_scenarios:
+        lines += [
+            "",
+            "## Saturation Ramp — Sync tier",
+            "",
+            "> Server started with `max_connections = 48`. Uses Sync durability to",
+            "> stress the group-fsync path under escalating concurrency.",
+            "",
+        ]
+
+        by_threads_sync: dict[int, dict[str, list[dict]]] = defaultdict(dict)
+        for s in ramp_sync_scenarios:
+            parts = s.split("_")
+            # "ramp_sync_N_threads_dXms" → thread count is parts[2]
+            n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            d_suffix = next((p for p in parts if p.startswith("d") and p.endswith("ms")), None)
+            d_label = d_suffix if d_suffix else "?"
+            by_threads_sync[n][d_label] = groups[s]
+
+        sorted_sync_threads = sorted(by_threads_sync.keys())
+        sync_deadlines = sorted({d for td in by_threads_sync.values() for d in td.keys()})
+
+        first_saturated_sync = next(
+            (
+                n for n in sorted_sync_threads
+                if avg([float(r.get("io_errors", 0))
+                        for d in sync_deadlines
+                        for r in by_threads_sync[n].get(d, [])]) > 0
+            ),
+            None,
+        )
+
+        if len(sync_deadlines) > 1:
+            d_header = " | ".join(f"RPS ({d})" for d in sync_deadlines)
+            d_sep = " | ".join("--------" for _ in sync_deadlines)
+            lines.append(f"| Threads | {d_header} | I/O drops | Status |")
+            lines.append(f"|---------|{d_sep}|-----------|--------|")
+            for n in sorted_sync_threads:
+                rps_cols = []
+                io_drops = None
+                for d in sync_deadlines:
+                    rows = by_threads_sync[n].get(d, [])
+                    if rows:
+                        rps_cols.append(fmt_rps(rps_avg(rows)))
+                        if io_drops is None:
+                            io_drops_vals = [float(r.get("io_errors", 0)) for r in rows]
+                            io_drops = avg(io_drops_vals)
+                    else:
+                        rps_cols.append("—")
+                saturated = (io_drops or 0) > 0
+                status = "**SATURATED** ←" if n == first_saturated_sync else ("SATURATED" if saturated else "ok")
+                lines.append(
+                    f"| {n} | {' | '.join(rps_cols)}"
+                    f" | {fmt_rps(io_drops or 0)} | {status} |"
+                )
+        else:
+            d = sync_deadlines[0] if sync_deadlines else "?"
+            lines.append(f"| Threads | Avg RPS ({d}) | Acks | Nacks | I/O drops | Status |")
+            lines.append(f"|---------|--------------|------|-------|-----------|--------|")
+            for n in sorted_sync_threads:
+                rows = by_threads_sync[n].get(d, [])
+                ack_vals = [float(r.get("acks", 0)) for r in rows]
+                nack_vals = [float(r.get("nacks", 0)) for r in rows]
+                io_vals = [float(r.get("io_errors", 0)) for r in rows]
+                saturated = avg(io_vals) > 0
+                status = "**SATURATED** ←" if n == first_saturated_sync else ("SATURATED" if saturated else "ok")
                 lines.append(
                     f"| {n} | {fmt_rps(rps_avg(rows))}"
                     f" | {fmt_rps(avg(ack_vals))}"

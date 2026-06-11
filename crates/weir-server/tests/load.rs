@@ -153,6 +153,7 @@ fn run_ramp_level(
     srv: &weir_testkit::WeirServer,
     n_threads: usize,
     duration: Duration,
+    durability: Durability,
 ) -> LevelResult {
     let acks = Arc::new(AtomicU64::new(0));
     let nacks = Arc::new(AtomicU64::new(0));
@@ -177,7 +178,7 @@ fn run_ramp_level(
                     return;
                 };
                 while !stop.load(Ordering::Relaxed) {
-                    match client.push(b"ramp", Durability::Buffered) {
+                    match client.push(b"ramp", durability) {
                         Ok(()) => {
                             acks.fetch_add(1, Ordering::Relaxed);
                         }
@@ -393,7 +394,7 @@ fn ramp_to_saturation() {
     println!("{}", "-".repeat(62));
 
     for &n in LEVELS {
-        let result = run_ramp_level(&srv, n, LEVEL_DURATION);
+        let result = run_ramp_level(&srv, n, LEVEL_DURATION, Durability::Buffered);
         let rps = result.acks as f64 / result.duration.as_secs_f64();
         let status = if result.io_errors > 0 {
             "SATURATED"
@@ -408,6 +409,63 @@ fn ramp_to_saturation() {
 
         println!(
             "BENCH: {{\"scenario\":\"ramp_{n}_threads_d{d}ms\",\"threads\":{n},\
+             \"acks\":{},\"nacks\":{},\"io_errors\":{},\
+             \"wall_ms\":{},\"throughput_rps\":{}}}",
+            result.acks,
+            result.nacks,
+            result.io_errors,
+            result.duration.as_millis(),
+            rps as u64,
+        );
+
+        let mut health = srv.client();
+        assert!(
+            health.health_check().is_ok(),
+            "server became unresponsive after {n}-thread level (status: {status})"
+        );
+    }
+}
+
+/// Sync-tier saturation ramp: same as `ramp_to_saturation` but uses Sync
+/// durability to stress the group-fsync path under escalating concurrency.
+///
+/// Confirms the server survives concurrent Sync producers hitting the fsync
+/// bottleneck and that it degrades gracefully once the connection cap is
+/// exceeded (same assertion as the Buffered ramp).
+#[test]
+fn ramp_to_saturation_sync() {
+    const MAX_CONN: usize = 48;
+    const LEVEL_DURATION: Duration = Duration::from_secs(3);
+    const LEVELS: &[usize] = &[8, 16, 32, 48, 64, 96];
+
+    let srv = weir_server!("ramp_sync")
+        .bench_preset()
+        .max_connections(MAX_CONN)
+        .start();
+    let d = srv.batch_deadline_ms;
+
+    println!(
+        "\n{:<10} {:>10} {:>10} {:>8} {:>8} {:>12}",
+        "threads", "acks", "RPS", "nacks", "io_errs", "status"
+    );
+    println!("{}", "-".repeat(62));
+
+    for &n in LEVELS {
+        let result = run_ramp_level(&srv, n, LEVEL_DURATION, Durability::Sync);
+        let rps = result.acks as f64 / result.duration.as_secs_f64();
+        let status = if result.io_errors > 0 {
+            "SATURATED"
+        } else {
+            "ok"
+        };
+
+        println!(
+            "{:<10} {:>10} {:>10.0} {:>8} {:>8} {:>12}",
+            n, result.acks, rps, result.nacks, result.io_errors, status
+        );
+
+        println!(
+            "BENCH: {{\"scenario\":\"ramp_sync_{n}_threads_d{d}ms\",\"threads\":{n},\
              \"acks\":{},\"nacks\":{},\"io_errors\":{},\
              \"wall_ms\":{},\"throughput_rps\":{}}}",
             result.acks,
