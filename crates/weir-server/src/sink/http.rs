@@ -584,10 +584,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink
-            .commit(vec![p(b"a"), p(b"b"), p(b"c")])
-            .await
-            .unwrap();
+        let result = sink.commit(vec![p(b"a"), p(b"b"), p(b"c")]).await.unwrap();
         assert_eq!(result.committed.len(), 2);
         assert_eq!(result.dead_lettered.len(), 1);
     }
@@ -602,10 +599,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink
-            .commit(vec![p(b"a"), p(b"b")])
-            .await
-            .unwrap_err();
+        let err = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap_err();
         assert!(err.is_transient());
     }
 

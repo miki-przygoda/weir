@@ -1450,7 +1450,10 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([MockSink::ok_with_dead_letter(
-            vec![Payload::from(b"alpha".as_ref()), Payload::from(b"gamma".as_ref())],
+            vec![
+                Payload::from(b"alpha".as_ref()),
+                Payload::from(b"gamma".as_ref()),
+            ],
             vec![Payload::from(b"beta".as_ref())],
         )]));
         let metrics = noop_metrics();
@@ -1560,7 +1563,10 @@ mod tests {
             Err(MockError::Transient),
             Err(MockError::Transient),
             Err(MockError::Transient),
-            MockSink::ok(vec![Payload::from(b"r1".as_ref()), Payload::from(b"r2".as_ref())]),
+            MockSink::ok(vec![
+                Payload::from(b"r1".as_ref()),
+                Payload::from(b"r2".as_ref()),
+            ]),
         ]));
         let metrics = noop_metrics();
         run_drain(

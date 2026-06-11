@@ -399,8 +399,14 @@ mod tests {
         let batch_size = 3;
         // 60s deadline — flush must be triggered by batch-full, not timeout.
         let (shard_txs, batch_rxs) = make_shard_channels(1);
-        let handles =
-            spawn_workers(&queue_rx, shard_txs, 1, 1, batch_size, Duration::from_secs(60));
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            batch_size,
+            Duration::from_secs(60),
+        );
 
         for _ in 0..batch_size {
             let (unit, _) = make_unit(0, b"x");
