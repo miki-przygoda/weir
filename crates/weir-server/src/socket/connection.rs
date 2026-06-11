@@ -283,6 +283,8 @@ where
         payload,
         durability,
         ack_tx,
+        #[cfg(feature = "bench-trace")]
+        enqueued_at: std::time::Instant::now(),
     };
 
     // Partition by shard_id so every record destined for a given shard lands

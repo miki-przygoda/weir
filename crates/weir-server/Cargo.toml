@@ -10,6 +10,10 @@ postgres-sink = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postg
 clickhouse-sink = ["dep:reqwest", "dep:sha2", "_sql-sink"]
 # Internal: the shared sql_common module used by mysql-sink + postgres-sink + clickhouse-sink.
 _sql-sink = []
+# Per-stage latency instrumentation for the load suite. Off by default and
+# carries ZERO cost in a normal build — adds Instant fields + histograms only
+# when enabled. Build the binary with this to populate weir_stage_* metrics.
+bench-trace = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:arc-swap", "dep:x509-parser", "dep:rustls"]

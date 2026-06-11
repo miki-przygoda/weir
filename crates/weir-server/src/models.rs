@@ -18,4 +18,8 @@ pub struct WorkUnit {
     /// Oneshot back-channel to the async socket handler. The WAB drain resolves
     /// this with `true` on successful write, `false` on unrecoverable failure.
     pub ack_tx: oneshot::Sender<bool>,
+    /// Wall-clock instant the unit was enqueued to the work queue. Present only
+    /// under `bench-trace`; used to attribute per-stage latency in the load suite.
+    #[cfg(feature = "bench-trace")]
+    pub enqueued_at: std::time::Instant,
 }

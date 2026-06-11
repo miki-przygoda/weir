@@ -23,6 +23,8 @@ pub struct Batch {
     #[allow(dead_code)]
     pub shard_id: u32,
     pub records: Vec<WorkUnit>,
+    #[cfg(feature = "bench-trace")]
+    pub flushed_at: std::time::Instant,
 }
 
 /// Per-worker state. One `Worker` runs on one thread and holds independent
@@ -155,6 +157,8 @@ impl Worker {
             .send(Batch {
                 shard_id: shard as u32,
                 records,
+                #[cfg(feature = "bench-trace")]
+                flushed_at: std::time::Instant::now(),
             })
             .ok(); // receiver gone means WAB is shutting down; discard silently
     }
@@ -367,6 +371,8 @@ mod tests {
                 payload: payload.to_vec(),
                 durability: weir_core::Durability::Buffered,
                 ack_tx: tx,
+                #[cfg(feature = "bench-trace")]
+                enqueued_at: std::time::Instant::now(),
             },
             rx,
         )

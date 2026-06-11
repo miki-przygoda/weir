@@ -209,11 +209,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .name("weir-bridge".into())
             .spawn(move || {
                 while let Ok(batch) = batch_rx.recv() {
+                    #[cfg(feature = "bench-trace")]
+                    let flushed_at = batch.flushed_at;
                     for unit in batch.records {
                         let record = WabRecord {
                             payload: unit.payload,
                             durability: unit.durability,
                             ack_tx: unit.ack_tx,
+                            #[cfg(feature = "bench-trace")]
+                            enqueued_at: unit.enqueued_at,
+                            #[cfg(feature = "bench-trace")]
+                            worker_flushed_at: flushed_at,
                         };
                         if wab_tx.send(record).is_err() {
                             return;

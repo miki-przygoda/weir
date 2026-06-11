@@ -29,6 +29,10 @@ pub struct WabRecord {
     /// durably written according to the requested tier, or `false` on an
     /// unrecoverable write failure.
     pub ack_tx: oneshot::Sender<bool>,
+    #[cfg(feature = "bench-trace")]
+    pub enqueued_at: std::time::Instant,
+    #[cfg(feature = "bench-trace")]
+    pub worker_flushed_at: std::time::Instant,
 }
 
 /// Configuration for the WAB subsystem.
