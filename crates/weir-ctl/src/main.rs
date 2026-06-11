@@ -58,6 +58,12 @@ enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Inspect the on-disk WAB: active/sealed/confirmed segments + bytes per shard.
+    Segments {
+        /// Path to the daemon's WAB directory (the `wab_dir` config value).
+        #[arg(long)]
+        wab_dir: PathBuf,
+    },
 }
 
 fn parse_durability(s: &str) -> Result<Durability, String> {
@@ -81,6 +87,7 @@ fn main() -> ExitCode {
             socket,
         } => cmd_push(&socket, payload.as_bytes(), durability),
         Command::Metrics { addr, raw } => cmd_metrics(&addr, raw),
+        Command::Segments { wab_dir } => cmd_segments(&wab_dir),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -119,6 +126,131 @@ fn cmd_metrics(addr: &str, raw: bool) -> Result<(), String> {
     }
     print_summary(&body);
     Ok(())
+}
+
+/// On-disk segment accounting for one shard directory.
+struct ShardStat {
+    name: String,
+    active: u64,
+    sealed: u64,
+    confirmed: u64,
+    bytes: u64,
+}
+
+fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(wab_dir).map_err(|e| format!("read {}: {e}", wab_dir.display()))?;
+
+    let mut shards: Vec<ShardStat> = Vec::new();
+    let mut dl_files: u64 = 0;
+    let mut dl_bytes: u64 = 0;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+
+        // The dead-letter store is a sibling of the shard dirs, not a shard.
+        if name == "dead_letter" {
+            if let Ok(files) = std::fs::read_dir(&path) {
+                for f in files.flatten() {
+                    if f.path().is_file() {
+                        dl_files += 1;
+                        dl_bytes += f.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                }
+            }
+            continue;
+        }
+
+        let mut st = ShardStat {
+            name,
+            active: 0,
+            sealed: 0,
+            confirmed: 0,
+            bytes: 0,
+        };
+        if let Ok(files) = std::fs::read_dir(&path) {
+            for f in files.flatten() {
+                let fp = f.path();
+                let Some(fname) = fp.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
+                // Order matters: `.wab.confirmed` and `.wab.sealed` both end in
+                // a longer suffix than the bare `.wab`, so test them first.
+                if fname.ends_with(".wab.confirmed") {
+                    st.confirmed += 1;
+                } else if fname.ends_with(".wab.sealed") {
+                    st.sealed += 1;
+                    st.bytes += sz;
+                } else if fname.ends_with(".wab") {
+                    st.active += 1;
+                    st.bytes += sz;
+                }
+            }
+        }
+        shards.push(st);
+    }
+
+    if shards.is_empty() && dl_files == 0 {
+        println!("no shard directories under {}", wab_dir.display());
+        return Ok(());
+    }
+
+    shards.sort_by(|a, b| a.name.cmp(&b.name));
+    println!(
+        "{:<8} {:>7} {:>7} {:>10} {:>12}",
+        "shard", "active", "sealed", "confirmed", "bytes"
+    );
+    let (mut ta, mut ts, mut tc, mut tb) = (0u64, 0u64, 0u64, 0u64);
+    for s in &shards {
+        println!(
+            "{:<8} {:>7} {:>7} {:>10} {:>12}",
+            s.name,
+            s.active,
+            s.sealed,
+            s.confirmed,
+            fmt_bytes(s.bytes)
+        );
+        ta += s.active;
+        ts += s.sealed;
+        tc += s.confirmed;
+        tb += s.bytes;
+    }
+    println!(
+        "{:<8} {:>7} {:>7} {:>10} {:>12}",
+        "total",
+        ta,
+        ts,
+        tc,
+        fmt_bytes(tb)
+    );
+    println!("(active = being written; sealed = awaiting drain; confirmed = drained marker)");
+    if dl_files > 0 {
+        println!("dead-letter: {dl_files} file(s), {}", fmt_bytes(dl_bytes));
+    }
+    Ok(())
+}
+
+fn fmt_bytes(b: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = b as f64;
+    if f >= K * K * K {
+        format!("{:.1} GiB", f / (K * K * K))
+    } else if f >= K * K {
+        format!("{:.1} MiB", f / (K * K))
+    } else if f >= K {
+        format!("{:.1} KiB", f / K)
+    } else {
+        format!("{b} B")
+    }
 }
 
 /// Minimal HTTP/1.0 GET of `/metrics` — keeps weir-ctl free of an HTTP client
