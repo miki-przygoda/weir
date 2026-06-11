@@ -163,8 +163,11 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn new(header: Header, payload: Payload) -> Self {
-        Self { header, payload }
+    pub fn new(header: Header, payload: impl Into<Payload>) -> Self {
+        Self {
+            header,
+            payload: payload.into(),
+        }
     }
 
     /// Serialises the full frame: header bytes + payload bytes + payload CRC32 (LE).
@@ -213,7 +216,7 @@ impl Envelope {
             return Err(DecodeError::TruncatedFrame);
         }
 
-        let payload = buf[HEADER_LEN..HEADER_LEN + payload_len].to_vec();
+        let payload = bytes::Bytes::copy_from_slice(&buf[HEADER_LEN..HEADER_LEN + payload_len]);
         let expected_crc =
             u32::from_le_bytes(buf[HEADER_LEN + payload_len..frame_len].try_into().unwrap());
         let computed_crc = crc32fast::hash(&payload);

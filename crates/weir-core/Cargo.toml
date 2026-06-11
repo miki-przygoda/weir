@@ -10,6 +10,8 @@ categories = ["network-programming", "encoding"]
 
 [dependencies]
 crc32fast = "1.4"
+# bytes: tiny, ubiquitous, ~zero transitive deps; Payload = Bytes for O(1) drain clones.
+bytes = "1"
 # thiserror intentionally excluded: manual impl Error avoids syn/quote/proc-macro2
 # as build-time deps on a security-sensitive types crate.
 # serde intentionally excluded: payloads are opaque bytes to the core layer.
