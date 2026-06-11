@@ -1,0 +1,20 @@
+[package]
+name = "weir-ctl"
+description = "Admin and inspection CLI for the weir daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["weir", "cli", "operations", "admin", "durability"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "weir-ctl"
+path = "src/main.rs"
+
+[dependencies]
+weir-core = { path = "../weir-core", version = "0.8.0" }
+weir-client = { path = "../weir-client" }
+# clap with derive for the subcommand surface. The proc-macro build cost is
+# already paid elsewhere in the workspace (serde derive, etc.).
+clap = { version = "4", features = ["derive"] }
