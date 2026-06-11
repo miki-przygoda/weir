@@ -742,3 +742,75 @@ fn parse_load_metric(body: &str, prefix: &str) -> u64 {
     }
     0
 }
+
+#[cfg(feature = "bench-trace")]
+fn parse_load_metric_f64(body: &str, prefix: &str) -> f64 {
+    for line in body.lines() {
+        if line.starts_with(prefix)
+            && let Some(val) = line.split_whitespace().next_back()
+            && let Ok(n) = val.parse::<f64>()
+        {
+            return n;
+        }
+    }
+    0.0
+}
+
+/// Per-stage latency breakdown — gated behind `bench-trace` feature.
+///
+/// Starts a server compiled with `bench-trace`, pushes 2000 records of each
+/// tier, scrapes `/metrics` for the four `weir_stage_*_seconds` histograms,
+/// and emits one `BENCH_STAGE:` JSON line per tier with mean µs per stage.
+/// Only runs when `--features bench-trace` is passed to `cargo test`.
+#[cfg(feature = "bench-trace")]
+#[test]
+fn latency_stage_breakdown() {
+    const SAMPLES: usize = 2000;
+    let d = bench_deadline_ms();
+
+    for (tier_name, durability) in &[
+        ("sync", Durability::Sync),
+        ("batched", Durability::Batched),
+        ("buffered", Durability::Buffered),
+    ] {
+        let srv = weir_server!(&format!("stage_{tier_name}"))
+            .bench_preset()
+            .start();
+        let mut client = srv.client();
+
+        for _ in 0..SAMPLES {
+            client.push(b"stage", *durability).expect("push");
+        }
+        // Small pause to let the flusher finish observing stage_total for
+        // the last batch (especially Buffered which doesn't wait for fsync).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let body = srv.scrape_metrics();
+
+        // Parse sum and count for each stage histogram.
+        let q_sum = parse_load_metric_f64(&body, "weir_stage_queue_seconds_sum");
+        let q_count = parse_load_metric_f64(&body, "weir_stage_queue_seconds_count");
+        let bw_sum = parse_load_metric_f64(&body, "weir_stage_bridge_wait_seconds_sum");
+        let bw_count = parse_load_metric_f64(&body, "weir_stage_bridge_wait_seconds_count");
+        let w_sum = parse_load_metric_f64(&body, "weir_stage_write_seconds_sum");
+        let w_count = parse_load_metric_f64(&body, "weir_stage_write_seconds_count");
+        let t_sum = parse_load_metric_f64(&body, "weir_stage_total_seconds_sum");
+        let t_count = parse_load_metric_f64(&body, "weir_stage_total_seconds_count");
+
+        // Mean µs per stage = sum / count * 1e6.
+        let mean_us = |sum: f64, count: f64| -> f64 {
+            if count > 0.0 { sum / count * 1_000_000.0 } else { 0.0 }
+        };
+
+        let queue_us = mean_us(q_sum, q_count) as u64;
+        let bridge_wait_us = mean_us(bw_sum, bw_count) as u64;
+        let write_us = mean_us(w_sum, w_count) as u64;
+        let total_us = mean_us(t_sum, t_count) as u64;
+
+        println!(
+            "BENCH_STAGE: {{\"scenario\":\"stage_{tier_name}_d{d}ms\",\
+             \"queue_us\":{queue_us},\"bridge_wait_us\":{bridge_wait_us},\
+             \"write_us\":{write_us},\"total_us\":{total_us}}}"
+        );
+    }
+}
