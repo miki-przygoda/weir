@@ -12,26 +12,53 @@ changes are tracked separately under **Wire protocol** below.
 
 ## [Unreleased] — 0.8.0
 
-### Added
+A performance-focused pass (Phase 3). The headline finding, proven with the new
+per-stage instrumentation across a macOS dev box and a real Linux machine: the
+durable write path is **fsync-bound** — `fdatasync` is ~89% of Sync latency on
+NVMe and ~99% on a SATA SSD. The changes below make the software pipeline leaner
+and fully measurable; the fsync floor itself is storage-bound. Full results:
+`docs/benchmarks/phase3-results.md`.
 
+### Performance
+
+- **Bridge-thread removal (Stream B).** The per-shard "bridge" thread that
+  converted `Batch` → `WabRecord` is gone; the worker now feeds the WAB flusher
+  directly over a single `Batch` channel per shard (the `WabRecord` type was
+  removed). One fewer OS thread + channel hop per shard. Per-shard FIFO,
+  group-fsync coalescing, panic supervision, and graceful shutdown are unchanged
+  and verified.
+- **`bytes::Bytes` payload (Stream C).** `Payload` changed from `Vec<u8>` to
+  ref-counted `bytes::Bytes`, making payload clones O(1). Eliminates the drain's
+  per-batch payload copy in `commit_batch` and the HTTP sink's `to_vec()`. Wire
+  and on-disk formats are byte-identical (verified by the codec, crash-recovery,
+  and fuzz suites).
+- **Vectored WAB writes (Stream D).** `WabSegment::write_record` now issues one
+  `writev` instead of three `write_all` syscalls per record — the per-record
+  write stage drops ~60%. (`write_all_vectored` is still unstable, so a single
+  `write_vectored` + poison-on-short-write is used.) Total latency is fsync-bound
+  and unchanged.
+- **io_uring evaluated and rejected.** A direct micro-benchmark on Linux showed
+  io_uring (batched writes + IO_DRAIN datasync fsync) is never faster than
+  `writev`+`fdatasync` for the WAB write+fsync pattern — the cost is the
+  storage-bound fsync, which io_uring cannot accelerate (and its ring bookkeeping
+  adds overhead). Not pursued; `write_vectored` already captured the portable
+  write-syscall win.
 - **Adaptive coalesce window (Stream E).** The worker's coalesce window is now
   sized from an exponential moving average (alpha=1/4) of observed fsync
-  latency, fed back via a shared lock-free `Arc<AtomicU64>`. On fast local
-  NVMe (fsync ~150 µs) the window converges near the old fixed 200 µs value —
-  no change in local throughput. The win is on slower storage (cloud volumes,
-  spinning disks) where a fixed 200 µs window is too short and fragments
-  batches; throughput gain on slow storage is deferred to Linux/cloud-storage
-  validation. Window is clamped to [50 µs, 2 ms].
-
-### Changed
-
-- **`worker_count` now defaults to `shard_count`** instead of the hard-coded
-  `2`. In the default single-shard config this removes an idle worker thread.
-  The balanced invariant `worker_count == shard_count` is now the out-of-box
-  default; operators who explicitly set `worker_count` are unaffected.
+  latency, fed back via a shared lock-free `Arc<AtomicU64>`, clamped to
+  [50 µs, 2 ms]. On fast NVMe it converges near the old fixed 200 µs; the
+  intended benefit is on slower storage where a fixed window fragments batches.
+  (A/B on a SATA SSD shows it is marginal — helps low concurrency, neutral-to-
+  slightly-worse at high concurrency.)
 
 ### Added
 
+- **Per-stage latency instrumentation** (`bench-trace` feature, off by default,
+  Stream A). Records enqueue → worker-flush → flusher → ack stage timings as
+  Prometheus histograms (`weir_stage_*_seconds`) so the load suite can attribute
+  latency to a pipeline stage. Also widens the latency-percentile samples
+  (500 → 2000) with per-run σ, and adds a Sync-tier saturation ramp. Zero cost
+  when the feature is off.
 - **ClickHouse sink** (feature `clickhouse-sink`, opt-in) — HTTP
   `INSERT … FORMAT RowBinary` batch inserts via reqwest, with a content-derived
   sha256 `insert_deduplication_token` per batch so a crash-replayed byte-identical
