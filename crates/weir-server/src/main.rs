@@ -11,10 +11,7 @@ mod worker;
 
 use std::{
     path::Path,
-    sync::{
-        Arc,
-        atomic::AtomicU64,
-    },
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 

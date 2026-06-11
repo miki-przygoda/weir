@@ -410,7 +410,14 @@ fn flusher_thread(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if !batches.is_empty() {
-                    flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics, &coalesce_hint);
+                    flush_batch(
+                        &mut writer,
+                        &mut batches,
+                        &drain_tx,
+                        shard_id,
+                        &metrics,
+                        &coalesce_hint,
+                    );
                     record_count = 0;
                 }
                 continue;
@@ -430,7 +437,14 @@ fn flusher_thread(
             }
         }
 
-        flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics, &coalesce_hint);
+        flush_batch(
+            &mut writer,
+            &mut batches,
+            &drain_tx,
+            shard_id,
+            &metrics,
+            &coalesce_hint,
+        );
         record_count = 0;
     }
 
@@ -586,9 +600,7 @@ fn fsync_observed(
     let result = writer.fsync_current();
     let elapsed = t.elapsed();
     let sample_us = elapsed.as_micros() as u64;
-    metrics
-        .wab_fsync_duration
-        .observe(elapsed.as_secs_f64());
+    metrics.wab_fsync_duration.observe(elapsed.as_secs_f64());
     // Update the shared EWMA hint (Relaxed: heuristic, not a correctness signal).
     let cur = coalesce_hint.load(Relaxed);
     coalesce_hint.store(ewma_update_us(cur, sample_us), Relaxed);

@@ -414,8 +414,15 @@ mod tests {
     fn single_worker_batches_on_deadline() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (shard_txs, batch_rxs) = make_shard_channels(1);
-        let handles =
-            spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(20), default_hint());
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            10,
+            Duration::from_millis(20),
+            default_hint(),
+        );
 
         let (unit, _ack) = make_unit(0, b"hello");
         queue_tx.push(0, unit);
@@ -470,8 +477,15 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         // 60s deadline — flush must be triggered by disconnect, not timeout.
         let (shard_txs, batch_rxs) = make_shard_channels(1);
-        let handles =
-            spawn_workers(&queue_rx, shard_txs, 1, 1, 100, Duration::from_secs(60), default_hint());
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            100,
+            Duration::from_secs(60),
+            default_hint(),
+        );
 
         let (unit, _) = make_unit(0, b"pending");
         queue_tx.push(0, unit);
@@ -492,8 +506,15 @@ mod tests {
     fn spawn_workers_returns_correct_counts() {
         let (_queue_tx, queue_rx) = queue::new::<WorkUnit>(2);
         let (shard_txs, _batch_rxs) = make_shard_channels(3);
-        let handles =
-            spawn_workers(&queue_rx, shard_txs, 3, 2, 100, Duration::from_millis(10), default_hint());
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            3,
+            2,
+            100,
+            Duration::from_millis(10),
+            default_hint(),
+        );
         // shard channel count is set by the caller (3 in this case)
         assert_eq!(_batch_rxs.len(), 3);
         assert_eq!(handles.len(), 2);
@@ -508,8 +529,15 @@ mod tests {
     fn worker_exits_cleanly_after_disconnect() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (shard_txs, _batch_rxs) = make_shard_channels(1);
-        let handles =
-            spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(10), default_hint());
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            10,
+            Duration::from_millis(10),
+            default_hint(),
+        );
 
         drop(queue_tx);
         for h in handles {
