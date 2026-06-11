@@ -256,7 +256,7 @@ impl Sink for MySqlSink {
         let sql = self.build_insert_sql(batch.len());
         let params: Vec<mysql_async::Value> = batch
             .iter()
-            .map(|p| mysql_async::Value::Bytes(p.clone()))
+            .map(|p| mysql_async::Value::Bytes(p.to_vec()))
             .collect();
 
         let conn_fut = async {
@@ -320,6 +320,10 @@ impl Sink for MySqlSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn p(s: &'static [u8]) -> Payload {
+        Payload::from_static(s)
+    }
 
     fn cfg() -> MySqlSinkConfig {
         MySqlSinkConfig {
@@ -480,7 +484,7 @@ mod tests {
         c.url = "mysql://x:y@127.0.0.1:1/weir".into();
         c.timeout = Duration::from_secs(2);
         let sink = MySqlSink::new(c).unwrap();
-        let err = sink.commit(vec![b"hello".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"hello")]).await.unwrap_err();
         assert!(
             err.is_transient(),
             "connect-refused must be transient, got: {err}"
@@ -494,7 +498,7 @@ mod tests {
         c.url = "mysql://x:y@10.255.255.1:3306/weir".into();
         c.timeout = Duration::from_millis(50);
         let sink = MySqlSink::new(c).unwrap();
-        let err = sink.commit(vec![b"hello".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"hello")]).await.unwrap_err();
         assert!(matches!(err, SqlSinkError::Timeout { .. }), "got: {err}");
         assert!(err.is_transient());
         // Driver context survives into the Display string.

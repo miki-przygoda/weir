@@ -290,6 +290,10 @@ impl Sink for ClickHouseSink {
 mod tests {
     use super::*;
 
+    fn p(s: &'static [u8]) -> Payload {
+        Payload::from_static(s)
+    }
+
     // ── RowBinary ──────────────────────────────────────────────────────────
 
     #[test]
@@ -299,20 +303,20 @@ mod tests {
 
     #[test]
     fn rowbinary_single_short_payload() {
-        let out = encode_rowbinary(&[b"ab".to_vec()]);
+        let out = encode_rowbinary(&[p(b"ab")]);
         assert_eq!(out, vec![0x02, b'a', b'b']);
     }
 
     #[test]
     fn rowbinary_multi_payload_concatenates_rows() {
-        let out = encode_rowbinary(&[b"a".to_vec(), b"bc".to_vec()]);
+        let out = encode_rowbinary(&[p(b"a"), p(b"bc")]);
         assert_eq!(out, vec![0x01, b'a', 0x02, b'b', b'c']);
     }
 
     #[test]
     fn rowbinary_len_uses_multibyte_leb128_past_127() {
         // 200 = 0xC8 → LEB128 [0xC8, 0x01].
-        let payload = vec![0u8; 200];
+        let payload = Payload::from(vec![0u8; 200]);
         let out = encode_rowbinary(&[payload]);
         assert_eq!(&out[..2], &[0xC8, 0x01]);
         assert_eq!(out.len(), 2 + 200);
@@ -320,27 +324,27 @@ mod tests {
 
     #[test]
     fn rowbinary_handles_empty_payload() {
-        assert_eq!(encode_rowbinary(&[Vec::new()]), vec![0x00]);
+        assert_eq!(encode_rowbinary(&[Payload::new()]), vec![0x00]);
     }
 
     // ── Dedup token ────────────────────────────────────────────────────────
 
     #[test]
     fn dedup_token_is_deterministic() {
-        let b = vec![b"x".to_vec(), b"yy".to_vec()];
+        let b = vec![p(b"x"), p(b"yy")];
         assert_eq!(dedup_token(&b), dedup_token(&b));
     }
 
     #[test]
     fn dedup_token_changes_on_reorder() {
-        let a = vec![b"x".to_vec(), b"yy".to_vec()];
-        let b = vec![b"yy".to_vec(), b"x".to_vec()];
+        let a = vec![p(b"x"), p(b"yy")];
+        let b = vec![p(b"yy"), p(b"x")];
         assert_ne!(dedup_token(&a), dedup_token(&b));
     }
 
     #[test]
     fn dedup_token_is_64_hex_chars() {
-        let t = dedup_token(&[b"hello".to_vec()]);
+        let t = dedup_token(&[p(b"hello")]);
         assert_eq!(t.len(), 64);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
     }

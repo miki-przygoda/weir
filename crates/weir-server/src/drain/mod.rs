@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn commit_result_separates_committed_and_dead_lettered() {
-        let p = b"hello".to_vec();
+        let p: Payload = Payload::from(b"hello".as_ref());
         let result: CommitResult<Payload> = CommitResult {
             committed: vec![p.clone()],
             dead_lettered: vec![(p.clone(), "reason".into())],
@@ -906,8 +906,8 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([MockSink::ok(vec![
-            b"r1".to_vec(),
-            b"r2".to_vec(),
+            Payload::from(b"r1".as_ref()),
+            Payload::from(b"r2".as_ref()),
         ])]));
         let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
@@ -957,7 +957,7 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::Transient),
-            MockSink::ok(vec![b"data".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"data".as_ref())]),
         ]));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
@@ -1015,7 +1015,7 @@ mod tests {
         let mut responses: Vec<MockResult> = (0..=MAX_RETRIES)
             .map(|_| Err(MockError::Transient))
             .collect();
-        responses.push(MockSink::ok(vec![b"seg2".to_vec()]));
+        responses.push(MockSink::ok(vec![Payload::from(b"seg2".as_ref())]));
         let sink = Arc::new(MockSink::with_responses(responses));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
@@ -1075,8 +1075,8 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([MockSink::ok_with_dead_letter(
-            vec![b"ok_record".to_vec()],
-            vec![b"bad_record".to_vec()],
+            vec![Payload::from(b"ok_record".as_ref())],
+            vec![Payload::from(b"bad_record".as_ref())],
         )]));
         let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
@@ -1193,7 +1193,7 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::Permanent),
-            MockSink::ok(vec![b"record".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"record".as_ref())]),
         ]));
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
@@ -1285,7 +1285,7 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::Permanent),
-            MockSink::ok(vec![b"r".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"r".as_ref())]),
         ]));
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
@@ -1420,13 +1420,13 @@ mod tests {
 
         assert!(!dl_files.is_empty(), "dead-letter files must exist");
         for path in &dl_files {
-            let records: Vec<Vec<u8>> = crate::wab::SegmentReader::open(path)
+            let records: Vec<Payload> = crate::wab::SegmentReader::open(path)
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .expect("dead-letter records must have valid CRCs");
             assert_eq!(records.len(), 2);
-            assert_eq!(records[0], b"dead1");
-            assert_eq!(records[1], b"dead2");
+            assert_eq!(records[0], b"dead1" as &[u8]);
+            assert_eq!(records[1], b"dead2" as &[u8]);
         }
 
         std::fs::remove_dir_all(dir).ok();
@@ -1450,8 +1450,8 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([MockSink::ok_with_dead_letter(
-            vec![b"alpha".to_vec(), b"gamma".to_vec()],
-            vec![b"beta".to_vec()],
+            vec![Payload::from(b"alpha".as_ref()), Payload::from(b"gamma".as_ref())],
+            vec![Payload::from(b"beta".as_ref())],
         )]));
         let metrics = noop_metrics();
         run_drain(
@@ -1467,7 +1467,7 @@ mod tests {
         let dead_lettered = sink.dead_lettered_records();
         assert_eq!(committed, vec![b"alpha".to_vec(), b"gamma".to_vec()]);
         assert_eq!(dead_lettered.len(), 1);
-        assert_eq!(dead_lettered[0].0, b"beta".to_vec());
+        assert_eq!(dead_lettered[0].0, b"beta" as &[u8]);
 
         // Metric counts agree with the capture.
         assert_eq!(records_committed(&metrics), committed.len() as u64);
@@ -1512,7 +1512,7 @@ mod tests {
         const HINT: Duration = Duration::from_millis(75);
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::TransientWithRetryAfter(HINT)),
-            MockSink::ok(vec![b"hello".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"hello".as_ref())]),
         ]));
         let metrics = noop_metrics();
         run_drain(
@@ -1560,7 +1560,7 @@ mod tests {
             Err(MockError::Transient),
             Err(MockError::Transient),
             Err(MockError::Transient),
-            MockSink::ok(vec![b"r1".to_vec(), b"r2".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"r1".as_ref()), Payload::from(b"r2".as_ref())]),
         ]));
         let metrics = noop_metrics();
         run_drain(

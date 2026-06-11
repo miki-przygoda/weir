@@ -650,13 +650,13 @@ impl Iterator for SegmentReader {
         }
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        let mut payload = vec![0u8; payload_len];
-        if let Err(e) = self.reader.read_exact(&mut payload) {
+        let mut payload_buf = vec![0u8; payload_len];
+        if let Err(e) = self.reader.read_exact(&mut payload_buf) {
             self.done = true;
             return Some(Err(e));
         }
 
-        let computed_crc = crc32fast::hash(&payload);
+        let computed_crc = crc32fast::hash(&payload_buf);
         if expected_crc != computed_crc {
             self.done = true;
             return Some(Err(io::Error::new(
@@ -667,7 +667,8 @@ impl Iterator for SegmentReader {
             )));
         }
 
-        Some(Ok(payload))
+        // Freeze: O(1) ownership transfer from Vec allocation to Bytes.
+        Some(Ok(Payload::from(payload_buf)))
     }
 }
 
@@ -696,7 +697,7 @@ mod tests {
         }
         let sealed = seg.seal().unwrap();
 
-        let got: Vec<Vec<u8>> = SegmentReader::open(&sealed)
+        let got: Vec<Payload> = SegmentReader::open(&sealed)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

@@ -347,7 +347,7 @@ mod tests {
         (
             WorkUnit {
                 shard_id,
-                payload: payload.to_vec(),
+                payload: weir_core::Payload::copy_from_slice(payload),
                 durability: weir_core::Durability::Buffered,
                 ack_tx: tx,
                 #[cfg(feature = "bench-trace")]
@@ -385,7 +385,7 @@ mod tests {
             .expect("batch should arrive after deadline flush");
         assert_eq!(batch.shard_id, 0);
         assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.records[0].payload.as_slice(), b"hello");
+        assert_eq!(batch.records[0].payload.as_ref(), b"hello");
 
         drop(queue_tx);
         for h in handles {
@@ -433,7 +433,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("pending records should be flushed on disconnect");
         assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.records[0].payload.as_slice(), b"pending");
+        assert_eq!(batch.records[0].payload.as_ref(), b"pending");
 
         for h in handles {
             h.join().unwrap();
