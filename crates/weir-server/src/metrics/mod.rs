@@ -229,6 +229,21 @@ pub(crate) struct Metrics {
     /// not 0o600. Defense-in-depth signal for tampering or operator error.
     pub wab_unexpected_mode: Counter<u64, AtomicU64>,
 
+    // ── Per-stage latency (bench-trace only) ─────────────────────────────────
+    /// queue + coalesce wait: enqueue → worker flush. bench-trace only.
+    #[cfg(feature = "bench-trace")]
+    pub stage_queue: Histogram,
+    /// bridge hop + flusher recv wait: worker flush → flusher dequeue. bench-trace only.
+    /// This is where the Batched double-deadline anomaly will show up.
+    #[cfg(feature = "bench-trace")]
+    pub stage_bridge_wait: Histogram,
+    /// record write: flusher dequeue → write_record done (pre-fsync). bench-trace only.
+    #[cfg(feature = "bench-trace")]
+    pub stage_write: Histogram,
+    /// end-to-end server-side: enqueue → ack fired. bench-trace only.
+    #[cfg(feature = "bench-trace")]
+    pub stage_total: Histogram,
+
     // ── Dead letter / drain state ─────────────────────────────────────────────
     pub dead_letter_bytes_on_disk: Gauge<f64, AtomicU64>,
     /// Increments once per entry into `BlockedDeadLetterFull`, not once per wake cycle.
@@ -243,6 +258,14 @@ pub(crate) struct Metrics {
 
 /// Latency histogram buckets covering 1 ms–1 s; suitable for fsync and network round-trips.
 const LATENCY_BUCKETS: &[f64] = &[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+
+/// Finer buckets for the per-stage breakdown — queue/write stages are tens of
+/// microseconds, far below LATENCY_BUCKETS' 1 ms floor. Only used under bench-trace.
+#[cfg(feature = "bench-trace")]
+const STAGE_BUCKETS: &[f64] = &[
+    0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500,
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1,
+];
 
 impl Metrics {
     /// Creates all metrics, registers them with a fresh [`Registry`], and returns both.
@@ -411,6 +434,31 @@ impl Metrics {
              threshold (e.g. 300 s)."
         );
 
+        #[cfg(feature = "bench-trace")]
+        let stage_queue = reg!(
+            Histogram::new(STAGE_BUCKETS.iter().copied()),
+            "weir_stage_queue_seconds",
+            "Per-record queue + coalesce wait (enqueue → worker flush). bench-trace only."
+        );
+        #[cfg(feature = "bench-trace")]
+        let stage_bridge_wait = reg!(
+            Histogram::new(STAGE_BUCKETS.iter().copied()),
+            "weir_stage_bridge_wait_seconds",
+            "Per-record bridge hop + flusher recv wait (worker flush → flusher dequeue). bench-trace only."
+        );
+        #[cfg(feature = "bench-trace")]
+        let stage_write = reg!(
+            Histogram::new(STAGE_BUCKETS.iter().copied()),
+            "weir_stage_write_seconds",
+            "Per-record write time (flusher dequeue → write_record done, pre-fsync). bench-trace only."
+        );
+        #[cfg(feature = "bench-trace")]
+        let stage_total = reg!(
+            Histogram::new(STAGE_BUCKETS.iter().copied()),
+            "weir_stage_total_seconds",
+            "Per-record end-to-end server-side latency (enqueue → ack fired). bench-trace only."
+        );
+
         let metrics = Self {
             records_accepted,
             records_ack,
@@ -438,6 +486,14 @@ impl Metrics {
             dead_letter_full,
             drain_state,
             dead_letter_blocked_duration,
+            #[cfg(feature = "bench-trace")]
+            stage_queue,
+            #[cfg(feature = "bench-trace")]
+            stage_bridge_wait,
+            #[cfg(feature = "bench-trace")]
+            stage_write,
+            #[cfg(feature = "bench-trace")]
+            stage_total,
         };
 
         // Pre-initialise gauge families so all label combinations appear on the first scrape

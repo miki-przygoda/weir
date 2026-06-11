@@ -448,12 +448,38 @@ fn flush_batch(
     let mut batched_acks: Vec<oneshot::Sender<bool>> = Vec::new();
     let mut need_fsync = false;
 
+    // bench-trace: per-record (enqueued_at, worker_flushed_at) pairs for
+    // stage_total observation after the fsync. Cleared alongside sync/batched_acks.
+    #[cfg(feature = "bench-trace")]
+    let mut sync_ts: Vec<(Instant, Instant)> = Vec::new();
+    #[cfg(feature = "bench-trace")]
+    let mut batched_ts: Vec<(Instant, Instant)> = Vec::new();
+
     for record in batch.drain(..) {
+        // Capture flusher-received-at and observe queue + bridge_wait stages.
+        #[cfg(feature = "bench-trace")]
+        let flusher_recv_at = {
+            let now = Instant::now();
+            metrics
+                .stage_queue
+                .observe((record.worker_flushed_at - record.enqueued_at).as_secs_f64());
+            metrics
+                .stage_bridge_wait
+                .observe((now - record.worker_flushed_at).as_secs_f64());
+            now
+        };
+
         // write_record returns Some(sealed_path) when the segment rotated.
         let Ok(rotation) = writer.write_record(&record.payload) else {
             let _ = record.ack_tx.send(false);
             continue;
         };
+
+        // Observe the write stage (pre-fsync).
+        #[cfg(feature = "bench-trace")]
+        metrics
+            .stage_write
+            .observe(flusher_recv_at.elapsed().as_secs_f64());
 
         if let Some(sealed) = rotation {
             // Segment was sealed (seal includes fsync). Notify drain.
@@ -471,12 +497,21 @@ fn flush_batch(
             Durability::Sync => {
                 need_fsync = true;
                 sync_acks.push(record.ack_tx);
+                #[cfg(feature = "bench-trace")]
+                sync_ts.push((record.enqueued_at, record.worker_flushed_at));
             }
             Durability::Batched => {
                 need_fsync = true;
                 batched_acks.push(record.ack_tx);
+                #[cfg(feature = "bench-trace")]
+                batched_ts.push((record.enqueued_at, record.worker_flushed_at));
             }
             Durability::Buffered => {
+                // Observe stage_total for buffered records (ack fires immediately).
+                #[cfg(feature = "bench-trace")]
+                metrics
+                    .stage_total
+                    .observe(record.enqueued_at.elapsed().as_secs_f64());
                 let _ = record.ack_tx.send(true);
             }
         }
@@ -487,6 +522,13 @@ fn flush_batch(
     // both tiers' acks fire after it completes.
     if need_fsync {
         let ok = fsync_observed(writer, shard_id, metrics);
+        // Observe stage_total for Sync + Batched records (ack fires after fsync).
+        #[cfg(feature = "bench-trace")]
+        for (enqueued_at, _) in sync_ts.into_iter().chain(batched_ts) {
+            metrics
+                .stage_total
+                .observe(enqueued_at.elapsed().as_secs_f64());
+        }
         for ack_tx in sync_acks.into_iter().chain(batched_acks) {
             let _ = ack_tx.send(ok);
         }
