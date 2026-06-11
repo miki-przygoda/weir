@@ -2960,6 +2960,7 @@ dependencies = [
 name = "weir-core"
 version = "0.7.0"
 dependencies = [
+ "bytes",
  "crc32fast",
  "proptest",
 ]

@@ -2681,8 +2681,9 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "0.4.0"
+version = "0.7.0"
 dependencies = [
+ "bytes",
  "crc32fast",
 ]
 
@@ -2697,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "weir-server"
-version = "0.4.0"
+version = "0.7.0"
 dependencies = [
  "core_affinity",
  "crc32fast",
