@@ -82,9 +82,19 @@ fn emit_latency(scenario: &str, samples: usize, sorted_us: &[u64]) {
     };
     let mean = sorted_us.iter().sum::<u64>() / samples as u64;
     let min = sorted_us.first().copied().unwrap_or(0);
+    // Population stddev over sorted_us (integer µs).
+    let variance = sorted_us
+        .iter()
+        .map(|&v| {
+            let diff = v as i64 - mean as i64;
+            (diff * diff) as u64
+        })
+        .sum::<u64>()
+        / samples as u64;
+    let stddev_us = (variance as f64).sqrt() as u64;
     println!(
         "BENCH: {{\"scenario\":\"{scenario}\",\"samples\":{samples},\
-         \"min_us\":{min},\"mean_us\":{mean},\"p50_us\":{},\"p75_us\":{},\
+         \"min_us\":{min},\"mean_us\":{mean},\"stddev_us\":{stddev_us},\"p50_us\":{},\"p75_us\":{},\
          \"p95_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{}}}",
         p(50.0),
         p(75.0),
@@ -237,7 +247,7 @@ fn baseline_single_thread_throughput_sync() {
 /// Latency percentiles: single Sync producer, every push timed individually.
 #[test]
 fn baseline_latency_percentiles_sync() {
-    const SAMPLES: usize = 500;
+    const SAMPLES: usize = 2000;
     let srv = weir_server!("latency_sync").bench_preset().start();
     let mut client = srv.client();
 
@@ -255,7 +265,7 @@ fn baseline_latency_percentiles_sync() {
 /// Latency percentiles: single Batched producer.
 #[test]
 fn baseline_latency_percentiles_batched() {
-    const SAMPLES: usize = 500;
+    const SAMPLES: usize = 2000;
     let srv = weir_server!("latency_batched").bench_preset().start();
     let mut client = srv.client();
 
@@ -273,7 +283,7 @@ fn baseline_latency_percentiles_batched() {
 /// Latency percentiles: single Buffered producer.
 #[test]
 fn baseline_latency_percentiles_buffered() {
-    const SAMPLES: usize = 500;
+    const SAMPLES: usize = 2000;
     let srv = weir_server!("latency_buffered").bench_preset().start();
     let mut client = srv.client();
 

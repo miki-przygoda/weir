@@ -186,14 +186,15 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
 
     # ── Latency comparison ─────────────────────────────────────────────────
     LATENCY_FIELDS = [
-        ("min_us",   "Min"),
-        ("mean_us",  "Mean"),
-        ("p50_us",   "p50"),
-        ("p75_us",   "p75"),
-        ("p95_us",   "p95"),
-        ("p99_us",   "p99"),
-        ("p999_us",  "p99.9"),
-        ("max_us",   "Max"),
+        ("min_us",      "Min"),
+        ("mean_us",     "Mean"),
+        ("stddev_us",   "σ"),
+        ("p50_us",      "p50"),
+        ("p75_us",      "p75"),
+        ("p95_us",      "p95"),
+        ("p99_us",      "p99"),
+        ("p999_us",     "p99.9"),
+        ("max_us",      "Max"),
     ]
 
     lines += [""]
