@@ -389,7 +389,7 @@ impl Config {
         let shard_count = merge!(shard_count).unwrap_or(1);
         check_range("shard_count", shard_count, 1, 256)?;
 
-        let worker_count = merge!(worker_count).unwrap_or(2);
+        let worker_count = merge!(worker_count).unwrap_or(shard_count);
         check_range("worker_count", worker_count, 1, 64)?;
 
         // Defaults from docs/benchmarks/batch-tuning.md: (256, 1ms) is the sweet
@@ -813,7 +813,8 @@ mod tests {
         let dir = tmp_dir("defaults");
         let c = layers_with_wab(dir.clone()).unwrap();
         assert_eq!(c.shard_count, 1);
-        assert_eq!(c.worker_count, 2);
+        // worker_count defaults to shard_count (1 by default) — no idle worker.
+        assert_eq!(c.worker_count, 1);
         assert_eq!(c.batch_size, 256);
         assert_eq!(c.batch_deadline_ms, 1);
         assert_eq!(c.wab_segment_max_bytes, 256 * 1024 * 1024);
@@ -839,6 +840,32 @@ mod tests {
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
         assert_eq!(c.log_level, "info");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// When `worker_count` is not explicitly set, it defaults to the resolved
+    /// `shard_count`. This ensures there is no idle worker in the default
+    /// single-shard config, and that scaling shard_count automatically scales
+    /// the worker pool.
+    #[test]
+    fn worker_count_defaults_to_shard_count() {
+        let dir = tmp_dir("worker_follows_shard");
+        // shard_count=4, worker_count unset → resolved worker_count must be 4.
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(4),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.shard_count, 4);
+        assert_eq!(
+            c.worker_count, 4,
+            "worker_count should default to shard_count (4) when not explicitly set"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

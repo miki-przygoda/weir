@@ -10,7 +10,25 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
-## [Unreleased]
+## [Unreleased] — 0.8.0
+
+### Added
+
+- **Adaptive coalesce window (Stream E).** The worker's coalesce window is now
+  sized from an exponential moving average (alpha=1/4) of observed fsync
+  latency, fed back via a shared lock-free `Arc<AtomicU64>`. On fast local
+  NVMe (fsync ~150 µs) the window converges near the old fixed 200 µs value —
+  no change in local throughput. The win is on slower storage (cloud volumes,
+  spinning disks) where a fixed 200 µs window is too short and fragments
+  batches; throughput gain on slow storage is deferred to Linux/cloud-storage
+  validation. Window is clamped to [50 µs, 2 ms].
+
+### Changed
+
+- **`worker_count` now defaults to `shard_count`** instead of the hard-coded
+  `2`. In the default single-shard config this removes an idle worker thread.
+  The balanced invariant `worker_count == shard_count` is now the out-of-box
+  default; operators who explicitly set `worker_count` are unaffected.
 
 ### Added
 

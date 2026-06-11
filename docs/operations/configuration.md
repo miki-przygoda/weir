@@ -155,17 +155,23 @@ of thumb is `max(2, cores - 2) / 2`.
 #### `worker_count`
 
 - **Type**: usize
-- **Default**: `2`
+- **Default**: `shard_count` (same as the resolved `shard_count` value)
 - **Range**: 1–64
 - **CLI**: `--worker-count <n>`
 - **Env**: `WEIR_WORKER_COUNT`
 - **TOML**: `worker_count`
 
 Number of worker threads pulling from the global queue and batching
-records into per-shard bridge channels. Workers are stateless and
+records into per-shard batch channels. Workers are stateless and
 pinned at startup; they exist primarily to absorb tokio
 `spawn_blocking` slots without each spawn-blocking task fighting for a
 queue lock.
+
+The default was changed in 0.8.0 from the hard-coded `2` to `shard_count`.
+With the old default, the standard single-shard config had `worker_count=2`
+but only one shard, so worker 1 was permanently idle. Defaulting to
+`shard_count` removes the idle worker and keeps the balanced invariant
+(`worker_count == shard_count`) out of the box.
 
 **When to tune**: scale with `max_connections / 32` as a starting
 point. The bottleneck is rarely worker count itself; if records
