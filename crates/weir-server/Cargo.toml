@@ -1,8 +1,16 @@
 [features]
-default = []
+default = ["http-sink", "mysql-sink", "postgres-sink"]
+# HTTP sink: POSTs each record to a configurable URL.
+http-sink = ["dep:reqwest", "dep:sha2"]
+# MySQL sink: writes batches via multi-row INSERT.
+mysql-sink = ["dep:mysql_async", "_sql-sink"]
+# PostgreSQL sink: writes batches via multi-row INSERT.
+postgres-sink = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:rustls", "_sql-sink"]
+# Internal: the shared sql_common module used by mysql-sink + postgres-sink.
+_sql-sink = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:arc-swap", "dep:x509-parser"]
+tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:arc-swap", "dep:x509-parser", "dep:rustls"]
 
 [package]
 name = "weir-server"
@@ -11,13 +19,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["durability", "write-buffer", "wal", "daemon", "ingestion"]
+categories = ["database", "network-programming", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [[bin]]
 name = "weir-server"
 path = "src/main.rs"
 
 [dependencies]
-weir-core = { path = "../weir-core", version = "0.5.0" }
+weir-core = { path = "../weir-core", version = "0.6.0" }
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = [
@@ -49,24 +62,24 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "charset",
     "http2",
-] }
+], optional = true }
 # sha2 is used by HttpSink to compute Idempotency-Key headers so endpoints
 # can deduplicate retries that follow the drain's at-least-once contract.
 # RustCrypto pure-Rust SHA-2, no system dependency.
-sha2 = "0.10"
+sha2 = { version = "0.10", optional = true }
 # MySQL sink: async client with pooling. default-features = false drops
 # native-tls / flate2 / time-related features; we only need the connection,
 # the protocol, and rustls for TLS to production servers.
 mysql_async = { version = "0.34", default-features = false, features = [
     "minimal-rust",
     "rustls-tls",
-] }
+], optional = true }
 # Postgres sink: tokio-postgres + deadpool-postgres for connection pooling.
 # Mirrors the MySQL sink's pool-based connection model.
-tokio-postgres = "0.7"
+tokio-postgres = { version = "0.7", optional = true }
 deadpool-postgres = { version = "0.14", default-features = false, features = [
     "rt_tokio_1",
-] }
+], optional = true }
 # Postgres TLS connector — opt-in via the URL's `?sslmode=require` query
 # parameter. aws-lc-rs is already the workspace's crypto provider (via
 # reqwest's rustls and mysql_async); webpki-roots gives a bundled CA
@@ -76,19 +89,17 @@ deadpool-postgres = { version = "0.14", default-features = false, features = [
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = [
     "aws-lc-rs",
     "webpki-roots",
-] }
-# rustls and webpki-roots are already in the workspace transitively (via
-# reqwest, mysql_async, tokio-postgres-rustls). Naming them here as direct
-# deps lets postgres.rs construct the `ClientConfig` + `RootCertStore`
-# explicitly. Default features kept ON: rustls's defaults pull in
-# `aws_lc_rs` (the workspace crypto provider), `tls12`, `logging`,
-# `prefer-post-quantum`, and `std` — all desirable for a server binary.
-# default-features = false caused a "could not determine CryptoProvider"
-# panic at `ClientConfig::builder()` time because cargo's feature
-# unification across the multiple rustls dependents didn't carry
+], optional = true }
+# rustls is shared between postgres-sink (postgres.rs ClientConfig/RootCertStore)
+# and the tls feature (socket/tls.rs). Both feature entries list `dep:rustls`.
+# Default features kept ON: rustls's defaults pull in `aws_lc_rs` (the workspace
+# crypto provider), `tls12`, `logging`, `prefer-post-quantum`, and `std` — all
+# desirable for a server binary. default-features = false caused a "could not
+# determine CryptoProvider" panic at `ClientConfig::builder()` time because
+# cargo's feature unification across the multiple rustls dependents didn't carry
 # `aws_lc_rs` through to OUR builder call site.
-rustls = "0.23"
-webpki-roots = "1"
+rustls = { version = "0.23", optional = true }
+webpki-roots = { version = "1", optional = true }
 # TLS listener (feature = "tls"). tokio-rustls 0.26 tracks rustls 0.23.
 # Pinned to the aws-lc-rs crypto provider already used across the workspace.
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"], optional = true }

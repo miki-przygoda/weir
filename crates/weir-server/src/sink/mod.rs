@@ -1,17 +1,19 @@
 //! Sink trait, error contract, and built-in implementations.
 //!
-//! Built-in sinks:
-//! - [`noop::NoopSink`] — accepts all records, forwards nothing. The default
-//!   when `sink_type = "noop"`. Useful for soak-testing the daemon pipeline
-//!   without a real downstream.
-//! - [`http::HttpSink`] — POSTs each record to a configurable URL with
-//!   transient/permanent error classification. Use when `sink_type = "http"`.
-//! - [`mysql::MySqlSink`] — writes a whole batch with one multi-row
-//!   `INSERT` statement. The IOPS-compression sink: N records → 1 statement
-//!   → 1 server-side commit. Use when `sink_type = "mysql"`.
-//! - [`postgres::PostgresSink`] — Postgres counterpart to the MySQL sink.
-//!   Same multi-row INSERT shape, `ON CONFLICT DO NOTHING` in place of
-//!   `INSERT IGNORE` for idempotency. Use when `sink_type = "postgres"`.
+//! Built-in sinks (feature-gated — see crate `[features]`):
+//! - [`noop::NoopSink`] — always compiled; accepts all records, forwards
+//!   nothing. The default when `sink_type = "noop"`. Useful for soak-testing
+//!   the daemon pipeline without a real downstream.
+//! - [`http::HttpSink`] — feature `http-sink`; POSTs each record to a
+//!   configurable URL with transient/permanent error classification. Use when
+//!   `sink_type = "http"`.
+//! - [`mysql::MySqlSink`] — feature `mysql-sink`; writes a whole batch with
+//!   one multi-row `INSERT` statement. The IOPS-compression sink: N records →
+//!   1 statement → 1 server-side commit. Use when `sink_type = "mysql"`.
+//! - [`postgres::PostgresSink`] — feature `postgres-sink`; Postgres
+//!   counterpart to the MySQL sink. Same multi-row INSERT shape,
+//!   `ON CONFLICT DO NOTHING` in place of `INSERT IGNORE` for idempotency.
+//!   Use when `sink_type = "postgres"`.
 //!
 //! A `Sink` receives batches of records from the drain and commits them to a
 //! downstream store. Implementations decide their own connection management and
@@ -33,10 +35,14 @@
 //! `dyn Sink` with AFIT requires boxing the returned futures, which is left to the
 //! caller if they need type erasure.
 
+#[cfg(feature = "http-sink")]
 pub mod http;
+#[cfg(feature = "mysql-sink")]
 pub mod mysql;
 pub mod noop;
+#[cfg(feature = "postgres-sink")]
 pub mod postgres;
+#[cfg(feature = "_sql-sink")]
 mod sql_common;
 
 use weir_core::Payload;
@@ -93,7 +99,12 @@ pub struct CommitResult<R> {
 #[derive(Clone, Debug)]
 pub enum SinkHealth {
     Healthy,
+    // Returned by gated sinks (http/mysql/postgres) when they detect a
+    // partial or degraded downstream. Not used by NoopSink. Suppress the
+    // dead_code lint on noop-only builds rather than gating the variants.
+    #[allow(dead_code)]
     Degraded(String),
+    #[allow(dead_code)]
     Down(String),
 }
 

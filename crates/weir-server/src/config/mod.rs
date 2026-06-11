@@ -74,8 +74,11 @@ impl std::error::Error for ConfigError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkType {
     Noop,
+    #[cfg(feature = "http-sink")]
     Http,
+    #[cfg(feature = "mysql-sink")]
     Mysql,
+    #[cfg(feature = "postgres-sink")]
     Postgres,
 }
 
@@ -83,9 +86,33 @@ impl SinkType {
     fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
             "noop" => Ok(SinkType::Noop),
+            #[cfg(feature = "http-sink")]
             "http" => Ok(SinkType::Http),
+            #[cfg(not(feature = "http-sink"))]
+            "http" => Err(ConfigError::InvalidValue {
+                field: "sink_type",
+                reason: "sink_type 'http' requires the 'http-sink' feature; \
+                         this binary was built without it"
+                    .to_string(),
+            }),
+            #[cfg(feature = "mysql-sink")]
             "mysql" => Ok(SinkType::Mysql),
+            #[cfg(not(feature = "mysql-sink"))]
+            "mysql" => Err(ConfigError::InvalidValue {
+                field: "sink_type",
+                reason: "sink_type 'mysql' requires the 'mysql-sink' feature; \
+                         this binary was built without it"
+                    .to_string(),
+            }),
+            #[cfg(feature = "postgres-sink")]
             "postgres" => Ok(SinkType::Postgres),
+            #[cfg(not(feature = "postgres-sink"))]
+            "postgres" => Err(ConfigError::InvalidValue {
+                field: "sink_type",
+                reason: "sink_type 'postgres' requires the 'postgres-sink' feature; \
+                         this binary was built without it"
+                    .to_string(),
+            }),
             other => Err(ConfigError::InvalidValue {
                 field: "sink_type",
                 reason: format!(
@@ -103,6 +130,7 @@ impl SinkType {
 /// SQL); this function is the config-layer adapter that turns user-facing
 /// strings into that enum so the config doesn't have to maintain a parallel
 /// copy of the variants.
+#[cfg(feature = "mysql-sink")]
 fn parse_mysql_insert_mode(s: &str) -> Result<crate::sink::mysql::InsertMode, ConfigError> {
     use crate::sink::mysql::InsertMode;
     match s {
@@ -117,6 +145,7 @@ fn parse_mysql_insert_mode(s: &str) -> Result<crate::sink::mysql::InsertMode, Co
 
 /// Parses the `sink_postgres_insert_mode` config string into the sink-layer
 /// enum. Mirror of [`parse_mysql_insert_mode`] for the Postgres sink.
+#[cfg(feature = "postgres-sink")]
 fn parse_postgres_insert_mode(s: &str) -> Result<crate::sink::postgres::InsertMode, ConfigError> {
     use crate::sink::postgres::InsertMode;
     match s {
@@ -156,11 +185,17 @@ pub(crate) struct PartialConfig {
     pub sink_timeout_secs: Option<u64>,
     pub sink_max_batch_size: Option<usize>,
     pub sink_send_idempotency_key: Option<bool>,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: Option<String>,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_column: Option<String>,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_insert_mode: Option<String>,
+    #[cfg(feature = "postgres-sink")]
     pub sink_postgres_table: Option<String>,
+    #[cfg(feature = "postgres-sink")]
     pub sink_postgres_column: Option<String>,
+    #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: Option<String>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
@@ -228,15 +263,50 @@ pub struct Config {
     pub shutdown_timeout_secs: u64,
     pub connection_read_timeout_secs: u64,
     pub sink_type: SinkType,
+    // These four fields are only read by the non-noop sink arms in main.rs.
+    // When no non-noop sink feature is enabled they are dead code; suppress
+    // the lint so `cargo clippy -- -D warnings` stays clean on noop-only builds.
+    #[cfg_attr(
+        not(any(
+            feature = "http-sink",
+            feature = "mysql-sink",
+            feature = "postgres-sink"
+        )),
+        allow(dead_code)
+    )]
     pub sink_url: Option<String>,
+    #[cfg_attr(
+        not(any(
+            feature = "http-sink",
+            feature = "mysql-sink",
+            feature = "postgres-sink"
+        )),
+        allow(dead_code)
+    )]
     pub sink_timeout_secs: u64,
+    #[cfg_attr(
+        not(any(
+            feature = "http-sink",
+            feature = "mysql-sink",
+            feature = "postgres-sink"
+        )),
+        allow(dead_code)
+    )]
     pub sink_max_batch_size: usize,
+    // sink_send_idempotency_key is only consumed by the http-sink arm.
+    #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
     pub sink_send_idempotency_key: bool,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: String,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_column: String,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_insert_mode: crate::sink::mysql::InsertMode,
+    #[cfg(feature = "postgres-sink")]
     pub sink_postgres_table: String,
+    #[cfg(feature = "postgres-sink")]
     pub sink_postgres_column: String,
+    #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: crate::sink::postgres::InsertMode,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
@@ -395,22 +465,28 @@ impl Config {
         let sink_type = SinkType::parse(&sink_type_str)?;
 
         let sink_url = merge!(sink_url);
-        if matches!(
-            sink_type,
-            SinkType::Http | SinkType::Mysql | SinkType::Postgres
-        ) && sink_url.as_deref().unwrap_or("").is_empty()
-        {
+        // Validate that sink_url is set whenever a sink type that requires it
+        // is selected. Each check is guarded by the matching feature so the
+        // variant only exists when the feature is compiled in.
+        #[cfg(feature = "http-sink")]
+        if matches!(sink_type, SinkType::Http) && sink_url.as_deref().unwrap_or("").is_empty() {
             return Err(ConfigError::InvalidValue {
                 field: "sink_url",
-                reason: format!(
-                    "sink_url must be set when sink_type = {:?}",
-                    match sink_type {
-                        SinkType::Http => "http",
-                        SinkType::Mysql => "mysql",
-                        SinkType::Postgres => "postgres",
-                        SinkType::Noop => unreachable!(),
-                    }
-                ),
+                reason: "sink_url must be set when sink_type = \"http\"".to_string(),
+            });
+        }
+        #[cfg(feature = "mysql-sink")]
+        if matches!(sink_type, SinkType::Mysql) && sink_url.as_deref().unwrap_or("").is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_url",
+                reason: "sink_url must be set when sink_type = \"mysql\"".to_string(),
+            });
+        }
+        #[cfg(feature = "postgres-sink")]
+        if matches!(sink_type, SinkType::Postgres) && sink_url.as_deref().unwrap_or("").is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_url",
+                reason: "sink_url must be set when sink_type = \"postgres\"".to_string(),
             });
         }
 
@@ -428,23 +504,31 @@ impl Config {
         // MySQL sink: identifier validation happens inside MySqlSink::new at
         // startup (strict [A-Za-z_][A-Za-z0-9_]{0,63} rule, single source of
         // truth so future identifier-policy changes only touch one file).
+        #[cfg(feature = "mysql-sink")]
         let sink_mysql_table =
             merge!(sink_mysql_table).unwrap_or_else(|| "weir_records".to_string());
+        #[cfg(feature = "mysql-sink")]
         let sink_mysql_column = merge!(sink_mysql_column).unwrap_or_else(|| "payload".to_string());
+        #[cfg(feature = "mysql-sink")]
         let sink_mysql_insert_mode_str =
             merge!(sink_mysql_insert_mode).unwrap_or_else(|| "ignore".to_string());
+        #[cfg(feature = "mysql-sink")]
         let sink_mysql_insert_mode = parse_mysql_insert_mode(&sink_mysql_insert_mode_str)?;
 
         // Postgres sink: same identifier-validation story as MySQL; happens
         // inside PostgresSink::new at startup. Default insert mode is
         // `on_conflict_do_nothing` (idempotent under crash-recovery retries
         // when paired with a UNIQUE constraint).
+        #[cfg(feature = "postgres-sink")]
         let sink_postgres_table =
             merge!(sink_postgres_table).unwrap_or_else(|| "weir_records".to_string());
+        #[cfg(feature = "postgres-sink")]
         let sink_postgres_column =
             merge!(sink_postgres_column).unwrap_or_else(|| "payload".to_string());
+        #[cfg(feature = "postgres-sink")]
         let sink_postgres_insert_mode_str = merge!(sink_postgres_insert_mode)
             .unwrap_or_else(|| "on_conflict_do_nothing".to_string());
+        #[cfg(feature = "postgres-sink")]
         let sink_postgres_insert_mode = parse_postgres_insert_mode(&sink_postgres_insert_mode_str)?;
 
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
@@ -542,11 +626,17 @@ impl Config {
             sink_timeout_secs,
             sink_max_batch_size,
             sink_send_idempotency_key,
+            #[cfg(feature = "mysql-sink")]
             sink_mysql_table,
+            #[cfg(feature = "mysql-sink")]
             sink_mysql_column,
+            #[cfg(feature = "mysql-sink")]
             sink_mysql_insert_mode,
+            #[cfg(feature = "postgres-sink")]
             sink_postgres_table,
+            #[cfg(feature = "postgres-sink")]
             sink_postgres_column,
+            #[cfg(feature = "postgres-sink")]
             sink_postgres_insert_mode,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
@@ -688,8 +778,11 @@ mod tests {
         assert_eq!(c.sink_timeout_secs, 10);
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
+        #[cfg(feature = "mysql-sink")]
         assert_eq!(c.sink_mysql_table, "weir_records");
+        #[cfg(feature = "mysql-sink")]
         assert_eq!(c.sink_mysql_column, "payload");
+        #[cfg(feature = "mysql-sink")]
         assert_eq!(
             c.sink_mysql_insert_mode,
             crate::sink::mysql::InsertMode::Ignore
@@ -890,6 +983,7 @@ mod tests {
 
     // ── Sink: MySQL ───────────────────────────────────────────────────────────
 
+    #[cfg(feature = "mysql-sink")]
     #[test]
     fn sink_type_mysql_requires_url() {
         let dir = tmp_dir("mysql_no_url");
@@ -907,6 +1001,7 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(feature = "mysql-sink")]
     #[test]
     fn sink_type_mysql_accepts_url() {
         let dir = tmp_dir("mysql_url");
@@ -929,6 +1024,7 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(feature = "mysql-sink")]
     #[test]
     fn sink_mysql_insert_mode_parses() {
         for (input, expected) in [
@@ -953,6 +1049,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mysql-sink")]
     #[test]
     fn sink_mysql_insert_mode_rejects_garbage() {
         let dir = tmp_dir("mysql_bad_mode");
@@ -990,8 +1087,10 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("sink_type"), "{msg}");
-        // Error should mention all valid options so the operator knows their
-        // recourse without grepping source.
+        // The error message for a completely-unknown sink type always names
+        // all four backends regardless of which features are compiled in,
+        // because that arm fires only when the string doesn't match any of
+        // the known names (known names return feature-dependent errors).
         assert!(msg.contains("noop"), "{msg}");
         assert!(msg.contains("http"), "{msg}");
         assert!(msg.contains("mysql"), "{msg}");

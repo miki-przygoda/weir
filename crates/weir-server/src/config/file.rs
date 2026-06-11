@@ -33,11 +33,17 @@ struct RawServer {
     sink_timeout_secs: Option<u64>,
     sink_max_batch_size: Option<usize>,
     sink_send_idempotency_key: Option<bool>,
+    #[cfg(feature = "mysql-sink")]
     sink_mysql_table: Option<String>,
+    #[cfg(feature = "mysql-sink")]
     sink_mysql_column: Option<String>,
+    #[cfg(feature = "mysql-sink")]
     sink_mysql_insert_mode: Option<String>,
+    #[cfg(feature = "postgres-sink")]
     sink_postgres_table: Option<String>,
+    #[cfg(feature = "postgres-sink")]
     sink_postgres_column: Option<String>,
+    #[cfg(feature = "postgres-sink")]
     sink_postgres_insert_mode: Option<String>,
     dead_letter_max_bytes: Option<u64>,
     dead_letter_check_interval_secs: Option<u64>,
@@ -137,11 +143,17 @@ pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
         sink_timeout_secs: s.sink_timeout_secs,
         sink_max_batch_size: s.sink_max_batch_size,
         sink_send_idempotency_key: s.sink_send_idempotency_key,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_table: s.sink_mysql_table,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_column: s.sink_mysql_column,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_insert_mode: s.sink_mysql_insert_mode,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_table: s.sink_postgres_table,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_column: s.sink_postgres_column,
+        #[cfg(feature = "postgres-sink")]
         sink_postgres_insert_mode: s.sink_postgres_insert_mode,
         dead_letter_max_bytes: s.dead_letter_max_bytes,
         dead_letter_check_interval_secs: s.dead_letter_check_interval_secs,

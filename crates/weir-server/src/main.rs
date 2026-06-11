@@ -16,9 +16,12 @@ use tracing::info;
 use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
+#[cfg(feature = "http-sink")]
 use sink::http::{HttpSink, HttpSinkConfig};
+#[cfg(feature = "mysql-sink")]
 use sink::mysql::{MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
+#[cfg(feature = "postgres-sink")]
 use sink::postgres::{PostgresSink, PostgresSinkConfig};
 use wab::WabRecord;
 
@@ -242,6 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Arc::clone(&metrics),
             )
         }
+        #[cfg(feature = "http-sink")]
         SinkType::Http => {
             let url = config
                 .sink_url
@@ -273,6 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
         }
+        #[cfg(feature = "mysql-sink")]
         SinkType::Mysql => {
             let url = config
                 .sink_url
@@ -304,6 +309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
         }
+        #[cfg(feature = "postgres-sink")]
         SinkType::Postgres => {
             let url = config
                 .sink_url
