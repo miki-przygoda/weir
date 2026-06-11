@@ -71,6 +71,12 @@ pub struct DrainConfig {
     /// Maximum number of retry attempts per segment before the segment is left
     /// on disk and the drain advances to the next segment.
     pub max_retries: u32,
+    /// Hard upper bound on a single `Sink::commit` call. A backstop against a
+    /// sink that hangs without honouring its own internal timeout (notably
+    /// third-party sinks built on `weir-sink-sdk`, which carry no built-in
+    /// timeout). On elapse, the commit is treated as a transient error and the
+    /// segment is retried.
+    pub commit_timeout: Duration,
 }
 
 // ── Internal state machine types ──────────────────────────────────────────────
@@ -463,7 +469,29 @@ async fn commit_batch<S: Sink>(
         .collect();
 
     let t = std::time::Instant::now();
-    match sink.commit(records).await {
+    // Backstop timeout: a sink that hangs (e.g. a third-party sink with no
+    // internal timeout) must not stall the drain forever. On elapse, treat it
+    // as a transient error so the segment is retried.
+    let commit = match tokio::time::timeout(config.commit_timeout, sink.commit(records)).await {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            metrics
+                .sink_commit_duration
+                .observe(t.elapsed().as_secs_f64());
+            metrics
+                .sink_commit_records
+                .get_or_create(&OutcomeLabel {
+                    outcome: Outcome::retried,
+                })
+                .inc_by(payloads.len() as u64);
+            warn!(
+                timeout_secs = config.commit_timeout.as_secs(),
+                "drain: sink commit exceeded commit_timeout; treating as transient, retrying segment"
+            );
+            return BatchResult::Transient { retry_after: None };
+        }
+    };
+    match commit {
         Ok(commit_result) => {
             metrics
                 .sink_commit_duration
@@ -854,6 +882,7 @@ mod tests {
             dead_letter_check_interval: Duration::from_millis(10),
             base_retry_delay: Duration::from_millis(1),
             max_retries: MAX_RETRIES,
+            commit_timeout: Duration::from_secs(30),
         }
     }
 

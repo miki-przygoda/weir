@@ -226,6 +226,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dead_letter_check_interval: Duration::from_secs(config.dead_letter_check_interval_secs),
         base_retry_delay: Duration::from_millis(100),
         max_retries: MAX_RETRIES,
+        // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
+        // sink hangs without honouring its internal timeout.
+        commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
     };
     // Sink selection. drain::spawn is generic over the sink type but returns
     // the same JoinHandle<()> regardless, so both arms produce a uniform
