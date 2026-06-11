@@ -1,4 +1,11 @@
-use std::{thread, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
+    thread,
+    time::Duration,
+};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::warn;
@@ -12,6 +19,13 @@ use crate::{
 /// free for the OS scheduler and network interrupt handlers.
 const WORKER_CORE_START: usize = 2;
 
+/// Minimum coalesce window: never collapse to zero, ensuring there is always a
+/// brief drain period to catch stragglers in quiet single-producer scenarios.
+const COALESCE_MIN_US: u64 = 50;
+/// Maximum coalesce window: bounds the added latency on very slow storage so the
+/// daemon never holds a record for more than 2 ms beyond the batch boundary.
+const COALESCE_MAX_US: u64 = 2_000;
+
 /// Per-worker state. One `Worker` runs on one thread and holds independent
 /// per-shard batch buffers — no lock contention on the hot path.
 struct Worker {
@@ -21,15 +35,24 @@ struct Worker {
     batch_size: usize,
     /// One sender per shard, shared (cloned) across all worker threads.
     shard_txs: Vec<Sender<Batch>>,
+    /// Shared EWMA of fsync latency in microseconds. Read once per batch to
+    /// size the coalesce window. Updated by flusher threads after each fsync.
+    coalesce_hint: Arc<AtomicU64>,
 }
 
 impl Worker {
-    fn new(shard_count: usize, batch_size: usize, shard_txs: Vec<Sender<Batch>>) -> Self {
+    fn new(
+        shard_count: usize,
+        batch_size: usize,
+        shard_txs: Vec<Sender<Batch>>,
+        coalesce_hint: Arc<AtomicU64>,
+    ) -> Self {
         let buffers = pretouched_buffers(shard_count, batch_size);
         Worker {
             buffers,
             batch_size,
             shard_txs,
+            coalesce_hint,
         }
     }
 
@@ -51,16 +74,26 @@ impl Worker {
         //     sporadic; skip the coalesce window so we don't tax
         //     latency.
         //
-        // 200 μs covers the worst-case stagger of ~16 producers' next-
-        // cycle pushes after a 1 ms fsync. The recv_timeout loop EXTENDS
-        // each time a record arrives, so the wait collapses naturally
-        // once records stop coming.
-        const COALESCE_WINDOW: Duration = Duration::from_micros(200);
         let mut expect_concurrent = false;
 
         loop {
             match work_rx.recv_timeout(batch_deadline) {
                 Ok(unit) => {
+                    // Read the EWMA-derived coalesce window once per outer-loop
+                    // batch. Clamped to [50 µs, 2 ms] so the window can neither
+                    // collapse to nothing nor add unbounded latency.
+                    //
+                    // On fast local NVMe (fsync ~150 µs) this lands near the
+                    // old fixed 200 µs. The win shows on slower storage (cloud
+                    // volumes, spinning disks) where fsync latency is higher;
+                    // throughput gain on slow storage is deferred to
+                    // Linux/cloud validation.
+                    let window = Duration::from_micros(
+                        self.coalesce_hint
+                            .load(Relaxed)
+                            .clamp(COALESCE_MIN_US, COALESCE_MAX_US),
+                    );
+
                     let shard = (unit.shard_id as usize) % self.buffers.len();
                     self.buffers[shard].push(unit);
                     if self.buffers[shard].len() >= self.batch_size {
@@ -88,7 +121,7 @@ impl Worker {
                     // (large) set the flag.
                     if expect_concurrent {
                         while self.any_buffer_below_batch_size() {
-                            match work_rx.recv_timeout(COALESCE_WINDOW) {
+                            match work_rx.recv_timeout(window) {
                                 Ok(unit) => {
                                     total_drained += 1;
                                     let shard = (unit.shard_id as usize) % self.buffers.len();
@@ -188,6 +221,7 @@ pub fn spawn_workers(
     worker_count: usize,
     batch_size: usize,
     batch_deadline: Duration,
+    coalesce_hint: Arc<AtomicU64>,
 ) -> Vec<thread::JoinHandle<()>> {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
@@ -202,6 +236,7 @@ pub fn spawn_workers(
     for worker_idx in 0..worker_count {
         let work_rx = queue_rx.get(worker_idx);
         let txs = shard_txs.clone();
+        let hint = Arc::clone(&coalesce_hint);
         let core_id = if core_ids.is_empty() {
             None
         } else {
@@ -258,7 +293,7 @@ pub fn spawn_workers(
                 // ── Warmup ───────────────────────────────────────────────────
                 simd_warmup();
 
-                let worker = Worker::new(shard_count, batch_size, txs);
+                let worker = Worker::new(shard_count, batch_size, txs, hint);
                 worker.run(work_rx, batch_deadline);
             })
             .expect("failed to spawn worker thread");
@@ -371,11 +406,16 @@ mod tests {
         (txs, rxs)
     }
 
+    fn default_hint() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(200))
+    }
+
     #[test]
     fn single_worker_batches_on_deadline() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (shard_txs, batch_rxs) = make_shard_channels(1);
-        let handles = spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(20));
+        let handles =
+            spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(20), default_hint());
 
         let (unit, _ack) = make_unit(0, b"hello");
         queue_tx.push(0, unit);
@@ -406,6 +446,7 @@ mod tests {
             1,
             batch_size,
             Duration::from_secs(60),
+            default_hint(),
         );
 
         for _ in 0..batch_size {
@@ -429,7 +470,8 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         // 60s deadline — flush must be triggered by disconnect, not timeout.
         let (shard_txs, batch_rxs) = make_shard_channels(1);
-        let handles = spawn_workers(&queue_rx, shard_txs, 1, 1, 100, Duration::from_secs(60));
+        let handles =
+            spawn_workers(&queue_rx, shard_txs, 1, 1, 100, Duration::from_secs(60), default_hint());
 
         let (unit, _) = make_unit(0, b"pending");
         queue_tx.push(0, unit);
@@ -450,7 +492,8 @@ mod tests {
     fn spawn_workers_returns_correct_counts() {
         let (_queue_tx, queue_rx) = queue::new::<WorkUnit>(2);
         let (shard_txs, _batch_rxs) = make_shard_channels(3);
-        let handles = spawn_workers(&queue_rx, shard_txs, 3, 2, 100, Duration::from_millis(10));
+        let handles =
+            spawn_workers(&queue_rx, shard_txs, 3, 2, 100, Duration::from_millis(10), default_hint());
         // shard channel count is set by the caller (3 in this case)
         assert_eq!(_batch_rxs.len(), 3);
         assert_eq!(handles.len(), 2);
@@ -465,7 +508,8 @@ mod tests {
     fn worker_exits_cleanly_after_disconnect() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (shard_txs, _batch_rxs) = make_shard_channels(1);
-        let handles = spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(10));
+        let handles =
+            spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(10), default_hint());
 
         drop(queue_tx);
         for h in handles {
