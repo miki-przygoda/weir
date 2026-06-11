@@ -64,6 +64,29 @@ enum Command {
         #[arg(long)]
         wab_dir: PathBuf,
     },
+    /// Inspect and manage the dead-letter store.
+    #[command(subcommand)]
+    Dl(DlCommand),
+}
+
+/// Subcommands under `weir-ctl dl`.
+#[derive(Subcommand)]
+enum DlCommand {
+    /// List dead-letter segments (count + bytes).
+    List {
+        /// Path to the daemon's WAB directory.
+        #[arg(long)]
+        wab_dir: PathBuf,
+    },
+    /// Delete ALL dead-letter segments. Irreversible — defaults to a dry run.
+    Drop {
+        /// Path to the daemon's WAB directory.
+        #[arg(long)]
+        wab_dir: PathBuf,
+        /// Actually delete. Without this flag, prints what would be deleted.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn parse_durability(s: &str) -> Result<Durability, String> {
@@ -88,6 +111,10 @@ fn main() -> ExitCode {
         } => cmd_push(&socket, payload.as_bytes(), durability),
         Command::Metrics { addr, raw } => cmd_metrics(&addr, raw),
         Command::Segments { wab_dir } => cmd_segments(&wab_dir),
+        Command::Dl(dl) => match dl {
+            DlCommand::List { wab_dir } => cmd_dl_list(&wab_dir),
+            DlCommand::Drop { wab_dir, yes } => cmd_dl_drop(&wab_dir, yes),
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -251,6 +278,88 @@ fn fmt_bytes(b: u64) -> String {
     } else {
         format!("{b} B")
     }
+}
+
+// ── Dead-letter (`dl`) ──────────────────────────────────────────────────────────
+
+fn dead_letter_dir(wab_dir: &Path) -> PathBuf {
+    wab_dir.join("dead_letter")
+}
+
+/// Returns `(path, size)` for every `dl_*.wab` segment in the dead-letter dir,
+/// sorted by name. A missing dead-letter directory is treated as empty.
+fn dl_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
+    let entries = match std::fs::read_dir(dl_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", dl_dir.display())),
+    };
+    let mut out = Vec::new();
+    for f in entries.flatten() {
+        let p = f.path();
+        let is_dl = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("dl_") && n.ends_with(".wab"));
+        if p.is_file() && is_dl {
+            let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push((p, sz));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn cmd_dl_list(wab_dir: &Path) -> Result<(), String> {
+    let dl_dir = dead_letter_dir(wab_dir);
+    let segs = dl_segments(&dl_dir)?;
+    if segs.is_empty() {
+        println!("dead-letter store is empty ({})", dl_dir.display());
+        return Ok(());
+    }
+    println!("{:<26} {:>12}", "segment", "bytes");
+    let mut total = 0u64;
+    for (p, sz) in &segs {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        println!("{name:<26} {:>12}", fmt_bytes(*sz));
+        total += sz;
+    }
+    println!(
+        "{:<26} {:>12}",
+        format!("total ({})", segs.len()),
+        fmt_bytes(total)
+    );
+    Ok(())
+}
+
+fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
+    let dl_dir = dead_letter_dir(wab_dir);
+    let segs = dl_segments(&dl_dir)?;
+    if segs.is_empty() {
+        println!("dead-letter store is empty; nothing to drop");
+        return Ok(());
+    }
+    let total: u64 = segs.iter().map(|(_, s)| *s).sum();
+    if !yes {
+        println!(
+            "would delete {} dead-letter segment(s) ({}) under {}",
+            segs.len(),
+            fmt_bytes(total),
+            dl_dir.display()
+        );
+        println!("re-run with --yes to confirm — this is irreversible.");
+        return Ok(());
+    }
+    for (p, _) in &segs {
+        std::fs::remove_file(p).map_err(|e| format!("remove {}: {e}", p.display()))?;
+    }
+    println!(
+        "dropped {} dead-letter segment(s) ({})",
+        segs.len(),
+        fmt_bytes(total)
+    );
+    println!("note: if the daemon is running, restart it so its dead-letter accounting refreshes.");
+    Ok(())
 }
 
 /// Minimal HTTP/1.0 GET of `/metrics` — keeps weir-ctl free of an HTTP client
