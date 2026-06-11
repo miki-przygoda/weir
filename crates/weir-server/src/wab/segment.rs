@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::{self, IoSlice, Write},
     path::{Path, PathBuf},
 };
 
@@ -121,18 +121,33 @@ impl WabSegment {
         let len_bytes = payload_len.to_le_bytes();
         let crc_bytes = crc32.to_le_bytes();
 
-        // The three write_alls form one atomic logical record. If any one
-        // fails after another has written bytes, the OS file offset has
-        // advanced past stray bytes that the in-memory accounting below
-        // won't see — poison the segment so subsequent writes are refused.
-        if let Err(e) = self
-            .file
-            .write_all(&len_bytes)
-            .and_then(|_| self.file.write_all(&crc_bytes))
-            .and_then(|_| self.file.write_all(payload))
-        {
-            self.poisoned = true;
-            return Err(e);
+        // One vectored write (writev) instead of three separate write_all
+        // syscalls per record. `write_all_vectored` is still unstable, so we
+        // issue a single `write_vectored` and treat anything short of a full
+        // write the same way the old three-write sequence treated a mid-record
+        // failure: the OS file offset has advanced past stray bytes the
+        // in-memory accounting below won't see, so poison the segment. For a
+        // regular file a short writev essentially only occurs on ENOSPC, which
+        // is poison-worthy anyway.
+        let bufs = [
+            IoSlice::new(&len_bytes),
+            IoSlice::new(&crc_bytes),
+            IoSlice::new(payload),
+        ];
+        let total = len_bytes.len() + crc_bytes.len() + payload.len();
+        match self.file.write_vectored(&bufs) {
+            Ok(n) if n == total => {}
+            Ok(_) => {
+                self.poisoned = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short vectored write of WAB record",
+                ));
+            }
+            Err(e) => {
+                self.poisoned = true;
+                return Err(e);
+            }
         }
 
         self.file_crc_hasher.update(&len_bytes);
