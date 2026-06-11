@@ -3,29 +3,14 @@ use std::{thread, time::Duration};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::warn;
 
-use crate::{models::WorkUnit, queue::QueueReceiver};
+use crate::{
+    models::{Batch, WorkUnit},
+    queue::QueueReceiver,
+};
 
 /// Workers are pinned starting at this logical core index, leaving cores 0–1
 /// free for the OS scheduler and network interrupt handlers.
 const WORKER_CORE_START: usize = 2;
-
-/// A flushed batch of work units for one shard, ready for the WAB to consume.
-/// `ack_tx` inside each `WorkUnit` is carried intact; the WAB drain resolves
-/// it after the record is durably written.
-pub struct Batch {
-    /// Diagnostic tag — never read in production today, but the field is
-    /// set by every batch-producing path so a test can assert routing
-    /// correctness (`single_worker_batches_on_deadline` does) and a future
-    /// per-shard tracing/metric story has the data it needs without
-    /// re-plumbing. `#[expect(dead_code)]` won't work here because the test
-    /// compilation pass DOES read the field; using `#[allow]` so production
-    /// builds stay quiet and test builds don't trip `unfulfilled_lint_expectations`.
-    #[allow(dead_code)]
-    pub shard_id: u32,
-    pub records: Vec<WorkUnit>,
-    #[cfg(feature = "bench-trace")]
-    pub flushed_at: std::time::Instant,
-}
 
 /// Per-worker state. One `Worker` runs on one thread and holds independent
 /// per-shard batch buffers — no lock contention on the hot path.
@@ -191,27 +176,20 @@ impl Worker {
 /// guaranteed to reach the per-shard WAB writer ahead of any record acked
 /// later for the same shard, even across multiple concurrent connections.
 ///
-/// Returns one `Receiver<Batch>` per shard (consumed by the WAB drain) and
-/// one `JoinHandle` per worker. Workers exit cleanly when all `QueueSender`
-/// clones are dropped.
+/// Accepts `shard_txs`: one `Sender<Batch>` per shard, owned by the WAB
+/// (`wab::spawn` creates the channels and returns the senders via `WabHandle`).
+/// Workers send `Batch`es directly to the flusher — no intermediate bridge
+/// thread. Returns one `JoinHandle` per worker. Workers exit cleanly when all
+/// `QueueSender` clones are dropped.
 pub fn spawn_workers(
     queue_rx: &QueueReceiver<WorkUnit>,
+    shard_txs: Vec<Sender<Batch>>,
     shard_count: usize,
     worker_count: usize,
     batch_size: usize,
     batch_deadline: Duration,
-) -> (Vec<Receiver<Batch>>, Vec<thread::JoinHandle<()>>) {
+) -> Vec<thread::JoinHandle<()>> {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-
-    // Per-shard batch output channels. The capacity gives each worker room to
-    // queue several batches before back-pressure propagates to the queue.
-    let mut shard_txs: Vec<Sender<Batch>> = Vec::with_capacity(shard_count);
-    let mut shard_rxs: Vec<Receiver<Batch>> = Vec::with_capacity(shard_count);
-    for _ in 0..shard_count {
-        let (tx, rx) = crossbeam_channel::bounded(worker_count * 4);
-        shard_txs.push(tx);
-        shard_rxs.push(rx);
-    }
 
     assert_eq!(
         queue_rx.partitions(),
@@ -288,7 +266,7 @@ pub fn spawn_workers(
         handles.push(handle);
     }
 
-    (shard_rxs, handles)
+    handles
 }
 
 /// Allocates per-shard batch buffers and pre-touches their backing pages so
@@ -361,6 +339,7 @@ fn simd_warmup() {}
 mod tests {
     use super::*;
     use crate::queue;
+    use crossbeam_channel::Receiver;
     use tokio::sync::oneshot;
 
     fn make_unit(shard_id: u32, payload: &[u8]) -> (WorkUnit, oneshot::Receiver<bool>) {
@@ -378,10 +357,25 @@ mod tests {
         )
     }
 
+    /// Create a set of per-shard `(Sender<Batch>, Receiver<Batch>)` pairs for
+    /// tests. The test holds the receivers; the senders are passed to
+    /// `spawn_workers` (mirroring how `wab::spawn` owns them in production).
+    fn make_shard_channels(shard_count: usize) -> (Vec<Sender<Batch>>, Vec<Receiver<Batch>>) {
+        let mut txs = Vec::with_capacity(shard_count);
+        let mut rxs = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (tx, rx) = crossbeam_channel::bounded(64);
+            txs.push(tx);
+            rxs.push(rx);
+        }
+        (txs, rxs)
+    }
+
     #[test]
     fn single_worker_batches_on_deadline() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
-        let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(20));
+        let (shard_txs, batch_rxs) = make_shard_channels(1);
+        let handles = spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(20));
 
         let (unit, _ack) = make_unit(0, b"hello");
         queue_tx.push(0, unit);
@@ -404,8 +398,9 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let batch_size = 3;
         // 60s deadline — flush must be triggered by batch-full, not timeout.
-        let (batch_rxs, handles) =
-            spawn_workers(&queue_rx, 1, 1, batch_size, Duration::from_secs(60));
+        let (shard_txs, batch_rxs) = make_shard_channels(1);
+        let handles =
+            spawn_workers(&queue_rx, shard_txs, 1, 1, batch_size, Duration::from_secs(60));
 
         for _ in 0..batch_size {
             let (unit, _) = make_unit(0, b"x");
@@ -427,7 +422,8 @@ mod tests {
     fn pending_batches_flushed_on_sender_drop() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         // 60s deadline — flush must be triggered by disconnect, not timeout.
-        let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 100, Duration::from_secs(60));
+        let (shard_txs, batch_rxs) = make_shard_channels(1);
+        let handles = spawn_workers(&queue_rx, shard_txs, 1, 1, 100, Duration::from_secs(60));
 
         let (unit, _) = make_unit(0, b"pending");
         queue_tx.push(0, unit);
@@ -447,8 +443,10 @@ mod tests {
     #[test]
     fn spawn_workers_returns_correct_counts() {
         let (_queue_tx, queue_rx) = queue::new::<WorkUnit>(2);
-        let (batch_rxs, handles) = spawn_workers(&queue_rx, 3, 2, 100, Duration::from_millis(10));
-        assert_eq!(batch_rxs.len(), 3);
+        let (shard_txs, _batch_rxs) = make_shard_channels(3);
+        let handles = spawn_workers(&queue_rx, shard_txs, 3, 2, 100, Duration::from_millis(10));
+        // shard channel count is set by the caller (3 in this case)
+        assert_eq!(_batch_rxs.len(), 3);
         assert_eq!(handles.len(), 2);
 
         drop(_queue_tx);
@@ -460,7 +458,8 @@ mod tests {
     #[test]
     fn worker_exits_cleanly_after_disconnect() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
-        let (_batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(10));
+        let (shard_txs, _batch_rxs) = make_shard_channels(1);
+        let handles = spawn_workers(&queue_rx, shard_txs, 1, 1, 10, Duration::from_millis(10));
 
         drop(queue_tx);
         for h in handles {

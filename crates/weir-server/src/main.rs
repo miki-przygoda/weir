@@ -25,7 +25,6 @@ use sink::mysql::{MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
 #[cfg(feature = "postgres-sink")]
 use sink::postgres::{PostgresSink, PostgresSinkConfig};
-use wab::WabRecord;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -188,48 +187,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&metrics),
     )?;
 
-    // ── Workers (queue → per-shard Batch channels) ────────────────────────────
+    // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
+    //
+    // Workers send `Batch`es directly to the WAB flusher via the shard channels
+    // returned by `wab::spawn`. No bridge thread: the hop is
+    // worker → Batch-channel → flusher.
 
-    let (shard_batch_rxs, worker_handles) = worker::spawn_workers(
+    let worker_handles = worker::spawn_workers(
         &queue_rx,
+        wab_handle.shard_txs,
         config.shard_count,
         config.worker_count,
         config.batch_size,
         Duration::from_millis(config.batch_deadline_ms),
     );
-
-    // ── Bridge threads (Batch → WabRecord per shard) ──────────────────────────
-    //
-    // Each bridge thread converts WorkUnit fields directly — both sides share
-    // `tokio::sync::oneshot::Sender<bool>` for the ack channel.
-
-    let mut bridge_handles = Vec::with_capacity(config.shard_count);
-    for (batch_rx, wab_tx) in shard_batch_rxs.into_iter().zip(wab_handle.shard_txs) {
-        let handle = std::thread::Builder::new()
-            .name("weir-bridge".into())
-            .spawn(move || {
-                while let Ok(batch) = batch_rx.recv() {
-                    #[cfg(feature = "bench-trace")]
-                    let flushed_at = batch.flushed_at;
-                    for unit in batch.records {
-                        let record = WabRecord {
-                            payload: unit.payload,
-                            durability: unit.durability,
-                            ack_tx: unit.ack_tx,
-                            #[cfg(feature = "bench-trace")]
-                            enqueued_at: unit.enqueued_at,
-                            #[cfg(feature = "bench-trace")]
-                            worker_flushed_at: flushed_at,
-                        };
-                        if wab_tx.send(record).is_err() {
-                            return;
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn bridge thread");
-        bridge_handles.push(handle);
-    }
 
     // ── Drain ─────────────────────────────────────────────────────────────────
 
@@ -581,9 +552,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Graceful pipeline drain ───────────────────────────────────────────────
     //
     // queue_tx moved into socket::run and dropped when it returns.
-    // Workers observe Disconnected → flush remaining batches → exit.
-    // Bridge threads observe shard_rx Disconnected → exit → drop wab_tx.
-    // WAB flushers observe wab_rx Disconnected → seal segments → exit → drop drain_tx.
+    // Workers observe Disconnected → flush remaining Batches → drop shard_txs
+    //   clones → flusher Disconnected.
+    // WAB flushers observe Disconnected → seal segments → exit → drop drain_tx.
     // Drain thread observes drain_rx Disconnected → drains pending segments → exits.
     //
     // The queue-depth background task holds a `queue_tx.clone()`. Dropping the
@@ -594,9 +565,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("socket layer shut down; waiting for pipeline to drain");
 
     for h in worker_handles {
-        h.join().ok();
-    }
-    for h in bridge_handles {
         h.join().ok();
     }
     for h in wab_handle.join_handles {

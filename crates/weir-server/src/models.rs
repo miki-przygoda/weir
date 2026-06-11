@@ -23,3 +23,22 @@ pub struct WorkUnit {
     #[cfg(feature = "bench-trace")]
     pub enqueued_at: std::time::Instant,
 }
+
+/// A flushed batch of work units for one shard, ready for the WAB to consume.
+/// `ack_tx` inside each `WorkUnit` is carried intact; the WAB flusher resolves
+/// it after the record is durably written.
+pub struct Batch {
+    /// Diagnostic tag — never read in production today, but the field is
+    /// set by every batch-producing path so a test can assert routing
+    /// correctness and a future per-shard tracing/metric story has the data
+    /// it needs without re-plumbing. `#[allow(dead_code)]` so production
+    /// builds stay quiet and test builds don't trip lint expectations.
+    #[allow(dead_code)]
+    pub shard_id: u32,
+    pub records: Vec<WorkUnit>,
+    /// Wall-clock instant the worker flushed this batch. Present only under
+    /// `bench-trace`; used by the WAB flusher to attribute the worker-flush →
+    /// flusher-dequeue (`bridge_wait`) stage delta.
+    #[cfg(feature = "bench-trace")]
+    pub flushed_at: std::time::Instant,
+}

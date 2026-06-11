@@ -16,24 +16,11 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
+use crate::models::Batch;
 use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::ShardWriter;
 use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
-
-/// A record queued by a connection handler for writing to the WAB.
-pub struct WabRecord {
-    pub payload: Payload,
-    pub durability: Durability,
-    /// Per-request ack channel. The flusher sends `true` after the record is
-    /// durably written according to the requested tier, or `false` on an
-    /// unrecoverable write failure.
-    pub ack_tx: oneshot::Sender<bool>,
-    #[cfg(feature = "bench-trace")]
-    pub enqueued_at: std::time::Instant,
-    #[cfg(feature = "bench-trace")]
-    pub worker_flushed_at: std::time::Instant,
-}
 
 /// Configuration for the WAB subsystem.
 pub struct WabConfig {
@@ -66,7 +53,7 @@ impl Default for WabConfig {
 /// segments to be sealed.
 pub struct WabHandle {
     /// One sender per shard. Drop all of them to signal shutdown.
-    pub shard_txs: Vec<Sender<WabRecord>>,
+    pub shard_txs: Vec<Sender<Batch>>,
     pub join_handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -221,7 +208,7 @@ pub fn spawn(
     let mut join_handles = Vec::with_capacity(config.shard_count);
 
     for shard_id in 0..config.shard_count {
-        let (tx, rx) = crossbeam_channel::bounded::<WabRecord>(config.batch_size * 4);
+        let (tx, rx) = crossbeam_channel::bounded::<Batch>(config.batch_size * 4);
         shard_txs.push(tx);
 
         let sdir = shard_dir_path(&wab_dir, shard_id);
@@ -240,9 +227,9 @@ pub fn spawn(
                 // panic inside `catch_unwind` doesn't drop them. The body
                 // factory clones the channel / Arc / PathBuf handles for
                 // each attempt — channel clones share the same queue, so
-                // records buffered in the bounded WabRecord queue survive
-                // a flusher panic and are drained by the respawned
-                // flusher in the same order.
+                // Batches buffered in the bounded queue survive a flusher
+                // panic and are drained by the respawned flusher in the
+                // same order.
                 run_with_panic_supervision(shard_id, metrics_for_panic, || {
                     let sdir = sdir.clone();
                     let rx = rx.clone();
@@ -333,7 +320,7 @@ fn read_segment_record_count(path: &Path) -> io::Result<u64> {
 fn flusher_thread(
     shard_id: u16,
     shard_dir: PathBuf,
-    work_rx: Receiver<WabRecord>,
+    work_rx: Receiver<Batch>,
     drain_tx: Sender<PathBuf>,
     batch_size: usize,
     batch_deadline: Duration,
@@ -381,30 +368,44 @@ fn flusher_thread(
 
     info!(shard = shard_id, "WAB flusher started");
 
-    let mut batch: Vec<WabRecord> = Vec::with_capacity(batch_size);
+    // Accumulate multiple Batches per fsync to preserve cross-batch coalescing.
+    // record_count tracks the total records accumulated so we stop draining once
+    // we reach batch_size (bounding memory and latency under very high load).
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut record_count = 0usize;
 
     loop {
-        // Block on the first record of the batch (or detect channel close).
+        // Block on the first Batch (or detect channel close / deadline).
         match work_rx.recv_timeout(batch_deadline) {
-            Ok(record) => batch.push(record),
+            Ok(batch) => {
+                record_count += batch.records.len();
+                batches.push(batch);
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if !batch.is_empty() {
-                    flush_batch(&mut writer, &mut batch, &drain_tx, shard_id, &metrics);
+                if !batches.is_empty() {
+                    flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics);
+                    record_count = 0;
                 }
                 continue;
             }
         }
 
-        // Drain any additional available records up to batch_size.
-        while batch.len() < batch_size {
+        // Drain any additional available Batches up to batch_size records total.
+        // Using try_recv (non-blocking) preserves today's coalescing without
+        // introducing a second timed wait.
+        while record_count < batch_size {
             match work_rx.try_recv() {
-                Ok(record) => batch.push(record),
+                Ok(batch) => {
+                    record_count += batch.records.len();
+                    batches.push(batch);
+                }
                 Err(_) => break,
             }
         }
 
-        flush_batch(&mut writer, &mut batch, &drain_tx, shard_id, &metrics);
+        flush_batch(&mut writer, &mut batches, &drain_tx, shard_id, &metrics);
+        record_count = 0;
     }
 
     // Graceful shutdown: seal the active segment and send to drain.
@@ -433,7 +434,7 @@ fn flusher_thread(
 
 fn flush_batch(
     writer: &mut ShardWriter,
-    batch: &mut Vec<WabRecord>,
+    batches: &mut Vec<Batch>,
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
     metrics: &Arc<Metrics>,
@@ -448,71 +449,78 @@ fn flush_batch(
     let mut batched_acks: Vec<oneshot::Sender<bool>> = Vec::new();
     let mut need_fsync = false;
 
-    // bench-trace: per-record (enqueued_at, worker_flushed_at) pairs for
-    // stage_total observation after the fsync. Cleared alongside sync/batched_acks.
+    // bench-trace: per-record enqueued_at for stage_total observation after
+    // the fsync. Cleared alongside sync/batched_acks.
     #[cfg(feature = "bench-trace")]
-    let mut sync_ts: Vec<(Instant, Instant)> = Vec::new();
+    let mut sync_ts: Vec<Instant> = Vec::new();
     #[cfg(feature = "bench-trace")]
-    let mut batched_ts: Vec<(Instant, Instant)> = Vec::new();
+    let mut batched_ts: Vec<Instant> = Vec::new();
 
-    for record in batch.drain(..) {
-        // Capture flusher-received-at and observe queue + bridge_wait stages.
+    for batch in batches.drain(..) {
+        // worker_flushed_at is the instant the worker stamped the Batch.
+        // All records in this Batch share the same stamp.
         #[cfg(feature = "bench-trace")]
-        let flusher_recv_at = {
-            let now = Instant::now();
-            metrics
-                .stage_queue
-                .observe((record.worker_flushed_at - record.enqueued_at).as_secs_f64());
-            metrics
-                .stage_bridge_wait
-                .observe((now - record.worker_flushed_at).as_secs_f64());
-            now
-        };
+        let worker_flushed_at = batch.flushed_at;
 
-        // write_record returns Some(sealed_path) when the segment rotated.
-        let Ok(rotation) = writer.write_record(&record.payload) else {
-            let _ = record.ack_tx.send(false);
-            continue;
-        };
-
-        // Observe the write stage (pre-fsync).
-        #[cfg(feature = "bench-trace")]
-        metrics
-            .stage_write
-            .observe(flusher_recv_at.elapsed().as_secs_f64());
-
-        if let Some(sealed) = rotation {
-            // Segment was sealed (seal includes fsync). Notify drain.
-            info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
-            metrics
-                .wab_segments
-                .get_or_create(&SegmentStateLabel {
-                    state: SegmentState::sealed,
-                })
-                .inc();
-            drain_tx.send(sealed).ok();
-        }
-
-        match record.durability {
-            Durability::Sync => {
-                need_fsync = true;
-                sync_acks.push(record.ack_tx);
-                #[cfg(feature = "bench-trace")]
-                sync_ts.push((record.enqueued_at, record.worker_flushed_at));
-            }
-            Durability::Batched => {
-                need_fsync = true;
-                batched_acks.push(record.ack_tx);
-                #[cfg(feature = "bench-trace")]
-                batched_ts.push((record.enqueued_at, record.worker_flushed_at));
-            }
-            Durability::Buffered => {
-                // Observe stage_total for buffered records (ack fires immediately).
-                #[cfg(feature = "bench-trace")]
+        for unit in batch.records {
+            // Capture flusher-received-at and observe queue + bridge_wait stages.
+            #[cfg(feature = "bench-trace")]
+            let flusher_recv_at = {
+                let now = Instant::now();
                 metrics
-                    .stage_total
-                    .observe(record.enqueued_at.elapsed().as_secs_f64());
-                let _ = record.ack_tx.send(true);
+                    .stage_queue
+                    .observe((worker_flushed_at - unit.enqueued_at).as_secs_f64());
+                metrics
+                    .stage_bridge_wait
+                    .observe((now - worker_flushed_at).as_secs_f64());
+                now
+            };
+
+            // write_record returns Some(sealed_path) when the segment rotated.
+            let Ok(rotation) = writer.write_record(&unit.payload) else {
+                let _ = unit.ack_tx.send(false);
+                continue;
+            };
+
+            // Observe the write stage (pre-fsync).
+            #[cfg(feature = "bench-trace")]
+            metrics
+                .stage_write
+                .observe(flusher_recv_at.elapsed().as_secs_f64());
+
+            if let Some(sealed) = rotation {
+                // Segment was sealed (seal includes fsync). Notify drain.
+                info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
+                metrics
+                    .wab_segments
+                    .get_or_create(&SegmentStateLabel {
+                        state: SegmentState::sealed,
+                    })
+                    .inc();
+                drain_tx.send(sealed).ok();
+            }
+
+            match unit.durability {
+                Durability::Sync => {
+                    need_fsync = true;
+                    sync_acks.push(unit.ack_tx);
+                    #[cfg(feature = "bench-trace")]
+                    sync_ts.push(unit.enqueued_at);
+                }
+                Durability::Batched => {
+                    need_fsync = true;
+                    batched_acks.push(unit.ack_tx);
+                    #[cfg(feature = "bench-trace")]
+                    batched_ts.push(unit.enqueued_at);
+                }
+                Durability::Buffered => {
+                    // Observe stage_total for buffered records (ack fires immediately).
+                    #[cfg(feature = "bench-trace")]
+                    metrics
+                        .stage_total
+                        .observe(unit.enqueued_at.elapsed().as_secs_f64());
+                    let _ = unit.ack_tx.send(true);
+                }
             }
         }
     }
@@ -524,7 +532,7 @@ fn flush_batch(
         let ok = fsync_observed(writer, shard_id, metrics);
         // Observe stage_total for Sync + Batched records (ack fires after fsync).
         #[cfg(feature = "bench-trace")]
-        for (enqueued_at, _) in sync_ts.into_iter().chain(batched_ts) {
+        for enqueued_at in sync_ts.into_iter().chain(batched_ts) {
             metrics
                 .stage_total
                 .observe(enqueued_at.elapsed().as_secs_f64());
