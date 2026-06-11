@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/weir-core",
+    "crates/weir-sink-sdk",
     "crates/weir-server",
     "crates/weir-client",
     "crates/weir-ctl",

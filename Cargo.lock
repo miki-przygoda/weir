@@ -3126,8 +3126,16 @@ dependencies = [
  "webpki-roots 1.0.7",
  "weir-client",
  "weir-core",
+ "weir-sink-sdk",
  "weir-testkit",
  "x509-parser",
+]
+
+[[package]]
+name = "weir-sink-sdk"
+version = "0.8.0"
+dependencies = [
+ "weir-core",
 ]
 
 [[package]]
