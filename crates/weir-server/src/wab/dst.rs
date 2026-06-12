@@ -26,10 +26,12 @@
 #![allow(dead_code)]
 
 use std::{
+    cell::RefCell,
+    collections::HashSet,
     io,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
     },
     time::{Duration, Instant},
@@ -67,10 +69,37 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
-    /// A seed-derived payload of 1..=64 bytes.
-    fn payload(&mut self) -> Vec<u8> {
-        let len = (self.next_u64() % 64 + 1) as usize;
-        (0..len).map(|_| (self.next_u64() & 0xFF) as u8).collect()
+    /// A seed-derived payload whose first 8 bytes are `index` (big-endian), so
+    /// every record in a run is unique — the durability [`Ledger`] keys on the
+    /// payload bytes, and the recovery checks compare payloads directly.
+    fn unique_payload(&mut self, index: u64) -> Vec<u8> {
+        let mut payload = index.to_be_bytes().to_vec();
+        let tail = (self.next_u64() % 56) as usize;
+        payload.extend((0..tail).map(|_| (self.next_u64() & 0xFF) as u8));
+        payload
+    }
+}
+
+// ── Durability ledger ───────────────────────────────────────────────────────
+
+/// Records which payloads have actually reached stable storage. A
+/// [`SimSegmentHandle`] accumulates the payloads written to it and moves them
+/// here the instant a real `fsync` (or seal) succeeds; a segment dropped before
+/// its fsync (a mid-batch write error) never marks its records durable. The
+/// oracle then checks the core durability invariant: **no record is acked
+/// `true` unless it is in this set.**
+#[derive(Clone, Default)]
+struct Ledger {
+    durable: Arc<Mutex<HashSet<Vec<u8>>>>,
+}
+
+impl Ledger {
+    fn mark_durable(&self, payloads: impl IntoIterator<Item = Vec<u8>>) {
+        self.durable.lock().unwrap().extend(payloads);
+    }
+
+    fn is_durable(&self, payload: &[u8]) -> bool {
+        self.durable.lock().unwrap().contains(payload)
     }
 }
 
@@ -169,11 +198,12 @@ impl SimFaults {
 /// reader run unmodified against the resulting on-disk state.
 pub struct SimSegmentStore {
     faults: Arc<SimFaults>,
+    ledger: Ledger,
 }
 
 impl SimSegmentStore {
-    fn new(faults: Arc<SimFaults>) -> Self {
-        SimSegmentStore { faults }
+    fn new(faults: Arc<SimFaults>, ledger: Ledger) -> Self {
+        SimSegmentStore { faults, ledger }
     }
 }
 
@@ -183,6 +213,8 @@ impl SegmentStore for SimSegmentStore {
         Ok(Box::new(SimSegmentHandle {
             inner,
             faults: Arc::clone(&self.faults),
+            ledger: self.ledger.clone(),
+            pending: RefCell::new(Vec::new()),
         }))
     }
 
@@ -195,11 +227,19 @@ impl SegmentStore for SimSegmentStore {
 struct SimSegmentHandle {
     inner: WabSegment,
     faults: Arc<SimFaults>,
+    ledger: Ledger,
+    /// Payloads written to this segment but not yet fsynced. On a successful
+    /// fsync/seal they move to the [`Ledger`]; if the segment is dropped first
+    /// (a mid-batch write error drops it from `ShardWriter`), they never do —
+    /// which is exactly the data that a crash would lose.
+    pending: RefCell<Vec<Vec<u8>>>,
 }
 
 impl SegmentHandle for SimSegmentHandle {
     fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
-        self.inner.write_record(payload)
+        self.inner.write_record(payload)?;
+        self.pending.borrow_mut().push(payload.to_vec());
+        Ok(())
     }
 
     fn fsync(&self) -> io::Result<()> {
@@ -208,7 +248,11 @@ impl SegmentHandle for SimSegmentHandle {
             self.faults.fsync_failed.store(true, SeqCst);
             return Err(io::Error::other("DST: injected EIO on fdatasync"));
         }
-        self.inner.fsync()
+        self.inner.fsync()?;
+        // The barrier succeeded — everything written so far is now durable.
+        self.ledger
+            .mark_durable(self.pending.borrow_mut().drain(..));
+        Ok(())
     }
 
     fn should_rotate(&self, max_bytes: u64) -> bool {
@@ -216,18 +260,27 @@ impl SegmentHandle for SimSegmentHandle {
     }
 
     fn seal(self: Box<Self>) -> io::Result<PathBuf> {
-        let SimSegmentHandle { inner, faults } = *self;
+        let SimSegmentHandle {
+            inner,
+            faults,
+            ledger,
+            pending,
+        } = *self;
         if faults.rename_fails.load(SeqCst) {
             // Durably finalise (sentinel + footer + fsync) but never rename:
             // the segment is left fully formed at its `.wab` path, exactly as a
             // crash between sync_all and rename would leave it. Recovery
-            // re-seals it via the sentinel branch in `recover_segment`.
-            let _durable = inner.finalize_to_disk()?;
+            // re-seals it via the sentinel branch in `recover_segment`. The data
+            // IS synced, so its records are durable despite the failed rename.
+            inner.finalize_to_disk()?;
+            ledger.mark_durable(pending.into_inner());
             return Err(io::Error::other(
                 "DST: injected crash between fsync and rename",
             ));
         }
-        inner.seal()
+        let sealed = inner.seal()?;
+        ledger.mark_durable(pending.into_inner());
+        Ok(sealed)
     }
 }
 
@@ -423,7 +476,11 @@ fn read_sealed_payloads(shard_dir: &Path) -> Vec<Vec<u8>> {
 fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
     let env = SimEnv::new("sync_flush");
     let sim_faults = SimFaults::from_faults(faults);
-    let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(Arc::clone(&sim_faults)));
+    let ledger = Ledger::default();
+    let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(
+        Arc::clone(&sim_faults),
+        ledger.clone(),
+    ));
     let clock = SimClock::new();
 
     let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(records.max(1) * 4);
@@ -431,12 +488,15 @@ fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
     let coalesce_hint = Arc::new(AtomicU64::new(200));
 
     let mut rng = SplitMix64::new(seed);
+    let mut payloads = Vec::with_capacity(records);
     let mut ack_rxs = Vec::with_capacity(records);
     let mut units = Vec::with_capacity(records);
-    for _ in 0..records {
+    for i in 0..records {
+        let payload = rng.unique_payload(i as u64);
         let (ack_tx, ack_rx) = oneshot::channel();
         ack_rxs.push(ack_rx);
-        units.push(make_unit(rng.payload(), Durability::Sync, ack_tx));
+        units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+        payloads.push(payload);
     }
     work_tx.send(make_batch(units)).expect("send batch");
     drop(work_tx); // flusher drains the one batch then exits
@@ -472,9 +532,15 @@ fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
         .collect();
 
     let fsync_failed = sim_faults.any_fsync_failed();
-    // I1 — Sync-ack durability: a failed covering fsync must produce no true ack.
-    if fsync_failed {
-        assert_invariant(seed, "i1_no_false_sync_ack", acks.iter().all(|&ok| !ok));
+    // I1 — durability causality: a record acked `true` must have actually
+    // reached stable storage (be in the ledger). This subsumes the simple
+    // "EIO ⇒ all Nacked" check and catches mid-batch false-ack windows, where a
+    // record acked off one segment's fsync was written to a *different* segment
+    // that was dropped without a sync.
+    for (payload, &acked) in payloads.iter().zip(&acks) {
+        if acked {
+            assert_invariant(seed, "i1_acked_true_is_durable", ledger.is_durable(payload));
+        }
     }
 
     env.cleanup();
@@ -492,7 +558,9 @@ fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
 fn run_crash_before_rename(seed: u64, faults: &[Fault], records: usize) -> SimReport {
     let env = SimEnv::new("crash_rename");
     let sim_faults = SimFaults::from_faults(faults);
-    let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(Arc::clone(&sim_faults)));
+    let ledger = Ledger::default();
+    let store: Arc<dyn SegmentStore> =
+        Arc::new(SimSegmentStore::new(Arc::clone(&sim_faults), ledger));
     let shard_dir = env.shard_dir(0);
 
     let mut writer = ShardWriter::new_with_store(
@@ -505,8 +573,8 @@ fn run_crash_before_rename(seed: u64, faults: &[Fault], records: usize) -> SimRe
 
     let mut rng = SplitMix64::new(seed);
     let mut written = Vec::with_capacity(records);
-    for _ in 0..records {
-        let payload = rng.payload();
+    for i in 0..records {
+        let payload = rng.unique_payload(i as u64);
         writer.write_record(&payload).expect("write_record");
         written.push(payload);
     }
