@@ -1,4 +1,6 @@
 pub mod clock;
+#[cfg(any(test, feature = "dst"))]
+pub mod dst;
 pub mod format;
 pub mod recovery;
 pub mod segment;

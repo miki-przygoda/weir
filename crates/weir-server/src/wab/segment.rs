@@ -199,12 +199,18 @@ impl WabSegment {
         self.record_count
     }
 
-    /// Seals the segment: writes sentinel + footer, fsyncs, and atomically renames
-    /// the file from `.wab` to `.wab.sealed`.
+    /// Writes the sentinel + footer and fsyncs, making every prior record
+    /// durable at the segment's `.wab` path. Returns that (still-`.wab`) path.
     ///
-    /// Consumes `self` to ensure the segment cannot be written to after sealing.
-    /// Returns the path of the newly sealed file.
-    pub fn seal(mut self) -> io::Result<PathBuf> {
+    /// This is the **durability commit point**: once it returns `Ok`, the data
+    /// survives a crash. [`seal`](Self::seal) then renames the path to
+    /// `.wab.sealed` to publish it. A crash *between* this fsync and that rename
+    /// leaves a fully-formed segment at the `.wab` path, which crash recovery
+    /// re-seals via the sentinel branch in `recover_segment` — the DST harness
+    /// exercises exactly that window by failing the rename after this returns.
+    ///
+    /// Consumes `self` so the segment cannot be written to afterwards.
+    pub(crate) fn finalize_to_disk(mut self) -> io::Result<PathBuf> {
         let sealed_at = unix_nanos_now();
 
         // Finalise CRC before writing sentinel (sentinel is not covered by file_crc32).
@@ -218,9 +224,19 @@ impl WabSegment {
 
         platform_fsync(&self.file)?;
 
-        let sealed_path = sealed_path_for(&self.path);
-        std::fs::rename(&self.path, &sealed_path)?;
+        Ok(self.path)
+    }
 
+    /// Seals the segment: writes sentinel + footer, fsyncs (see
+    /// [`finalize_to_disk`](Self::finalize_to_disk)), and atomically renames the
+    /// file from `.wab` to `.wab.sealed`.
+    ///
+    /// Consumes `self` to ensure the segment cannot be written to after sealing.
+    /// Returns the path of the newly sealed file.
+    pub fn seal(self) -> io::Result<PathBuf> {
+        let active_path = self.finalize_to_disk()?;
+        let sealed_path = sealed_path_for(&active_path);
+        std::fs::rename(&active_path, &sealed_path)?;
         Ok(sealed_path)
     }
 }

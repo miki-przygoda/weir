@@ -14,6 +14,11 @@ _sql-sink = []
 # carries ZERO cost in a normal build — adds Instant fields + histograms only
 # when enabled. Build the binary with this to populate weir_stage_* metrics.
 bench-trace = []
+# Deterministic Simulation Testing harness for the WAB flusher (wab::dst).
+# Off by default: the sim clock + fault-injecting segment store + invariant
+# oracle compile only under `cargo test` or this feature, so release binaries
+# contain zero sim code. Enable it to run the DST sweeps outside `cargo test`.
+dst = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.
 tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:arc-swap", "dep:x509-parser", "dep:rustls"]
@@ -126,3 +131,7 @@ weir-testkit = { path = "../weir-testkit" }
 ureq = "2"
 # Generates throwaway CA / server / client certs for the TLS integration tests.
 rcgen = "0.13"
+# Loads/saves pinned DST regression seeds (tests/dst_seeds/*.json) for the
+# wab::dst harness. Only the seed-regression replay test touches JSON; the
+# harness itself needs no serialisation at runtime.
+serde_json = "1"
