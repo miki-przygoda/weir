@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod format;
 pub mod recovery;
 pub mod segment;
@@ -20,9 +21,10 @@ use tracing::{info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::Batch;
+use clock::{BlockingClock, RealClock};
 use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
-use segment::ShardWriter;
+use segment::{FsSegmentStore, SegmentStore, ShardWriter};
 use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
 
 /// Exponential moving average update, fixed-point microseconds.
@@ -131,10 +133,15 @@ pub(crate) const MAX_FLUSHER_RESPAWNS: u32 = 10;
 /// crossbeam channels (lock-free, panic-safe). We accept the
 /// unwind-safety claim — matching the previous implementation's
 /// rationale.
-fn run_with_panic_supervision<F, B>(shard_id: usize, metrics: Arc<Metrics>, mut body_factory: F)
-where
+fn run_with_panic_supervision<F, B, C>(
+    shard_id: usize,
+    metrics: Arc<Metrics>,
+    clock: &C,
+    mut body_factory: F,
+) where
     F: FnMut() -> B,
     B: FnOnce(),
+    C: BlockingClock,
 {
     let mut attempt: u32 = 0;
     loop {
@@ -176,7 +183,7 @@ where
                 // fix, so the loop's job is mostly to surface a
                 // clean "now permanently offline" log line within
                 // about a second.
-                thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+                clock.sleep(Duration::from_millis(10 * u64::from(attempt)));
             }
         }
     }
@@ -253,13 +260,16 @@ pub fn spawn(
                 // Batches buffered in the bounded queue survive a flusher
                 // panic and are drained by the respawned flusher in the
                 // same order.
-                run_with_panic_supervision(shard_id, metrics_for_panic, || {
+                run_with_panic_supervision(shard_id, metrics_for_panic, &RealClock, || {
                     let sdir = sdir.clone();
                     let rx = rx.clone();
                     let drain_clone = drain_clone.clone();
                     let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
                     let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
                     move || {
+                        // Production filesystem backend; the DST harness drives
+                        // `flusher_thread` directly with a fault-injecting store.
+                        let store: Arc<dyn SegmentStore> = Arc::new(FsSegmentStore);
                         flusher_thread(
                             shard_id as u16,
                             sdir,
@@ -271,6 +281,8 @@ pub fn spawn(
                             core_id,
                             metrics_for_flusher,
                             coalesce_hint,
+                            &RealClock,
+                            store,
                         );
                     }
                 });
@@ -342,7 +354,7 @@ fn read_segment_record_count(path: &Path) -> io::Result<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn flusher_thread(
+fn flusher_thread<C: BlockingClock>(
     shard_id: u16,
     shard_dir: PathBuf,
     work_rx: Receiver<Batch>,
@@ -353,6 +365,8 @@ fn flusher_thread(
     core_id: Option<core_affinity::CoreId>,
     metrics: Arc<Metrics>,
     coalesce_hint: Arc<AtomicU64>,
+    clock: &C,
+    store: Arc<dyn SegmentStore>,
 ) {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
@@ -378,7 +392,13 @@ fn flusher_thread(
     }
 
     // Startup warmup
-    let mut writer = ShardWriter::new(shard_id, shard_dir, segment_max_bytes, Arc::clone(&metrics));
+    let mut writer = ShardWriter::new_with_store(
+        shard_id,
+        shard_dir,
+        segment_max_bytes,
+        Arc::clone(&metrics),
+        store,
+    );
     if let Err(e) = writer.scan_and_advance_counter() {
         warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
     }
@@ -402,7 +422,7 @@ fn flusher_thread(
 
     loop {
         // Block on the first Batch (or detect channel close / deadline).
-        match work_rx.recv_timeout(batch_deadline) {
+        match clock.recv_timeout(&work_rx, batch_deadline) {
             Ok(batch) => {
                 record_count += batch.records.len();
                 batches.push(batch);
@@ -805,7 +825,12 @@ mod tests {
         let m = Arc::new(m);
         // One panic then clean recovery — verify the supervisor caught
         // it and bumped the metric exactly once.
-        run_with_panic_supervision(0, Arc::clone(&m), panic_then_recover_factory(1, "boom"));
+        run_with_panic_supervision(
+            0,
+            Arc::clone(&m),
+            &RealClock,
+            panic_then_recover_factory(1, "boom"),
+        );
         assert_eq!(m.wab_flusher_panics.get(), 1);
     }
 
@@ -820,7 +845,7 @@ mod tests {
         let m = Arc::new(m);
         let shard = 7;
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        run_with_panic_supervision(shard, Arc::clone(&m), move || {
+        run_with_panic_supervision(shard, Arc::clone(&m), &RealClock, move || {
             let counter = std::sync::Arc::clone(&counter);
             move || {
                 if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -835,7 +860,7 @@ mod tests {
     fn supervisor_lets_clean_exit_pass_through() {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
-        run_with_panic_supervision(0, Arc::clone(&m), || {
+        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
             || { /* normal return on first attempt */ }
         });
         assert_eq!(m.wab_flusher_panics.get(), 0);
@@ -853,6 +878,7 @@ mod tests {
         run_with_panic_supervision(
             0,
             Arc::clone(&m),
+            &RealClock,
             panic_then_recover_factory(3, "transient boom"),
         );
         assert_eq!(
@@ -873,7 +899,7 @@ mod tests {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
         let start = std::time::Instant::now();
-        run_with_panic_supervision(0, Arc::clone(&m), || {
+        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
             // Every attempt panics — never recovers.
             || panic!("persistent panic")
         });

@@ -345,28 +345,11 @@ pub struct ShardWriter {
 }
 
 impl ShardWriter {
-    /// Production constructor: segments backed by real files
-    /// ([`FsSegmentStore`]).
-    pub fn new(
-        shard_id: u16,
-        shard_dir: PathBuf,
-        segment_max_bytes: u64,
-        metrics: Arc<Metrics>,
-    ) -> Self {
-        Self::new_with_store(
-            shard_id,
-            shard_dir,
-            segment_max_bytes,
-            metrics,
-            Arc::new(FsSegmentStore),
-        )
-    }
-
-    /// Construct over an injected [`SegmentStore`]. Production goes through
-    /// [`new`](Self::new) (`FsSegmentStore`); the DST harness passes a
-    /// fault-injecting store. The store is the sole filesystem boundary, so
-    /// every segment creation, rotation, fsync, seal, and counter-scan flows
-    /// through it.
+    /// Construct over an injected [`SegmentStore`] — the sole filesystem
+    /// boundary, so every segment creation, rotation, fsync, seal, and
+    /// counter-scan flows through it. Production injects [`FsSegmentStore`] at
+    /// the flusher's single construction point (see [`super::spawn`]); the DST
+    /// harness injects a fault-injecting store.
     pub fn new_with_store(
         shard_id: u16,
         shard_dir: PathBuf,
@@ -589,7 +572,13 @@ mod tests {
         // `poisoned_segment_refuses_subsequent_writes`.
         let dir = tmp_dir("shardwriter_drop");
         let metrics = Arc::new(Metrics::new().0);
-        let mut writer = ShardWriter::new(0, dir.clone(), 1024 * 1024, metrics);
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            metrics,
+            Arc::new(FsSegmentStore),
+        );
 
         writer.write_record(b"first").unwrap();
         assert!(writer.active.is_some(), "segment open after first write");
@@ -646,7 +635,13 @@ mod tests {
         // Tiny segment_max_bytes so a single write rotates and creates a
         // second segment — this exercises ensure_open twice in one
         // writer's lifetime (initial + post-rotation).
-        let mut writer = ShardWriter::new(0, dir.clone(), 32, Arc::clone(&metrics));
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            32,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+        );
 
         let open_counter = || -> u64 {
             metrics
