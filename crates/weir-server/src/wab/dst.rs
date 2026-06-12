@@ -654,4 +654,57 @@ mod tests {
         assert_eq!(a.recovered, b.recovered);
         assert_eq!(a.written, a.recovered);
     }
+
+    /// Replays every pinned regression seed in `tests/dst_seeds/`. A spec whose
+    /// invariants once failed lives here forever; `run()` re-checks them and
+    /// panics with the seed repro on any regression. New failing seeds are
+    /// pinned by dropping their serialised `SimSpec` JSON into that directory.
+    #[test]
+    fn replay_pinned_regression_seeds() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/dst_seeds");
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("tests/dst_seeds unreadable ({}): {e}", dir.display()));
+        let mut replayed = 0;
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let json = std::fs::read_to_string(&path).unwrap();
+            let spec: SimSpec = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("malformed DST seed {}: {e}", path.display()));
+            spec.run();
+            replayed += 1;
+        }
+        assert!(
+            replayed > 0,
+            "no pinned DST seeds found in {}",
+            dir.display()
+        );
+    }
+
+    /// Random-seed sweep across the two fault scenarios. Every run checks its
+    /// invariants in-harness, so any seed that breaks one fails here with a
+    /// pin-able repro. The count is `WEIR_DST_SWEEP` (small by default so PR
+    /// runs stay fast; the CI `dst` job cranks it up).
+    #[test]
+    fn sweep_random_seeds() {
+        let n: u64 = std::env::var("WEIR_DST_SWEEP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        let mut rng = SplitMix64::new(0xA11C_E5EE_D000);
+        for _ in 0..n {
+            let seed = rng.next_u64();
+            let records = 1 + (seed % 8) as usize;
+            Sim::new(seed)
+                .fault(Fault::FsyncReturns { nth: 1 })
+                .scenario(Scenario::SyncFlush { records })
+                .run();
+            Sim::new(seed)
+                .fault(Fault::RenameFails)
+                .scenario(Scenario::CrashBeforeRename { records })
+                .run();
+        }
+    }
 }

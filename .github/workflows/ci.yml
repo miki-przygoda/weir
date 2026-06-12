@@ -28,6 +28,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
+  dst:
+    name: dst (sim sweep)
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Builds the WAB deterministic-simulation harness with the `dst` feature
+      # ON (compile-checks the non-test path too), replays every pinned
+      # regression seed in tests/dst_seeds/, and runs a deeper random-seed
+      # sweep than the default `cargo test` (300 seeds × 2 fault scenarios).
+      # A violated durability invariant fails here with a WEIR_DST_SEED repro.
+      - name: DST scenarios + regression seeds + sweep
+        env:
+          WEIR_DST_SWEEP: "300"
+        run: cargo test -p weir-server --bin weir-server --features dst "wab::dst::" -- --test-threads=1
+
   load:
     runs-on: ubuntu-latest
     needs: test
