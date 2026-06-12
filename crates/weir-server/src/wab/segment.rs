@@ -249,6 +249,76 @@ pub fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
     shard_dir.join(format!("seg_{counter:08}{EXT_ACTIVE}"))
 }
 
+/// An open, writable WAB segment — the seam between [`ShardWriter`] and the
+/// bytes on disk. Production uses [`WabSegment`] directly (see the impl below);
+/// the deterministic-simulation harness swaps in a backend that injects
+/// `fsync`/`seal` faults on a seeded schedule. Held as a `Box<dyn SegmentHandle>`
+/// so `ShardWriter`'s rotate/seal lifecycle is backend-agnostic. The single
+/// vtable hop per write/fsync is negligible against the real syscall it guards.
+pub trait SegmentHandle: Send {
+    /// Append one record. Mirrors [`WabSegment::write_record`].
+    fn write_record(&mut self, payload: &[u8]) -> io::Result<()>;
+    /// Sync the segment to stable storage. Mirrors [`WabSegment::fsync`].
+    fn fsync(&self) -> io::Result<()>;
+    /// True once the segment has reached the rotation threshold. Mirrors
+    /// [`WabSegment::should_rotate`].
+    fn should_rotate(&self, max_bytes: u64) -> bool;
+    /// Seal the segment (sentinel + footer + fsync + atomic rename) and return
+    /// the `.wab.sealed` path. Consumes the handle. Mirrors [`WabSegment::seal`].
+    fn seal(self: Box<Self>) -> io::Result<PathBuf>;
+}
+
+/// Creates segments and enumerates existing ones for a shard — the complete
+/// filesystem boundary for [`ShardWriter`]. Production is [`FsSegmentStore`]
+/// (real files); the DST harness injects a fault-aware store. Held as
+/// `Arc<dyn SegmentStore>` so the generic stays out of the public
+/// [`super::spawn`] signature.
+pub trait SegmentStore: Send + Sync {
+    /// Create a fresh active segment at `path` for `shard_id`.
+    fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>>;
+    /// Counter values of every active segment file in `dir`. Sealed (`.wab.sealed`)
+    /// files do not parse via [`segment_counter_from_path`] and so are skipped —
+    /// this matches the historical scan, which only advanced past active segments.
+    /// Used by [`ShardWriter::scan_and_advance_counter`].
+    fn segment_counters(&self, dir: &Path) -> io::Result<Vec<u64>>;
+}
+
+/// Production [`SegmentStore`]: real files on the local filesystem via
+/// [`WabSegment`].
+pub struct FsSegmentStore;
+
+impl SegmentStore for FsSegmentStore {
+    fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>> {
+        Ok(Box::new(WabSegment::create(path, shard_id)?))
+    }
+
+    fn segment_counters(&self, dir: &Path) -> io::Result<Vec<u64>> {
+        let mut counters = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if let Some(n) = segment_counter_from_path(&entry.path()) {
+                counters.push(n);
+            }
+        }
+        Ok(counters)
+    }
+}
+
+impl SegmentHandle for WabSegment {
+    fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
+        WabSegment::write_record(self, payload)
+    }
+    fn fsync(&self) -> io::Result<()> {
+        WabSegment::fsync(self)
+    }
+    fn should_rotate(&self, max_bytes: u64) -> bool {
+        WabSegment::should_rotate(self, max_bytes)
+    }
+    fn seal(self: Box<Self>) -> io::Result<PathBuf> {
+        WabSegment::seal(*self)
+    }
+}
+
 /// Manages the active segment for one shard. Opens the segment lazily on first write.
 pub struct ShardWriter {
     shard_id: u16,
@@ -258,7 +328,11 @@ pub struct ShardWriter {
     /// Bytes threshold at which the active segment is sealed and rotated.
     /// Set via `WabConfig::segment_max_bytes` at flusher-thread spawn time.
     segment_max_bytes: u64,
-    active: Option<WabSegment>,
+    active: Option<Box<dyn SegmentHandle>>,
+    /// The filesystem backend. `FsSegmentStore` in production; a fault-injecting
+    /// store in the DST harness. Boxed as `Arc<dyn>` so `ShardWriter` and the
+    /// public `spawn` API stay free of a backend generic.
+    store: Arc<dyn SegmentStore>,
     /// Metrics handle so `ensure_open` can bump the
     /// `weir_wab_segments_total{state="open"}` counter every time a new
     /// segment file is created. The other state transitions (sealed,
@@ -271,11 +345,34 @@ pub struct ShardWriter {
 }
 
 impl ShardWriter {
+    /// Production constructor: segments backed by real files
+    /// ([`FsSegmentStore`]).
     pub fn new(
         shard_id: u16,
         shard_dir: PathBuf,
         segment_max_bytes: u64,
         metrics: Arc<Metrics>,
+    ) -> Self {
+        Self::new_with_store(
+            shard_id,
+            shard_dir,
+            segment_max_bytes,
+            metrics,
+            Arc::new(FsSegmentStore),
+        )
+    }
+
+    /// Construct over an injected [`SegmentStore`]. Production goes through
+    /// [`new`](Self::new) (`FsSegmentStore`); the DST harness passes a
+    /// fault-injecting store. The store is the sole filesystem boundary, so
+    /// every segment creation, rotation, fsync, seal, and counter-scan flows
+    /// through it.
+    pub fn new_with_store(
+        shard_id: u16,
+        shard_dir: PathBuf,
+        segment_max_bytes: u64,
+        metrics: Arc<Metrics>,
+        store: Arc<dyn SegmentStore>,
     ) -> Self {
         ShardWriter {
             shard_id,
@@ -283,6 +380,7 @@ impl ShardWriter {
             next_counter: 1,
             segment_max_bytes,
             active: None,
+            store,
             metrics,
         }
     }
@@ -291,16 +389,12 @@ impl ShardWriter {
     /// shard directory. Called during startup so new segments don't collide with
     /// existing (sealed) ones.
     pub fn scan_and_advance_counter(&mut self) -> io::Result<()> {
-        let mut max: u64 = 0;
-        for entry in std::fs::read_dir(&self.shard_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if let Some(n) = segment_counter_from_path(&path)
-                && n > max
-            {
-                max = n;
-            }
-        }
+        let max = self
+            .store
+            .segment_counters(&self.shard_dir)?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
         if max >= self.next_counter {
             self.next_counter = max.checked_add(1).expect("segment counter overflow");
         }
@@ -365,7 +459,7 @@ impl ShardWriter {
                 .next_counter
                 .checked_add(1)
                 .expect("segment counter overflow");
-            self.active = Some(WabSegment::create(&path, self.shard_id)?);
+            self.active = Some(self.store.create(&path, self.shard_id)?);
             // Newly opened segment — bump the `open` state counter so the
             // open → sealed → confirmed/quarantined transition story is
             // observable end to end via `weir_wab_segments_total{state="..."}`.
@@ -483,42 +577,47 @@ mod tests {
 
     #[test]
     fn shardwriter_drops_segment_after_write_error() {
-        // After an inner WabSegment returns Err from write_record, ShardWriter
-        // must drop its `active` segment so the next call opens a fresh file
-        // with a new counter — otherwise subsequent writes would interleave
-        // with the stray bytes from the failed write.
+        // After an inner segment returns Err from write_record, ShardWriter must
+        // drop its `active` segment so the next call opens a fresh file with a
+        // new counter — otherwise subsequent writes would interleave with stray
+        // bytes from the failed write. We induce a deterministic write error with
+        // an oversized payload (rejected before any bytes reach the file) rather
+        // than poking the inner segment's private `poisoned` flag, which is no
+        // longer reachable through the `SegmentHandle` trait object. The
+        // drop-on-error behaviour under test is identical regardless of which
+        // error the inner write returned; the poison path itself is covered by
+        // `poisoned_segment_refuses_subsequent_writes`.
         let dir = tmp_dir("shardwriter_drop");
         let metrics = Arc::new(Metrics::new().0);
         let mut writer = ShardWriter::new(0, dir.clone(), 1024 * 1024, metrics);
-        writer.write_record(b"first").unwrap();
-        let active_path_before = writer
-            .active
-            .as_ref()
-            .expect("segment open after first write")
-            .path
-            .clone();
 
-        // Poison the inner segment so the next write_record fails.
-        writer.active.as_mut().unwrap().poisoned = true;
+        writer.write_record(b"first").unwrap();
+        assert!(writer.active.is_some(), "segment open after first write");
+
+        // Oversized payload → inner write_record returns Err → active dropped.
+        let too_large = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
         writer
-            .write_record(b"poisoned")
-            .expect_err("write to poisoned segment must fail");
+            .write_record(&too_large)
+            .expect_err("oversized write must fail");
         assert!(
             writer.active.is_none(),
             "active segment must be dropped after write error"
         );
 
-        // The next write opens a fresh segment with a different file path.
+        // The next write opens a fresh segment file. The orphaned first segment
+        // is left on disk, so the shard dir now holds two active `.wab` files —
+        // proving recovery opened a new file rather than reusing the orphan.
         writer.write_record(b"recovered").unwrap();
-        let active_path_after = writer
-            .active
-            .as_ref()
-            .expect("segment open after recovery")
-            .path
-            .clone();
-        assert_ne!(
-            active_path_before, active_path_after,
-            "recovery must open a new segment file, not reuse the poisoned one"
+        assert!(writer.active.is_some(), "segment open after recovery");
+
+        let active_count = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "wab"))
+            .count();
+        assert_eq!(
+            active_count, 2,
+            "recovery must open a new segment file, not reuse the orphaned one"
         );
 
         fs::remove_dir_all(dir).ok();
