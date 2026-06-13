@@ -694,6 +694,10 @@ mod tests {
     struct MockSink {
         responses: Mutex<VecDeque<MockResult>>,
         call_count: AtomicU64,
+        /// Number of initial `commit()` calls that hang forever (await
+        /// `pending()`), modelling a sink with no internal timeout. The drain's
+        /// backstop `commit_timeout` must cancel these.
+        hang_calls: u64,
         max_batch: usize,
         /// Wall-clock instant of every `commit()` call. Tests that need to
         /// measure inter-call gaps (e.g. retry-after observance) read this
@@ -715,6 +719,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
+                hang_calls: 0,
                 max_batch: 1000,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -729,10 +734,20 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
+                hang_calls: 0,
                 max_batch,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
                 dead_lettered_records: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A sink whose first `hang_calls` `commit()` invocations hang forever,
+        /// then falls back to `responses` (empty = commit the whole batch).
+        fn with_hang(hang_calls: u64, responses: impl IntoIterator<Item = MockResult>) -> Self {
+            Self {
+                hang_calls,
+                ..Self::with_responses(responses)
             }
         }
 
@@ -780,8 +795,12 @@ mod tests {
         type Error = MockError;
 
         async fn commit(&self, batch: Vec<Payload>) -> MockResult {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let nth = self.call_count.fetch_add(1, Ordering::Relaxed) + 1;
             self.call_timestamps.lock().unwrap().push(Instant::now());
+            if nth <= self.hang_calls {
+                // Hang forever; the drain's backstop timeout cancels this future.
+                std::future::pending::<()>().await;
+            }
             let mut responses = self.responses.lock().unwrap();
             let response = responses.pop_front().unwrap_or_else(|| {
                 Ok(CommitResult {
@@ -840,6 +859,14 @@ mod tests {
         m.sink_commit_records
             .get_or_create(&OutcomeLabel {
                 outcome: Outcome::dead_lettered,
+            })
+            .get()
+    }
+
+    fn records_retried(m: &Metrics) -> u64 {
+        m.sink_commit_records
+            .get_or_create(&OutcomeLabel {
+                outcome: Outcome::retried,
             })
             .get()
     }
@@ -994,6 +1021,47 @@ mod tests {
             get_confirmed_path(&sealed).exists(),
             "confirmed after successful retry"
         );
+        assert!(!sealed.exists());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Concern #2: a sink whose `commit()` hangs (a third-party sink with no
+    /// internal timeout) must not stall the drain forever. The backstop
+    /// `commit_timeout` fires → the batch is treated as transient → the segment
+    /// is retried. Here the sink hangs on its first commit, then succeeds: the
+    /// segment must still be confirmed, with the timeout charged to `retried`.
+    #[test]
+    fn hung_sink_commit_times_out_then_segment_retried_and_confirmed() {
+        let dir = tmp_dir("hung_sink");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1", b"r2"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let metrics = noop_metrics();
+        // Hang on the 1st commit; the 2nd falls back to the default response
+        // (commits the whole batch).
+        let sink = Arc::new(MockSink::with_hang(1, []));
+        let mut config = fast_config(dir.clone());
+        // Short backstop so the hung commit is cancelled quickly.
+        config.commit_timeout = Duration::from_millis(50);
+        run_drain(rx, tx, sink.clone(), config, metrics.clone());
+
+        assert!(
+            sink.call_count() >= 2,
+            "the hung commit must be retried (calls={})",
+            sink.call_count()
+        );
+        assert!(
+            records_retried(&metrics) >= 2,
+            "the timeout path must charge the records to the `retried` outcome"
+        );
+        assert_eq!(
+            segments_confirmed(&metrics),
+            1,
+            "the segment is confirmed once the retry succeeds — no record lost, no deadlock"
+        );
+        assert!(get_confirmed_path(&sealed).exists());
         assert!(!sealed.exists());
 
         std::fs::remove_dir_all(dir).ok();
