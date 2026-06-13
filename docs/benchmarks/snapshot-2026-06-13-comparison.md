@@ -91,10 +91,47 @@ carries zero sim code.
   SATA, ≈80k on a write-barrier NVMe), scaling with concurrency.
 - **No perf debt** accrued from the Phase 4 / DST work.
 
-## Going deeper (next, optional)
+## Per-stage breakdown — fsync share, made explicit
 
-- **Per-stage breakdown** (`--features bench-trace`) — decomposes a Sync record
-  into queue / write / fsync / ack to show the fsync % directly (the Phase 3
-  table did this on Mac; running it on both would make "≈100% fsync" explicit).
-- **Live `/metrics` scrape under load** — a snapshot of the Prometheus runtime
-  state (fsync-duration histogram, segment lifecycle counts, drain state).
+`--features bench-trace` decomposes a single record's latency into the pipeline
+stages (mean µs, 2000 samples/tier). The fsync stage isn't measured directly;
+it's the remainder: `fsync ≈ total − queue − bridge_wait − write`.
+
+| Stage (Sync tier, mean µs) | Mac | beast |
+|---|---|---|
+| queue (enqueue → worker-flush) | 3 | 16 |
+| bridge_wait (worker → flusher) | 3 | 8 |
+| write (flusher write, pre-fsync) | 6 | 6 |
+| **fsync (remainder)** | **~203** | **~1,433** |
+| **total** (enqueue → ack) | **215** | **1,463** |
+| **fsync share of total** | **~94%** | **~98%** |
+
+Buffered (no fsync) total: **10 µs** (Mac) / **6 µs** (beast). The software
+pipeline is ≤30 µs and roughly constant across both boxes; the fsync is the
+whole story, and the slower the disk the more completely it dominates
+(94% → 98%). This is the fsync-bound thesis as a direct decomposition, not an
+inference.
+
+## Observability snapshot (Mac, `/metrics` under load)
+
+A point-in-time Prometheus scrape after driving 300 records (100 each
+sync/batched/buffered, 256 B) through a standalone server (noop sink, 4 shards,
+8 KiB segments to force rotations). Confirms the runtime instrumentation is
+wired end to end:
+
+| Family | Value |
+|---|---|
+| `weir_records_accepted_total` | sync 100 · batched 100 · buffered 100 (300 ack, 0 nack) |
+| `weir_wab_segments_total` | **open 12 → sealed 8 → confirmed 8** (full lifecycle observable) |
+| `weir_wab_fsync_duration_seconds` | count 196, 195 ≤ 1 ms (1 in 1–2 ms) |
+| `weir_wab_fsync_failures_total` / `weir_wab_flusher_panics_total` | 0 / 0 |
+| `weir_sink_commit_records_total{committed}` | 248 |
+| `weir_drain_state` | `draining` = 1 (blocked / retrying = 0) |
+| `weir_recovery_segments_quarantined_total` | 0 |
+| `weir_queue_depth` | 0 |
+
+> Reproduce: start `weir-server` with `WEIR_SINK_TYPE=noop WEIR_SHARD_COUNT=4
+> WEIR_WAB_SEGMENT_MAX_BYTES=8192 WEIR_METRICS_PORT=9185` (socket parent must be
+> a real dir, **not** the `/tmp`→`/private/tmp` symlink — the hardened bind opens
+> it `O_DIRECTORY|O_NOFOLLOW`), push load via `weir-ctl push … --durability …`,
+> then `weir-ctl metrics --addr 127.0.0.1:9185` or `curl …/metrics`.
