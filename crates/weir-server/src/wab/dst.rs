@@ -31,13 +31,13 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering::SeqCst},
     },
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -133,6 +133,178 @@ impl BlockingClock for SimClock {
         self.virtual_nanos
             .fetch_add(timeout.as_nanos() as u64, SeqCst);
         rx.recv_timeout(timeout)
+    }
+
+    fn sleep(&self, dur: Duration) {
+        self.virtual_nanos.fetch_add(dur.as_nanos() as u64, SeqCst);
+    }
+}
+
+// ── Cooperative scheduler (SimExecutor) ─────────────────────────────────────
+
+/// A cooperative, deterministic scheduler over real OS threads. Only the thread
+/// holding the turn runs; threads release it at instrumented yield points (a
+/// flusher's `recv_timeout` via [`SchedClock`], a producer's send) and the
+/// scheduler hands the turn to the next runnable thread chosen by the seed RNG.
+/// This turns a concurrent scenario into a reproducible, seed-driven
+/// interleaving without rebuilding the async/threading runtime.
+///
+/// Liveness rests on one rule the participants must honour: a thread that
+/// yields **blocked** (waiting for input) is only re-scheduled after another
+/// thread makes progress (`progress`) or finishes — and a producer never blocks
+/// (the sim uses unbounded channels), so a blocked consumer is always
+/// eventually fed or sees `Disconnected`. As a backstop, `acquire` panics rather
+/// than hangs if its turn never comes, so a scheduler bug surfaces as a test
+/// failure, not a wedged CI run.
+struct SimScheduler {
+    inner: Mutex<SchedState>,
+    cv: Condvar,
+}
+
+struct SchedState {
+    threads: Vec<usize>,
+    turn: Option<usize>,
+    blocked: HashSet<usize>,
+    done: HashSet<usize>,
+    rng: SplitMix64,
+}
+
+impl SimScheduler {
+    fn new(seed: u64) -> Arc<Self> {
+        Arc::new(SimScheduler {
+            inner: Mutex::new(SchedState {
+                threads: Vec::new(),
+                turn: None,
+                blocked: HashSet::new(),
+                done: HashSet::new(),
+                rng: SplitMix64::new(seed ^ 0x5C8E_D513_2B0A_77F1),
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn register(&self, id: usize) {
+        self.inner.lock().unwrap().threads.push(id);
+    }
+
+    /// Picks the first thread to run, kicking off the schedule.
+    fn start(&self) {
+        let mut state = self.inner.lock().unwrap();
+        pick_next(&mut state);
+        self.cv.notify_all();
+    }
+
+    /// Block until it is `id`'s turn. Panics if the turn never arrives — a
+    /// deadlock backstop (no legitimate schedule should starve a thread).
+    fn acquire(&self, id: usize) {
+        let mut state = self.inner.lock().unwrap();
+        loop {
+            if state.turn == Some(id) {
+                return;
+            }
+            let (s, timeout) = self.cv.wait_timeout(state, Duration::from_secs(5)).unwrap();
+            state = s;
+            assert!(
+                !timeout.timed_out() || state.turn == Some(id),
+                "DST scheduler deadlock: thread {id} never got its turn (turn={:?})",
+                state.turn
+            );
+        }
+    }
+
+    /// Give up the turn. `blocked` marks this thread as waiting on input (not
+    /// re-scheduled until progress/finish). Hands the turn to the next runnable.
+    fn yield_to_next(&self, id: usize, blocked: bool) {
+        let mut state = self.inner.lock().unwrap();
+        if blocked {
+            state.blocked.insert(id);
+        }
+        pick_next(&mut state);
+        self.cv.notify_all();
+    }
+
+    /// Yield + reacquire — a plain cooperative point (not blocked).
+    fn step(&self, id: usize) {
+        self.yield_to_next(id, false);
+        self.acquire(id);
+    }
+
+    /// Yield blocked-on-input + reacquire when fed.
+    fn block(&self, id: usize) {
+        self.yield_to_next(id, true);
+        self.acquire(id);
+    }
+
+    /// Mark that input became available — any blocked consumer may now retry.
+    fn progress(&self) {
+        self.inner.lock().unwrap().blocked.clear();
+    }
+
+    /// This thread is finished; hand off and never return for a turn.
+    fn finish(&self, id: usize) {
+        let mut state = self.inner.lock().unwrap();
+        state.done.insert(id);
+        pick_next(&mut state);
+        self.cv.notify_all();
+    }
+}
+
+/// Picks the next runnable thread (registered, not done, not blocked) by RNG and
+/// installs it as the turn. If every non-done thread is blocked, clears the
+/// blocked set (forces a retry — a blocked consumer will see `Disconnected`
+/// once producers are done). Sets `turn = None` when all threads are done.
+/// Iterates a SORTED candidate list so the RNG pick is deterministic.
+fn pick_next(state: &mut SchedState) {
+    let runnable = |state: &SchedState| -> Vec<usize> {
+        let mut v: Vec<usize> = state
+            .threads
+            .iter()
+            .copied()
+            .filter(|t| !state.done.contains(t) && !state.blocked.contains(t))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+
+    let mut candidates = runnable(state);
+    if candidates.is_empty() && !state.blocked.is_empty() {
+        state.blocked.clear();
+        candidates = runnable(state);
+    }
+    state.turn = if candidates.is_empty() {
+        None
+    } else {
+        let idx = (state.rng.next_u64() % candidates.len() as u64) as usize;
+        Some(candidates[idx])
+    };
+}
+
+/// A [`BlockingClock`] backed by the [`SimScheduler`]: every `recv_timeout` is a
+/// cooperative yield point. A successful receive yields then resumes; an empty
+/// channel yields blocked until a producer feeds it; a disconnected channel
+/// returns immediately. `Timeout` is never returned — the flusher processes each
+/// batch as it arrives and shuts down on `Disconnected`.
+struct SchedClock {
+    sched: Arc<SimScheduler>,
+    id: usize,
+    virtual_nanos: Arc<AtomicU64>,
+}
+
+impl BlockingClock for SchedClock {
+    fn recv_timeout<T>(&self, rx: &Receiver<T>, _timeout: Duration) -> Result<T, RecvTimeoutError> {
+        loop {
+            match rx.try_recv() {
+                Ok(v) => {
+                    self.sched.step(self.id);
+                    return Ok(v);
+                }
+                Err(TryRecvError::Empty) => self.sched.block(self.id),
+                Err(TryRecvError::Disconnected) => {
+                    self.sched.step(self.id);
+                    return Err(RecvTimeoutError::Disconnected);
+                }
+            }
+        }
     }
 
     fn sleep(&self, dur: Duration) {
@@ -360,6 +532,14 @@ pub enum Scenario {
     /// fsync barrier; assert the supervisor respawns and no record is falsely
     /// acked (the panic unwinds before the ack loop).
     PanicDuringFlush { records: usize },
+    /// A producer and the real flusher run as two cooperatively-scheduled
+    /// threads; the seed picks how `batches` × `records_per_batch` sends
+    /// interleave with the flusher's receives. Asserts FIFO + durability hold
+    /// under the chosen interleaving.
+    InterleavedFlush {
+        batches: usize,
+        records_per_batch: usize,
+    },
     /// Drive the panic supervisor under [`SimClock`]; assert it caps out in
     /// virtual (instantly-advanced) time.
     PanicSupervisor,
@@ -390,6 +570,10 @@ impl SimSpec {
             Scenario::PanicDuringFlush { records } => {
                 run_panic_during_flush(self.seed, &self.faults, *records)
             }
+            Scenario::InterleavedFlush {
+                batches,
+                records_per_batch,
+            } => run_interleaved_flush(self.seed, &self.faults, *batches, *records_per_batch),
             Scenario::PanicSupervisor => run_panic_supervisor(self.seed),
         }
     }
@@ -864,6 +1048,126 @@ fn run_panic_supervisor(seed: u64) -> SimReport {
     }
 }
 
+/// Scenario (Phase 3) — a producer and the real flusher run as two cooperatively
+/// scheduled threads ([`SimScheduler`]), so the seed deterministically chooses
+/// how the producer's sends interleave with the flusher's receives (i.e. how
+/// batches coalesce). Drives the actual `flusher_thread` loop (recv → drain →
+/// `flush_batch` → shutdown seal) via a [`SchedClock`]. Asserts I1 (acked ⟹
+/// durable) under the interleaving; the test additionally checks per-shard FIFO
+/// + completeness against the produced order.
+fn run_interleaved_flush(
+    seed: u64,
+    faults: &[Fault],
+    batches_count: usize,
+    records_per_batch: usize,
+) -> SimReport {
+    let env = SimEnv::new("interleaved");
+    let sim_faults = SimFaults::from_faults(faults);
+    let ledger = Ledger::default();
+    let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(
+        Arc::clone(&sim_faults),
+        ledger.clone(),
+    ));
+
+    // Unbounded so the producer never blocks on send — the scheduler's liveness
+    // rule relies on producers not blocking.
+    let (work_tx, work_rx) = crossbeam_channel::unbounded::<Batch>();
+    let (drain_tx, _drain_rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let coalesce_hint = Arc::new(AtomicU64::new(200));
+
+    let mut rng = SplitMix64::new(seed);
+    let total = batches_count * records_per_batch;
+    let mut payloads = Vec::with_capacity(total);
+    let mut ack_rxs = Vec::with_capacity(total);
+    let mut batches: Vec<Batch> = Vec::with_capacity(batches_count);
+    let mut idx = 0u64;
+    for _ in 0..batches_count {
+        let mut units = Vec::with_capacity(records_per_batch);
+        for _ in 0..records_per_batch {
+            let payload = rng.unique_payload(idx);
+            idx += 1;
+            let (ack_tx, ack_rx) = oneshot::channel();
+            ack_rxs.push(ack_rx);
+            units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+            payloads.push(payload);
+        }
+        batches.push(make_batch(units));
+    }
+
+    let sched = SimScheduler::new(seed);
+    const PRODUCER: usize = 0;
+    const FLUSHER: usize = 1;
+    sched.register(PRODUCER);
+    sched.register(FLUSHER);
+
+    // Producer: send each batch, mark progress (unblock the flusher), yield.
+    let sched_p = Arc::clone(&sched);
+    let producer = std::thread::spawn(move || {
+        sched_p.acquire(PRODUCER);
+        for batch in batches {
+            work_tx.send(batch).expect("send batch");
+            sched_p.progress();
+            sched_p.step(PRODUCER);
+        }
+        drop(work_tx); // flusher's next recv sees Disconnected → shutdown seal
+        sched_p.finish(PRODUCER);
+    });
+
+    // Flusher: the real flusher_thread, its recv_timeout driven by the scheduler.
+    let sched_f = Arc::clone(&sched);
+    let shard_dir = env.shard_dir(0);
+    let metrics = Arc::clone(&env.metrics);
+    let flusher = std::thread::spawn(move || {
+        let clock = SchedClock {
+            sched: Arc::clone(&sched_f),
+            id: FLUSHER,
+            virtual_nanos: Arc::new(AtomicU64::new(0)),
+        };
+        sched_f.acquire(FLUSHER);
+        super::flusher_thread(
+            0,
+            shard_dir,
+            work_rx,
+            drain_tx,
+            total.max(1),
+            Duration::from_millis(5),
+            64 * 1024 * 1024,
+            None,
+            metrics,
+            coalesce_hint,
+            &clock,
+            store,
+        );
+        sched_f.finish(FLUSHER);
+    });
+
+    sched.start();
+    producer.join().expect("producer join");
+    flusher.join().expect("flusher join");
+
+    let acks: Vec<bool> = ack_rxs
+        .into_iter()
+        .map(|mut rx| rx.try_recv().unwrap_or(false))
+        .collect();
+
+    // I1 — acked ⟹ durable holds regardless of how the sends interleaved.
+    for (payload, &acked) in payloads.iter().zip(&acks) {
+        if acked {
+            assert_invariant(seed, "i1_acked_true_is_durable", ledger.is_durable(payload));
+        }
+    }
+
+    let recovered = read_sealed_payloads(&env.shard_dir(0));
+    env.cleanup();
+    SimReport {
+        seed,
+        acks,
+        written: payloads,
+        recovered,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1318,49 @@ mod tests {
         );
     }
 
+    /// SimExecutor: a producer and the real flusher run as two cooperatively
+    /// scheduled threads, the seed choosing the interleaving. Per-shard FIFO and
+    /// durability must hold regardless of how the sends interleave: every
+    /// produced record is acked durable, and the sealed segment replays them in
+    /// production order.
+    #[test]
+    fn interleaved_producer_flusher_preserves_fifo_and_durability() {
+        let report = Sim::new(0x5EED_0008)
+            .scenario(Scenario::InterleavedFlush {
+                batches: 5,
+                records_per_batch: 3,
+            })
+            .run();
+        assert!(
+            report.acks.iter().all(|&ok| ok),
+            "no fault ⇒ every record durably acked, got {:?}",
+            report.acks
+        );
+        assert_eq!(
+            report.recovered, report.written,
+            "per-shard FIFO + completeness must hold under the interleaving"
+        );
+    }
+
+    /// The scheduler is deterministic: the same seed yields the same interleaving
+    /// and therefore the same ack/record sequence.
+    #[test]
+    fn interleaved_run_is_seed_deterministic() {
+        let spec = SimSpec {
+            seed: 0x0BAD_C0DE_F00D,
+            scenario: Scenario::InterleavedFlush {
+                batches: 4,
+                records_per_batch: 4,
+            },
+            faults: vec![],
+        };
+        let a = spec.run();
+        let b = spec.run();
+        assert_eq!(a.recovered, b.recovered, "same seed ⇒ same interleaving");
+        assert_eq!(a.acks, b.acks);
+        assert_eq!(a.recovered, a.written);
+    }
+
     /// Replays every pinned regression seed in `tests/dst_seeds/`. A spec whose
     /// invariants once failed lives here forever; `run()` re-checks them and
     /// panics with the seed repro on any regression. New failing seeds are
@@ -1077,6 +1424,16 @@ mod tests {
             Sim::new(seed)
                 .fault(Fault::SealFails)
                 .scenario(Scenario::SealFailsAtShutdown { records })
+                .run();
+            // Cooperatively-scheduled producer/flusher interleaving ⇒ FIFO +
+            // durability hold; also exercises the scheduler for deadlocks across
+            // many seed-chosen interleavings.
+            let rpb = 1 + (seed >> 16) % 4;
+            Sim::new(seed)
+                .scenario(Scenario::InterleavedFlush {
+                    batches: records,
+                    records_per_batch: rpb as usize,
+                })
                 .run();
         }
     }
