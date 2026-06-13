@@ -149,6 +149,11 @@ pub enum Fault {
     /// The `nth` `fdatasync` on the shard (1-based) returns `EIO` instead of
     /// syncing — models a disk that fails the durability barrier.
     FsyncReturns { nth: u64 },
+    /// The `nth` `write_record` on the shard (1-based) returns a short-write
+    /// error — models a torn write (the writev that only partially lands on
+    /// ENOSPC). `ShardWriter` drops the segment; the prior records written to it
+    /// are now in an un-fsynced, dropped segment.
+    ShortWriteOn { nth: u64 },
     /// The next `seal()` finalises (sentinel + footer + fsync) but its rename
     /// never lands — models a crash between `sync_all` and `rename`.
     RenameFails,
@@ -164,6 +169,10 @@ struct SimFaults {
     fsync_calls: AtomicU64,
     /// Set once an injected fsync actually fired — read by invariant checks.
     fsync_failed: AtomicBool,
+    /// 1-based index of the `write_record` that must tear (`None` = never).
+    write_fail_on: Option<u64>,
+    /// Count of `write_record` calls seen so far (across all handles).
+    write_calls: AtomicU64,
     /// The next seal's rename fails.
     rename_fails: AtomicBool,
 }
@@ -171,10 +180,12 @@ struct SimFaults {
 impl SimFaults {
     fn from_faults(faults: &[Fault]) -> Arc<Self> {
         let mut fsync_fail_on = None;
+        let mut write_fail_on = None;
         let mut rename_fails = false;
         for fault in faults {
             match fault {
                 Fault::FsyncReturns { nth } => fsync_fail_on = Some(*nth),
+                Fault::ShortWriteOn { nth } => write_fail_on = Some(*nth),
                 Fault::RenameFails => rename_fails = true,
             }
         }
@@ -182,6 +193,8 @@ impl SimFaults {
             fsync_fail_on,
             fsync_calls: AtomicU64::new(0),
             fsync_failed: AtomicBool::new(false),
+            write_fail_on,
+            write_calls: AtomicU64::new(0),
             rename_fails: AtomicBool::new(rename_fails),
         })
     }
@@ -237,6 +250,15 @@ struct SimSegmentHandle {
 
 impl SegmentHandle for SimSegmentHandle {
     fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
+        let nth = self.faults.write_calls.fetch_add(1, SeqCst) + 1;
+        if self.faults.write_fail_on == Some(nth) {
+            // Torn write: the underlying writev returned short (ENOSPC). The real
+            // WabSegment poisons and `ShardWriter` drops the segment. We model
+            // the failed write without touching `inner` — ShardWriter drops the
+            // segment on *any* write error, and the prior records' durability
+            // fate is exactly what we're testing.
+            return Err(io::Error::other("DST: injected torn (short) write"));
+        }
         self.inner.write_record(payload)?;
         self.pending.borrow_mut().push(payload.to_vec());
         Ok(())
@@ -721,6 +743,26 @@ mod tests {
         assert_eq!(a.written, b.written, "same seed must produce same payloads");
         assert_eq!(a.recovered, b.recovered);
         assert_eq!(a.written, a.recovered);
+    }
+
+    /// Scenario (Phase 2): a torn write on the 3rd record of a 4-record Sync
+    /// batch drops the active segment mid-flush. The two records already written
+    /// to that segment were never fsynced, so they MUST be Nacked, not falsely
+    /// acked off a later segment's fsync (I1, checked inside `run`). The torn
+    /// record is Nacked; the 4th record lands in a fresh segment and is durably
+    /// acked. This pins the fix for the mid-batch false-ack window.
+    #[test]
+    fn torn_write_midbatch_does_not_falsely_ack_prior_records() {
+        let report = Sim::new(0x5EED_0005)
+            .fault(Fault::ShortWriteOn { nth: 3 })
+            .scenario(Scenario::SyncFlush { records: 4 })
+            .run();
+        assert_eq!(
+            report.acks,
+            vec![false, false, false, true],
+            "records 0-1 (dropped segment) + record 2 (torn) are Nacked; \
+             record 3 (fresh segment, fsynced) is durably acked"
+        );
     }
 
     /// Replays every pinned regression seed in `tests/dst_seeds/`. A spec whose

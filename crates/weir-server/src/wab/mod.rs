@@ -502,22 +502,30 @@ fn flush_batch(
     metrics: &Arc<Metrics>,
     coalesce_hint: &Arc<AtomicU64>,
 ) {
-    // Sync records used to fsync per-record; now they ride the same
-    // group-fsync as Batched. Sync's contract is "fsync before ack" and
-    // a single fsync at the end of the batch covers every record written
-    // during it, so the contract still holds while the fsync rate drops
-    // by up to batch_size× under concurrent Sync load (the previous
-    // per-record fsync was the bottleneck in the herd benchmarks).
-    let mut sync_acks: Vec<oneshot::Sender<bool>> = Vec::new();
-    let mut batched_acks: Vec<oneshot::Sender<bool>> = Vec::new();
-    let mut need_fsync = false;
+    // Sync + Batched records both ride a single group fsync at the end of the
+    // flush (the per-record fsync was the herd-benchmark bottleneck). Their acks
+    // are split by the FATE of the segment each record landed in:
+    //
+    //   - `durable_acks` — records in a segment that ROTATED mid-flush. Rotation
+    //     seals the segment, which fsyncs it, so those records are already on
+    //     stable storage → ack `true` unconditionally (even if the active
+    //     segment's later fsync fails).
+    //   - `pending_acks` — records in the CURRENT active segment, not yet
+    //     synced. They ack with the end-of-batch group fsync's result. Crucially,
+    //     if a later mid-batch `write_record` error DROPS the active segment
+    //     (`ShardWriter` sets `active = None`), every record collected for it is
+    //     Nacked here — otherwise they would ride a group fsync of a *different*
+    //     (or absent) segment and be falsely acked durable while their bytes sit
+    //     in an abandoned, never-fsynced file (silent data loss on crash).
+    let mut durable_acks: Vec<oneshot::Sender<bool>> = Vec::new();
+    let mut pending_acks: Vec<oneshot::Sender<bool>> = Vec::new();
 
-    // bench-trace: per-record enqueued_at for stage_total observation after
-    // the fsync. Cleared alongside sync/batched_acks.
+    // bench-trace: per-record enqueued_at for stage_total observation, split the
+    // same way as the acks.
     #[cfg(feature = "bench-trace")]
-    let mut sync_ts: Vec<Instant> = Vec::new();
+    let mut durable_ts: Vec<Instant> = Vec::new();
     #[cfg(feature = "bench-trace")]
-    let mut batched_ts: Vec<Instant> = Vec::new();
+    let mut pending_ts: Vec<Instant> = Vec::new();
 
     for batch in batches.drain(..) {
         // worker_flushed_at is the instant the worker stamped the Batch.
@@ -540,9 +548,22 @@ fn flush_batch(
             };
 
             // write_record returns Some(sealed_path) when the segment rotated.
-            let Ok(rotation) = writer.write_record(&unit.payload) else {
-                let _ = unit.ack_tx.send(false);
-                continue;
+            let rotation = match writer.write_record(&unit.payload) {
+                Ok(rotation) => rotation,
+                Err(_) => {
+                    // The active segment was dropped. Records already collected
+                    // for it (pending_acks) are now in an abandoned, un-fsynced
+                    // file — Nack them rather than let the group fsync below
+                    // falsely ack them. Records in already-rotated (sealed +
+                    // fsynced) segments are durable and untouched.
+                    for ack_tx in pending_acks.drain(..) {
+                        let _ = ack_tx.send(false);
+                    }
+                    #[cfg(feature = "bench-trace")]
+                    pending_ts.clear();
+                    let _ = unit.ack_tx.send(false);
+                    continue;
+                }
             };
 
             // Observe the write stage (pre-fsync).
@@ -551,8 +572,11 @@ fn flush_batch(
                 .stage_write
                 .observe(flusher_recv_at.elapsed().as_secs_f64());
 
+            let rotated = rotation.is_some();
             if let Some(sealed) = rotation {
-                // Segment was sealed (seal includes fsync). Notify drain.
+                // Segment was sealed (seal includes fsync) — every record in it
+                // is now durable: this triggering record plus all prior records
+                // collected for that segment. Promote them and notify drain.
                 info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
                 metrics
                     .wab_segments
@@ -561,20 +585,25 @@ fn flush_batch(
                     })
                     .inc();
                 drain_tx.send(sealed).ok();
+                durable_acks.append(&mut pending_acks);
+                #[cfg(feature = "bench-trace")]
+                durable_ts.append(&mut pending_ts);
             }
 
             match unit.durability {
-                Durability::Sync => {
-                    need_fsync = true;
-                    sync_acks.push(unit.ack_tx);
-                    #[cfg(feature = "bench-trace")]
-                    sync_ts.push(unit.enqueued_at);
-                }
-                Durability::Batched => {
-                    need_fsync = true;
-                    batched_acks.push(unit.ack_tx);
-                    #[cfg(feature = "bench-trace")]
-                    batched_ts.push(unit.enqueued_at);
+                Durability::Sync | Durability::Batched => {
+                    // A record that triggered rotation is in the just-sealed
+                    // (durable) segment; otherwise it's in the current active
+                    // segment, awaiting the group fsync.
+                    if rotated {
+                        durable_acks.push(unit.ack_tx);
+                        #[cfg(feature = "bench-trace")]
+                        durable_ts.push(unit.enqueued_at);
+                    } else {
+                        pending_acks.push(unit.ack_tx);
+                        #[cfg(feature = "bench-trace")]
+                        pending_ts.push(unit.enqueued_at);
+                    }
                 }
                 Durability::Buffered => {
                     // Observe stage_total for buffered records (ack fires immediately).
@@ -588,21 +617,32 @@ fn flush_batch(
         }
     }
 
-    // Group fsync covering every Sync and Batched record written during
-    // this flush. One fsync per batch instead of one per Sync record;
-    // both tiers' acks fire after it completes.
-    if need_fsync {
+    // One group fsync covers every record still in the active segment; they ack
+    // with its result. (If every fsync-tier record rotated out, pending_acks is
+    // empty and we skip the now-redundant fsync.)
+    if !pending_acks.is_empty() {
         let ok = fsync_observed(writer, shard_id, metrics, coalesce_hint);
-        // Observe stage_total for Sync + Batched records (ack fires after fsync).
         #[cfg(feature = "bench-trace")]
-        for enqueued_at in sync_ts.into_iter().chain(batched_ts) {
+        for enqueued_at in pending_ts {
             metrics
                 .stage_total
                 .observe(enqueued_at.elapsed().as_secs_f64());
         }
-        for ack_tx in sync_acks.into_iter().chain(batched_acks) {
+        for ack_tx in pending_acks {
             let _ = ack_tx.send(ok);
         }
+    }
+
+    // Records in rotated (sealed + fsynced) segments are durable regardless of
+    // the active segment's fsync outcome — ack them true.
+    #[cfg(feature = "bench-trace")]
+    for enqueued_at in durable_ts {
+        metrics
+            .stage_total
+            .observe(enqueued_at.elapsed().as_secs_f64());
+    }
+    for ack_tx in durable_acks {
+        let _ = ack_tx.send(true);
     }
 }
 
