@@ -1,0 +1,21 @@
+# weir config for the monitoring demo stack. Tuned to make the dashboard lively:
+# 4 shards + small segments so the open→sealed→confirmed lifecycle visibly moves.
+# See deploy/docker/weir.toml.example for the full annotated reference.
+
+[server]
+socket_path = "/run/weir/weir.sock"
+wab_dir = "/var/lib/weir/wab"
+shard_count = 4
+worker_count = 4
+batch_size = 256
+batch_deadline_ms = 1
+# Small segments so rotations (sealed/confirmed transitions) happen often enough
+# to watch on the dashboard. Production default is 256 MiB.
+wab_segment_max_bytes = 65536
+metrics_port = 9185
+# Bind metrics to all interfaces so Prometheus (a sibling container) can scrape
+# weir:9185. The default is 127.0.0.1 (localhost-only); in production, restrict
+# access via firewall/port-mapping rather than the bind address.
+metrics_bind = "0.0.0.0"
+sink_type = "noop"
+log_level = "info"

@@ -1,0 +1,84 @@
+# weir monitoring stack — turnkey Prometheus + Grafana + weir + a load generator.
+#
+#   cd deploy/monitoring && docker compose up --build
+#
+# Then open Grafana at http://localhost:3000 (anonymous, the "weir — durable
+# write buffer" dashboard is pre-loaded) and Prometheus at http://localhost:9090
+# (Status → Rules shows the loaded alerts). The loadgen pushes a steady trickle
+# of records across all three durability tiers so the panels show live data.
+#
+# This is an EXAMPLE you own: edit the dashboard in Grafana (it's real Grafana —
+# every panel is customizable), tune the alert thresholds in
+# ../prometheus/weir-alerts.yml, or point your existing Prometheus/Grafana at a
+# real weir instead. weir's only job here is exposing /metrics; Prometheus
+# stores the history and Grafana renders it.
+
+services:
+  weir:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: weir-server:local
+    restart: unless-stopped
+    volumes:
+      - weir_socket:/run/weir
+      - wab_data:/var/lib/weir/wab
+      - ./weir.toml:/etc/weir/weir.toml:ro
+    environment:
+      # Demo: accept the loadgen container regardless of its UID. In production
+      # leave the peer-UID check on (the default) and run producers as the weir user.
+      WEIR_PEER_UID_CHECK: "false"
+      WEIR_LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  loadgen:
+    build:
+      context: ../..
+      dockerfile: deploy/monitoring/loadgen.Dockerfile
+    image: weir-loadgen:local
+    restart: unless-stopped
+    depends_on:
+      weir:
+        condition: service_healthy
+    volumes:
+      - weir_socket:/run/weir
+    environment:
+      WEIR_SOCKET: /run/weir/weir.sock
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    depends_on:
+      - weir
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/weir-alerts.yml:/etc/prometheus/weir-alerts.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/weir-dashboard.json:/var/lib/grafana/dashboards/weir-dashboard.json:ro
+
+volumes:
+  weir_socket:
+    driver: local
+  wab_data:
+    driver: local
