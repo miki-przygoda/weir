@@ -1,0 +1,5 @@
+{
+  "seed": 1593920007,
+  "scenario": { "PanicDuringFlush": { "records": 4 } },
+  "faults": [{ "PanicOnFsync": { "nth": 1 } }]
+}

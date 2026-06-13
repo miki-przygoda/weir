@@ -154,6 +154,12 @@ pub enum Fault {
     /// ENOSPC). `ShardWriter` drops the segment; the prior records written to it
     /// are now in an un-fsynced, dropped segment.
     ShortWriteOn { nth: u64 },
+    /// The `nth` `fdatasync` on the shard (1-based) panics *before* syncing —
+    /// models the flusher crashing at the durability barrier. The panic unwinds
+    /// through `flush_batch` (dropping the pending ack senders → producers Nack)
+    /// and is caught by the panic supervisor, which respawns the flusher. No
+    /// record may be acked `true`: the panic fires before the ack loop.
+    PanicOnFsync { nth: u64 },
     /// Every `seal()` fails outright (its sentinel/footer write or fsync hits
     /// ENOSPC) — the segment is left un-sealed at its `.wab` path. Records
     /// already covered by an earlier group fsync stay durable; recovery must
@@ -174,6 +180,8 @@ struct SimFaults {
     fsync_calls: AtomicU64,
     /// Set once an injected fsync actually fired — read by invariant checks.
     fsync_failed: AtomicBool,
+    /// 1-based index of the fsync that must panic (`None` = never).
+    fsync_panic_on: Option<u64>,
     /// 1-based index of the `write_record` that must tear (`None` = never).
     write_fail_on: Option<u64>,
     /// Count of `write_record` calls seen so far (across all handles).
@@ -187,12 +195,14 @@ struct SimFaults {
 impl SimFaults {
     fn from_faults(faults: &[Fault]) -> Arc<Self> {
         let mut fsync_fail_on = None;
+        let mut fsync_panic_on = None;
         let mut write_fail_on = None;
         let mut seal_fails = false;
         let mut rename_fails = false;
         for fault in faults {
             match fault {
                 Fault::FsyncReturns { nth } => fsync_fail_on = Some(*nth),
+                Fault::PanicOnFsync { nth } => fsync_panic_on = Some(*nth),
                 Fault::ShortWriteOn { nth } => write_fail_on = Some(*nth),
                 Fault::SealFails => seal_fails = true,
                 Fault::RenameFails => rename_fails = true,
@@ -202,6 +212,7 @@ impl SimFaults {
             fsync_fail_on,
             fsync_calls: AtomicU64::new(0),
             fsync_failed: AtomicBool::new(false),
+            fsync_panic_on,
             write_fail_on,
             write_calls: AtomicU64::new(0),
             seal_fails: AtomicBool::new(seal_fails),
@@ -280,6 +291,12 @@ impl SegmentHandle for SimSegmentHandle {
             self.faults.fsync_failed.store(true, SeqCst);
             return Err(io::Error::other("DST: injected EIO on fdatasync"));
         }
+        if self.faults.fsync_panic_on == Some(nth) {
+            // Panic at the barrier — BEFORE the real sync and the ledger mark, so
+            // no record becomes durable and no ledger lock is held (no poison).
+            // The unwind drops the pending ack senders → producers Nack.
+            panic!("DST: injected panic at fdatasync (crash at durability barrier)");
+        }
         self.inner.fsync()?;
         // The barrier succeeded — everything written so far is now durable.
         self.ledger
@@ -339,6 +356,10 @@ pub enum Scenario {
     /// Flush `records` (group-fsynced + acked), then fail the shutdown seal and
     /// run recovery; assert every acked record is still recoverable.
     SealFailsAtShutdown { records: usize },
+    /// Flush `records` under the panic supervisor with a panic injected at the
+    /// fsync barrier; assert the supervisor respawns and no record is falsely
+    /// acked (the panic unwinds before the ack loop).
+    PanicDuringFlush { records: usize },
     /// Drive the panic supervisor under [`SimClock`]; assert it caps out in
     /// virtual (instantly-advanced) time.
     PanicSupervisor,
@@ -365,6 +386,9 @@ impl SimSpec {
             }
             Scenario::SealFailsAtShutdown { records } => {
                 run_seal_fails_at_shutdown(self.seed, &self.faults, *records)
+            }
+            Scenario::PanicDuringFlush { records } => {
+                run_panic_during_flush(self.seed, &self.faults, *records)
             }
             Scenario::PanicSupervisor => run_panic_supervisor(self.seed),
         }
@@ -665,6 +689,101 @@ fn run_seal_fails_at_shutdown(seed: u64, faults: &[Fault], records: usize) -> Si
     }
 }
 
+/// Scenario (Phase 3) — a panic *during* a flush. Runs the flusher under the
+/// real panic supervisor (mirroring `super::spawn`) with a panic injected at the
+/// fsync barrier. The panic unwinds through `flush_batch`, dropping the pending
+/// ack senders (→ producers Nack), and the supervisor respawns the flusher.
+/// Asserts no record is falsely acked `true` and the supervisor recovers.
+fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
+    let env = SimEnv::new("panic_flush");
+    let sim_faults = SimFaults::from_faults(faults);
+    let ledger = Ledger::default();
+
+    let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(records.max(1) * 4);
+    let (drain_tx, _drain_rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let coalesce_hint = Arc::new(AtomicU64::new(200));
+
+    let mut rng = SplitMix64::new(seed);
+    let mut payloads = Vec::with_capacity(records);
+    let mut ack_rxs = Vec::with_capacity(records);
+    let mut units = Vec::with_capacity(records);
+    for i in 0..records {
+        let payload = rng.unique_payload(i as u64);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        ack_rxs.push(ack_rx);
+        units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+        payloads.push(payload);
+    }
+    work_tx.send(make_batch(units)).expect("send batch");
+    drop(work_tx); // after the panic loses the batch, the respawn sees Disconnected
+
+    let shard_dir = env.shard_dir(0);
+    let metrics_for_panic = Arc::clone(&env.metrics);
+    let metrics_for_flusher = Arc::clone(&env.metrics);
+    let faults_for_store = Arc::clone(&sim_faults);
+    let ledger_for_store = ledger.clone();
+    let clock = SimClock::new();
+
+    let handle = std::thread::spawn(move || {
+        // Mirror production: the flusher body runs under panic supervision, which
+        // catches the injected panic and respawns. The body factory re-clones the
+        // shared handles per attempt; the fault state + ledger are shared (Arc).
+        super::run_with_panic_supervision(0, metrics_for_panic, &clock, || {
+            let shard_dir = shard_dir.clone();
+            let work_rx = work_rx.clone();
+            let drain_tx = drain_tx.clone();
+            let metrics = Arc::clone(&metrics_for_flusher);
+            let coalesce_hint = Arc::clone(&coalesce_hint);
+            let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(
+                Arc::clone(&faults_for_store),
+                ledger_for_store.clone(),
+            ));
+            let clock = clock.clone();
+            move || {
+                super::flusher_thread(
+                    0,
+                    shard_dir,
+                    work_rx,
+                    drain_tx,
+                    records.max(1),
+                    Duration::from_millis(5),
+                    64 * 1024 * 1024,
+                    None,
+                    metrics,
+                    coalesce_hint,
+                    &clock,
+                    store,
+                );
+            }
+        });
+    });
+    handle.join().expect("supervised flusher thread join");
+
+    // A panic-dropped ack sender surfaces as a closed channel (try_recv == Closed),
+    // which we record as a Nack (false) — the record was not acked durable.
+    let acks: Vec<bool> = ack_rxs
+        .into_iter()
+        .map(|mut rx| rx.try_recv().unwrap_or(false))
+        .collect();
+
+    // I1 — acked ⟹ durable: a panic at the barrier must never fire a `true` ack
+    // (the panic unwinds before the ack loop).
+    for (payload, &acked) in payloads.iter().zip(&acks) {
+        if acked {
+            assert_invariant(seed, "i1_acked_true_is_durable", ledger.is_durable(payload));
+        }
+    }
+
+    let flusher_panics = env.metrics.wab_flusher_panics.get();
+    env.cleanup();
+    SimReport {
+        seed,
+        acks,
+        flusher_panics,
+        ..Default::default()
+    }
+}
+
 /// Scenario 2 — crash between `sync_all` and `rename` in `seal()` (G-WAB-3).
 /// Writes `records`, seals (rename injected to fail), then recovers; asserts
 /// every synced record comes back intact and in order.
@@ -870,6 +989,28 @@ mod tests {
         assert_eq!(
             report.recovered, report.written,
             "recovery recovers exactly the acked records from the un-sealed segment"
+        );
+    }
+
+    /// Scenario (Phase 3): the flusher panics at the fsync barrier mid-flush.
+    /// The panic unwinds through `flush_batch` (dropping the pending ack
+    /// senders) and the supervisor respawns the flusher. No record may be acked
+    /// `true` — the panic fires before the ack loop — and the supervisor must
+    /// have caught at least one panic and recovered (the run terminates).
+    #[test]
+    fn panic_at_fsync_barrier_acks_nothing_and_supervisor_recovers() {
+        let report = Sim::new(0x5EED_0007)
+            .fault(Fault::PanicOnFsync { nth: 1 })
+            .scenario(Scenario::PanicDuringFlush { records: 4 })
+            .run();
+        assert!(
+            report.acks.iter().all(|&ok| !ok),
+            "a panic at the barrier must not fire a true ack, got {:?}",
+            report.acks
+        );
+        assert!(
+            report.flusher_panics >= 1,
+            "the supervisor must have caught the injected panic"
         );
     }
 
