@@ -47,6 +47,21 @@ jobs:
           WEIR_DST_SWEEP: "300"
         run: cargo test -p weir-server --bin weir-server --features dst "wab::dst::" -- --test-threads=1
 
+  monitoring:
+    name: monitoring (observability e2e)
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # Brings up the full docker-compose stack (weir + Prometheus + Grafana +
+      # loadgen), simulates load, and asserts the metrics advance, the
+      # durability/health invariants hold, and the dashboard's panel queries
+      # return data through Grafana's datasource proxy. Validates the dashboard,
+      # alert rules, and the image build end to end.
+      - name: Monitoring stack smoke test
+        run: deploy/monitoring/smoke-test.sh --teardown
+
   load:
     runs-on: ubuntu-latest
     needs: test

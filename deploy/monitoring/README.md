@@ -35,6 +35,23 @@ Tear down with `docker compose down -v`.
 It's an **example you own** — every Grafana panel is editable, and the alert
 thresholds in `../prometheus/weir-alerts.yml` are yours to tune.
 
+The dashboard opens with an at-a-glance **health strip** (up · fsync-failures ·
+flusher-panics · ack-timeouts · sink-health · drain-state · ingest · nack),
+then Ingest / Durability / Drain / System detail rows.
+
+## Verify it (end-to-end smoke test)
+
+```sh
+./smoke-test.sh             # launch, generate load, assert, leave running
+./smoke-test.sh --teardown  # ... and tear down at the end (CI)
+```
+
+Brings the stack up, simulates movement with the loadgen, then asserts the
+metrics advance, the durability/health invariants hold, and the dashboard's own
+panel queries — run through Grafana's datasource proxy, exactly as the UI does —
+return the right data. Exits non-zero on any failure. Runs in CI (the
+`monitoring` job).
+
 ## Files
 
 | File | Purpose |
@@ -44,6 +61,7 @@ thresholds in `../prometheus/weir-alerts.yml` are yours to tune.
 | `prometheus.yml` | Scrape config + loads the alert rules. |
 | `loadgen.Dockerfile` / `loadgen-loop.sh` | Builds `weir-client`'s `push_simple` example and loops it. |
 | `grafana/provisioning/` | Auto-loads the Prometheus datasource + the dashboard. |
+| `smoke-test.sh` | End-to-end test: launch → load → assert metrics + dashboard data. |
 | `../grafana/weir-dashboard.json` | The dashboard (importable anywhere). |
 | `../prometheus/weir-alerts.yml` | The alert rules (`promtool check rules` validated). |
 
