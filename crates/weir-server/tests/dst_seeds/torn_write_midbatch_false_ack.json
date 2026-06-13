@@ -1,0 +1,5 @@
+{
+  "seed": 1593920005,
+  "scenario": { "SyncFlush": { "records": 4 } },
+  "faults": [{ "ShortWriteOn": { "nth": 3 } }]
+}

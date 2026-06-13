@@ -915,13 +915,27 @@ mod tests {
         for _ in 0..n {
             let seed = rng.next_u64();
             let records = 1 + (seed % 8) as usize;
+            // EIO on the durability barrier ⇒ no false ack.
             Sim::new(seed)
                 .fault(Fault::FsyncReturns { nth: 1 })
                 .scenario(Scenario::SyncFlush { records })
                 .run();
+            // Torn write somewhere in the batch ⇒ no false ack on the records in
+            // the dropped segment.
+            let torn_nth = 1 + (seed >> 8) % records as u64;
+            Sim::new(seed)
+                .fault(Fault::ShortWriteOn { nth: torn_nth })
+                .scenario(Scenario::SyncFlush { records })
+                .run();
+            // Crash between sync_all and rename ⇒ recovery replays everything.
             Sim::new(seed)
                 .fault(Fault::RenameFails)
                 .scenario(Scenario::CrashBeforeRename { records })
+                .run();
+            // ENOSPC at the shutdown seal ⇒ every acked record stays recoverable.
+            Sim::new(seed)
+                .fault(Fault::SealFails)
+                .scenario(Scenario::SealFailsAtShutdown { records })
                 .run();
         }
     }
