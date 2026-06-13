@@ -154,6 +154,11 @@ pub enum Fault {
     /// ENOSPC). `ShardWriter` drops the segment; the prior records written to it
     /// are now in an un-fsynced, dropped segment.
     ShortWriteOn { nth: u64 },
+    /// Every `seal()` fails outright (its sentinel/footer write or fsync hits
+    /// ENOSPC) — the segment is left un-sealed at its `.wab` path. Records
+    /// already covered by an earlier group fsync stay durable; recovery must
+    /// still recover them from the un-sealed file.
+    SealFails,
     /// The next `seal()` finalises (sentinel + footer + fsync) but its rename
     /// never lands — models a crash between `sync_all` and `rename`.
     RenameFails,
@@ -173,6 +178,8 @@ struct SimFaults {
     write_fail_on: Option<u64>,
     /// Count of `write_record` calls seen so far (across all handles).
     write_calls: AtomicU64,
+    /// Every seal fails outright (ENOSPC at seal).
+    seal_fails: AtomicBool,
     /// The next seal's rename fails.
     rename_fails: AtomicBool,
 }
@@ -181,11 +188,13 @@ impl SimFaults {
     fn from_faults(faults: &[Fault]) -> Arc<Self> {
         let mut fsync_fail_on = None;
         let mut write_fail_on = None;
+        let mut seal_fails = false;
         let mut rename_fails = false;
         for fault in faults {
             match fault {
                 Fault::FsyncReturns { nth } => fsync_fail_on = Some(*nth),
                 Fault::ShortWriteOn { nth } => write_fail_on = Some(*nth),
+                Fault::SealFails => seal_fails = true,
                 Fault::RenameFails => rename_fails = true,
             }
         }
@@ -195,6 +204,7 @@ impl SimFaults {
             fsync_failed: AtomicBool::new(false),
             write_fail_on,
             write_calls: AtomicU64::new(0),
+            seal_fails: AtomicBool::new(seal_fails),
             rename_fails: AtomicBool::new(rename_fails),
         })
     }
@@ -288,6 +298,15 @@ impl SegmentHandle for SimSegmentHandle {
             ledger,
             pending,
         } = *self;
+        if faults.seal_fails.load(SeqCst) {
+            // ENOSPC at seal: the sentinel/footer write or fsync fails, leaving
+            // the segment un-sealed at its `.wab` path. We do NOT mark `pending`
+            // durable — the seal's own fsync didn't complete. Records covered by
+            // an earlier group fsync are already in the ledger from that fsync;
+            // records that were never group-fsynced (e.g. a failed rotation
+            // seal) correctly stay non-durable and get Nacked by the caller.
+            return Err(io::Error::other("DST: injected ENOSPC at seal"));
+        }
         if faults.rename_fails.load(SeqCst) {
             // Durably finalise (sentinel + footer + fsync) but never rename:
             // the segment is left fully formed at its `.wab` path, exactly as a
@@ -317,6 +336,9 @@ pub enum Scenario {
     /// Write `records`, seal (rename injected to fail = crash), then run
     /// recovery; collect the recovered payloads.
     CrashBeforeRename { records: usize },
+    /// Flush `records` (group-fsynced + acked), then fail the shutdown seal and
+    /// run recovery; assert every acked record is still recoverable.
+    SealFailsAtShutdown { records: usize },
     /// Drive the panic supervisor under [`SimClock`]; assert it caps out in
     /// virtual (instantly-advanced) time.
     PanicSupervisor,
@@ -340,6 +362,9 @@ impl SimSpec {
             Scenario::SyncFlush { records } => run_sync_flush(self.seed, &self.faults, *records),
             Scenario::CrashBeforeRename { records } => {
                 run_crash_before_rename(self.seed, &self.faults, *records)
+            }
+            Scenario::SealFailsAtShutdown { records } => {
+                run_seal_fails_at_shutdown(self.seed, &self.faults, *records)
             }
             Scenario::PanicSupervisor => run_panic_supervisor(self.seed),
         }
@@ -492,10 +517,22 @@ fn read_sealed_payloads(shard_dir: &Path) -> Vec<Vec<u8>> {
     out
 }
 
-/// Scenario 1 — `EIO` on `fdatasync` (G-WAB-1). Sends `records` Sync units
-/// through the real flusher thread under the fault schedule; asserts that a
-/// failed durability barrier produces no `true` ack.
-fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
+/// The observable result of driving the real flusher over a batch of Sync
+/// records: what was sent, how each was acked, the durability ledger, and the
+/// (not-yet-cleaned-up) environment so a caller can run recovery against it.
+struct FlushOutcome {
+    payloads: Vec<Vec<u8>>,
+    acks: Vec<bool>,
+    ledger: Ledger,
+    fsync_failed: bool,
+    env: SimEnv,
+}
+
+/// Sends `records` unique Sync units in one batch through the **real**
+/// [`super::flusher_thread`] under `faults`, joins the flusher, and collects the
+/// per-record acks. Performs no invariant checks and leaves `env` un-cleaned so
+/// the caller can recover from the on-disk state.
+fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutcome {
     let env = SimEnv::new("sync_flush");
     let sim_faults = SimFaults::from_faults(faults);
     let ledger = Ledger::default();
@@ -525,7 +562,6 @@ fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
 
     let shard_dir = env.shard_dir(0);
     let metrics = Arc::clone(&env.metrics);
-    let store_for_thread = Arc::clone(&store);
     let handle = std::thread::spawn(move || {
         super::flusher_thread(
             0,
@@ -539,7 +575,7 @@ fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
             metrics,
             coalesce_hint,
             &clock,
-            store_for_thread,
+            store,
         );
     });
     handle.join().expect("flusher thread join");
@@ -553,23 +589,78 @@ fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
         })
         .collect();
 
-    let fsync_failed = sim_faults.any_fsync_failed();
-    // I1 — durability causality: a record acked `true` must have actually
-    // reached stable storage (be in the ledger). This subsumes the simple
-    // "EIO ⇒ all Nacked" check and catches mid-batch false-ack windows, where a
-    // record acked off one segment's fsync was written to a *different* segment
-    // that was dropped without a sync.
-    for (payload, &acked) in payloads.iter().zip(&acks) {
+    FlushOutcome {
+        payloads,
+        acks,
+        ledger,
+        fsync_failed: sim_faults.any_fsync_failed(),
+        env,
+    }
+}
+
+/// I1 — durability causality: a record acked `true` must actually be on stable
+/// storage (in the ledger). Subsumes the simple "EIO ⇒ all Nacked" check and
+/// catches mid-batch false-ack windows.
+fn assert_acked_records_durable(seed: u64, out: &FlushOutcome) {
+    for (payload, &acked) in out.payloads.iter().zip(&out.acks) {
         if acked {
-            assert_invariant(seed, "i1_acked_true_is_durable", ledger.is_durable(payload));
+            assert_invariant(
+                seed,
+                "i1_acked_true_is_durable",
+                out.ledger.is_durable(payload),
+            );
+        }
+    }
+}
+
+/// Scenario 1 — `EIO` on `fdatasync` (G-WAB-1). Sends `records` Sync units
+/// through the real flusher thread under the fault schedule; asserts that a
+/// failed durability barrier produces no `true` ack.
+fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
+    let out = drive_sync_flusher(seed, faults, records);
+    assert_acked_records_durable(seed, &out);
+    out.env.cleanup();
+    SimReport {
+        seed,
+        acks: out.acks,
+        fsync_failed: out.fsync_failed,
+        ..Default::default()
+    }
+}
+
+/// Scenario (Phase 2) — `ENOSPC` at the shutdown seal. The records are written
+/// and group-fsynced (acked `true` + durable), then the flusher's shutdown seal
+/// fails, leaving an un-sealed `.wab`. Recovery must still recover every acked
+/// record: a durable ack survives a failed seal.
+fn run_seal_fails_at_shutdown(seed: u64, faults: &[Fault], records: usize) -> SimReport {
+    let out = drive_sync_flusher(seed, faults, records);
+    // The group fsync succeeded, so the records are durable and acked despite
+    // the later seal failure.
+    assert_acked_records_durable(seed, &out);
+
+    // The shutdown seal failed → the segment is an un-sealed `.wab`. Recover it.
+    super::recovery::recover_open_segments(&out.env.wab_dir, &out.env.metrics).expect("recovery");
+    let recovered = read_sealed_payloads(&out.env.shard_dir(0));
+
+    // I3 — durable-ack survivability: every record acked `true` must be
+    // recoverable after the failed seal (no acked record is lost).
+    for (payload, &acked) in out.payloads.iter().zip(&out.acks) {
+        if acked {
+            assert_invariant(
+                seed,
+                "i3_acked_record_recoverable",
+                recovered.contains(payload),
+            );
         }
     }
 
-    env.cleanup();
+    out.env.cleanup();
     SimReport {
         seed,
-        acks,
-        fsync_failed,
+        acks: out.acks,
+        fsync_failed: out.fsync_failed,
+        written: out.payloads,
+        recovered,
         ..Default::default()
     }
 }
@@ -762,6 +853,23 @@ mod tests {
             vec![false, false, false, true],
             "records 0-1 (dropped segment) + record 2 (torn) are Nacked; \
              record 3 (fresh segment, fsynced) is durably acked"
+        );
+    }
+
+    /// Scenario (Phase 2): the shutdown seal hits ENOSPC after the records were
+    /// already group-fsynced + acked. The acks stay `true` (the data is durable)
+    /// and recovery recovers every one of them from the un-sealed `.wab` — a
+    /// failed seal must not lose an acked record.
+    #[test]
+    fn enospc_at_shutdown_seal_recovers_every_acked_record() {
+        let report = Sim::new(0x5EED_0006)
+            .fault(Fault::SealFails)
+            .scenario(Scenario::SealFailsAtShutdown { records: 5 })
+            .run();
+        assert_eq!(report.acks, vec![true; 5], "the group fsync succeeded");
+        assert_eq!(
+            report.recovered, report.written,
+            "recovery recovers exactly the acked records from the un-sealed segment"
         );
     }
 
