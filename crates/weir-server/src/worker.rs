@@ -545,4 +545,46 @@ mod tests {
                 .expect("worker thread should exit cleanly after disconnect");
         }
     }
+
+    /// G-QUEUE-1: when a shard's flusher is offline (its `Batch` receiver is
+    /// gone — e.g. the flusher panic-capped-out), the worker's `flush_shard`
+    /// send fails. It must do so gracefully: drop the batch (taking the
+    /// `WorkUnit`s' `ack_tx`s with it) rather than panic or block, so producers
+    /// observe a closed ack channel and Nack. No record is silently lost with a
+    /// success ack — at-least-once holds under shard failure.
+    #[test]
+    fn offline_shard_nacks_records_without_panicking() {
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let (shard_txs, shard_rxs) = make_shard_channels(1);
+        // Flusher offline: drop the only shard's Batch receiver so every send
+        // from the worker returns Disconnected.
+        drop(shard_rxs);
+
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            10,
+            Duration::from_millis(10),
+            default_hint(),
+        );
+
+        let (unit, mut ack_rx) = make_unit(0, b"orphan");
+        queue_tx.push(0, unit);
+
+        drop(queue_tx); // worker drains, flushes to the offline shard, then exits
+        for h in handles {
+            h.join()
+                .expect("worker must not panic when its shard is offline");
+        }
+
+        // The batch could not be sent, so it (and the ack_tx inside it) was
+        // dropped → the producer sees a closed channel, i.e. a Nack — never a
+        // false `true`.
+        match ack_rx.try_recv() {
+            Err(oneshot::error::TryRecvError::Closed) => {}
+            other => panic!("offline shard should Nack via a closed ack channel, got {other:?}"),
+        }
+    }
 }
