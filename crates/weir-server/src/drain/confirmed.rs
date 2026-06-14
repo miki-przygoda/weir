@@ -47,13 +47,26 @@ pub(super) fn write_confirmed_file(sealed: &Path, record_count: u64) {
     let confirmed = confirmed_path(sealed);
     let sealed_at = read_sealed_at_nanos(sealed).unwrap_or(0);
     let bytes = build_confirmed(sealed_at, record_count, unix_nanos_now());
-    if let Err(e) = std::fs::write(&confirmed, bytes) {
+    if let Err(e) = write_confirmed_durably(&confirmed, &bytes) {
         error!(
             path = %confirmed.display(),
             error = %e,
-            "drain: failed to write .confirmed file; segment will be replayed on restart"
+            "drain: failed to durably write .confirmed file; segment may be re-drained on restart"
         );
     }
+}
+
+/// Writes the sidecar and makes both its contents and its directory entry
+/// durable. Without the fsyncs a crash can lose (or tear) the `.confirmed` file,
+/// causing the already-delivered segment to be re-drained on restart — duplicate
+/// delivery (tolerated by the at-least-once + dedup contract, but avoidable).
+fn write_confirmed_durably(confirmed: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(confirmed)?;
+    f.write_all(bytes)?;
+    f.sync_all()?; // sidecar contents durable
+    crate::wab::segment::fsync_parent_dir(confirmed)?; // sidecar dirent durable
+    Ok(())
 }
 
 /// Derives the `.wab.confirmed` path from a `.wab.sealed` path by swapping

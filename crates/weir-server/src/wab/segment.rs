@@ -78,6 +78,11 @@ impl WabSegment {
         };
 
         seg.file.write_all(&header)?;
+        // Make the new file's directory entry durable. Records written here are
+        // group-fsynced for their *data*, but the dirent that links this file into
+        // the shard dir is only crash-durable after a parent-dir fsync — without
+        // it, a crash could orphan a file whose Sync records we acked as durable.
+        fsync_parent_dir(path)?;
         Ok(seg)
     }
 
@@ -237,6 +242,11 @@ impl WabSegment {
         let active_path = self.finalize_to_disk()?;
         let sealed_path = sealed_path_for(&active_path);
         std::fs::rename(&active_path, &sealed_path)?;
+        // Publish the rename durably: without a parent-dir fsync a crash can lose
+        // the .wab.sealed dirent. (Recovery would re-seal the orphaned .wab, so
+        // this is lower-stakes than the create-time fsync above — but it keeps the
+        // documented "seal is the durability commit point" honest.)
+        fsync_parent_dir(&sealed_path)?;
         Ok(sealed_path)
     }
 }
@@ -491,6 +501,33 @@ fn platform_fsync(file: &File) -> io::Result<()> {
     file.sync_data() // fdatasync on Linux
 }
 
+/// Fsyncs the parent directory of `path` so a preceding create or rename of that
+/// entry is durable across a crash.
+///
+/// `platform_fsync` makes a file's *data* durable, but POSIX only guarantees the
+/// *directory entry* (the create/rename that links the file into its dir) is
+/// durable after an fsync on the parent directory. Without this, a crash right
+/// after [`WabSegment::create`] could orphan a file whose records we later ack as
+/// durable, and a crash right after [`WabSegment::seal`]'s rename could lose the
+/// `.wab.sealed` publication. Opening a directory read-only and fsync-ing its fd
+/// flushes its entries on Linux and macOS (`F_BARRIERFSYNC` is file-specific; the
+/// plain `fsync` behind `sync_all` is the directory-durability primitive).
+///
+/// No-op on Windows: the WAB's `fdatasync`-based durability model is Unix-first,
+/// and opening a directory as a `File` is not portable there.
+#[cfg(not(windows))]
+pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +561,19 @@ mod tests {
         assert!(sealed.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
         assert!(!path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fsync_parent_dir_smoke() {
+        // The dir-fsync helper used after create/seal/.confirmed to make directory
+        // entries crash-durable (B4). Must succeed for a file in a real directory
+        // and be a harmless no-op when there is no parent component.
+        let dir = tmp_dir("fsyncdir");
+        let path = dir.join("seg_00000001.wab");
+        fs::write(&path, b"x").unwrap();
+        fsync_parent_dir(&path).unwrap();
+        fsync_parent_dir(std::path::Path::new("no_parent_component")).unwrap();
         fs::remove_dir_all(dir).ok();
     }
 
