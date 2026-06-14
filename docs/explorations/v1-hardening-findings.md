@@ -186,6 +186,21 @@ the nack-reason decode oracle, metrics endpoint has its own conn cap).
 
 ## Part 3 — Refactor & code quality
 
+> **STATUS (2026-06-14): ALL of R1–R10 RESOLVED**, one commit each. API-freeze
+> gates: **R1** `ba34cf7` (Payload alias→newtype over Bytes — Deref/AsRef + length-only
+> Debug, closes **F2**), **R2** `841a3c4` (Header/Envelope fields→private + accessors;
+> Envelope::new derives payload_len so it can't desync), **R3** `6b14669`
+> (`#![deny(missing_docs)]` on weir-core/client/sink-sdk + weir-core crate doc + 25
+> filled gaps). Safe refactors: **R4** `6504915` (sealed→confirmed path hoisted to
+> `wab::format::confirmed_path_for`), **R5** `d48c719` (path-validator drift guard +
+> stale-comment fix), **R6** `fb423c0` (main.rs sink-selection helpers), **R7** `d1f3325`
+> (drain ProcessResult→DrainState single source of truth). Housekeeping: **R8** `f147e58`
+> (dead `_UNUSED_DURATION_TAG`), **R9** `f049801` (WabSegment::create O_EXCL doc), **R10**
+> `33f8b9c` (wab/* pub→pub(crate) outside the format facade). Module-split was
+> CONSIDERED-AND-SKIPPED (user's call; the scout judged the production code cohesive and
+> the bulk is colocated tests). Full gate green across default·tls·clickhouse-sink·dst·
+> no-default-features. **Part 3 fully closed.**
+
 **Headline:** the codebase is in unusually good shape — the "large modules" are large
 mostly from dense, high-quality *colocated tests* (drain ~66% tests, wab ~52%, config
 ~40%). **No structural change is recommended inside the ack/fsync path.** The
