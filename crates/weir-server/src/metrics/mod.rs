@@ -171,6 +171,13 @@ pub(crate) struct Metrics {
     /// healthy deployment; non-zero suggests an attempted bypass of the
     /// socket file's mode bits or a misconfigured producer.
     pub connection_rejected_peer_uid: Counter<u64, AtomicU64>,
+    /// Counts `accept(2)` failures due to resource exhaustion (EMFILE/ENFILE/
+    /// ENOBUFS/ENOMEM). On these the accept loop backs off briefly before
+    /// retrying, because the pending connection stays in the kernel queue and
+    /// an immediate retry would busy-spin. A rising value means the daemon is
+    /// out of file descriptors or socket buffers — raise the fd ulimit or
+    /// lower `max_connections`.
+    pub accept_resource_exhaustion: Counter<u64, AtomicU64>,
     /// Counts in-flight connections that were force-aborted because they
     /// didn't drain within `shutdown_timeout_secs`. Each aborted connection
     /// may correspond to a push whose record was written to the WAB but
@@ -321,6 +328,13 @@ impl Metrics {
             "Connections refused by the peer-credential check (peer uid != daemon uid, \
              or credential lookup failed). Any non-zero value suggests an attempted \
              bypass of the socket file's 0o600 mode or a misconfigured producer."
+        );
+        let accept_resource_exhaustion = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_accept_resource_exhaustion",
+            "accept(2) failures due to resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM). \
+             The accept loop backs off briefly on each. A rising value means the daemon is \
+             out of file descriptors or socket buffers."
         );
         let connections_aborted_at_shutdown = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -480,6 +494,7 @@ impl Metrics {
             accept_latency,
             connection_idle_timeout,
             connection_rejected_peer_uid,
+            accept_resource_exhaustion,
             connections_aborted_at_shutdown,
             ack_timeout,
             tls_handshake_failures,

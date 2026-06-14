@@ -204,6 +204,15 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!(error = %e, "accept error");
+                        if is_accept_resource_exhaustion(&e) {
+                            // The pending connection stays in the kernel accept
+                            // queue, so retrying immediately busy-spins at 100%
+                            // CPU and floods the log until an fd frees. Back off
+                            // to yield the CPU. The shutdown signal still wins
+                            // because the select! re-evaluates after the sleep.
+                            metrics.accept_resource_exhaustion.inc();
+                            time::sleep(ACCEPT_BACKOFF_ON_EXHAUSTION).await;
+                        }
                     }
                 }
             }
@@ -247,6 +256,29 @@ pub async fn run(
 
 async fn drain_join_set(join_set: &mut JoinSet<()>) {
     while join_set.join_next().await.is_some() {}
+}
+
+/// Backoff applied when `accept(2)` fails with a resource-exhaustion errno.
+/// Long enough to yield the CPU and let a descriptor or buffer be returned,
+/// short enough that throughput recovers promptly once pressure clears.
+#[cfg(unix)]
+pub(super) const ACCEPT_BACKOFF_ON_EXHAUSTION: Duration = Duration::from_millis(50);
+
+/// True if an `accept(2)` error is a transient resource-exhaustion condition
+/// (out of file descriptors or socket buffers). On these the pending
+/// connection stays in the kernel accept queue, so an immediate retry returns
+/// the same error and the loop busy-spins at 100% CPU while flooding the log.
+/// The fix is to back off briefly; the condition clears once an fd frees.
+///
+/// `ECONNABORTED` is deliberately excluded — there the client aborted before
+/// `accept` completed, the queue entry is consumed, and retrying immediately
+/// is correct (no spin).
+#[cfg(unix)]
+pub(super) fn is_accept_resource_exhaustion(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+    )
 }
 
 /// Validates a socket path: absolute, no `..`, no null bytes.
@@ -757,6 +789,25 @@ mod tests {
         assert!(is_group_or_other_writable(0o1777));
         // The sticky/setuid/setgid bits alone (no write bits) are not writable.
         assert!(!is_group_or_other_writable(0o1700));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_accept_resource_exhaustion_classifies_errnos() {
+        // Resource-exhaustion errnos warrant a backoff.
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(
+                is_accept_resource_exhaustion(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} should back off"
+            );
+        }
+        // ECONNABORTED (client aborted pre-accept) and non-errno errors do not.
+        assert!(!is_accept_resource_exhaustion(
+            &io::Error::from_raw_os_error(libc::ECONNABORTED)
+        ));
+        assert!(!is_accept_resource_exhaustion(&io::Error::other(
+            "synthetic"
+        )));
     }
 
     #[tokio::test]

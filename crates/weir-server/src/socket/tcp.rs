@@ -234,6 +234,14 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!(error = %e, "TCP accept error");
+                        if super::is_accept_resource_exhaustion(&e) {
+                            // Same rationale as the Unix loop: the pending
+                            // connection stays queued, so an immediate retry
+                            // busy-spins. Back off to yield the CPU until a
+                            // descriptor or buffer frees.
+                            metrics.accept_resource_exhaustion.inc();
+                            time::sleep(super::ACCEPT_BACKOFF_ON_EXHAUSTION).await;
+                        }
                     }
                 }
             }
