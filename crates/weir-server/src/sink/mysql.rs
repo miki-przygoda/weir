@@ -146,8 +146,13 @@ impl MySqlSink {
             .map_err(MySqlSinkBuildError::from)?;
         sql_common::validate_identifier("column", &config.column, IDENTIFIER_MAX_LEN)
             .map_err(MySqlSinkBuildError::from)?;
-        let opts = mysql_async::Opts::from_url(&config.url)
-            .map_err(|e| MySqlSinkBuildError::InvalidUrl(e.to_string()))?;
+        let opts = mysql_async::Opts::from_url(&config.url).map_err(|_e| {
+            // Do not surface the driver's error verbatim — it can embed the
+            // connection URL including the user:password@ component, leaking the
+            // password to stderr/logs. Report the redacted URL instead (the same
+            // redaction the Debug impl uses).
+            MySqlSinkBuildError::InvalidUrl(sql_common::redact_password(&config.url))
+        })?;
         let pool = Pool::new(opts);
         Ok(Self {
             config,
@@ -354,6 +359,26 @@ mod tests {
             MySqlSink::new(c).unwrap_err(),
             MySqlSinkBuildError::InvalidUrl(_)
         ));
+    }
+
+    #[test]
+    fn invalid_url_error_redacts_password() {
+        // A URL carrying a password but failing to parse: the build error must
+        // report the REDACTED url, never the driver's verbatim string (which can
+        // embed user:password@) — otherwise the password leaks to stderr/logs.
+        let mut c = cfg();
+        c.url = "mysql://user:supersecret@host:notaport/db".to_string();
+        let err = MySqlSink::new(c).unwrap_err();
+        assert!(
+            matches!(err, MySqlSinkBuildError::InvalidUrl(_)),
+            "expected InvalidUrl, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("<redacted>"), "url must be redacted: {msg}");
+        assert!(
+            !msg.contains("supersecret"),
+            "password must not leak: {msg}"
+        );
     }
 
     // The full identifier-validation matrix lives in
