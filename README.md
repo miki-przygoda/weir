@@ -63,11 +63,14 @@ amortises downstream cost via bulk drain.
 
 ## Crates
 
-| Crate         | Type      | Description                                                                                          |
-|---------------|-----------|------------------------------------------------------------------------------------------------------|
-| `weir-core`   | lib       | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`. Cross-platform.              |
-| `weir-server` | bin + lib | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
-| `weir-client` | lib       | Client library. Connects over a Unix socket, sends Push/HealthCheck frames, returns typed errors. Ships two examples (`push_simple`, `health_check`). Benchmark coverage lives in `weir-server/tests/load.rs`. |
+| Crate           | Type       | Description                                                                                          |
+|-----------------|------------|------------------------------------------------------------------------------------------------------|
+| `weir-core`     | lib        | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`, `Payload`. Cross-platform.   |
+| `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
+| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships two examples (`push_simple`, `health_check`). Benchmark coverage lives in `weir-server/tests/load.rs`. |
+| `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract, published standalone so downstream authors can write custom sinks without depending on the daemon internals. |
+| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop). |
+| `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
 
 ## Non-goals (v1)
 
@@ -75,7 +78,9 @@ amortises downstream cost via bulk drain.
 - **Not a message broker** — no pub/sub, no fan-out. One producer stream, one sink.
 - **Not a database** — the WAB is not queryable; replay on crash is the only read path.
 - **Not opinionated about serialisation** — the wire envelope carries opaque bytes.
-- **No TCP in v1** — Unix domain socket only. TCP + TLS is a later addition.
+
+The default transport is the Unix domain socket; an optional TCP + mutual-TLS
+listener is available behind the `tls` feature for cross-host producers.
 
 ## License
 

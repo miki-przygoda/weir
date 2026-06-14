@@ -70,7 +70,7 @@ s, see `shutdown_timeout_secs`).
 
 ```bash
 cargo build --release -p weir-client    # client library (lib)
-cargo build --release                   # all three crates
+cargo build --release                   # the whole workspace
 ```
 
 To exercise the daemon end-to-end without writing producer code, build and
