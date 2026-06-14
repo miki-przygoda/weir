@@ -46,8 +46,10 @@ impl WabSegment {
     /// Creates a new segment file at `path`.
     ///
     /// Uses `O_CREAT | O_EXCL | O_NOFOLLOW` to prevent symlink attacks and
-    /// ensure the file is newly created. The caller must guarantee `path` does
-    /// not already exist.
+    /// ensure the file is newly created. `O_EXCL` *enforces* non-existence: if
+    /// `path` already exists the call returns [`io::ErrorKind::AlreadyExists`]
+    /// rather than truncating or appending, so the caller never has to check
+    /// first (and a racing creator can't be silently clobbered).
     pub fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
         // O_NOFOLLOW: reject symlinks at the target path (prevents TOCTOU redirect).
         // mode 0o600: segment files are private to the daemon; no group/other read.
