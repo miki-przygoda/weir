@@ -344,11 +344,21 @@ impl Sink for HttpSink {
     }
 
     async fn health(&self) -> SinkHealth {
-        // Coarse health probe: HEAD the URL. If it returns 2xx/3xx, healthy;
-        // 4xx (other than auth challenges) suggests an endpoint misconfig
-        // (degraded); 5xx or transport failure suggests the endpoint is down.
+        // Coarse health probe: HEAD the URL. This probe is UNAUTHENTICATED —
+        // the bearer token is attached per-POST in commit(), not as a client
+        // default — so a 401/403 here is an expected auth challenge from a
+        // reachable endpoint, not a misconfiguration; the real (authenticated)
+        // commit path will succeed, so treat it as healthy. 2xx/3xx are
+        // healthy; other 4xx suggest an endpoint misconfig (degraded); 5xx or a
+        // transport failure suggests the endpoint is down.
         match self.client.head(&self.config.url).send().await {
             Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                SinkHealth::Healthy
+            }
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN =>
+            {
                 SinkHealth::Healthy
             }
             Ok(resp) if resp.status().is_client_error() => {
@@ -728,6 +738,41 @@ mod tests {
             "Idempotency-Key header should be absent when disabled, found:\n{}",
             headers[0]
         );
+    }
+
+    // ── Health probe tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_treats_auth_challenge_as_healthy() {
+        // The HEAD probe is unauthenticated; a 401/403 from a reachable
+        // endpoint is an expected auth challenge, not a misconfig. The
+        // authenticated commit path still works, so report healthy.
+        for resp in [
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let (url, _counter) = spawn_mock_server(vec![resp]).await;
+            let sink = HttpSink::new(cfg(&url)).unwrap();
+            assert!(
+                matches!(sink.health().await, SinkHealth::Healthy),
+                "{resp} should be healthy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_treats_other_4xx_as_degraded_and_5xx_as_down() {
+        let (url, _c) =
+            spawn_mock_server(vec!["HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"]).await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        assert!(matches!(sink.health().await, SinkHealth::Degraded(_)));
+
+        let (url, _c) = spawn_mock_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        assert!(matches!(sink.health().await, SinkHealth::Down(_)));
     }
 
     // ── Retry-After header tests ──────────────────────────────────────────
