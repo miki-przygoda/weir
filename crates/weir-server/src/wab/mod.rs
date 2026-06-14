@@ -331,7 +331,17 @@ pub(crate) fn replay_unconfirmed(
                     info!(sealed = %sealed.display(), "skipping replay — segment already confirmed");
                 }
                 Ok(false) => {
-                    let record_count = read_segment_record_count(&sealed).unwrap_or(0);
+                    // A footer-read failure here only undercounts the
+                    // recovery_records_replayed metric (the segment is still
+                    // queued + delivered); surface it rather than silently
+                    // reporting 0 so the undercount is explainable.
+                    let record_count = match read_segment_record_count(&sealed) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
+                            0
+                        }
+                    };
                     info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
                     metrics.recovery_records_replayed.inc_by(record_count);
                     drain_tx.send(sealed).map_err(|_| {
