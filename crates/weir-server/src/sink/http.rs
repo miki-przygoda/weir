@@ -131,9 +131,9 @@ impl HttpSink {
             req = req.bearer_auth(token.as_ref());
         }
 
-        // No-copy: reqwest::Body implements From<bytes::Bytes> — payload bytes
-        // are handed to reqwest without any allocation or memcopy.
-        let req = req.body(payload);
+        // No-copy: reqwest::Body implements From<bytes::Bytes> — the payload's
+        // inner Bytes is handed to reqwest without any allocation or memcopy.
+        let req = req.body(payload.into_bytes());
 
         let resp = match req.send().await {
             Ok(r) => r,
