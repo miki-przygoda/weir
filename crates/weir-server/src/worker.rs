@@ -100,18 +100,18 @@ impl Worker {
                         self.flush_shard(shard);
                     }
                     let mut total_drained: usize = 1; // the wake-up record
-                    // Phase 1: wait-free drain.
-                    while self.any_buffer_below_batch_size() {
-                        match work_rx.try_recv() {
-                            Ok(unit) => {
-                                total_drained += 1;
-                                let shard = (unit.shard_id as usize) % self.buffers.len();
-                                self.buffers[shard].push(unit);
-                                if self.buffers[shard].len() >= self.batch_size {
-                                    self.flush_shard(shard);
-                                }
-                            }
-                            Err(_) => break,
+                    // Phase 1: wait-free drain. A shard buffer is flushed (and
+                    // swapped for a fresh empty one) the instant it reaches
+                    // batch_size, so no buffer is ever at the ceiling at the top
+                    // of this loop — the drain is bounded by the channel running
+                    // dry, not by buffer fullness. Pull until try_recv reports
+                    // empty.
+                    while let Ok(unit) = work_rx.try_recv() {
+                        total_drained += 1;
+                        let shard = (unit.shard_id as usize) % self.buffers.len();
+                        self.buffers[shard].push(unit);
+                        if self.buffers[shard].len() >= self.batch_size {
+                            self.flush_shard(shard);
                         }
                     }
                     // Phase 2: coalesce only when the PREVIOUS batch told us
@@ -120,17 +120,12 @@ impl Worker {
                     // arrival hits this branch because the previous batch
                     // (large) set the flag.
                     if expect_concurrent {
-                        while self.any_buffer_below_batch_size() {
-                            match work_rx.recv_timeout(window) {
-                                Ok(unit) => {
-                                    total_drained += 1;
-                                    let shard = (unit.shard_id as usize) % self.buffers.len();
-                                    self.buffers[shard].push(unit);
-                                    if self.buffers[shard].len() >= self.batch_size {
-                                        self.flush_shard(shard);
-                                    }
-                                }
-                                Err(_) => break,
+                        while let Ok(unit) = work_rx.recv_timeout(window) {
+                            total_drained += 1;
+                            let shard = (unit.shard_id as usize) % self.buffers.len();
+                            self.buffers[shard].push(unit);
+                            if self.buffers[shard].len() >= self.batch_size {
+                                self.flush_shard(shard);
                             }
                         }
                     }
@@ -151,14 +146,6 @@ impl Worker {
                 }
             }
         }
-    }
-
-    /// Returns true if any shard's buffer has room left before hitting
-    /// `batch_size`. Used as the inner-loop drain guard so we never overrun
-    /// the batch-size ceiling — if every buffer is already at the ceiling,
-    /// continuing the drain just wastes a try_recv.
-    fn any_buffer_below_batch_size(&self) -> bool {
-        self.buffers.iter().any(|b| b.len() < self.batch_size)
     }
 
     /// Flushes one shard's buffer. Swaps in a fresh pre-allocated buffer so
