@@ -528,7 +528,15 @@ async fn commit_batch<S: Sink>(
                             .set(dead_letter.total_bytes() as f64);
                     }
                     Err(e) => {
-                        error!(error = %e, "drain: failed to write dead-letter records");
+                        // The records were rejected by the sink AND could not be
+                        // dead-lettered (e.g. ENOSPC on the dead-letter dir — exactly
+                        // when pressure peaks). Falling through to Ok would confirm
+                        // and DELETE the segment with these records neither delivered
+                        // nor dead-lettered: silent data loss. Treat it as transient
+                        // so the segment is preserved and retried (the already-
+                        // committed records re-send under the at-least-once contract).
+                        error!(error = %e, "drain: failed to write dead-letter records; preserving segment for retry");
+                        return BatchResult::Transient { retry_after: None };
                     }
                 }
             }
@@ -580,13 +588,20 @@ async fn commit_batch<S: Sink>(
                         .set(dead_letter.total_bytes() as f64);
                 }
                 Err(dl_err) => {
-                    error!(error = %dl_err, "drain: failed to write dead-letter records for permanent error");
+                    // The batch hit a permanent sink error AND could not be
+                    // dead-lettered. Confirming here would DELETE the segment with
+                    // the records neither delivered nor dead-lettered — silent data
+                    // loss. Preserve the segment by retrying; the dead-letter write
+                    // typically succeeds once disk pressure clears, or the drain
+                    // blocks on the dead-letter cap (would_exceed_cap above).
+                    error!(error = %dl_err, "drain: failed to dead-letter records for permanent error; preserving segment for retry");
+                    return BatchResult::Transient { retry_after: None };
                 }
             }
 
-            // Segment can be confirmed: we've either dead-lettered the records or
-            // logged the failure. Leaving the segment unconsumed would replay the
-            // same permanent-error records on every restart.
+            // Dead-letter write succeeded: the records are durably re-homed, so the
+            // segment can be confirmed. Leaving it unconsumed would replay the same
+            // permanent-error records on every restart.
             BatchResult::Ok
         }
     }
@@ -1064,6 +1079,74 @@ mod tests {
         assert!(get_confirmed_path(&sealed).exists());
         assert!(!sealed.exists());
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B1: a failed dead-letter write must NOT confirm the segment ──────────
+    // Regression for a silent-data-loss bug: when the sink permanently rejects
+    // records AND the dead-letter write also fails (e.g. ENOSPC on the dead-letter
+    // dir — exactly when dead-letter pressure peaks), the old code logged the error
+    // and fell through to BatchResult::Ok → the segment was confirmed and DELETED
+    // with the records neither delivered nor dead-lettered. The fix returns
+    // Transient so the segment is preserved and retried (and left on disk if
+    // retries exhaust), never silently dropped. We fault the dead-letter store by
+    // removing its directory so write_records fails deterministically.
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn permanent_error_with_failed_dead_letter_write_is_transient_not_ok() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("b1_perm_dlfail");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+
+        let sink = MockSink::with_responses([Err(MockError::Permanent)]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let payloads = vec![Payload::from(b"r1".as_ref()), Payload::from(b"r2".as_ref())];
+
+        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        assert!(
+            matches!(result, BatchResult::Transient { .. }),
+            "permanent sink error + failed dead-letter write must be Transient (preserve \
+             segment), not Ok (which confirms + deletes it → silent data loss)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn partial_dead_letter_with_failed_write_is_transient_not_ok() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("b1_partial_dlfail");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+
+        // commit() succeeds but reports one record permanently rejected; the
+        // follow-up dead-letter write then fails.
+        let sink = MockSink::with_responses([MockSink::ok_with_dead_letter(
+            vec![Payload::from(b"ok".as_ref())],
+            vec![Payload::from(b"bad".as_ref())],
+        )]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let payloads = vec![
+            Payload::from(b"ok".as_ref()),
+            Payload::from(b"bad".as_ref()),
+        ];
+
+        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        assert!(
+            matches!(result, BatchResult::Transient { .. }),
+            "successful commit with a failed dead-letter write must be Transient \
+             (preserve segment), not Ok"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
