@@ -13,6 +13,11 @@ pub enum NackReason {
     PayloadTooLarge = 0x04,
     BadPayloadCrc = 0x05,
     InternalError = 0x06,
+    /// The push carried a zero-length payload, which the WAB cannot represent:
+    /// an empty record's length prefix is four zero bytes, identical to the
+    /// end-of-records sentinel, so storing one would truncate the segment.
+    /// Rejected at ingest.
+    EmptyPayload = 0x07,
 }
 
 /// Error returned when a `u8` does not map to a known `NackReason` variant.
@@ -39,6 +44,7 @@ impl TryFrom<u8> for NackReason {
             0x04 => Ok(NackReason::PayloadTooLarge),
             0x05 => Ok(NackReason::BadPayloadCrc),
             0x06 => Ok(NackReason::InternalError),
+            0x07 => Ok(NackReason::EmptyPayload),
             v => Err(UnknownNackReason(v)),
         }
     }
@@ -72,12 +78,16 @@ mod tests {
             NackReason::try_from(0x06).unwrap(),
             NackReason::InternalError
         );
+        assert_eq!(
+            NackReason::try_from(0x07).unwrap(),
+            NackReason::EmptyPayload
+        );
     }
 
     #[test]
     fn try_from_returns_unknown_for_unrecognised_byte() {
-        let err = NackReason::try_from(0x07).unwrap_err();
-        assert_eq!(err.0, 0x07);
+        let err = NackReason::try_from(0x08).unwrap_err();
+        assert_eq!(err.0, 0x08);
         let err = NackReason::try_from(0x00).unwrap_err();
         assert_eq!(err.0, 0x00);
         let err = NackReason::try_from(0xff).unwrap_err();
@@ -92,6 +102,7 @@ mod tests {
         assert_eq!(NackReason::PayloadTooLarge as u8, 0x04);
         assert_eq!(NackReason::BadPayloadCrc as u8, 0x05);
         assert_eq!(NackReason::InternalError as u8, 0x06);
+        assert_eq!(NackReason::EmptyPayload as u8, 0x07);
     }
 
     /// Verifies the VersionMismatch Nack payload is [reason_byte, daemon_version_byte].

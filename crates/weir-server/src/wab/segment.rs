@@ -98,6 +98,18 @@ impl WabSegment {
                 "segment is poisoned by a previous partial write",
             ));
         }
+        // Defense-in-depth: an empty payload serialises to a zero length prefix,
+        // which is the end-of-records sentinel — writing one would truncate the
+        // segment on the next read. Empty payloads are rejected at ingest
+        // (NackReason::EmptyPayload), so this should be unreachable, but the WAB
+        // is the hard durability boundary and must never store a record it can't
+        // read back.
+        if payload.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty payload cannot be represented in a WAB segment",
+            ));
+        }
         let payload_len = u32::try_from(payload.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -574,6 +586,19 @@ mod tests {
         fs::write(&path, b"x").unwrap();
         fsync_parent_dir(&path).unwrap();
         fsync_parent_dir(std::path::Path::new("no_parent_component")).unwrap();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn write_record_rejects_empty_payload() {
+        // An empty payload would serialise to the end-of-records sentinel and
+        // truncate the segment — the WAB must reject it (defense-in-depth behind
+        // the ingest-layer NackReason::EmptyPayload check).
+        let dir = tmp_dir("emptyrec");
+        let path = dir.join("seg_00000001.wab");
+        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let err = seg.write_record(b"").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         fs::remove_dir_all(dir).ok();
     }
 

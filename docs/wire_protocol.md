@@ -70,6 +70,7 @@ Byte 1: (VersionMismatch only) daemon's WIRE_VERSION
 | 0x04 | PayloadTooLarge   | none                                 |
 | 0x05 | BadPayloadCrc     | none                                 |
 | 0x06 | InternalError     | none                                 |
+| 0x07 | EmptyPayload      | none                                 |
 
 The `VersionMismatch` second byte lets a client produce a specific error:
 > "daemon is on wire protocol v1; this client is built against v2 — upgrade the daemon or downgrade the client."

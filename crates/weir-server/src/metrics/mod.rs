@@ -51,6 +51,7 @@ pub enum NackReason {
     payload_too_large,
     bad_payload_crc,
     internal_error,
+    empty_payload,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]

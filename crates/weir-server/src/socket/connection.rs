@@ -169,6 +169,22 @@ where
                 .inc();
             return Ok(());
         }
+        if payload_len == 0 {
+            // An empty payload can't be represented in the WAB: a zero length
+            // prefix is the end-of-records sentinel, so storing one would
+            // truncate the segment (silently dropping records written after it).
+            // Reject at ingest rather than let it reach the WAB.
+            let tv = durability_to_tier(header.durability);
+            send_nack(stream.get_mut(), WireNack::EmptyPayload, &[]).await?;
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: tv,
+                    reason: MetricNack::empty_payload,
+                })
+                .inc();
+            return Ok(());
+        }
 
         // ── 4. Read payload ──────────────────────────────────────────────────
         // Accumulate into Vec<u8> then freeze to Bytes (O(1) ownership transfer).
@@ -673,6 +689,23 @@ mod tests {
         let (msg_type, payload) = read_response(&mut client).await;
         assert_eq!(msg_type, MessageType::Nack);
         assert_eq!(payload[0], NackReason::PayloadTooLarge as u8);
+    }
+
+    #[tokio::test]
+    async fn empty_payload_rejected_at_ingest() {
+        // A Push claiming a zero-length payload: the WAB cannot represent it (the
+        // length prefix is the end-of-records sentinel), so the server must Nack
+        // it at ingest before it reaches the WAB rather than let it truncate a
+        // segment.
+        let mut client = spawn_handler(test_cfg()).await;
+        let header = Header::new(MessageType::Push, Durability::Sync, 0, 0);
+        client.write_all(&header.encode()).await.unwrap();
+        // Dummy payload CRC — not read; the empty-payload check fires first.
+        client.write_all(&[0u8; 4]).await.unwrap();
+
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::EmptyPayload as u8);
     }
 
     #[tokio::test]
