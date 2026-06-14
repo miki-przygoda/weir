@@ -68,6 +68,11 @@ pub struct HttpSinkConfig {
     /// Default: true. Set false only if your endpoint can't tolerate the
     /// extra header (e.g. strict CORS, header allow-lists).
     pub send_idempotency_key: bool,
+    /// Maximum number of per-record POSTs kept in flight per `commit()` batch.
+    /// The drain runs on one thread, but the POSTs are async, so up to this many
+    /// overlap their network round-trips — collapsing a segment's serial RTT
+    /// cost without changing the per-record protocol or failure granularity.
+    pub concurrency: usize,
 }
 
 impl std::fmt::Debug for HttpSinkConfig {
@@ -81,6 +86,7 @@ impl std::fmt::Debug for HttpSinkConfig {
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
             .field("send_idempotency_key", &self.send_idempotency_key)
+            .field("concurrency", &self.concurrency)
             .finish()
     }
 }
@@ -107,9 +113,12 @@ impl HttpSink {
         let client = Client::builder()
             .timeout(config.timeout)
             // Keep idle connections warm between batches. The drain calls
-            // commit in a tight loop while a segment is being processed.
+            // commit in a tight loop while a segment is being processed. Size
+            // the idle pool to the in-flight concurrency so an HTTP/1.1 endpoint
+            // has a connection ready for each concurrent POST (HTTP/2 multiplexes
+            // and needs fewer, but sizing up doesn't hurt).
             .pool_idle_timeout(Some(Duration::from_secs(60)))
-            .pool_max_idle_per_host(8)
+            .pool_max_idle_per_host(config.concurrency.max(1))
             .user_agent(concat!("weir/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(HttpSinkBuildError::ClientBuild)?;
@@ -303,14 +312,30 @@ impl Sink for HttpSink {
     type Error = HttpSinkError;
 
     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, HttpSinkError> {
-        let mut committed = Vec::with_capacity(batch.len());
-        let mut dead_lettered: Vec<(Payload, String)> = Vec::new();
+        use futures_util::stream::StreamExt;
 
-        for record in batch {
-            // Clone the Bytes handle (O(1) ref-bump) so we retain the record
-            // for committed/dead-lettered accounting while posting the original.
-            let posted = record.clone();
-            match self.post_record(posted).await {
+        let concurrency = self.config.concurrency.max(1);
+
+        // One POST per record (unchanged protocol + per-record Idempotency-Key
+        // + per-record dead-lettering), but up to `concurrency` in flight. The
+        // drain thread is single-threaded; these futures are async, so their
+        // network round-trips overlap — a 1000-record segment no longer pays
+        // 1000× the serial RTT. `buffered` (not `buffer_unordered`) keeps the
+        // results in batch order, so `committed` stays in submission order.
+        let stream = futures_util::stream::iter(batch)
+            .map(|record| async move {
+                // Clone the Bytes handle (O(1) ref-bump) so we keep the record
+                // for accounting while posting it.
+                let outcome = self.post_record(record.clone()).await;
+                (record, outcome)
+            })
+            .buffered(concurrency);
+        let mut stream = std::pin::pin!(stream);
+
+        let mut committed = Vec::new();
+        let mut dead_lettered: Vec<(Payload, String)> = Vec::new();
+        while let Some((record, outcome)) = stream.next().await {
+            match outcome {
                 Ok(()) => committed.push(record),
                 Err(HttpSinkError::PermanentStatus {
                     status,
@@ -324,10 +349,11 @@ impl Sink for HttpSink {
                     dead_lettered.push((record, format!("http {status}: {body_excerpt}")));
                 }
                 Err(e) => {
-                    // Transient: abort the batch so the drain retries the
-                    // whole segment. Records already committed in this call
-                    // may be re-sent — the idempotency contract on the
-                    // endpoint covers this (documented in sink/mod.rs).
+                    // Transient: abort the batch so the drain retries the whole
+                    // segment. Dropping the stream cancels any still-in-flight
+                    // POSTs. Records already committed in this call may be
+                    // re-sent — the endpoint's idempotency contract covers this
+                    // (documented in sink/mod.rs).
                     return Err(e);
                 }
             }
@@ -473,6 +499,7 @@ mod tests {
             max_batch_size: 100,
             bearer_token: None,
             send_idempotency_key: true,
+            concurrency: 8,
         }
     }
 
@@ -504,6 +531,76 @@ mod tests {
         // Give the mock server a moment to finish counting.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn http_commit_preserves_record_order_under_concurrency() {
+        // `buffered` (not `buffer_unordered`) keeps `committed` in submission
+        // order even though the POSTs run concurrently.
+        let (url, _counter) =
+            spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
+        let mut c = cfg(&url);
+        c.concurrency = 4;
+        let sink = HttpSink::new(c).unwrap();
+        let batch = vec![p(b"r0"), p(b"r1"), p(b"r2"), p(b"r3"), p(b"r4")];
+        let result = sink.commit(batch.clone()).await.unwrap();
+        assert_eq!(result.committed, batch);
+        assert!(result.dead_lettered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_posts_run_concurrently() {
+        // A server that holds every connection open until N of them are
+        // simultaneously connected, then releases all at once. If the sink
+        // POSTed serially, the 2nd POST would never start until the 1st
+        // returned — so the barrier (and thus the commit) would deadlock.
+        // Completing within the timeout proves the POSTs overlap.
+        use tokio::sync::Barrier;
+        const N: usize = 4;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let barrier = Arc::new(Barrier::new(N));
+        tokio::spawn(async move {
+            for _ in 0..N {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    // Read the request header block, then wait for all N peers.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if find_double_crlf(&buf).is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    barrier.wait().await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let mut c = cfg(&url);
+        c.concurrency = N;
+        let sink = HttpSink::new(c).unwrap();
+        let batch: Vec<Payload> = (0..N)
+            .map(|i| Payload::from(format!("rec{i}").into_bytes()))
+            .collect();
+        let result = tokio::time::timeout(Duration::from_secs(5), sink.commit(batch))
+            .await
+            .expect("commit deadlocked — POSTs did not run concurrently")
+            .unwrap();
+        assert_eq!(result.committed.len(), N);
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 [features]
 default = ["http-sink", "mysql-sink", "postgres-sink"]
-# HTTP sink: POSTs each record to a configurable URL.
-http-sink = ["dep:reqwest", "dep:sha2"]
+# HTTP sink: POSTs each record to a configurable URL (concurrent per-record POSTs).
+http-sink = ["dep:reqwest", "dep:sha2", "dep:futures-util"]
 # MySQL sink: writes batches via multi-row INSERT.
 mysql-sink = ["dep:mysql_async", "_sql-sink"]
 # PostgreSQL sink: writes batches via multi-row INSERT.
@@ -82,6 +82,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 # can deduplicate retries that follow the drain's at-least-once contract.
 # RustCrypto pure-Rust SHA-2, no system dependency.
 sha2 = { version = "0.10", optional = true }
+# Bounded-concurrency stream combinator (`buffered`) for the HTTP sink's parallel
+# per-record POSTs. Already in the tree via reqwest, so it adds no compile cost;
+# default-features = false keeps it to the `std` stream adapters we use.
+futures-util = { version = "0.3", default-features = false, features = [
+    "std",
+], optional = true }
 # MySQL sink: async client with pooling. default-features = false drops
 # native-tls / flate2 / time-related features; we only need the connection,
 # the protocol, and rustls for TLS to production servers.

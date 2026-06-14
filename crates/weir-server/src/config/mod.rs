@@ -196,6 +196,7 @@ pub(crate) struct PartialConfig {
     pub sink_timeout_secs: Option<u64>,
     pub sink_max_batch_size: Option<usize>,
     pub sink_send_idempotency_key: Option<bool>,
+    pub sink_http_concurrency: Option<usize>,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: Option<String>,
     #[cfg(feature = "mysql-sink")]
@@ -313,6 +314,10 @@ pub struct Config {
     // sink_send_idempotency_key is only consumed by the http-sink arm.
     #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
     pub sink_send_idempotency_key: bool,
+    /// Max HTTP POSTs the http sink keeps in flight per `commit()` batch.
+    /// Only consumed by the http-sink arm.
+    #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
+    pub sink_http_concurrency: usize,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: String,
     #[cfg(feature = "mysql-sink")]
@@ -532,6 +537,12 @@ impl Config {
         // endpoint dedupe without computing the hash itself.
         let sink_send_idempotency_key = merge!(sink_send_idempotency_key).unwrap_or(true);
 
+        // HTTP sink concurrency: the drain is single-threaded but the POSTs are
+        // async, so up to N run concurrently per commit batch — the I/O waits
+        // overlap, collapsing a segment's serial RTT cost. Default 8.
+        let sink_http_concurrency = merge!(sink_http_concurrency).unwrap_or(8);
+        check_range("sink_http_concurrency", sink_http_concurrency, 1, 1024)?;
+
         // MySQL sink: identifier validation happens inside MySqlSink::new at
         // startup (strict [A-Za-z_][A-Za-z0-9_]{0,63} rule, single source of
         // truth so future identifier-policy changes only touch one file).
@@ -669,6 +680,7 @@ impl Config {
             sink_timeout_secs,
             sink_max_batch_size,
             sink_send_idempotency_key,
+            sink_http_concurrency,
             #[cfg(feature = "mysql-sink")]
             sink_mysql_table,
             #[cfg(feature = "mysql-sink")]
@@ -828,6 +840,7 @@ mod tests {
         assert_eq!(c.sink_timeout_secs, 10);
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
+        assert_eq!(c.sink_http_concurrency, 8);
         #[cfg(feature = "mysql-sink")]
         assert_eq!(c.sink_mysql_table, "weir_records");
         #[cfg(feature = "mysql-sink")]

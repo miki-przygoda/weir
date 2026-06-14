@@ -37,6 +37,8 @@ OPTIONS:
     --sink-timeout-secs <secs>               Per-request sink timeout (1-300) [default: 10]
     --sink-max-batch-size <n>                Sink commit batch cap (1-10000) [default: 100]
     --sink-send-idempotency-key <bool>       Send Idempotency-Key header (http) [default: true]
+    --sink-http-concurrency <n>              Max concurrent POSTs per batch (http, 1-1024)
+                                               [default: 8]
     --sink-mysql-table <name>                MySQL target table [default: weir_records]
     --sink-mysql-column <name>               MySQL target column [default: payload]
     --sink-mysql-insert-mode <mode>          MySQL: ignore | plain [default: ignore]
@@ -137,6 +139,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         sink_send_idempotency_key: pargs
             .opt_value_from_str("--sink-send-idempotency-key")
+            .map_err(pico_err)?,
+        sink_http_concurrency: pargs
+            .opt_value_from_str("--sink-http-concurrency")
             .map_err(pico_err)?,
         #[cfg(feature = "mysql-sink")]
         sink_mysql_table: pargs

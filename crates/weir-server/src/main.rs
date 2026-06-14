@@ -316,6 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bearer = bearer_token.is_some(),
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
+                concurrency = config.sink_http_concurrency,
                 "sink: http"
             );
             let http_cfg = HttpSinkConfig {
@@ -324,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_batch_size: config.sink_max_batch_size,
                 bearer_token,
                 send_idempotency_key: config.sink_send_idempotency_key,
+                concurrency: config.sink_http_concurrency,
             };
             let sink = HttpSink::new(http_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))

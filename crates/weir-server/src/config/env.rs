@@ -24,6 +24,7 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         sink_timeout_secs: env_parse("WEIR_SINK_TIMEOUT_SECS")?,
         sink_max_batch_size: env_parse("WEIR_SINK_MAX_BATCH_SIZE")?,
         sink_send_idempotency_key: env_parse("WEIR_SINK_SEND_IDEMPOTENCY_KEY")?,
+        sink_http_concurrency: env_parse("WEIR_SINK_HTTP_CONCURRENCY")?,
         #[cfg(feature = "mysql-sink")]
         sink_mysql_table: env_string("WEIR_SINK_MYSQL_TABLE")?,
         #[cfg(feature = "mysql-sink")]

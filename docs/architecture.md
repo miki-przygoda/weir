@@ -114,7 +114,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 | `sink_type` | Module | Records per `commit()` | Use |
 |------------|--------|--------------------|-----|
 | `noop` | `sink::noop::NoopSink` | accepts all, forwards nothing | soak-testing the daemon pipeline |
-| `http` | `sink::http::HttpSink` | one HTTP POST **per record** | endpoints that already accept POST bodies |
+| `http` | `sink::http::HttpSink` | one HTTP POST **per record**, up to `sink_http_concurrency` in flight | endpoints that already accept POST bodies |
 | `mysql` | `sink::mysql::MySqlSink` | one multi-row `INSERT` **per batch** | the IOPS-compression downstream |
 
 The `mysql` sink is the one that delivers on the headline claim: N

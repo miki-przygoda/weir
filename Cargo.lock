@@ -3103,6 +3103,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-channel",
  "deadpool-postgres",
+ "futures-util",
  "libc",
  "mysql_async",
  "pico-args",

@@ -33,6 +33,7 @@ struct RawServer {
     sink_timeout_secs: Option<u64>,
     sink_max_batch_size: Option<usize>,
     sink_send_idempotency_key: Option<bool>,
+    sink_http_concurrency: Option<usize>,
     #[cfg(feature = "mysql-sink")]
     sink_mysql_table: Option<String>,
     #[cfg(feature = "mysql-sink")]
@@ -87,6 +88,7 @@ const KNOWN_SERVER_KEYS: &[&str] = &[
     "sink_timeout_secs",
     "sink_max_batch_size",
     "sink_send_idempotency_key",
+    "sink_http_concurrency",
     "sink_mysql_table",
     "sink_mysql_column",
     "sink_mysql_insert_mode",
@@ -152,6 +154,7 @@ pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
         sink_timeout_secs: s.sink_timeout_secs,
         sink_max_batch_size: s.sink_max_batch_size,
         sink_send_idempotency_key: s.sink_send_idempotency_key,
+        sink_http_concurrency: s.sink_http_concurrency,
         #[cfg(feature = "mysql-sink")]
         sink_mysql_table: s.sink_mysql_table,
         #[cfg(feature = "mysql-sink")]

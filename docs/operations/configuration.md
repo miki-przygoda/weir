@@ -470,7 +470,7 @@ Weir ships with four built-in sinks:
 | `sink_type` | What it does | When to use |
 |------------|--------------|------|
 | `"noop"` | accepts every record, forwards nothing | soak-testing the daemon pipeline; integration tests |
-| `"http"` | POSTs each record to `sink_url`; one round-trip per record | endpoints that already accept POST bodies |
+| `"http"` | POSTs each record to `sink_url`; up to `sink_http_concurrency` POSTs in flight per batch | endpoints that already accept POST bodies |
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 | `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
 
@@ -558,9 +558,10 @@ that legitimately take seconds (some logging ingesters do).
 - **TOML**: `sink_max_batch_size`
 
 Maximum records the drain hands to a single `Sink::commit` call. The
-HTTP sink iterates records inside `commit` (one POST per record), so
-this also caps the longest contiguous run of POSTs before the drain
-re-checks its shutdown signal and dead-letter state.
+HTTP sink sends one POST per record inside `commit` (up to
+`sink_http_concurrency` in flight), so this also caps the longest run
+of POSTs before the drain re-checks its shutdown signal and
+dead-letter state.
 
 **When to tune**: lower for endpoints that prefer many small calls; the
 default 100 is a balanced point for most deployments.
@@ -593,6 +594,29 @@ breaking parsers.
 **When to disable**: only if the endpoint can't tolerate the extra
 header (strict CORS, header allow-lists). In that case the endpoint
 must implement its own dedup — usually by hashing the body server-side.
+
+---
+
+#### `sink_http_concurrency`
+
+- **Type**: usize
+- **Default**: `8`
+- **Range**: 1–1024
+- **CLI**: `--sink-http-concurrency <n>`
+- **Env**: `WEIR_SINK_HTTP_CONCURRENCY`
+- **TOML**: `sink_http_concurrency`
+
+How many per-record POSTs the HTTP sink keeps in flight per `commit`
+batch. The drain runs on a single thread, but the POSTs are async, so
+up to this many overlap their network round-trips — collapsing a
+segment's serial latency (1000 records × one RTT each would otherwise
+serialise to ~1000 RTTs). The protocol is unchanged: still one POST per
+record, each with its own `Idempotency-Key`, and dead-lettering stays
+per-record. Results are committed in submission order.
+
+**When to tune**: raise it for high-latency endpoints where the RTT
+dominates; lower it (or set `1` for fully serial) for endpoints that
+rate-limit aggressively or can't handle concurrent connections.
 
 ---
 
