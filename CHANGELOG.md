@@ -10,16 +10,79 @@ changes are tracked separately under **Wire protocol** below.
 
 ---
 
-## [Unreleased] — 0.8.0
+## [0.9.0] - 2026-06-14
 
-A performance-focused pass (Phase 3). The headline finding, proven with the new
-per-stage instrumentation across a macOS dev box and a real Linux machine: the
-durable write path is **fsync-bound** — `fdatasync` is ~89% of Sync latency on
-NVMe and ~99% on a SATA SSD. The changes below make the software pipeline leaner
-and fully measurable; the fsync floor itself is storage-bound. Full results:
-`docs/benchmarks/phase3-results.md`.
+The consolidation release — everything from the v1 development arc since 0.5.0,
+gathered into one publishable cut and the last release before 1.0. Highlights: a
+published **Sink SDK** and an **admin CLI** (`weir-ctl`), a **ClickHouse sink**, a
+**performance pass** that proved the durable write path is fsync-bound, a
+**deterministic simulation-testing (DST) harness** for the WAB that found and
+fixed a real durability bug, and a full **observability package** (Grafana +
+Prometheus + a turnkey monitoring stack). The public API is expected to be stable
+but is not yet frozen — that promise lands at 1.0.
+
+### Added
+
+- **`weir-sink-sdk` crate** — the `Sink` trait and its `SinkError` / `CommitResult`
+  contract, extracted into a standalone published crate so downstream authors can
+  implement custom sinks without depending on the server internals.
+- **`weir-ctl` admin CLI** — a separate binary for operating a running daemon:
+  `health`, `push`, and `metrics`; `segments` for per-shard on-disk WAB
+  inspection; and `dl` to list/drop entries in the dead-letter store.
+- **ClickHouse sink** (feature `clickhouse-sink`, opt-in) — HTTP
+  `INSERT … FORMAT RowBinary` batch inserts via reqwest, with a content-derived
+  sha256 `insert_deduplication_token` per batch so a crash-replayed byte-identical
+  batch is deduplicated by a `Replicated*MergeTree` engine. Reuses `sql_common`
+  (identifier validation, password redaction, `SqlSinkError`). Config:
+  `sink_type = "clickhouse"`, `sink_clickhouse_{database,table,column}`.
+- **Observability package** (`deploy/`) — a Prometheus + Grafana stack you can
+  drop in, deliverables-as-config:
+  - a Grafana **overview dashboard** (`deploy/grafana/weir-dashboard.json`) — an
+    at-a-glance health strip + Ingest / Durability / Drain / System rows;
+  - **per-instance dashboards** generated DRY from one panel definition by
+    `deploy/grafana/gen-dashboards.py` (latency percentiles + an fsync heatmap,
+    per-tier throughput, segment lifecycle, sink/drain detail);
+  - **Prometheus alert rules** (`deploy/prometheus/weir-alerts.yml`, 14 rules /
+    4 groups, `promtool`-validated), each linking a per-alert runbook in the new
+    operator guide `docs/monitoring.md`;
+  - a **turnkey `docker compose` demo** (`deploy/monitoring/`) — weir + Prometheus
+    + Grafana + load generators — with opt-in `levels` (min/med/high/max usage
+    comparison, a dashboard per level) and `chaos` (dead-letter / degraded-sink /
+    peer-UID faults) profiles, plus an end-to-end `smoke-test.sh` that runs in CI.
+- **Per-stage latency instrumentation** (`bench-trace` feature, off by default,
+  Stream A). Records enqueue → worker-flush → flusher → ack stage timings as
+  Prometheus histograms (`weir_stage_*_seconds`) so the load suite can attribute
+  latency to a pipeline stage. Also widens the latency-percentile samples
+  (500 → 2000) with per-run σ, and adds a Sync-tier saturation ramp. Zero cost
+  when the feature is off.
+
+### Reliability
+
+- **Deterministic Simulation Testing (DST) harness for the WAB.** The flusher's
+  durability path is driven under a virtual clock against a fault-injecting
+  segment store, with a causality ledger and an invariant oracle whose central
+  assertion is that **an ack is never a false ack** — every record reported
+  durable is recoverable. Injectable seams (`SegmentStore`, `BlockingClock`) let
+  the sim model fsync errors, torn writes, a crash between sync and rename, ENOSPC
+  at shutdown, and flusher panics; a cooperative scheduler (`SimExecutor`) explores
+  thread interleavings deterministically. Pinned regression seeds replay in CI and
+  any failure prints a `WEIR_DST_SEED=…` reproduction, alongside a random-seed
+  sweep.
+- **Fixed a false-ack durability bug** surfaced by the DST harness: after a write
+  error dropped the active segment mid-batch, the group-fsync could cover the
+  wrong segment and ack records that were not actually durable. Records in a
+  segment dropped mid-batch are now Nacked, never falsely acked.
+- **Drain backstop timeout** around `Sink::commit`, so a sink that hangs forever
+  can no longer wedge the drain indefinitely — the commit times out and the
+  segment is retried.
 
 ### Performance
+
+A performance pass (Phase 3). The headline finding, proven with the new per-stage
+instrumentation across a macOS dev box and a real Linux machine: the durable write
+path is **fsync-bound** — `fdatasync` is ~89% of Sync latency on NVMe and ~99% on
+a SATA SSD. The changes below make the software pipeline leaner and fully
+measurable; the fsync floor itself is storage-bound.
 
 - **Bridge-thread removal (Stream B).** The per-shard "bridge" thread that
   converted `Batch` → `WabRecord` is gone; the worker now feeds the WAB flusher
@@ -51,27 +114,29 @@ and fully measurable; the fsync floor itself is storage-bound. Full results:
   (A/B on a SATA SSD shows it is marginal — helps low concurrency, neutral-to-
   slightly-worse at high concurrency.)
 
-### Added
+### Changed
 
-- **Per-stage latency instrumentation** (`bench-trace` feature, off by default,
-  Stream A). Records enqueue → worker-flush → flusher → ack stage timings as
-  Prometheus histograms (`weir_stage_*_seconds`) so the load suite can attribute
-  latency to a pipeline stage. Also widens the latency-percentile samples
-  (500 → 2000) with per-run σ, and adds a Sync-tier saturation ramp. Zero cost
-  when the feature is off.
-- **ClickHouse sink** (feature `clickhouse-sink`, opt-in) — HTTP
-  `INSERT … FORMAT RowBinary` batch inserts via reqwest, with a content-derived
-  sha256 `insert_deduplication_token` per batch so a crash-replayed byte-identical
-  batch is deduplicated by a `Replicated*MergeTree` engine. Reuses `sql_common`
-  (identifier validation, password redaction, `SqlSinkError`). Config:
-  `sink_type = "clickhouse"`, `sink_clickhouse_{database,table,column}`.
 - **Sinks are now feature-gated** — `http-sink`, `mysql-sink`, `postgres-sink`,
   `clickhouse-sink` (`noop` is always compiled). `default = ["http-sink",
   "mysql-sink", "postgres-sink"]`, so the default daemon build is unchanged;
   library consumers can trim the dependency tree with `default-features = false`.
   Requesting an unbuilt sink via `sink_type` now fails with a clear
-  "requires the 'X-sink' feature" error. crates.io metadata
-  (`keywords`/`categories`/docs.rs) added to the published crates.
+  "requires the 'X-sink' feature" error.
+- **`worker_count` defaults to `shard_count`** — no idle worker thread when the
+  two are left unset.
+
+### Fixed
+
+- The Docker image build now includes the `weir-sink-sdk` and `weir-ctl`
+  workspace members (stub manifests + sources) so `cargo build -p weir-server`
+  resolves the full workspace.
+
+### Publishing
+
+- crates.io metadata (`keywords`, `categories`, docs.rs config) added to the
+  published crates, under the **MIT** license. Publish order:
+  `weir-core → weir-sink-sdk → weir-client / weir-server / weir-ctl`;
+  `weir-testkit` is `publish = false` (dev-only).
 
 ## [0.5.0] - 2026-06-10
 
@@ -1254,6 +1319,7 @@ The five commits making up this pass:
 
 ---
 
+[0.9.0]: https://github.com/miki-przygoda/weir/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/miki-przygoda/weir/compare/v0.4.0...v0.5.0
 [0.3.0]: https://github.com/miki-przygoda/weir/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/miki-przygoda/weir/compare/v0.1.0...v0.2.0

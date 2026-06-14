@@ -14,4 +14,4 @@ all-features = true
 [dependencies]
 # The only dependency: the payload type (a re-exported `bytes::Bytes`). Sink
 # authors implement these traits without pulling in the daemon.
-weir-core = { path = "../weir-core", version = "0.8.0" }
+weir-core = { path = "../weir-core", version = "0.9.0" }

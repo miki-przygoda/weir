@@ -56,7 +56,7 @@
 // about do not apply here, and sink authors get clean `async fn` signatures.
 #![allow(async_fn_in_trait)]
 
-/// Opaque record payload bytes — a ref-counted [`bytes::Bytes`] (re-exported from
+/// Opaque record payload bytes — a ref-counted `bytes::Bytes` (re-exported from
 /// `weir-core`) so clones through the drain are O(1).
 pub use weir_core::Payload;
 

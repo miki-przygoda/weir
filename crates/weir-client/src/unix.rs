@@ -54,7 +54,7 @@ impl From<io::Error> for ClientError {
 ///
 /// The type parameter `S` is the underlying transport. The default is
 /// [`UnixStream`] (Unix domain socket). When the `tls` feature is enabled,
-/// `S` can also be [`crate::TlsStream`] (TCP + mutual TLS).
+/// `S` can also be `TlsStream` (TCP + mutual TLS).
 ///
 /// The underlying stream runs in blocking mode. Each method sends one request
 /// frame and reads one response frame before returning. Requests are not

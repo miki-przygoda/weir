@@ -167,7 +167,7 @@ pinned at startup; they exist primarily to absorb tokio
 `spawn_blocking` slots without each spawn-blocking task fighting for a
 queue lock.
 
-The default was changed in 0.8.0 from the hard-coded `2` to `shard_count`.
+The default was changed in 0.9.0 from the hard-coded `2` to `shard_count`.
 With the old default, the standard single-shard config had `worker_count=2`
 but only one shard, so worker 1 was permanently idle. Defaulting to
 `shard_count` removes the idle worker and keeps the balanced invariant

@@ -8,7 +8,9 @@ use crate::{
 /// Magic bytes at offset 0. Presence at a fixed offset allows stream resync by scanning for b"WEIR".
 const MAGIC: [u8; 4] = *b"WEIR";
 
-/// Wire layout (16 bytes, big-endian fields are little-endian per spec):
+/// Wire layout (16 bytes; multi-byte fields are little-endian):
+///
+/// ```text
 /// [0..4]   magic         b"WEIR"
 /// [4]      version       u8        — WIRE_VERSION
 /// [5]      message_type  u8        — MessageType repr
@@ -16,6 +18,7 @@ const MAGIC: [u8; 4] = *b"WEIR";
 /// [7]      flags         u8        — reserved; zero on write
 /// [8..12]  payload_len   u32 LE
 /// [12..16] header_crc32  u32 LE    — CRC32 of bytes [0..12]
+/// ```
 pub const HEADER_LEN: usize = 16;
 
 /// Number of header bytes covered by the CRC. Everything except the CRC field itself.
