@@ -333,6 +333,7 @@ fn metrics_all_families_registered() {
         "weir_accept_latency_seconds",
         "weir_connection_idle_timeout",
         "weir_connection_rejected_peer_uid",
+        "weir_accept_resource_exhaustion",
         "weir_connections_aborted_at_shutdown",
         "weir_ack_timeout",
         // TLS
@@ -357,6 +358,7 @@ fn metrics_all_families_registered() {
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
         "weir_drain_state",
+        "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",
     ];
 
