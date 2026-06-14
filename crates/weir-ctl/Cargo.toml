@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 weir-core = { path = "../weir-core", version = "0.9.0" }
-weir-client = { path = "../weir-client" }
+weir-client = { path = "../weir-client", version = "0.9.0" }
 # clap with derive for the subcommand surface. The proc-macro build cost is
 # already paid elsewhere in the workspace (serde derive, etc.).
 clap = { version = "4", features = ["derive"] }
