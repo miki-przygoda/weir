@@ -208,6 +208,11 @@ pub(crate) struct Metrics {
     /// restarts — any non-zero value requires operator attention. Check logs
     /// for the shard_id and panic payload.
     pub wab_flusher_panics: Counter<u64, AtomicU64>,
+    /// weir-drain thread panics caught and respawned by its supervisor. Sustained
+    /// values indicate a logic bug in the sink/drain path; if the supervisor
+    /// exhausts its respawn budget, delivery stops and the WAB accumulates on disk
+    /// until the daemon restarts.
+    pub drain_panics: Counter<u64, AtomicU64>,
     /// fsync / fdatasync calls that returned an error. A non-zero value is a
     /// durability hazard: the kernel buffered the write but couldn't push it
     /// to stable storage. Producers whose records were in the failed fsync
@@ -364,6 +369,14 @@ impl Metrics {
              restarts. Any non-zero value requires operator attention; check logs \
              for the shard_id and panic payload."
         );
+        let drain_panics = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_panics",
+            "weir-drain thread panics caught and respawned by its supervisor. \
+             Sustained values indicate a logic bug in the sink/drain path; if the \
+             supervisor exhausts its respawn budget, delivery stops and the WAB \
+             accumulates on disk until restart."
+        );
         let wab_fsync_failures = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_wab_fsync_failures",
@@ -474,6 +487,7 @@ impl Metrics {
             wab_bytes_on_disk,
             wab_fsync_duration,
             wab_flusher_panics,
+            drain_panics,
             wab_fsync_failures,
             sink_commit_duration,
             sink_commit_records,

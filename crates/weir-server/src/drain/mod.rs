@@ -57,6 +57,7 @@ pub const MAX_RETRIES: u32 = 3;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct DrainConfig {
     /// Root WAB directory (used to locate and create the dead-letter directory).
     pub wab_dir: PathBuf,
@@ -127,8 +128,63 @@ pub fn spawn<S: Sink + 'static>(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("weir-drain".into())
-        .spawn(move || drain_thread(drain_rx, sink, config, metrics))
+        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics))
         .expect("failed to spawn drain thread")
+}
+
+/// Maximum times the drain is respawned after a panic before giving up — past
+/// this, delivery stops and the WAB accumulates on disk until restart (the same
+/// policy as the WAB flusher supervisor).
+const MAX_DRAIN_RESPAWNS: u32 = 10;
+
+/// Runs [`drain_thread`] under panic supervision. A panic in the drain (a sink
+/// impl, `process_segment`, `confirm_and_delete`, …) is caught and the drain is
+/// respawned with a fresh runtime + dead-letter writer, reading from the same
+/// channel so buffered segments survive. Without this, a single panic would kill
+/// delivery permanently while producers keep being acked and the WAB grows
+/// unbounded. The segment in flight at panic time is not re-delivered this run,
+/// but it is durable on disk and replayed on the next restart.
+fn run_drain_supervised<S: Sink>(
+    drain_rx: crossbeam_channel::Receiver<PathBuf>,
+    sink: Arc<S>,
+    config: DrainConfig,
+    metrics: Arc<Metrics>,
+) {
+    let mut attempts = 0u32;
+    loop {
+        let rx = drain_rx.clone();
+        let sink = Arc::clone(&sink);
+        let cfg = config.clone();
+        let m = Arc::clone(&metrics);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            drain_thread(rx, sink, cfg, m)
+        }));
+        match result {
+            // Clean exit: the channel closed (all flushers gone). Done.
+            Ok(()) => break,
+            Err(_) => {
+                attempts += 1;
+                metrics.drain_panics.inc();
+                if attempts >= MAX_DRAIN_RESPAWNS {
+                    error!(
+                        attempts,
+                        "drain thread panicked too many times; giving up — delivery is \
+                         stopped and the WAB will accumulate on disk until restart"
+                    );
+                    break;
+                }
+                error!(
+                    attempts,
+                    max = MAX_DRAIN_RESPAWNS,
+                    "drain thread panicked; respawning"
+                );
+                std::thread::sleep(Duration::from_millis(
+                    100u64.saturating_mul(attempts as u64),
+                ));
+            }
+        }
+    }
+    info!("drain supervisor exiting");
 }
 
 // ── Drain state helper ────────────────────────────────────────────────────────
@@ -759,6 +815,9 @@ mod tests {
         /// `pending()`), modelling a sink with no internal timeout. The drain's
         /// backstop `commit_timeout` must cancel these.
         hang_calls: u64,
+        /// Number of initial `commit()` calls that panic, to drive the drain's
+        /// panic supervisor.
+        panic_calls: u64,
         max_batch: usize,
         /// Wall-clock instant of every `commit()` call. Tests that need to
         /// measure inter-call gaps (e.g. retry-after observance) read this
@@ -781,6 +840,7 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
+                panic_calls: 0,
                 max_batch: 1000,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -796,6 +856,7 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
+                panic_calls: 0,
                 max_batch,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -808,6 +869,15 @@ mod tests {
         fn with_hang(hang_calls: u64, responses: impl IntoIterator<Item = MockResult>) -> Self {
             Self {
                 hang_calls,
+                ..Self::with_responses(responses)
+            }
+        }
+
+        /// A sink whose first `panic_calls` `commit()` invocations panic, to drive
+        /// the drain's panic supervisor (then falls back to `responses`).
+        fn with_panic(panic_calls: u64, responses: impl IntoIterator<Item = MockResult>) -> Self {
+            Self {
+                panic_calls,
                 ..Self::with_responses(responses)
             }
         }
@@ -858,6 +928,9 @@ mod tests {
         async fn commit(&self, batch: Vec<Payload>) -> MockResult {
             let nth = self.call_count.fetch_add(1, Ordering::Relaxed) + 1;
             self.call_timestamps.lock().unwrap().push(Instant::now());
+            if nth <= self.panic_calls {
+                panic!("mock sink: induced panic on commit #{nth}");
+            }
             if nth <= self.hang_calls {
                 // Hang forever; the drain's backstop timeout cancels this future.
                 std::future::pending::<()>().await;
@@ -934,6 +1007,10 @@ mod tests {
 
     fn dl_full_count(m: &Metrics) -> u64 {
         m.dead_letter_full.get()
+    }
+
+    fn drain_panics(m: &Metrics) -> u64 {
+        m.drain_panics.get()
     }
 
     fn drain_is_blocked(m: &Metrics) -> bool {
@@ -1244,6 +1321,43 @@ mod tests {
         assert!(
             matches!(result, ProcessResult::Confirmed { record_count: 0 }),
             "a NotFound segment is already gone → Confirmed no-op (nothing to preserve)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B7: the drain survives a sink panic and keeps delivering ─────────────
+    #[test]
+    fn drain_survives_sink_panic_and_keeps_delivering() {
+        let dir = tmp_dir("b7_panic");
+        let shard_dir = dir.join("shard_00");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mk = |counter: u64, payload: &[u8]| {
+            let p = segment_path(&shard_dir, counter);
+            let mut s = WabSegment::create(&p, 0).unwrap();
+            s.write_record(payload).unwrap();
+            s.seal().unwrap()
+        };
+        let _seg_a = mk(1, b"a");
+        let seg_b = mk(2, b"b");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(_seg_a.clone()).unwrap();
+        tx.send(seg_b.clone()).unwrap();
+
+        // Panic on the first commit (segment A); the supervisor must catch it,
+        // respawn the drain, and still deliver segment B. (A is durable on disk
+        // and would be replayed on a real restart — it is not re-delivered here.)
+        let sink = Arc::new(MockSink::with_panic(1, []));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+
+        assert!(
+            drain_panics(&metrics) >= 1,
+            "the sink panic must be counted"
+        );
+        assert!(
+            get_confirmed_path(&seg_b).exists(),
+            "the drain must survive the panic and confirm the following segment"
         );
         std::fs::remove_dir_all(dir).ok();
     }

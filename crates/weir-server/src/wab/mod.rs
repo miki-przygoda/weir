@@ -497,7 +497,9 @@ fn flusher_thread<C: BlockingClock>(
                     state: SegmentState::sealed,
                 })
                 .inc();
-            drain_tx.send(sealed).ok();
+            if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
+                warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed on shutdown; sealed segment is durable and will be delivered on restart");
+            }
         }
         Ok(None) => {
             info!(
@@ -601,7 +603,9 @@ fn flush_batch(
                         state: SegmentState::sealed,
                     })
                     .inc();
-                drain_tx.send(sealed).ok();
+                if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
+                    warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed; sealed segment is durable and will be delivered on restart");
+                }
                 durable_acks.append(&mut pending_acks);
                 #[cfg(feature = "bench-trace")]
                 durable_ts.append(&mut pending_ts);
