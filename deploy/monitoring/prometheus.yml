@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+rule_files:
+  - /etc/prometheus/weir-alerts.yml
+
+# Three scrape jobs. Only `weir` is always running; the `weir-levels` and
+# `weir-chaos` targets exist only when their compose profile is up (otherwise
+# they show DOWN on the Targets page — expected). The shipped alert rules all
+# select job=~"weir", and Prometheus regexes are fully anchored, so "weir" does
+# NOT match "weir-levels"/"weir-chaos" — the optional instances never trip the
+# WeirInstanceDown alert when their profile is off.
+scrape_configs:
+  - job_name: weir
+    static_configs:
+      - targets: ["weir:9185"]
+
+  # `levels` profile — four instances at min/med/high/max load. Each carries a
+  # `level` label so the dashboard's "Usage levels" row can compare them.
+  - job_name: weir-levels
+    static_configs:
+      - targets: ["weir-min:9185"]
+        labels: { level: min }
+      - targets: ["weir-med:9185"]
+        labels: { level: med }
+      - targets: ["weir-high:9185"]
+        labels: { level: high }
+      - targets: ["weir-max:9185"]
+        labels: { level: max }
+
+  # `chaos` profile — the deliberately-failing instance.
+  - job_name: weir-chaos
+    static_configs:
+      - targets: ["weir-chaos:9185"]

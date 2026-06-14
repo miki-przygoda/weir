@@ -43,21 +43,32 @@ BASE_LATENCY_SCENARIO = "latency_sync"  # kept for single-deadline fallback
 DEADLINES = ["1ms", "2ms"]
 
 RAMP_PREFIX = "ramp_"
+RAMP_SYNC_PREFIX = "ramp_sync_"
 
 
-def parse_results(path: str) -> dict[str, list[dict]]:
-    groups: dict[str, list[dict]] = defaultdict(list)
+def parse_results(path: str) -> tuple[dict[str, list[dict]], dict[str, list[dict]]]:
+    """Parse both BENCH: and BENCH_STAGE: lines from the results file in one pass.
+
+    Returns (bench_groups, stage_groups).
+    """
+    bench_groups: dict[str, list[dict]] = defaultdict(list)
+    stage_groups: dict[str, list[dict]] = defaultdict(list)
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if not line.startswith("BENCH: "):
-                continue
-            try:
-                obj = json.loads(line[len("BENCH: "):])
-                groups[obj["scenario"]].append(obj)
-            except (json.JSONDecodeError, KeyError):
-                pass
-    return dict(groups)
+            if line.startswith("BENCH_STAGE: "):
+                try:
+                    obj = json.loads(line[len("BENCH_STAGE: "):])
+                    stage_groups[obj["scenario"]].append(obj)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            elif line.startswith("BENCH: "):
+                try:
+                    obj = json.loads(line[len("BENCH: "):])
+                    bench_groups[obj["scenario"]].append(obj)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+    return dict(bench_groups), dict(stage_groups)
 
 
 def avg(values: list[float]) -> float:
@@ -95,6 +106,72 @@ def rps_avg(rows: list[dict]) -> float:
 def rps_std(rows: list[dict]) -> float:
     vals = [float(r["throughput_rps"]) for r in rows if "throughput_rps" in r]
     return stddev(vals)
+
+
+def build_stage_md(stage_groups: dict[str, list[dict]]) -> str:
+    """Render the per-stage latency breakdown section (bench-trace)."""
+    if not stage_groups:
+        return ""
+
+    STAGE_FIELDS = [
+        ("queue_us",       "Queue (µs)"),
+        ("bridge_wait_us", "Bridge wait (µs)"),
+        ("write_us",       "Write (µs)"),
+        ("total_us",       "Total (µs)"),
+    ]
+
+    # Collect all unique deadlines present.
+    deadlines_seen: list[str] = []
+    for s in stage_groups:
+        parts = s.split("_")
+        d_suffix = next((p for p in parts if p.startswith("d") and p.endswith("ms")), None)
+        if d_suffix and d_suffix not in deadlines_seen:
+            deadlines_seen.append(d_suffix)
+    deadlines_seen.sort()
+
+    lines = [
+        "",
+        "## Per-stage latency breakdown (bench-trace)",
+        "",
+        "> Mean µs per stage, averaged over all runs. Captured with `--features bench-trace`.",
+        "> queue = enqueue→worker-flush; bridge_wait = worker-flush→flusher-dequeue;",
+        "> write = flusher-dequeue→write_record (pre-fsync); total = enqueue→ack-fired.",
+        "",
+    ]
+
+    for d in deadlines_seen:
+        # Find scenarios for this deadline (sorted by tier: sync, batched, buffered).
+        scenarios = [
+            (s, grp)
+            for s, grp in stage_groups.items()
+            if f"_{d}" in s
+        ]
+        if not scenarios:
+            continue
+        # Sort: sync before batched before buffered.
+        tier_order = {"sync": 0, "batched": 1, "buffered": 2}
+        scenarios.sort(key=lambda x: tier_order.get(
+            next((p for p in x[0].split("_") if p in tier_order), "z"), 3
+        ))
+
+        if len(deadlines_seen) > 1:
+            lines.append(f"### deadline = {d}")
+            lines.append("")
+
+        tier_header = " | ".join(s for s, _ in scenarios)
+        tier_sep = " | ".join("--------" for _ in scenarios)
+        lines.append(f"| Stage | {tier_header} |")
+        lines.append(f"|-------|{tier_sep}|")
+
+        for field, label in STAGE_FIELDS:
+            row_vals = []
+            for _, grp in scenarios:
+                vals = [float(r[field]) for r in grp if field in r]
+                row_vals.append(f"{avg(vals):.0f}" if vals else "—")
+            lines.append(f"| {label} | {' | '.join(row_vals)} |")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
@@ -186,14 +263,15 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
 
     # ── Latency comparison ─────────────────────────────────────────────────
     LATENCY_FIELDS = [
-        ("min_us",   "Min"),
-        ("mean_us",  "Mean"),
-        ("p50_us",   "p50"),
-        ("p75_us",   "p75"),
-        ("p95_us",   "p95"),
-        ("p99_us",   "p99"),
-        ("p999_us",  "p99.9"),
-        ("max_us",   "Max"),
+        ("min_us",      "Min"),
+        ("mean_us",     "Mean"),
+        ("stddev_us",   "σ"),
+        ("p50_us",      "p50"),
+        ("p75_us",      "p75"),
+        ("p95_us",      "p95"),
+        ("p99_us",      "p99"),
+        ("p999_us",     "p99.9"),
+        ("max_us",      "Max"),
     ]
 
     lines += [""]
@@ -237,8 +315,9 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
             lines.append(f"| {label} | {' | '.join(row_vals)} |")
 
     # ── Saturation ramp ────────────────────────────────────────────────────
+    # Buffered ramp: scenarios starting with "ramp_" but NOT "ramp_sync_".
     ramp_scenarios = sorted(
-        [s for s in groups if s.startswith(RAMP_PREFIX)],
+        [s for s in groups if s.startswith(RAMP_PREFIX) and not s.startswith(RAMP_SYNC_PREFIX)],
         key=lambda s: (
             # Sort by thread count (second token), then deadline.
             int(s.split("_")[1]) if s.split("_")[1].isdigit() else 0,
@@ -248,7 +327,7 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
     if ramp_scenarios:
         lines += [
             "",
-            "## Saturation Ramp",
+            "## Saturation Ramp — Buffered tier",
             "",
             "> Server started with `max_connections = 48`. Levels above 48 threads",
             "> trigger connection-cap exhaustion; the server must survive every level.",
@@ -313,6 +392,88 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
                 io_vals = [float(r.get("io_errors", 0)) for r in rows]
                 saturated = avg(io_vals) > 0
                 status = "**SATURATED** ←" if n == first_saturated else ("SATURATED" if saturated else "ok")
+                lines.append(
+                    f"| {n} | {fmt_rps(rps_avg(rows))}"
+                    f" | {fmt_rps(avg(ack_vals))}"
+                    f" | {fmt_rps(avg(nack_vals))}"
+                    f" | {fmt_rps(avg(io_vals))} | {status} |"
+                )
+
+    # Sync ramp: scenarios starting with "ramp_sync_".
+    ramp_sync_scenarios = sorted(
+        [s for s in groups if s.startswith(RAMP_SYNC_PREFIX)],
+        key=lambda s: (
+            # "ramp_sync_8_threads_d1ms" → thread count is the token after "sync".
+            int(s.split("_")[2]) if len(s.split("_")) > 2 and s.split("_")[2].isdigit() else 0,
+            s,
+        ),
+    )
+    if ramp_sync_scenarios:
+        lines += [
+            "",
+            "## Saturation Ramp — Sync tier",
+            "",
+            "> Server started with `max_connections = 48`. Uses Sync durability to",
+            "> stress the group-fsync path under escalating concurrency.",
+            "",
+        ]
+
+        by_threads_sync: dict[int, dict[str, list[dict]]] = defaultdict(dict)
+        for s in ramp_sync_scenarios:
+            parts = s.split("_")
+            # "ramp_sync_N_threads_dXms" → thread count is parts[2]
+            n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            d_suffix = next((p for p in parts if p.startswith("d") and p.endswith("ms")), None)
+            d_label = d_suffix if d_suffix else "?"
+            by_threads_sync[n][d_label] = groups[s]
+
+        sorted_sync_threads = sorted(by_threads_sync.keys())
+        sync_deadlines = sorted({d for td in by_threads_sync.values() for d in td.keys()})
+
+        first_saturated_sync = next(
+            (
+                n for n in sorted_sync_threads
+                if avg([float(r.get("io_errors", 0))
+                        for d in sync_deadlines
+                        for r in by_threads_sync[n].get(d, [])]) > 0
+            ),
+            None,
+        )
+
+        if len(sync_deadlines) > 1:
+            d_header = " | ".join(f"RPS ({d})" for d in sync_deadlines)
+            d_sep = " | ".join("--------" for _ in sync_deadlines)
+            lines.append(f"| Threads | {d_header} | I/O drops | Status |")
+            lines.append(f"|---------|{d_sep}|-----------|--------|")
+            for n in sorted_sync_threads:
+                rps_cols = []
+                io_drops = None
+                for d in sync_deadlines:
+                    rows = by_threads_sync[n].get(d, [])
+                    if rows:
+                        rps_cols.append(fmt_rps(rps_avg(rows)))
+                        if io_drops is None:
+                            io_drops_vals = [float(r.get("io_errors", 0)) for r in rows]
+                            io_drops = avg(io_drops_vals)
+                    else:
+                        rps_cols.append("—")
+                saturated = (io_drops or 0) > 0
+                status = "**SATURATED** ←" if n == first_saturated_sync else ("SATURATED" if saturated else "ok")
+                lines.append(
+                    f"| {n} | {' | '.join(rps_cols)}"
+                    f" | {fmt_rps(io_drops or 0)} | {status} |"
+                )
+        else:
+            d = sync_deadlines[0] if sync_deadlines else "?"
+            lines.append(f"| Threads | Avg RPS ({d}) | Acks | Nacks | I/O drops | Status |")
+            lines.append(f"|---------|--------------|------|-------|-----------|--------|")
+            for n in sorted_sync_threads:
+                rows = by_threads_sync[n].get(d, [])
+                ack_vals = [float(r.get("acks", 0)) for r in rows]
+                nack_vals = [float(r.get("nacks", 0)) for r in rows]
+                io_vals = [float(r.get("io_errors", 0)) for r in rows]
+                saturated = avg(io_vals) > 0
+                status = "**SATURATED** ←" if n == first_saturated_sync else ("SATURATED" if saturated else "ok")
                 lines.append(
                     f"| {n} | {fmt_rps(rps_avg(rows))}"
                     f" | {fmt_rps(avg(ack_vals))}"
@@ -399,19 +560,20 @@ def main():
     output_path = sys.argv[2]
     history_path = sys.argv[3] if len(sys.argv) == 4 else None
 
-    groups = parse_results(results_path)
+    groups, stage_groups = parse_results(results_path)
 
-    if not groups:
-        print("No BENCH: lines found — nothing to write.", file=sys.stderr)
+    if not groups and not stage_groups:
+        print("No BENCH: or BENCH_STAGE: lines found — nothing to write.", file=sys.stderr)
         sys.exit(1)
 
-    run_count = max(len(v) for v in groups.values())
-    md = build_md(groups, run_count)
+    run_count = max(len(v) for v in groups.values()) if groups else 0
+    md = build_md(groups, run_count) if groups else ""
+    stage_md = build_stage_md(stage_groups)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w") as f:
-        f.write(md)
-    print(f"Wrote {output_path} ({run_count} run(s), {len(groups)} scenario(s))")
+        f.write(md + stage_md)
+    print(f"Wrote {output_path} ({run_count} run(s), {len(groups)} scenario(s), {len(stage_groups)} stage scenario(s))")
 
     if history_path:
         version = os.environ.get("WEIR_VERSION", "dev")

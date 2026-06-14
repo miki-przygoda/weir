@@ -1,0 +1,17 @@
+[package]
+name = "weir-sink-sdk"
+description = "Sink trait and error contract for building sinks for the weir daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["weir", "sink", "ingestion", "database", "async"]
+categories = ["database", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+# The only dependency: the payload type (a re-exported `bytes::Bytes`). Sink
+# authors implement these traits without pulling in the daemon.
+weir-core = { path = "../weir-core", version = "0.9.0" }

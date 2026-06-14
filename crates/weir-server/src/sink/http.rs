@@ -117,21 +117,23 @@ impl HttpSink {
         Ok(Self { config, client })
     }
 
-    async fn post_record(&self, payload: &[u8]) -> Result<(), HttpSinkError> {
+    async fn post_record(&self, payload: Payload) -> Result<(), HttpSinkError> {
         let mut req = self
             .client
             .post(&self.config.url)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
 
         if self.config.send_idempotency_key {
-            req = req.header("Idempotency-Key", payload_idempotency_key(payload));
+            req = req.header("Idempotency-Key", payload_idempotency_key(&payload));
         }
 
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token.as_ref());
         }
 
-        let req = req.body(payload.to_vec());
+        // No-copy: reqwest::Body implements From<bytes::Bytes> — payload bytes
+        // are handed to reqwest without any allocation or memcopy.
+        let req = req.body(payload);
 
         let resp = match req.send().await {
             Ok(r) => r,
@@ -305,7 +307,10 @@ impl Sink for HttpSink {
         let mut dead_lettered: Vec<(Payload, String)> = Vec::new();
 
         for record in batch {
-            match self.post_record(&record).await {
+            // Clone the Bytes handle (O(1) ref-bump) so we retain the record
+            // for committed/dead-lettered accounting while posting the original.
+            let posted = record.clone();
+            match self.post_record(posted).await {
                 Ok(()) => committed.push(record),
                 Err(HttpSinkError::PermanentStatus {
                     status,
@@ -363,6 +368,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Test helper: build a `Payload` from a static byte string literal.
+    fn p(s: &'static [u8]) -> Payload {
+        Payload::from_static(s)
+    }
 
     /// Spawns a minimal HTTP/1.1 server that answers each incoming request
     /// with the next response from `responses`, cycling if exhausted. Returns
@@ -476,7 +486,7 @@ mod tests {
             spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
         let result = sink
-            .commit(vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()])
+            .commit(vec![p(b"alpha"), p(b"beta"), p(b"gamma")])
             .await
             .unwrap();
         assert_eq!(result.committed.len(), 3);
@@ -493,7 +503,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink.commit(vec![b"alpha".to_vec()]).await.unwrap();
+        let result = sink.commit(vec![p(b"alpha")]).await.unwrap();
         assert!(result.committed.is_empty());
         assert_eq!(result.dead_lettered.len(), 1);
         let (_, reason) = &result.dead_lettered[0];
@@ -508,7 +518,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(err.is_transient(), "500 must be transient: {err}");
         assert!(
             matches!(err, HttpSinkError::TransientStatus { status, .. } if status.as_u16() == 500)
@@ -523,7 +533,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(err.is_transient(), "429 must be transient: {err}");
     }
 
@@ -534,7 +544,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(err.is_transient(), "408 must be transient: {err}");
     }
 
@@ -547,7 +557,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink.commit(vec![b"alpha".to_vec()]).await.unwrap();
+        let result = sink.commit(vec![p(b"alpha")]).await.unwrap();
         assert_eq!(result.dead_lettered.len(), 1);
     }
 
@@ -555,7 +565,7 @@ mod tests {
     async fn connect_refused_is_transient() {
         // Pick a port that's almost certainly closed.
         let sink = HttpSink::new(cfg("http://127.0.0.1:1/")).unwrap();
-        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(
             err.is_transient(),
             "connect refused must be transient: {err}"
@@ -574,10 +584,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink
-            .commit(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
-            .await
-            .unwrap();
+        let result = sink.commit(vec![p(b"a"), p(b"b"), p(b"c")]).await.unwrap();
         assert_eq!(result.committed.len(), 2);
         assert_eq!(result.dead_lettered.len(), 1);
     }
@@ -592,10 +599,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink
-            .commit(vec![b"a".to_vec(), b"b".to_vec()])
-            .await
-            .unwrap_err();
+        let err = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap_err();
         assert!(err.is_transient());
     }
 
@@ -689,7 +693,7 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let url = spawn_header_capture_server(Arc::clone(&captured)).await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        sink.commit(vec![b"hello, weir".to_vec()]).await.unwrap();
+        sink.commit(vec![p(b"hello, weir")]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let headers = captured.lock().unwrap();
@@ -712,7 +716,7 @@ mod tests {
         let mut c = cfg(&url);
         c.send_idempotency_key = false;
         let sink = HttpSink::new(c).unwrap();
-        sink.commit(vec![b"hello, weir".to_vec()]).await.unwrap();
+        sink.commit(vec![p(b"hello, weir")]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let headers = captured.lock().unwrap();
@@ -769,7 +773,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(err.is_transient());
         assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
     }
@@ -781,7 +785,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(err.is_transient());
         assert_eq!(err.retry_after(), None);
     }
@@ -795,7 +799,7 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![b"alpha".to_vec()]).await.unwrap_err();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(err.is_transient());
         assert_eq!(err.retry_after(), None);
     }

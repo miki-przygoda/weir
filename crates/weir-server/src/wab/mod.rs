@@ -1,3 +1,6 @@
+pub mod clock;
+#[cfg(any(test, feature = "dst"))]
+pub mod dst;
 pub mod format;
 pub mod recovery;
 pub mod segment;
@@ -6,7 +9,10 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -16,19 +22,25 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
+use crate::models::Batch;
+use clock::{BlockingClock, RealClock};
 use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
-use segment::ShardWriter;
+use segment::{FsSegmentStore, SegmentStore, ShardWriter};
 use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
 
-/// A record queued by a connection handler for writing to the WAB.
-pub struct WabRecord {
-    pub payload: Payload,
-    pub durability: Durability,
-    /// Per-request ack channel. The flusher sends `true` after the record is
-    /// durably written according to the requested tier, or `false` on an
-    /// unrecoverable write failure.
-    pub ack_tx: oneshot::Sender<bool>,
+/// Exponential moving average update, fixed-point microseconds.
+/// alpha = 1/4 (new sample weighted 25%). Pure fn so it's unit-testable.
+///
+/// On fast NVMe (fsync ~150 µs) this converges to ~150–200 µs — close to
+/// the old fixed 200 µs constant — so there is no throughput change on
+/// local NVMe. The win shows on slower storage (cloud volumes, spinning
+/// disks) where fsync latency is higher and a fixed 200 µs window is too
+/// short, causing extra fsyncs. Throughput gain on slow storage deferred
+/// to Linux/cloud validation.
+pub(crate) fn ewma_update_us(current_us: u64, sample_us: u64) -> u64 {
+    // current*3/4 + sample/4, integer math, no overflow for realistic µs.
+    (current_us.saturating_mul(3) / 4).saturating_add(sample_us / 4)
 }
 
 /// Configuration for the WAB subsystem.
@@ -62,7 +74,7 @@ impl Default for WabConfig {
 /// segments to be sealed.
 pub struct WabHandle {
     /// One sender per shard. Drop all of them to signal shutdown.
-    pub shard_txs: Vec<Sender<WabRecord>>,
+    pub shard_txs: Vec<Sender<Batch>>,
     pub join_handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -123,10 +135,15 @@ pub(crate) const MAX_FLUSHER_RESPAWNS: u32 = 10;
 /// crossbeam channels (lock-free, panic-safe). We accept the
 /// unwind-safety claim — matching the previous implementation's
 /// rationale.
-fn run_with_panic_supervision<F, B>(shard_id: usize, metrics: Arc<Metrics>, mut body_factory: F)
-where
+fn run_with_panic_supervision<F, B, C>(
+    shard_id: usize,
+    metrics: Arc<Metrics>,
+    clock: &C,
+    mut body_factory: F,
+) where
     F: FnMut() -> B,
     B: FnOnce(),
+    C: BlockingClock,
 {
     let mut attempt: u32 = 0;
     loop {
@@ -168,7 +185,7 @@ where
                 // fix, so the loop's job is mostly to surface a
                 // clean "now permanently offline" log line within
                 // about a second.
-                thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+                clock.sleep(Duration::from_millis(10 * u64::from(attempt)));
             }
         }
     }
@@ -193,11 +210,16 @@ pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
 
 /// Runs crash recovery, replays sealed-but-unconfirmed segments to `drain_tx`,
 /// then spawns one flusher thread per shard.
+///
+/// `coalesce_hint` is an `Arc<AtomicU64>` holding the EWMA of fsync latency in
+/// microseconds (init 200). Each flusher thread updates it after every fsync;
+/// the worker threads read it to size their coalesce window.
 pub fn spawn(
     wab_dir: PathBuf,
     config: WabConfig,
     drain_tx: Sender<PathBuf>,
     metrics: Arc<Metrics>,
+    coalesce_hint: Arc<AtomicU64>,
 ) -> io::Result<WabHandle> {
     // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
 
@@ -217,7 +239,7 @@ pub fn spawn(
     let mut join_handles = Vec::with_capacity(config.shard_count);
 
     for shard_id in 0..config.shard_count {
-        let (tx, rx) = crossbeam_channel::bounded::<WabRecord>(config.batch_size * 4);
+        let (tx, rx) = crossbeam_channel::bounded::<Batch>(config.batch_size * 4);
         shard_txs.push(tx);
 
         let sdir = shard_dir_path(&wab_dir, shard_id);
@@ -228,6 +250,7 @@ pub fn spawn(
         let batch_deadline = config.batch_deadline;
         let segment_max_bytes = config.segment_max_bytes;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
+        let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
 
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
@@ -236,15 +259,19 @@ pub fn spawn(
                 // panic inside `catch_unwind` doesn't drop them. The body
                 // factory clones the channel / Arc / PathBuf handles for
                 // each attempt — channel clones share the same queue, so
-                // records buffered in the bounded WabRecord queue survive
-                // a flusher panic and are drained by the respawned
-                // flusher in the same order.
-                run_with_panic_supervision(shard_id, metrics_for_panic, || {
+                // Batches buffered in the bounded queue survive a flusher
+                // panic and are drained by the respawned flusher in the
+                // same order.
+                run_with_panic_supervision(shard_id, metrics_for_panic, &RealClock, || {
                     let sdir = sdir.clone();
                     let rx = rx.clone();
                     let drain_clone = drain_clone.clone();
                     let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
+                    let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
                     move || {
+                        // Production filesystem backend; the DST harness drives
+                        // `flusher_thread` directly with a fault-injecting store.
+                        let store: Arc<dyn SegmentStore> = Arc::new(FsSegmentStore);
                         flusher_thread(
                             shard_id as u16,
                             sdir,
@@ -255,6 +282,9 @@ pub fn spawn(
                             segment_max_bytes,
                             core_id,
                             metrics_for_flusher,
+                            coalesce_hint,
+                            &RealClock,
+                            store,
                         );
                     }
                 });
@@ -326,16 +356,19 @@ fn read_segment_record_count(path: &Path) -> io::Result<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn flusher_thread(
+fn flusher_thread<C: BlockingClock>(
     shard_id: u16,
     shard_dir: PathBuf,
-    work_rx: Receiver<WabRecord>,
+    work_rx: Receiver<Batch>,
     drain_tx: Sender<PathBuf>,
     batch_size: usize,
     batch_deadline: Duration,
     segment_max_bytes: u64,
     core_id: Option<core_affinity::CoreId>,
     metrics: Arc<Metrics>,
+    coalesce_hint: Arc<AtomicU64>,
+    clock: &C,
+    store: Arc<dyn SegmentStore>,
 ) {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
@@ -361,7 +394,13 @@ fn flusher_thread(
     }
 
     // Startup warmup
-    let mut writer = ShardWriter::new(shard_id, shard_dir, segment_max_bytes, Arc::clone(&metrics));
+    let mut writer = ShardWriter::new_with_store(
+        shard_id,
+        shard_dir,
+        segment_max_bytes,
+        Arc::clone(&metrics),
+        store,
+    );
     if let Err(e) = writer.scan_and_advance_counter() {
         warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
     }
@@ -377,30 +416,58 @@ fn flusher_thread(
 
     info!(shard = shard_id, "WAB flusher started");
 
-    let mut batch: Vec<WabRecord> = Vec::with_capacity(batch_size);
+    // Accumulate multiple Batches per fsync to preserve cross-batch coalescing.
+    // record_count tracks the total records accumulated so we stop draining once
+    // we reach batch_size (bounding memory and latency under very high load).
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut record_count = 0usize;
 
     loop {
-        // Block on the first record of the batch (or detect channel close).
-        match work_rx.recv_timeout(batch_deadline) {
-            Ok(record) => batch.push(record),
+        // Block on the first Batch (or detect channel close / deadline).
+        match clock.recv_timeout(&work_rx, batch_deadline) {
+            Ok(batch) => {
+                record_count += batch.records.len();
+                batches.push(batch);
+            }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if !batch.is_empty() {
-                    flush_batch(&mut writer, &mut batch, &drain_tx, shard_id, &metrics);
+                if !batches.is_empty() {
+                    flush_batch(
+                        &mut writer,
+                        &mut batches,
+                        &drain_tx,
+                        shard_id,
+                        &metrics,
+                        &coalesce_hint,
+                    );
+                    record_count = 0;
                 }
                 continue;
             }
         }
 
-        // Drain any additional available records up to batch_size.
-        while batch.len() < batch_size {
+        // Drain any additional available Batches up to batch_size records total.
+        // Using try_recv (non-blocking) preserves today's coalescing without
+        // introducing a second timed wait.
+        while record_count < batch_size {
             match work_rx.try_recv() {
-                Ok(record) => batch.push(record),
+                Ok(batch) => {
+                    record_count += batch.records.len();
+                    batches.push(batch);
+                }
                 Err(_) => break,
             }
         }
 
-        flush_batch(&mut writer, &mut batch, &drain_tx, shard_id, &metrics);
+        flush_batch(
+            &mut writer,
+            &mut batches,
+            &drain_tx,
+            shard_id,
+            &metrics,
+            &coalesce_hint,
+        );
+        record_count = 0;
     }
 
     // Graceful shutdown: seal the active segment and send to drain.
@@ -429,76 +496,176 @@ fn flusher_thread(
 
 fn flush_batch(
     writer: &mut ShardWriter,
-    batch: &mut Vec<WabRecord>,
+    batches: &mut Vec<Batch>,
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
     metrics: &Arc<Metrics>,
+    coalesce_hint: &Arc<AtomicU64>,
 ) {
-    // Sync records used to fsync per-record; now they ride the same
-    // group-fsync as Batched. Sync's contract is "fsync before ack" and
-    // a single fsync at the end of the batch covers every record written
-    // during it, so the contract still holds while the fsync rate drops
-    // by up to batch_size× under concurrent Sync load (the previous
-    // per-record fsync was the bottleneck in the herd benchmarks).
-    let mut sync_acks: Vec<oneshot::Sender<bool>> = Vec::new();
-    let mut batched_acks: Vec<oneshot::Sender<bool>> = Vec::new();
-    let mut need_fsync = false;
+    // Sync + Batched records both ride a single group fsync at the end of the
+    // flush (the per-record fsync was the herd-benchmark bottleneck). Their acks
+    // are split by the FATE of the segment each record landed in:
+    //
+    //   - `durable_acks` — records in a segment that ROTATED mid-flush. Rotation
+    //     seals the segment, which fsyncs it, so those records are already on
+    //     stable storage → ack `true` unconditionally (even if the active
+    //     segment's later fsync fails).
+    //   - `pending_acks` — records in the CURRENT active segment, not yet
+    //     synced. They ack with the end-of-batch group fsync's result. Crucially,
+    //     if a later mid-batch `write_record` error DROPS the active segment
+    //     (`ShardWriter` sets `active = None`), every record collected for it is
+    //     Nacked here — otherwise they would ride a group fsync of a *different*
+    //     (or absent) segment and be falsely acked durable while their bytes sit
+    //     in an abandoned, never-fsynced file (silent data loss on crash).
+    let mut durable_acks: Vec<oneshot::Sender<bool>> = Vec::new();
+    let mut pending_acks: Vec<oneshot::Sender<bool>> = Vec::new();
 
-    for record in batch.drain(..) {
-        // write_record returns Some(sealed_path) when the segment rotated.
-        let Ok(rotation) = writer.write_record(&record.payload) else {
-            let _ = record.ack_tx.send(false);
-            continue;
-        };
+    // bench-trace: per-record enqueued_at for stage_total observation, split the
+    // same way as the acks.
+    #[cfg(feature = "bench-trace")]
+    let mut durable_ts: Vec<Instant> = Vec::new();
+    #[cfg(feature = "bench-trace")]
+    let mut pending_ts: Vec<Instant> = Vec::new();
 
-        if let Some(sealed) = rotation {
-            // Segment was sealed (seal includes fsync). Notify drain.
-            info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
+    for batch in batches.drain(..) {
+        // worker_flushed_at is the instant the worker stamped the Batch.
+        // All records in this Batch share the same stamp.
+        #[cfg(feature = "bench-trace")]
+        let worker_flushed_at = batch.flushed_at;
+
+        for unit in batch.records {
+            // Capture flusher-received-at and observe queue + bridge_wait stages.
+            #[cfg(feature = "bench-trace")]
+            let flusher_recv_at = {
+                let now = Instant::now();
+                metrics
+                    .stage_queue
+                    .observe((worker_flushed_at - unit.enqueued_at).as_secs_f64());
+                metrics
+                    .stage_bridge_wait
+                    .observe((now - worker_flushed_at).as_secs_f64());
+                now
+            };
+
+            // write_record returns Some(sealed_path) when the segment rotated.
+            let rotation = match writer.write_record(&unit.payload) {
+                Ok(rotation) => rotation,
+                Err(_) => {
+                    // The active segment was dropped. Records already collected
+                    // for it (pending_acks) are now in an abandoned, un-fsynced
+                    // file — Nack them rather than let the group fsync below
+                    // falsely ack them. Records in already-rotated (sealed +
+                    // fsynced) segments are durable and untouched.
+                    for ack_tx in pending_acks.drain(..) {
+                        let _ = ack_tx.send(false);
+                    }
+                    #[cfg(feature = "bench-trace")]
+                    pending_ts.clear();
+                    let _ = unit.ack_tx.send(false);
+                    continue;
+                }
+            };
+
+            // Observe the write stage (pre-fsync).
+            #[cfg(feature = "bench-trace")]
             metrics
-                .wab_segments
-                .get_or_create(&SegmentStateLabel {
-                    state: SegmentState::sealed,
-                })
-                .inc();
-            drain_tx.send(sealed).ok();
-        }
+                .stage_write
+                .observe(flusher_recv_at.elapsed().as_secs_f64());
 
-        match record.durability {
-            Durability::Sync => {
-                need_fsync = true;
-                sync_acks.push(record.ack_tx);
+            let rotated = rotation.is_some();
+            if let Some(sealed) = rotation {
+                // Segment was sealed (seal includes fsync) — every record in it
+                // is now durable: this triggering record plus all prior records
+                // collected for that segment. Promote them and notify drain.
+                info!(shard = shard_id, sealed = %sealed.display(), "WAB segment rotated");
+                metrics
+                    .wab_segments
+                    .get_or_create(&SegmentStateLabel {
+                        state: SegmentState::sealed,
+                    })
+                    .inc();
+                drain_tx.send(sealed).ok();
+                durable_acks.append(&mut pending_acks);
+                #[cfg(feature = "bench-trace")]
+                durable_ts.append(&mut pending_ts);
             }
-            Durability::Batched => {
-                need_fsync = true;
-                batched_acks.push(record.ack_tx);
-            }
-            Durability::Buffered => {
-                let _ = record.ack_tx.send(true);
+
+            match unit.durability {
+                Durability::Sync | Durability::Batched => {
+                    // A record that triggered rotation is in the just-sealed
+                    // (durable) segment; otherwise it's in the current active
+                    // segment, awaiting the group fsync.
+                    if rotated {
+                        durable_acks.push(unit.ack_tx);
+                        #[cfg(feature = "bench-trace")]
+                        durable_ts.push(unit.enqueued_at);
+                    } else {
+                        pending_acks.push(unit.ack_tx);
+                        #[cfg(feature = "bench-trace")]
+                        pending_ts.push(unit.enqueued_at);
+                    }
+                }
+                Durability::Buffered => {
+                    // Observe stage_total for buffered records (ack fires immediately).
+                    #[cfg(feature = "bench-trace")]
+                    metrics
+                        .stage_total
+                        .observe(unit.enqueued_at.elapsed().as_secs_f64());
+                    let _ = unit.ack_tx.send(true);
+                }
             }
         }
     }
 
-    // Group fsync covering every Sync and Batched record written during
-    // this flush. One fsync per batch instead of one per Sync record;
-    // both tiers' acks fire after it completes.
-    if need_fsync {
-        let ok = fsync_observed(writer, shard_id, metrics);
-        for ack_tx in sync_acks.into_iter().chain(batched_acks) {
+    // One group fsync covers every record still in the active segment; they ack
+    // with its result. (If every fsync-tier record rotated out, pending_acks is
+    // empty and we skip the now-redundant fsync.)
+    if !pending_acks.is_empty() {
+        let ok = fsync_observed(writer, shard_id, metrics, coalesce_hint);
+        #[cfg(feature = "bench-trace")]
+        for enqueued_at in pending_ts {
+            metrics
+                .stage_total
+                .observe(enqueued_at.elapsed().as_secs_f64());
+        }
+        for ack_tx in pending_acks {
             let _ = ack_tx.send(ok);
         }
+    }
+
+    // Records in rotated (sealed + fsynced) segments are durable regardless of
+    // the active segment's fsync outcome — ack them true.
+    #[cfg(feature = "bench-trace")]
+    for enqueued_at in durable_ts {
+        metrics
+            .stage_total
+            .observe(enqueued_at.elapsed().as_secs_f64());
+    }
+    for ack_tx in durable_acks {
+        let _ = ack_tx.send(true);
     }
 }
 
 /// Fsyncs the active segment, observing the duration and recording any error
 /// through both a tracing log line (so operators see the underlying
 /// io::Error string) and a Prometheus counter (so the failure rate is
-/// alertable). Returns the bool the caller propagates to ack_tx.
-fn fsync_observed(writer: &mut ShardWriter, shard_id: u16, metrics: &Arc<Metrics>) -> bool {
+/// alertable). Updates `coalesce_hint` with an EWMA of the observed fsync
+/// duration so the worker can size its coalesce window dynamically. Returns
+/// the bool the caller propagates to ack_tx.
+fn fsync_observed(
+    writer: &mut ShardWriter,
+    shard_id: u16,
+    metrics: &Arc<Metrics>,
+    coalesce_hint: &Arc<AtomicU64>,
+) -> bool {
     let t = Instant::now();
     let result = writer.fsync_current();
-    metrics
-        .wab_fsync_duration
-        .observe(t.elapsed().as_secs_f64());
+    let elapsed = t.elapsed();
+    let sample_us = elapsed.as_micros() as u64;
+    metrics.wab_fsync_duration.observe(elapsed.as_secs_f64());
+    // Update the shared EWMA hint (Relaxed: heuristic, not a correctness signal).
+    let cur = coalesce_hint.load(Relaxed);
+    coalesce_hint.store(ewma_update_us(cur, sample_us), Relaxed);
     match result {
         Ok(()) => true,
         Err(e) => {
@@ -596,13 +763,13 @@ impl Iterator for SegmentReader {
         }
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        let mut payload = vec![0u8; payload_len];
-        if let Err(e) = self.reader.read_exact(&mut payload) {
+        let mut payload_buf = vec![0u8; payload_len];
+        if let Err(e) = self.reader.read_exact(&mut payload_buf) {
             self.done = true;
             return Some(Err(e));
         }
 
-        let computed_crc = crc32fast::hash(&payload);
+        let computed_crc = crc32fast::hash(&payload_buf);
         if expected_crc != computed_crc {
             self.done = true;
             return Some(Err(io::Error::new(
@@ -613,7 +780,8 @@ impl Iterator for SegmentReader {
             )));
         }
 
-        Some(Ok(payload))
+        // Freeze: O(1) ownership transfer from Vec allocation to Bytes.
+        Some(Ok(Payload::from(payload_buf)))
     }
 }
 
@@ -642,7 +810,7 @@ mod tests {
         }
         let sealed = seg.seal().unwrap();
 
-        let got: Vec<Vec<u8>> = SegmentReader::open(&sealed)
+        let got: Vec<Payload> = SegmentReader::open(&sealed)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -699,7 +867,12 @@ mod tests {
         let m = Arc::new(m);
         // One panic then clean recovery — verify the supervisor caught
         // it and bumped the metric exactly once.
-        run_with_panic_supervision(0, Arc::clone(&m), panic_then_recover_factory(1, "boom"));
+        run_with_panic_supervision(
+            0,
+            Arc::clone(&m),
+            &RealClock,
+            panic_then_recover_factory(1, "boom"),
+        );
         assert_eq!(m.wab_flusher_panics.get(), 1);
     }
 
@@ -714,7 +887,7 @@ mod tests {
         let m = Arc::new(m);
         let shard = 7;
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        run_with_panic_supervision(shard, Arc::clone(&m), move || {
+        run_with_panic_supervision(shard, Arc::clone(&m), &RealClock, move || {
             let counter = std::sync::Arc::clone(&counter);
             move || {
                 if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -729,7 +902,7 @@ mod tests {
     fn supervisor_lets_clean_exit_pass_through() {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
-        run_with_panic_supervision(0, Arc::clone(&m), || {
+        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
             || { /* normal return on first attempt */ }
         });
         assert_eq!(m.wab_flusher_panics.get(), 0);
@@ -747,6 +920,7 @@ mod tests {
         run_with_panic_supervision(
             0,
             Arc::clone(&m),
+            &RealClock,
             panic_then_recover_factory(3, "transient boom"),
         );
         assert_eq!(
@@ -767,7 +941,7 @@ mod tests {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
         let start = std::time::Instant::now();
-        run_with_panic_supervision(0, Arc::clone(&m), || {
+        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
             // Every attempt panics — never recovers.
             || panic!("persistent panic")
         });
@@ -801,6 +975,83 @@ mod tests {
         assert_eq!(
             panic_message_str(&int_payload),
             "<non-string panic payload>"
+        );
+    }
+
+    // ── EWMA helper ──────────────────────────────────────────────────────────
+
+    /// `ewma_update_us` converges toward a constant input. After enough
+    /// samples the EWMA should be within 10% of the constant.
+    #[test]
+    fn ewma_converges_toward_constant_input() {
+        let target = 500u64;
+        let mut cur = 200u64; // start below target
+        for _ in 0..64 {
+            cur = ewma_update_us(cur, target);
+        }
+        // After 64 updates alpha=1/4 EWMA is well within 10% of target.
+        assert!(
+            cur > target * 9 / 10 && cur < target * 11 / 10,
+            "EWMA should converge to ~{target}, got {cur}"
+        );
+    }
+
+    /// A single spike should move the EWMA by at most 25% of the spike
+    /// magnitude (alpha=1/4 → new = old*3/4 + spike*1/4).
+    #[test]
+    fn ewma_single_spike_is_dampened() {
+        let start = 200u64;
+        let spike = 2_000u64;
+        let after = ewma_update_us(start, spike);
+        // Expected: 200*3/4 + 2000/4 = 150 + 500 = 650
+        assert_eq!(after, 650, "single spike should land at 650 µs");
+        // The move is 450 out of 1800 possible = 25%; verify it's ≤ 25%.
+        let delta = after.saturating_sub(start);
+        let max_delta = (spike - start) / 4 + 1; // +1 for integer rounding
+        assert!(
+            delta <= max_delta,
+            "spike should shift EWMA by at most 25% of spike delta, but delta={delta} max={max_delta}"
+        );
+    }
+
+    /// Zero sample (degenerate: no fsync measured) should reduce the EWMA
+    /// towards zero without panic.
+    #[test]
+    fn ewma_zero_sample_does_not_panic() {
+        let result = ewma_update_us(200, 0);
+        assert_eq!(result, 150, "zero sample: 200*3/4 + 0/4 = 150");
+    }
+
+    /// Very large sample (saturating multiply guard) — must not overflow.
+    #[test]
+    fn ewma_large_values_do_not_overflow() {
+        // u64::MAX / 2 as current — saturating_mul(3) would overflow without
+        // saturation; verify the function handles it without panic.
+        let large = u64::MAX / 2;
+        let result = ewma_update_us(large, 1_000_000);
+        // We can't assert an exact value, just that it didn't panic.
+        let _ = result;
+    }
+
+    /// The worker's clamping range [50, 2000] does not clip the converged
+    /// EWMA when fsync is in the realistic NVMe range (~150–250 µs). This
+    /// documents that on fast local NVMe the window stays near the old
+    /// fixed 200 µs constant — no local throughput change expected.
+    #[test]
+    fn ewma_nvme_range_is_not_clipped() {
+        const MIN_US: u64 = 50;
+        const MAX_US: u64 = 2_000;
+        // Simulate NVMe fsync latency of 150 µs; start from the default 200.
+        let mut cur = 200u64;
+        for _ in 0..64 {
+            cur = ewma_update_us(cur, 150);
+        }
+        let clamped = cur.clamp(MIN_US, MAX_US);
+        // The converged EWMA (~150) should be within the [50, 2000] range
+        // — no clamping needed on NVMe latencies.
+        assert_eq!(
+            cur, clamped,
+            "NVMe-range EWMA ({cur} µs) should not be clipped by [50, 2000] bounds"
         );
     }
 }

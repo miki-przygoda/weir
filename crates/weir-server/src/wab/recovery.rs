@@ -431,13 +431,13 @@ mod tests {
         let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
 
         // Recovery should have recovered exactly 2 records.
-        let records: Vec<Vec<u8>> = crate::wab::SegmentReader::open(&sealed)
+        let records: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0], b"record1");
-        assert_eq!(records[1], b"record2");
+        assert_eq!(records[0], b"record1" as &[u8]);
+        assert_eq!(records[1], b"record2" as &[u8]);
 
         fs::remove_dir_all(dir).ok();
     }

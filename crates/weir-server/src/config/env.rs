@@ -36,6 +36,12 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         sink_postgres_column: env_string("WEIR_SINK_POSTGRES_COLUMN")?,
         #[cfg(feature = "postgres-sink")]
         sink_postgres_insert_mode: env_string("WEIR_SINK_POSTGRES_INSERT_MODE")?,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_database: env_string("WEIR_SINK_CLICKHOUSE_DATABASE")?,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_table: env_string("WEIR_SINK_CLICKHOUSE_TABLE")?,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_column: env_string("WEIR_SINK_CLICKHOUSE_COLUMN")?,
         dead_letter_max_bytes: env_parse("WEIR_DEAD_LETTER_MAX_BYTES")?,
         dead_letter_check_interval_secs: env_parse("WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS")?,
         log_level: env_string("WEIR_LOG_LEVEL")?,

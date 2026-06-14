@@ -155,17 +155,23 @@ of thumb is `max(2, cores - 2) / 2`.
 #### `worker_count`
 
 - **Type**: usize
-- **Default**: `2`
+- **Default**: `shard_count` (same as the resolved `shard_count` value)
 - **Range**: 1–64
 - **CLI**: `--worker-count <n>`
 - **Env**: `WEIR_WORKER_COUNT`
 - **TOML**: `worker_count`
 
 Number of worker threads pulling from the global queue and batching
-records into per-shard bridge channels. Workers are stateless and
+records into per-shard batch channels. Workers are stateless and
 pinned at startup; they exist primarily to absorb tokio
 `spawn_blocking` slots without each spawn-blocking task fighting for a
 queue lock.
+
+The default was changed in 0.9.0 from the hard-coded `2` to `shard_count`.
+With the old default, the standard single-shard config had `worker_count=2`
+but only one shard, so worker 1 was permanently idle. Defaulting to
+`shard_count` removes the idle worker and keeps the balanced invariant
+(`worker_count == shard_count`) out of the box.
 
 **When to tune**: scale with `max_connections / 32` as a starting
 point. The bottleneck is rarely worker count itself; if records
@@ -809,6 +815,62 @@ explicit opt-in. A TLS-terminating proxy (stunnel, ghostunnel,
 pgbouncer with TLS upstream) remains a valid option for deployments
 that need certificate-pinning or client-auth — neither is wired up
 by the in-process connector yet.
+
+---
+
+### Sink: ClickHouse (`sink_type = "clickhouse"`)
+
+Requires the `clickhouse-sink` build feature. The sink sends one HTTP
+`INSERT INTO {database}.{table} ({column}) FORMAT RowBinary` request per
+batch to ClickHouse's HTTP interface (default `:8123`), with the batch
+encoded as length-prefixed bytes into a single `String` column. N records →
+one request → one ClickHouse block — the same IOPS compression as the SQL
+sinks. `sink_url` carries `http://[user:password@]host:8123` (credentials
+sent as HTTP basic auth, redacted in logs).
+
+#### `sink_clickhouse_database`
+
+- **Type**: string · **Default**: `default`
+- **CLI**: `--sink-clickhouse-database` · **Env**: `WEIR_SINK_CLICKHOUSE_DATABASE` · **TOML**: `sink_clickhouse_database`
+
+#### `sink_clickhouse_table`
+
+- **Type**: string · **Default**: `weir_records`
+- **CLI**: `--sink-clickhouse-table` · **Env**: `WEIR_SINK_CLICKHOUSE_TABLE` · **TOML**: `sink_clickhouse_table`
+
+#### `sink_clickhouse_column`
+
+- **Type**: string · **Default**: `payload`
+- **CLI**: `--sink-clickhouse-column` · **Env**: `WEIR_SINK_CLICKHOUSE_COLUMN` · **TOML**: `sink_clickhouse_column`
+
+#### Idempotency (dedup token)
+
+The drain is at-least-once per segment, so a crash mid-commit replays the
+batch. ClickHouse has no `ON CONFLICT`; instead the sink sends a
+deterministic `insert_deduplication_token = sha256(batch)` on each insert,
+so a replayed byte-identical batch is deduplicated by ClickHouse **provided
+the target table uses a dedup-capable engine** — a `Replicated*MergeTree`
+(where `insert_deduplicate` is on by default) or a `MergeTree` with
+`non_replicated_deduplication_window` set. Mind the dedup window (default
+last ~100 blocks). If the engine isn't dedup-capable, the token is harmless
+and dedup falls back to your table design.
+
+Reference schema:
+
+```sql
+CREATE TABLE weir_records (payload String)
+ENGINE = MergeTree ORDER BY tuple()
+SETTINGS non_replicated_deduplication_window = 100;
+```
+
+#### Error classification
+
+| ClickHouse response | Classification | What weir does |
+|---------------------|----------------|----------------|
+| connect / DNS / network reset | transient | retry the segment |
+| HTTP 5xx | transient | retry |
+| request timeout (`sink_timeout_secs`) | timeout (transient) | retry |
+| HTTP 4xx (bad query, auth, unknown table) | permanent | dead-letter the batch |
 
 ---
 

@@ -82,9 +82,19 @@ fn emit_latency(scenario: &str, samples: usize, sorted_us: &[u64]) {
     };
     let mean = sorted_us.iter().sum::<u64>() / samples as u64;
     let min = sorted_us.first().copied().unwrap_or(0);
+    // Population stddev over sorted_us (integer µs).
+    let variance = sorted_us
+        .iter()
+        .map(|&v| {
+            let diff = v as i64 - mean as i64;
+            (diff * diff) as u64
+        })
+        .sum::<u64>()
+        / samples as u64;
+    let stddev_us = (variance as f64).sqrt() as u64;
     println!(
         "BENCH: {{\"scenario\":\"{scenario}\",\"samples\":{samples},\
-         \"min_us\":{min},\"mean_us\":{mean},\"p50_us\":{},\"p75_us\":{},\
+         \"min_us\":{min},\"mean_us\":{mean},\"stddev_us\":{stddev_us},\"p50_us\":{},\"p75_us\":{},\
          \"p95_us\":{},\"p99_us\":{},\"p999_us\":{},\"max_us\":{}}}",
         p(50.0),
         p(75.0),
@@ -143,6 +153,7 @@ fn run_ramp_level(
     srv: &weir_testkit::WeirServer,
     n_threads: usize,
     duration: Duration,
+    durability: Durability,
 ) -> LevelResult {
     let acks = Arc::new(AtomicU64::new(0));
     let nacks = Arc::new(AtomicU64::new(0));
@@ -167,7 +178,7 @@ fn run_ramp_level(
                     return;
                 };
                 while !stop.load(Ordering::Relaxed) {
-                    match client.push(b"ramp", Durability::Buffered) {
+                    match client.push(b"ramp", durability) {
                         Ok(()) => {
                             acks.fetch_add(1, Ordering::Relaxed);
                         }
@@ -237,7 +248,7 @@ fn baseline_single_thread_throughput_sync() {
 /// Latency percentiles: single Sync producer, every push timed individually.
 #[test]
 fn baseline_latency_percentiles_sync() {
-    const SAMPLES: usize = 500;
+    const SAMPLES: usize = 2000;
     let srv = weir_server!("latency_sync").bench_preset().start();
     let mut client = srv.client();
 
@@ -255,7 +266,7 @@ fn baseline_latency_percentiles_sync() {
 /// Latency percentiles: single Batched producer.
 #[test]
 fn baseline_latency_percentiles_batched() {
-    const SAMPLES: usize = 500;
+    const SAMPLES: usize = 2000;
     let srv = weir_server!("latency_batched").bench_preset().start();
     let mut client = srv.client();
 
@@ -273,7 +284,7 @@ fn baseline_latency_percentiles_batched() {
 /// Latency percentiles: single Buffered producer.
 #[test]
 fn baseline_latency_percentiles_buffered() {
-    const SAMPLES: usize = 500;
+    const SAMPLES: usize = 2000;
     let srv = weir_server!("latency_buffered").bench_preset().start();
     let mut client = srv.client();
 
@@ -383,7 +394,7 @@ fn ramp_to_saturation() {
     println!("{}", "-".repeat(62));
 
     for &n in LEVELS {
-        let result = run_ramp_level(&srv, n, LEVEL_DURATION);
+        let result = run_ramp_level(&srv, n, LEVEL_DURATION, Durability::Buffered);
         let rps = result.acks as f64 / result.duration.as_secs_f64();
         let status = if result.io_errors > 0 {
             "SATURATED"
@@ -398,6 +409,63 @@ fn ramp_to_saturation() {
 
         println!(
             "BENCH: {{\"scenario\":\"ramp_{n}_threads_d{d}ms\",\"threads\":{n},\
+             \"acks\":{},\"nacks\":{},\"io_errors\":{},\
+             \"wall_ms\":{},\"throughput_rps\":{}}}",
+            result.acks,
+            result.nacks,
+            result.io_errors,
+            result.duration.as_millis(),
+            rps as u64,
+        );
+
+        let mut health = srv.client();
+        assert!(
+            health.health_check().is_ok(),
+            "server became unresponsive after {n}-thread level (status: {status})"
+        );
+    }
+}
+
+/// Sync-tier saturation ramp: same as `ramp_to_saturation` but uses Sync
+/// durability to stress the group-fsync path under escalating concurrency.
+///
+/// Confirms the server survives concurrent Sync producers hitting the fsync
+/// bottleneck and that it degrades gracefully once the connection cap is
+/// exceeded (same assertion as the Buffered ramp).
+#[test]
+fn ramp_to_saturation_sync() {
+    const MAX_CONN: usize = 48;
+    const LEVEL_DURATION: Duration = Duration::from_secs(3);
+    const LEVELS: &[usize] = &[8, 16, 32, 48, 64, 96];
+
+    let srv = weir_server!("ramp_sync")
+        .bench_preset()
+        .max_connections(MAX_CONN)
+        .start();
+    let d = srv.batch_deadline_ms;
+
+    println!(
+        "\n{:<10} {:>10} {:>10} {:>8} {:>8} {:>12}",
+        "threads", "acks", "RPS", "nacks", "io_errs", "status"
+    );
+    println!("{}", "-".repeat(62));
+
+    for &n in LEVELS {
+        let result = run_ramp_level(&srv, n, LEVEL_DURATION, Durability::Sync);
+        let rps = result.acks as f64 / result.duration.as_secs_f64();
+        let status = if result.io_errors > 0 {
+            "SATURATED"
+        } else {
+            "ok"
+        };
+
+        println!(
+            "{:<10} {:>10} {:>10.0} {:>8} {:>8} {:>12}",
+            n, result.acks, rps, result.nacks, result.io_errors, status
+        );
+
+        println!(
+            "BENCH: {{\"scenario\":\"ramp_sync_{n}_threads_d{d}ms\",\"threads\":{n},\
              \"acks\":{},\"nacks\":{},\"io_errors\":{},\
              \"wall_ms\":{},\"throughput_rps\":{}}}",
             result.acks,
@@ -673,4 +741,80 @@ fn parse_load_metric(body: &str, prefix: &str) -> u64 {
         }
     }
     0
+}
+
+#[cfg(feature = "bench-trace")]
+fn parse_load_metric_f64(body: &str, prefix: &str) -> f64 {
+    for line in body.lines() {
+        if line.starts_with(prefix)
+            && let Some(val) = line.split_whitespace().next_back()
+            && let Ok(n) = val.parse::<f64>()
+        {
+            return n;
+        }
+    }
+    0.0
+}
+
+/// Per-stage latency breakdown — gated behind `bench-trace` feature.
+///
+/// Starts a server compiled with `bench-trace`, pushes 2000 records of each
+/// tier, scrapes `/metrics` for the four `weir_stage_*_seconds` histograms,
+/// and emits one `BENCH_STAGE:` JSON line per tier with mean µs per stage.
+/// Only runs when `--features bench-trace` is passed to `cargo test`.
+#[cfg(feature = "bench-trace")]
+#[test]
+fn latency_stage_breakdown() {
+    const SAMPLES: usize = 2000;
+    let d = bench_deadline_ms();
+
+    for (tier_name, durability) in &[
+        ("sync", Durability::Sync),
+        ("batched", Durability::Batched),
+        ("buffered", Durability::Buffered),
+    ] {
+        let srv = weir_server!(&format!("stage_{tier_name}"))
+            .bench_preset()
+            .start();
+        let mut client = srv.client();
+
+        for _ in 0..SAMPLES {
+            client.push(b"stage", *durability).expect("push");
+        }
+        // Small pause to let the flusher finish observing stage_total for
+        // the last batch (especially Buffered which doesn't wait for fsync).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let body = srv.scrape_metrics();
+
+        // Parse sum and count for each stage histogram.
+        let q_sum = parse_load_metric_f64(&body, "weir_stage_queue_seconds_sum");
+        let q_count = parse_load_metric_f64(&body, "weir_stage_queue_seconds_count");
+        let bw_sum = parse_load_metric_f64(&body, "weir_stage_bridge_wait_seconds_sum");
+        let bw_count = parse_load_metric_f64(&body, "weir_stage_bridge_wait_seconds_count");
+        let w_sum = parse_load_metric_f64(&body, "weir_stage_write_seconds_sum");
+        let w_count = parse_load_metric_f64(&body, "weir_stage_write_seconds_count");
+        let t_sum = parse_load_metric_f64(&body, "weir_stage_total_seconds_sum");
+        let t_count = parse_load_metric_f64(&body, "weir_stage_total_seconds_count");
+
+        // Mean µs per stage = sum / count * 1e6.
+        let mean_us = |sum: f64, count: f64| -> f64 {
+            if count > 0.0 {
+                sum / count * 1_000_000.0
+            } else {
+                0.0
+            }
+        };
+
+        let queue_us = mean_us(q_sum, q_count) as u64;
+        let bridge_wait_us = mean_us(bw_sum, bw_count) as u64;
+        let write_us = mean_us(w_sum, w_count) as u64;
+        let total_us = mean_us(t_sum, t_count) as u64;
+
+        println!(
+            "BENCH_STAGE: {{\"scenario\":\"stage_{tier_name}_d{d}ms\",\
+             \"queue_us\":{queue_us},\"bridge_wait_us\":{bridge_wait_us},\
+             \"write_us\":{write_us},\"total_us\":{total_us}}}"
+        );
+    }
 }

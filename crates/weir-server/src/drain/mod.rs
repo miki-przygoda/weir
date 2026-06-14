@@ -71,6 +71,12 @@ pub struct DrainConfig {
     /// Maximum number of retry attempts per segment before the segment is left
     /// on disk and the drain advances to the next segment.
     pub max_retries: u32,
+    /// Hard upper bound on a single `Sink::commit` call. A backstop against a
+    /// sink that hangs without honouring its own internal timeout (notably
+    /// third-party sinks built on `weir-sink-sdk`, which carry no built-in
+    /// timeout). On elapse, the commit is treated as a transient error and the
+    /// segment is retried.
+    pub commit_timeout: Duration,
 }
 
 // ── Internal state machine types ──────────────────────────────────────────────
@@ -463,7 +469,29 @@ async fn commit_batch<S: Sink>(
         .collect();
 
     let t = std::time::Instant::now();
-    match sink.commit(records).await {
+    // Backstop timeout: a sink that hangs (e.g. a third-party sink with no
+    // internal timeout) must not stall the drain forever. On elapse, treat it
+    // as a transient error so the segment is retried.
+    let commit = match tokio::time::timeout(config.commit_timeout, sink.commit(records)).await {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            metrics
+                .sink_commit_duration
+                .observe(t.elapsed().as_secs_f64());
+            metrics
+                .sink_commit_records
+                .get_or_create(&OutcomeLabel {
+                    outcome: Outcome::retried,
+                })
+                .inc_by(payloads.len() as u64);
+            warn!(
+                timeout_secs = config.commit_timeout.as_secs(),
+                "drain: sink commit exceeded commit_timeout; treating as transient, retrying segment"
+            );
+            return BatchResult::Transient { retry_after: None };
+        }
+    };
+    match commit {
         Ok(commit_result) => {
             metrics
                 .sink_commit_duration
@@ -666,6 +694,10 @@ mod tests {
     struct MockSink {
         responses: Mutex<VecDeque<MockResult>>,
         call_count: AtomicU64,
+        /// Number of initial `commit()` calls that hang forever (await
+        /// `pending()`), modelling a sink with no internal timeout. The drain's
+        /// backstop `commit_timeout` must cancel these.
+        hang_calls: u64,
         max_batch: usize,
         /// Wall-clock instant of every `commit()` call. Tests that need to
         /// measure inter-call gaps (e.g. retry-after observance) read this
@@ -687,6 +719,7 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
+                hang_calls: 0,
                 max_batch: 1000,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -701,10 +734,20 @@ mod tests {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
+                hang_calls: 0,
                 max_batch,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
                 dead_lettered_records: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A sink whose first `hang_calls` `commit()` invocations hang forever,
+        /// then falls back to `responses` (empty = commit the whole batch).
+        fn with_hang(hang_calls: u64, responses: impl IntoIterator<Item = MockResult>) -> Self {
+            Self {
+                hang_calls,
+                ..Self::with_responses(responses)
             }
         }
 
@@ -752,8 +795,12 @@ mod tests {
         type Error = MockError;
 
         async fn commit(&self, batch: Vec<Payload>) -> MockResult {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let nth = self.call_count.fetch_add(1, Ordering::Relaxed) + 1;
             self.call_timestamps.lock().unwrap().push(Instant::now());
+            if nth <= self.hang_calls {
+                // Hang forever; the drain's backstop timeout cancels this future.
+                std::future::pending::<()>().await;
+            }
             let mut responses = self.responses.lock().unwrap();
             let response = responses.pop_front().unwrap_or_else(|| {
                 Ok(CommitResult {
@@ -816,6 +863,14 @@ mod tests {
             .get()
     }
 
+    fn records_retried(m: &Metrics) -> u64 {
+        m.sink_commit_records
+            .get_or_create(&OutcomeLabel {
+                outcome: Outcome::retried,
+            })
+            .get()
+    }
+
     fn dl_full_count(m: &Metrics) -> u64 {
         m.dead_letter_full.get()
     }
@@ -854,6 +909,7 @@ mod tests {
             dead_letter_check_interval: Duration::from_millis(10),
             base_retry_delay: Duration::from_millis(1),
             max_retries: MAX_RETRIES,
+            commit_timeout: Duration::from_secs(30),
         }
     }
 
@@ -886,7 +942,7 @@ mod tests {
 
     #[test]
     fn commit_result_separates_committed_and_dead_lettered() {
-        let p = b"hello".to_vec();
+        let p: Payload = Payload::from(b"hello".as_ref());
         let result: CommitResult<Payload> = CommitResult {
             committed: vec![p.clone()],
             dead_lettered: vec![(p.clone(), "reason".into())],
@@ -906,8 +962,8 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([MockSink::ok(vec![
-            b"r1".to_vec(),
-            b"r2".to_vec(),
+            Payload::from(b"r1".as_ref()),
+            Payload::from(b"r2".as_ref()),
         ])]));
         let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
@@ -957,7 +1013,7 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::Transient),
-            MockSink::ok(vec![b"data".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"data".as_ref())]),
         ]));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
@@ -965,6 +1021,47 @@ mod tests {
             get_confirmed_path(&sealed).exists(),
             "confirmed after successful retry"
         );
+        assert!(!sealed.exists());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Concern #2: a sink whose `commit()` hangs (a third-party sink with no
+    /// internal timeout) must not stall the drain forever. The backstop
+    /// `commit_timeout` fires → the batch is treated as transient → the segment
+    /// is retried. Here the sink hangs on its first commit, then succeeds: the
+    /// segment must still be confirmed, with the timeout charged to `retried`.
+    #[test]
+    fn hung_sink_commit_times_out_then_segment_retried_and_confirmed() {
+        let dir = tmp_dir("hung_sink");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1", b"r2"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let metrics = noop_metrics();
+        // Hang on the 1st commit; the 2nd falls back to the default response
+        // (commits the whole batch).
+        let sink = Arc::new(MockSink::with_hang(1, []));
+        let mut config = fast_config(dir.clone());
+        // Short backstop so the hung commit is cancelled quickly.
+        config.commit_timeout = Duration::from_millis(50);
+        run_drain(rx, tx, sink.clone(), config, metrics.clone());
+
+        assert!(
+            sink.call_count() >= 2,
+            "the hung commit must be retried (calls={})",
+            sink.call_count()
+        );
+        assert!(
+            records_retried(&metrics) >= 2,
+            "the timeout path must charge the records to the `retried` outcome"
+        );
+        assert_eq!(
+            segments_confirmed(&metrics),
+            1,
+            "the segment is confirmed once the retry succeeds — no record lost, no deadlock"
+        );
+        assert!(get_confirmed_path(&sealed).exists());
         assert!(!sealed.exists());
 
         std::fs::remove_dir_all(dir).ok();
@@ -1015,7 +1112,7 @@ mod tests {
         let mut responses: Vec<MockResult> = (0..=MAX_RETRIES)
             .map(|_| Err(MockError::Transient))
             .collect();
-        responses.push(MockSink::ok(vec![b"seg2".to_vec()]));
+        responses.push(MockSink::ok(vec![Payload::from(b"seg2".as_ref())]));
         let sink = Arc::new(MockSink::with_responses(responses));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
@@ -1075,8 +1172,8 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([MockSink::ok_with_dead_letter(
-            vec![b"ok_record".to_vec()],
-            vec![b"bad_record".to_vec()],
+            vec![Payload::from(b"ok_record".as_ref())],
+            vec![Payload::from(b"bad_record".as_ref())],
         )]));
         let metrics = noop_metrics();
         run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
@@ -1193,7 +1290,7 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::Permanent),
-            MockSink::ok(vec![b"record".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"record".as_ref())]),
         ]));
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
@@ -1285,7 +1382,7 @@ mod tests {
 
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::Permanent),
-            MockSink::ok(vec![b"r".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"r".as_ref())]),
         ]));
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
@@ -1420,13 +1517,13 @@ mod tests {
 
         assert!(!dl_files.is_empty(), "dead-letter files must exist");
         for path in &dl_files {
-            let records: Vec<Vec<u8>> = crate::wab::SegmentReader::open(path)
+            let records: Vec<Payload> = crate::wab::SegmentReader::open(path)
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .expect("dead-letter records must have valid CRCs");
             assert_eq!(records.len(), 2);
-            assert_eq!(records[0], b"dead1");
-            assert_eq!(records[1], b"dead2");
+            assert_eq!(records[0], b"dead1" as &[u8]);
+            assert_eq!(records[1], b"dead2" as &[u8]);
         }
 
         std::fs::remove_dir_all(dir).ok();
@@ -1450,8 +1547,11 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         let sink = Arc::new(MockSink::with_responses([MockSink::ok_with_dead_letter(
-            vec![b"alpha".to_vec(), b"gamma".to_vec()],
-            vec![b"beta".to_vec()],
+            vec![
+                Payload::from(b"alpha".as_ref()),
+                Payload::from(b"gamma".as_ref()),
+            ],
+            vec![Payload::from(b"beta".as_ref())],
         )]));
         let metrics = noop_metrics();
         run_drain(
@@ -1467,7 +1567,7 @@ mod tests {
         let dead_lettered = sink.dead_lettered_records();
         assert_eq!(committed, vec![b"alpha".to_vec(), b"gamma".to_vec()]);
         assert_eq!(dead_lettered.len(), 1);
-        assert_eq!(dead_lettered[0].0, b"beta".to_vec());
+        assert_eq!(dead_lettered[0].0, b"beta" as &[u8]);
 
         // Metric counts agree with the capture.
         assert_eq!(records_committed(&metrics), committed.len() as u64);
@@ -1512,7 +1612,7 @@ mod tests {
         const HINT: Duration = Duration::from_millis(75);
         let sink = Arc::new(MockSink::with_responses([
             Err(MockError::TransientWithRetryAfter(HINT)),
-            MockSink::ok(vec![b"hello".to_vec()]),
+            MockSink::ok(vec![Payload::from(b"hello".as_ref())]),
         ]));
         let metrics = noop_metrics();
         run_drain(
@@ -1560,7 +1660,10 @@ mod tests {
             Err(MockError::Transient),
             Err(MockError::Transient),
             Err(MockError::Transient),
-            MockSink::ok(vec![b"r1".to_vec(), b"r2".to_vec()]),
+            MockSink::ok(vec![
+                Payload::from(b"r1".as_ref()),
+                Payload::from(b"r2".as_ref()),
+            ]),
         ]));
         let metrics = noop_metrics();
         run_drain(

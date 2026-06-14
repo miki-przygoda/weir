@@ -359,7 +359,7 @@ impl Sink for PostgresSink {
             // tokio-postgres takes parameters as `&[&(dyn ToSql + Sync)]`.
             // We need a Vec of `&[u8]` first, then a Vec of references to
             // those — both have to outlive the `execute` call.
-            let slices: Vec<&[u8]> = batch.iter().map(|p| p.as_slice()).collect();
+            let slices: Vec<&[u8]> = batch.iter().map(|p| p.as_ref()).collect();
             let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = slices
                 .iter()
                 .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))

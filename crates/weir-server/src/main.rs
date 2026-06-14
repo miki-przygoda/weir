@@ -9,13 +9,19 @@ mod socket;
 mod wab;
 mod worker;
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::Path,
+    sync::{Arc, atomic::AtomicU64},
+    time::Duration,
+};
 
 use tracing::info;
 
 use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
 use models::WorkUnit;
+#[cfg(feature = "clickhouse-sink")]
+use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
 #[cfg(feature = "http-sink")]
 use sink::http::{HttpSink, HttpSinkConfig};
 #[cfg(feature = "mysql-sink")]
@@ -23,7 +29,6 @@ use sink::mysql::{MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
 #[cfg(feature = "postgres-sink")]
 use sink::postgres::{PostgresSink, PostgresSinkConfig};
-use wab::WabRecord;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -171,6 +176,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (drain_tx, drain_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(256);
 
+    // ── Coalesce hint: shared EWMA of fsync latency ───────────────────────────
+    //
+    // Flusher threads update this after each fsync; worker threads read it once
+    // per batch to size their coalesce window. Lock-free, Relaxed ordering —
+    // it is a heuristic, not a correctness signal.
+    //
+    // Initial value 200 µs matches the old fixed COALESCE_WINDOW constant so
+    // behaviour before the first fsync is unchanged.
+    let coalesce_hint = Arc::new(AtomicU64::new(200));
+
     // ── WAB (one flusher thread per shard) ────────────────────────────────────
 
     let wab_config = wab::WabConfig {
@@ -184,44 +199,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wab_config,
         drain_tx,
         Arc::clone(&metrics),
+        Arc::clone(&coalesce_hint),
     )?;
 
-    // ── Workers (queue → per-shard Batch channels) ────────────────────────────
+    // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
+    //
+    // Workers send `Batch`es directly to the WAB flusher via the shard channels
+    // returned by `wab::spawn`. No bridge thread: the hop is
+    // worker → Batch-channel → flusher.
 
-    let (shard_batch_rxs, worker_handles) = worker::spawn_workers(
+    let worker_handles = worker::spawn_workers(
         &queue_rx,
+        wab_handle.shard_txs,
         config.shard_count,
         config.worker_count,
         config.batch_size,
         Duration::from_millis(config.batch_deadline_ms),
+        coalesce_hint,
     );
-
-    // ── Bridge threads (Batch → WabRecord per shard) ──────────────────────────
-    //
-    // Each bridge thread converts WorkUnit fields directly — both sides share
-    // `tokio::sync::oneshot::Sender<bool>` for the ack channel.
-
-    let mut bridge_handles = Vec::with_capacity(config.shard_count);
-    for (batch_rx, wab_tx) in shard_batch_rxs.into_iter().zip(wab_handle.shard_txs) {
-        let handle = std::thread::Builder::new()
-            .name("weir-bridge".into())
-            .spawn(move || {
-                while let Ok(batch) = batch_rx.recv() {
-                    for unit in batch.records {
-                        let record = WabRecord {
-                            payload: unit.payload,
-                            durability: unit.durability,
-                            ack_tx: unit.ack_tx,
-                        };
-                        if wab_tx.send(record).is_err() {
-                            return;
-                        }
-                    }
-                }
-            })
-            .expect("failed to spawn bridge thread");
-        bridge_handles.push(handle);
-    }
 
     // ── Drain ─────────────────────────────────────────────────────────────────
 
@@ -231,6 +226,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dead_letter_check_interval: Duration::from_secs(config.dead_letter_check_interval_secs),
         base_retry_delay: Duration::from_millis(100),
         max_retries: MAX_RETRIES,
+        // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
+        // sink hangs without honouring its internal timeout.
+        commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
     };
     // Sink selection. drain::spawn is generic over the sink type but returns
     // the same JoinHandle<()> regardless, so both arms produce a uniform
@@ -334,6 +332,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let sink = PostgresSink::new(pg_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
+            })?;
+            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+        }
+        #[cfg(feature = "clickhouse-sink")]
+        SinkType::ClickHouse => {
+            let url = config
+                .sink_url
+                .clone()
+                .expect("config validation guarantees sink_url is set when sink_type = ClickHouse");
+            info!(
+                // URL omitted from the log line — it may carry credentials.
+                database = %config.sink_clickhouse_database,
+                table = %config.sink_clickhouse_table,
+                column = %config.sink_clickhouse_column,
+                timeout_secs = config.sink_timeout_secs,
+                max_batch_size = config.sink_max_batch_size,
+                "sink: clickhouse"
+            );
+            let ch_cfg = ClickHouseSinkConfig {
+                url,
+                database: config.sink_clickhouse_database.clone(),
+                table: config.sink_clickhouse_table.clone(),
+                column: config.sink_clickhouse_column.clone(),
+                max_batch_size: config.sink_max_batch_size,
+                timeout: Duration::from_secs(config.sink_timeout_secs),
+            };
+            let sink = ClickHouseSink::new(ch_cfg).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("failed to build ClickHouse sink: {e}"))
             })?;
             drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
         }
@@ -545,9 +571,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Graceful pipeline drain ───────────────────────────────────────────────
     //
     // queue_tx moved into socket::run and dropped when it returns.
-    // Workers observe Disconnected → flush remaining batches → exit.
-    // Bridge threads observe shard_rx Disconnected → exit → drop wab_tx.
-    // WAB flushers observe wab_rx Disconnected → seal segments → exit → drop drain_tx.
+    // Workers observe Disconnected → flush remaining Batches → drop shard_txs
+    //   clones → flusher Disconnected.
+    // WAB flushers observe Disconnected → seal segments → exit → drop drain_tx.
     // Drain thread observes drain_rx Disconnected → drains pending segments → exits.
     //
     // The queue-depth background task holds a `queue_tx.clone()`. Dropping the
@@ -558,9 +584,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("socket layer shut down; waiting for pipeline to drain");
 
     for h in worker_handles {
-        h.join().ok();
-    }
-    for h in bridge_handles {
         h.join().ok();
     }
     for h in wab_handle.join_handles {

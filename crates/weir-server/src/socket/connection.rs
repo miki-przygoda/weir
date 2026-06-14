@@ -171,8 +171,9 @@ where
         }
 
         // ── 4. Read payload ──────────────────────────────────────────────────
-        let mut payload = vec![0u8; payload_len];
-        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload)).await {
+        // Accumulate into Vec<u8> then freeze to Bytes (O(1) ownership transfer).
+        let mut payload_buf = vec![0u8; payload_len];
+        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload_buf)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -185,6 +186,8 @@ where
                 return Ok(());
             }
         }
+        // Freeze: O(1) ownership transfer from Vec allocation to Bytes.
+        let payload = weir_core::Payload::from(payload_buf);
 
         // ── 5. Read and validate payload CRC ────────────────────────────────
         let mut crc_buf = [0u8; 4];
@@ -268,7 +271,7 @@ async fn handle_push<S>(
     stream: &mut S,
     queue_tx: QueueSender<WorkUnit>,
     durability: Durability,
-    payload: Vec<u8>,
+    payload: weir_core::Payload,
     tv: TierValue,
     shard_id: u32,
     ack_timeout: Duration,
@@ -283,6 +286,8 @@ where
         payload,
         durability,
         ack_tx,
+        #[cfg(feature = "bench-trace")]
+        enqueued_at: std::time::Instant::now(),
     };
 
     // Partition by shard_id so every record destined for a given shard lands

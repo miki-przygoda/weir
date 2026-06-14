@@ -102,14 +102,17 @@ except Exception:
 
 wait_for_healthy mysql
 wait_for_healthy postgres
+wait_for_healthy clickhouse
 
 # ── Run the integration tests ─────────────────────────────────────────────────
 
 export WEIR_TEST_MYSQL_URL="mysql://root:test@127.0.0.1:33306/weir_test"
 export WEIR_TEST_POSTGRES_URL="postgres://postgres:test@127.0.0.1:55432/weir_test"
+export WEIR_TEST_CLICKHOUSE_URL="http://127.0.0.1:18123"
 
 info "WEIR_TEST_MYSQL_URL=$WEIR_TEST_MYSQL_URL"
 info "WEIR_TEST_POSTGRES_URL=$WEIR_TEST_POSTGRES_URL"
+info "WEIR_TEST_CLICKHOUSE_URL=$WEIR_TEST_CLICKHOUSE_URL"
 
 CARGO_FLAGS=""
 if [ "${RELEASE:-0}" = "1" ]; then
@@ -129,4 +132,9 @@ info "running postgres_sink_end_to_end"
 cargo test $CARGO_FLAGS -p weir-server --test system -- --ignored --exact \
     postgres_sink_end_to_end
 
-info "both sink integration tests passed"
+info "running clickhouse_sink_end_to_end"
+# shellcheck disable=SC2086
+cargo test $CARGO_FLAGS -p weir-server --features clickhouse-sink --test system -- --ignored --exact \
+    clickhouse_sink_end_to_end
+
+info "all three sink integration tests passed"

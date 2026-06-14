@@ -1,29 +1,30 @@
-use std::{thread, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
+    thread,
+    time::Duration,
+};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::warn;
 
-use crate::{models::WorkUnit, queue::QueueReceiver};
+use crate::{
+    models::{Batch, WorkUnit},
+    queue::QueueReceiver,
+};
 
 /// Workers are pinned starting at this logical core index, leaving cores 0–1
 /// free for the OS scheduler and network interrupt handlers.
 const WORKER_CORE_START: usize = 2;
 
-/// A flushed batch of work units for one shard, ready for the WAB to consume.
-/// `ack_tx` inside each `WorkUnit` is carried intact; the WAB drain resolves
-/// it after the record is durably written.
-pub struct Batch {
-    /// Diagnostic tag — never read in production today, but the field is
-    /// set by every batch-producing path so a test can assert routing
-    /// correctness (`single_worker_batches_on_deadline` does) and a future
-    /// per-shard tracing/metric story has the data it needs without
-    /// re-plumbing. `#[expect(dead_code)]` won't work here because the test
-    /// compilation pass DOES read the field; using `#[allow]` so production
-    /// builds stay quiet and test builds don't trip `unfulfilled_lint_expectations`.
-    #[allow(dead_code)]
-    pub shard_id: u32,
-    pub records: Vec<WorkUnit>,
-}
+/// Minimum coalesce window: never collapse to zero, ensuring there is always a
+/// brief drain period to catch stragglers in quiet single-producer scenarios.
+const COALESCE_MIN_US: u64 = 50;
+/// Maximum coalesce window: bounds the added latency on very slow storage so the
+/// daemon never holds a record for more than 2 ms beyond the batch boundary.
+const COALESCE_MAX_US: u64 = 2_000;
 
 /// Per-worker state. One `Worker` runs on one thread and holds independent
 /// per-shard batch buffers — no lock contention on the hot path.
@@ -34,15 +35,24 @@ struct Worker {
     batch_size: usize,
     /// One sender per shard, shared (cloned) across all worker threads.
     shard_txs: Vec<Sender<Batch>>,
+    /// Shared EWMA of fsync latency in microseconds. Read once per batch to
+    /// size the coalesce window. Updated by flusher threads after each fsync.
+    coalesce_hint: Arc<AtomicU64>,
 }
 
 impl Worker {
-    fn new(shard_count: usize, batch_size: usize, shard_txs: Vec<Sender<Batch>>) -> Self {
+    fn new(
+        shard_count: usize,
+        batch_size: usize,
+        shard_txs: Vec<Sender<Batch>>,
+        coalesce_hint: Arc<AtomicU64>,
+    ) -> Self {
         let buffers = pretouched_buffers(shard_count, batch_size);
         Worker {
             buffers,
             batch_size,
             shard_txs,
+            coalesce_hint,
         }
     }
 
@@ -64,16 +74,26 @@ impl Worker {
         //     sporadic; skip the coalesce window so we don't tax
         //     latency.
         //
-        // 200 μs covers the worst-case stagger of ~16 producers' next-
-        // cycle pushes after a 1 ms fsync. The recv_timeout loop EXTENDS
-        // each time a record arrives, so the wait collapses naturally
-        // once records stop coming.
-        const COALESCE_WINDOW: Duration = Duration::from_micros(200);
         let mut expect_concurrent = false;
 
         loop {
             match work_rx.recv_timeout(batch_deadline) {
                 Ok(unit) => {
+                    // Read the EWMA-derived coalesce window once per outer-loop
+                    // batch. Clamped to [50 µs, 2 ms] so the window can neither
+                    // collapse to nothing nor add unbounded latency.
+                    //
+                    // On fast local NVMe (fsync ~150 µs) this lands near the
+                    // old fixed 200 µs. The win shows on slower storage (cloud
+                    // volumes, spinning disks) where fsync latency is higher;
+                    // throughput gain on slow storage is deferred to
+                    // Linux/cloud validation.
+                    let window = Duration::from_micros(
+                        self.coalesce_hint
+                            .load(Relaxed)
+                            .clamp(COALESCE_MIN_US, COALESCE_MAX_US),
+                    );
+
                     let shard = (unit.shard_id as usize) % self.buffers.len();
                     self.buffers[shard].push(unit);
                     if self.buffers[shard].len() >= self.batch_size {
@@ -101,7 +121,7 @@ impl Worker {
                     // (large) set the flag.
                     if expect_concurrent {
                         while self.any_buffer_below_batch_size() {
-                            match work_rx.recv_timeout(COALESCE_WINDOW) {
+                            match work_rx.recv_timeout(window) {
                                 Ok(unit) => {
                                     total_drained += 1;
                                     let shard = (unit.shard_id as usize) % self.buffers.len();
@@ -155,6 +175,8 @@ impl Worker {
             .send(Batch {
                 shard_id: shard as u32,
                 records,
+                #[cfg(feature = "bench-trace")]
+                flushed_at: std::time::Instant::now(),
             })
             .ok(); // receiver gone means WAB is shutting down; discard silently
     }
@@ -187,27 +209,21 @@ impl Worker {
 /// guaranteed to reach the per-shard WAB writer ahead of any record acked
 /// later for the same shard, even across multiple concurrent connections.
 ///
-/// Returns one `Receiver<Batch>` per shard (consumed by the WAB drain) and
-/// one `JoinHandle` per worker. Workers exit cleanly when all `QueueSender`
-/// clones are dropped.
+/// Accepts `shard_txs`: one `Sender<Batch>` per shard, owned by the WAB
+/// (`wab::spawn` creates the channels and returns the senders via `WabHandle`).
+/// Workers send `Batch`es directly to the flusher — no intermediate bridge
+/// thread. Returns one `JoinHandle` per worker. Workers exit cleanly when all
+/// `QueueSender` clones are dropped.
 pub fn spawn_workers(
     queue_rx: &QueueReceiver<WorkUnit>,
+    shard_txs: Vec<Sender<Batch>>,
     shard_count: usize,
     worker_count: usize,
     batch_size: usize,
     batch_deadline: Duration,
-) -> (Vec<Receiver<Batch>>, Vec<thread::JoinHandle<()>>) {
+    coalesce_hint: Arc<AtomicU64>,
+) -> Vec<thread::JoinHandle<()>> {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-
-    // Per-shard batch output channels. The capacity gives each worker room to
-    // queue several batches before back-pressure propagates to the queue.
-    let mut shard_txs: Vec<Sender<Batch>> = Vec::with_capacity(shard_count);
-    let mut shard_rxs: Vec<Receiver<Batch>> = Vec::with_capacity(shard_count);
-    for _ in 0..shard_count {
-        let (tx, rx) = crossbeam_channel::bounded(worker_count * 4);
-        shard_txs.push(tx);
-        shard_rxs.push(rx);
-    }
 
     assert_eq!(
         queue_rx.partitions(),
@@ -220,6 +236,7 @@ pub fn spawn_workers(
     for worker_idx in 0..worker_count {
         let work_rx = queue_rx.get(worker_idx);
         let txs = shard_txs.clone();
+        let hint = Arc::clone(&coalesce_hint);
         let core_id = if core_ids.is_empty() {
             None
         } else {
@@ -276,7 +293,7 @@ pub fn spawn_workers(
                 // ── Warmup ───────────────────────────────────────────────────
                 simd_warmup();
 
-                let worker = Worker::new(shard_count, batch_size, txs);
+                let worker = Worker::new(shard_count, batch_size, txs, hint);
                 worker.run(work_rx, batch_deadline);
             })
             .expect("failed to spawn worker thread");
@@ -284,7 +301,7 @@ pub fn spawn_workers(
         handles.push(handle);
     }
 
-    (shard_rxs, handles)
+    handles
 }
 
 /// Allocates per-shard batch buffers and pre-touches their backing pages so
@@ -357,6 +374,7 @@ fn simd_warmup() {}
 mod tests {
     use super::*;
     use crate::queue;
+    use crossbeam_channel::Receiver;
     use tokio::sync::oneshot;
 
     fn make_unit(shard_id: u32, payload: &[u8]) -> (WorkUnit, oneshot::Receiver<bool>) {
@@ -364,18 +382,47 @@ mod tests {
         (
             WorkUnit {
                 shard_id,
-                payload: payload.to_vec(),
+                payload: weir_core::Payload::copy_from_slice(payload),
                 durability: weir_core::Durability::Buffered,
                 ack_tx: tx,
+                #[cfg(feature = "bench-trace")]
+                enqueued_at: std::time::Instant::now(),
             },
             rx,
         )
     }
 
+    /// Create a set of per-shard `(Sender<Batch>, Receiver<Batch>)` pairs for
+    /// tests. The test holds the receivers; the senders are passed to
+    /// `spawn_workers` (mirroring how `wab::spawn` owns them in production).
+    fn make_shard_channels(shard_count: usize) -> (Vec<Sender<Batch>>, Vec<Receiver<Batch>>) {
+        let mut txs = Vec::with_capacity(shard_count);
+        let mut rxs = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            let (tx, rx) = crossbeam_channel::bounded(64);
+            txs.push(tx);
+            rxs.push(rx);
+        }
+        (txs, rxs)
+    }
+
+    fn default_hint() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(200))
+    }
+
     #[test]
     fn single_worker_batches_on_deadline() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
-        let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(20));
+        let (shard_txs, batch_rxs) = make_shard_channels(1);
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            10,
+            Duration::from_millis(20),
+            default_hint(),
+        );
 
         let (unit, _ack) = make_unit(0, b"hello");
         queue_tx.push(0, unit);
@@ -385,7 +432,7 @@ mod tests {
             .expect("batch should arrive after deadline flush");
         assert_eq!(batch.shard_id, 0);
         assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.records[0].payload.as_slice(), b"hello");
+        assert_eq!(batch.records[0].payload.as_ref(), b"hello");
 
         drop(queue_tx);
         for h in handles {
@@ -398,8 +445,16 @@ mod tests {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let batch_size = 3;
         // 60s deadline — flush must be triggered by batch-full, not timeout.
-        let (batch_rxs, handles) =
-            spawn_workers(&queue_rx, 1, 1, batch_size, Duration::from_secs(60));
+        let (shard_txs, batch_rxs) = make_shard_channels(1);
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            batch_size,
+            Duration::from_secs(60),
+            default_hint(),
+        );
 
         for _ in 0..batch_size {
             let (unit, _) = make_unit(0, b"x");
@@ -421,7 +476,16 @@ mod tests {
     fn pending_batches_flushed_on_sender_drop() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         // 60s deadline — flush must be triggered by disconnect, not timeout.
-        let (batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 100, Duration::from_secs(60));
+        let (shard_txs, batch_rxs) = make_shard_channels(1);
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            100,
+            Duration::from_secs(60),
+            default_hint(),
+        );
 
         let (unit, _) = make_unit(0, b"pending");
         queue_tx.push(0, unit);
@@ -431,7 +495,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("pending records should be flushed on disconnect");
         assert_eq!(batch.records.len(), 1);
-        assert_eq!(batch.records[0].payload.as_slice(), b"pending");
+        assert_eq!(batch.records[0].payload.as_ref(), b"pending");
 
         for h in handles {
             h.join().unwrap();
@@ -441,8 +505,18 @@ mod tests {
     #[test]
     fn spawn_workers_returns_correct_counts() {
         let (_queue_tx, queue_rx) = queue::new::<WorkUnit>(2);
-        let (batch_rxs, handles) = spawn_workers(&queue_rx, 3, 2, 100, Duration::from_millis(10));
-        assert_eq!(batch_rxs.len(), 3);
+        let (shard_txs, _batch_rxs) = make_shard_channels(3);
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            3,
+            2,
+            100,
+            Duration::from_millis(10),
+            default_hint(),
+        );
+        // shard channel count is set by the caller (3 in this case)
+        assert_eq!(_batch_rxs.len(), 3);
         assert_eq!(handles.len(), 2);
 
         drop(_queue_tx);
@@ -454,12 +528,63 @@ mod tests {
     #[test]
     fn worker_exits_cleanly_after_disconnect() {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
-        let (_batch_rxs, handles) = spawn_workers(&queue_rx, 1, 1, 10, Duration::from_millis(10));
+        let (shard_txs, _batch_rxs) = make_shard_channels(1);
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            10,
+            Duration::from_millis(10),
+            default_hint(),
+        );
 
         drop(queue_tx);
         for h in handles {
             h.join()
                 .expect("worker thread should exit cleanly after disconnect");
+        }
+    }
+
+    /// G-QUEUE-1: when a shard's flusher is offline (its `Batch` receiver is
+    /// gone — e.g. the flusher panic-capped-out), the worker's `flush_shard`
+    /// send fails. It must do so gracefully: drop the batch (taking the
+    /// `WorkUnit`s' `ack_tx`s with it) rather than panic or block, so producers
+    /// observe a closed ack channel and Nack. No record is silently lost with a
+    /// success ack — at-least-once holds under shard failure.
+    #[test]
+    fn offline_shard_nacks_records_without_panicking() {
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let (shard_txs, shard_rxs) = make_shard_channels(1);
+        // Flusher offline: drop the only shard's Batch receiver so every send
+        // from the worker returns Disconnected.
+        drop(shard_rxs);
+
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            10,
+            Duration::from_millis(10),
+            default_hint(),
+        );
+
+        let (unit, mut ack_rx) = make_unit(0, b"orphan");
+        queue_tx.push(0, unit);
+
+        drop(queue_tx); // worker drains, flushes to the offline shard, then exits
+        for h in handles {
+            h.join()
+                .expect("worker must not panic when its shard is offline");
+        }
+
+        // The batch could not be sent, so it (and the ack_tx inside it) was
+        // dropped → the producer sees a closed channel, i.e. a Nack — never a
+        // false `true`.
+        match ack_rx.try_recv() {
+            Err(oneshot::error::TryRecvError::Closed) => {}
+            other => panic!("offline shard should Nack via a closed ack channel, got {other:?}"),
         }
     }
 }

@@ -151,6 +151,18 @@ pub(super) fn parse_from(
         sink_postgres_insert_mode: pargs
             .opt_value_from_str("--sink-postgres-insert-mode")
             .map_err(pico_err)?,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_database: pargs
+            .opt_value_from_str("--sink-clickhouse-database")
+            .map_err(pico_err)?,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_table: pargs
+            .opt_value_from_str("--sink-clickhouse-table")
+            .map_err(pico_err)?,
+        #[cfg(feature = "clickhouse-sink")]
+        sink_clickhouse_column: pargs
+            .opt_value_from_str("--sink-clickhouse-column")
+            .map_err(pico_err)?,
         dead_letter_max_bytes: pargs
             .opt_value_from_str("--dead-letter-max-bytes")
             .map_err(pico_err)?,

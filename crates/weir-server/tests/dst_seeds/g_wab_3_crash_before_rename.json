@@ -1,0 +1,5 @@
+{
+  "seed": 81985529216486895,
+  "scenario": { "CrashBeforeRename": { "records": 6 } },
+  "faults": ["RenameFails"]
+}
