@@ -30,8 +30,6 @@
 //!   prefix in Display strings is the operator-friendly choice.
 //! - The Sink trait impl, the SQL-string builder, the config struct.
 
-use std::time::Duration;
-
 use super::SinkError;
 
 // ── Identifier validation ─────────────────────────────────────────────────────
@@ -184,14 +182,6 @@ impl SinkError for SqlSinkError {
         )
     }
 }
-
-// ── Misc shared constants ─────────────────────────────────────────────────────
-
-/// Re-exported for symmetry — both sinks use `Duration` in their config
-/// for `timeout`, and pulling it here means `mysql.rs`/`postgres.rs` only
-/// need to import this module to get the full SQL-sink toolkit.
-#[allow(dead_code)]
-pub(super) const _UNUSED_DURATION_TAG: Option<Duration> = None;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
