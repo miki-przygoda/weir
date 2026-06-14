@@ -20,6 +20,11 @@ DST harness caught and fixed. The new findings are the **downstream analogue in 
 drain** — the same "confirm-and-delete on a path that didn't actually persist"
 shape, one layer past where the DST invariant (`i1_acked_true_is_durable`) stops.
 
+> **STATUS (2026-06-14): B1–B4 confirmed in code and RESOLVED**, one commit each
+> with fail-first regression tests where feasible — B1 `e14fe02`, B2 `f51db90`,
+> B3 `cf72749`, B4 `d4e4ff5`. Full bin suite (231) + DST sweep (300 seeds) green.
+> B5–B8 below remain open (medium/robustness).
+
 ### 🔴 CRITICAL — silent data loss / startup hang
 
 **B1. Permanent sink error + dead-letter write failure ⇒ segment confirmed &
