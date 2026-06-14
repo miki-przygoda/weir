@@ -48,6 +48,15 @@ worth revisiting later:
   through the buffer (vs health metrics): an SSE/WebSocket endpoint or a fan-out
   `tap` sink to observe buffered data in real time. A genuine product feature,
   distinct from health monitoring and larger in scope. Post-1.0.
+- **TLS-failure chaos scenario** — the monitoring stack's `chaos` profile already
+  demonstrates dead-letter, degraded-sink, and peer-UID-rejection panels lighting
+  up under real faults (`deploy/monitoring/`, opt-in `--profile chaos`). The one
+  gap is **TLS handshake failures / cert reloads**: those metrics are gated behind
+  the `tls` build feature (absent from the default image), so the panel renders a
+  clean `0` for now. Phase 5: ship a `--features tls` chaos image + a bad-cert
+  probe so that panel earns its place too. The chaos harness (failmock + a
+  mismatched-uid probe + a tight dead-letter cap) is the reusable foundation —
+  a TLS probe drops straight into it.
 
 ## Publish readiness (Phase 5 — crates.io + public repo)
 

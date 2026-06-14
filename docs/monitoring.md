@@ -22,8 +22,11 @@ thing — your job is to fix the underlying disk/sink, not to chase lost data.
 
 The artifacts live under `deploy/`:
 
-- `deploy/grafana/weir-dashboard.json` — the Grafana dashboard (4 rows: Ingest,
-  Durability, Drain, System).
+- `deploy/grafana/weir-dashboard.json` — the overview Grafana dashboard (an
+  at-a-glance health strip, then Ingest / Durability / Drain / System rows).
+- `deploy/grafana/dashboards/` — per-instance dashboards (`weir-min/med/high/max/
+  chaos`) generated DRY by `deploy/grafana/gen-dashboards.py`; the demo's
+  `levels`/`chaos` profiles populate them.
 - `deploy/prometheus/weir-alerts.yml` — the Prometheus alert rules.
 - `deploy/monitoring/` — a turnkey `docker compose` stack (Prometheus + Grafana +
   weir + a load generator) to see it all live. See `deploy/monitoring/README.md`.
@@ -33,6 +36,13 @@ The artifacts live under `deploy/`:
 dashboard JSON (pick your Prometheus datasource on import). **Turnkey demo:**
 `cd deploy/monitoring && docker compose up --build`, then open Grafana at
 `http://localhost:3000`.
+
+**See an alert actually fire.** The demo's opt-in `chaos` profile
+(`docker compose --profile chaos up`) deliberately drives a permanently-failing
+sink, a full dead-letter dir, and peer-UID rejections — so you can watch
+`WeirDeadLettered`, `WeirDrainBlocked`, `WeirSinkDown`, and
+`WeirUnauthorizedConnections` go red and rehearse the runbook below against a
+live signal before you need it in anger.
 
 Alert selectors assume a `job="weir"` scrape job — adjust `job=~"weir"` to match
 your scrape config.

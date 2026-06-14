@@ -1,0 +1,47 @@
+# weir config for the `chaos` profile — deliberately drives the "bad" panels so
+# the dead-letter / sink-health / peer-UID indicators can be seen lighting up
+# (they sit correctly at zero in the healthy demo). Bring it up with:
+#
+#   docker compose --profile chaos up --build
+#
+# What it triggers:
+#   • HTTP sink → failmock, which returns HTTP 400 to every POST. 400 is a
+#     PERMANENT failure (4xx except 408/429), so weir dead-letters the records
+#     instead of retrying forever — `weir_dead_letter_bytes_on_disk` climbs.
+#     (A 5xx would be transient and retry indefinitely, never dead-lettering.)
+#   • The sink's health probe HEADs the same URL, gets 400, and reports
+#     Degraded — `weir_sink_health{state="degraded"}` goes hot.
+#   • A small dead_letter_max_bytes cap so the dir fills within ~10s and the
+#     drain transitions to blocked_dead_letter_full (drain-state panel → BLOCKED).
+#   • peer_uid_check on (also forced via env): the root `chaos-probe` is rejected
+#     by SO_PEERCRED while the uid-10001 loadgen is accepted —
+#     `weir_connection_rejected_peer_uid_total` climbs.
+#
+# TLS handshake-failure chaos is intentionally NOT here: it needs a weir image
+# built with the `tls` feature (not in the default build). Parked for Phase 5.
+
+[server]
+socket_path = "/run/weir/weir.sock"
+wab_dir = "/var/lib/weir/wab"
+shard_count = 4
+worker_count = 4
+batch_size = 256
+batch_deadline_ms = 1
+wab_segment_max_bytes = 65536
+metrics_port = 9185
+metrics_bind = "0.0.0.0"
+
+# Permanent-failure sink: every POST gets a 400 from failmock → dead-letter.
+sink_type = "http"
+sink_url = "http://failmock/"
+sink_timeout_secs = 2
+
+# Fill the dead-letter dir quickly so the BLOCKED state is reachable in the
+# demo window, and re-check often so recovery (if the cap is raised) is prompt.
+dead_letter_max_bytes = 131072
+dead_letter_check_interval_secs = 2
+
+# Reject peers whose uid != the daemon's. The chaos-probe connects as root
+# (uid 0) and is refused; the loadgen runs as uid 10001 and is accepted.
+peer_uid_check = true
+log_level = "info"
