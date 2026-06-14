@@ -322,20 +322,16 @@ fn drain_thread<S: Sink>(
                         &metrics,
                         &mut dead_letter,
                     ));
-                    match result {
-                        ProcessResult::Confirmed { record_count } => {
-                            confirm_and_delete(&segment, record_count, &metrics);
-                            DrainState::Draining
-                        }
-                        ProcessResult::Transient { retry_after } => DrainState::RetryingTransient {
+                    // Subsequent failure: spend one retry and double the delay
+                    // (exponential backoff). retries_left is >= 1 here — the
+                    // == 0 case returned above.
+                    next_state_after_process(segment, result, &metrics, |segment, retry_after| {
+                        DrainState::RetryingTransient {
                             segment,
                             retries_left: retries_left - 1,
                             next_delay: next_retry_delay(next_delay * 2, retry_after),
-                        },
-                        ProcessResult::BlockedDeadLetter => enter_blocked(segment, &metrics),
-                        // Segment was quarantined inside process_segment — move on.
-                        ProcessResult::Quarantined => DrainState::Draining,
-                    }
+                        }
+                    })
                 }
             }
 
@@ -408,26 +404,46 @@ fn drain_thread<S: Sink>(
     info!("drain thread exiting");
 }
 
-fn transition_from_draining(
+/// Maps a [`ProcessResult`] to the next [`DrainState`]. The three terminal
+/// outcomes are identical whether we arrived from a first attempt or a retry —
+/// `Confirmed` confirms+deletes and moves on, `BlockedDeadLetter` enters the
+/// blocked state, `Quarantined` (handled inside `process_segment`) moves on.
+/// Only the `Transient → RetryingTransient` backoff differs between the two
+/// callers (fresh budget vs. decremented/exponential), so each supplies it via
+/// `on_transient`. This is the single source of truth for the non-retry
+/// transitions — see the `Draining` and `RetryingTransient` arms in `run`.
+fn next_state_after_process(
     segment: PathBuf,
     result: ProcessResult,
-    config: &DrainConfig,
     metrics: &Metrics,
+    on_transient: impl FnOnce(PathBuf, Option<Duration>) -> DrainState,
 ) -> DrainState {
     match result {
         ProcessResult::Confirmed { record_count } => {
             confirm_and_delete(&segment, record_count, metrics);
             DrainState::Draining
         }
-        ProcessResult::Transient { retry_after } => DrainState::RetryingTransient {
-            segment,
-            retries_left: config.max_retries,
-            next_delay: next_retry_delay(config.base_retry_delay, retry_after),
-        },
+        ProcessResult::Transient { retry_after } => on_transient(segment, retry_after),
         ProcessResult::BlockedDeadLetter => enter_blocked(segment, metrics),
         // Segment was quarantined inside process_segment — move on.
         ProcessResult::Quarantined => DrainState::Draining,
     }
+}
+
+fn transition_from_draining(
+    segment: PathBuf,
+    result: ProcessResult,
+    config: &DrainConfig,
+    metrics: &Metrics,
+) -> DrainState {
+    // First failure for this segment: a fresh retry budget and the base delay.
+    next_state_after_process(segment, result, metrics, |segment, retry_after| {
+        DrainState::RetryingTransient {
+            segment,
+            retries_left: config.max_retries,
+            next_delay: next_retry_delay(config.base_retry_delay, retry_after),
+        }
+    })
 }
 
 /// How often the drain polls `Sink::health()` while idle (waiting on the
