@@ -134,6 +134,12 @@ Confidence: medium-high.*
 
 ## Part 2 — Security-by-design
 
+> **STATUS (2026-06-14): F1 RESOLVED** (`8114a69` — both SQL build-error sites route
+> through `redact_password`) and **F3 RESOLVED** (`a19b1d7` — `bind_hardened` warns when
+> the socket parent dir is group/world-writable; opt-in `require_private_parent` refusal
+> left as a follow-up). F2 folds into R1 (Payload newtype). F4/F5 are accepted-risk /
+> docs-only as noted.
+
 **Verdict:** weir is genuinely well-hardened for its single-node, local-trust model.
 One real (low-severity) leak, a few undocumented/violable assumptions, lots of
 already-solid areas.
@@ -257,3 +263,49 @@ false-ack-prevention core); merging the two `InsertMode` enums (dialect-specific
 6. **B5–B8** (drain/recovery hardening) + **R4–R7** (safe refactors) as the cleanup
    pass.
 7. **F2/F5 docs+lint, R8–R10** housekeeping — opportunistic.
+
+---
+
+## Part 5 — Second-pass findings (N1–N7) — ALL RESOLVED
+
+After Part 1 (B1–B8) closed, a second multi-agent hunt re-swept the codebase on the
+hypothesis that the CRITICAL bugs had "overpowered" the first pass and masked smaller
+ones. It did — a backlog of real (mostly data-loss / data-leak) issues the first sweep
+missed. All confirmed in code and fixed, one commit + regression test each.
+
+- **N1 — `user:password@` URL parsing split at the FIRST `@`** *(HIGH — data loss +
+  credential leak)* — `sink/sql_common.rs`, `sink/clickhouse.rs`. A `@` in the password
+  split mid-secret: wrong creds (every insert fails → dead-letter) AND the secret tail
+  spliced into the base URL → request + access logs. Fixed: split at the LAST `@` within
+  the authority. `35e8bf7`.
+- **N2 — empty payload serializes to the WAB sentinel** *(HIGH — silent data loss)* —
+  an empty payload `[0,0,0,0]` IS the end-of-records sentinel; storing one truncates the
+  segment. Fixed: reject empty **Push** payloads at ingest with `Nack(EmptyPayload)`
+  (new wire reason `0x07`) + a `write_record` guard. `5e4d4ba`.
+  - **N2 regression (this pass):** the ingest reject ran before message dispatch, so it
+    also Nack'd HealthCheck frames (zero-length by spec) → every `health_check()` failed.
+    Caught by the system + load integration suites (not the bin suite). Fixed by gating
+    on `message_type == Push`. `b30f90f`.
+- **N3 — ClickHouse 429/408 dead-lettered live data** *(MED — data loss under load)* —
+  back-pressure (429 Too Many Requests, 408) was classified permanent → dead-lettered
+  instead of retried. Fixed: `status_is_transient` treats 5xx/408/429 as transient,
+  matching the HTTP sink. `e8ef824`.
+- **N4 — bind parent-dir race not surfaced** *(LOW — security)* = F3 above. `a19b1d7`.
+- **N5 — accept(2) EMFILE/ENFILE busy-spin** *(MED — availability)* — on fd/buffer
+  exhaustion the pending connection stays queued, so the accept loop spun at 100% CPU.
+  Fixed: 50ms backoff on EMFILE/ENFILE/ENOBUFS/ENOMEM (Unix + TCP loops) + a
+  `weir_accept_resource_exhaustion` metric. `14c69ce`.
+- **N6 — quarantine cross-shard filename collision** *(MED — forensic data loss)* —
+  segment counters are shard-local, so `seg_00000001.wab` exists in every shard; the flat
+  quarantine dir let one shard's corrupt segment clobber another's via `rename`. Fixed:
+  namespace by shard + refuse-to-clobber. `31d0c49`.
+- **N7 — minors sweep** *(LOW)* — stale CLI `--help` (worker-count default; missing
+  postgres/clickhouse sinks) `0de857e`; HTTP `health()` wrongly degraded auth-challenge
+  endpoints `76375a2`; dead `any_buffer_below_batch_size` guard `ebb8988`; cryptic error
+  on a short segment footer `60f767e`; ClickHouse dedup token ignored batch boundaries
+  (distinct batches → same token → dropped as dup) `60d9998`; ClickHouse URL unvalidated
+  until first commit `b1d7925`.
+
+> **Verification:** full bin suite (default 247 / all-features 281) + system (38) + load
+> (13) + tls_listener (4) + DST 300-seed sweep + clippy/fmt across default·tls·
+> clickhouse-sink·dst — all green.
