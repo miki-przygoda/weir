@@ -99,10 +99,18 @@ pub(super) fn redact_password(url: &str) -> String {
         return url.to_string();
     };
     let rest = &url[scheme_end + 3..];
-    let Some(at) = rest.find('@') else {
+    // The userinfo lives in the authority, which ends at the first '/', '?', or
+    // '#'. Restrict the search there so a '@' in the path/query can't be mistaken
+    // for the userinfo/host separator.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // The userinfo/host boundary is the LAST '@' in the authority: a password may
+    // contain unencoded '@' characters, so the FIRST '@' would split mid-password
+    // and leak the tail.
+    let Some(at) = rest[..authority_end].rfind('@') else {
         return url.to_string();
     };
     let creds = &rest[..at];
+    // user:password splits at the FIRST ':' — a username carries no unencoded ':'.
     let Some(colon) = creds.find(':') else {
         return url.to_string();
     };
@@ -306,6 +314,18 @@ mod tests {
         let url = "postgres://user:p%40ss%21@host/db";
         let r = redact_password(url);
         assert!(!r.contains("p%40ss%21"), "url-encoded password leaked: {r}");
+    }
+
+    #[test]
+    fn redact_password_redacts_password_containing_at_sign() {
+        // A raw '@' in the password must not split mid-password and leak the tail.
+        let url = "mysql://alice:p@ss@word@db.example.com:3306/weir";
+        let r = redact_password(url);
+        assert!(!r.contains("p@ss@word"), "password leaked: {r}");
+        assert!(!r.contains("ss@word"), "password tail leaked: {r}");
+        assert!(r.contains("alice"), "user should remain: {r}");
+        assert!(r.contains("db.example.com"), "host should remain: {r}");
+        assert!(r.contains("<redacted>"), "redaction marker missing: {r}");
     }
 
     // ── SqlSinkError ────────────────────────────────────────────────────────

@@ -184,7 +184,13 @@ impl ClickHouseSink {
 fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
     if let Some(scheme_end) = url.find("://") {
         let rest = &url[scheme_end + 3..];
-        if let Some(at) = rest.find('@') {
+        // userinfo lives in the authority (up to the first '/', '?', '#'); the
+        // userinfo/host boundary is the LAST '@' there. A password may contain
+        // unencoded '@' characters — using the first '@' would split mid-password,
+        // authenticate with the wrong credentials, and splice a secret fragment
+        // into the base URL (which then ends up in the request + access logs).
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
             let creds = &rest[..at];
             if let Some(colon) = creds.find(':') {
                 let user = creds[..colon].to_string();
@@ -403,6 +409,19 @@ mod tests {
         let (base, creds) = split_credentials("http://host:8123");
         assert_eq!(base, "http://host:8123");
         assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn split_credentials_handles_at_sign_in_password() {
+        // A '@' in the password must not split mid-password: the wrong split
+        // authenticates with truncated creds AND splices the secret tail into the
+        // base URL (which lands in the request + access logs).
+        let (base, creds) = split_credentials("http://user:p@ss@host:8123");
+        assert_eq!(
+            base, "http://host:8123",
+            "secret fragment must not leak into base"
+        );
+        assert_eq!(creds, Some(("user".to_string(), "p@ss".to_string())));
     }
 
     // ── Query builder ──────────────────────────────────────────────────────
