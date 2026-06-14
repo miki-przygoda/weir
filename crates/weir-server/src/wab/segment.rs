@@ -22,7 +22,7 @@ use weir_core::MAX_PAYLOAD_HARD_CAP;
 /// The running `file_crc_hasher` accumulates CRC32 over every byte written to the
 /// file (including the header), so the footer's `file_crc32` field requires no
 /// full-file re-read at seal time.
-pub struct WabSegment {
+pub(crate) struct WabSegment {
     file: File,
     path: PathBuf,
     /// Total bytes written to the file (header + records). Used for rotation.
@@ -50,7 +50,7 @@ impl WabSegment {
     /// `path` already exists the call returns [`io::ErrorKind::AlreadyExists`]
     /// rather than truncating or appending, so the caller never has to check
     /// first (and a racing creator can't be silently clobbered).
-    pub fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
+    pub(crate) fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
         // O_NOFOLLOW: reject symlinks at the target path (prevents TOCTOU redirect).
         // mode 0o600: segment files are private to the daemon; no group/other read.
         #[cfg(unix)]
@@ -94,7 +94,7 @@ impl WabSegment {
     ///
     /// Uses checked arithmetic throughout: a panic here means the segment has grown
     /// beyond addressable bounds, which is unrecoverable.
-    pub fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other(
                 "segment is poisoned by a previous partial write",
@@ -199,14 +199,14 @@ impl WabSegment {
     ///
     /// Linux: `fdatasync` — flushes data and critical metadata without waiting for
     /// directory entry updates.
-    pub fn fsync(&self) -> io::Result<()> {
+    pub(crate) fn fsync(&self) -> io::Result<()> {
         platform_fsync(&self.file)
     }
 
     /// Returns true if the segment has reached or exceeded the configured
     /// rotation threshold. The threshold is owned by `ShardWriter` so a single
     /// `WabSegment` instance can be reused under different policies (e.g. tests).
-    pub fn should_rotate(&self, max_bytes: u64) -> bool {
+    pub(crate) fn should_rotate(&self, max_bytes: u64) -> bool {
         self.bytes_written >= max_bytes
     }
 
@@ -214,7 +214,7 @@ impl WabSegment {
     /// code reads the in-memory counter directly during `seal()` to write
     /// the segment footer.
     #[cfg(test)]
-    pub fn record_count(&self) -> u64 {
+    pub(crate) fn record_count(&self) -> u64 {
         self.record_count
     }
 
@@ -252,7 +252,7 @@ impl WabSegment {
     ///
     /// Consumes `self` to ensure the segment cannot be written to after sealing.
     /// Returns the path of the newly sealed file.
-    pub fn seal(self) -> io::Result<PathBuf> {
+    pub(crate) fn seal(self) -> io::Result<PathBuf> {
         let active_path = self.finalize_to_disk()?;
         let sealed_path = sealed_path_for(&active_path);
         std::fs::rename(&active_path, &sealed_path)?;
@@ -266,7 +266,7 @@ impl WabSegment {
 }
 
 /// Derives the `.wab.sealed` path from an active `.wab` path.
-pub fn sealed_path_for(active_path: &Path) -> PathBuf {
+pub(crate) fn sealed_path_for(active_path: &Path) -> PathBuf {
     let mut p = active_path.to_owned();
     let name = p
         .file_name()
@@ -279,13 +279,13 @@ pub fn sealed_path_for(active_path: &Path) -> PathBuf {
 }
 
 /// Derives the segment counter from a file stem like `seg_00000001`.
-pub fn segment_counter_from_path(path: &Path) -> Option<u64> {
+pub(crate) fn segment_counter_from_path(path: &Path) -> Option<u64> {
     let stem = path.file_stem()?.to_str()?;
     stem.strip_prefix("seg_")?.parse().ok()
 }
 
 /// Formats a segment file name for a given shard directory and counter.
-pub fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
+pub(crate) fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
     shard_dir.join(format!("seg_{counter:08}{EXT_ACTIVE}"))
 }
 
@@ -295,7 +295,7 @@ pub fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
 /// `fsync`/`seal` faults on a seeded schedule. Held as a `Box<dyn SegmentHandle>`
 /// so `ShardWriter`'s rotate/seal lifecycle is backend-agnostic. The single
 /// vtable hop per write/fsync is negligible against the real syscall it guards.
-pub trait SegmentHandle: Send {
+pub(crate) trait SegmentHandle: Send {
     /// Append one record. Mirrors [`WabSegment::write_record`].
     fn write_record(&mut self, payload: &[u8]) -> io::Result<()>;
     /// Sync the segment to stable storage. Mirrors [`WabSegment::fsync`].
@@ -313,7 +313,7 @@ pub trait SegmentHandle: Send {
 /// (real files); the DST harness injects a fault-aware store. Held as
 /// `Arc<dyn SegmentStore>` so the generic stays out of the public
 /// [`super::spawn`] signature.
-pub trait SegmentStore: Send + Sync {
+pub(crate) trait SegmentStore: Send + Sync {
     /// Create a fresh active segment at `path` for `shard_id`.
     fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>>;
     /// Counter values of every active segment file in `dir`. Sealed (`.wab.sealed`)
@@ -325,7 +325,7 @@ pub trait SegmentStore: Send + Sync {
 
 /// Production [`SegmentStore`]: real files on the local filesystem via
 /// [`WabSegment`].
-pub struct FsSegmentStore;
+pub(crate) struct FsSegmentStore;
 
 impl SegmentStore for FsSegmentStore {
     fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>> {
@@ -360,7 +360,7 @@ impl SegmentHandle for WabSegment {
 }
 
 /// Manages the active segment for one shard. Opens the segment lazily on first write.
-pub struct ShardWriter {
+pub(crate) struct ShardWriter {
     shard_id: u16,
     shard_dir: PathBuf,
     /// Counter used to name the next segment file (incremented on each rotation).
@@ -390,7 +390,7 @@ impl ShardWriter {
     /// counter-scan flows through it. Production injects [`FsSegmentStore`] at
     /// the flusher's single construction point (see [`super::spawn`]); the DST
     /// harness injects a fault-injecting store.
-    pub fn new_with_store(
+    pub(crate) fn new_with_store(
         shard_id: u16,
         shard_dir: PathBuf,
         segment_max_bytes: u64,
@@ -411,7 +411,7 @@ impl ShardWriter {
     /// Sets `next_counter` to one past the highest existing segment counter in the
     /// shard directory. Called during startup so new segments don't collide with
     /// existing (sealed) ones.
-    pub fn scan_and_advance_counter(&mut self) -> io::Result<()> {
+    pub(crate) fn scan_and_advance_counter(&mut self) -> io::Result<()> {
         let max = self
             .store
             .segment_counters(&self.shard_dir)?
@@ -434,7 +434,7 @@ impl ShardWriter {
     /// The orphaned file is left on disk; crash recovery seals it and the drain
     /// reader stops at the first invalid record — records written successfully
     /// before the failure remain drainable.
-    pub fn write_record(&mut self, payload: &[u8]) -> io::Result<Option<PathBuf>> {
+    pub(crate) fn write_record(&mut self, payload: &[u8]) -> io::Result<Option<PathBuf>> {
         self.ensure_open()?;
         if let Err(e) = self
             .active
@@ -459,7 +459,7 @@ impl ShardWriter {
     }
 
     /// Fsyncs the current active segment. No-op if no segment is open.
-    pub fn fsync_current(&self) -> io::Result<()> {
+    pub(crate) fn fsync_current(&self) -> io::Result<()> {
         if let Some(seg) = &self.active {
             seg.fsync()?;
         }
@@ -468,7 +468,7 @@ impl ShardWriter {
 
     /// Seals the current active segment and returns its sealed path.
     /// Returns `None` if no segment is currently open.
-    pub fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
+    pub(crate) fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
         match self.active.take() {
             Some(seg) => Ok(Some(seg.seal()?)),
             None => Ok(None),
@@ -547,7 +547,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    pub fn tmp_dir(label: &str) -> PathBuf {
+    pub(crate) fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weir_seg_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir

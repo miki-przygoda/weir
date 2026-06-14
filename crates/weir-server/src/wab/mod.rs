@@ -1,9 +1,9 @@
-pub mod clock;
+pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
-pub mod dst;
-pub mod format;
-pub mod recovery;
-pub mod segment;
+pub(crate) mod dst;
+pub(crate) mod format;
+pub(crate) mod recovery;
+pub(crate) mod segment;
 
 use std::{
     fs::{self, File},
@@ -44,18 +44,18 @@ pub(crate) fn ewma_update_us(current_us: u64, sample_us: u64) -> u64 {
 }
 
 /// Configuration for the WAB subsystem.
-pub struct WabConfig {
+pub(crate) struct WabConfig {
     /// Number of shards (one flusher thread per shard).
-    pub shard_count: usize,
+    pub(crate) shard_count: usize,
     /// Maximum number of records per flush batch.
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
     /// Maximum time to accumulate a batch before flushing.
-    pub batch_deadline: Duration,
+    pub(crate) batch_deadline: Duration,
     /// Rotation threshold in bytes. The active segment is sealed and a new one
     /// opened once `bytes_written` reaches this value. Default 256 MiB matches
     /// the historical hard-coded behaviour; tests and storage-constrained
     /// deployments may set it lower.
-    pub segment_max_bytes: u64,
+    pub(crate) segment_max_bytes: u64,
 }
 
 impl Default for WabConfig {
@@ -72,10 +72,10 @@ impl Default for WabConfig {
 /// Returned by `spawn`. Drop `shard_txs` to initiate shutdown (flusher threads
 /// exit when their receiver disconnects), then join the handles to wait for all
 /// segments to be sealed.
-pub struct WabHandle {
+pub(crate) struct WabHandle {
     /// One sender per shard. Drop all of them to signal shutdown.
-    pub shard_txs: Vec<Sender<Batch>>,
-    pub join_handles: Vec<thread::JoinHandle<()>>,
+    pub(crate) shard_txs: Vec<Sender<Batch>>,
+    pub(crate) join_handles: Vec<thread::JoinHandle<()>>,
 }
 
 fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
@@ -214,7 +214,7 @@ pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
 /// `coalesce_hint` is an `Arc<AtomicU64>` holding the EWMA of fsync latency in
 /// microseconds (init 200). Each flusher thread updates it after every fsync;
 /// the worker threads read it to size their coalesce window.
-pub fn spawn(
+pub(crate) fn spawn(
     wab_dir: PathBuf,
     config: WabConfig,
     drain_tx: Sender<PathBuf>,
@@ -722,13 +722,13 @@ fn fsync_observed(
 /// Streams records without materialising the whole segment. Applies
 /// `MAX_PAYLOAD_HARD_CAP` before every heap allocation to bound memory usage
 /// during recovery. Stops at the end-of-records sentinel or on the first error.
-pub struct SegmentReader {
+pub(crate) struct SegmentReader {
     reader: BufReader<File>,
     done: bool,
 }
 
 impl SegmentReader {
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 

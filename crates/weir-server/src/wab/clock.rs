@@ -16,7 +16,7 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 /// The flusher's wall-clock dependencies. See the module docs.
-pub trait BlockingClock {
+pub(crate) trait BlockingClock {
     /// Block for at most `timeout`, returning the next value from `rx`.
     /// Mirrors [`crossbeam_channel::Receiver::recv_timeout`].
     fn recv_timeout<T>(&self, rx: &Receiver<T>, timeout: Duration) -> Result<T, RecvTimeoutError>;
@@ -28,7 +28,7 @@ pub trait BlockingClock {
 /// Production [`BlockingClock`]: real crossbeam waits and real thread sleeps.
 /// Zero-sized, so the flusher monomorphises to its pre-seam form.
 #[derive(Clone, Copy, Default)]
-pub struct RealClock;
+pub(crate) struct RealClock;
 
 impl BlockingClock for RealClock {
     #[inline]

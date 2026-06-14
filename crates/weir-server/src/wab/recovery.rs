@@ -18,7 +18,7 @@ use weir_core::MAX_PAYLOAD_HARD_CAP;
 /// Scans all shard directories under `wab_dir` and runs crash recovery on any
 /// unsealed `.wab` files found. Sealed files are left untouched by this function;
 /// the replay pass (in `spawn`) handles those.
-pub fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
+pub(crate) fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
     for entry in fs::read_dir(wab_dir)? {
         let entry = entry?;
         let shard_dir = entry.path();
@@ -107,7 +107,11 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
 ///
 /// If the header has bad magic or an unknown version, the segment is quarantined
 /// rather than silently skipped or left in place.
-pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<PathBuf> {
+pub(crate) fn recover_segment(
+    path: &Path,
+    wab_dir: &Path,
+    metrics: &Arc<Metrics>,
+) -> io::Result<PathBuf> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -316,7 +320,7 @@ pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> i
 /// quarantined file (the same shard+counter can recur across a restart once the
 /// original is moved out of the shard dir and the counter resets) — a free
 /// suffix is found first.
-pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
+pub(crate) fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
     let quarantine_dir = wab_dir.join("quarantine");
     super::create_dir_private(quarantine_dir.clone())?;
     let file_name = path
@@ -371,7 +375,7 @@ fn non_clobbering_dest(dir: &Path, base: &str) -> io::Result<PathBuf> {
 /// - Bad CRC or unknown version: quarantines the segment and its `.confirmed` file,
 ///   returns `Err` so the caller knows to skip this segment entirely.
 /// - Valid: returns `Ok(true)`.
-pub fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
+pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
     let confirmed_path = {
         let s = sealed_path.to_string_lossy();
         let base = s.strip_suffix(EXT_SEALED).unwrap_or(&s);
