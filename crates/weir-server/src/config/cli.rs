@@ -13,7 +13,8 @@ OPTIONS:
     --socket-path <path>                     Unix socket path [env: WEIR_SOCKET_PATH]
     --wab-dir <path>                         WAB directory [env: WEIR_WAB_DIR]
     --shard-count <n>                        Number of WAB shards (1-256) [default: 1]
-    --worker-count <n>                       Worker thread count (1-64) [default: 2]
+    --worker-count <n>                       Worker thread count (1-64)
+                                               [default: same as --shard-count]
     --batch-size <n>                         Records per flush batch (1-100000) [default: 256]
     --batch-deadline-ms <n>                  Batch accumulation time ms (1-60000) [default: 1]
     --wab-segment-max-bytes <n>              WAB segment rotation threshold (4096-4294967296)
@@ -29,14 +30,24 @@ OPTIONS:
     --peer-uid-check <bool>                  Refuse connections from uids other
                                                than the daemon's [default: true]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
-    --sink-type <type>                       Sink: noop | http | mysql [default: noop]
-    --sink-url <url>                         Sink URL (required if type=http or mysql)
+    --sink-type <type>                       Sink: noop | http | mysql | postgres |
+                                               clickhouse [default: noop]
+    --sink-url <url>                         Sink URL (required for http/mysql/postgres/
+                                               clickhouse)
     --sink-timeout-secs <secs>               Per-request sink timeout (1-300) [default: 10]
     --sink-max-batch-size <n>                Sink commit batch cap (1-10000) [default: 100]
     --sink-send-idempotency-key <bool>       Send Idempotency-Key header (http) [default: true]
     --sink-mysql-table <name>                MySQL target table [default: weir_records]
     --sink-mysql-column <name>               MySQL target column [default: payload]
     --sink-mysql-insert-mode <mode>          MySQL: ignore | plain [default: ignore]
+    --sink-postgres-table <name>             Postgres target table [default: weir_records]
+    --sink-postgres-column <name>            Postgres target column [default: payload]
+    --sink-postgres-insert-mode <mode>       Postgres: on_conflict_do_nothing | plain
+                                               [default: on_conflict_do_nothing]
+    --sink-clickhouse-database <name>        ClickHouse database (requires build with
+                                               --features clickhouse-sink) [default: default]
+    --sink-clickhouse-table <name>           ClickHouse target table [default: weir_records]
+    --sink-clickhouse-column <name>          ClickHouse target column [default: payload]
     --dead-letter-max-bytes <n>              Dead-letter dir size cap [default: 1073741824]
     --dead-letter-check-interval-secs <n>    Blocked-state wake interval (1-3600) [default: 30]
     --log-level <level>                      Log level (trace/debug/info/warn/error) [default: info]
