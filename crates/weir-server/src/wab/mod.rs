@@ -366,6 +366,19 @@ pub(crate) fn replay_unconfirmed(
 /// 8 bytes are `record_count` as a u64 LE (see wab/format.rs for the layout).
 fn read_segment_record_count(path: &Path) -> io::Result<u64> {
     let mut file = fs::File::open(path)?;
+    // Guard the seek-from-end: a file shorter than the footer would seek to a
+    // negative offset, which surfaces as a cryptic platform error ("Invalid
+    // argument") rather than a clear cause. Reject it explicitly first.
+    let len = file.metadata()?.len();
+    if len < SEGMENT_FOOTER_LEN as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "segment '{}' is {len} bytes, shorter than the {SEGMENT_FOOTER_LEN}-byte footer",
+                path.display()
+            ),
+        ));
+    }
     file.seek(SeekFrom::End(-(SEGMENT_FOOTER_LEN as i64)))?;
     let mut footer = [0u8; 8];
     file.read_exact(&mut footer)?;
@@ -836,6 +849,19 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(got, payloads);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn read_segment_record_count_rejects_short_file_clearly() {
+        let dir = tmp_dir("shortfooter");
+        let path = dir.join("truncated.wab.sealed");
+        // Shorter than the footer — the seek-from-end would otherwise go
+        // negative and yield a cryptic platform error.
+        fs::write(&path, b"xy").unwrap();
+        let err = read_segment_record_count(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(err.to_string().contains("shorter than"), "{err}");
         fs::remove_dir_all(dir).ok();
     }
 
