@@ -114,6 +114,8 @@ impl std::fmt::Debug for ClickHouseSinkConfig {
 pub enum ClickHouseSinkBuildError {
     #[error("clickhouse sink: url is empty")]
     EmptyUrl,
+    #[error("clickhouse sink: url is not a valid http(s) URL: {0}")]
+    InvalidUrl(String),
     #[error(
         "clickhouse sink {field} {value:?} is not a valid identifier \
          (must be [A-Za-z_][A-Za-z0-9_]{{0,62}})"
@@ -153,9 +155,10 @@ impl std::fmt::Debug for ClickHouseSink {
 }
 
 impl ClickHouseSink {
-    /// Build a new ClickHouse sink. Validates the URL is non-empty and the
-    /// database/table/column identifiers, then constructs an HTTP client. The
-    /// first request is lazy — connection failures surface on `commit()`.
+    /// Build a new ClickHouse sink. Validates the URL is a non-empty http(s)
+    /// URL and the database/table/column identifiers, then constructs an HTTP
+    /// client. Only the *connection* is lazy — a reachability failure surfaces
+    /// on the first `commit()`; a malformed URL is rejected here at startup.
     pub fn new(config: ClickHouseSinkConfig) -> Result<Self, ClickHouseSinkBuildError> {
         if config.url.is_empty() {
             return Err(ClickHouseSinkBuildError::EmptyUrl);
@@ -165,6 +168,29 @@ impl ClickHouseSink {
         sql_common::validate_identifier("column", &config.column, IDENTIFIER_MAX_LEN)?;
 
         let (base_url, credentials) = split_credentials(&config.url);
+
+        // Validate the credential-stripped URL parses as http(s) at build time
+        // so an obviously-malformed URL fails at startup instead of only
+        // surfacing on the first commit (where it would look like a transient
+        // network fault and retry forever). base_url has any userinfo removed,
+        // so neither arm can leak a password; the parse-error arm redacts
+        // config.url defensively in case split_credentials left a secret in.
+        match reqwest::Url::parse(&base_url) {
+            Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
+            Ok(u) => {
+                return Err(ClickHouseSinkBuildError::InvalidUrl(format!(
+                    "scheme '{}' is not http or https (in {})",
+                    u.scheme(),
+                    base_url
+                )));
+            }
+            Err(e) => {
+                return Err(ClickHouseSinkBuildError::InvalidUrl(format!(
+                    "{e} (in {})",
+                    sql_common::redact_password(&config.url)
+                )));
+            }
+        }
 
         let client = reqwest::Client::builder()
             .build()
@@ -416,6 +442,38 @@ mod tests {
     #[test]
     fn new_accepts_valid_config() {
         assert!(ClickHouseSink::new(cfg("http://h:8123", "weir_records", "payload")).is_ok());
+        assert!(ClickHouseSink::new(cfg("https://h:8443", "weir_records", "payload")).is_ok());
+    }
+
+    #[test]
+    fn new_rejects_url_without_scheme() {
+        let e = ClickHouseSink::new(cfg("localhost:8123", "t", "payload")).unwrap_err();
+        assert!(
+            matches!(e, ClickHouseSinkBuildError::InvalidUrl(_)),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_non_http_scheme() {
+        let e = ClickHouseSink::new(cfg("ftp://h:8123", "t", "payload")).unwrap_err();
+        assert!(
+            matches!(e, ClickHouseSinkBuildError::InvalidUrl(_)),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn new_invalid_url_error_redacts_password() {
+        // A malformed but credentialed URL must not leak the password in the
+        // build error. "ht!tp" is an invalid scheme so url parsing fails.
+        let e = ClickHouseSink::new(cfg("ht!tp://user:secret@host", "t", "payload")).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            matches!(e, ClickHouseSinkBuildError::InvalidUrl(_)),
+            "{e:?}"
+        );
+        assert!(!msg.contains("secret"), "password leaked: {msg}");
     }
 
     #[test]
