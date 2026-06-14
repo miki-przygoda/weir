@@ -155,10 +155,10 @@ where
         // Effective cap is min(config, hard cap). The hard cap is applied here
         // regardless of ConnectionConfig contents so the check holds even when
         // handle_connection is called directly (e.g. in tests) without run().
-        let payload_len = header.payload_len as usize;
+        let payload_len = header.payload_len() as usize;
         let cap = config.max_payload_bytes.min(MAX_PAYLOAD_HARD_CAP);
         if payload_len > cap {
-            let tv = durability_to_tier(header.durability);
+            let tv = durability_to_tier(header.durability());
             send_nack(stream.get_mut(), WireNack::PayloadTooLarge, &[]).await?;
             metrics
                 .records_nack
@@ -169,7 +169,7 @@ where
                 .inc();
             return Ok(());
         }
-        if payload_len == 0 && header.message_type == MessageType::Push {
+        if payload_len == 0 && header.message_type() == MessageType::Push {
             // An empty Push payload can't be represented in the WAB: a zero
             // length prefix is the end-of-records sentinel, so storing one would
             // truncate the segment (silently dropping records written after it).
@@ -177,7 +177,7 @@ where
             // ONLY to Push — a HealthCheck frame legitimately carries a
             // zero-length payload (see docs/wire_protocol.md) and must pass
             // through to the dispatch below.
-            let tv = durability_to_tier(header.durability);
+            let tv = durability_to_tier(header.durability());
             send_nack(stream.get_mut(), WireNack::EmptyPayload, &[]).await?;
             metrics
                 .records_nack
@@ -225,7 +225,7 @@ where
         let expected_crc = u32::from_le_bytes(crc_buf);
         let computed_crc = crc32fast::hash(&payload);
         if expected_crc != computed_crc {
-            let tv = durability_to_tier(header.durability);
+            let tv = durability_to_tier(header.durability());
             send_nack(stream.get_mut(), WireNack::BadPayloadCrc, &[]).await?;
             metrics
                 .records_nack
@@ -238,9 +238,9 @@ where
         }
 
         // ── 6 & 7. Dispatch by message type ─────────────────────────────────
-        match header.message_type {
+        match header.message_type() {
             MessageType::Push => {
-                let tv = durability_to_tier(header.durability);
+                let tv = durability_to_tier(header.durability());
                 metrics
                     .records_accepted
                     .get_or_create(&TierLabel { tier: tv.clone() })
@@ -248,7 +248,7 @@ where
                 handle_push(
                     stream.get_mut(),
                     queue_tx.clone(),
-                    header.durability,
+                    header.durability(),
                     payload,
                     tv,
                     config.shard_id,
@@ -264,7 +264,7 @@ where
                     .await?;
             }
             _ => {
-                debug!(msg_type = ?header.message_type, "unexpected message type from client");
+                debug!(msg_type = ?header.message_type(), "unexpected message type from client");
                 send_nack(stream.get_mut(), WireNack::InternalError, &[]).await?;
                 metrics
                     .records_nack
@@ -548,13 +548,13 @@ mod tests {
         let mut header_buf = [0u8; HEADER_LEN];
         stream.read_exact(&mut header_buf).await.unwrap();
         let header = Header::decode(&header_buf).unwrap();
-        let mut payload = vec![0u8; header.payload_len as usize];
+        let mut payload = vec![0u8; header.payload_len() as usize];
         if !payload.is_empty() {
             stream.read_exact(&mut payload).await.unwrap();
         }
         let mut crc_buf = [0u8; 4];
         stream.read_exact(&mut crc_buf).await.unwrap();
-        (header.message_type, payload)
+        (header.message_type(), payload)
     }
 
     // ── Frame-level tests ─────────────────────────────────────────────────────

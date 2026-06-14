@@ -36,7 +36,8 @@ const REFERENCE_PUSH_HELLO_SYNC: &[u8; 25] = &[
 fn push_hello_sync_encodes_to_reference_bytes() {
     let header = Header::new(MessageType::Push, Durability::Sync, 0, 5);
     assert_eq!(
-        header.version, WIRE_VERSION,
+        header.version(),
+        WIRE_VERSION,
         "test assumes WIRE_VERSION = 1"
     );
     let envelope = Envelope::new(header, b"hello".to_vec());

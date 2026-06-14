@@ -577,7 +577,7 @@ fn payload_size_boundary_enforced() {
             .expect("read response header");
         let resp_header = Header::decode(&resp_header_buf).expect("decode response header");
         assert_eq!(
-            resp_header.message_type,
+            resp_header.message_type(),
             MessageType::Nack,
             "expected Nack response for over-cap header"
         );
@@ -585,7 +585,7 @@ fn payload_size_boundary_enforced() {
         // The wire format puts the NackReason as the first byte of the
         // payload (see `send_nack` in src/socket/connection.rs). Read the
         // payload and verify the reason byte.
-        let mut payload = vec![0u8; resp_header.payload_len as usize];
+        let mut payload = vec![0u8; resp_header.payload_len() as usize];
         if !payload.is_empty() {
             stream.read_exact(&mut payload).expect("read nack payload");
         }

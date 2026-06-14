@@ -48,7 +48,7 @@ mod tests {
         }
 
         let header = Header::decode(&header_buf).expect("mock server: decode header");
-        let payload_len = header.payload_len as usize;
+        let payload_len = header.payload_len() as usize;
 
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
@@ -62,7 +62,7 @@ mod tests {
             .read_exact(&mut crc_buf)
             .expect("mock server: read CRC");
 
-        Some((header.message_type, payload))
+        Some((header.message_type(), payload))
     }
 
     /// Writes an Ack frame (empty payload) to `stream`.

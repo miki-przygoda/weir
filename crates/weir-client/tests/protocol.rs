@@ -26,7 +26,7 @@ fn all_message_types_round_trip() {
         MessageType::HealthCheckResponse,
     ] {
         let h = Header::new(mt, Durability::Sync, 0, 0);
-        assert_eq!(Header::decode(&h.encode()).unwrap().message_type, mt);
+        assert_eq!(Header::decode(&h.encode()).unwrap().message_type(), mt);
     }
 }
 
@@ -34,7 +34,7 @@ fn all_message_types_round_trip() {
 fn all_durability_tiers_round_trip() {
     for d in [Durability::Sync, Durability::Batched, Durability::Buffered] {
         let h = Header::new(MessageType::Push, d, 0, 0);
-        assert_eq!(Header::decode(&h.encode()).unwrap().durability, d);
+        assert_eq!(Header::decode(&h.encode()).unwrap().durability(), d);
     }
 }
 
@@ -47,7 +47,7 @@ fn header_is_exactly_16_bytes() {
 #[test]
 fn flags_field_preserved() {
     let h = Header::new(MessageType::Push, Durability::Sync, 0xAB, 0);
-    assert_eq!(Header::decode(&h.encode()).unwrap().flags, 0xAB);
+    assert_eq!(Header::decode(&h.encode()).unwrap().flags(), 0xAB);
 }
 
 // ── Header decode rejections ──────────────────────────────────────────────────

@@ -68,14 +68,20 @@ impl TryFrom<u8> for MessageType {
 /// Decoded wire header. `magic` and `header_crc32` are not stored: magic is always
 /// `b"WEIR"` after a successful decode (storing it invites confusion about validity),
 /// and CRC is computed on encode rather than held as state.
+///
+/// Fields are private and read-only (accessors below): a header is only ever
+/// produced by [`Header::new`] (which pins `version` to [`WIRE_VERSION`]) or by
+/// [`Header::decode`] (which validates every field). This makes it impossible
+/// for a caller to desync `payload_len` from the real payload or set `version`
+/// off `WIRE_VERSION` after construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    pub version: u8,
-    pub message_type: MessageType,
-    pub durability: Durability,
+    version: u8,
+    message_type: MessageType,
+    durability: Durability,
     /// Currently reserved; must be zero on write. Preserved verbatim through encode/decode.
-    pub flags: u8,
-    pub payload_len: u32,
+    flags: u8,
+    payload_len: u32,
 }
 
 impl Header {
@@ -93,6 +99,34 @@ impl Header {
             flags,
             payload_len,
         }
+    }
+
+    /// Wire protocol version. Always [`WIRE_VERSION`] for a header built by
+    /// [`Header::new`]; a decoded header only exists if its version matched.
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// The frame's [`MessageType`].
+    pub fn message_type(&self) -> MessageType {
+        self.message_type
+    }
+
+    /// The frame's [`Durability`] tier.
+    pub fn durability(&self) -> Durability {
+        self.durability
+    }
+
+    /// Reserved flags byte (zero in v1; preserved verbatim through the codec).
+    pub fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Declared payload length in bytes. For an [`Envelope`] this always equals
+    /// the actual payload length (see [`Envelope::new`]); on a bare decoded
+    /// header it is the wire-declared length used to read the payload.
+    pub fn payload_len(&self) -> u32 {
+        self.payload_len
     }
 
     /// Serialises the header to exactly `HEADER_LEN` bytes. CRC is computed here;
@@ -159,18 +193,38 @@ impl Header {
 }
 
 /// A complete weir wire frame: validated header + payload bytes.
+///
+/// Fields are private and read-only ([`header`](Envelope::header) /
+/// [`payload`](Envelope::payload)). [`Envelope::new`] makes the payload
+/// authoritative for `header.payload_len`, so the declared length and the
+/// actual payload can never disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
-    pub header: Header,
-    pub payload: Payload,
+    header: Header,
+    payload: Payload,
 }
 
 impl Envelope {
+    /// Builds a frame from a header and payload. The header's `payload_len` is
+    /// overwritten with the payload's actual length, so the two cannot desync
+    /// — the payload is the single source of truth for the length on the wire.
     pub fn new(header: Header, payload: impl Into<Payload>) -> Self {
-        Self {
-            header,
-            payload: payload.into(),
-        }
+        let payload = payload.into();
+        let header = Header {
+            payload_len: payload.len() as u32,
+            ..header
+        };
+        Self { header, payload }
+    }
+
+    /// The frame's validated [`Header`].
+    pub fn header(&self) -> Header {
+        self.header
+    }
+
+    /// The frame's payload bytes.
+    pub fn payload(&self) -> &Payload {
+        &self.payload
     }
 
     /// Serialises the full frame: header bytes + payload bytes + payload CRC32 (LE).

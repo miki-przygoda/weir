@@ -93,9 +93,9 @@ impl<S: Read + Write> WeirClient<S> {
         self.stream.write_all(&frame)?;
 
         let resp = self.read_response()?;
-        match resp.header.message_type {
+        match resp.header().message_type() {
             MessageType::Ack => Ok(()),
-            MessageType::Nack => Err(nack_error(&resp.payload)),
+            MessageType::Nack => Err(nack_error(resp.payload())),
             other => Err(ClientError::Protocol(format!(
                 "expected Ack or Nack, got {other:?}"
             ))),
@@ -124,9 +124,9 @@ impl<S: Read + Write> WeirClient<S> {
         self.stream.write_all(&frame)?;
 
         let resp = self.read_response()?;
-        match resp.header.message_type {
+        match resp.header().message_type() {
             MessageType::HealthCheckResponse => Ok(()),
-            MessageType::Nack => Err(nack_error(&resp.payload)),
+            MessageType::Nack => Err(nack_error(resp.payload())),
             other => Err(ClientError::Protocol(format!(
                 "expected HealthCheckResponse, got {other:?}"
             ))),
@@ -140,7 +140,7 @@ impl<S: Read + Write> WeirClient<S> {
         let header =
             Header::decode(&header_buf).map_err(|e| ClientError::Protocol(e.to_string()))?;
 
-        let payload_len = header.payload_len as usize;
+        let payload_len = header.payload_len() as usize;
         let mut payload_buf = vec![0u8; payload_len];
         if payload_len > 0 {
             self.stream.read_exact(&mut payload_buf)?;
@@ -244,7 +244,7 @@ mod tests {
             let mut hdr = [0u8; weir_core::HEADER_LEN];
             server_end.read_exact(&mut hdr).unwrap();
             let h = weir_core::Header::decode(&hdr).unwrap();
-            let mut rest = vec![0u8; h.payload_len as usize + 4];
+            let mut rest = vec![0u8; h.payload_len() as usize + 4];
             server_end.read_exact(&mut rest).unwrap();
             // Send back an Ack so push_default can complete.
             let ack = weir_core::Envelope::new(
@@ -258,7 +258,7 @@ mod tests {
             )
             .encode();
             server_end.write_all(&ack).unwrap();
-            h.durability
+            h.durability()
         });
 
         c.push_default(b"hello").unwrap();

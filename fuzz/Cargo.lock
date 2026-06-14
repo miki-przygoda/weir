@@ -2681,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2698,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "weir-server"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "core_affinity",
  "crc32fast",
@@ -2720,6 +2720,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots 1.0.7",
+ "weir-core",
+ "weir-sink-sdk",
+]
+
+[[package]]
+name = "weir-sink-sdk"
+version = "0.9.0"
+dependencies = [
  "weir-core",
 ]
 

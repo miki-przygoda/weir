@@ -69,11 +69,11 @@ proptest! {
     fn header_round_trip(h in arb_header()) {
         let bytes = h.encode();
         let decoded = Header::decode(&bytes).expect("freshly encoded header must decode");
-        prop_assert_eq!(decoded.version, h.version);
-        prop_assert_eq!(decoded.message_type, h.message_type);
-        prop_assert_eq!(decoded.durability, h.durability);
-        prop_assert_eq!(decoded.flags, h.flags);
-        prop_assert_eq!(decoded.payload_len, h.payload_len);
+        prop_assert_eq!(decoded.version(), h.version());
+        prop_assert_eq!(decoded.message_type(), h.message_type());
+        prop_assert_eq!(decoded.durability(), h.durability());
+        prop_assert_eq!(decoded.flags(), h.flags());
+        prop_assert_eq!(decoded.payload_len(), h.payload_len());
     }
 
     /// `Header::decode` never panics on arbitrary 16-byte input. The decoder
@@ -174,12 +174,12 @@ proptest! {
         let env = Envelope::new(header, payload.clone());
         let bytes = env.encode();
         let decoded = Envelope::decode(&bytes).expect("freshly encoded envelope must decode");
-        prop_assert_eq!(decoded.header.version, WIRE_VERSION);
-        prop_assert_eq!(decoded.header.message_type, mt);
-        prop_assert_eq!(decoded.header.durability, d);
-        prop_assert_eq!(decoded.header.flags, flags);
-        prop_assert_eq!(decoded.header.payload_len, payload.len() as u32);
-        prop_assert_eq!(decoded.payload, payload);
+        prop_assert_eq!(decoded.header().version(), WIRE_VERSION);
+        prop_assert_eq!(decoded.header().message_type(), mt);
+        prop_assert_eq!(decoded.header().durability(), d);
+        prop_assert_eq!(decoded.header().flags(), flags);
+        prop_assert_eq!(decoded.header().payload_len(), payload.len() as u32);
+        prop_assert_eq!(&decoded.payload()[..], &payload[..]);
     }
 
     /// Encoded frame length is exactly `HEADER_LEN + payload.len() + 4`. This
