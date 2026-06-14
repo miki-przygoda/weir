@@ -60,13 +60,20 @@ fn encode_rowbinary(batch: &[Payload]) -> Vec<u8> {
 
 // ── Dedup token ─────────────────────────────────────────────────────────────────
 
-/// Content-derived dedup token: `sha256(payload₀ ++ payload₁ ++ …)`, lower-hex.
-/// A crash-replayed byte-identical batch produces the same token, so a
-/// dedup-capable engine deduplicates the re-inserted block.
+/// Content-derived dedup token: `sha256(len(p₀) ++ p₀ ++ len(p₁) ++ p₁ ++ …)`,
+/// lower-hex. A crash-replayed byte-identical batch produces the same token, so
+/// a dedup-capable engine deduplicates the re-inserted block.
+///
+/// Each payload is length-prefixed before hashing so the digest is unambiguous
+/// across different batch boundaries. Concatenating payloads without delimiters
+/// would make `["ab", "c"]` and `["a", "bc"]` hash identically — ClickHouse
+/// would then drop the second, genuinely-distinct block as a duplicate, losing
+/// data. The 8-byte little-endian length restores a prefix-free framing.
 fn dedup_token(batch: &[Payload]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for p in batch {
+        hasher.update((p.len() as u64).to_le_bytes());
         hasher.update(p);
     }
     hasher
@@ -357,6 +364,16 @@ mod tests {
     fn dedup_token_changes_on_reorder() {
         let a = vec![p(b"x"), p(b"yy")];
         let b = vec![p(b"yy"), p(b"x")];
+        assert_ne!(dedup_token(&a), dedup_token(&b));
+    }
+
+    #[test]
+    fn dedup_token_distinguishes_different_batch_boundaries() {
+        // ["ab","c"] and ["a","bc"] concatenate to the same bytes but are
+        // different batches — they must NOT share a dedup token, or ClickHouse
+        // would drop the second as a duplicate and lose data.
+        let a = vec![p(b"ab"), p(b"c")];
+        let b = vec![p(b"a"), p(b"bc")];
         assert_ne!(dedup_token(&a), dedup_token(&b));
     }
 
