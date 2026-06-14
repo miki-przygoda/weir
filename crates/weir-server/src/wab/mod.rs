@@ -230,10 +230,13 @@ pub fn spawn(
     // Phase 1 (calling thread): crash recovery — unsealed .wab → .wab.sealed
     recover_open_segments(&wab_dir, &metrics)?;
 
-    // Phase 2 (calling thread): replay sealed-but-unconfirmed segments
-    replay_unconfirmed(&wab_dir, config.shard_count, &drain_tx, &metrics)?;
+    // NOTE: replay of sealed-but-unconfirmed segments is intentionally NOT done
+    // here. The caller invokes `replay_unconfirmed` AFTER the drain consumer is
+    // spawned — otherwise the blocking sends into the bounded drain channel would
+    // dead-lock the startup thread once the recovery backlog exceeds the channel
+    // capacity and no consumer exists yet (B3).
 
-    // Phase 3: one flusher thread per shard
+    // Phase 2: one flusher thread per shard
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let mut shard_txs = Vec::with_capacity(config.shard_count);
     let mut join_handles = Vec::with_capacity(config.shard_count);
@@ -300,7 +303,11 @@ pub fn spawn(
     })
 }
 
-fn replay_unconfirmed(
+/// Replays sealed-but-unconfirmed segments from a previous run by sending their
+/// paths to the drain. MUST be called only after the drain consumer is running:
+/// the sends block on the bounded drain channel, so with no consumer a backlog
+/// larger than the channel capacity would dead-lock the caller (B3).
+pub(crate) fn replay_unconfirmed(
     wab_dir: &Path,
     shard_count: usize,
     drain_tx: &Sender<PathBuf>,
@@ -815,6 +822,61 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(got, payloads);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B3: recovery replay must not dead-lock on the bounded drain channel ──
+    #[test]
+    fn replay_needs_a_live_consumer_for_backlog_over_channel_capacity() {
+        // replay_unconfirmed blocking-sends each sealed-but-unconfirmed segment
+        // into the bounded drain channel. If the backlog exceeds the channel
+        // capacity and no consumer is draining, the send blocks forever — the
+        // startup deadlock (B3). The fix is in the startup wiring: the drain
+        // consumer is spawned BEFORE replay runs. This test characterises the
+        // hazard — replay blocks without a consumer, and streams the whole backlog
+        // once one exists.
+        let dir = tmp_dir("replay_consumer");
+        let shard_dir = shard_dir_path(&dir, 0);
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        const N: u64 = 300; // > the bounded(256) drain channel capacity
+        for i in 1..=N {
+            let path = segment_path(&shard_dir, i);
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"replayed").unwrap();
+            seg.seal().unwrap();
+        }
+
+        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let dir_for_replay = dir.clone();
+        let replay = std::thread::spawn(move || {
+            let metrics = Arc::new(crate::metrics::Metrics::new().0);
+            replay_unconfirmed(&dir_for_replay, 1, &tx, &metrics).unwrap();
+            let _ = done_tx.send(());
+            // tx dropped here → the consumer below sees the channel disconnect.
+        });
+
+        // No consumer yet: replay fills the channel and blocks (the deadlock).
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "replay must block on a full channel with no consumer (the B3 deadlock)"
+        );
+
+        // Live consumer → replay streams the remaining backlog and completes.
+        let consumer = std::thread::spawn(move || {
+            let mut count = 0u64;
+            while rx.recv().is_ok() {
+                count += 1;
+            }
+            count
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replay must complete once a consumer drains the channel");
+        let received = consumer.join().unwrap();
+        replay.join().unwrap();
+        assert_eq!(received, N, "every backlog segment must reach the drain");
         fs::remove_dir_all(dir).ok();
     }
 

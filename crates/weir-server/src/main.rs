@@ -175,6 +175,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Drain channel ─────────────────────────────────────────────────────────
 
     let (drain_tx, drain_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(256);
+    // Startup-only sender for replaying sealed-but-unconfirmed segments from a
+    // previous run. Replay runs AFTER the drain consumer is spawned (below) so
+    // the blocking bounded-channel sends drain live instead of dead-locking the
+    // startup thread on a recovery backlog larger than the channel capacity (B3).
+    // Dropped immediately after replay so it doesn't keep the channel open at
+    // shutdown.
+    let replay_tx = drain_tx.clone();
 
     // ── Coalesce hint: shared EWMA of fsync latency ───────────────────────────
     //
@@ -364,6 +371,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
         }
     };
+
+    // ── Replay recovery backlog (drain consumer is now live) ──────────────────
+    //
+    // Replay sealed-but-unconfirmed segments from a previous run now that the
+    // drain thread is consuming. Done here rather than inside wab::spawn so the
+    // blocking sends into the bounded drain channel are drained live — a backlog
+    // larger than the channel capacity would otherwise dead-lock startup (B3).
+    // Runs before the socket binds, so the recovery backlog is queued ahead of
+    // any newly-accepted traffic.
+    wab::replay_unconfirmed(&config.wab_dir, config.shard_count, &replay_tx, &metrics)?;
+    drop(replay_tx); // release the startup sender so shutdown can close the drain channel
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
 
