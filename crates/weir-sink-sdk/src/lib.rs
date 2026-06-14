@@ -55,6 +55,7 @@
 // `dyn Sink`. So the Send-bound ergonomics the `async_fn_in_trait` lint warns
 // about do not apply here, and sink authors get clean `async fn` signatures.
 #![allow(async_fn_in_trait)]
+#![deny(missing_docs)]
 
 /// Opaque record payload bytes — a ref-counted `bytes::Bytes` (re-exported from
 /// `weir-core`) so clones through the drain are O(1).

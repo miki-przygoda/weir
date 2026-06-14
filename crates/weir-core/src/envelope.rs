@@ -1,3 +1,7 @@
+//! The weir wire frame: [`Header`] (the 16-byte fixed header) and [`Envelope`]
+//! (header + payload), with the `encode`/`decode` codecs that own CRC
+//! computation and the DoS-resistant validation order.
+
 use crate::{
     durability::Durability,
     error::DecodeError,
@@ -31,10 +35,15 @@ pub const MIN_FRAME_LEN: usize = HEADER_LEN + 4;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
+    /// Producer → daemon: a record to durably buffer.
     Push = 0x01,
+    /// Daemon → producer: the pushed record was accepted at its durability tier.
     Ack = 0x02,
+    /// Daemon → producer: the frame or record was rejected (see [`NackReason`](crate::NackReason)).
     Nack = 0x03,
+    /// Producer → daemon: liveness probe (zero-length payload).
     HealthCheck = 0x04,
+    /// Daemon → producer: reply to a [`HealthCheck`](MessageType::HealthCheck).
     HealthCheckResponse = 0x05,
 }
 

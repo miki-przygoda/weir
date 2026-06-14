@@ -1,3 +1,6 @@
+//! The [`Durability`] tier — the per-record durability guarantee a producer
+//! requests in the frame header.
+
 /// Durability tier requested by the producer for a given record.
 /// Wire values are fixed and must not change without a WIRE_VERSION bump.
 #[repr(u8)]

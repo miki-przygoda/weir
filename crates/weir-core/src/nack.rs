@@ -1,3 +1,5 @@
+//! The [`NackReason`] byte that prefixes every Nack message payload.
+
 /// Reason byte carried as the first byte of every Nack message payload.
 /// Wire values are fixed and must not change without a WIRE_VERSION bump.
 ///
@@ -7,11 +9,18 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NackReason {
+    /// Frame did not start with the `b"WEIR"` magic.
     BadMagic = 0x01,
+    /// Frame's version byte did not equal the daemon's `WIRE_VERSION`. The Nack
+    /// payload's second byte carries the daemon's version (see above).
     VersionMismatch = 0x02,
+    /// Header CRC32 did not match the header bytes.
     BadHeaderCrc = 0x03,
+    /// Declared `payload_len` exceeded the daemon's effective cap.
     PayloadTooLarge = 0x04,
+    /// Payload CRC32 did not match the payload bytes.
     BadPayloadCrc = 0x05,
+    /// The daemon hit an internal error (e.g. queue saturation); transient.
     InternalError = 0x06,
     /// The push carried a zero-length payload, which the WAB cannot represent:
     /// an empty record's length prefix is four zero bytes, identical to the

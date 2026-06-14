@@ -1,3 +1,6 @@
+//! The decode failure taxonomy: [`DecodeError`] (one variant per frame-validation
+//! step, which the daemon maps to a Nack reason) and the top-level [`WeirError`].
+
 use std::fmt;
 
 /// All errors that can occur when decoding a weir wire frame.
@@ -13,19 +16,39 @@ pub enum DecodeError {
     /// Version byte does not equal `WIRE_VERSION`. Carries both sides for error messaging.
     /// Checked before header CRC so a version-mismatched frame from a newer client gets
     /// `VersionMismatch`, not a confusing `HeaderCrcMismatch`.
-    VersionMismatch { supported: u8, received: u8 },
+    VersionMismatch {
+        /// The `WIRE_VERSION` this build supports.
+        supported: u8,
+        /// The version byte carried by the rejected frame.
+        received: u8,
+    },
     /// Message type byte has no known variant.
     UnknownMessageType(u8),
     /// Durability byte has no known variant.
     UnknownDurability(u8),
     /// Header CRC32 (bytes [12..16]) does not match CRC of bytes [0..12].
-    HeaderCrcMismatch { expected: u32, computed: u32 },
+    HeaderCrcMismatch {
+        /// CRC carried in the header.
+        expected: u32,
+        /// CRC computed over bytes [0..12].
+        computed: u32,
+    },
     /// Payload CRC32 (trailing 4 bytes) does not match CRC of the payload bytes.
-    PayloadCrcMismatch { expected: u32, computed: u32 },
+    PayloadCrcMismatch {
+        /// CRC carried in the trailing 4 bytes.
+        expected: u32,
+        /// CRC computed over the payload bytes.
+        computed: u32,
+    },
     /// Buffer is shorter than the declared frame length.
     TruncatedFrame,
     /// `payload_len` exceeds the hard cap. Rejection happens before any heap allocation.
-    PayloadTooLarge { len: usize, cap: usize },
+    PayloadTooLarge {
+        /// The declared payload length.
+        len: usize,
+        /// The hard cap it exceeded.
+        cap: usize,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -76,6 +99,7 @@ impl std::error::Error for DecodeError {}
 /// Top-level error type for the weir-core crate.
 #[derive(Debug)]
 pub enum WeirError {
+    /// A wire frame failed to decode.
     Decode(DecodeError),
 }
 
