@@ -306,13 +306,29 @@ pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> i
 /// Moves a corrupt file to `<wab_dir>/quarantine/` and logs the reason.
 /// Failure to quarantine is returned as an error so the caller can decide
 /// whether to abort or continue.
+///
+/// Segment counters are shard-local — every `ShardWriter` starts at 1 — so the
+/// same basename (e.g. `seg_00000001.wab`) exists in every shard directory.
+/// Quarantining by basename alone into one flat directory would let one
+/// shard's corrupt segment silently clobber another's via `rename(2)`,
+/// destroying a forensic artifact. We therefore prefix the destination with
+/// the source's parent (shard) directory name, and never overwrite an existing
+/// quarantined file (the same shard+counter can recur across a restart once the
+/// original is moved out of the shard dir and the counter resets) — a free
+/// suffix is found first.
 pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
     let quarantine_dir = wab_dir.join("quarantine");
     super::create_dir_private(quarantine_dir.clone())?;
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let dest = quarantine_dir.join(file_name);
+    let shard_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown_shard".to_string());
+    let base = format!("{shard_name}__{}", file_name.to_string_lossy());
+    let dest = non_clobbering_dest(&quarantine_dir, &base)?;
     error!(
         path = %path.display(),
         dest = %dest.display(),
@@ -320,6 +336,32 @@ pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
         "quarantining WAB segment"
     );
     fs::rename(path, &dest)
+}
+
+/// Returns a path inside `dir` based on `base` that does not yet exist, so the
+/// caller's `rename` cannot silently overwrite an earlier quarantined file.
+/// Tries `base`, then `base.1`, `base.2`, … There is a small TOCTOU between
+/// the existence check and the caller's rename; quarantine is a best-effort
+/// forensic path and the shard-prefixed `base` already makes a same-name
+/// collision rare, so probing for a free name is sufficient.
+fn non_clobbering_dest(dir: &Path, base: &str) -> io::Result<PathBuf> {
+    let first = dir.join(base);
+    if !first.try_exists()? {
+        return Ok(first);
+    }
+    for n in 1..=10_000u32 {
+        let candidate = dir.join(format!("{base}.{n}"));
+        if !candidate.try_exists()? {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "quarantine: exhausted unique names for '{base}' in {}",
+            dir.display()
+        ),
+    ))
 }
 
 /// Checks the `.confirmed` file for a sealed segment and returns whether it is
@@ -461,6 +503,65 @@ mod tests {
         assert!(dir.join("quarantine").exists());
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_preserves_same_named_segments_from_different_shards() {
+        // Segment counters are shard-local, so seg_00000001.wab exists in every
+        // shard dir. Quarantining the same basename from two shards must not let
+        // one clobber the other.
+        let wab_dir = tmp_dir("quarantine_crossshard");
+        let shard0 = wab_dir.join("shard_00");
+        let shard1 = wab_dir.join("shard_01");
+        fs::create_dir_all(&shard0).unwrap();
+        fs::create_dir_all(&shard1).unwrap();
+
+        let seg0 = shard0.join("seg_00000001.wab");
+        let seg1 = shard1.join("seg_00000001.wab");
+        fs::write(&seg0, b"corrupt-from-shard-0").unwrap();
+        fs::write(&seg1, b"corrupt-from-shard-1").unwrap();
+
+        quarantine(&seg0, &wab_dir, "test shard 0").unwrap();
+        quarantine(&seg1, &wab_dir, "test shard 1").unwrap();
+
+        // Both originals moved out.
+        assert!(!seg0.exists());
+        assert!(!seg1.exists());
+
+        // Both forensic artifacts survive, distinctly named, with their
+        // original contents intact (no clobber).
+        let q = wab_dir.join("quarantine");
+        let d0 = fs::read(q.join("shard_00__seg_00000001.wab")).unwrap();
+        let d1 = fs::read(q.join("shard_01__seg_00000001.wab")).unwrap();
+        assert_eq!(d0, b"corrupt-from-shard-0");
+        assert_eq!(d1, b"corrupt-from-shard-1");
+
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    #[test]
+    fn quarantine_does_not_clobber_same_shard_recurrence() {
+        // A restart can reset a shard's counter and recreate seg_00000001.wab
+        // after the original was quarantined. The second quarantine of the same
+        // shard+counter must get a distinct name, not overwrite the first.
+        let wab_dir = tmp_dir("quarantine_recurrence");
+        let shard0 = wab_dir.join("shard_00");
+        fs::create_dir_all(&shard0).unwrap();
+
+        let seg = shard0.join("seg_00000001.wab");
+        fs::write(&seg, b"first-corrupt").unwrap();
+        quarantine(&seg, &wab_dir, "first").unwrap();
+
+        fs::write(&seg, b"second-corrupt").unwrap();
+        quarantine(&seg, &wab_dir, "second").unwrap();
+
+        let q = wab_dir.join("quarantine");
+        let first = fs::read(q.join("shard_00__seg_00000001.wab")).unwrap();
+        let second = fs::read(q.join("shard_00__seg_00000001.wab.1")).unwrap();
+        assert_eq!(first, b"first-corrupt");
+        assert_eq!(second, b"second-corrupt");
+
+        fs::remove_dir_all(wab_dir).ok();
     }
 
     #[test]
