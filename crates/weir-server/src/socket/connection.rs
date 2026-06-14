@@ -169,11 +169,14 @@ where
                 .inc();
             return Ok(());
         }
-        if payload_len == 0 {
-            // An empty payload can't be represented in the WAB: a zero length
-            // prefix is the end-of-records sentinel, so storing one would
+        if payload_len == 0 && header.message_type == MessageType::Push {
+            // An empty Push payload can't be represented in the WAB: a zero
+            // length prefix is the end-of-records sentinel, so storing one would
             // truncate the segment (silently dropping records written after it).
-            // Reject at ingest rather than let it reach the WAB.
+            // Reject at ingest rather than let it reach the WAB. This applies
+            // ONLY to Push — a HealthCheck frame legitimately carries a
+            // zero-length payload (see docs/wire_protocol.md) and must pass
+            // through to the dispatch below.
             let tv = durability_to_tier(header.durability);
             send_nack(stream.get_mut(), WireNack::EmptyPayload, &[]).await?;
             metrics

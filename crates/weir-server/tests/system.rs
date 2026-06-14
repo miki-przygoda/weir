@@ -494,10 +494,20 @@ fn new_connection_accepted_after_previous_client_drops() {
 // ── Payload edge cases ────────────────────────────────────────────────────────
 
 #[test]
-fn empty_payload_is_accepted() {
+fn empty_payload_is_rejected() {
+    // An empty Push payload collides with the WAB end-of-records sentinel
+    // (a zero-length prefix), so the server rejects it at ingest with
+    // Nack(EmptyPayload) rather than risk truncating a segment. HealthCheck
+    // frames also carry a zero-length payload but are unaffected — see
+    // `health_check_returns_ok`.
+    use weir_core::NackReason;
     let srv = weir_server!("empty_payload").start();
     let mut client = srv.client();
-    client.push(b"", Durability::Sync).unwrap();
+    let err = client.push(b"", Durability::Sync).unwrap_err();
+    assert!(
+        matches!(err, ClientError::Nack(NackReason::EmptyPayload)),
+        "expected Nack(EmptyPayload), got {err:?}"
+    );
 }
 
 #[test]
