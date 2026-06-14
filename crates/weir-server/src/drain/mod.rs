@@ -1214,6 +1214,31 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // ── B6: a failed .confirmed write must not delete the segment ────────────
+    #[test]
+    fn confirmed_write_failure_preserves_segment() {
+        let dir = tmp_dir("b6_confirm_fail");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1"]);
+        // Block the .confirmed write: put a directory where the sidecar file would
+        // go, so File::create fails deterministically.
+        let confirmed = get_confirmed_path(&sealed);
+        std::fs::create_dir_all(&confirmed).unwrap();
+
+        let metrics = noop_metrics();
+        super::confirmed::confirm_and_delete(&sealed, 1, &metrics);
+
+        assert!(
+            sealed.exists(),
+            "segment must be preserved when the .confirmed write fails (re-drained on restart)"
+        );
+        assert_eq!(
+            segments_confirmed(&metrics),
+            0,
+            "must not mark the segment confirmed when the .confirmed write failed"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn transient_max_retries_exhausted_leaves_segment_on_disk() {
         let dir = tmp_dir("max_retry");

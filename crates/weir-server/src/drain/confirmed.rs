@@ -28,7 +28,19 @@ use crate::wab::format::{
 /// segment. Bumps the `wab_segments{state=confirmed}` counter so the
 /// confirmed transition is observable in Prometheus.
 pub(super) fn confirm_and_delete(sealed: &Path, record_count: u64, metrics: &Metrics) {
-    write_confirmed_file(sealed, record_count);
+    if let Err(e) = write_confirmed_file(sealed, record_count) {
+        // Could not durably record the confirmation. Do NOT delete the segment:
+        // leaving it (with no .confirmed sidecar) keeps recovery consistent — the
+        // segment is re-drained on the next restart (a duplicate, absorbed by the
+        // at-least-once + dedup contract) rather than being deleted with no
+        // record that it was ever drained.
+        error!(
+            path = %sealed.display(),
+            error = %e,
+            "drain: .confirmed write failed; preserving segment for re-drain on restart"
+        );
+        return;
+    }
     if let Err(e) = std::fs::remove_file(sealed) {
         warn!(path = %sealed.display(), error = %e, "drain: failed to delete confirmed segment");
     }
@@ -40,20 +52,15 @@ pub(super) fn confirm_and_delete(sealed: &Path, record_count: u64, metrics: &Met
         .inc();
 }
 
-/// Writes the sidecar file next to `sealed`. Failure is logged at error
-/// level — the segment will simply be replayed on the next daemon
-/// restart (recovery treats a missing `.confirmed` as "needs draining").
-pub(super) fn write_confirmed_file(sealed: &Path, record_count: u64) {
+/// Writes the `.confirmed` sidecar next to `sealed`, making both its contents and
+/// its directory entry durable. Returns `Err` if it can't be durably written; the
+/// caller (`confirm_and_delete`) then preserves the segment so it is re-drained on
+/// the next restart (recovery treats a missing `.confirmed` as "needs draining").
+pub(super) fn write_confirmed_file(sealed: &Path, record_count: u64) -> io::Result<()> {
     let confirmed = confirmed_path(sealed);
     let sealed_at = read_sealed_at_nanos(sealed).unwrap_or(0);
     let bytes = build_confirmed(sealed_at, record_count, unix_nanos_now());
-    if let Err(e) = write_confirmed_durably(&confirmed, &bytes) {
-        error!(
-            path = %confirmed.display(),
-            error = %e,
-            "drain: failed to durably write .confirmed file; segment may be re-drained on restart"
-        );
-    }
+    write_confirmed_durably(&confirmed, &bytes)
 }
 
 /// Writes the sidecar and makes both its contents and its directory entry
