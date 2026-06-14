@@ -307,6 +307,12 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
     let dirfd = open_parent_dirfd(parent)?;
     let _dirfd_guard = OwnedDirFd(dirfd);
 
+    // The one irreducible bind(2)→fstatat race window (below) is fully closed
+    // only when the socket's parent directory is writable by the daemon user
+    // alone. Warn if it is group/world-writable (e.g. /tmp) so the operator can
+    // move the socket somewhere private — see docs/security/socket-bind.md.
+    warn_if_parent_world_writable(dirfd, parent);
+
     cleanup_existing_socket(dirfd, basename, path)?;
 
     // bind(2) does not follow a symlink at the final component for AF_UNIX
@@ -503,6 +509,48 @@ fn stat_at_dir(dirfd: libc::c_int, basename: &std::ffi::OsStr) -> io::Result<lib
     Ok(st)
 }
 
+/// Warn if the socket's parent directory is group- or world-writable.
+///
+/// The hardened bind sequence closes every TOCTOU window it can, but the
+/// final `bind(2)`→`fstatat` gap is only fully closed when no other user can
+/// create entries in the parent directory. A group/world-writable parent
+/// (e.g. `/tmp`, mode 0o1777) leaves that gap exploitable. We can't refuse to
+/// start — operators legitimately place sockets under `/tmp` during
+/// development — but we surface it loudly so it's a deliberate choice.
+///
+/// `dirfd` is the parent directory fd already held by `bind_hardened`; we
+/// `fstat` it rather than re-resolving `parent` by path to avoid a fresh
+/// TOCTOU window. `fstat` is one of the few operations permitted on an
+/// `O_PATH` fd, so this works on Linux as well as the macOS `O_RDONLY` fallback.
+#[cfg(unix)]
+fn warn_if_parent_world_writable(dirfd: libc::c_int, parent: &Path) {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // Safety: dirfd is a valid directory fd held by the caller; &mut st is a
+    // writable libc::stat the kernel fills in.
+    let rc = unsafe { libc::fstat(dirfd, &mut st) };
+    if rc == 0 && is_group_or_other_writable(st.st_mode) {
+        // A sticky bit (e.g. /tmp's 0o1777) limits deletion to the owner but
+        // does NOT stop other users creating new entries, so the bind-race
+        // window stays open regardless. Mention it so the warning isn't
+        // dismissed as "but it has the sticky bit".
+        let sticky = (st.st_mode & libc::S_ISVTX) != 0;
+        warn!(
+            mode = format!("{:#o}", st.st_mode & 0o7777),
+            sticky,
+            parent = %parent.display(),
+            "socket parent directory is group/world-writable; the bind-time race \
+             window (see docs/security/socket-bind.md) is not fully closed — place \
+             the socket in a directory writable only by the daemon user",
+        );
+    }
+}
+
+/// True if `mode` grants write to group or other (the `0o020`/`0o002` bits).
+#[cfg(unix)]
+fn is_group_or_other_writable(mode: libc::mode_t) -> bool {
+    (mode & 0o022) != 0
+}
+
 /// RAII guard that closes a directory fd on drop. The dirfd is held only as
 /// long as the bind sequence; we don't keep it open after `run` returns.
 #[cfg(unix)]
@@ -692,6 +740,41 @@ mod tests {
             after_bind, 0o022,
             "bind_hardened must restore process umask to its pre-call value, got {after_bind:#o}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_group_or_other_writable_classifies_modes() {
+        // Private modes: only the owner can write.
+        assert!(!is_group_or_other_writable(0o700));
+        assert!(!is_group_or_other_writable(0o755));
+        assert!(!is_group_or_other_writable(0o600));
+        // Group-writable.
+        assert!(is_group_or_other_writable(0o770));
+        assert!(is_group_or_other_writable(0o775));
+        // World-writable, including the /tmp sticky-bit mode.
+        assert!(is_group_or_other_writable(0o777));
+        assert!(is_group_or_other_writable(0o1777));
+        // The sticky/setuid/setgid bits alone (no write bits) are not writable.
+        assert!(!is_group_or_other_writable(0o1700));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_warns_but_succeeds_on_world_writable_parent() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // A 0o1777 (/tmp-like) parent leaves the bind race open. We warn, but
+        // must NOT fail the bind — operators legitimately use such directories.
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("weir_ww_parent_{}_{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let path = dir.join("weir.sock");
+        let listener = bind_hardened(&path).expect("bind must succeed despite loose parent");
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[tokio::test]
