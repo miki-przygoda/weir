@@ -220,6 +220,7 @@ fn nack_reason_round_trips_all_known_values() {
         NackReason::PayloadTooLarge,
         NackReason::BadPayloadCrc,
         NackReason::InternalError,
+        NackReason::EmptyPayload,
     ] {
         assert_eq!(NackReason::try_from(r as u8).unwrap(), r);
     }
@@ -228,7 +229,8 @@ fn nack_reason_round_trips_all_known_values() {
 #[test]
 fn nack_reason_rejects_unknown_byte() {
     assert!(NackReason::try_from(0x00).is_err());
-    assert!(NackReason::try_from(0x07).is_err());
+    // 0x07 is EmptyPayload (a known reason); 0x08 is the first unused byte.
+    assert!(NackReason::try_from(0x08).is_err());
     assert!(NackReason::try_from(0xFF).is_err());
 }
 
