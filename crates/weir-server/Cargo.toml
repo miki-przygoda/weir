@@ -141,3 +141,8 @@ rcgen = "0.13"
 # wab::dst harness. Only the seed-regression replay test touches JSON; the
 # harness itself needs no serialisation at runtime.
 serde_json = "1"
+# Property-based fault-list exploration for the wab::dst harness: generates and
+# SHRINKS (seed, fault-list, record-count) triples against the durability
+# invariants, so any future regression auto-minimises to a smallest reproducer.
+# Already a dev-dep of weir-core/weir-client.
+proptest = "1"

@@ -3108,6 +3108,7 @@ dependencies = [
  "mysql_async",
  "pico-args",
  "prometheus-client",
+ "proptest",
  "rcgen",
  "reqwest",
  "rustls",
