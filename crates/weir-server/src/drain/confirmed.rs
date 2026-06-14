@@ -20,9 +20,7 @@ use std::path::{Path, PathBuf};
 use tracing::{error, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
-use crate::wab::format::{
-    EXT_CONFIRMED, EXT_SEALED, SEGMENT_FOOTER_LEN, build_confirmed, unix_nanos_now,
-};
+use crate::wab::format::{SEGMENT_FOOTER_LEN, build_confirmed, unix_nanos_now};
 
 /// Writes the `.confirmed` sidecar for `sealed` and removes the sealed
 /// segment. Bumps the `wab_segments{state=confirmed}` counter so the
@@ -76,13 +74,13 @@ fn write_confirmed_durably(confirmed: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Derives the `.wab.confirmed` path from a `.wab.sealed` path by swapping
-/// the extension. Made `pub(super)` so the drain tests can verify side-effect
-/// presence (`assert!(confirmed_path(&sealed).exists())`).
+/// Derives the `.wab.confirmed` path from a `.wab.sealed` path. Thin wrapper
+/// over the shared [`crate::wab::format::confirmed_path_for`] (the single
+/// source of truth, shared with recovery's read side). Kept `pub(super)` so the
+/// drain tests can verify side-effect presence
+/// (`assert!(confirmed_path(&sealed).exists())`).
 pub(super) fn confirmed_path(sealed: &Path) -> PathBuf {
-    let s = sealed.to_string_lossy();
-    let base = s.strip_suffix(EXT_SEALED).unwrap_or(&s);
-    PathBuf::from(format!("{base}{EXT_CONFIRMED}"))
+    crate::wab::format::confirmed_path_for(sealed)
 }
 
 /// Reads the `sealed_at` timestamp from the segment footer (last 32 bytes

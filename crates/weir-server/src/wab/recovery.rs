@@ -376,11 +376,9 @@ fn non_clobbering_dest(dir: &Path, base: &str) -> io::Result<PathBuf> {
 ///   returns `Err` so the caller knows to skip this segment entirely.
 /// - Valid: returns `Ok(true)`.
 pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
-    let confirmed_path = {
-        let s = sealed_path.to_string_lossy();
-        let base = s.strip_suffix(EXT_SEALED).unwrap_or(&s);
-        PathBuf::from(format!("{base}{EXT_CONFIRMED}"))
-    };
+    // Shared sealed→confirmed name mapping (the drain's write side uses the
+    // same helper) — see crate::wab::format::confirmed_path_for.
+    let confirmed_path = super::format::confirmed_path_for(sealed_path);
 
     if !confirmed_path.exists() {
         return Ok(false);
