@@ -127,6 +127,39 @@ fn spawn_tls_reload_task(
     });
 }
 
+/// Returns the configured sink URL, or a clear startup error if it's absent.
+/// Config validation already guarantees it's set for URL-requiring sinks, so
+/// this is belt-and-suspenders — but a `Result` beats a panic on the startup
+/// path, and one message replaces five near-identical `.expect` strings.
+#[cfg(any(
+    feature = "http-sink",
+    feature = "mysql-sink",
+    feature = "postgres-sink",
+    feature = "clickhouse-sink"
+))]
+fn require_sink_url(
+    config: &Config,
+    sink_label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    config.sink_url.clone().ok_or_else(|| {
+        format!("sink_type = {sink_label} requires a sink URL (set --sink-url or WEIR_SINK_URL)")
+            .into()
+    })
+}
+
+/// Wraps a built sink and spawns the drain — the tail shared by every sink arm.
+/// `drain::spawn` is generic over the sink but returns the same
+/// `JoinHandle<()>`, so each arm produces a uniform handle for the join
+/// sequence later in `main`.
+fn build_and_spawn_drain<S: sink::Sink + 'static>(
+    sink: S,
+    drain_rx: crossbeam_channel::Receiver<std::path::PathBuf>,
+    drain_config: DrainConfig,
+    metrics: Arc<metrics::Metrics>,
+) -> std::thread::JoinHandle<()> {
+    drain::spawn(drain_rx, Arc::new(sink), drain_config, metrics)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -266,19 +299,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let drain_handle = match config.sink_type {
         SinkType::Noop => {
             info!("sink: noop (records committed-and-forgotten)");
-            drain::spawn(
-                drain_rx,
-                Arc::new(NoopSink),
-                drain_config,
-                Arc::clone(&metrics),
-            )
+            build_and_spawn_drain(NoopSink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "http-sink")]
         SinkType::Http => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = Http");
+            let url = require_sink_url(&config, "http")?;
             // Bearer token read from env at startup (never from config file).
             // Logged only as a presence boolean — the token itself never reaches
             // a log line.
@@ -303,14 +328,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = HttpSink::new(http_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "mysql-sink")]
         SinkType::Mysql => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = Mysql");
+            let url = require_sink_url(&config, "mysql")?;
             let insert_mode = config.sink_mysql_insert_mode;
             info!(
                 // URL omitted from the log line — it contains credentials.
@@ -335,14 +357,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = MySqlSink::new(mysql_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build MySQL sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "postgres-sink")]
         SinkType::Postgres => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = Postgres");
+            let url = require_sink_url(&config, "postgres")?;
             info!(
                 // URL omitted from the log line for the same reason as MySQL.
                 table = %config.sink_postgres_table,
@@ -363,14 +382,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = PostgresSink::new(pg_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "clickhouse-sink")]
         SinkType::ClickHouse => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = ClickHouse");
+            let url = require_sink_url(&config, "clickhouse")?;
             info!(
                 // URL omitted from the log line — it may carry credentials.
                 database = %config.sink_clickhouse_database,
@@ -391,7 +407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = ClickHouseSink::new(ch_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build ClickHouse sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
     };
 
