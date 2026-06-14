@@ -405,9 +405,21 @@ async fn process_segment<S: Sink>(
 ) -> ProcessResult {
     let reader = match SegmentReader::open(segment) {
         Ok(r) => r,
-        Err(e) => {
-            error!(path = %segment.display(), error = %e, "drain: cannot open segment; skipping");
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Already gone (deleted out-of-band, or a double-send). Nothing to
+            // deliver and nothing to preserve — a genuine no-op.
+            warn!(path = %segment.display(), "drain: segment not found; treating as already-consumed");
             return ProcessResult::Confirmed { record_count: 0 };
+        }
+        Err(e) => {
+            // Any other open failure — transient I/O (fd exhaustion, ENOMEM, a
+            // momentary read error) or post-seal corruption (bad magic/version).
+            // Confirming here would DELETE a segment full of undelivered records on
+            // a transient blip. Preserve it: a transient error clears on retry, and
+            // a genuinely corrupt segment ends up left on disk for manual recovery
+            // (and is quarantined by crash recovery on the next restart).
+            error!(path = %segment.display(), error = %e, "drain: cannot open segment; preserving for retry");
+            return ProcessResult::Transient { retry_after: None };
         }
     };
 
@@ -1146,6 +1158,58 @@ mod tests {
             matches!(result, BatchResult::Transient { .. }),
             "successful commit with a failed dead-letter write must be Transient \
              (preserve segment), not Ok"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B2: an open failure must not silently confirm+delete a good segment ──
+    // SegmentReader::open fails on transient I/O (fd exhaustion, ENOMEM) as well
+    // as on permanent corruption. The old code returned Confirmed{0} for ANY open
+    // error → the segment was deleted, discarding undelivered records on a
+    // transient blip. The fix preserves the segment (Transient) for everything
+    // except NotFound (already gone → genuine no-op).
+
+    #[test]
+    fn corrupt_segment_open_is_preserved_not_deleted() {
+        let dir = tmp_dir("b2_corrupt");
+        let shard_dir = dir.join("shard_00");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        // A file with bad magic → SegmentReader::open errors (InvalidData),
+        // standing in for any non-NotFound open failure (transient or corrupt).
+        let seg = segment_path(&shard_dir, 1);
+        let sealed = seg.with_extension("wab.sealed");
+        std::fs::write(&sealed, b"NOTWEIR-not-a-valid-segment-header-xxxx").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
+
+        assert!(
+            sealed.exists(),
+            "an unopenable segment must be left on disk for recovery, not deleted"
+        );
+        assert!(
+            !get_confirmed_path(&sealed).exists(),
+            "an unopenable segment must not be confirmed"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn missing_segment_open_is_confirmed_noop() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("b2_missing");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_responses([]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let missing = dir.join("shard_00").join("does_not_exist.wab.sealed");
+
+        let result = block_on(process_segment(&missing, &sink, &config, &metrics, &mut dl));
+        assert!(
+            matches!(result, ProcessResult::Confirmed { record_count: 0 }),
+            "a NotFound segment is already gone → Confirmed no-op (nothing to preserve)"
         );
         std::fs::remove_dir_all(dir).ok();
     }
