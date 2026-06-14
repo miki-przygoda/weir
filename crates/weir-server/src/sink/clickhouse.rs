@@ -178,6 +178,18 @@ impl ClickHouseSink {
     }
 }
 
+/// Whether an HTTP status from ClickHouse is transient (retry the segment) vs
+/// permanent (dead-letter). 5xx, 408 (Request Timeout), and 429 (Too Many
+/// Requests) are back-pressure: ClickHouse returns 429 under
+/// `max_concurrent_queries` and a fronting proxy/LB commonly returns 429/503, so
+/// the drain must retry rather than dead-letter live data (matches the HTTP
+/// sink). Other 4xx (bad query, auth, unknown table/column) are permanent.
+fn status_is_transient(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Split an optional `user:password@` component out of the URL. Returns
 /// `(base_url_without_userinfo, Some((user, password)))` if present, else
 /// `(url, None)`.
@@ -253,13 +265,13 @@ impl Sink for ClickHouseSink {
                 committed: batch,
                 dead_lettered: Vec::new(),
             })
-        } else if status.is_server_error() {
+        } else if status_is_transient(status) {
             Err(sql_common::SqlSinkError::transient(
                 "clickhouse",
                 format!("http {status}"),
             ))
         } else {
-            // 4xx → permanent (bad query, auth, unknown table/column). Dead-letter.
+            // Other 4xx → permanent (bad query, auth, unknown table/column). Dead-letter.
             let detail = resp.text().await.unwrap_or_default();
             let detail: String = detail.chars().take(500).collect();
             Err(sql_common::SqlSinkError::permanent(
@@ -409,6 +421,21 @@ mod tests {
         let (base, creds) = split_credentials("http://host:8123");
         assert_eq!(base, "http://host:8123");
         assert_eq!(creds, None);
+    }
+
+    #[test]
+    fn status_classification_treats_backpressure_as_transient() {
+        use reqwest::StatusCode;
+        // Back-pressure / transient — retry, never dead-letter.
+        assert!(status_is_transient(StatusCode::TOO_MANY_REQUESTS)); // 429
+        assert!(status_is_transient(StatusCode::REQUEST_TIMEOUT)); // 408
+        assert!(status_is_transient(StatusCode::INTERNAL_SERVER_ERROR)); // 500
+        assert!(status_is_transient(StatusCode::SERVICE_UNAVAILABLE)); // 503
+        // Permanent — dead-letter.
+        assert!(!status_is_transient(StatusCode::BAD_REQUEST)); // 400
+        assert!(!status_is_transient(StatusCode::UNAUTHORIZED)); // 401
+        assert!(!status_is_transient(StatusCode::NOT_FOUND)); // 404
+        assert!(!status_is_transient(StatusCode::CONFLICT)); // 409
     }
 
     #[test]
