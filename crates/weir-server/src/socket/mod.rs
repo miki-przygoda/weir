@@ -282,7 +282,13 @@ pub(super) fn is_accept_resource_exhaustion(e: &io::Error) -> bool {
 }
 
 /// Validates a socket path: absolute, no `..`, no null bytes.
-/// Matches the same rules as `validate_path` in `wab/mod.rs`.
+///
+/// These are the same format rules as `config::validate_path_format_inner`
+/// (the config-layer check for `wab_dir`/`socket_path`). The two are kept
+/// deliberately separate — each guards its own trust boundary in its own layer
+/// — rather than merged into one shared helper. The shared test vector
+/// `crate::path_validation_test_vectors::CASES` runs both validators over the
+/// same accept/reject cases so their rules cannot silently drift apart.
 pub fn validate_socket_path(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -658,6 +664,27 @@ mod tests {
     #[test]
     fn validate_socket_path_accepts_valid_absolute() {
         assert!(validate_socket_path(Path::new("/run/weir/weir.sock")).is_ok());
+    }
+
+    #[test]
+    fn validate_socket_path_matches_shared_vector() {
+        // Drift guard: the same cases must produce the same accept/reject from
+        // config::validate_path_format_inner — see config's twin test.
+        for (path, should_pass) in crate::path_validation_test_vectors::CASES {
+            assert_eq!(
+                validate_socket_path(Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_socket_path({path:?})"
+            );
+        }
+        #[cfg(unix)]
+        for (path, should_pass) in crate::path_validation_test_vectors::UNIX_ONLY_CASES {
+            assert_eq!(
+                validate_socket_path(Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_socket_path({path:?})"
+            );
+        }
     }
 
     // ── Hardened bind ─────────────────────────────────────────────────────────

@@ -9,6 +9,29 @@ mod socket;
 mod wab;
 mod worker;
 
+/// Shared accept/reject cases for the two independent path-format validators —
+/// `socket::validate_socket_path` and `config::validate_path_format_inner`.
+/// They are deliberately NOT merged (separate trust-boundary checks in separate
+/// layers), so this vector is the drift guard: both test modules run every case
+/// through their own validator and must agree. Adding a rule to one validator
+/// without the other now fails a test here.
+#[cfg(test)]
+pub(crate) mod path_validation_test_vectors {
+    /// `(path, should_pass)` — cross-platform format rules (absolute, no `..`).
+    pub(crate) const CASES: &[(&str, bool)] = &[
+        ("/run/weir/weir.sock", true),
+        ("/var/lib/weir/data", true),
+        ("relative/path.sock", false),
+        ("weir.sock", false),
+        ("/var/../etc/weir.sock", false),
+        ("/run/weir/../weir.sock", false),
+    ];
+
+    /// Null-byte cases. The null check is `#[cfg(unix)]` in both validators.
+    #[cfg(unix)]
+    pub(crate) const UNIX_ONLY_CASES: &[(&str, bool)] = &[("/run/weir\0/x.sock", false)];
+}
+
 use std::{
     path::Path,
     sync::{Arc, atomic::AtomicU64},

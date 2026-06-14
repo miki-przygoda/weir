@@ -1216,6 +1216,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_path_format_matches_shared_vector() {
+        // Drift guard: the same cases must produce the same accept/reject from
+        // socket::validate_socket_path — see socket's twin test.
+        for (path, should_pass) in crate::path_validation_test_vectors::CASES {
+            assert_eq!(
+                validate_path_format("test", Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_path_format({path:?})"
+            );
+        }
+        #[cfg(unix)]
+        for (path, should_pass) in crate::path_validation_test_vectors::UNIX_ONLY_CASES {
+            assert_eq!(
+                validate_path_format("test", Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_path_format({path:?})"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     fn missing_config_file_returns_empty_partial() {
         let result =
