@@ -20,10 +20,11 @@ DST harness caught and fixed. The new findings are the **downstream analogue in 
 drain** — the same "confirm-and-delete on a path that didn't actually persist"
 shape, one layer past where the DST invariant (`i1_acked_true_is_durable`) stops.
 
-> **STATUS (2026-06-14): B1–B4 confirmed in code and RESOLVED**, one commit each
-> with fail-first regression tests where feasible — B1 `e14fe02`, B2 `f51db90`,
-> B3 `cf72749`, B4 `d4e4ff5`. Full bin suite (231) + DST sweep (300 seeds) green.
-> B5–B8 below remain open (medium/robustness).
+> **STATUS (2026-06-14): ALL of B1–B8 confirmed in code and RESOLVED**, one commit
+> each with regression tests — B1 `e14fe02`, B2 `f51db90`, B3 `cf72749`,
+> B4 `d4e4ff5`, B8 `25198f5`, B6 `635e5c4`, B5 `b3e4cfe`, B7 `434be38`. Full bin
+> suite (234) + DST sweep (300 seeds) + clippy/fmt green. Part 1 is fully closed;
+> **Part 2 (security F1–F5) and Part 3 (refactor R1–R10) remain.**
 
 ### 🔴 CRITICAL — silent data loss / startup hang
 
