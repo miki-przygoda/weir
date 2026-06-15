@@ -409,7 +409,7 @@ impl Config {
         check_range("batch_size", batch_size, 1, 100_000)?;
 
         let batch_deadline_ms = merge!(batch_deadline_ms).unwrap_or(1);
-        check_range("batch_deadline_ms", batch_deadline_ms as usize, 1, 60_000)?;
+        check_range("batch_deadline_ms", batch_deadline_ms, 1, 60_000)?;
 
         // Default 256 MiB matches the historical hard-coded behaviour.
         // Lower bound 4 KiB so the segment header (one page) fits;
@@ -488,7 +488,7 @@ impl Config {
         let connection_read_timeout_secs = merge!(connection_read_timeout_secs).unwrap_or(30);
         check_range(
             "connection_read_timeout_secs",
-            connection_read_timeout_secs as usize,
+            connection_read_timeout_secs,
             1,
             600,
         )?;
@@ -533,7 +533,7 @@ impl Config {
         }
 
         let sink_timeout_secs = merge!(sink_timeout_secs).unwrap_or(10);
-        check_range("sink_timeout_secs", sink_timeout_secs as usize, 1, 300)?;
+        check_range("sink_timeout_secs", sink_timeout_secs, 1, 300)?;
 
         let sink_max_batch_size = merge!(sink_max_batch_size).unwrap_or(100);
         check_range("sink_max_batch_size", sink_max_batch_size, 1, 10_000)?;
@@ -609,12 +609,17 @@ impl Config {
         let dead_letter_check_interval_secs = merge!(dead_letter_check_interval_secs).unwrap_or(30);
         check_range(
             "dead_letter_check_interval_secs",
-            dead_letter_check_interval_secs as usize,
+            dead_letter_check_interval_secs,
             1,
             3_600,
         )?;
 
-        let log_level = merge!(log_level).unwrap_or_else(|| "info".into());
+        // Treat an empty / whitespace-only value as unset → "info". Otherwise an
+        // empty WEIR_LOG_LEVEL="" wins the merge and main's EnvFilter::try_new("")
+        // builds an empty filter that disables ALL logging silently (F58).
+        let log_level = merge!(log_level)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "info".into());
 
         // ── TCP + TLS ────────────────────────────────────────────────────────────
         let tcp_bind_str = merge!(tcp_bind);
