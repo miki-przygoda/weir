@@ -68,6 +68,13 @@ ENVIRONMENT:
     or the config file). For sink_type = \"mysql\", set the URL — which
     contains credentials — via WEIR_SINK_URL rather than the TOML file
     so secrets never land on disk.
+
+NOTES:
+    The --sink-mysql-*, --sink-postgres-*, and --sink-clickhouse-* flags
+    require the matching build feature (mysql-sink / postgres-sink /
+    clickhouse-sink). On a binary built without a feature, passing its flag
+    is rejected with a message naming the feature to rebuild with.
+    Boolean flags accept true/false, 1/0, yes/no, or on/off.
 ";
 
 pub(super) fn parse() -> Result<(PartialConfig, PathBuf), ConfigError> {
@@ -120,9 +127,7 @@ pub(super) fn parse_from(
         metrics_max_connections: pargs
             .opt_value_from_str("--metrics-max-connections")
             .map_err(pico_err)?,
-        peer_uid_check: pargs
-            .opt_value_from_str("--peer-uid-check")
-            .map_err(pico_err)?,
+        peer_uid_check: opt_bool(&mut pargs, "--peer-uid-check")?,
         shutdown_timeout_secs: pargs
             .opt_value_from_str("--shutdown-timeout-secs")
             .map_err(pico_err)?,
@@ -137,9 +142,7 @@ pub(super) fn parse_from(
         sink_max_batch_size: pargs
             .opt_value_from_str("--sink-max-batch-size")
             .map_err(pico_err)?,
-        sink_send_idempotency_key: pargs
-            .opt_value_from_str("--sink-send-idempotency-key")
-            .map_err(pico_err)?,
+        sink_send_idempotency_key: opt_bool(&mut pargs, "--sink-send-idempotency-key")?,
         sink_http_concurrency: pargs
             .opt_value_from_str("--sink-http-concurrency")
             .map_err(pico_err)?,
@@ -199,6 +202,27 @@ pub(super) fn parse_from(
 
     let remaining = pargs.finish();
     if !remaining.is_empty() {
+        // A flag that's only wired up under a Cargo feature lands in `remaining`
+        // exactly when that feature wasn't compiled in (the matching
+        // `opt_value_from_str` call is `#[cfg]`-ed out). Turn the generic
+        // "unknown arguments" into a message that names the required feature so
+        // an operator who copied a flag straight from --help isn't left guessing
+        // (F56).
+        for arg in &remaining {
+            if let Some(s) = arg.to_str() {
+                let name = s.split('=').next().unwrap_or(s);
+                if let Some((flag, feature)) = FEATURE_GATED_FLAGS.iter().find(|(f, _)| *f == name)
+                {
+                    return Err(ConfigError::InvalidValue {
+                        field: "<args>",
+                        reason: format!(
+                            "flag '{flag}' requires the '{feature}' feature, which this binary \
+                             was built without (rebuild with --features {feature})"
+                        ),
+                    });
+                }
+            }
+        }
         return Err(ConfigError::InvalidValue {
             field: "<args>",
             reason: format!("unknown arguments: {remaining:?}"),
@@ -208,9 +232,123 @@ pub(super) fn parse_from(
     Ok((partial, config_path))
 }
 
+/// CLI flags that exist only when their sink feature is compiled in, mapped to
+/// the feature that provides them. Used to give a precise "requires feature X"
+/// error (F56) instead of the generic "unknown arguments". A flag reaches the
+/// `remaining` set only on a build without its feature, so no `cfg!` guard is
+/// needed here — a flag that IS compiled in is consumed by pico-args before
+/// `finish()` and never matched against this table.
+const FEATURE_GATED_FLAGS: &[(&str, &str)] = &[
+    ("--sink-mysql-table", "mysql-sink"),
+    ("--sink-mysql-column", "mysql-sink"),
+    ("--sink-mysql-insert-mode", "mysql-sink"),
+    ("--sink-postgres-table", "postgres-sink"),
+    ("--sink-postgres-column", "postgres-sink"),
+    ("--sink-postgres-insert-mode", "postgres-sink"),
+    ("--sink-clickhouse-database", "clickhouse-sink"),
+    ("--sink-clickhouse-table", "clickhouse-sink"),
+    ("--sink-clickhouse-column", "clickhouse-sink"),
+];
+
+/// Parses a boolean flag leniently (`true/false`, `1/0`, `yes/no`, `on/off`),
+/// via [`super::parse_bool`]. `opt_value_from_str::<bool>` accepted only exact
+/// `true`/`false` (F57).
+fn opt_bool(
+    pargs: &mut pico_args::Arguments,
+    flag: &'static str,
+) -> Result<Option<bool>, ConfigError> {
+    // Read the raw value as a String, then parse it ourselves so the flag name
+    // lands in the error (opt_value_from_fn takes a non-capturing fn pointer).
+    match pargs
+        .opt_value_from_str::<_, String>(flag)
+        .map_err(pico_err)?
+    {
+        None => Ok(None),
+        Some(raw) => super::parse_bool(flag, &raw).map(Some),
+    }
+}
+
 fn pico_err(e: pico_args::Error) -> ConfigError {
     ConfigError::ParseError {
         field: "command-line argument",
         source: Box::new(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(parts: &[&str]) -> pico_args::Arguments {
+        // from_vec excludes the executable path, matching how we'd parse real argv.
+        pico_args::Arguments::from_vec(parts.iter().map(OsString::from).collect())
+    }
+
+    // ── F57: lenient boolean flags ────────────────────────────────────────────
+
+    #[test]
+    fn bool_flag_accepts_zero_one_and_mixed_case() {
+        for (raw, expected) in [
+            ("0", false),
+            ("1", true),
+            ("TRUE", true),
+            ("False", false),
+            ("yes", true),
+            ("off", false),
+        ] {
+            let (partial, _) = parse_from(args(&["--peer-uid-check", raw])).unwrap();
+            assert_eq!(partial.peer_uid_check, Some(expected), "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn bool_flag_rejects_garbage_naming_the_flag() {
+        // map Ok payload to () — PartialConfig isn't Debug (and shouldn't be:
+        // it holds the raw sink_url), so unwrap_err can't format the Ok variant.
+        let err = parse_from(args(&["--peer-uid-check", "maybe"]))
+            .map(|_| ())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--peer-uid-check"), "{msg}");
+        assert!(msg.contains("not a valid boolean"), "{msg}");
+    }
+
+    // ── F56: feature-gated flags name the required feature ─────────────────────
+
+    /// On a build WITHOUT clickhouse-sink, `--sink-clickhouse-table` is not wired
+    /// into the parser, so it lands in `remaining`. The error must name the
+    /// feature to rebuild with, not the generic "unknown arguments".
+    #[cfg(not(feature = "clickhouse-sink"))]
+    #[test]
+    fn gated_flag_without_its_feature_names_the_feature() {
+        let err = parse_from(args(&["--sink-clickhouse-table", "events"]))
+            .map(|_| ())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("clickhouse-sink"), "{msg}");
+        assert!(msg.contains("--sink-clickhouse-table"), "{msg}");
+        assert!(!msg.contains("unknown arguments"), "{msg}");
+    }
+
+    /// A truly unknown flag still produces the generic error.
+    #[test]
+    fn unknown_flag_still_generic_error() {
+        let err = parse_from(args(&["--definitely-not-a-flag", "x"]))
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown arguments"), "{err}");
+    }
+
+    #[test]
+    fn every_gated_flag_maps_to_a_real_feature_name() {
+        // Drift guard: the feature names must match the ones the build actually
+        // gates on, mirroring file.rs's KNOWN feature set.
+        for (flag, feature) in FEATURE_GATED_FLAGS {
+            assert!(
+                matches!(*feature, "mysql-sink" | "postgres-sink" | "clickhouse-sink"),
+                "{flag} names an unknown feature {feature}"
+            );
+        }
     }
 }

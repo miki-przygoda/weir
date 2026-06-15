@@ -233,6 +233,29 @@ impl PartialConfig {
 
 // ── Final config ──────────────────────────────────────────────────────────────
 
+/// The sink URL, wrapped so the derived `Config: Debug` cannot leak the
+/// password component into a `?config` log line — the same operator-credentials
+/// hygiene the SQL sink configs apply to their own `Debug` impls (F59). Derefs
+/// to the inner `Option<String>` for transparent read access.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RedactedUrl(pub Option<String>);
+
+impl std::ops::Deref for RedactedUrl {
+    type Target = Option<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RedactedUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(url) => write!(f, "Some({:?})", crate::sink::redact_url_password(url)),
+            None => f.write_str("None"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     /// Absolute path to the Unix socket file.
@@ -292,7 +315,7 @@ pub struct Config {
         )),
         allow(dead_code)
     )]
-    pub sink_url: Option<String>,
+    pub sink_url: RedactedUrl,
     #[cfg_attr(
         not(any(
             feature = "http-sink",
@@ -687,7 +710,7 @@ impl Config {
             shutdown_timeout_secs,
             connection_read_timeout_secs,
             sink_type,
-            sink_url,
+            sink_url: RedactedUrl(sink_url),
             sink_timeout_secs,
             sink_max_batch_size,
             sink_send_idempotency_key,
@@ -807,6 +830,30 @@ where
     }
 }
 
+// ── Boolean parsing helper ──────────────────────────────────────────────────────
+
+/// Lenient boolean parse for env-var and CLI string values. Accepts the common
+/// spellings (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) case-insensitively
+/// and trims surrounding whitespace.
+///
+/// `bool::from_str` — the previous parser for these fields — accepted only the
+/// exact lowercase `true`/`false`, so `WEIR_PEER_UID_CHECK=1` or
+/// `--sink-send-idempotency-key TRUE` aborted startup with an opaque parse error
+/// (F57). TOML booleans are unaffected (they have a native bool type).
+pub(crate) fn parse_bool(field: &'static str, raw: &str) -> Result<bool, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidValue {
+            field,
+            reason: format!(
+                "'{}' is not a valid boolean; use true/false, 1/0, yes/no, or on/off",
+                raw.trim()
+            ),
+        }),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -847,7 +894,7 @@ mod tests {
         assert_eq!(c.shutdown_timeout_secs, 30);
         assert_eq!(c.connection_read_timeout_secs, 30);
         assert_eq!(c.sink_type, SinkType::Noop);
-        assert_eq!(c.sink_url, None);
+        assert!(c.sink_url.is_none());
         assert_eq!(c.sink_timeout_secs, 10);
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
@@ -1385,5 +1432,77 @@ mod tests {
         // (which would also contain the substring "tls").
         assert!(err.to_string().contains("feature"), "{err}");
         fs::remove_dir_all(dir).ok();
+    }
+
+    // ── parse_bool (F57) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_bool_truthy_values() {
+        for t in [
+            "true", "TRUE", "True", "1", "yes", "YES", "on", "ON", "  true  ",
+        ] {
+            assert!(parse_bool("field", t).unwrap(), "input {t:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_falsey_values() {
+        for f in [
+            "false", "FALSE", "False", "0", "no", "NO", "off", "OFF", "  0  ",
+        ] {
+            assert!(!parse_bool("field", f).unwrap(), "input {f:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_rejects_garbage_with_helpful_message() {
+        let err = parse_bool("peer_uid_check", "maybe").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("peer_uid_check"), "{msg}");
+        assert!(msg.contains("not a valid boolean"), "{msg}");
+        // The message lists the accepted spellings.
+        assert!(msg.contains("true/false"), "{msg}");
+    }
+
+    // ── RedactedUrl Debug (F59) ───────────────────────────────────────────────
+
+    #[test]
+    fn config_debug_redacts_sink_url_password() {
+        let dir = tmp_dir("debug_redact");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                // A credentialed URL — the password must never appear in Debug.
+                sink_url: Some("mysql://admin:s3cr3t@db.internal:3306/weir".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("s3cr3t"), "password leaked in Debug: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker missing: {dbg}"
+        );
+        // Scheme/user/host stay visible for operator diagnostics.
+        assert!(dbg.contains("admin"), "{dbg}");
+        assert!(dbg.contains("db.internal"), "{dbg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn redacted_url_debug_none_is_none() {
+        assert_eq!(format!("{:?}", RedactedUrl(None)), "None");
+    }
+
+    #[test]
+    fn redacted_url_debug_unauthenticated_url_unchanged() {
+        // No userinfo ⇒ nothing to redact; the URL is shown as-is.
+        let r = RedactedUrl(Some("https://example.com/ingest".into()));
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("https://example.com/ingest"), "{dbg}");
+        assert!(!dbg.contains("<redacted>"), "{dbg}");
     }
 }

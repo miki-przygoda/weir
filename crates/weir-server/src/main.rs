@@ -141,7 +141,7 @@ fn require_sink_url(
     config: &Config,
     sink_label: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    config.sink_url.clone().ok_or_else(|| {
+    config.sink_url.0.clone().ok_or_else(|| {
         format!("sink_type = {sink_label} requires a sink URL (set --sink-url or WEIR_SINK_URL)")
             .into()
     })

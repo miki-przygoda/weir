@@ -92,29 +92,12 @@ pub(super) fn validate_identifier(
 /// permissive about URL parsing (it doesn't try to validate the URL
 /// itself, only locate the password substring) so debug formatting can
 /// never fail on a malformed URL.
+///
+/// The implementation lives in [`crate::sink::redact_url_password`] (always
+/// compiled) so the config layer can share it regardless of which sink
+/// features are built in; this is the SQL-sink-facing alias (F59).
 pub(super) fn redact_password(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
-    };
-    let rest = &url[scheme_end + 3..];
-    // The userinfo lives in the authority, which ends at the first '/', '?', or
-    // '#'. Restrict the search there so a '@' in the path/query can't be mistaken
-    // for the userinfo/host separator.
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    // The userinfo/host boundary is the LAST '@' in the authority: a password may
-    // contain unencoded '@' characters, so the FIRST '@' would split mid-password
-    // and leak the tail.
-    let Some(at) = rest[..authority_end].rfind('@') else {
-        return url.to_string();
-    };
-    let creds = &rest[..at];
-    // user:password splits at the FIRST ':' — a username carries no unencoded ':'.
-    let Some(colon) = creds.find(':') else {
-        return url.to_string();
-    };
-    let user = &creds[..colon];
-    let tail = &rest[at..];
-    format!("{}://{}:<redacted>{}", &url[..scheme_end], user, tail)
+    super::redact_url_password(url)
 }
 
 // ── Runtime error type ────────────────────────────────────────────────────────
