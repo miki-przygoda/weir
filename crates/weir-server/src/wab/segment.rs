@@ -278,10 +278,29 @@ pub(crate) fn sealed_path_for(active_path: &Path) -> PathBuf {
     p
 }
 
-/// Derives the segment counter from a file stem like `seg_00000001`.
+/// Derives the segment counter from a segment filename regardless of which
+/// lifecycle extension it carries — `seg_00000001.wab`, `seg_00000001.wab.sealed`,
+/// and `seg_00000001.wab.confirmed` all yield `1`. The counter is the digit run
+/// immediately after the `seg_` prefix; everything after it is ignored.
+///
+/// Counting EVERY on-disk segment (not just active `.wab` files) is load-bearing:
+/// after crash recovery seals the active segment, a shard directory can hold only
+/// `.wab.sealed` (and `.wab.confirmed`) files awaiting drain. If the counter scan
+/// ignored those, a fresh writer would reset `next_counter` to 1 and its first
+/// segment's seal-rename would silently overwrite a recovered-but-undrained
+/// sealed segment — data loss. `file_stem()` strips only the *last* extension, so
+/// it left `seg_00000001.wab` on a sealed file and failed to parse; we parse the
+/// leading digit run directly to avoid that.
 pub(crate) fn segment_counter_from_path(path: &Path) -> Option<u64> {
-    let stem = path.file_stem()?.to_str()?;
-    stem.strip_prefix("seg_")?.parse().ok()
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("seg_")?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
 }
 
 /// Formats a segment file name for a given shard directory and counter.
@@ -316,10 +335,12 @@ pub(crate) trait SegmentHandle: Send {
 pub(crate) trait SegmentStore: Send + Sync {
     /// Create a fresh active segment at `path` for `shard_id`.
     fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>>;
-    /// Counter values of every active segment file in `dir`. Sealed (`.wab.sealed`)
-    /// files do not parse via [`segment_counter_from_path`] and so are skipped —
-    /// this matches the historical scan, which only advanced past active segments.
-    /// Used by [`ShardWriter::scan_and_advance_counter`].
+    /// Counter values of every segment file in `dir` — active (`.wab`), sealed
+    /// (`.wab.sealed`), AND confirmed (`.wab.confirmed`). All lifecycle states
+    /// must be counted so [`ShardWriter::scan_and_advance_counter`] advances past
+    /// recovered-but-undrained sealed segments; counting only active files lets a
+    /// post-recovery writer reuse a counter and overwrite a sealed segment (data
+    /// loss). Used by [`ShardWriter::scan_and_advance_counter`].
     fn segment_counters(&self, dir: &Path) -> io::Result<Vec<u64>>;
 }
 
@@ -700,6 +721,75 @@ mod tests {
         assert_eq!(
             active_count, 2,
             "recovery must open a new segment file, not reuse the orphaned one"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn segment_counter_from_path_parses_all_lifecycle_extensions() {
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000001.wab")),
+            Some(1)
+        );
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000007.wab.sealed")),
+            Some(7)
+        );
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000042.wab.confirmed")),
+            Some(42)
+        );
+        assert_eq!(segment_counter_from_path(Path::new("/s/README")), None);
+        assert_eq!(segment_counter_from_path(Path::new("/s/seg_abc.wab")), None);
+    }
+
+    #[test]
+    fn scan_and_advance_counter_advances_past_sealed_segments() {
+        // Regression for the recovery counter-reset data-loss bug: after crash
+        // recovery seals the active segment, the shard dir can hold only
+        // seg_00000001.wab.sealed (recovered, awaiting drain). A fresh writer MUST
+        // advance past it — otherwise its first seal renames seg_00000001.wab over
+        // the recovered, undrained sealed segment and loses those records.
+        let dir = tmp_dir("scan_past_sealed");
+        let active = segment_path(&dir, 1);
+        let mut seg = WabSegment::create(&active, 0).unwrap();
+        seg.write_record(b"recovered-record").unwrap();
+        let sealed = seg.seal().unwrap();
+        assert!(
+            sealed
+                .to_string_lossy()
+                .ends_with("seg_00000001.wab.sealed")
+        );
+        let original = fs::read(&sealed).unwrap();
+
+        // Fresh writer over the same shard dir, as at startup post-recovery.
+        let metrics = Arc::new(Metrics::new().0);
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            metrics,
+            Arc::new(FsSegmentStore),
+        );
+        writer.scan_and_advance_counter().unwrap();
+
+        // New ingest -> new segment -> seal. It must NOT reuse counter 1.
+        writer.write_record(b"new-record").unwrap();
+        let new_sealed = writer.seal_current().unwrap().expect("a segment was open");
+        assert!(
+            new_sealed
+                .to_string_lossy()
+                .ends_with("seg_00000002.wab.sealed"),
+            "new segment reused a counter: {}",
+            new_sealed.display()
+        );
+        // The recovered segment survived untouched.
+        assert!(sealed.exists(), "recovered sealed segment was deleted");
+        assert_eq!(
+            fs::read(&sealed).unwrap(),
+            original,
+            "recovered sealed segment was overwritten"
         );
 
         fs::remove_dir_all(dir).ok();
