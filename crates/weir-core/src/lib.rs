@@ -9,7 +9,9 @@
 //! - [`Envelope`] / [`Header`] — a complete wire frame and its 16-byte header,
 //!   with `encode`/`decode` that own the CRC and validation order.
 //! - [`MessageType`] / [`Durability`] / [`NackReason`] — the fixed-repr enums
-//!   carried in the header and Nack payloads.
+//!   carried in the header and Nack payloads, each with a `TryFrom<u8>` whose
+//!   error is [`UnknownMessageType`] / [`UnknownDurability`] / [`UnknownNackReason`]
+//!   (re-exported here alongside the enums).
 //! - [`Payload`] — opaque, ref-counted payload bytes (O(1) clone).
 //! - [`DecodeError`] / [`WeirError`] — the decode failure taxonomy.
 //! - [`WIRE_VERSION`] / [`MAX_PAYLOAD_HARD_CAP`] / [`HEADER_LEN`] /
@@ -26,9 +28,9 @@ pub mod nack;
 pub mod payload;
 pub mod version;
 
-pub use durability::Durability;
-pub use envelope::{Envelope, HEADER_LEN, Header, MIN_FRAME_LEN, MessageType};
+pub use durability::{Durability, UnknownDurability};
+pub use envelope::{Envelope, HEADER_LEN, Header, MIN_FRAME_LEN, MessageType, UnknownMessageType};
 pub use error::{DecodeError, WeirError};
-pub use nack::NackReason;
+pub use nack::{NackReason, UnknownNackReason};
 pub use payload::Payload;
 pub use version::{MAX_PAYLOAD_HARD_CAP, WIRE_VERSION};

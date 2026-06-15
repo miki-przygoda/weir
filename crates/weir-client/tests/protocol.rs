@@ -201,6 +201,24 @@ fn envelope_decode_rejects_oversized_payload_len() {
     );
 }
 
+// ── TryFrom error structs are reachable at the crate root (G19) ────────────────
+
+#[test]
+fn wire_tryfrom_error_structs_are_re_exported_at_crate_root() {
+    // Each fixed-repr enum's TryFrom<u8> error must be nameable from the crate
+    // root, not just its sub-module, so a caller can store/match the error type.
+    use weir_core::{
+        Durability, MessageType, UnknownDurability, UnknownMessageType, UnknownNackReason,
+    };
+
+    let e: UnknownMessageType = MessageType::try_from(0xFF).unwrap_err();
+    assert_eq!(e.0, 0xFF);
+    let e: UnknownDurability = Durability::try_from(0xFF).unwrap_err();
+    assert_eq!(e.0, 0xFF);
+    let e: UnknownNackReason = NackReason::try_from(0xFF).unwrap_err();
+    assert_eq!(e.0, 0xFF);
+}
+
 // ── NackReason ────────────────────────────────────────────────────────────────
 
 #[test]
