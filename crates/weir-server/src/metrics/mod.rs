@@ -52,6 +52,8 @@ pub enum NackReason {
     bad_payload_crc,
     internal_error,
     empty_payload,
+    unknown_message,
+    reserved_flags_set,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]

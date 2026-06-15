@@ -71,6 +71,26 @@ Byte 1: (VersionMismatch only) daemon's WIRE_VERSION
 | 0x05 | BadPayloadCrc     | none                                 |
 | 0x06 | InternalError     | none                                 |
 | 0x07 | EmptyPayload      | none                                 |
+| 0x08 | UnknownMessage    | none                                 |
+| 0x09 | ReservedFlagsSet  | none                                 |
+
+Reason bytes `0x0A`–`0xFF` are reserved for future use; a client that receives
+an unrecognised reason byte should surface it (e.g. log the raw byte) rather
+than assume a specific meaning.
+
+`UnknownMessage` (`0x08`) is sent when a frame's header passes magic / version /
+header-CRC validation but carries a `message_type` or `durability` byte the
+daemon does not recognise — a **permanent** protocol error (typically version
+skew). It is distinct from `InternalError`: the daemon **closes** the connection
+after it, and retrying the identical frame will not succeed.
+
+`ReservedFlagsSet` (`0x09`) is sent when a frame's header is otherwise valid but
+sets one or more bits in the reserved `flags` byte (byte 7), which **must be
+zero** in wire v1. The daemon rejects such a frame rather than silently ignoring
+the flag — a producer must never believe an unrecognised flag took effect. Like
+`UnknownMessage` this is **permanent** and the daemon **closes** the connection
+after it. Introducing flag semantics in a future version is therefore an
+explicit, `WIRE_VERSION`-gated change.
 
 The `VersionMismatch` second byte lets a client produce a specific error:
 > "daemon is on wire protocol v1; this client is built against v2 — upgrade the daemon or downgrade the client."
@@ -156,6 +176,8 @@ fresh connection.
 | Push with bad header CRC | closed after Nack(BadHeaderCrc) |
 | Push with `payload_len > cap` | closed after Nack(PayloadTooLarge) |
 | Push with bad payload CRC | closed after Nack(BadPayloadCrc) |
+| Push with unknown message_type / durability | closed after Nack(UnknownMessage) |
+| Push with a nonzero reserved `flags` byte | closed after Nack(ReservedFlagsSet) |
 | Idle past `connection_read_timeout_secs` mid-frame | closed silently (slowloris guard); no Nack |
 
 Validation-failure closes are deliberate — once the framing has

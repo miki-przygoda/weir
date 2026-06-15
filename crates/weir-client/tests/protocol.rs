@@ -45,9 +45,21 @@ fn header_is_exactly_16_bytes() {
 }
 
 #[test]
-fn flags_field_preserved() {
+fn nonzero_flags_rejected() {
+    // Wire v1 reserves the flags byte: it must be zero. A frame that sets any
+    // flag bit is rejected at decode (F52) rather than silently accepted — a
+    // producer must never believe an unrecognised flag took effect.
     let h = Header::new(MessageType::Push, Durability::Sync, 0xAB);
-    assert_eq!(Header::decode(&h.encode()).unwrap().flags(), 0xAB);
+    assert_eq!(
+        Header::decode(&h.encode()),
+        Err(DecodeError::ReservedFlagsSet { flags: 0xAB })
+    );
+}
+
+#[test]
+fn zero_flags_accepted() {
+    let h = Header::new(MessageType::Push, Durability::Sync, 0);
+    assert_eq!(Header::decode(&h.encode()).unwrap().flags(), 0);
 }
 
 // ── Header decode rejections ──────────────────────────────────────────────────
@@ -199,6 +211,9 @@ fn nack_reason_repr_values_are_stable() {
     assert_eq!(NackReason::PayloadTooLarge as u8, 0x04);
     assert_eq!(NackReason::BadPayloadCrc as u8, 0x05);
     assert_eq!(NackReason::InternalError as u8, 0x06);
+    assert_eq!(NackReason::EmptyPayload as u8, 0x07);
+    assert_eq!(NackReason::UnknownMessage as u8, 0x08);
+    assert_eq!(NackReason::ReservedFlagsSet as u8, 0x09);
 }
 
 #[test]
@@ -211,6 +226,8 @@ fn nack_reason_round_trips_all_known_values() {
         NackReason::BadPayloadCrc,
         NackReason::InternalError,
         NackReason::EmptyPayload,
+        NackReason::UnknownMessage,
+        NackReason::ReservedFlagsSet,
     ] {
         assert_eq!(NackReason::try_from(r as u8).unwrap(), r);
     }
@@ -219,8 +236,9 @@ fn nack_reason_round_trips_all_known_values() {
 #[test]
 fn nack_reason_rejects_unknown_byte() {
     assert!(NackReason::try_from(0x00).is_err());
-    // 0x07 is EmptyPayload (a known reason); 0x08 is the first unused byte.
-    assert!(NackReason::try_from(0x08).is_err());
+    // 0x01..=0x09 are known reasons (0x09 is ReservedFlagsSet, F52); 0x0A is the
+    // first unused byte.
+    assert!(NackReason::try_from(0x0A).is_err());
     assert!(NackReason::try_from(0xFF).is_err());
 }
 
@@ -228,7 +246,7 @@ fn nack_reason_rejects_unknown_byte() {
 
 mod proptest_wire {
     use proptest::prelude::*;
-    use weir_core::{Durability, Envelope, HEADER_LEN, Header, MessageType};
+    use weir_core::{DecodeError, Durability, Envelope, HEADER_LEN, Header, MessageType};
 
     fn any_message_type() -> impl Strategy<Value = MessageType> {
         prop_oneof![
@@ -250,6 +268,8 @@ mod proptest_wire {
 
     proptest! {
         /// Encode → decode is the identity for any valid header field combination.
+        /// A zero flags byte round-trips; any nonzero flags byte is rejected with
+        /// `ReservedFlagsSet` (F52), so the property is conditional on `flags`.
         #[test]
         fn header_encode_decode_roundtrip(
             mt in any_message_type(),
@@ -258,7 +278,14 @@ mod proptest_wire {
         ) {
             let h = Header::new(mt, d, flags);
             let encoded = h.encode();
-            prop_assert_eq!(Header::decode(&encoded), Ok(h));
+            if flags == 0 {
+                prop_assert_eq!(Header::decode(&encoded), Ok(h));
+            } else {
+                prop_assert_eq!(
+                    Header::decode(&encoded),
+                    Err(DecodeError::ReservedFlagsSet { flags })
+                );
+            }
         }
 
         /// Encode → decode is the identity for any payload byte sequence.

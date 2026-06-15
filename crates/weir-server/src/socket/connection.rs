@@ -429,6 +429,20 @@ fn nack_for_decode_error(e: &DecodeError) -> (WireNack, MetricNack, &'static [u8
         DecodeError::HeaderCrcMismatch { .. } => {
             (WireNack::BadHeaderCrc, MetricNack::bad_header_crc, &[])
         }
+        // CRC-valid header but an unrecognised message_type/durability byte: a
+        // PERMANENT client protocol error (version skew). Distinct from the
+        // transient, keep-open InternalError so the client can tell the two apart
+        // (F25). The connection is closed after the Nack (see the decode site).
+        DecodeError::UnknownMessageType(_) | DecodeError::UnknownDurability(_) => {
+            (WireNack::UnknownMessage, MetricNack::unknown_message, &[])
+        }
+        // Nonzero reserved flags: a permanent, connection-closing protocol error
+        // (the frame set a bit that must be zero in wire v1) — F52.
+        DecodeError::ReservedFlagsSet { .. } => (
+            WireNack::ReservedFlagsSet,
+            MetricNack::reserved_flags_set,
+            &[],
+        ),
         _ => (WireNack::InternalError, MetricNack::internal_error, &[]),
     }
 }
@@ -687,6 +701,53 @@ mod tests {
         let (msg_type, payload) = read_response(&mut client).await;
         assert_eq!(msg_type, MessageType::Nack);
         assert_eq!(payload[0], NackReason::BadPayloadCrc as u8);
+    }
+
+    #[tokio::test]
+    async fn unknown_message_type_returns_nack_unknown_message_and_closes() {
+        let mut client = spawn_handler(test_cfg()).await;
+        let mut frame = push_frame(b"data");
+        // Patch the message_type byte to an unrecognised value and recompute the
+        // header CRC so the frame passes magic/version/CRC and reaches typed-field
+        // parsing — exercising the UnknownMessageType → UnknownMessage path (F25).
+        frame[5] = 0xff;
+        let crc = crc32fast::hash(&frame[..12]).to_le_bytes();
+        frame[12..16].copy_from_slice(&crc);
+        client.write_all(&frame).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::UnknownMessage as u8);
+        // Permanent protocol error: the daemon closes the connection after the
+        // Nack so a client cannot retry the identical (never-valid) frame.
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).await.unwrap(),
+            0,
+            "connection must close after an UnknownMessage Nack"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_flags_returns_nack_reserved_flags_and_closes() {
+        let mut client = spawn_handler(test_cfg()).await;
+        let mut frame = push_frame(b"data");
+        // Set a bit in the reserved flags byte and recompute the header CRC so the
+        // frame is structurally valid up to the flags check — exercising the
+        // ReservedFlagsSet path (F52).
+        frame[7] = 0x01;
+        let crc = crc32fast::hash(&frame[..12]).to_le_bytes();
+        frame[12..16].copy_from_slice(&crc);
+        client.write_all(&frame).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::ReservedFlagsSet as u8);
+        // Permanent protocol error: the daemon closes the connection after the Nack.
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).await.unwrap(),
+            0,
+            "connection must close after a ReservedFlagsSet Nack"
+        );
     }
 
     #[tokio::test]

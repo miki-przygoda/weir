@@ -44,10 +44,11 @@ fn arb_durability() -> impl Strategy<Value = Durability> {
 fn arb_header() -> impl Strategy<Value = Header> {
     // Header::new derives payload_len (0 for a bare header; set by Envelope::new
     // otherwise — F50), so the strategy only varies the fields the constructor
-    // takes. Out-of-cap declared lengths are exercised by the dedicated
-    // PayloadTooLarge property below.
-    (arb_message_type(), arb_durability(), any::<u8>())
-        .prop_map(|(mt, d, flags)| Header::new(mt, d, flags))
+    // takes. flags is pinned to 0: in wire v1 a nonzero flags byte is rejected on
+    // decode (F52), so this strategy produces only *valid* (decodable) headers.
+    // Nonzero-flags rejection is exercised by `nonzero_flags_rejected` below, and
+    // out-of-cap declared lengths by the dedicated PayloadTooLarge property.
+    (arb_message_type(), arb_durability()).prop_map(|(mt, d)| Header::new(mt, d, 0))
 }
 
 fn arb_small_payload() -> impl Strategy<Value = Vec<u8>> {
@@ -150,15 +151,37 @@ proptest! {
             ),
         }
     }
+
+    /// A structurally valid header (correct magic, version, CRC, and known
+    /// type/durability) that sets ANY bit in the reserved flags byte must decode
+    /// to `ReservedFlagsSet`, carrying the offending byte verbatim. In wire v1 the
+    /// flags byte is reserved and must be zero; the daemon rejects a nonzero value
+    /// rather than silently ignoring it (F52).
+    #[test]
+    fn nonzero_flags_rejected(
+        mt in arb_message_type(),
+        d in arb_durability(),
+        flags in 1u8..=u8::MAX,
+    ) {
+        // Build the header bytes by hand: Header::new accepts a flags arg but its
+        // own encode produces a CRC over the nonzero byte, which is exactly what
+        // we want on the wire. arb_header pins flags to 0, so go through new here.
+        let bytes = Header::new(mt, d, flags).encode();
+        prop_assert_eq!(
+            Header::decode(&bytes),
+            Err(DecodeError::ReservedFlagsSet { flags })
+        );
+    }
 }
 
 // ── Properties: Envelope round-trip ───────────────────────────────────────────
 
 proptest! {
-    /// Any (message_type, durability, flags, payload) tuple survives encode +
-    /// decode. payload_len in the header is set automatically from the
-    /// payload length so the round-trip is on the full frame, not just the
-    /// header.
+    /// Any (message_type, durability, payload) tuple with a zero flags byte
+    /// survives encode + decode; a nonzero flags byte is rejected with
+    /// `ReservedFlagsSet` (F52). payload_len in the header is set automatically
+    /// from the payload length so the round-trip is on the full frame, not just
+    /// the header.
     #[test]
     fn envelope_round_trip(
         mt in arb_message_type(),
@@ -169,13 +192,20 @@ proptest! {
         let header = Header::new(mt, d, flags);
         let env = Envelope::new(header, payload.clone());
         let bytes = env.encode();
-        let decoded = Envelope::decode(&bytes).expect("freshly encoded envelope must decode");
-        prop_assert_eq!(decoded.header().version(), WIRE_VERSION);
-        prop_assert_eq!(decoded.header().message_type(), mt);
-        prop_assert_eq!(decoded.header().durability(), d);
-        prop_assert_eq!(decoded.header().flags(), flags);
-        prop_assert_eq!(decoded.header().payload_len(), payload.len() as u32);
-        prop_assert_eq!(&decoded.payload()[..], &payload[..]);
+        if flags == 0 {
+            let decoded = Envelope::decode(&bytes).expect("freshly encoded envelope must decode");
+            prop_assert_eq!(decoded.header().version(), WIRE_VERSION);
+            prop_assert_eq!(decoded.header().message_type(), mt);
+            prop_assert_eq!(decoded.header().durability(), d);
+            prop_assert_eq!(decoded.header().flags(), 0u8);
+            prop_assert_eq!(decoded.header().payload_len(), payload.len() as u32);
+            prop_assert_eq!(&decoded.payload()[..], &payload[..]);
+        } else {
+            prop_assert_eq!(
+                Envelope::decode(&bytes),
+                Err(DecodeError::ReservedFlagsSet { flags })
+            );
+        }
     }
 
     /// Encoded frame length is exactly `HEADER_LEN + payload.len() + 4`. This
@@ -226,14 +256,15 @@ proptest! {
         oversize_len in (MAX_PAYLOAD_HARD_CAP as u32 + 1)..=u32::MAX,
         mt in arb_message_type(),
         d in arb_durability(),
-        flags in any::<u8>(),
     ) {
         // Header::new can no longer declare an arbitrary length (F50), so patch
         // the encoded header's payload_len field + recompute the header CRC to put
         // the (possibly un-allocatable) declared length on the wire. Only the
         // 16-byte header is emitted — no payload bytes — so if the decoder tried
-        // to allocate before the cap check, it would fault here.
-        let mut bytes = Header::new(mt, d, flags).encode();
+        // to allocate before the cap check, it would fault here. flags is left 0:
+        // a nonzero flags byte is rejected before the payload_len is read (F52),
+        // so it would mask the PayloadTooLarge path this property targets.
+        let mut bytes = Header::new(mt, d, 0).encode();
         bytes[8..12].copy_from_slice(&oversize_len.to_le_bytes());
         let crc = crc32fast::hash(&bytes[..12]);
         bytes[12..16].copy_from_slice(&crc.to_le_bytes());

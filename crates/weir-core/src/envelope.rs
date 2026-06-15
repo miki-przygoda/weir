@@ -191,7 +191,15 @@ impl Header {
             MessageType::try_from(buf[5]).map_err(|e| DecodeError::UnknownMessageType(e.0))?;
         let durability =
             Durability::try_from(buf[6]).map_err(|e| DecodeError::UnknownDurability(e.0))?;
+        // Reserved flags byte MUST be zero in wire v1. Reject a nonzero value
+        // rather than preserving-and-ignoring it: silently dropping a flag that a
+        // future version gives meaning to would let a producer believe a semantic
+        // flag took effect when this daemon ignored it. Adding flags later is
+        // therefore an explicit, version-gated change (F52).
         let flags = buf[7];
+        if flags != 0 {
+            return Err(DecodeError::ReservedFlagsSet { flags });
+        }
         let payload_len = u32::from_le_bytes(buf[8..12].try_into().unwrap());
 
         Ok(Self {
@@ -411,6 +419,40 @@ mod tests {
     fn header_decode_rejects_unknown_durability() {
         let mut buf = push_header().encode();
         buf[6] = 0xff;
+        let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
+        buf[12..16].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            Header::decode(&buf),
+            Err(DecodeError::UnknownDurability(0xff))
+        );
+    }
+
+    /// In wire v1 the reserved flags byte must be zero. A header that sets any
+    /// flag bit (with an otherwise-valid CRC over that byte) is rejected with
+    /// `ReservedFlagsSet` rather than silently accepted (F52).
+    #[test]
+    fn header_decode_rejects_nonzero_flags() {
+        let buf = Header::new(MessageType::Push, Durability::Sync, 0x01).encode();
+        assert_eq!(
+            Header::decode(&buf),
+            Err(DecodeError::ReservedFlagsSet { flags: 0x01 })
+        );
+        // The full byte is reported verbatim, not just "nonzero".
+        let buf = Header::new(MessageType::Push, Durability::Sync, 0xff).encode();
+        assert_eq!(
+            Header::decode(&buf),
+            Err(DecodeError::ReservedFlagsSet { flags: 0xff })
+        );
+    }
+
+    /// The reserved-flags check fires only after magic/version/CRC/type/durability
+    /// all pass: a frame that is *both* nonzero-flagged and unknown-durability
+    /// surfaces the durability error first (the decode order is load-bearing for
+    /// the daemon's Nack mapping).
+    #[test]
+    fn header_decode_flags_checked_after_durability() {
+        let mut buf = Header::new(MessageType::Push, Durability::Sync, 0x01).encode();
+        buf[6] = 0xff; // unknown durability
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(

@@ -52,6 +52,13 @@ pub enum DecodeError {
         /// The hard cap it exceeded.
         cap: usize,
     },
+    /// The reserved `flags` byte was nonzero. In wire v1 `flags` must be zero; a
+    /// daemon rejects a frame that sets any flag bit rather than silently
+    /// ignoring it (F52). Carries the offending byte.
+    ReservedFlagsSet {
+        /// The nonzero `flags` byte the frame carried.
+        flags: u8,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -92,6 +99,9 @@ impl fmt::Display for DecodeError {
             }
             Self::PayloadTooLarge { len, cap } => {
                 write!(f, "payload length {len} exceeds cap {cap}")
+            }
+            Self::ReservedFlagsSet { flags } => {
+                write!(f, "reserved flags byte must be zero, got {flags:#04x}")
             }
         }
     }
