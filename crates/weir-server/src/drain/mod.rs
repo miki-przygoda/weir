@@ -14,7 +14,9 @@
 //! Draining
 //!   │  Permanent error AND dead-letter cap exceeded
 //!   ▼
-//! BlockedDeadLetterFull  ──(cap clears)──▶  Draining (same segment, retry from start)
+//! BlockedDeadLetterFull  ──(cap clears)──▶  RetryingTransient (same segment,
+//!                                            RESUMING past already-processed
+//!                                            sub-batches — see F05)
 //! ```
 //!
 //! # Confirmed files
@@ -440,9 +442,15 @@ fn drain_thread<S: Sink>(
                     // past the sub-batches already durably processed (skip =
                     // processed) rather than from record 0, so earlier sub-batches
                     // aren't re-committed/re-dead-lettered (F05). Route through
-                    // RetryingTransient (zero delay) — the state that carries
-                    // `processed`; fresh segments still arrive via pending/the
-                    // channel and are picked up by Draining.
+                    // RetryingTransient — the state that carries `processed`; fresh
+                    // segments still arrive via pending/the channel and are picked
+                    // up by Draining.
+                    //
+                    // Seed next_delay with base_retry_delay (NOT zero): the retry
+                    // fires after the base delay, and crucially, if it then hits a
+                    // transient SINK error, next_state_after_process doubles a
+                    // non-zero base into real exponential backoff — a zero seed
+                    // would double to zero and busy-loop with no backoff (G12).
                     //
                     // Do NOT clear the episode or reset the duration gauge here: if
                     // the retry immediately re-blocks (a flapping cap) it's the same
@@ -452,7 +460,7 @@ fn drain_thread<S: Sink>(
                     DrainState::RetryingTransient {
                         segment,
                         retries_left: config.max_retries,
-                        next_delay: Duration::ZERO,
+                        next_delay: config.base_retry_delay,
                         processed,
                     }
                 } else if channel_closed {
@@ -651,6 +659,13 @@ async fn process_segment<S: Sink>(
         read_index += 1;
         // Skip the prefix already durably processed by a previous attempt so we
         // don't re-commit / re-dead-letter it (F05).
+        //
+        // The SegmentReader has already decoded + CRC-verified this skipped record
+        // by the time we drop it, so a resumed retry re-walks (re-reads + re-CRCs)
+        // the whole processed prefix (G13). That's accepted: retries are the
+        // uncommon path and bounded by max_retries, and the work is a cheap
+        // sequential scan — not worth a seek/fast-forward API on the
+        // durability-critical reader right before the 1.0 freeze.
         if read_index <= skip {
             continue;
         }
@@ -693,10 +708,6 @@ async fn process_segment<S: Sink>(
             }
         }
     }
-    // All readable records are now durably processed (durable_through == the
-    // full count); the Confirmed arm records the segment's total record count.
-    debug_assert_eq!(durable_through, read_index);
-
     if read_failed {
         // Readable prefix delivered; move the segment (with its unreadable tail) to
         // the quarantine dir for manual recovery rather than deleting it. If the
@@ -716,6 +727,14 @@ async fn process_segment<S: Sink>(
         }
         return ProcessResult::Quarantined;
     }
+
+    // Clean path only: every readable record is now durably processed
+    // (durable_through == the full count). Asserted AFTER the read_failed
+    // early-return — on a resumed segment (skip > 0) that then hits a mid-prefix
+    // read error, durable_through == skip < read_index, which is expected and
+    // handled above by quarantine; asserting before that check would trip on a
+    // legitimate state (G10).
+    debug_assert_eq!(durable_through, read_index);
 
     ProcessResult::Confirmed {
         record_count: read_index,
