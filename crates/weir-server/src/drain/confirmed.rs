@@ -67,7 +67,28 @@ pub(super) fn write_confirmed_file(sealed: &Path, record_count: u64) -> io::Resu
 /// delivery (tolerated by the at-least-once + dedup contract, but avoidable).
 fn write_confirmed_durably(confirmed: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
+
+    // Explicit 0o600 so the sidecar is daemon-private regardless of the process
+    // umask. Plain File::create relies on the umask alone (default mode 0o666);
+    // under any umask other than 0o077 the .confirmed file becomes
+    // group/world-readable, and the daemon's own recovery audit
+    // (audit_segment_modes) flags a confirmed file with mode != 0o600 as possible
+    // tampering — a false-positive on the next restart. Matches the hardened mode
+    // in WabSegment::create (F10). create+truncate (not create_new) so a torn
+    // sidecar from a crashed earlier attempt is overwritten on re-drain.
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(confirmed)?
+    };
+    #[cfg(not(unix))]
     let mut f = std::fs::File::create(confirmed)?;
+
     f.write_all(bytes)?;
     f.sync_all()?; // sidecar contents durable
     crate::wab::segment::fsync_parent_dir(confirmed)?; // sidecar dirent durable
@@ -98,4 +119,29 @@ fn read_sealed_at_nanos(path: &Path) -> io::Result<i64> {
     file.read_exact(&mut footer)?;
     // sealed_at is at footer bytes [20..28] — see wab_format.md.
     Ok(i64::from_le_bytes(footer[20..28].try_into().unwrap()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// F10: the `.confirmed` sidecar must be created 0o600 explicitly, not left
+    /// to the umask. With an explicit 0o600 the result is umask-independent
+    /// (0o600 has no group/other bits for any standard umask to clear), so the
+    /// daemon's own recovery audit never false-positives on it.
+    #[test]
+    fn confirmed_sidecar_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("weir_f10_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg_00000000.wab.confirmed");
+
+        write_confirmed_durably(&path, b"sidecar-bytes").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "sidecar mode {mode:#o} != 0o600");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
