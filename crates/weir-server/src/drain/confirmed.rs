@@ -26,6 +26,13 @@ use crate::wab::format::{SEGMENT_FOOTER_LEN, build_confirmed, unix_nanos_now};
 /// segment. Bumps the `wab_segments{state=confirmed}` counter so the
 /// confirmed transition is observable in Prometheus.
 pub(super) fn confirm_and_delete(sealed: &Path, record_count: u64, metrics: &Metrics) {
+    if !sealed.exists() {
+        // The segment is already gone — e.g. process_segment reported a NotFound
+        // open as Confirmed{0} (a genuine no-op). Writing a .confirmed sidecar for
+        // a segment that no longer exists would leave an orphan sidecar with no
+        // segment behind it; there is nothing to confirm or delete, so skip (S23).
+        return;
+    }
     if let Err(e) = write_confirmed_file(sealed, record_count) {
         // Could not durably record the confirmation. Do NOT delete the segment:
         // leaving it (with no .confirmed sidecar) keeps recovery consistent — the

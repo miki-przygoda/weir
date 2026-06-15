@@ -857,12 +857,11 @@ async fn commit_batch<S: Sink>(
             metrics
                 .sink_commit_duration
                 .observe(t.elapsed().as_secs_f64());
-            metrics
-                .sink_commit_records
-                .get_or_create(&OutcomeLabel {
-                    outcome: Outcome::committed,
-                })
-                .inc_by(commit_result.committed.len() as u64);
+            // The committed-records count is bumped at the END, only on the path
+            // that actually returns BatchResult::Ok — a Blocked or failed-write
+            // Transient return below leaves the batch to be re-committed on retry,
+            // and counting here would double-count it (S24).
+            let committed_count = commit_result.committed.len() as u64;
 
             if !commit_result.dead_lettered.is_empty() {
                 let dead_payloads: Vec<Payload> = commit_result
@@ -915,6 +914,12 @@ async fn commit_batch<S: Sink>(
                 }
             }
 
+            metrics
+                .sink_commit_records
+                .get_or_create(&OutcomeLabel {
+                    outcome: Outcome::committed,
+                })
+                .inc_by(committed_count);
             BatchResult::Ok
         }
 
