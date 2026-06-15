@@ -313,15 +313,50 @@ pub(crate) fn replay_unconfirmed(
     drain_tx: &Sender<PathBuf>,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
-    for shard_id in 0..shard_count {
-        let sdir = shard_dir_path(wab_dir, shard_id);
-        if !sdir.exists() {
+    // Enumerate EVERY shard directory on disk, not just 0..shard_count. recovery
+    // (recover_open_segments) already seals active segments in all of them;
+    // scanning only the configured range here would strand sealed-but-unconfirmed
+    // segments in shard dirs whose index is >= shard_count after an operator
+    // REDUCED shard_count across a restart — records acked durable but then never
+    // replayed, confirmed, or dead-lettered (S05). The drain is shard-agnostic, so
+    // draining an orphaned dir's backlog is correct; the dir is left empty once
+    // its segments confirm. Propagate dirent errors (don't filter .ok()): a
+    // silently-skipped sealed segment is silently-dropped acked data.
+    let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    shard_dirs.sort();
+
+    for sdir in shard_dirs {
+        if !sdir.is_dir() {
             continue;
         }
-        // Propagate (don't filter_map(.ok())) a dirent error: silently skipping a
-        // sealed-but-unconfirmed segment here would drop records that were acked
-        // durable but never delivered. Failing startup loudly is the safe choice
-        // — recovery is re-run on the next start (F15).
+        let name = sdir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        // Skip the daemon's reserved subdirs (mirrors recover_open_segments):
+        // quarantine/ holds parked segments; dead_letter/ is owned by the
+        // DeadLetterWriter and must not be replayed as a shard.
+        if name == "quarantine" || name == "dead_letter" {
+            continue;
+        }
+        // A shard directory beyond the configured count means shard_count was
+        // reduced with undrained data present. Its backlog is recovered here (not
+        // stranded), but surface the misconfiguration so the operator notices.
+        if let Some(idx) = name
+            .strip_prefix("shard_")
+            .and_then(|n| n.parse::<usize>().ok())
+            && idx >= shard_count
+        {
+            warn!(
+                shard_dir = %sdir.display(),
+                idx,
+                shard_count,
+                "draining backlog from a shard directory beyond the configured shard_count (shard_count reduced across a restart?); records are recovered, not stranded"
+            );
+        }
         let mut sealed_segments: Vec<PathBuf> = fs::read_dir(&sdir)?
             .map(|e| e.map(|e| e.path()))
             .collect::<io::Result<Vec<_>>>()?
@@ -956,6 +991,46 @@ mod tests {
         let received = consumer.join().unwrap();
         replay.join().unwrap();
         assert_eq!(received, N, "every backlog segment must reach the drain");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── S05: replay must drain shard dirs beyond the configured shard_count ──────
+    #[test]
+    fn replay_drains_shard_dirs_beyond_configured_count() {
+        // An operator who REDUCES shard_count across a restart must not strand
+        // sealed-but-unconfirmed segments in the now-orphaned shard dirs. Recovery
+        // already seals active segments in every dir; replay must likewise scan
+        // every dir, not just 0..shard_count (S05).
+        let dir = tmp_dir("replay_orphan_shards");
+        for s in 0..4u16 {
+            let shard_dir = shard_dir_path(&dir, s as usize);
+            fs::create_dir_all(&shard_dir).unwrap();
+            let path = segment_path(&shard_dir, 1);
+            let mut seg = WabSegment::create(&path, s).unwrap();
+            seg.write_record(b"orphaned").unwrap();
+            seg.seal().unwrap();
+        }
+
+        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        // Configured shard_count = 2, but 4 shard dirs hold backlog on disk.
+        replay_unconfirmed(&dir, 2, &tx, &metrics).unwrap();
+        drop(tx);
+
+        let received: Vec<String> = rx.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(
+            received.len(),
+            4,
+            "all 4 shard dirs' segments must replay, including the 2 beyond shard_count"
+        );
+        assert!(
+            received.iter().any(|n| n.contains("shard_02")),
+            "orphaned shard_02 backlog must be drained, not stranded"
+        );
+        assert!(
+            received.iter().any(|n| n.contains("shard_03")),
+            "orphaned shard_03 backlog must be drained, not stranded"
+        );
         fs::remove_dir_all(dir).ok();
     }
 
