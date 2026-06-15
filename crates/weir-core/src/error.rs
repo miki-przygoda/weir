@@ -12,7 +12,13 @@ use std::fmt;
 /// decoder validates magic → version → header CRC → message_type / durability →
 /// payload fields (so e.g. `UnknownMessageType` only arises on an
 /// already-CRC-valid header). Match on the variant, never on its position.
+///
+/// `#[non_exhaustive]`: the decode taxonomy is expected to grow (wire v1 already
+/// gained `ReservedFlagsSet` and `TrailingBytes` during the 1.0 hardening), so
+/// downstream matches must include a wildcard arm and adding a variant later is
+/// not a breaking change.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// First four bytes are not `b"WEIR"`. Not a weir frame or stream is desynced.
     BadMagic,
@@ -125,7 +131,12 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Top-level error type for the weir-core crate.
+///
+/// `#[non_exhaustive]`: more top-level error categories may be added post-1.0
+/// (the crate currently only decodes, but the type is the public error root), so
+/// downstream matches must carry a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum WeirError {
     /// A wire frame failed to decode.
     Decode(DecodeError),

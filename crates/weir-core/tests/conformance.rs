@@ -61,6 +61,10 @@ fn error_tag(e: &DecodeError) -> &'static str {
         DecodeError::PayloadTooLarge { .. } => "PayloadTooLarge",
         DecodeError::ReservedFlagsSet { .. } => "ReservedFlagsSet",
         DecodeError::TrailingBytes { .. } => "TrailingBytes",
+        // DecodeError is #[non_exhaustive] (F48). A new variant must be given a
+        // tag here before a vector can reference it; until then, fail loudly
+        // rather than silently mis-tagging it.
+        other => panic!("conformance: unmapped DecodeError variant {other:?}"),
     }
 }
 

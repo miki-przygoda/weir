@@ -10,7 +10,12 @@ use weir_core::{
 };
 
 /// All errors that can be returned by [`WeirClient`] methods.
+///
+/// `#[non_exhaustive]`: the client error set may grow post-1.0 (it already gained
+/// `VersionMismatch` during the 1.0 hardening), so downstream matches must carry
+/// a wildcard arm and adding a variant later is not a breaking change.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ClientError {
     /// An I/O error on the underlying socket.
     Io(io::Error),

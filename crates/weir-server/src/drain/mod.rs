@@ -231,6 +231,13 @@ fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
             error!(reason = %reason, "sink health: down");
             (0.0, 0.0, 1.0)
         }
+        // SinkHealth is #[non_exhaustive] (F48): report an unrecognised future
+        // state as degraded so the gauge still moves off "healthy" and operators
+        // get a signal rather than a silently-stuck reading.
+        _ => {
+            warn!("sink health: unrecognised state; reporting as degraded");
+            (0.0, 1.0, 0.0)
+        }
     };
     metrics
         .sink_health

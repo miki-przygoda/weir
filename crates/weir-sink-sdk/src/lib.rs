@@ -139,7 +139,11 @@ impl<R> CommitResult<R> {
 }
 
 /// Coarse health signal from [`Sink::health`].
+///
+/// `#[non_exhaustive]`: a finer health taxonomy may be added post-1.0, so
+/// downstream matches must include a wildcard arm.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum SinkHealth {
     /// The downstream is fully available.
     Healthy,
