@@ -193,6 +193,12 @@ impl ClickHouseSink {
         }
 
         let client = reqwest::Client::builder()
+            // Whole-request timeout (covers the error-body read too). The explicit
+            // tokio::time::timeout around send() only bounds the headers; without a
+            // client timeout, resp.text() on an error response could hang until the
+            // drain's coarse commit_timeout backstop fired (F32). Matches the HTTP
+            // sink, which sets a client timeout.
+            .timeout(config.timeout)
             .build()
             .map_err(|e| ClickHouseSinkBuildError::Client(e.to_string()))?;
         Ok(Self {
@@ -223,9 +229,36 @@ fn status_is_transient(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
-/// Split an optional `user:password@` component out of the URL. Returns
-/// `(base_url_without_userinfo, Some((user, password)))` if present, else
-/// `(url, None)`.
+/// Percent-decodes a URL userinfo component (RFC 3986 `%XX`). Invalid escapes
+/// are left verbatim. ClickHouse — like the SQL sink drivers — expects the
+/// DECODED credential, so a percent-encoded password (`p%40ss`) must
+/// authenticate as `p@ss` rather than reaching the server literally (F34).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Split an optional `user[:password]@` component out of the URL. Returns
+/// `(base_url_without_userinfo, Some((user, password)))` if userinfo is present
+/// (password defaults to empty when only a username is given), else `(url, None)`.
+/// User and password are percent-decoded (F34).
 fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
     if let Some(scheme_end) = url.find("://") {
         let rest = &url[scheme_end + 3..];
@@ -237,12 +270,18 @@ fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         if let Some(at) = rest[..authority_end].rfind('@') {
             let creds = &rest[..at];
-            if let Some(colon) = creds.find(':') {
-                let user = creds[..colon].to_string();
-                let pass = creds[colon + 1..].to_string();
-                let base = format!("{}://{}", &url[..scheme_end], &rest[at + 1..]);
-                return (base, Some((user, pass)));
-            }
+            // `user:password`, or a bare `username` with no ':' — either way the
+            // userinfo must be stripped from base_url so it isn't sent in the URL
+            // or logged (F33: a username-only authority was previously left in).
+            let (user_raw, pass_raw) = match creds.find(':') {
+                Some(colon) => (&creds[..colon], &creds[colon + 1..]),
+                None => (creds, ""),
+            };
+            let base = format!("{}://{}", &url[..scheme_end], &rest[at + 1..]);
+            return (
+                base,
+                Some((percent_decode(user_raw), percent_decode(pass_raw))),
+            );
         }
     }
     (url.to_string(), None)
@@ -511,6 +550,31 @@ mod tests {
         assert!(!status_is_transient(StatusCode::UNAUTHORIZED)); // 401
         assert!(!status_is_transient(StatusCode::NOT_FOUND)); // 404
         assert!(!status_is_transient(StatusCode::CONFLICT)); // 409
+    }
+
+    #[test]
+    fn split_credentials_handles_username_only_userinfo() {
+        // F33: a bare username with no password must still be stripped from
+        // base_url (previously left "user@" in the URL).
+        let (base, creds) = split_credentials("http://justuser@host:8123");
+        assert_eq!(base, "http://host:8123");
+        assert_eq!(creds, Some(("justuser".to_string(), String::new())));
+    }
+
+    #[test]
+    fn split_credentials_percent_decodes_userinfo() {
+        // F34: percent-encoded credentials must be decoded before basic auth,
+        // matching the SQL drivers — p%40ss is the password p@ss.
+        let (base, creds) = split_credentials("http://user:p%40ss%21@host:8123");
+        assert_eq!(base, "http://host:8123");
+        assert_eq!(creds, Some(("user".to_string(), "p@ss!".to_string())));
+    }
+
+    #[test]
+    fn percent_decode_leaves_invalid_escapes_verbatim() {
+        assert_eq!(percent_decode("ab%2"), "ab%2"); // truncated escape
+        assert_eq!(percent_decode("a%zzb"), "a%zzb"); // non-hex
+        assert_eq!(percent_decode("plain"), "plain");
     }
 
     #[test]
