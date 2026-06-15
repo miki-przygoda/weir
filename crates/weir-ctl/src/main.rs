@@ -286,8 +286,14 @@ fn dead_letter_dir(wab_dir: &Path) -> PathBuf {
     wab_dir.join("dead_letter")
 }
 
-/// Returns `(path, size)` for every `dl_*.wab` segment in the dead-letter dir,
+/// Returns `(path, size)` for every dead-letter segment in the dead-letter dir,
 /// sorted by name. A missing dead-letter directory is treated as empty.
+///
+/// Dead-letter records are written and then SEALED, so the on-disk files are
+/// `dl_NNNNNNNN.wab.sealed` — the previous `ends_with(".wab")` filter never
+/// matched them, so `dl list`/`dl drop` always reported an empty store (F40). We
+/// match the sealed files plus any orphaned `dl_*.wab` partial left by a failed
+/// write, so `drop` cleans those up too.
 fn dl_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     let entries = match std::fs::read_dir(dl_dir) {
         Ok(e) => e,
@@ -297,10 +303,9 @@ fn dl_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     let mut out = Vec::new();
     for f in entries.flatten() {
         let p = f.path();
-        let is_dl = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("dl_") && n.ends_with(".wab"));
+        let is_dl = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.starts_with("dl_") && (n.ends_with(".wab.sealed") || n.ends_with(".wab"))
+        });
         if p.is_file() && is_dl {
             let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
             out.push((p, sz));
@@ -472,4 +477,38 @@ fn active_label(body: &str, metric: &str, label: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dl_segments_finds_sealed_files_not_just_bare_wab() {
+        // Regression for F40: dead-letter files are sealed (dl_NNN.wab.sealed);
+        // the old `ends_with(".wab")` filter missed them entirely.
+        let dir = std::env::temp_dir().join(format!("weir_ctl_dl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dl_00000001.wab.sealed"), b"sealed-record").unwrap();
+        std::fs::write(dir.join("dl_00000002.wab"), b"orphan-partial").unwrap();
+        std::fs::write(dir.join("not_a_dl_file.txt"), b"ignore").unwrap();
+
+        let segs = dl_segments(&dir).unwrap();
+        let names: Vec<String> = segs
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["dl_00000001.wab.sealed", "dl_00000002.wab"],
+            "must find sealed dead-letter files (and orphan partials), not the .txt"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dl_segments_missing_dir_is_empty() {
+        let dir = std::env::temp_dir().join("weir_ctl_dl_nonexistent_xyzzy");
+        assert!(dl_segments(&dir).unwrap().is_empty());
+    }
 }
