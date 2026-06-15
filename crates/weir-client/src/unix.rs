@@ -15,6 +15,14 @@ pub enum ClientError {
     Io(io::Error),
     /// The daemon sent a Nack with a recognised reason.
     Nack(NackReason),
+    /// The daemon rejected the frame because its wire version differs from the
+    /// client's. Carries the daemon's `WIRE_VERSION` (the second Nack-payload
+    /// byte) so the caller can report both sides and decide whether to upgrade
+    /// the daemon or downgrade the client.
+    VersionMismatch {
+        /// The wire-protocol version the daemon speaks.
+        daemon_version: u8,
+    },
     /// The daemon sent a Nack with an unrecognised reason byte.
     UnknownNack(u8),
     /// The daemon's response violated the wire protocol.
@@ -28,6 +36,11 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::Io(e) => write!(f, "socket I/O error: {e}"),
             Self::Nack(r) => write!(f, "server nack: {r:?}"),
+            Self::VersionMismatch { daemon_version } => write!(
+                f,
+                "wire version mismatch: daemon speaks v{daemon_version}, this client speaks v{}",
+                weir_core::WIRE_VERSION
+            ),
             Self::UnknownNack(b) => write!(f, "server nack with unknown reason {b:#04x}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::NoDefaultDurability => {
@@ -223,6 +236,14 @@ impl WeirClient<UnixStream> {
 fn nack_error(payload: &[u8]) -> ClientError {
     match payload.first().copied() {
         Some(b) => match NackReason::try_from(b) {
+            // A VersionMismatch Nack carries the daemon's WIRE_VERSION as a
+            // second payload byte (`[0x02, daemon_version]`). Surface it so the
+            // caller can report both sides; fall back to the bare reason if the
+            // daemon (somehow) omitted it.
+            Ok(NackReason::VersionMismatch) => match payload.get(1).copied() {
+                Some(daemon_version) => ClientError::VersionMismatch { daemon_version },
+                None => ClientError::Nack(NackReason::VersionMismatch),
+            },
             Ok(r) => ClientError::Nack(r),
             Err(_) => ClientError::UnknownNack(b),
         },
@@ -276,5 +297,35 @@ mod tests {
 
         c.push_default(b"hello").unwrap();
         assert_eq!(reader.join().unwrap(), Durability::Batched);
+    }
+
+    #[test]
+    fn nack_error_surfaces_daemon_version_on_version_mismatch() {
+        // Daemon sends `[VersionMismatch (0x02), daemon_wire_version]`.
+        let payload = [NackReason::VersionMismatch as u8, 7];
+        match nack_error(&payload) {
+            ClientError::VersionMismatch { daemon_version } => assert_eq!(daemon_version, 7),
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nack_error_version_mismatch_without_version_byte_falls_back() {
+        // A malformed VersionMismatch Nack with no second byte must not panic;
+        // it degrades to the bare reason.
+        let payload = [NackReason::VersionMismatch as u8];
+        assert!(matches!(
+            nack_error(&payload),
+            ClientError::Nack(NackReason::VersionMismatch)
+        ));
+    }
+
+    #[test]
+    fn nack_error_other_reasons_unaffected() {
+        let payload = [NackReason::PayloadTooLarge as u8];
+        assert!(matches!(
+            nack_error(&payload),
+            ClientError::Nack(NackReason::PayloadTooLarge)
+        ));
     }
 }
