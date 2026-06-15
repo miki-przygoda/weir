@@ -19,7 +19,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::Batch;
@@ -436,8 +436,37 @@ fn flusher_thread<C: BlockingClock>(
         Arc::clone(&metrics),
         store,
     );
-    if let Err(e) = writer.scan_and_advance_counter() {
-        warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
+    // Establish the segment counter before sealing anything. A failure here is
+    // NOT benign: defaulting to 1 while crash recovery has already sealed
+    // undrained seg_NNNNNNNN.wab.sealed files would let the first seal's rename
+    // overwrite one of them — silent loss of acked-but-undrained records (the F12
+    // hole, re-reachable via a transient read_dir failure under fd/mem pressure —
+    // G02). Retry briefly to ride out a transient blip; if it still fails, refuse
+    // to seal at an unestablished counter and take the shard offline (return →
+    // work_rx drops → workers Nack; no respawn). The crown invariant — never a
+    // false ack — outranks this shard's availability; a restart re-runs recovery.
+    {
+        let mut attempt = 0u32;
+        loop {
+            match writer.scan_and_advance_counter() {
+                Ok(()) => break,
+                Err(e) if attempt < 3 => {
+                    attempt += 1;
+                    warn!(shard = shard_id, error = %e, attempt, "segment-counter scan failed; retrying before giving up");
+                    clock.sleep(Duration::from_millis(50u64.saturating_mul(attempt as u64)));
+                }
+                Err(e) => {
+                    error!(
+                        shard = shard_id,
+                        error = %e,
+                        "segment-counter scan failed repeatedly; refusing to seal at an \
+                         unestablished counter (would risk overwriting a recovered sealed \
+                         segment) — taking shard offline; records will Nack until restart"
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     // Scratch buffer pre-touch: fault in the backing page before the first record arrives.

@@ -255,6 +255,24 @@ impl WabSegment {
     pub(crate) fn seal(self) -> io::Result<PathBuf> {
         let active_path = self.finalize_to_disk()?;
         let sealed_path = sealed_path_for(&active_path);
+        // Refuse to clobber an existing sealed segment. rename(2) silently
+        // REPLACES its destination; if next_counter ever regressed (e.g. a failed
+        // startup counter-scan defaulting to 1), sealing seg_NNNNNNNN.wab over a
+        // recovered-but-undrained seg_NNNNNNNN.wab.sealed would lose acked records
+        // — the F12/G02 data-loss hole. The flusher already refuses to start at an
+        // unestablished counter (wab/mod.rs), so this is belt-and-suspenders that
+        // turns any residual overwrite into a loud error rather than silent loss.
+        // Single-writer-per-shard, so the check→rename window is not a TOCTOU risk.
+        if sealed_path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to seal '{}' over existing '{}' — would overwrite a sealed segment",
+                    active_path.display(),
+                    sealed_path.display()
+                ),
+            ));
+        }
         std::fs::rename(&active_path, &sealed_path)?;
         // Publish the rename durably: without a parent-dir fsync a crash can lose
         // the .wab.sealed dirent. (Recovery would re-seal the orphaned .wab, so
@@ -801,6 +819,54 @@ mod tests {
         );
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    /// G02 (defense-in-depth): seal() must refuse to rename an active segment
+    /// over an EXISTING .wab.sealed rather than silently clobber it. This is the
+    /// last-line guard behind the flusher's refusal to start at an unestablished
+    /// counter — even if the counter ever regressed, no sealed segment is lost.
+    #[test]
+    fn seal_refuses_to_overwrite_an_existing_sealed_segment() {
+        let dir = tmp_dir("seal_no_clobber");
+        let active = segment_path(&dir, 1);
+        let mut seg = WabSegment::create(&active, 0).unwrap();
+        seg.write_record(b"would-clobber").unwrap();
+
+        // Pre-place the sealed target (as a recovered, undrained sealed segment).
+        let sealed_target = sealed_path_for(&active);
+        fs::write(&sealed_target, b"PRE-EXISTING-RECOVERED-SEGMENT").unwrap();
+
+        let err = seg.seal().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        // The pre-existing sealed segment is untouched.
+        assert_eq!(
+            fs::read(&sealed_target).unwrap(),
+            b"PRE-EXISTING-RECOVERED-SEGMENT",
+            "seal clobbered an existing sealed segment"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// G02 (precondition): a failing segment-counter scan (here forced via an
+    /// unreadable dir, modelling a transient EMFILE/ENOMEM read_dir failure) must
+    /// ERROR and leave next_counter at its default 1 — NOT silently advance. The
+    /// flusher reacts to that error by going offline rather than sealing at an
+    /// unestablished counter that could overwrite a recovered sealed segment.
+    #[test]
+    fn scan_and_advance_counter_errors_on_unreadable_dir_leaving_counter_unadvanced() {
+        let metrics = Arc::new(Metrics::new().0);
+        let missing =
+            std::env::temp_dir().join(format!("weir_g02_no_such_shard_dir_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        let mut writer =
+            ShardWriter::new_with_store(0, missing, 1024 * 1024, metrics, Arc::new(FsSegmentStore));
+        let err = writer.scan_and_advance_counter().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            writer.next_counter, 1,
+            "a failed scan must not advance next_counter past its default"
+        );
     }
 
     #[test]
