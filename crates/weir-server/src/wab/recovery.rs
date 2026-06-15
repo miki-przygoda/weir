@@ -37,7 +37,14 @@ pub(crate) fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> i
             continue;
         }
         let name = shard_dir.file_name().unwrap_or_default().to_string_lossy();
-        if name == "quarantine" {
+        // Skip the daemon's own reserved subdirectories. `quarantine/` holds
+        // unrecoverable segments parked for an operator. `dead_letter/` holds
+        // segment-format files (dl_NNNNNNNN.wab[.sealed]) owned by the
+        // DeadLetterWriter, which manages their dl_ counter and size accounting;
+        // a crash mid-write can leave an active dl_*.wab there, and recovery must
+        // NOT treat dead_letter/ as a shard dir and re-seal that file — doing so
+        // bypasses dead-letter accounting and counter ownership (F16).
+        if name == "quarantine" || name == "dead_letter" {
             continue;
         }
         audit_segment_modes(&shard_dir, metrics);
@@ -550,6 +557,55 @@ mod tests {
             }
         }
         assert_eq!(recovered, vec![b"seg-one".to_vec(), b"seg-two".to_vec()]);
+
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    /// F16: recovery must NOT descend into `dead_letter/` and re-seal a torn
+    /// `dl_*.wab` there. Those files (and their dl_ counter) are owned by the
+    /// DeadLetterWriter; re-sealing one bypasses dead-letter accounting.
+    #[test]
+    fn recover_open_segments_skips_dead_letter_dir() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let wab_dir = tmp_dir("recover_skips_dl");
+
+        // A real shard with an active segment — recovery MUST seal this one.
+        let shard_dir = wab_dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+        let shard_seg = segment_path(&shard_dir, 1);
+        WabSegment::create(&shard_seg, 0)
+            .unwrap()
+            .write_record(b"live")
+            .unwrap();
+
+        // A torn (still-active) dead-letter segment, segment-format so that
+        // WITHOUT the skip recovery would re-seal it.
+        let dl_dir = wab_dir.join("dead_letter");
+        fs::create_dir_all(&dl_dir).unwrap();
+        let dl_seg = dl_dir.join("dl_00000001.wab");
+        WabSegment::create(&dl_seg, 0)
+            .unwrap()
+            .write_record(b"dead")
+            .unwrap();
+
+        recover_open_segments(&wab_dir, &noop_metrics()).unwrap();
+
+        // The shard segment was sealed (active gone, a .wab.sealed appeared)…
+        let shard_sealed = fs::read_dir(&shard_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().to_string_lossy().ends_with(".wab.sealed"));
+        assert!(!shard_seg.exists(), "active shard segment should be gone");
+        assert!(shard_sealed, "shard segment should have been sealed");
+        // …but the dead-letter file is untouched: still active, never sealed.
+        assert!(
+            dl_seg.exists(),
+            "dead_letter dl_*.wab must be left in place"
+        );
+        assert!(
+            !dl_dir.join("dl_00000001.wab.sealed").exists(),
+            "recovery must not re-seal a dead_letter segment"
+        );
 
         fs::remove_dir_all(wab_dir).ok();
     }
