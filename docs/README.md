@@ -33,21 +33,20 @@ Two short docs to get you from zero to a running daemon with records flowing.
 
 ## Operations
 
-Documentation for running weir in production. Configuration is
-covered today; tuning, deployment, observability, and disaster-recovery
-docs are planned for the next docs phase.
+Documentation for running weir in production.
 
 - [**configuration.md**](operations/configuration.md) — Every config
   option: default, range, CLI flag, env var, TOML key, what it
   controls, and when to tune. Plus minimal-config and production-config
   examples. *(canonical reference; ~470 lines)*
-- *Tuning guide* — operator-facing tuning guide. *(planned, Phase 2)*
-- *Observability* — metrics catalogue + alert recipes + Grafana
-  dashboard JSON. *(planned, Phase 2)*
-- *Deployment* — systemd unit, Kubernetes manifest, sidecar pattern.
-  *(planned, Phase 2)*
-- *Disaster recovery* — sink down, disk full, dead-letter full, crash
-  scenarios. *(planned, Phase 2)*
+- [**tcp-mtls.md**](operations/tcp-mtls.md) — The optional TCP + mutual-TLS
+  listener for cross-host producers (behind the `tls` feature): certificate
+  setup, config keys, and live cert reload on `SIGHUP`.
+- [**monitoring.md**](monitoring.md) — Prometheus metrics at `/metrics`,
+  the per-alert runbook, and the Grafana dashboard. Turnkey monitoring stack
+  (weir + Prometheus + Grafana) under [`deploy/monitoring/`](https://github.com/miki-przygoda/weir/tree/main/deploy/monitoring).
+- *Tuning guide* and *disaster-recovery runbook* — operator-facing guides.
+  *(planned)*
 
 ---
 
@@ -62,8 +61,13 @@ the on-disk WAB layout.
 - [**wab_format.md**](wab_format.md) — WAB segment binary format,
   `.confirmed` sidecar, crash-recovery algorithm, segment lifecycle
   (active → sealed → confirmed → deleted).
+- [**conformance.md**](conformance.md) — Language-neutral conformance
+  vectors (`conformance/wire_v1_vectors.json`): canonical hex frames plus
+  the result a conformant decoder must produce for every message type, all
+  nine Nack reasons, and each decode-rejection case. Run your codec against
+  them to confirm byte-compatibility.
 - *Writing a client* — practical client-implementation tutorial.
-  *(planned, Phase 3)*
+  *(planned)*
 
 ---
 

@@ -147,30 +147,28 @@ Only one image variant is currently built. Future plans:
 
 Neither is published yet.
 
-## `cargo install` *(not yet — planned for v1.0)*
+## `cargo install`
 
-Once weir is published to crates.io, you'll be able to:
+With the 1.0 crates published to crates.io:
 
 ```bash
 cargo install weir-server
 ```
 
-This will fetch the latest published version, build it with the host's
-Rust toolchain, and install to `~/.cargo/bin/weir-server`.
+This fetches the latest published version, builds it with the host's
+Rust toolchain, and installs to `~/.cargo/bin/weir-server`. The wire
+protocol and public API are frozen at 1.0 under Semantic Versioning, so
+the version caveat that kept earlier builds off crates.io no longer
+applies.
 
-Until then, install from source as above. The pre-v1.0 crate is not
-on crates.io because the wire protocol may still receive breaking
-changes, and `cargo install` users have no way to see the version
-caveat before installing.
+## Pre-built release binaries
 
-## Pre-built release binaries *(not yet — planned for v1.0)*
-
-A planned `release.yml` GitHub Actions workflow will build and attach
-binaries for `x86_64-linux`, `aarch64-linux`, `x86_64-macos`,
-`aarch64-macos`, and `x86_64-windows` (for `weir-core` only) on every
-version tag. Not yet implemented.
-
-Until then, use the from-source or container paths.
+The `release.yml` GitHub Actions workflow builds and attaches binaries
+for `x86_64-linux`, `aarch64-linux`, `x86_64-macos`, `aarch64-macos`,
+and `x86_64-windows` (for `weir-core` only) to each version tag's
+[GitHub Release](https://github.com/miki-przygoda/weir/releases).
+Download the archive for your platform, or use the from-source or
+container paths above.
 
 ## Verifying the install
 
