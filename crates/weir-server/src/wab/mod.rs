@@ -318,9 +318,14 @@ pub(crate) fn replay_unconfirmed(
         if !sdir.exists() {
             continue;
         }
+        // Propagate (don't filter_map(.ok())) a dirent error: silently skipping a
+        // sealed-but-unconfirmed segment here would drop records that were acked
+        // durable but never delivered. Failing startup loudly is the safe choice
+        // — recovery is re-run on the next start (F15).
         let mut sealed_segments: Vec<PathBuf> = fs::read_dir(&sdir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
+            .map(|e| e.map(|e| e.path()))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
             .collect();
         sealed_segments.sort(); // ascending counter order

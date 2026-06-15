@@ -320,6 +320,12 @@ pub(crate) fn recover_segment(
 
     let sealed = sealed_path_for(path);
     fs::rename(path, &sealed)?;
+    // Make the rename's dirent crash-durable, exactly as WabSegment::seal does
+    // (B4). Without this a crash right after recovery could lose the .wab.sealed
+    // dirent and re-present the segment as an unsealed .wab on the next start —
+    // recovery is idempotent so no data is lost, but the parent fsync keeps the
+    // recovered seal as durable as a live one (F14).
+    super::segment::fsync_parent_dir(&sealed)?;
 
     info!(
         sealed = %sealed.display(),
