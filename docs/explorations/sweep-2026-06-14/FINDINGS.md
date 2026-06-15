@@ -5,9 +5,9 @@
 ## TL;DR
 
 - **76 raw** → **60 confirmed-real** after adversarial verification (+ 1 uncertain, 1 refuted).
-- **Fixed: 30** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
+- **Fixed: 38** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
 - **Needs your decision: 10** → all in **[`ESCALATIONS.md`](ESCALATIONS.md)** (separate file so they're easy to find).
-- **Queued safe fixes: 20** — being worked through; this list shrinks as they land.
+- **Queued safe fixes: 12** — being worked through; this list shrinks as they land.
 
 ## ⚠️ Your decisions live in [`ESCALATIONS.md`](ESCALATIONS.md)
 
@@ -46,7 +46,10 @@ Quick index (full detail + recommendations in that file):
 | F44 | medium | client-sdk-ctl | Client read_response allocates vec![0u8; payload_len] without the MAX_PAYLOAD_HARD_CAP guard the server applies before allocating | `d04dd87` |
 | F07 | low | drain | Dead-letter cap accounting omits fixed 60-byte per-file segment overhead, so dead_letter_max_bytes can be exceeded | `7acd6ee` |
 | F08 | low | drain | Swallowed rescan() error can wedge the drain blocked despite an operator-freed dead-letter directory | `02382df` |
+| F09 | low | drain | dead_letter_full counter and blocked_since reset on every unblock→reblock cycle, inflating the metric and resetting blocked-duration | `ba3b74b` |
+| F10 | low | drain | .confirmed sidecar created without explicit 0o600 mode, tripping the daemon's own recovery mode audit under any non-0o077 umask | `d566e36` |
 | F13 | low | wab | segment_counters doc comment justifies skipping sealed files as 'matches the historical scan' — stale rationale that masks the counter-reset data-loss bug | `fb02a62` |
+| F16 | low | wab | recover_open_segments processes the dead_letter/ directory as if it were a shard directory | `84d55a9` |
 | F22 | low | worker-queue-metrics | accept_latency histogram uses 1ms-floor buckets for a sub-millisecond measurement | `0530fd2` |
 | F23 | low | worker-queue-metrics | flush_shard 'WAB is shutting down' comment misdescribes the permanent-shard-offline case | `238a364` |
 | F33 | low | sink | ClickHouse split_credentials leaves username-only userinfo in base_url, contradicting the struct invariant | `7e15ac4` |
@@ -54,8 +57,13 @@ Quick index (full detail + recommendations in that file):
 | F36 | low | sink | ClickHouse RowBinary encoding silently assumes a plain String column with no config validation and contract buried in a private fn comment | `238a364` |
 | F45 | low | client-sdk-ctl | weir-sink-sdk re-export doc describes Payload as bytes::Bytes, contradicting the R1 newtype rationale | `238a364` |
 | F46 | low | client-sdk-ctl | SDK doc overstates that health() is called after every commit attempt | `238a364` |
+| F47 | low | client-sdk-ctl | Client discards the daemon-version byte the server sends on a VersionMismatch Nack | `65a39fb` |
 | F49 | low | core | Envelope::new silently truncates payload length via payload.len() as u32, falsifying the documented 'cannot desync' invariant | `d04dd87` |
+| F55 | low | config | Feature-gated [server] keys are silently dropped: in KNOWN_SERVER_KEYS but absent from RawConfig on builds without the feature | `b0f2e9b` |
+| F56 | low | config | HELP advertises feature-gated CLI flags that fail as generic 'unknown arguments' when the feature is off, with no feature hint | `b0f2e9b` |
+| F57 | low | config | Boolean env/CLI values accept only exactly 'true'/'false'; '1', '0', 'TRUE' abort startup | `b0f2e9b` |
 | F58 | low | config | log_level is never validated; invalid or empty values silently degrade or disable logging | `03cff76` |
+| F59 | low | config | Config derives Debug, exposing sink_url credentials, inconsistent with the project's deliberate bearer_token redaction | `b0f2e9b` |
 | F19 | info | wab | macOS data fsync uses F_BARRIERFSYNC (barrier) while directory durability uses plain fsync via sync_all — weaker than F_FULLFSYNC; an explicit, undertested tradeoff on the crown durability path | `238a364` |
 | F60 | info | config | u64 durations range-checked via `as usize` truncate on 32-bit targets, letting out-of-range values pass | `03cff76` |
 
@@ -68,21 +76,13 @@ Quick index (full detail + recommendations in that file):
 | F21 | medium | worker-queue-metrics | Phase-2 coalesce starves co-located shards on a shared worker (worker_count < shard_count) |
 | F38 | medium | sink | HTTP concurrency: no test asserts a transient mid-batch error actually cancels still-in-flight POSTs |
 | F39 | medium | sink | HTTP concurrency: no test pins record-to-outcome pairing (right payload in committed vs dead_lettered) under concurrent POSTs |
-| F09 | low | drain | dead_letter_full counter and blocked_since reset on every unblock→reblock cycle, inflating the metric and resetting blocked-duration |
-| F10 | low | drain | .confirmed sidecar created without explicit 0o600 mode, tripping the daemon's own recovery mode audit under any non-0o077 umask |
-| F16 | low | wab | recover_open_segments processes the dead_letter/ directory as if it were a shard directory |
 | F18 | low | wab | Recovery: the partial-seal sentinel branch during crash recovery is untested |
 | F26 | low | socket | Payload and CRC reads are not raced against handler_shutdown, so a mid-frame stall holds a semaphore permit until read_timeout during graceful shutdown |
 | F27 | low | socket | Payload/CRC read timeout is a whole-transfer deadline but is documented and metered as a per-byte idle timeout |
 | F28 | low | socket | Shutdown-time socket removal is path-based (std::fs::remove_file), inconsistent with the hardened unlinkat-based startup cleanup |
 | F29 | low | socket | TLS handshake is not raced against handler_shutdown, so in-flight handshakes block graceful drain up to handshake_timeout |
 | F30 | low | socket | umask save/restore in bind_hardened has no RAII guard; an unwind between set and restore would leak the tightened 0o177 umask process-wide |
-| F47 | low | client-sdk-ctl | Client discards the daemon-version byte the server sends on a VersionMismatch Nack |
 | F51 | low | core | Payload newtype: PartialEq impls and the Borrow<[u8]> hashmap-key contract are untested |
-| F55 | low | config | Feature-gated [server] keys are silently dropped: in KNOWN_SERVER_KEYS but absent from RawConfig on builds without the feature |
-| F56 | low | config | HELP advertises feature-gated CLI flags that fail as generic 'unknown arguments' when the feature is off, with no feature hint |
-| F57 | low | config | Boolean env/CLI values accept only exactly 'true'/'false'; '1', '0', 'TRUE' abort startup |
-| F59 | low | config | Config derives Debug, exposing sink_url credentials, inconsistent with the project's deliberate bearer_token redaction |
 
 ## ⚪ Considered & dismissed
 
