@@ -236,6 +236,23 @@ fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
         .set(down);
 }
 
+/// Probes [`Sink::health`] under a timeout backstop and maps a hang to `Down`.
+///
+/// The drain runs on a single-threaded runtime; an un-timed `health()` that
+/// hangs would wedge the entire drain — the idle loop would never return to
+/// `recv` (missing shutdown), and the blocked-state poll would never reach its
+/// `channel_closed` check. Mirrors the `commit()` timeout backstop so a
+/// misbehaving sink degrades the health gauge instead of stalling delivery.
+fn probe_health<S: Sink>(rt: &tokio::runtime::Runtime, sink: &S, timeout: Duration) -> SinkHealth {
+    match rt.block_on(async { tokio::time::timeout(timeout, sink.health()).await }) {
+        Ok(health) => health,
+        Err(_elapsed) => SinkHealth::Down(format!(
+            "health probe exceeded {}s backstop",
+            timeout.as_secs()
+        )),
+    }
+}
+
 // ── Drain thread ──────────────────────────────────────────────────────────────
 
 fn drain_thread<S: Sink>(
@@ -277,7 +294,7 @@ fn drain_thread<S: Sink>(
                         match drain_rx.recv_timeout(HEALTH_POLL_INTERVAL) {
                             Ok(p) => break p,
                             Err(RecvTimeoutError::Timeout) => {
-                                let health = rt.block_on(sink.health());
+                                let health = probe_health(&rt, &*sink, config.commit_timeout);
                                 set_sink_health(&metrics, health);
                             }
                             Err(RecvTimeoutError::Disconnected) => break 'outer,
@@ -293,7 +310,7 @@ fn drain_thread<S: Sink>(
                     &mut dead_letter,
                 ));
 
-                let health = rt.block_on(sink.health());
+                let health = probe_health(&rt, &*sink, config.commit_timeout);
                 set_sink_health(&metrics, health);
 
                 transition_from_draining(segment, result, &config, &metrics)
@@ -366,7 +383,13 @@ fn drain_thread<S: Sink>(
                 }
 
                 // Rescan so external deletions (e.g. operator cleanup) are reflected.
-                let _ = dead_letter.rescan();
+                // A failed rescan leaves total_bytes stale at its at-cap value, so
+                // the unblock check below can't clear and the drain stays blocked
+                // even after the operator frees the dir — surface it rather than
+                // swallowing (F08).
+                if let Err(e) = dead_letter.rescan() {
+                    warn!(error = %e, "drain: dead-letter rescan failed while blocked; total_bytes may be stale until the next successful rescan");
+                }
                 metrics
                     .dead_letter_bytes_on_disk
                     .set(dead_letter.total_bytes() as f64);
@@ -376,7 +399,7 @@ fn drain_thread<S: Sink>(
                 // while we were waiting on dead-letter headroom; without
                 // this poll the gauge would be stuck at whatever value the
                 // last segment commit produced.
-                let health = rt.block_on(sink.health());
+                let health = probe_health(&rt, &*sink, config.commit_timeout);
                 set_sink_health(&metrics, health);
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
                     // Headroom available — retry the preserved segment from the beginning.
@@ -611,6 +634,26 @@ async fn commit_batch<S: Sink>(
     };
     match commit {
         Ok(commit_result) => {
+            // The Sink contract is that committed ∪ dead_lettered partitions the
+            // input batch. A (non-conforming, third-party) sink that drops a
+            // record from BOTH vectors would otherwise have the segment
+            // confirmed-and-deleted with that record neither delivered nor
+            // dead-lettered — a silent false ack with zero detection (F02).
+            // Refuse to confirm: preserve the segment, retry, and surface it
+            // loudly. Built-in sinks always partition, so this never fires for
+            // them. (The deeper fix — encoding the invariant in the SDK type — is
+            // tracked as F41.)
+            let accounted = commit_result.committed.len() + commit_result.dead_lettered.len();
+            if accounted != payloads.len() {
+                error!(
+                    input = payloads.len(),
+                    committed = commit_result.committed.len(),
+                    dead_lettered = commit_result.dead_lettered.len(),
+                    "drain: sink CommitResult does not account for every record; preserving \
+                     segment instead of confirming (likely a Sink contract violation)"
+                );
+                return BatchResult::Transient { retry_after: None };
+            }
             metrics
                 .sink_commit_duration
                 .observe(t.elapsed().as_secs_f64());
@@ -630,7 +673,20 @@ async fn commit_batch<S: Sink>(
 
                 let estimated = estimated_write_bytes(&dead_payloads);
                 if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
-                    return BatchResult::Blocked;
+                    if estimated > config.dead_letter_max_bytes {
+                        // This batch alone exceeds the cap, so blocking could never
+                        // clear (even an empty dir won't fit it) — that would wedge
+                        // the drain forever in a block↔retry livelock (F03). The cap
+                        // bounds steady-state growth, not a single oversized
+                        // permanent rejection; write it anyway (overshoot once).
+                        warn!(
+                            estimated,
+                            cap = config.dead_letter_max_bytes,
+                            "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
+                        );
+                    } else {
+                        return BatchResult::Blocked;
+                    }
                 }
 
                 match dead_letter.write_records(&dead_payloads) {
@@ -690,7 +746,18 @@ async fn commit_batch<S: Sink>(
 
             let estimated = estimated_write_bytes(payloads);
             if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
-                return BatchResult::Blocked;
+                if estimated > config.dead_letter_max_bytes {
+                    // Batch alone exceeds the cap — blocking could never clear, so
+                    // write it anyway rather than livelock the drain (F03). The cap
+                    // bounds steady-state growth, not one oversized permanent batch.
+                    warn!(
+                        estimated,
+                        cap = config.dead_letter_max_bytes,
+                        "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
+                    );
+                } else {
+                    return BatchResult::Blocked;
+                }
             }
 
             match dead_letter.write_records(payloads) {
