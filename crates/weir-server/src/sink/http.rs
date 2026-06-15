@@ -78,7 +78,9 @@ pub struct HttpSinkConfig {
 impl std::fmt::Debug for HttpSinkConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpSinkConfig")
-            .field("url", &self.url)
+            // The URL may carry userinfo (user:password@host); redact the password
+            // so it never lands in a Debug-formatted log line (S25).
+            .field("url", &crate::sink::redact_url_password(&self.url))
             .field("timeout", &self.timeout)
             .field("max_batch_size", &self.max_batch_size)
             .field(
@@ -216,7 +218,11 @@ impl HttpSink {
         let body_excerpt = match resp.bytes().await {
             Ok(bytes) => {
                 let cut = bytes.len().min(256);
-                String::from_utf8_lossy(&bytes[..cut]).into_owned()
+                // Strip control characters: the body is downstream-controlled and
+                // is interpolated into log lines and the dead-letter reason, so a
+                // hostile endpoint could otherwise inject forged log records or
+                // terminal escape sequences (S29).
+                crate::sink::sanitize_log_excerpt(&String::from_utf8_lossy(&bytes[..cut]))
             }
             Err(_) => String::from("<body read failed>"),
         };

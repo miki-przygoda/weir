@@ -63,3 +63,63 @@ pub(crate) fn redact_url_password(url: &str) -> String {
     let tail = &rest[at..];
     format!("{}://{}:<redacted>{}", &url[..scheme_end], user, tail)
 }
+
+/// Replaces ASCII/Unicode control characters with `.` for safe logging.
+///
+/// Downstream sink response bodies are interpolated into log lines and
+/// dead-letter reason strings. Without this, a hostile or compromised endpoint
+/// could embed newlines (forging extra log records) or terminal escape sequences
+/// in its body and have the daemon emit them verbatim (S29).
+pub(crate) fn sanitize_log_excerpt(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_url_password_covers_adversarial_inputs() {
+        // No userinfo → unchanged.
+        assert_eq!(
+            redact_url_password("https://host/path"),
+            "https://host/path"
+        );
+        // Simple user:pass.
+        assert_eq!(
+            redact_url_password("https://u:p@host/path"),
+            "https://u:<redacted>@host/path"
+        );
+        // Password containing '@' must split at the LAST '@', not leak the tail.
+        assert_eq!(
+            redact_url_password("https://u:p@ss@host/db"),
+            "https://u:<redacted>@host/db"
+        );
+        // A '@' in the path must not be mistaken for the userinfo separator.
+        assert_eq!(
+            redact_url_password("https://host/p@th"),
+            "https://host/p@th"
+        );
+        // Username only (no password) → unchanged (nothing to redact).
+        assert_eq!(
+            redact_url_password("https://user@host/x"),
+            "https://user@host/x"
+        );
+        // The literal password must never survive in the output.
+        let red = redact_url_password("postgres://admin:sup3rS3cret@db:5432/app");
+        assert!(!red.contains("sup3rS3cret"), "password leaked: {red}");
+        assert!(red.contains("<redacted>"));
+    }
+
+    #[test]
+    fn sanitize_log_excerpt_strips_control_chars() {
+        assert_eq!(
+            sanitize_log_excerpt("ok\n2026 INFO forged log line\r\x1b[31m"),
+            "ok.2026 INFO forged log line..[31m"
+        );
+        // Normal text and non-control Unicode pass through untouched.
+        assert_eq!(sanitize_log_excerpt("plain café"), "plain café");
+    }
+}

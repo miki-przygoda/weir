@@ -330,7 +330,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|t| !t.is_empty())
                 .map(Arc::from);
             info!(
-                url = %url,
+                // The URL may carry userinfo (user:password@host); redact the
+                // password so it never reaches a log line (S25).
+                url = %crate::sink::redact_url_password(&url),
                 bearer = bearer_token.is_some(),
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,

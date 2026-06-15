@@ -16,8 +16,10 @@ use weir_core::Durability;
 
 /// Default daemon Unix socket. Override with `--socket`.
 const DEFAULT_SOCKET: &str = "/run/weir/weir.sock";
-/// Default `/metrics` endpoint. Override with `--addr`.
-const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9090";
+/// Default `/metrics` endpoint. Override with `--addr`. Matches the daemon's
+/// metrics default (config `metrics_port` = 9185); a mismatch would make
+/// `weir-ctl metrics` fail out-of-the-box against a default daemon (S27).
+const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9185";
 
 #[derive(Parser)]
 #[command(

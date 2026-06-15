@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File},
+    fs,
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -141,7 +141,21 @@ pub(crate) fn recover_segment(
     wab_dir: &Path,
     metrics: &Arc<Metrics>,
 ) -> io::Result<PathBuf> {
-    let file = File::open(path)?;
+    // O_NOFOLLOW on the read pass too, matching the write pass below: a segment
+    // path that is a symlink (swapped in by an attacker with write access to the
+    // WAB dir) must fail the open rather than be followed to an attacker-chosen
+    // target. The threat model claims segment opens don't follow symlinks; this
+    // makes the read side honour that (S26).
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
 
     // ── Validate header ──────────────────────────────────────────────────────
