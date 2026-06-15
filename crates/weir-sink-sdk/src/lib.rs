@@ -57,8 +57,9 @@
 #![allow(async_fn_in_trait)]
 #![deny(missing_docs)]
 
-/// Opaque record payload bytes — a ref-counted `bytes::Bytes` (re-exported from
-/// `weir-core`) so clones through the drain are O(1).
+/// Opaque record payload bytes (re-exported from `weir-core`). A newtype over
+/// ref-counted `bytes::Bytes` that derefs to `[u8]`, so clones through the drain
+/// are O(1).
 pub use weir_core::Payload;
 
 /// A record type carried through the drain pipeline.
@@ -146,8 +147,11 @@ pub trait Sink: Send + Sync + 'static {
         1000
     }
 
-    /// Periodic health probe — called after every commit attempt and on a
-    /// wall-clock interval so the daemon's `weir_sink_health` gauge keeps moving
-    /// even when no segments are flowing. Keep it cheap (a single ping / HEAD).
+    /// Health probe feeding the daemon's `weir_sink_health` gauge. The drain
+    /// calls it after a segment is processed in the Draining state, and on a
+    /// wall-clock interval while idle or blocked on a full dead-letter dir — so
+    /// the gauge keeps moving even when no segments are flowing. It is NOT called
+    /// after every individual commit (retries don't re-probe). Keep it cheap (a
+    /// single ping / HEAD) — it runs under a timeout backstop on the drain thread.
     async fn health(&self) -> SinkHealth;
 }

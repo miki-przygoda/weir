@@ -165,7 +165,13 @@ impl Worker {
                 #[cfg(feature = "bench-trace")]
                 flushed_at: std::time::Instant::now(),
             })
-            .ok(); // receiver gone means WAB is shutting down; discard silently
+            // A SendError means this shard's flusher receiver is gone: either the
+            // WAB is shutting down, OR the flusher panic-capped-out and the shard
+            // is permanently offline (see worker_exits_cleanly_after_disconnect /
+            // the G-QUEUE-1 test). Either way the batch's records are dropped here;
+            // their ack_tx senders drop with them, so producers see a closed ack
+            // channel and Nack (no false ack). Discarding the send is correct.
+            .ok();
     }
 
     fn flush_all(&mut self) {

@@ -521,9 +521,17 @@ impl ShardWriter {
 #[cfg(target_os = "macos")]
 fn platform_fsync(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    // F_BARRIERFSYNC (85): flushes data to persistent storage with a write barrier,
-    // ensuring ordering without waiting for all pending media writes. Faster than
-    // F_FULLFSYNC while still providing the ordering guarantee the WAB requires.
+    // F_BARRIERFSYNC (85): issues a write barrier — data reaches the drive and is
+    // ordered before later writes — without forcing the drive's volatile cache to
+    // the medium. This is a DELIBERATE durability/throughput tradeoff (F19): unlike
+    // F_FULLFSYNC, a barrier does NOT guarantee survival of a sudden power loss on a
+    // drive with a non-volatile-safe write cache (most consumer SSDs). It matches
+    // what fdatasync provides on Linux for typical configurations and is the
+    // platform-recommended fast path; operators who need power-loss durability on
+    // such hardware should ensure the drive honours cache-flush/barriers (or front
+    // the WAB with a battery/capacitor-backed cache). The crown invariant
+    // (acked-true ⇒ on stable storage) holds under an OS crash; the residual is the
+    // hardware-cache-on-power-loss case.
     let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
     if ret == -1 {
         return Err(io::Error::last_os_error());

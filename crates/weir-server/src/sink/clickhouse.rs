@@ -17,6 +17,14 @@
 //! with `non_replicated_deduplication_window` set) deduplicates the re-inserted
 //! block. ClickHouse has no `ON CONFLICT`; dedup is the token + the engine's
 //! choice — weir stays un-opinionated about the table model.
+//!
+//! # Target column type (F36)
+//!
+//! The RowBinary body is `leb128(len) ++ bytes` per record — the wire form for a
+//! single ClickHouse **`String`** column. The configured `column` MUST be a
+//! `String` (not `FixedString`/`LowCardinality`/`Nullable`/numeric), or the
+//! insert is rejected. weir does not validate the remote column type; this is the
+//! operator's responsibility.
 
 use std::time::Duration;
 
@@ -69,6 +77,14 @@ fn encode_rowbinary(batch: &[Payload]) -> Vec<u8> {
 /// would make `["ab", "c"]` and `["a", "bc"]` hash identically — ClickHouse
 /// would then drop the second, genuinely-distinct block as a duplicate, losing
 /// data. The 8-byte little-endian length restores a prefix-free framing.
+///
+/// Caveat (F35): the token covers exactly the sub-batch handed to `commit()`,
+/// which the drain sizes by `sink_max_batch_size`. If that config changes across
+/// a restart, a replayed segment re-splits into differently-sized sub-batches
+/// whose tokens differ from the originals, so ClickHouse's
+/// `insert_deduplication_token` won't recognise them as duplicates — at-least-once
+/// can then double-insert. Keep `sink_max_batch_size` stable for the dedup
+/// guarantee to hold across restarts.
 fn dedup_token(batch: &[Payload]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
