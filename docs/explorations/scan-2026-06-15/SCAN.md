@@ -9,6 +9,28 @@
 - **Several findings are regressions in THIS session's unswept code** (F05 drain follow-ups, the F43 client read-timeout) — caught before lockdown, as intended.
 - The rest are low/info: docs drift, observability accounting, weir-ctl polish, a few additive-API ideas for the freeze review.
 
+## Status — all dispositioned (2026-06-15)
+
+**17 fixed** (one commit each, gated, fail-first/regression tests where feasible):
+
+| Findings | Commit | Area |
+|----------|--------|------|
+| G01 | `9a020e4` | sink: never follow redirects (false-ack) |
+| G02 | `cfa18bf` | wab: never seal at an unestablished counter (F12 re-trigger) |
+| G10 G11 G12 G13 | `c3b035f` | drain: F05 follow-ups (backoff, assert order, diagram, prefix note) |
+| G03 G04 G16 G17 | `d1a9dde` | client: poison-on-read-failure + TLS polish |
+| G05 G06 | `ba48c54` | weir-ctl: dl drop partial-failure + segments filter |
+| G14 G15 | `4203582` | metrics: accept-loop survives errors; no reserved-dir double-count |
+| G07 G08 G20 | `c52ba56` | config dead-code gate, DecodeError doc, cert-parse gating |
+
+**3 deferred to the Group 1/2 freeze review** (additive public-API on frozen crates — decided WITH the wire/API freeze, not unilaterally):
+
+- **G09** — Payload's `PartialEq`-against-bytes impls are one-directional (`payload == slice` compiles, `slice == payload` doesn't). Adding the reverse impls is additive API on `weir-core` → fold into the Group 2 (Public Rust API) freeze decision.
+- **G18** — `Envelope::decode` silently ignores trailing bytes past `frame_len`. Documenting/testing the current behaviour is safe, but whether to *reject* trailing data is a wire-contract decision → Group 1 (Wire-protocol) freeze.
+- **G19** — the wire `TryFrom` error structs (`UnknownMessageType`/`UnknownDurability`/`UnknownNackReason`) aren't re-exported at the crate root. Re-exporting is additive API on `weir-core` → Group 2 freeze.
+
+**1 refuted** (see bottom).
+
 ## 🟠 High (2)
 
 ### G01 — Sink HTTP/ClickHouse clients follow redirects by default; a redirected POST ending in 2xx is acked as committed though the body was never delivered (false ack)
