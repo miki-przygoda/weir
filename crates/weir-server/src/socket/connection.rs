@@ -40,10 +40,13 @@ pub struct ConnectionConfig {
     /// Cap applied before allocation: `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
     /// The field already holds the effective minimum so no further clamping is needed here.
     pub max_payload_bytes: usize,
-    /// Maximum time the handler will sit in `read_exact` waiting for the next
-    /// byte. Caps slowloris-style attacks where a connected client never sends
-    /// (or sends only a partial frame) and would otherwise hold a semaphore
-    /// permit indefinitely.
+    /// Deadline applied to each `read_exact` phase of a frame — the 16-byte
+    /// header, the payload, and the 4-byte CRC are each bounded by this value.
+    /// It is a whole-phase deadline, not a strict per-byte idle timer: a client
+    /// that never sends (slowloris) and a client streaming a large payload
+    /// pathologically slowly (e.g. <~`payload_len`/`read_timeout` B/s) are both
+    /// cut off, so a connection can't hold a semaphore permit indefinitely. The
+    /// `weir_connection_idle_timeout` counter is bumped in either case.
     pub read_timeout: Duration,
     /// Maximum time the handler will wait on the WAB ack oneshot. See
     /// [`ACK_TIMEOUT`] for the production default and rationale; tests
@@ -191,8 +194,18 @@ where
 
         // ── 4. Read payload ──────────────────────────────────────────────────
         // Accumulate into Vec<u8> then freeze to Bytes (O(1) ownership transfer).
+        // Raced against shutdown like the header read: a client stalled mid-frame
+        // at shutdown must not hold its semaphore permit until read_timeout and
+        // eat the drain window. No ack/nack has been sent for this frame, so the
+        // client sees the dropped connection as a failed push and retries — no
+        // false ack, no data loss (F26).
         let mut payload_buf = vec![0u8; payload_len];
-        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload_buf)).await {
+        let payload_read = tokio::select! {
+            biased;
+            res = tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload_buf)) => res,
+            _ = shutdown_rx.changed() => return Ok(()),
+        };
+        match payload_read {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -200,7 +213,7 @@ where
                 debug!(
                     payload_len,
                     timeout_secs = config.read_timeout.as_secs(),
-                    "connection idle past read_timeout during payload read; dropping"
+                    "connection exceeded read_timeout during payload read; dropping"
                 );
                 return Ok(());
             }
@@ -210,14 +223,19 @@ where
 
         // ── 5. Read and validate payload CRC ────────────────────────────────
         let mut crc_buf = [0u8; 4];
-        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut crc_buf)).await {
+        let crc_read = tokio::select! {
+            biased;
+            res = tokio::time::timeout(config.read_timeout, stream.read_exact(&mut crc_buf)) => res,
+            _ = shutdown_rx.changed() => return Ok(()),
+        };
+        match crc_read {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 metrics.connection_idle_timeout.inc();
                 debug!(
                     timeout_secs = config.read_timeout.as_secs(),
-                    "connection idle past read_timeout during CRC read; dropping"
+                    "connection exceeded read_timeout during CRC read; dropping"
                 );
                 return Ok(());
             }
@@ -964,5 +982,83 @@ mod tests {
             1,
             "connection_idle_timeout counter must increment on payload-read timeout"
         );
+    }
+
+    /// F26: a client stalled mid-payload at shutdown must be released promptly
+    /// via the shutdown race, not held until read_timeout. read_timeout is set
+    /// to 30 s so the test would hang for that long if the payload read ignored
+    /// the shutdown signal.
+    #[tokio::test]
+    async fn shutdown_releases_connection_stalled_mid_payload() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_secs(30),
+            shard_id: 0,
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Header advertising a 1 KiB payload, then send nothing → stall mid-frame.
+        let header = Header::new(MessageType::Push, Durability::Sync, 0, 1024).encode();
+        let handle = tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            shutdown_rx,
+        ));
+        client.write_all(&header).await.unwrap();
+        // Let the handler consume the header and block on the payload read.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler not released promptly on shutdown mid-payload")
+            .expect("handler task panicked")
+            .expect("handler returned Err");
+    }
+
+    /// F26: same as above but stalled mid-CRC (header + full payload received,
+    /// CRC withheld). Guards the second of the two reads the fix touched.
+    #[tokio::test]
+    async fn shutdown_releases_connection_stalled_mid_crc() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_secs(30),
+            shard_id: 0,
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Header + the 5-byte payload, but withhold the 4-byte CRC → stall on CRC.
+        let header = Header::new(MessageType::Push, Durability::Sync, 0, 5).encode();
+        let handle = tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            shutdown_rx,
+        ));
+        client.write_all(&header).await.unwrap();
+        client.write_all(b"hello").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler not released promptly on shutdown mid-CRC")
+            .expect("handler task panicked")
+            .expect("handler returned Err");
     }
 }

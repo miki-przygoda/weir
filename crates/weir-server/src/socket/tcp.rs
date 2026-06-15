@@ -170,18 +170,25 @@ pub async fn run(
                         let n = conn_counter.fetch_add(1, Ordering::Relaxed);
                         cfg.shard_id = (n % shard_count) as u32;
                         let m = Arc::clone(&metrics);
-                        let handler_shutdown = handler_shutdown_rx.clone();
+                        let mut handler_shutdown = handler_shutdown_rx.clone();
 
                         join_set.spawn(async move {
                             let _permit = permit;
 
-                            // ── TLS handshake under a timeout ────────────────
-                            let tls_stream = match time::timeout(
-                                handshake_timeout,
-                                acceptor.accept(stream),
-                            )
-                            .await
-                            {
+                            // ── TLS handshake under a timeout, raced against
+                            // shutdown ───────────────────────────────────────
+                            // A client that completes the TCP accept then stalls
+                            // mid-TLS-handshake at shutdown must not hold its
+                            // permit + JoinSet slot until handshake_timeout,
+                            // eating the drain window and forcing abort_all (F29).
+                            // No application data has been exchanged yet, so
+                            // dropping on shutdown is clean.
+                            let handshake = tokio::select! {
+                                biased;
+                                res = time::timeout(handshake_timeout, acceptor.accept(stream)) => res,
+                                _ = handler_shutdown.changed() => return,
+                            };
+                            let tls_stream = match handshake {
                                 Ok(Ok(s)) => s,
                                 Ok(Err(e)) => {
                                     let reason = classify_handshake_error(&e);

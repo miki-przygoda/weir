@@ -328,8 +328,9 @@ impl Metrics {
         let connection_idle_timeout = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_connection_idle_timeout",
-            "Connections dropped because the handler sat in read_exact longer than \
-             connection_read_timeout_secs without receiving the next byte"
+            "Connections dropped because a frame read phase (header, payload, or CRC) \
+             exceeded connection_read_timeout_secs — whether the client was idle or \
+             merely streaming pathologically slowly"
         );
         let connection_rejected_peer_uid = reg!(
             Counter::<u64, AtomicU64>::default(),

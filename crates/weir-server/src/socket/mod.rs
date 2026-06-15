@@ -250,8 +250,39 @@ pub async fn run(
         }
     }
 
+    // Remove the socket file. On Unix use the same hardened dirfd + fstatat
+    // (S_IFSOCK) + unlinkat sequence as startup cleanup so a by-name remove
+    // can't be redirected by an attacker who swapped a different inode in at
+    // the path under a group/world-writable parent — the exact TOCTOU pattern
+    // the bind path was hardened against (F28). Best-effort: the daemon is
+    // exiting, so a failure is logged, not fatal.
+    #[cfg(unix)]
+    remove_socket_hardened(&config.socket_path);
+    #[cfg(not(unix))]
     let _ = std::fs::remove_file(&config.socket_path);
     Ok(())
+}
+
+/// Hardened shutdown-time removal of the socket file: open the parent dir,
+/// confirm the entry is still a socket (not a swapped-in symlink/file), and
+/// `unlinkat` it. Mirrors `cleanup_existing_socket` so removal never acts on an
+/// attacker-controlled name (F28). A missing file is success; a non-socket
+/// entry is refused (and logged).
+#[cfg(unix)]
+fn remove_socket_hardened(path: &Path) {
+    let result = (|| -> io::Result<()> {
+        let (parent, basename) = split_parent_basename(path)?;
+        let dirfd = open_parent_dirfd(parent)?;
+        let _dirfd_guard = OwnedDirFd(dirfd);
+        cleanup_existing_socket(dirfd, basename, path)
+    })();
+    if let Err(e) = result {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "socket manager: could not remove socket file at shutdown"
+        );
+    }
 }
 
 async fn drain_join_set(join_set: &mut JoinSet<()>) {
@@ -369,10 +400,16 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
     // other file-creation path in weir specifies its mode bits explicitly
     // (WAB segments 0o600, dirs 0o700), so the temporary tightening is
     // invisible to those paths. A tighter umask is also a safer default.
-    let saved_umask = umask_set(0o177);
-    let bind_result = UnixListener::bind(path);
-    let _ = umask_set(saved_umask);
-    let listener = bind_result?;
+    //
+    // The restore is RAII-guarded so an unwind (or the `?` below) between
+    // tightening and restoring cannot leak umask 0o177 process-wide, silently
+    // tightening every later file/dir creation (F30). The guard is scoped to
+    // this block so the umask is restored the instant bind returns — the
+    // fstatat checks that follow create nothing.
+    let listener = {
+        let _umask_guard = UmaskGuard(umask_set(0o177));
+        UnixListener::bind(path)?
+    };
 
     // Snapshot the inode bind created. The window between bind(2) and this
     // fstatat is the only un-closeable race window (Linux has no `bind_at`
@@ -606,6 +643,19 @@ impl Drop for OwnedDirFd {
     }
 }
 
+/// RAII guard that restores the process umask on drop. Wraps the saved umask
+/// (the value returned by the tightening `umask_set`), so an unwind between
+/// tightening and restoring can't leak the tightened value process-wide (F30).
+#[cfg(unix)]
+struct UmaskGuard(libc::mode_t);
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        let _ = umask_set(self.0);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -799,6 +849,73 @@ mod tests {
             after_bind, 0o022,
             "bind_hardened must restore process umask to its pre-call value, got {after_bind:#o}"
         );
+    }
+
+    /// F30: the RAII guard restores the saved umask on drop, including the
+    /// unwind/early-return path that a bare save/restore statement would miss.
+    #[test]
+    #[cfg(unix)]
+    fn umask_guard_restores_on_drop() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Baseline 0o022.
+        unsafe {
+            libc::umask(0o022);
+        }
+        {
+            // Tighten to 0o177; the guard captures the returned 0o022.
+            let _guard = UmaskGuard(umask_set(0o177));
+            // Read the live umask without disturbing it (set to its own value).
+            let live = unsafe { libc::umask(0o177) };
+            assert_eq!(
+                live, 0o177,
+                "umask must be tightened while the guard is alive"
+            );
+        }
+        // Guard dropped → 0o022 restored. Read it back (and re-set to 0o022).
+        let after = unsafe { libc::umask(0o022) };
+        assert_eq!(
+            after, 0o022,
+            "UmaskGuard must restore the saved umask on drop, got {after:#o}"
+        );
+    }
+
+    /// F28: hardened shutdown removal unlinks a real socket via the dirfd path.
+    #[test]
+    #[cfg(unix)]
+    fn remove_socket_hardened_unlinks_a_socket() {
+        let path = tmp_socket_path("rm_sock");
+        std::fs::remove_file(&path).ok();
+        let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(path.exists());
+        remove_socket_hardened(&path);
+        assert!(!path.exists(), "hardened removal must unlink the socket");
+    }
+
+    /// F28: hardened removal refuses to unlink a non-socket entry (an attacker
+    /// swap), the same guard the startup cleanup applies.
+    #[test]
+    #[cfg(unix)]
+    fn remove_socket_hardened_refuses_non_socket() {
+        let path = tmp_socket_path("rm_nonsock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        remove_socket_hardened(&path); // logs, must not remove
+        assert!(
+            path.exists(),
+            "hardened removal must refuse a non-socket entry"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F28: a missing socket file is a no-op (clean shutdown after the file was
+    /// already removed out-of-band).
+    #[test]
+    #[cfg(unix)]
+    fn remove_socket_hardened_missing_is_noop() {
+        let path = tmp_socket_path("rm_missing");
+        std::fs::remove_file(&path).ok();
+        assert!(!path.exists());
+        remove_socket_hardened(&path); // must not panic
+        assert!(!path.exists());
     }
 
     #[test]
