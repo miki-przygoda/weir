@@ -303,14 +303,18 @@ pub struct Config {
     pub shutdown_timeout_secs: u64,
     pub connection_read_timeout_secs: u64,
     pub sink_type: SinkType,
-    // These four fields are only read by the non-noop sink arms in main.rs.
-    // When no non-noop sink feature is enabled they are dead code; suppress
-    // the lint so `cargo clippy -- -D warnings` stays clean on noop-only builds.
+    // These fields are read by the non-noop sink arms in main.rs (http / mysql /
+    // postgres / clickhouse — see require_sink_url's four-feature gate). When NONE
+    // of those features is enabled they are dead code; the allow keeps
+    // `cargo clippy -- -D warnings` clean on a noop-only / no-default-features
+    // build. The gate must match require_sink_url's feature set (incl.
+    // clickhouse-sink), else a clickhouse-only build would wrongly suppress (G07).
     #[cfg_attr(
         not(any(
             feature = "http-sink",
             feature = "mysql-sink",
-            feature = "postgres-sink"
+            feature = "postgres-sink",
+            feature = "clickhouse-sink"
         )),
         allow(dead_code)
     )]
@@ -319,7 +323,8 @@ pub struct Config {
         not(any(
             feature = "http-sink",
             feature = "mysql-sink",
-            feature = "postgres-sink"
+            feature = "postgres-sink",
+            feature = "clickhouse-sink"
         )),
         allow(dead_code)
     )]
@@ -328,7 +333,8 @@ pub struct Config {
         not(any(
             feature = "http-sink",
             feature = "mysql-sink",
-            feature = "postgres-sink"
+            feature = "postgres-sink",
+            feature = "clickhouse-sink"
         )),
         allow(dead_code)
     )]

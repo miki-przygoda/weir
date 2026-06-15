@@ -222,8 +222,15 @@ pub async fn run(
                             // Subject CN is NOT a security control (the mTLS
                             // verifier already proved a CA-signed client cert);
                             // it's purely diagnostic. See client_cert_cn.
-                            let cn = client_cert_cn(&tls_stream);
-                            debug!(%peer_addr, client_cn = ?cn, "TLS handshake ok");
+                            //
+                            // Gate the parse behind the active level: client_cert_cn
+                            // parses + allocates from the full X.509 cert on every
+                            // successful handshake, and it's only ever used in this
+                            // debug! field — wasted work when DEBUG is off (G20).
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                let cn = client_cert_cn(&tls_stream);
+                                debug!(%peer_addr, client_cn = ?cn, "TLS handshake ok");
+                            }
 
                             if let Err(e) =
                                 handle_connection(tls_stream, tx, cfg, m, handler_shutdown).await

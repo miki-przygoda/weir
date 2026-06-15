@@ -5,10 +5,13 @@ use std::fmt;
 
 /// All errors that can occur when decoding a weir wire frame.
 ///
-/// Variants are ordered by the decode sequence: magic → version → header CRC → payload fields.
-/// This ordering is meaningful: the server uses the specific variant to determine which Nack
-/// reason byte to send. `VersionMismatch` is distinct from `BadMagic` and `HeaderCrcMismatch`
-/// so the server can send the daemon's WIRE_VERSION in the Nack payload.
+/// Each variant identifies a specific frame-validation failure, and the daemon
+/// maps it to a distinct Nack reason byte: `VersionMismatch` is kept separate from
+/// `BadMagic` and `HeaderCrcMismatch` so the daemon can return its `WIRE_VERSION`
+/// in the Nack payload. The variants are NOT declared in strict decode order — the
+/// decoder validates magic → version → header CRC → message_type / durability →
+/// payload fields (so e.g. `UnknownMessageType` only arises on an
+/// already-CRC-valid header). Match on the variant, never on its position.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// First four bytes are not `b"WEIR"`. Not a weir frame or stream is desynced.
