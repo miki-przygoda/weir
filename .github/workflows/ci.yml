@@ -16,7 +16,22 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      # Lint the feature matrix: default, all-features (clickhouse + tls), and
+      # no-default-features (noop-only). Feature-gating regressions and lints in
+      # otherwise-uncompiled code (clickhouse/tls) now fail CI (S08).
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  advisories:
+    name: advisories (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
 
   test:
     runs-on: ubuntu-latest
@@ -27,6 +42,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
+      # Build + run the clickhouse-sink and tls test code, which the default
+      # feature set never compiles (S08). --all-features pulls in both.
+      - run: cargo test --all-features
 
   dst:
     name: dst (sim sweep)

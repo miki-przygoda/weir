@@ -69,7 +69,9 @@ pub(crate) fn redact_url_password(url: &str) -> String {
 /// Downstream sink response bodies are interpolated into log lines and
 /// dead-letter reason strings. Without this, a hostile or compromised endpoint
 /// could embed newlines (forging extra log records) or terminal escape sequences
-/// in its body and have the daemon emit them verbatim (S29).
+/// in its body and have the daemon emit them verbatim (S29). Only the HTTP and
+/// ClickHouse sinks read a response body, so it is compiled only for those.
+#[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
 pub(crate) fn sanitize_log_excerpt(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '.' } else { c })
@@ -113,6 +115,7 @@ mod tests {
         assert!(red.contains("<redacted>"));
     }
 
+    #[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
     #[test]
     fn sanitize_log_excerpt_strips_control_chars() {
         assert_eq!(

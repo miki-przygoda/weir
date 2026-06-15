@@ -376,8 +376,11 @@ impl Sink for ClickHouseSink {
             ))
         } else {
             // Other 4xx → permanent (bad query, auth, unknown table/column). Dead-letter.
+            // Strip control chars: the body is downstream-controlled and is logged
+            // / stored in the dead-letter reason (S29).
             let detail = resp.text().await.unwrap_or_default();
-            let detail: String = detail.chars().take(500).collect();
+            let detail: String =
+                crate::sink::sanitize_log_excerpt(&detail.chars().take(500).collect::<String>());
             Err(sql_common::SqlSinkError::permanent(
                 "clickhouse",
                 format!("http {status}: {detail}"),
