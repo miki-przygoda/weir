@@ -277,6 +277,15 @@ fn drain_thread<S: Sink>(
     let mut state = DrainState::Draining;
     let mut pending: VecDeque<PathBuf> = VecDeque::new();
 
+    // The start of the current dead-letter-full blocking episode, if any. An
+    // episode spans a flapping cap (unblock → reblock the same segment without
+    // intervening progress): `enter_blocked` increments `dead_letter_full` and
+    // stamps `blocked_since` only when this is `None`, and reuses the stored
+    // instant otherwise, so a flap counts as ONE episode and the blocked-duration
+    // gauge keeps climbing rather than resetting. Cleared (and the gauge reset)
+    // when a segment is actually confirmed or quarantined — genuine progress (F09).
+    let mut block_episode: Option<Instant> = None;
+
     'outer: loop {
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
@@ -313,7 +322,7 @@ fn drain_thread<S: Sink>(
                 let health = probe_health(&rt, &*sink, config.commit_timeout);
                 set_sink_health(&metrics, health);
 
-                transition_from_draining(segment, result, &config, &metrics)
+                transition_from_draining(segment, result, &config, &metrics, &mut block_episode)
             }
 
             // ── RetryingTransient ─────────────────────────────────────────────
@@ -342,13 +351,17 @@ fn drain_thread<S: Sink>(
                     // Subsequent failure: spend one retry and double the delay
                     // (exponential backoff). retries_left is >= 1 here — the
                     // == 0 case returned above.
-                    next_state_after_process(segment, result, &metrics, |segment, retry_after| {
-                        DrainState::RetryingTransient {
+                    next_state_after_process(
+                        segment,
+                        result,
+                        &metrics,
+                        &mut block_episode,
+                        |segment, retry_after| DrainState::RetryingTransient {
                             segment,
                             retries_left: retries_left - 1,
                             next_delay: next_retry_delay(next_delay * 2, retry_after),
-                        }
-                    })
+                        },
+                    )
                 }
             }
 
@@ -402,8 +415,12 @@ fn drain_thread<S: Sink>(
                 let health = probe_health(&rt, &*sink, config.commit_timeout);
                 set_sink_health(&metrics, health);
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
-                    // Headroom available — retry the preserved segment from the beginning.
-                    metrics.dead_letter_blocked_duration.set(0.0);
+                    // Headroom available — retry the preserved segment from the
+                    // beginning. Do NOT clear the episode or reset the duration
+                    // gauge here: if the retry immediately re-blocks (a flapping
+                    // cap), it's the same episode and the duration must keep
+                    // climbing. The gauge resets only when a segment is actually
+                    // confirmed/quarantined — see next_state_after_process (F09).
                     pending.push_front(segment);
                     DrainState::Draining
                 } else if channel_closed {
@@ -439,17 +456,22 @@ fn next_state_after_process(
     segment: PathBuf,
     result: ProcessResult,
     metrics: &Metrics,
+    block_episode: &mut Option<Instant>,
     on_transient: impl FnOnce(PathBuf, Option<Duration>) -> DrainState,
 ) -> DrainState {
     match result {
         ProcessResult::Confirmed { record_count } => {
             confirm_and_delete(&segment, record_count, metrics);
+            end_block_episode(block_episode, metrics);
             DrainState::Draining
         }
         ProcessResult::Transient { retry_after } => on_transient(segment, retry_after),
-        ProcessResult::BlockedDeadLetter => enter_blocked(segment, metrics),
+        ProcessResult::BlockedDeadLetter => enter_blocked(segment, metrics, block_episode),
         // Segment was quarantined inside process_segment — move on.
-        ProcessResult::Quarantined => DrainState::Draining,
+        ProcessResult::Quarantined => {
+            end_block_episode(block_episode, metrics);
+            DrainState::Draining
+        }
     }
 }
 
@@ -458,15 +480,30 @@ fn transition_from_draining(
     result: ProcessResult,
     config: &DrainConfig,
     metrics: &Metrics,
+    block_episode: &mut Option<Instant>,
 ) -> DrainState {
     // First failure for this segment: a fresh retry budget and the base delay.
-    next_state_after_process(segment, result, metrics, |segment, retry_after| {
-        DrainState::RetryingTransient {
+    next_state_after_process(
+        segment,
+        result,
+        metrics,
+        block_episode,
+        |segment, retry_after| DrainState::RetryingTransient {
             segment,
             retries_left: config.max_retries,
             next_delay: next_retry_delay(config.base_retry_delay, retry_after),
-        }
-    })
+        },
+    )
+}
+
+/// Ends the current dead-letter-full blocking episode (if one is open) because
+/// a segment was just confirmed or quarantined — genuine forward progress. The
+/// blocked-duration gauge is reset to zero only here, never on a transient
+/// unblock, so a flapping cap doesn't repeatedly zero it (F09).
+fn end_block_episode(block_episode: &mut Option<Instant>, metrics: &Metrics) {
+    if block_episode.take().is_some() {
+        metrics.dead_letter_blocked_duration.set(0.0);
+    }
 }
 
 /// How often the drain polls `Sink::health()` while idle (waiting on the
@@ -486,9 +523,25 @@ fn next_retry_delay(default: Duration, hint: Option<Duration>) -> Duration {
     chosen.min(MAX_RETRY_DELAY)
 }
 
-fn enter_blocked(segment: PathBuf, metrics: &Metrics) -> DrainState {
-    let blocked_since = Instant::now();
-    metrics.dead_letter_full.inc();
+fn enter_blocked(
+    segment: PathBuf,
+    metrics: &Metrics,
+    block_episode: &mut Option<Instant>,
+) -> DrainState {
+    // Increment the counter and stamp the episode start only on a genuine new
+    // episode. If `block_episode` is already set we re-entered blocked after a
+    // transient unblock of the same pressure (a flapping cap) — reuse the stored
+    // instant so `dead_letter_full` counts distinct episodes and the duration
+    // gauge keeps climbing rather than resetting (F09).
+    let blocked_since = match *block_episode {
+        Some(started) => started,
+        None => {
+            let now = Instant::now();
+            metrics.dead_letter_full.inc();
+            *block_episode = Some(now);
+            now
+        }
+    };
     set_drain_state(metrics, DrainStateValue::blocked_dead_letter_full);
     DrainState::BlockedDeadLetterFull {
         segment,
@@ -1862,6 +1915,43 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// F09: a flapping cap (unblock → reblock the same pressure without
+    /// intervening progress) must count as ONE episode — `dead_letter_full`
+    /// increments once and `blocked_since` is preserved — while a genuine
+    /// confirm ends the episode and resets the duration gauge.
+    #[test]
+    fn block_episode_counts_once_across_flap_then_resets_on_progress() {
+        let (m, _reg) = Metrics::new();
+        let mut episode: Option<Instant> = None;
+        let seg = PathBuf::from("/tmp/weir-f09-seg");
+
+        // First genuine entry: counts and stamps the episode start.
+        let _ = enter_blocked(seg.clone(), &m, &mut episode);
+        assert_eq!(m.dead_letter_full.get(), 1);
+        let first_start = episode.expect("episode stamped on entry");
+
+        // Re-enter blocked after a transient unblock (no confirm in between):
+        // must NOT re-increment and must reuse the original start instant.
+        let _ = enter_blocked(seg.clone(), &m, &mut episode);
+        assert_eq!(m.dead_letter_full.get(), 1, "flap must not re-increment");
+        assert_eq!(
+            episode.expect("episode still open"),
+            first_start,
+            "blocked_since preserved across flap"
+        );
+
+        // Genuine progress (a segment confirmed): end the episode and reset the
+        // duration gauge to zero.
+        m.dead_letter_blocked_duration.set(5.0);
+        end_block_episode(&mut episode, &m);
+        assert!(episode.is_none(), "episode cleared on progress");
+        assert_eq!(m.dead_letter_blocked_duration.get(), 0.0);
+
+        // A brand-new episode after a real end counts again.
+        let _ = enter_blocked(seg, &m, &mut episode);
+        assert_eq!(m.dead_letter_full.get(), 2, "new episode after end counts");
     }
 
     #[test]
