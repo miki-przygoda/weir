@@ -155,7 +155,7 @@ of thumb is `max(2, cores - 2) / 2`.
 #### `worker_count`
 
 - **Type**: usize
-- **Default**: `shard_count` (same as the resolved `shard_count` value)
+- **Default**: `min(shard_count, 64)` — the resolved `shard_count`, capped at the field max
 - **Range**: 1–64
 - **CLI**: `--worker-count <n>`
 - **Env**: `WEIR_WORKER_COUNT`

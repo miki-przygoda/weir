@@ -394,7 +394,13 @@ impl Config {
         let shard_count = merge!(shard_count).unwrap_or(1);
         check_range("shard_count", shard_count, 1, 256)?;
 
-        let worker_count = merge!(worker_count).unwrap_or(shard_count);
+        // worker_count defaults to the shard count (one worker per shard is the
+        // throughput sweet spot), but capped at the field's own max of 64 — a
+        // valid shard_count of 65..=256 would otherwise produce a defaulted
+        // worker_count that fails the range check below with a misleading error,
+        // rejecting a config where the user only set shard_count (F53). An
+        // EXPLICIT worker_count > 64 is still (correctly) rejected.
+        let worker_count = merge!(worker_count).unwrap_or_else(|| shard_count.min(64));
         check_range("worker_count", worker_count, 1, 64)?;
 
         // Defaults from docs/benchmarks/batch-tuning.md: (256, 1ms) is the sweet
@@ -879,6 +885,46 @@ mod tests {
             c.worker_count, 4,
             "worker_count should default to shard_count (4) when not explicitly set"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F53: a valid shard_count of 65..=256 with worker_count unset must NOT be
+    /// rejected. The defaulted worker_count is capped at its own max (64) instead
+    /// of inheriting the larger shard_count and failing the range check.
+    #[test]
+    fn large_shard_count_with_defaulted_worker_count_is_accepted() {
+        let dir = tmp_dir("large_shard");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(128),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect("shard_count=128 with defaulted worker_count must be accepted");
+        assert_eq!(c.shard_count, 128);
+        assert_eq!(c.worker_count, 64, "defaulted worker_count caps at 64");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// An EXPLICIT worker_count above the max is still rejected.
+    #[test]
+    fn explicit_worker_count_over_max_is_rejected() {
+        let dir = tmp_dir("explicit_worker_over");
+        let err = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(128),
+                worker_count: Some(128),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("worker_count"), "{err}");
         fs::remove_dir_all(dir).ok();
     }
 

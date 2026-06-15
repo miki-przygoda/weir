@@ -14,7 +14,7 @@ OPTIONS:
     --wab-dir <path>                         WAB directory [env: WEIR_WAB_DIR]
     --shard-count <n>                        Number of WAB shards (1-256) [default: 1]
     --worker-count <n>                       Worker thread count (1-64)
-                                               [default: same as --shard-count]
+                                               [default: min(shard-count, 64)]
     --batch-size <n>                         Records per flush batch (1-100000) [default: 256]
     --batch-deadline-ms <n>                  Batch accumulation time ms (1-60000) [default: 1]
     --wab-segment-max-bytes <n>              WAB segment rotation threshold (4096-4294967296)
