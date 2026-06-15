@@ -387,3 +387,58 @@ Disposition: auto-fix everything **gated** (fmt + clippy + touched-crate tests; 
 - **Fix:** Reword the comment to match payload.rs and the F45 fix, e.g. '# The only dependency: weir-core, for the Payload newtype (a wrapper over bytes::Bytes; not a re-export — see the R1 newtype rationale).'
 - **Tests:** Docs-only; covered by the existing doctest in weir-sink-sdk/src/lib.rs that constructs Payload. No new test needed.
 - **Verified:** Confirmed: crates/weir-sink-sdk/Cargo.toml:15 still calls Payload "a re-exported `bytes::Bytes`", repeating the exact misstatement F45 fixed in lib.rs rustdoc (now correctly "A newtype over...`bytes::Bytes`") and contradicting payload.rs:7-17's newtype/semver-isolation rationale; comment-only, zero functional impact.
+
+---
+
+## Dispositions (applied 2026-06-16)
+
+**41 of 46 fixed**, each a gated commit on `v1/phase-5-sweep` tagged `[Sxx]`
+(grep the log). 5 flagged below for review. All fixes gated: fmt + clippy
+(default · all-features · no-default-features) + touched-crate tests; DST
+300-seed for the durability-adjacent ones (S01, S05).
+
+### Fixed
+
+- **Durability/correctness:** S01 (drain post-seal tail-truncation false-confirm
+  → quarantine), S05 (replay scans all shard dirs, no orphaned backlog), S23
+  (no orphan `.confirmed` sidecar), S24 (committed-metric double-count).
+- **Robustness:** S02 (response-write timeout), S14 (non-durable → Nack tests).
+- **Security:** S25 (HTTP URL redaction), S26 (recovery O_NOFOLLOW), S27
+  (weir-ctl port), S29 (log-injection sanitisation, HTTP + ClickHouse), S30/S31
+  (redaction tests), S42 (TLS config path validation).
+- **Public-readiness docs:** S04/S35/S36/S37/S38/S43/S44 (quickstart + install —
+  note: commit `5a05681` mis-tagged these as S17-S20/S41-S42; findings.json is
+  authoritative), S10/S11/S12/S13/S18/S19/S20/S21/S22 (truthing).
+- **Build/API:** S06 (postgres CVEs cleared), S07/S16 (deny.toml + cargo-deny
+  CI; rustls-pemfile advisory allow-listed), S08 (CI feature matrix), S17/S39
+  (MSRV), S40 (WeirClient Debug), S41 (#[must_use]), S45 (WeirError Eq), S46
+  (sink-sdk comment).
+- **Test coverage:** S03 (partition guard), S33 (recovery CRC truncation).
+
+### Flagged for review (not auto-fixed — moderate risk / judgment call)
+
+- **S09 (medium) — TCP+mTLS listener graceful drain.** The fire-and-forget
+  `tokio::spawn(tcp::run)` is cancelled by `drop(rt)` when the Unix loop returns,
+  so the TCP transport's graceful drain is cut short on shutdown. Fix is to bind
+  and await the JoinHandle, but it reshapes main.rs shutdown sequencing (behind
+  the `tls` feature) and the graceful-drain timing is hard to test
+  deterministically — left for a reviewed change.
+- **S15 (medium) — drain retry backoff not interruptible.** An interruptible
+  backoff was implemented and reverted: making the channel-disconnect cut the
+  wait conflates "input closed" with "shutdown" and breaks the `retry_after`
+  timing guarantee (the drain uses channel-disconnect as its only shutdown
+  signal). Needs a dedicated shutdown signal or a deliberate semantics decision —
+  not safe to change unattended.
+- **S28 (low) — sink response body has no size cap.** A hostile downstream can
+  return an unbounded body that's fully buffered before truncation. The proper
+  fix streams via `resp.chunk()` with a byte cap — a reqwest-handling rewrite on
+  the durability-critical sink path; deferred to a reviewed change. (Bounded in
+  practice by `sink_http_concurrency`.)
+- **S32 (low) — peer-uid fail-closed test.** Additive test only; the code is
+  correct, coverage deferred.
+- **S34 (low) — metrics accept-loop survival test.** Additive test only; the G14
+  fix is in place, coverage deferred.
+
+Plus **S16 code migration** (rustls-pemfile → rustls_pki_types::pem) deferred:
+the advisory is allow-listed in `deny.toml` with rationale; the migration is a
+post-1.0 TLS-loader change.
