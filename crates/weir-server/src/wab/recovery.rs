@@ -610,6 +610,117 @@ mod tests {
         fs::remove_dir_all(wab_dir).ok();
     }
 
+    /// Appends raw bytes to an active `.wab` segment after the WabSegment that
+    /// created it has been dropped (and so flushed). Used to splice in a crafted
+    /// trailing field (oversized length, sentinel) that the writer would never
+    /// emit, to exercise recovery's defensive decode branches.
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// F17 boundary: a record whose length field is exactly MAX_PAYLOAD_HARD_CAP
+    /// is a LEGAL record and must be recovered, not truncated. Guards the `>` in
+    /// the oversized-payload_len check against a `>=` off-by-one that would
+    /// silently drop the largest legal records on recovery.
+    #[test]
+    fn recovery_recovers_record_at_exactly_max_payload_cap() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("recover_max_payload");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(&vec![0xABu8; MAX_PAYLOAD_HARD_CAP])
+                .unwrap();
+        }
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "the max-size record must survive recovery"
+        );
+        assert_eq!(
+            recovered[0].len(),
+            MAX_PAYLOAD_HARD_CAP,
+            "recovered record must be exactly MAX_PAYLOAD_HARD_CAP bytes"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F17 just-over: a record whose length field is MAX_PAYLOAD_HARD_CAP + 1 is
+    /// treated as corruption; recovery truncates at the last valid record. We
+    /// splice only the 4-byte oversized length field (recovery rejects it before
+    /// reading any payload), so no giant buffer is needed.
+    #[test]
+    fn recovery_truncates_at_oversized_payload_len() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("recover_oversized");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"keep-me").unwrap();
+        }
+        // Splice an oversized length field where the next record would start.
+        let oversized = (MAX_PAYLOAD_HARD_CAP as u32 + 1).to_le_bytes();
+        append_raw(&path, &oversized);
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "recovery must truncate at the last valid record, keeping only it"
+        );
+        assert_eq!(recovered[0], b"keep-me" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F18: a partial seal (sentinel written, footer/rename not) must be handled
+    /// gracefully — recovery stops at the sentinel and recovers exactly the
+    /// pre-sentinel records.
+    #[test]
+    fn recovery_stops_at_partial_seal_sentinel() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("recover_sentinel");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"before-sentinel").unwrap();
+        }
+        // A sentinel is a zero-length record-length field (4 zero bytes), written
+        // by a seal before the footer/rename. Splice one in with no footer.
+        append_raw(&path, &[0u8; 4]);
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "recovery must stop at the sentinel, recovering only pre-sentinel records"
+        );
+        assert_eq!(recovered[0], b"before-sentinel" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn recovery_quarantines_bad_magic() {
         let dir = tmp_dir("badmagic");
