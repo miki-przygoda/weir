@@ -272,6 +272,15 @@ pub(crate) struct Metrics {
 /// Latency histogram buckets covering 1 ms–1 s; suitable for fsync and network round-trips.
 const LATENCY_BUCKETS: &[f64] = &[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
 
+/// Buckets for `accept_latency`, which measures only accept→semaphore→spawn —
+/// microsecond-scale CPU work that would all land in LATENCY_BUCKETS' first
+/// (1 ms) bucket, making the histogram useless (F22). Spans 10 µs–10 ms so the
+/// distribution is actually visible; always compiled (unlike the bench-trace
+/// STAGE_BUCKETS).
+const ACCEPT_BUCKETS: &[f64] = &[
+    0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.0025, 0.005, 0.01,
+];
+
 /// Finer buckets for the per-stage breakdown — queue/write stages are tens of
 /// microseconds, far below LATENCY_BUCKETS' 1 ms floor. Only used under bench-trace.
 #[cfg(feature = "bench-trace")]
@@ -312,7 +321,7 @@ impl Metrics {
             "Total records rejected (Nack), by durability tier and rejection reason"
         );
         let accept_latency = reg!(
-            Histogram::new(LATENCY_BUCKETS.iter().copied()),
+            Histogram::new(ACCEPT_BUCKETS.iter().copied()),
             "weir_accept_latency_seconds",
             "Wall-clock time from socket accept to spawn of the connection handler"
         );
