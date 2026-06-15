@@ -69,7 +69,19 @@ pub use weir_core::Payload;
 pub trait SinkRecord: Send + 'static {
     /// Build the record from the raw payload bytes handed over by the drain.
     fn from_payload(payload: Payload) -> Self;
-    /// Recover the raw payload bytes (used when a record must be dead-lettered).
+
+    /// Recover the raw payload bytes for a record the sink returned in
+    /// [`CommitResult::dead_lettered`].
+    ///
+    /// This is the **per-record** dead-letter path: when a `commit` call succeeds
+    /// but reports some records as permanently rejected, the drain calls
+    /// `into_payload` on each to recover the bytes it writes to the dead-letter
+    /// store. It is **not** used when `commit` returns `Err`: a whole-batch
+    /// permanent error dead-letters the original segment's raw payload bytes
+    /// directly (the typed records were moved into `commit` and are gone on the
+    /// error path). For the identity [`Payload`] record the two are the same
+    /// bytes; a custom record type only sees `into_payload` on the per-record
+    /// path, so it must not rely on it being called for whole-batch errors.
     fn into_payload(self) -> Payload;
 }
 
