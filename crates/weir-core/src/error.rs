@@ -113,7 +113,10 @@ impl fmt::Display for DecodeError {
                 write!(f, "reserved flags byte must be zero, got {flags:#04x}")
             }
             Self::TrailingBytes { extra } => {
-                write!(f, "buffer has {extra} byte(s) past the declared frame length")
+                write!(
+                    f,
+                    "buffer has {extra} byte(s) past the declared frame length"
+                )
             }
         }
     }

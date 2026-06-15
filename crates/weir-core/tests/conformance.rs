@@ -145,9 +145,8 @@ fn every_vector_decodes_as_specified() {
                 "vector {name}: re-encode is not byte-identical to the vector"
             );
         } else {
-            let err = result.expect_err(&format!(
-                "vector {name}: expected Err({expected}), got Ok"
-            ));
+            let err =
+                result.expect_err(&format!("vector {name}: expected Err({expected}), got Ok"));
             assert_eq!(
                 error_tag(&err),
                 expected,
