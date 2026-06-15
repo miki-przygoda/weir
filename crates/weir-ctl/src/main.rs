@@ -184,14 +184,14 @@ fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
             .to_string();
 
         // The dead-letter store is a sibling of the shard dirs, not a shard.
+        // Count it through the SAME dl_* / suffix filter as `dl list` and
+        // `dl drop` (dl_segments) so the two views can't disagree — previously
+        // this counted every file, including non-dl strays the dl commands skip
+        // (G06).
         if name == "dead_letter" {
-            if let Ok(files) = std::fs::read_dir(&path) {
-                for f in files.flatten() {
-                    if f.path().is_file() {
-                        dl_files += 1;
-                        dl_bytes += f.metadata().map(|m| m.len()).unwrap_or(0);
-                    }
-                }
+            if let Ok(segs) = dl_segments(&path) {
+                dl_files += segs.len() as u64;
+                dl_bytes += segs.iter().map(|(_, s)| *s).sum::<u64>();
             }
             continue;
         }
@@ -355,15 +355,34 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
         println!("re-run with --yes to confirm — this is irreversible.");
         return Ok(());
     }
-    for (p, _) in &segs {
-        std::fs::remove_file(p).map_err(|e| format!("remove {}: {e}", p.display()))?;
+    // Deletion is irreversible, so don't bail on the first failure and leave a
+    // silent partial deletion: attempt every file, then report what was dropped
+    // vs what failed and fail non-zero if any failed (G05).
+    let mut dropped = 0usize;
+    let mut dropped_bytes = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+    for (p, sz) in &segs {
+        match std::fs::remove_file(p) {
+            Ok(()) => {
+                dropped += 1;
+                dropped_bytes += *sz;
+            }
+            Err(e) => failures.push(format!("{}: {e}", p.display())),
+        }
     }
     println!(
-        "dropped {} dead-letter segment(s) ({})",
+        "dropped {dropped} of {} dead-letter segment(s) ({})",
         segs.len(),
-        fmt_bytes(total)
+        fmt_bytes(dropped_bytes)
     );
     println!("note: if the daemon is running, restart it so its dead-letter accounting refreshes.");
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} dead-letter segment(s) could not be removed:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        ));
+    }
     Ok(())
 }
 
@@ -510,5 +529,32 @@ mod tests {
     fn dl_segments_missing_dir_is_empty() {
         let dir = std::env::temp_dir().join("weir_ctl_dl_nonexistent_xyzzy");
         assert!(dl_segments(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dl_drop_removes_every_matched_segment() {
+        // G05: --yes drops all matched dl segments. (The accumulation loop also
+        // continues past per-file failures and reports them, but an unremovable
+        // file can't be created portably — root bypasses perms — so this covers
+        // the all-succeed path.)
+        let wab = std::env::temp_dir().join(format!("weir_ctl_drop_{}", std::process::id()));
+        let dl = wab.join("dead_letter");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::write(dl.join("dl_00000001.wab.sealed"), b"a").unwrap();
+        std::fs::write(dl.join("dl_00000002.wab"), b"b").unwrap();
+        std::fs::write(dl.join("keep.txt"), b"not-a-dl-file").unwrap();
+
+        cmd_dl_drop(&wab, true).unwrap();
+
+        // The two dl segments are gone; the non-dl file is untouched.
+        assert!(
+            dl_segments(&dl).unwrap().is_empty(),
+            "all dl segments dropped"
+        );
+        assert!(
+            dl.join("keep.txt").exists(),
+            "non-dl file must be left alone"
+        );
+        std::fs::remove_dir_all(&wab).ok();
     }
 }
