@@ -4,7 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering::Relaxed},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -120,14 +120,7 @@ impl Worker {
                     // arrival hits this branch because the previous batch
                     // (large) set the flag.
                     if expect_concurrent {
-                        while let Ok(unit) = work_rx.recv_timeout(window) {
-                            total_drained += 1;
-                            let shard = (unit.shard_id as usize) % self.buffers.len();
-                            self.buffers[shard].push(unit);
-                            if self.buffers[shard].len() >= self.batch_size {
-                                self.flush_shard(shard);
-                            }
-                        }
+                        total_drained += self.coalesce_window(&work_rx, window);
                     }
                     // Self-correcting: if we mispredict, the next batch's
                     // size updates the flag.
@@ -178,6 +171,44 @@ impl Worker {
         for shard in 0..self.buffers.len() {
             self.flush_shard(shard);
         }
+    }
+
+    /// Phase-2 coalesce: pull records into their shard buffers until `window`
+    /// elapses or the channel disconnects. Returns the number of records drained.
+    ///
+    /// The window is a SINGLE deadline computed once, NOT re-armed per record.
+    /// A worker that owns several shards (worker_count < shard_count) would
+    /// otherwise let a sustained burst on one co-located shard — records
+    /// arriving within `window` of each other — keep this loop alive for the
+    /// burst's entire length, while a record buffered for a quiet sibling shard
+    /// sat unflushed until it ended (cross-shard head-of-line latency coupling
+    /// unbounded by batch_deadline, F21). With a fixed deadline the added
+    /// coalesce latency for every shard is capped at `window`. Full shard
+    /// buffers are still flushed eagerly inside the loop, so a single shard's
+    /// throughput is unaffected.
+    fn coalesce_window(&mut self, work_rx: &Receiver<WorkUnit>, window: Duration) -> usize {
+        let deadline = Instant::now() + window;
+        let mut drained = 0;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match work_rx.recv_timeout(remaining) {
+                Ok(unit) => {
+                    drained += 1;
+                    let shard = (unit.shard_id as usize) % self.buffers.len();
+                    self.buffers[shard].push(unit);
+                    if self.buffers[shard].len() >= self.batch_size {
+                        self.flush_shard(shard);
+                    }
+                }
+                // Window elapsed (Timeout) or all producers gone (Disconnected):
+                // either way the coalesce phase is over.
+                Err(_) => break,
+            }
+        }
+        drained
     }
 
     /// Called on queue disconnect (graceful shutdown). Marked `#[cold]` and
@@ -579,5 +610,68 @@ mod tests {
             Err(oneshot::error::TryRecvError::Closed) => {}
             other => panic!("offline shard should Nack via a closed ack channel, got {other:?}"),
         }
+    }
+
+    /// F21: the Phase-2 coalesce window is a single deadline, not re-armed per
+    /// record. A worker owning several shards (worker_count < shard_count) must
+    /// not let a sustained burst on one shard hold the coalesce loop open for the
+    /// burst's whole length while a quiet sibling shard's record waits unflushed.
+    /// We drive `coalesce_window` directly with a continuous shard-0 burst and one
+    /// early shard-1 record, and assert the loop returns within a small multiple
+    /// of the window — so the sibling's added latency is bounded by the window,
+    /// not by the burst.
+    #[test]
+    fn coalesce_window_is_bounded_by_window_not_burst_length() {
+        let (shard_txs, _rxs) = make_shard_channels(2);
+        // batch_size huge so a shard never flushes on fullness — isolates the
+        // coalesce-loop duration as the thing under test.
+        let mut worker = Worker::new(2, 10_000, shard_txs, default_hint());
+
+        let (tx, rx) = crossbeam_channel::unbounded::<WorkUnit>();
+
+        // One record for the quiet sibling shard (shard 1), queued first.
+        let (sibling, _ack) = make_unit(1, b"sibling");
+        tx.send(sibling).unwrap();
+
+        // A sustained shard-0 burst: records arriving far closer together than
+        // the coalesce window, continuously for much longer than it. A
+        // re-arm-per-record loop would follow this burst for its whole length.
+        let producer = {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let until = Instant::now() + Duration::from_millis(100);
+                while Instant::now() < until {
+                    let (unit, _ack) = make_unit(0, b"burst");
+                    if tx.send(unit).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            })
+        };
+
+        let window = Duration::from_millis(15);
+        let start = Instant::now();
+        let drained = worker.coalesce_window(&rx, window);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(60),
+            "coalesce ran {elapsed:?} — it followed the burst rather than capping at \
+             the {window:?} window (F21 regression)"
+        );
+        // The sibling shard's record was captured and is ready for the caller's
+        // flush_all (which runs right after coalesce returns, ~window — not at
+        // burst end).
+        assert_eq!(
+            worker.buffers[1].len(),
+            1,
+            "the quiet sibling shard's record must be buffered and ready to flush"
+        );
+        assert!(drained >= 1, "the burst should have been drained too");
+
+        // Releasing the receiver makes the producer's next send fail and exit.
+        drop(rx);
+        producer.join().unwrap();
     }
 }
