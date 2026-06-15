@@ -3083,6 +3083,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "proptest",
+ "serde_json",
 ]
 
 [[package]]

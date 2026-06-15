@@ -330,6 +330,15 @@ local build matches the published wire format. Implementers of
 non-Rust clients can copy the constants directly to verify their
 encoders.
 
+For a complete, **language-neutral** suite — covering every message
+type, all nine Nack reason bytes, and one rejection vector per decode
+error (bad magic, version mismatch, bad CRC, oversize payload,
+truncation, reserved flags, trailing bytes, …) — see
+[`conformance.md`](conformance.md) and the machine-readable
+[`conformance/wire_v1_vectors.json`](conformance/wire_v1_vectors.json).
+weir's own decoder is checked against that file by
+`cargo test -p weir-core --test conformance`.
+
 ---
 
 ## Version history
