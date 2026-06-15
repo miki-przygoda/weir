@@ -506,12 +506,7 @@ fn fire_and_forget_overload() {
 
     // Pre-encode one Push frame to reuse across all writes.
     let payload: Vec<u8> = b"overload"[..].to_vec();
-    let header = Header::new(
-        MessageType::Push,
-        Durability::Buffered,
-        0,
-        payload.len() as u32,
-    );
+    let header = Header::new(MessageType::Push, Durability::Buffered, 0);
     let frame = Envelope::new(header, payload).encode();
 
     let handles: Vec<_> = (0..THREADS)

@@ -42,16 +42,12 @@ fn arb_durability() -> impl Strategy<Value = Durability> {
 }
 
 fn arb_header() -> impl Strategy<Value = Header> {
-    // payload_len capped at MAX_PAYLOAD_HARD_CAP so the header is one that a
-    // legitimate encoder would produce. Out-of-cap headers are exercised by
-    // the dedicated PayloadTooLarge property below.
-    (
-        arb_message_type(),
-        arb_durability(),
-        any::<u8>(),
-        0u32..=(MAX_PAYLOAD_HARD_CAP as u32),
-    )
-        .prop_map(|(mt, d, flags, pl)| Header::new(mt, d, flags, pl))
+    // Header::new derives payload_len (0 for a bare header; set by Envelope::new
+    // otherwise — F50), so the strategy only varies the fields the constructor
+    // takes. Out-of-cap declared lengths are exercised by the dedicated
+    // PayloadTooLarge property below.
+    (arb_message_type(), arb_durability(), any::<u8>())
+        .prop_map(|(mt, d, flags)| Header::new(mt, d, flags))
 }
 
 fn arb_small_payload() -> impl Strategy<Value = Vec<u8>> {
@@ -170,7 +166,7 @@ proptest! {
         flags in any::<u8>(),
         payload in arb_small_payload(),
     ) {
-        let header = Header::new(mt, d, flags, payload.len() as u32);
+        let header = Header::new(mt, d, flags);
         let env = Envelope::new(header, payload.clone());
         let bytes = env.encode();
         let decoded = Envelope::decode(&bytes).expect("freshly encoded envelope must decode");
@@ -186,7 +182,7 @@ proptest! {
     /// is a load-bearing invariant: the server's frame-reader relies on it.
     #[test]
     fn encoded_frame_length_is_exact(payload in arb_small_payload()) {
-        let header = Header::new(MessageType::Push, Durability::Sync, 0, payload.len() as u32);
+        let header = Header::new(MessageType::Push, Durability::Sync, 0);
         let env = Envelope::new(header, payload.clone());
         let bytes = env.encode();
         prop_assert_eq!(bytes.len(), HEADER_LEN + payload.len() + 4);
@@ -232,10 +228,15 @@ proptest! {
         d in arb_durability(),
         flags in any::<u8>(),
     ) {
-        let header = Header::new(mt, d, flags, oversize_len);
-        // Encode only the header bytes; deliberately do NOT include payload
-        // bytes — if the decoder tried to allocate first, this would fail.
-        let bytes = header.encode().to_vec();
+        // Header::new can no longer declare an arbitrary length (F50), so patch
+        // the encoded header's payload_len field + recompute the header CRC to put
+        // the (possibly un-allocatable) declared length on the wire. Only the
+        // 16-byte header is emitted — no payload bytes — so if the decoder tried
+        // to allocate before the cap check, it would fault here.
+        let mut bytes = Header::new(mt, d, flags).encode();
+        bytes[8..12].copy_from_slice(&oversize_len.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..12]);
+        bytes[12..16].copy_from_slice(&crc.to_le_bytes());
         match Envelope::decode(&bytes) {
             Err(DecodeError::PayloadTooLarge { len, cap }) => {
                 prop_assert_eq!(len as u32, oversize_len);
@@ -257,12 +258,8 @@ proptest! {
         keep in 0usize..=128,
     ) {
         // Build a valid frame with payload of `full_len` zero bytes…
-        let header = Header::new(
-            MessageType::Push,
-            Durability::Sync,
-            0,
-            full_len as u32,
-        );
+        // (Envelope::new derives payload_len from the payload.)
+        let header = Header::new(MessageType::Push, Durability::Sync, 0);
         let env = Envelope::new(header, vec![0u8; full_len]);
         let full = env.encode();
         // …then keep only a prefix that is short of the full frame.
@@ -288,9 +285,7 @@ proptest! {
         let header = Header::new(
             MessageType::Push,
             Durability::Sync,
-            0,
-            payload.len() as u32,
-        );
+            0);
         let env = Envelope::new(header, payload.clone());
         let mut bytes = env.encode();
         // Flip a bit in the first payload byte (at offset HEADER_LEN).

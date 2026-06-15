@@ -113,8 +113,7 @@ impl<S: Read + Write> WeirClient<S> {
         self.ensure_usable()?;
         // copy_from_slice at the API boundary so downstream handling is zero-copy.
         let payload = weir_core::Payload::copy_from_slice(payload.as_ref());
-        let len = payload.len() as u32;
-        let header = Header::new(MessageType::Push, durability, 0, len);
+        let header = Header::new(MessageType::Push, durability, 0);
         let frame = Envelope::new(header, payload).encode();
         self.stream.write_all(&frame)?;
 
@@ -146,7 +145,7 @@ impl<S: Read + Write> WeirClient<S> {
     /// or responds with a Nack.
     pub fn health_check(&mut self) -> Result<(), ClientError> {
         self.ensure_usable()?;
-        let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0, 0);
+        let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0);
         let frame = Envelope::new(header, vec![]).encode();
         self.stream.write_all(&frame)?;
 
@@ -348,12 +347,7 @@ mod tests {
             server_end.read_exact(&mut rest).unwrap();
             // Send back an Ack so push_default can complete.
             let ack = weir_core::Envelope::new(
-                weir_core::Header::new(
-                    weir_core::MessageType::Ack,
-                    weir_core::Durability::Sync,
-                    0,
-                    0,
-                ),
+                weir_core::Header::new(weir_core::MessageType::Ack, weir_core::Durability::Sync, 0),
                 vec![],
             )
             .encode();

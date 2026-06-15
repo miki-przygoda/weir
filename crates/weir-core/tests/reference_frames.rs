@@ -34,7 +34,7 @@ const REFERENCE_PUSH_HELLO_SYNC: &[u8; 25] = &[
 
 #[test]
 fn push_hello_sync_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::Push, Durability::Sync, 0, 5);
+    let header = Header::new(MessageType::Push, Durability::Sync, 0);
     assert_eq!(
         header.version(),
         WIRE_VERSION,
@@ -70,7 +70,7 @@ const REFERENCE_ACK: &[u8; 20] = &[
 
 #[test]
 fn ack_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::Ack, Durability::Sync, 0, 0);
+    let header = Header::new(MessageType::Ack, Durability::Sync, 0);
     let envelope = Envelope::new(header, Vec::new());
     let encoded = envelope.encode();
     assert_eq!(
@@ -103,7 +103,7 @@ const REFERENCE_NACK_PAYLOAD_TOO_LARGE: &[u8; 21] = &[
 #[test]
 fn nack_payload_too_large_encodes_to_reference_bytes() {
     use weir_core::NackReason;
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0, 1);
+    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
     let envelope = Envelope::new(header, vec![NackReason::PayloadTooLarge as u8]);
     let encoded = envelope.encode();
     assert_eq!(
@@ -149,7 +149,7 @@ const REFERENCE_NACK_VERSION_MISMATCH: &[u8; 22] = &[
 #[test]
 fn nack_version_mismatch_encodes_to_reference_bytes() {
     use weir_core::NackReason;
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0, 2);
+    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
     let envelope = Envelope::new(
         header,
         vec![NackReason::VersionMismatch as u8, WIRE_VERSION],
@@ -184,7 +184,7 @@ const REFERENCE_NACK_BAD_HEADER_CRC: &[u8; 21] = &[
 #[test]
 fn nack_bad_header_crc_encodes_to_reference_bytes() {
     use weir_core::NackReason;
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0, 1);
+    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
     let envelope = Envelope::new(header, vec![NackReason::BadHeaderCrc as u8]);
     let encoded = envelope.encode();
     assert_eq!(
@@ -213,7 +213,7 @@ const REFERENCE_HEALTHCHECK: &[u8; 20] = &[
 
 #[test]
 fn healthcheck_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0, 0);
+    let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0);
     let envelope = Envelope::new(header, Vec::new());
     let encoded = envelope.encode();
     assert_eq!(
@@ -242,7 +242,7 @@ const REFERENCE_HEALTHCHECK_RESPONSE: &[u8; 20] = &[
 
 #[test]
 fn healthcheck_response_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0);
+    let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0);
     let envelope = Envelope::new(header, Vec::new());
     let encoded = envelope.encode();
     assert_eq!(

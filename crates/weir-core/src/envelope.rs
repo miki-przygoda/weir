@@ -95,18 +95,21 @@ pub struct Header {
 
 impl Header {
     /// Constructs a header for outbound frames. Version is always `WIRE_VERSION`.
-    pub fn new(
-        message_type: MessageType,
-        durability: Durability,
-        flags: u8,
-        payload_len: u32,
-    ) -> Self {
+    ///
+    /// `payload_len` is NOT a parameter: it is set to 0 here and becomes
+    /// authoritative only when the header is wrapped in an [`Envelope`], which
+    /// derives it from the actual payload (see [`Envelope::new`]). This makes a
+    /// header whose declared length disagrees with its payload unrepresentable —
+    /// a bare `Header::encode` always declares `payload_len = 0`, so it is only
+    /// valid for the genuinely-empty-payload frames (Ack / HealthCheck) that use
+    /// it (F50).
+    pub fn new(message_type: MessageType, durability: Durability, flags: u8) -> Self {
         Self {
             version: WIRE_VERSION,
             message_type,
             durability,
             flags,
-            payload_len,
+            payload_len: 0,
         }
     }
 
@@ -308,15 +311,15 @@ mod tests {
     use super::*;
     use crate::version::WIRE_VERSION;
 
-    fn push_header(payload_len: u32) -> Header {
-        Header::new(MessageType::Push, Durability::Sync, 0, payload_len)
+    fn push_header() -> Header {
+        Header::new(MessageType::Push, Durability::Sync, 0)
     }
 
     // ── Header ──────────────────────────────────────────────────────────────
 
     #[test]
     fn header_encode_decode_round_trip() {
-        let h = push_header(42);
+        let h = push_header();
         let encoded = h.encode();
         let decoded = Header::decode(&encoded).unwrap();
         assert_eq!(h, decoded);
@@ -324,20 +327,20 @@ mod tests {
 
     #[test]
     fn header_encode_is_16_bytes() {
-        let encoded = push_header(0).encode();
+        let encoded = push_header().encode();
         assert_eq!(encoded.len(), HEADER_LEN);
     }
 
     #[test]
     fn header_decode_rejects_bad_magic() {
-        let mut buf = push_header(0).encode();
+        let mut buf = push_header().encode();
         buf[0] = 0x00;
         assert_eq!(Header::decode(&buf), Err(DecodeError::BadMagic));
     }
 
     #[test]
     fn header_decode_rejects_future_version() {
-        let mut buf = push_header(0).encode();
+        let mut buf = push_header().encode();
         buf[4] = WIRE_VERSION + 1;
         // Must recalculate CRC so we test the version path, not the CRC path.
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
@@ -353,7 +356,7 @@ mod tests {
 
     #[test]
     fn header_decode_rejects_older_version() {
-        let mut buf = push_header(0).encode();
+        let mut buf = push_header().encode();
         buf[4] = WIRE_VERSION - 1;
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -370,7 +373,7 @@ mod tests {
     /// return VersionMismatch, not HeaderCrcMismatch.
     #[test]
     fn header_decode_version_checked_before_crc() {
-        let mut buf = push_header(0).encode();
+        let mut buf = push_header().encode();
         // Set version to a future value and recompute a valid CRC for that version.
         buf[4] = WIRE_VERSION + 1;
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
@@ -384,7 +387,7 @@ mod tests {
 
     #[test]
     fn header_decode_rejects_corrupted_crc() {
-        let mut buf = push_header(0).encode();
+        let mut buf = push_header().encode();
         buf[12] ^= 0xff;
         assert!(matches!(
             Header::decode(&buf),
@@ -394,7 +397,7 @@ mod tests {
 
     #[test]
     fn header_decode_rejects_unknown_message_type() {
-        let mut buf = push_header(0).encode();
+        let mut buf = push_header().encode();
         buf[5] = 0xff;
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -406,7 +409,7 @@ mod tests {
 
     #[test]
     fn header_decode_rejects_unknown_durability() {
-        let mut buf = push_header(0).encode();
+        let mut buf = push_header().encode();
         buf[6] = 0xff;
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -453,7 +456,7 @@ mod tests {
 
     fn round_trip(msg_type: MessageType) {
         let payload = b"hello weir".to_vec();
-        let header = Header::new(msg_type, Durability::Sync, 0, payload.len() as u32);
+        let header = Header::new(msg_type, Durability::Sync, 0);
         let env = Envelope::new(header, payload);
         let encoded = env.encode();
         let decoded = Envelope::decode(&encoded).unwrap();
@@ -487,7 +490,7 @@ mod tests {
 
     #[test]
     fn envelope_round_trip_empty_payload() {
-        let header = push_header(0);
+        let header = push_header();
         let env = Envelope::new(header, vec![]);
         let encoded = env.encode();
         let decoded = Envelope::decode(&encoded).unwrap();
@@ -496,7 +499,7 @@ mod tests {
 
     #[test]
     fn envelope_decode_rejects_truncated_header() {
-        let env = Envelope::new(push_header(4), b"data".to_vec());
+        let env = Envelope::new(push_header(), b"data".to_vec());
         let encoded = env.encode();
         assert_eq!(
             Envelope::decode(&encoded[..HEADER_LEN - 1]),
@@ -507,7 +510,7 @@ mod tests {
     #[test]
     fn envelope_decode_rejects_truncated_payload() {
         let payload = b"hello".to_vec();
-        let env = Envelope::new(push_header(payload.len() as u32), payload);
+        let env = Envelope::new(push_header(), payload);
         let encoded = env.encode();
         // Strip the last byte of the payload+CRC section.
         assert_eq!(
@@ -518,7 +521,7 @@ mod tests {
 
     #[test]
     fn envelope_decode_rejects_header_only() {
-        let env = Envelope::new(push_header(4), b"data".to_vec());
+        let env = Envelope::new(push_header(), b"data".to_vec());
         let encoded = env.encode();
         assert_eq!(
             Envelope::decode(&encoded[..HEADER_LEN]),
@@ -529,7 +532,7 @@ mod tests {
     #[test]
     fn envelope_decode_rejects_corrupted_payload_crc() {
         let payload = b"hello".to_vec();
-        let env = Envelope::new(push_header(payload.len() as u32), payload);
+        let env = Envelope::new(push_header(), payload);
         let mut encoded = env.encode();
         // Flip a bit in the trailing CRC.
         let last = encoded.len() - 1;
@@ -545,9 +548,15 @@ mod tests {
         // The cap check fires immediately after Header::decode, before the frame-length
         // check, so even a 16-byte buffer returns PayloadTooLarge (not TruncatedFrame).
         // This ordering is deliberate: it prevents any heap allocation attempt.
+        //
+        // Header::new can no longer declare an oversized length (F50), so patch the
+        // payload_len field + recompute the header CRC directly to put the over-cap
+        // declared length on the wire.
         let oversized_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
-        let header = Header::new(MessageType::Push, Durability::Sync, 0, oversized_len);
-        let header_bytes = header.encode();
+        let mut header_bytes = Header::new(MessageType::Push, Durability::Sync, 0).encode();
+        header_bytes[8..12].copy_from_slice(&oversized_len.to_le_bytes());
+        let crc = crc32fast::hash(&header_bytes[..HEADER_CRC_COVERAGE]);
+        header_bytes[12..16].copy_from_slice(&crc.to_le_bytes());
         assert_eq!(
             Envelope::decode(&header_bytes),
             Err(DecodeError::PayloadTooLarge {

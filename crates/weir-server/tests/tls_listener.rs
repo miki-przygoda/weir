@@ -110,7 +110,7 @@ fn tls_connect(addr: SocketAddr, config: Arc<ClientConfig>) -> std::io::Result<T
 /// Encodes a Push frame (header + payload + payload CRC), identical wire shape
 /// to the connection-layer tests' `push_frame`.
 fn push_frame(payload: &[u8]) -> Vec<u8> {
-    let header = Header::new(MessageType::Push, Durability::Sync, 0, payload.len() as u32);
+    let header = Header::new(MessageType::Push, Durability::Sync, 0);
     Envelope::new(header, payload.to_vec()).encode()
 }
 

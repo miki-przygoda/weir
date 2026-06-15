@@ -557,17 +557,22 @@ fn payload_size_boundary_enforced() {
             io::{Read, Write},
             os::unix::net::UnixStream as RawStream,
         };
-        use weir_core::{HEADER_LEN, Header, MessageType, NackReason};
+        use weir_core::{Envelope, HEADER_LEN, Header, MessageType, NackReason};
 
         let mut stream = RawStream::connect(&srv.socket_path).expect("raw connect");
-        let header = Header::new(
-            MessageType::Push,
-            Durability::Batched,
-            0,
-            (MAX_PAYLOAD_HARD_CAP + 1) as u32,
-        );
+        // Header::new can no longer declare a length that disagrees with its
+        // payload (F50), so build a full frame whose Envelope derives the over-cap
+        // length from a real (discarded) payload, and transmit ONLY its 16-byte
+        // header. The server must reject on the declared length before reading any
+        // body bytes.
+        let oversize = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        let frame = Envelope::new(
+            Header::new(MessageType::Push, Durability::Batched, 0),
+            oversize,
+        )
+        .encode();
         stream
-            .write_all(&header.encode())
+            .write_all(&frame[..HEADER_LEN])
             .expect("write header for over-cap push");
 
         // Read response header.
@@ -1102,12 +1107,7 @@ fn stalled_client_does_not_block_other_connections() {
 
     // Pre-encode one Push frame for the stalled client to send.
     let payload = b"stall";
-    let header = Header::new(
-        MessageType::Push,
-        Durability::Buffered,
-        0,
-        payload.len() as u32,
-    );
+    let header = Header::new(MessageType::Push, Durability::Buffered, 0);
     let frame = Envelope::new(header, payload.to_vec()).encode();
 
     let stop_stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1169,12 +1169,7 @@ fn partial_frame_does_not_corrupt_next_connection() {
 
     // Build a valid Push frame with a 64-byte payload.
     let payload = vec![0xabu8; 64];
-    let header = Header::new(
-        MessageType::Push,
-        Durability::Buffered,
-        0,
-        payload.len() as u32,
-    );
+    let header = Header::new(MessageType::Push, Durability::Buffered, 0);
     let frame = Envelope::new(header, payload).encode();
 
     {
