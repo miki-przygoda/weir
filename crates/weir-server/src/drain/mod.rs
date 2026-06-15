@@ -725,9 +725,13 @@ async fn commit_batch<S: Sink>(
     }
 }
 
-/// Rough byte estimate for WAB record overhead + payload.
+/// Byte estimate for the dead-letter segment that `payloads` would seal into —
+/// header + per-record overhead + payloads + sentinel + footer. Delegates to the
+/// single source of truth so the `would_exceed_cap` pre-check matches the real
+/// sealed file size; the previous estimate omitted the ~60-byte segment framing,
+/// letting each write creep past `dead_letter_max_bytes` (F07).
 fn estimated_write_bytes(payloads: &[Payload]) -> u64 {
-    payloads.iter().map(|p| p.len() as u64 + 8).sum()
+    dead_letter::estimated_segment_bytes(payloads)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
