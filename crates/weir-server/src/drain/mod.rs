@@ -47,7 +47,7 @@ use crate::{
         SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth, SinkRecord},
-    wab::SegmentReader,
+    wab::{SegmentReader, read_segment_record_count},
 };
 
 use confirmed::confirm_and_delete;
@@ -717,22 +717,54 @@ async fn process_segment<S: Sink>(
     }
     if read_failed {
         // Readable prefix delivered; move the segment (with its unreadable tail) to
-        // the quarantine dir for manual recovery rather than deleting it. If the
-        // quarantine move itself fails, leave the segment on disk (recovery will
-        // re-encounter it) — still never silently dropped.
-        match crate::wab::recovery::quarantine(
-            segment,
-            &config.wab_dir,
-            "drain: mid-segment read error",
-        ) {
-            Ok(()) => {
-                metrics.recovery_segments_quarantined.inc();
-            }
-            Err(qe) => {
-                error!(path = %segment.display(), error = %qe, "drain: failed to quarantine unreadable segment; left on disk");
-            }
-        }
+        // the quarantine dir for manual recovery rather than deleting it.
+        quarantine_segment(segment, config, metrics, "drain: mid-segment read error");
         return ProcessResult::Quarantined;
+    }
+
+    // Completeness check before confirming (S01). A sealed segment ends with a
+    // zero-length sentinel followed by a footer whose `record_count` is
+    // authoritative. The sequential reader cannot tell "reached the sentinel"
+    // from "the file just ended": a post-seal tail truncation (partial media
+    // loss, a torn block, an at-rest truncation while the segment waits out a
+    // long sink outage) drops trailing records AND the sentinel/footer, and the
+    // reader returns a short, error-free stream. Confirming that would delete
+    // records that were acked durable to producers but never delivered — a silent
+    // crown-invariant violation. Cross-check the count we actually read against
+    // the footer; on any mismatch (or an unreadable footer, i.e. the footer
+    // itself was truncated) quarantine rather than confirm+delete. This turns a
+    // previously-undetected silent loss into an operator-visible quarantine.
+    match read_segment_record_count(segment) {
+        Ok(footer_count) if footer_count == read_index => {}
+        Ok(footer_count) => {
+            error!(
+                path = %segment.display(),
+                read = read_index,
+                footer = footer_count,
+                "drain: segment record count disagrees with its footer (truncated tail?); quarantining instead of confirming"
+            );
+            quarantine_segment(
+                segment,
+                config,
+                metrics,
+                "drain: record count mismatch vs footer (truncated tail)",
+            );
+            return ProcessResult::Quarantined;
+        }
+        Err(e) => {
+            error!(
+                path = %segment.display(),
+                error = %e,
+                "drain: cannot read segment footer to verify completeness; quarantining instead of confirming"
+            );
+            quarantine_segment(
+                segment,
+                config,
+                metrics,
+                "drain: footer unreadable, completeness unverifiable",
+            );
+            return ProcessResult::Quarantined;
+        }
     }
 
     // Clean path only: every readable record is now durably processed
@@ -745,6 +777,20 @@ async fn process_segment<S: Sink>(
 
     ProcessResult::Confirmed {
         record_count: read_index,
+    }
+}
+
+/// Moves a segment that cannot be safely confirmed into the quarantine dir for
+/// manual recovery, rather than deleting it. If the move itself fails the segment
+/// is left on disk (crash recovery re-encounters it) — never silently dropped.
+fn quarantine_segment(segment: &Path, config: &DrainConfig, metrics: &Metrics, reason: &str) {
+    match crate::wab::recovery::quarantine(segment, &config.wab_dir, reason) {
+        Ok(()) => {
+            metrics.recovery_segments_quarantined.inc();
+        }
+        Err(qe) => {
+            error!(path = %segment.display(), error = %qe, reason, "drain: failed to quarantine segment; left on disk");
+        }
     }
 }
 
@@ -1687,6 +1733,54 @@ mod tests {
             records_dead_lettered(&metrics),
             0,
             "no dead-lettering — the prefix is delivered, the tail is quarantined"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── S01: a post-seal tail truncation must quarantine, never confirm+delete ──
+    #[test]
+    fn post_seal_tail_truncation_quarantines_not_confirms() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("s01_tailtrunc");
+        // Seal a 3-record segment, then truncate so records 1-2 stay fully
+        // readable but record 3 + the zero-length sentinel + the footer are gone.
+        // Layout: 24-byte header + per-record [4 len + 4 crc + 2 payload = 10] →
+        // keep the first 44 bytes (header + 2 records). The sequential reader then
+        // reads r1, r2 and sees the missing length field as a clean end of stream.
+        let sealed = make_sealed_segment(&dir, 0, &[b"aa", b"bb", b"cc"]);
+        let bytes = std::fs::read(&sealed).unwrap();
+        assert!(
+            bytes.len() > 44,
+            "a sealed 3-record segment should exceed 44 bytes, was {}",
+            bytes.len()
+        );
+        std::fs::write(&sealed, &bytes[..44]).unwrap();
+
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_responses([]); // commits whatever prefix it is given
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+
+        let result = block_on(process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(result, ProcessResult::Quarantined),
+            "a post-seal tail truncation must quarantine, not confirm+delete the lost tail"
+        );
+        assert!(
+            !sealed.exists(),
+            "the truncated segment must be moved to quarantine, not left to be confirmed+deleted"
+        );
+        let q = dir.join("quarantine");
+        assert!(
+            q.is_dir() && std::fs::read_dir(&q).unwrap().count() == 1,
+            "the truncated segment must be preserved in quarantine for manual recovery"
+        );
+        assert_eq!(
+            records_dead_lettered(&metrics),
+            0,
+            "no dead-lettering — the readable prefix is delivered, the truncated tail is quarantined"
         );
         std::fs::remove_dir_all(dir).ok();
     }

@@ -369,7 +369,12 @@ pub(crate) fn replay_unconfirmed(
 /// Reads `record_count` from the footer of a sealed segment file without reading
 /// all records. The footer occupies the last `SEGMENT_FOOTER_LEN` bytes; its first
 /// 8 bytes are `record_count` as a u64 LE (see wab/format.rs for the layout).
-fn read_segment_record_count(path: &Path) -> io::Result<u64> {
+///
+/// `pub(crate)` so the drain can cross-check the footer's authoritative count
+/// against the number of records it actually read, catching a post-seal tail
+/// truncation that the sequential reader would otherwise see as a clean end of
+/// stream (S01).
+pub(crate) fn read_segment_record_count(path: &Path) -> io::Result<u64> {
     let mut file = fs::File::open(path)?;
     // Guard the seek-from-end: a file shorter than the footer would seek to a
     // negative offset, which surfaces as a cryptic platform error ("Invalid
