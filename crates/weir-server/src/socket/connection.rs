@@ -142,7 +142,7 @@ where
             Ok(h) => h,
             Err(e) => {
                 let (wire, metric, extra) = nack_for_decode_error(&e);
-                send_nack(stream.get_mut(), wire, extra).await?;
+                send_nack(stream.get_mut(), wire, extra, config.read_timeout).await?;
                 metrics
                     .records_nack
                     .get_or_create(&NackLabel {
@@ -162,7 +162,13 @@ where
         let cap = config.max_payload_bytes.min(MAX_PAYLOAD_HARD_CAP);
         if payload_len > cap {
             let tv = durability_to_tier(header.durability());
-            send_nack(stream.get_mut(), WireNack::PayloadTooLarge, &[]).await?;
+            send_nack(
+                stream.get_mut(),
+                WireNack::PayloadTooLarge,
+                &[],
+                config.read_timeout,
+            )
+            .await?;
             metrics
                 .records_nack
                 .get_or_create(&NackLabel {
@@ -181,7 +187,13 @@ where
             // zero-length payload (see docs/wire_protocol.md) and must pass
             // through to the dispatch below.
             let tv = durability_to_tier(header.durability());
-            send_nack(stream.get_mut(), WireNack::EmptyPayload, &[]).await?;
+            send_nack(
+                stream.get_mut(),
+                WireNack::EmptyPayload,
+                &[],
+                config.read_timeout,
+            )
+            .await?;
             metrics
                 .records_nack
                 .get_or_create(&NackLabel {
@@ -244,7 +256,13 @@ where
         let computed_crc = crc32fast::hash(&payload);
         if expected_crc != computed_crc {
             let tv = durability_to_tier(header.durability());
-            send_nack(stream.get_mut(), WireNack::BadPayloadCrc, &[]).await?;
+            send_nack(
+                stream.get_mut(),
+                WireNack::BadPayloadCrc,
+                &[],
+                config.read_timeout,
+            )
+            .await?;
             metrics
                 .records_nack
                 .get_or_create(&NackLabel {
@@ -271,19 +289,28 @@ where
                     tv,
                     config.shard_id,
                     config.ack_timeout,
+                    config.read_timeout,
                     &metrics,
                 )
                 .await?;
             }
             MessageType::HealthCheck => {
-                stream
-                    .get_mut()
-                    .write_all(healthcheck_response_frame_bytes())
-                    .await?;
+                write_all_timeout(
+                    stream.get_mut(),
+                    healthcheck_response_frame_bytes(),
+                    config.read_timeout,
+                )
+                .await?;
             }
             _ => {
                 debug!(msg_type = ?header.message_type(), "unexpected message type from client");
-                send_nack(stream.get_mut(), WireNack::InternalError, &[]).await?;
+                send_nack(
+                    stream.get_mut(),
+                    WireNack::InternalError,
+                    &[],
+                    config.read_timeout,
+                )
+                .await?;
                 metrics
                     .records_nack
                     .get_or_create(&NackLabel {
@@ -312,6 +339,7 @@ async fn handle_push<S>(
     tv: TierValue,
     shard_id: u32,
     ack_timeout: Duration,
+    write_timeout: Duration,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()>
 where
@@ -348,7 +376,7 @@ where
     };
 
     if push_result.is_err() {
-        send_nack(stream, WireNack::InternalError, &[]).await?;
+        send_nack(stream, WireNack::InternalError, &[], write_timeout).await?;
         metrics
             .records_nack
             .get_or_create(&NackLabel {
@@ -365,12 +393,12 @@ where
                 .records_ack
                 .get_or_create(&TierLabel { tier: tv })
                 .inc();
-            send_ack(stream).await
+            send_ack(stream, write_timeout).await
         }
         Ok(_) => {
             // Flusher fired ack with `false` (write/fsync error) or dropped
             // the sender (panic). Either way: InternalError nack.
-            send_nack(stream, WireNack::InternalError, &[]).await?;
+            send_nack(stream, WireNack::InternalError, &[], write_timeout).await?;
             metrics
                 .records_nack
                 .get_or_create(&NackLabel {
@@ -386,7 +414,7 @@ where
             // branch above). The record may still get written; producer
             // sees Nack(InternalError) and retries on a fresh connection.
             metrics.ack_timeout.inc();
-            send_nack(stream, WireNack::InternalError, &[]).await?;
+            send_nack(stream, WireNack::InternalError, &[], write_timeout).await?;
             metrics
                 .records_nack
                 .get_or_create(&NackLabel {
@@ -455,6 +483,7 @@ async fn send_nack<S: AsyncWrite + Unpin>(
     stream: &mut S,
     reason: WireNack,
     extra: &[u8],
+    write_timeout: Duration,
 ) -> io::Result<()> {
     let mut nack_payload = Vec::with_capacity(1 + extra.len());
     nack_payload.push(reason as u8);
@@ -462,7 +491,28 @@ async fn send_nack<S: AsyncWrite + Unpin>(
 
     let header = Header::new(MessageType::Nack, Durability::Sync, 0);
     let frame = Envelope::new(header, nack_payload).encode();
-    stream.write_all(&frame).await
+    write_all_timeout(stream, &frame, write_timeout).await
+}
+
+/// Writes a complete response frame, bounded by `write_timeout`. A client that
+/// stops reading (or reads pathologically slowly) must not pin the connection —
+/// and the semaphore permit it holds — indefinitely on a blocked write: with the
+/// global connection cap, enough such clients would exhaust every permit. On
+/// timeout the write surfaces as a `TimedOut` error, which propagates up and drops
+/// the connection (releasing the permit), mirroring the read-side slowloris guard
+/// that already bounds reads with the same `read_timeout` (S02).
+async fn write_all_timeout<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    bytes: &[u8],
+    write_timeout: Duration,
+) -> io::Result<()> {
+    match tokio::time::timeout(write_timeout, stream.write_all(bytes)).await {
+        Ok(res) => res,
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "response write exceeded write timeout; dropping connection",
+        )),
+    }
 }
 
 /// The Ack frame's 20 bytes are entirely constant — fixed magic, fixed
@@ -489,8 +539,11 @@ fn healthcheck_response_frame_bytes() -> &'static [u8] {
     })
 }
 
-async fn send_ack<S: AsyncWrite + Unpin>(stream: &mut S) -> io::Result<()> {
-    stream.write_all(ack_frame_bytes()).await
+async fn send_ack<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    write_all_timeout(stream, ack_frame_bytes(), write_timeout).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1128,5 +1181,58 @@ mod tests {
             .expect("handler not released promptly on shutdown mid-CRC")
             .expect("handler task panicked")
             .expect("handler returned Err");
+    }
+
+    // ── S02: response writes are bounded by a write timeout ─────────────────────
+
+    /// An `AsyncWrite` that never accepts a byte — models a client that has
+    /// stopped reading, so the socket send buffer is full and `write_all` would
+    /// block forever.
+    struct StalledWriter;
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn send_ack_is_bounded_by_write_timeout() {
+        // A non-reading client must not pin the connection (and its permit) forever
+        // on a blocked Ack write; the write is bounded by the write timeout (S02).
+        let mut w = StalledWriter;
+        let err = send_ack(&mut w, Duration::from_millis(50))
+            .await
+            .expect_err("a stalled writer must time out, not hang");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn send_nack_is_bounded_by_write_timeout() {
+        let mut w = StalledWriter;
+        let err = send_nack(
+            &mut w,
+            WireNack::InternalError,
+            &[],
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("a stalled writer must time out, not hang");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }
