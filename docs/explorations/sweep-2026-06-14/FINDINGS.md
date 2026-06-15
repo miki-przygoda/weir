@@ -5,9 +5,9 @@
 ## TL;DR
 
 - **76 raw** → **60 confirmed-real** after adversarial verification (+ 1 uncertain, 1 refuted).
-- **Fixed: 49** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
+- **Fixed: 50** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
 - **Needs your decision: 10** → all in **[`ESCALATIONS.md`](ESCALATIONS.md)** (separate file so they're easy to find).
-- **Queued safe fixes: 1** — being worked through; this list shrinks as they land.
+- **Queued safe fixes: 0** — being worked through; this list shrinks as they land.
 
 ## ⚠️ Your decisions live in [`ESCALATIONS.md`](ESCALATIONS.md)
 
@@ -43,6 +43,7 @@ Quick index (full detail + recommendations in that file):
 | F15 | medium | wab | replay_unconfirmed silently skips sealed-but-unconfirmed segments on a per-entry DirEntry error (filter_map(\|e\| e.ok())) | `ed7ad63` |
 | F17 | medium | wab | Recovery: no test for the oversized-payload_len boundary (record at exactly MAX_PAYLOAD_HARD_CAP must survive; one over must truncate) | `abe69c2` |
 | F20 | medium | worker-queue-metrics | Metrics HTTP server has no read/write timeout — slowloris permanently wedges the unauthenticated endpoint and blinds monitoring | `0530fd2` |
+| F21 | medium | worker-queue-metrics | Phase-2 coalesce starves co-located shards on a shared worker (worker_count < shard_count) | `9e5276a` |
 | F32 | medium | sink | ClickHouse response body read is not bounded by the sink's configured timeout (error path can hang to the drain backstop) | `7e15ac4` |
 | F34 | medium | sink | ClickHouse does not percent-decode URL credentials before HTTP basic auth (silent divergence from SQL sinks) | `7e15ac4` |
 | F38 | medium | sink | HTTP concurrency: no test asserts a transient mid-batch error actually cancels still-in-flight POSTs | `7daca2f` |
@@ -80,9 +81,7 @@ Quick index (full detail + recommendations in that file):
 
 ## 🟡 Queued safe fixes (in progress)
 
-| ID | Sev | Subsystem | Finding |
-|----|-----|-----------|---------|
-| F21 | medium | worker-queue-metrics | Phase-2 coalesce starves co-located shards on a shared worker (worker_count < shard_count) |
+_(all queued-safe fixes landed)_
 
 ## ⚪ Considered & dismissed
 
