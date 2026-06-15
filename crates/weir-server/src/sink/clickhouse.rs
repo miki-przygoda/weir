@@ -395,6 +395,9 @@ impl Sink for ClickHouseSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `is_transient` comes from the SinkError trait; bring it into scope for the
+    // commit() classification tests below.
+    use weir_sink_sdk::SinkError;
 
     fn p(s: &'static [u8]) -> Payload {
         Payload::from_static(s)
@@ -614,6 +617,170 @@ mod tests {
         assert_eq!(
             s.insert_query(),
             "INSERT INTO default.weir_records (payload) FORMAT RowBinary"
+        );
+    }
+
+    // ── commit() request/response classification (F37) ──────────────────────
+    //
+    // Previously commit() had zero in-process coverage — only an #[ignore]
+    // live-docker integration test — so a status-classification or dedup-token
+    // regression passed the running suite. These drive commit() against an
+    // in-process mock that captures the request line and returns a canned status.
+
+    /// Minimal HTTP/1.1 mock: replies to each request with `status_line` + `body`
+    /// and records every request line (method + target, which carries the query
+    /// string) in the returned buffer. `sleep_before` stalls the response to
+    /// exercise the timeout path.
+    async fn spawn_ch_mock(
+        status_line: &'static str,
+        body: &'static str,
+        sleep_before: Duration,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_task = std::sync::Arc::clone(&captured);
+        let response = format!(
+            "{status_line}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = std::sync::Arc::clone(&captured_task);
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let header_end = loop {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    break pos;
+                                }
+                            }
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let request_line = head.lines().next().unwrap_or("").to_string();
+                    // Drain the body so the client's send() completes cleanly.
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            let (n, v) = l.split_once(':')?;
+                            n.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let mut have = buf.len() - (header_end + 4);
+                    while have < content_length {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => have += n,
+                        }
+                    }
+                    captured.lock().unwrap().push(request_line);
+                    if !sleep_before.is_zero() {
+                        tokio::time::sleep(sleep_before).await;
+                    }
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        (url, captured)
+    }
+
+    #[tokio::test]
+    async fn commit_2xx_commits_batch_and_sends_query_and_dedup_token() {
+        let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
+        let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+        let result = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap();
+        assert_eq!(result.committed.len(), 2);
+        assert!(result.dead_lettered.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "expected exactly one POST");
+        // The INSERT query and the dedup token must be on the wire.
+        assert!(reqs[0].contains("query="), "no query param: {}", reqs[0]);
+        assert!(
+            reqs[0].contains("insert_deduplication_token="),
+            "no dedup token on the wire: {}",
+            reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_500_is_transient() {
+        let (url, _c) =
+            spawn_ch_mock("HTTP/1.1 500 Internal Server Error", "", Duration::ZERO).await;
+        let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        assert!(err.is_transient(), "500 must be transient: {err}");
+    }
+
+    #[tokio::test]
+    async fn commit_429_is_transient() {
+        let (url, _c) = spawn_ch_mock("HTTP/1.1 429 Too Many Requests", "", Duration::ZERO).await;
+        let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        assert!(err.is_transient(), "429 must be transient: {err}");
+    }
+
+    #[tokio::test]
+    async fn commit_4xx_is_permanent_with_detail() {
+        let (url, _c) = spawn_ch_mock(
+            "HTTP/1.1 400 Bad Request",
+            "Unknown column foo",
+            Duration::ZERO,
+        )
+        .await;
+        let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        assert!(!err.is_transient(), "400 must be permanent: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("400"), "{msg}");
+        assert!(msg.contains("Unknown column"), "detail dropped: {msg}");
+    }
+
+    #[tokio::test]
+    async fn commit_timeout_maps_to_timeout_error() {
+        // Server stalls 5s; the sink's 300ms timeout must fire first.
+        let (url, _c) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::from_secs(5)).await;
+        let mut c = cfg(&url, "weir_records", "payload");
+        c.timeout = Duration::from_millis(300);
+        let sink = ClickHouseSink::new(c).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), sink.commit(vec![p(b"a")]))
+            .await
+            .expect("commit must honour its own timeout, not hang")
+            .unwrap_err();
+        // A timeout is classified transient (retry the segment).
+        assert!(err.is_transient(), "timeout must be transient: {err}");
+    }
+
+    #[tokio::test]
+    async fn commit_empty_batch_makes_no_request() {
+        let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
+        let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+        let result = sink.commit(vec![]).await.unwrap();
+        assert!(result.committed.is_empty() && result.dead_lettered.is_empty());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "an empty batch must not POST"
         );
     }
 }
