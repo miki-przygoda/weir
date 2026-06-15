@@ -3,7 +3,7 @@
 //! Connects to a weir daemon's TCP+mTLS listener using the same aws-lc-rs
 //! provider and rustls 0.23 API that the server side uses.
 
-use std::{io::BufReader, net::TcpStream, path::Path, sync::Arc};
+use std::{io, io::BufReader, net::TcpStream, path::Path, sync::Arc, time::Duration};
 
 use rustls_pki_types::ServerName;
 use weir_core::Durability;
@@ -71,6 +71,20 @@ impl WeirClient<TlsStream> {
         let stream = rustls::StreamOwned::new(conn, sock);
 
         Ok(Self::from_parts(stream, cfg.default_durability))
+    }
+
+    /// Sets the read timeout on the underlying TCP socket. `None` (the default)
+    /// blocks indefinitely. Same opt-in availability rationale as the Unix
+    /// client's [`set_read_timeout`][WeirClient::set_read_timeout] — a wedged
+    /// daemon would otherwise block a producer forever in `read_response`.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.sock.set_read_timeout(timeout)
+    }
+
+    /// Sets the write timeout on the underlying TCP socket. `None` (the default)
+    /// blocks indefinitely. See [`set_read_timeout`][Self::set_read_timeout].
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.sock.set_write_timeout(timeout)
     }
 }
 

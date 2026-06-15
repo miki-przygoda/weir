@@ -2,6 +2,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::net::UnixStream,
     path::Path,
+    time::Duration,
 };
 
 use weir_core::{
@@ -78,7 +79,9 @@ impl From<io::Error> for ClientError {
 /// Drop the client to close the connection. The daemon treats EOF as a clean
 /// disconnect.
 pub struct WeirClient<S = UnixStream> {
-    stream: S,
+    // pub(crate) so the TLS connector (a sibling module) can reach the
+    // underlying TcpStream to apply socket timeouts (F43).
+    pub(crate) stream: S,
     default_durability: Option<Durability>,
 }
 
@@ -231,6 +234,29 @@ impl WeirClient<UnixStream> {
             default_durability: None,
         }
     }
+
+    /// Sets the read timeout on the underlying socket. `None` (the default)
+    /// blocks indefinitely.
+    ///
+    /// **Opt-in availability guard.** By default every method blocks in
+    /// [`read_response`][Self::push] waiting for the daemon's Ack/Nack, so a
+    /// wedged daemon (hung flusher, `SIGSTOP`, half-open connection) would block
+    /// a producer's hot path forever. With a read timeout set, a stalled reply
+    /// surfaces as a [`ClientError::Io`] timeout instead; the producer can retry
+    /// — the record may still have been durably written, which the at-least-once
+    /// contract covers. Pick a value comfortably above the daemon's Sync ack
+    /// latency under load: the daemon's own `ACK_TIMEOUT` is 30 s, so e.g.
+    /// 45–60 s lets the daemon's Nack win rather than racing it.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    /// Sets the write timeout on the underlying socket. `None` (the default)
+    /// blocks indefinitely. See [`set_read_timeout`][Self::set_read_timeout] for
+    /// the rationale — this bounds a stalled `write_all` of the request frame.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
+    }
 }
 
 fn nack_error(payload: &[u8]) -> ClientError {
@@ -327,5 +353,39 @@ mod tests {
             nack_error(&payload),
             ClientError::Nack(NackReason::PayloadTooLarge)
         ));
+    }
+
+    // ── F43: opt-in socket timeouts ───────────────────────────────────────────
+
+    #[test]
+    fn set_read_timeout_applies_to_socket() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let c = WeirClient::from_stream(a);
+        c.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        assert_eq!(
+            c.stream.read_timeout().unwrap(),
+            Some(Duration::from_millis(250))
+        );
+        // None clears it back to blocking.
+        c.set_read_timeout(None).unwrap();
+        assert_eq!(c.stream.read_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_silent_daemon_instead_of_blocking_forever() {
+        // `_b` is the daemon end: it's held open (so the connection stays up)
+        // but never replies. Without a read timeout, push would block forever.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        c.set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        // push writes the (tiny) frame, then blocks reading the reply that never
+        // comes → the timeout fires → an Io error rather than an indefinite hang.
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::Io(_)),
+            "expected Io timeout, got {err:?}"
+        );
     }
 }
