@@ -65,6 +65,17 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
         if !shard_path.is_dir() {
             continue;
         }
+        // Skip the daemon's reserved subdirs — they aren't shards. dead_letter/
+        // (dl_*.wab.sealed) has its own weir_dead_letter_bytes_on_disk gauge, and
+        // quarantine/ holds forensic .wab.sealed copies; counting either here
+        // would double-count live-segment bytes (G15, mirrors recovery's skip).
+        let dir_name = shard_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if dir_name == "dead_letter" || dir_name == "quarantine" {
+            continue;
+        }
         let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
             continue;
         };
@@ -751,5 +762,35 @@ mod tuning_tests {
         assert_eq!(recommended_agent_count(16), 7);
         // 32-core: 30 / 2 = 15.
         assert_eq!(recommended_agent_count(32), 15);
+    }
+}
+
+#[cfg(test)]
+mod wab_bytes_tests {
+    use super::compute_wab_bytes_on_disk;
+
+    /// G15: the gauge counts only live shard-segment bytes — the dead_letter/ and
+    /// quarantine/ reserved subdirs (which carry .wab.sealed files too) must be
+    /// skipped, or their bytes would be double-counted against their own gauges.
+    #[test]
+    fn compute_wab_bytes_skips_dead_letter_and_quarantine() {
+        let root = std::env::temp_dir().join(format!("weir_g15_{}", std::process::id()));
+        let shard = root.join("shard_00");
+        let dl = root.join("dead_letter");
+        let q = root.join("quarantine");
+        for d in [&shard, &dl, &q] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // 100 live shard bytes; 999 in dead_letter; 999 in quarantine.
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        std::fs::write(dl.join("dl_00000001.wab.sealed"), vec![0u8; 999]).unwrap();
+        std::fs::write(q.join("shard_00__seg_00000001.wab.sealed"), vec![0u8; 999]).unwrap();
+
+        assert_eq!(
+            compute_wab_bytes_on_disk(&root),
+            100,
+            "only live shard segments count; dead_letter + quarantine are skipped"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

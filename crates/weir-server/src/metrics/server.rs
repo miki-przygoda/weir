@@ -18,6 +18,11 @@ use tokio::{
     sync::Semaphore,
     task::JoinHandle,
 };
+use tracing::debug;
+
+/// Backoff after an accept() error, to avoid a hot spin on a persistent
+/// condition (e.g. EMFILE) while keeping metrics exposition alive.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Per-connection I/O deadline for a scrape. A scrape is a single tiny request
 /// and a small response against a local Prometheus; anything slower than this is
@@ -52,8 +57,18 @@ pub(crate) fn spawn(
 async fn serve(listener: TcpListener, registry: Arc<Registry>, max_connections: usize) {
     let semaphore = Arc::new(Semaphore::new(max_connections));
     loop {
-        let Ok((stream, _peer)) = listener.accept().await else {
-            return;
+        let (stream, _peer) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                // A transient accept error (ECONNABORTED, or resource exhaustion
+                // like EMFILE) must NOT take metrics exposition down permanently —
+                // the previous `else { return }` did exactly that. Log, back off
+                // briefly to avoid a hot spin on a persistent error, and continue;
+                // Prometheus retries on its next scrape regardless (G14).
+                debug!(error = %e, "metrics: accept error; backing off and continuing");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
         };
         // try_acquire_owned never blocks; if the cap is reached we drop the
         // connection immediately. Prometheus will retry on its next scrape
