@@ -565,6 +565,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn debug_redacts_bearer_token_and_url_password() {
+        // Lock the credential-redaction contract: neither the bearer token nor a
+        // URL password may appear in Debug output (S30 / S25).
+        let mut c = cfg("https://user:sup3rS3cret@example.com/ingest");
+        c.bearer_token = Some(Arc::from("t0p-s3cret-token"));
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("t0p-s3cret-token"),
+            "bearer token leaked in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("sup3rS3cret"),
+            "URL password leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+    }
+
     #[tokio::test]
     async fn empty_url_rejected_at_build() {
         let mut c = cfg("");

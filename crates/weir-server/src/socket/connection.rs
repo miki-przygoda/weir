@@ -607,6 +607,64 @@ mod tests {
         client
     }
 
+    /// Spawns a handler whose flusher resolves each work unit's ack oneshot with
+    /// `ack` — `Some(true)` = durable, `Some(false)` = write/fsync failed, `None`
+    /// = drop the unit (and its sender) without responding, modelling a flusher
+    /// panic. Used to exercise the non-durable → Nack(InternalError) paths (S14).
+    async fn spawn_handler_acking(cfg: ConnectionConfig, ack: Option<bool>) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+
+        std::thread::spawn(move || {
+            let rx = queue_rx.get(0);
+            while let Ok(unit) = rx.recv() {
+                match ack {
+                    Some(b) => {
+                        let _ = unit.ack_tx.send(b);
+                    }
+                    None => drop(unit), // drop the sender without responding
+                }
+            }
+        });
+
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            never_shutdown_rx(),
+        ));
+        client
+    }
+
+    #[tokio::test]
+    async fn false_ack_from_flusher_returns_internal_error_nack() {
+        let mut client = spawn_handler_acking(test_cfg(), Some(false)).await;
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(
+            payload[0],
+            NackReason::InternalError as u8,
+            "a non-durable (ack=false) flusher outcome must Nack(InternalError), never Ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_ack_sender_returns_internal_error_nack() {
+        let mut client = spawn_handler_acking(test_cfg(), None).await;
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(
+            payload[0],
+            NackReason::InternalError as u8,
+            "a dropped ack sender (flusher panic) must Nack(InternalError), never Ack"
+        );
+    }
+
     /// Encodes a complete Push frame (header + payload + payload CRC).
     fn push_frame(payload: &[u8]) -> Vec<u8> {
         let header = Header::new(MessageType::Push, Durability::Sync, 0);

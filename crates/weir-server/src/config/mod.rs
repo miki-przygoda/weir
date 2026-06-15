@@ -701,6 +701,10 @@ impl Config {
                             reason: concat!($fname, " is required when tcp_bind is set")
                                 .to_string(),
                         })?;
+                        // Format-validate (absolute, no `..`, no null bytes) like
+                        // socket_path/wab_dir, which the TLS paths previously skipped
+                        // (S42), before the existence check.
+                        validate_path_format($fname, path)?;
                         if !path.exists() {
                             return Err(ConfigError::InvalidValue {
                                 field: $fname,
