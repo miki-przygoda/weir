@@ -1604,6 +1604,32 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // ── S03: the CommitResult partition guard (F02 false-ack defense) ────────────
+    #[test]
+    fn under_accounting_commit_result_is_transient_not_ok() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("s03_underaccount");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        // A non-conforming sink whose committed ∪ dead_lettered covers only 1 of
+        // the 2 input records. The drain must refuse to confirm (Transient), never
+        // Ok — confirming would delete the segment with the dropped record neither
+        // delivered nor dead-lettered (the F02 partition guard).
+        let sink = MockSink::with_responses([Ok(CommitResult::new(
+            vec![Payload::from(b"only-one".as_ref())],
+            vec![],
+        ))]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let payloads = vec![Payload::from(b"r1".as_ref()), Payload::from(b"r2".as_ref())];
+
+        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        assert!(
+            matches!(result, BatchResult::Transient { .. }),
+            "an under-accounting CommitResult must be Transient (preserve segment), not Ok"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     // ── B2: an open failure must not silently confirm+delete a good segment ──
     // SegmentReader::open fails on transient I/O (fd exhaustion, ENOMEM) as well
     // as on permanent corruption. The old code returned Confirmed{0} for ANY open
