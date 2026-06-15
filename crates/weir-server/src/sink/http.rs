@@ -492,6 +492,38 @@ mod tests {
         None
     }
 
+    /// Reads a full HTTP request off `socket` and returns its body bytes (the
+    /// raw payload the sink POSTed). Returns an empty Vec if the connection
+    /// closes before the headers complete (e.g. the client cancelled the POST).
+    /// Lets content-routing mock servers decide the response per record so a
+    /// test can pin which payload got which outcome.
+    async fn read_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end = loop {
+            match socket.read(&mut tmp).await {
+                Ok(0) | Err(_) => return Vec::new(),
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = find_double_crlf(&buf) {
+                        break pos;
+                    }
+                }
+            }
+        };
+        let header_str = String::from_utf8_lossy(&buf[..header_end]);
+        let content_length = parse_content_length(&header_str).unwrap_or(0);
+        let mut body = buf[header_end + 4..].to_vec();
+        while body.len() < content_length {
+            match socket.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&tmp[..n]),
+            }
+        }
+        body.truncate(content_length);
+        body
+    }
+
     fn cfg(url: &str) -> HttpSinkConfig {
         HttpSinkConfig {
             url: url.to_string(),
@@ -682,8 +714,11 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_batch_committed_and_dead_lettered() {
-        // First request 200, second 400, third 200. Order of records in the
-        // batch determines which gets which response.
+        // This server cycles responses by request ARRIVAL order, which under
+        // concurrency 8 is non-deterministic — so this test pins only the COUNTS
+        // (2 committed, 1 dead-lettered). Record↔outcome pairing is pinned by
+        // http_pairs_each_record_with_its_own_outcome_under_concurrency (F39),
+        // which routes responses on request content instead.
         let (url, _counter) = spawn_mock_server(vec![
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
@@ -708,6 +743,124 @@ mod tests {
         let sink = HttpSink::new(cfg(&url)).unwrap();
         let err = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap_err();
         assert!(err.is_transient());
+    }
+
+    /// F39: under concurrency the completion order of POSTs is non-deterministic,
+    /// so a count-only assertion can't catch a record↔outcome mis-pairing. This
+    /// mock routes the response on request CONTENT (400 for b"bad", 200 else) and
+    /// asserts the RIGHT payload lands in committed vs dead_lettered.
+    #[tokio::test]
+    async fn http_pairs_each_record_with_its_own_outcome_under_concurrency() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let body = read_request_body(&mut socket).await;
+                    let response = if body == b"bad" {
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\n\r\nno!"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let mut c = cfg(&url);
+        c.concurrency = 8;
+        let sink = HttpSink::new(c).unwrap();
+        let result = sink
+            .commit(vec![p(b"good-1"), p(b"bad"), p(b"good-2")])
+            .await
+            .unwrap();
+
+        // committed holds exactly the two good payloads, in submission order
+        // (buffered preserves order even though POSTs complete out of order).
+        assert_eq!(result.committed, vec![p(b"good-1"), p(b"good-2")]);
+        // dead_lettered holds exactly the bad payload, with its 400 reason.
+        assert_eq!(result.dead_lettered.len(), 1);
+        assert_eq!(result.dead_lettered[0].0, p(b"bad"));
+        assert!(
+            result.dead_lettered[0].1.contains("400"),
+            "reason: {}",
+            result.dead_lettered[0].1
+        );
+    }
+
+    /// F38: a transient error early in the batch must CANCEL the still-in-flight
+    /// POSTs (the buffered stream is dropped on the early return), not wait them
+    /// out. The mock returns 500 immediately for b"boom" and stalls 10 s for any
+    /// other body; with boom first and concurrency >= batch size, commit must
+    /// return Err well under 10 s, and the stalled POSTs must never complete.
+    #[tokio::test]
+    async fn http_transient_cancels_in_flight_posts() {
+        const SLOW: Duration = Duration::from_secs(10);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_task = Arc::clone(&completed);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let completed = Arc::clone(&completed_task);
+                tokio::spawn(async move {
+                    let body = read_request_body(&mut socket).await;
+                    if body == b"boom" {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                            )
+                            .await;
+                    } else {
+                        // Stall: respond only after SLOW. If the client cancels the
+                        // in-flight POST, this socket closes and we never reach the
+                        // increment — exactly what the test asserts.
+                        tokio::time::sleep(SLOW).await;
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                    let _ = socket.shutdown().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        let mut c = cfg(&url);
+        c.concurrency = 8;
+        let sink = HttpSink::new(c).unwrap();
+        // boom FIRST: `buffered` yields results in submission order, so its 500 is
+        // observed before the stalled ones, triggering the early-return + drop.
+        let batch = vec![p(b"boom"), p(b"slow-1"), p(b"slow-2"), p(b"slow-3")];
+
+        let start = tokio::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(3), sink.commit(batch))
+            .await
+            .expect("commit must return promptly, not wait out the stalled in-flight POSTs")
+            .unwrap_err();
+        assert!(err.is_transient(), "expected transient error, got: {err}");
+        assert!(
+            start.elapsed() < SLOW,
+            "commit waited on the stalled POSTs instead of cancelling them"
+        );
+
+        // Grace period far shorter than SLOW: only boom should have completed;
+        // the stalled POSTs must have been cancelled, not awaited.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "stalled in-flight POSTs were not cancelled on the transient error"
+        );
     }
 
     // ── Idempotency key tests ─────────────────────────────────────────────
