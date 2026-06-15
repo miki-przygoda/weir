@@ -1,0 +1,482 @@
+{
+  "F01": {
+    "title": "Partial dead-letter write leaves an orphan active file that poisons all future dead-lettering (within-run create_new collision)",
+    "subsystem": "drain",
+    "severity": "high",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F02": {
+    "title": "Drain confirms+deletes a segment without verifying CommitResult covers every input record (committed + dead_lettered may not partition the batch)",
+    "subsystem": "drain",
+    "severity": "high",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F03": {
+    "title": "Single permanently-rejected batch larger than dead_letter_max_bytes wedges the drain in a permanent block\u2194retry livelock",
+    "subsystem": "drain",
+    "severity": "medium",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F04": {
+    "title": "Sink::health() is called with no timeout backstop; a hanging health() stalls the entire drain",
+    "subsystem": "drain",
+    "severity": "medium",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F05": {
+    "title": "Retried multi-batch segment re-dead-letters earlier sub-batches, amplifying duplicate dead-letter files and thrashing the cap",
+    "subsystem": "drain",
+    "severity": "medium",
+    "fix_class": "redesign",
+    "status": "queued",
+    "note": ""
+  },
+  "F06": {
+    "title": "Dead-letter total_bytes silently undercounts on metadata() failure, bypassing the dead_letter_max_bytes cap",
+    "subsystem": "drain",
+    "severity": "medium",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F07": {
+    "title": "Dead-letter cap accounting omits fixed 60-byte per-file segment overhead, so dead_letter_max_bytes can be exceeded",
+    "subsystem": "drain",
+    "severity": "low",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F08": {
+    "title": "Swallowed rescan() error can wedge the drain blocked despite an operator-freed dead-letter directory",
+    "subsystem": "drain",
+    "severity": "low",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F09": {
+    "title": "dead_letter_full counter and blocked_since reset on every unblock\u2192reblock cycle, inflating the metric and resetting blocked-duration",
+    "subsystem": "drain",
+    "severity": "low",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F10": {
+    "title": ".confirmed sidecar created without explicit 0o600 mode, tripping the daemon's own recovery mode audit under any non-0o077 umask",
+    "subsystem": "drain",
+    "severity": "low",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F11": {
+    "title": "DeadLetterWriter has zero unit tests; scan_dir counter-recovery across restart is untested",
+    "subsystem": "drain",
+    "severity": "high",
+    "fix_class": "test",
+    "status": "queued",
+    "note": ""
+  },
+  "F12": {
+    "title": "Segment counter resets to 1 after crash recovery; the new run's seal()-rename silently overwrites a still-undrained recovered .wab.sealed segment (data loss, crown-invariant violation)",
+    "subsystem": "wab",
+    "severity": "critical",
+    "fix_class": "bug-fix",
+    "status": "fixed",
+    "note": "fb02a62"
+  },
+  "F13": {
+    "title": "segment_counters stale doc",
+    "subsystem": "wab",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "fixed",
+    "note": "fb02a62 (folded into F12)"
+  },
+  "F14": {
+    "title": "recover_segment renames .wab -> .wab.sealed without fsync_parent_dir, unlike WabSegment::seal \u2014 recovered seal not crash-durable",
+    "subsystem": "wab",
+    "severity": "medium",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F15": {
+    "title": "replay_unconfirmed silently skips sealed-but-unconfirmed segments on a per-entry DirEntry error (filter_map(|e| e.ok()))",
+    "subsystem": "wab",
+    "severity": "medium",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F16": {
+    "title": "recover_open_segments processes the dead_letter/ directory as if it were a shard directory",
+    "subsystem": "wab",
+    "severity": "low",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F17": {
+    "title": "Recovery: no test for the oversized-payload_len boundary (record at exactly MAX_PAYLOAD_HARD_CAP must survive; one over must truncate)",
+    "subsystem": "wab",
+    "severity": "medium",
+    "fix_class": "test",
+    "status": "queued",
+    "note": ""
+  },
+  "F18": {
+    "title": "Recovery: the partial-seal sentinel branch during crash recovery is untested",
+    "subsystem": "wab",
+    "severity": "low",
+    "fix_class": "test",
+    "status": "queued",
+    "note": ""
+  },
+  "F19": {
+    "title": "macOS data fsync uses F_BARRIERFSYNC (barrier) while directory durability uses plain fsync via sync_all \u2014 weaker than F_FULLFSYNC; an explicit, undertested tradeoff on the crown durability path",
+    "subsystem": "wab",
+    "severity": "info",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F20": {
+    "title": "Metrics HTTP server has no read/write timeout \u2014 slowloris permanently wedges the unauthenticated endpoint and blinds monitoring",
+    "subsystem": "worker-queue-metrics",
+    "severity": "medium",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F21": {
+    "title": "Phase-2 coalesce starves co-located shards on a shared worker (worker_count < shard_count)",
+    "subsystem": "worker-queue-metrics",
+    "severity": "medium",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F22": {
+    "title": "accept_latency histogram uses 1ms-floor buckets for a sub-millisecond measurement",
+    "subsystem": "worker-queue-metrics",
+    "severity": "low",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F23": {
+    "title": "flush_shard 'WAB is shutting down' comment misdescribes the permanent-shard-offline case",
+    "subsystem": "worker-queue-metrics",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F24": {
+    "title": "QueueSender exposes len() with no is_empty()",
+    "subsystem": "worker-queue-metrics",
+    "severity": "info",
+    "fix_class": "decision",
+    "status": "queued",
+    "note": ""
+  },
+  "F25": {
+    "title": "UnknownMessageType/UnknownDurability decode errors are nacked as the (documented-as-transient, keep-connection-open) InternalError reason, yet the connection is closed",
+    "subsystem": "socket",
+    "severity": "medium",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F26": {
+    "title": "Payload and CRC reads are not raced against handler_shutdown, so a mid-frame stall holds a semaphore permit until read_timeout during graceful shutdown",
+    "subsystem": "socket",
+    "severity": "low",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F27": {
+    "title": "Payload/CRC read timeout is a whole-transfer deadline but is documented and metered as a per-byte idle timeout",
+    "subsystem": "socket",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F28": {
+    "title": "Shutdown-time socket removal is path-based (std::fs::remove_file), inconsistent with the hardened unlinkat-based startup cleanup",
+    "subsystem": "socket",
+    "severity": "low",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F29": {
+    "title": "TLS handshake is not raced against handler_shutdown, so in-flight handshakes block graceful drain up to handshake_timeout",
+    "subsystem": "socket",
+    "severity": "low",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F30": {
+    "title": "umask save/restore in bind_hardened has no RAII guard; an unwind between set and restore would leak the tightened 0o177 umask process-wide",
+    "subsystem": "socket",
+    "severity": "low",
+    "fix_class": "refactor",
+    "status": "queued",
+    "note": ""
+  },
+  "F31": {
+    "title": "MySQL sink dead-letters live data on a recoverable connection-time auth/access failure (asymmetric with Postgres)",
+    "subsystem": "sink",
+    "severity": "high",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F32": {
+    "title": "ClickHouse response body read is not bounded by the sink's configured timeout (error path can hang to the drain backstop)",
+    "subsystem": "sink",
+    "severity": "medium",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F33": {
+    "title": "ClickHouse split_credentials leaves username-only userinfo in base_url, contradicting the struct invariant",
+    "subsystem": "sink",
+    "severity": "low",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F34": {
+    "title": "ClickHouse does not percent-decode URL credentials before HTTP basic auth (silent divergence from SQL sinks)",
+    "subsystem": "sink",
+    "severity": "medium",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F35": {
+    "title": "ClickHouse content-derived dedup token silently breaks idempotency if sink_max_batch_size changes across a restart",
+    "subsystem": "sink",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F36": {
+    "title": "ClickHouse RowBinary encoding silently assumes a plain String column with no config validation and contract buried in a private fn comment",
+    "subsystem": "sink",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F37": {
+    "title": "ClickHouse sink commit() request/response classification has no in-process test (only an #[ignore] live-docker integration test)",
+    "subsystem": "sink",
+    "severity": "high",
+    "fix_class": "test",
+    "status": "queued",
+    "note": ""
+  },
+  "F38": {
+    "title": "HTTP concurrency: no test asserts a transient mid-batch error actually cancels still-in-flight POSTs",
+    "subsystem": "sink",
+    "severity": "medium",
+    "fix_class": "test",
+    "status": "queued",
+    "note": ""
+  },
+  "F39": {
+    "title": "HTTP concurrency: no test pins record-to-outcome pairing (right payload in committed vs dead_lettered) under concurrent POSTs",
+    "subsystem": "sink",
+    "severity": "medium",
+    "fix_class": "test",
+    "status": "queued",
+    "note": ""
+  },
+  "F40": {
+    "title": "weir-ctl `dl list` / `dl drop` silently see zero dead-letter segments (wrong suffix filter)",
+    "subsystem": "client-sdk-ctl",
+    "severity": "high",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F41": {
+    "title": "CommitResult partition invariant (committed \u222a dead_lettered = batch) is unenforced; the drain confirms+deletes the segment unconditionally on Ok",
+    "subsystem": "client-sdk-ctl",
+    "severity": "high",
+    "fix_class": "redesign",
+    "status": "queued",
+    "note": ""
+  },
+  "F42": {
+    "title": "SinkRecord::into_payload is documented as the dead-letter recovery path but is bypassed for whole-batch permanent (and transient) errors",
+    "subsystem": "client-sdk-ctl",
+    "severity": "high",
+    "fix_class": "redesign",
+    "status": "queued",
+    "note": ""
+  },
+  "F43": {
+    "title": "Blocking client sets no socket read/write/connect timeouts; a wedged daemon blocks producers indefinitely",
+    "subsystem": "client-sdk-ctl",
+    "severity": "medium",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F44": {
+    "title": "Client read_response allocates vec![0u8; payload_len] without the MAX_PAYLOAD_HARD_CAP guard the server applies before allocating",
+    "subsystem": "client-sdk-ctl",
+    "severity": "medium",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F45": {
+    "title": "weir-sink-sdk re-export doc describes Payload as bytes::Bytes, contradicting the R1 newtype rationale",
+    "subsystem": "client-sdk-ctl",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F46": {
+    "title": "SDK doc overstates that health() is called after every commit attempt",
+    "subsystem": "client-sdk-ctl",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F47": {
+    "title": "Client discards the daemon-version byte the server sends on a VersionMismatch Nack",
+    "subsystem": "client-sdk-ctl",
+    "severity": "low",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F48": {
+    "title": "Public error enums and CommitResult are not #[non_exhaustive]; adding any variant/field after 1.0 is a breaking change",
+    "subsystem": "core",
+    "severity": "medium",
+    "fix_class": "decision",
+    "status": "queued",
+    "note": ""
+  },
+  "F49": {
+    "title": "Envelope::new silently truncates payload length via payload.len() as u32, falsifying the documented 'cannot desync' invariant",
+    "subsystem": "core",
+    "severity": "low",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F50": {
+    "title": "Header::new takes a payload_len argument that Envelope::new always overwrites \u2014 an API that invites desync",
+    "subsystem": "core",
+    "severity": "low",
+    "fix_class": "decision",
+    "status": "queued",
+    "note": ""
+  },
+  "F51": {
+    "title": "Payload newtype: PartialEq impls and the Borrow<[u8]> hashmap-key contract are untested",
+    "subsystem": "core",
+    "severity": "low",
+    "fix_class": "test",
+    "status": "queued",
+    "note": ""
+  },
+  "F52": {
+    "title": "Reserved flags byte is preserved verbatim on decode but never validated to be zero, foreclosing in-version flag evolution",
+    "subsystem": "core",
+    "severity": "info",
+    "fix_class": "decision",
+    "status": "queued",
+    "note": ""
+  },
+  "F53": {
+    "title": "shard_count in 65..=256 with defaulted worker_count rejects a documented, in-range config with a misleading error",
+    "subsystem": "config",
+    "severity": "high",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F54": {
+    "title": "Config-time warn! calls are silently dropped (tracing subscriber initialized after Config::load)",
+    "subsystem": "config",
+    "severity": "medium",
+    "fix_class": "bug-fix",
+    "status": "queued",
+    "note": ""
+  },
+  "F55": {
+    "title": "Feature-gated [server] keys are silently dropped: in KNOWN_SERVER_KEYS but absent from RawConfig on builds without the feature",
+    "subsystem": "config",
+    "severity": "low",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F56": {
+    "title": "HELP advertises feature-gated CLI flags that fail as generic 'unknown arguments' when the feature is off, with no feature hint",
+    "subsystem": "config",
+    "severity": "low",
+    "fix_class": "doc",
+    "status": "queued",
+    "note": ""
+  },
+  "F57": {
+    "title": "Boolean env/CLI values accept only exactly 'true'/'false'; '1', '0', 'TRUE' abort startup",
+    "subsystem": "config",
+    "severity": "low",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F58": {
+    "title": "log_level is never validated; invalid or empty values silently degrade or disable logging",
+    "subsystem": "config",
+    "severity": "low",
+    "fix_class": "error-handling",
+    "status": "queued",
+    "note": ""
+  },
+  "F59": {
+    "title": "Config derives Debug, exposing sink_url credentials, inconsistent with the project's deliberate bearer_token redaction",
+    "subsystem": "config",
+    "severity": "low",
+    "fix_class": "guard",
+    "status": "queued",
+    "note": ""
+  },
+  "F60": {
+    "title": "u64 durations range-checked via `as usize` truncate on 32-bit targets, letting out-of-range values pass",
+    "subsystem": "config",
+    "severity": "info",
+    "fix_class": "refactor",
+    "status": "queued",
+    "note": ""
+  }
+}

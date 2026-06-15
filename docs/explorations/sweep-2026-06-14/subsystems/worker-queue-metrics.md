@@ -1,0 +1,39 @@
+# Sweep 2026-06-14 — worker-queue-metrics subsystem
+
+All five findings hold against the code: 4 are real defects (1 medium availability, 1 medium correctness/latency, 2 low observability/doc) and 1 is a real info-level API-design wart — none refuted.
+
+## Confirmed (real)
+
+### 1. Metrics HTTP server has no read/write timeout — slowloris permanently wedges the unauthenticated endpoint
+- **File:** `crates/weir-server/src/metrics/server.rs:67`
+- **Severity:** medium (kept)
+- **Argument:** `handle()` does a single untimed `stream.read(&mut buf).await` (server.rs:67) and untimed `write_all`s (server.rs:87-88). The only bound is the `max_connections` semaphore (default `metrics_max_connections = 8`, config/mod.rs:464; range 1..=1024 at 465). The owned permit is held for the whole connection lifetime and released only after read+encode+write (server.rs:57-60: `handle(...).await; drop(permit);`). A peer that completes the handshake and sends nothing parks the handler forever at line 67 holding its permit; `metrics_max_connections` such silent connections exhaust the pool, after which `serve()` keeps accepting but every scrape hits `try_acquire_owned() -> Err` (server.rs:52) and is dropped — the observability endpoint is permanently dead with no self-recovery until restart. The same wedge occurs on the write side. The data-path socket handler WAS hardened against exactly this: `connection.rs:109/195/213` wrap every `read_exact` in `tokio::time::timeout(config.read_timeout, ...)`, bump `connection_idle_timeout` (registered at metrics/mod.rs:319-323), and there is even a dedicated test `read_timeout_drops_idle_connection_before_header` (connection.rs:823). The metrics endpoint never got the equivalent. Default bind is `127.0.0.1` (config/mod.rs:257-263), but config explicitly permits `0.0.0.0`, making this remotely exploitable when an operator least wants to lose metrics.
+- **Verdict:** **real** — `serve()`/`handle()` (server.rs:43-89) contain zero `tokio::time::timeout`; the test `endpoint_caps_concurrent_connections` (server.rs:155-189) deliberately holds the permit "indefinitely" with a silent conn1, baking the unbounded park in as expected behavior, while the data path guards the identical case at connection.rs:109.
+
+### 2. Phase-2 coalesce starves co-located shards on a shared worker (worker_count < shard_count)
+- **File:** `crates/weir-server/src/worker.rs:122`
+- **Severity:** medium (kept)
+- **Argument:** worker_count < shard_count is explicitly supported — shard_count range 1..=256 (config/mod.rs:395), worker_count range 1..=64 (config/mod.rs:398), and config/mod.rs:243-249 documents the sub-worker case as "still correct, lower parallelism per shard" with routing `worker_idx = shard_id % worker_count`. One worker then owns multiple shard buffers. In `run()`, the `window` is computed once per outer batch (worker.rs:91-95) and phase 2 (worker.rs:122-131) does `while let Ok(unit) = work_rx.recv_timeout(window)`, re-arming a fresh `window` on every received record; inside it `flush_shard` fires only for the just-received unit's shard and only at `batch_size`. `flush_all()` runs only after the loop exits (worker.rs:135). So if producer A floods shard X (X and Y co-located via `shard_id % buffers.len()`, worker.rs:97/111/125), the loop keeps draining X's burst and never breaks until A pauses for a full `window` (max COALESCE_MAX_US = 2 ms gap, worker.rs:27). A single record already buffered for quiet shard Y sits in `buffers[Y]` unflushed for the entire duration of X's burst — and its producer's ack is delayed for that whole time. This is cross-shard head-of-line latency coupling, unbounded by `batch_deadline` (the loop persists across arbitrarily many sub-2ms-gap recvs), and undocumented (the config doc claims sub-worker configs are merely "lower parallelism per shard").
+- **Verdict:** **real** — phase 2 loop (worker.rs:122-131) re-arms `window` per record and `flush_all()` is gated behind loop exit (worker.rs:135), so a sustained burst on one co-located shard delays a sibling shard's buffered record for the burst's full length, not bounded by `batch_deadline`.
+
+### 3. accept_latency histogram uses 1ms-floor buckets for a sub-millisecond measurement
+- **File:** `crates/weir-server/src/metrics/mod.rs:314`
+- **Severity:** low (kept)
+- **Argument:** `weir_accept_latency_seconds` is registered with `LATENCY_BUCKETS` (mod.rs:314-315), whose smallest bucket is 0.001 s / 1 ms (mod.rs:273). It is observed at socket/mod.rs:203 as `accept_start.elapsed()` where `accept_start = Instant::now()` at socket/mod.rs:144 — spanning only accept(2) -> `try_acquire_owned` -> clones -> `join_set.spawn`, all pure CPU work (single-digit-to-tens of microseconds). Virtually every observation lands in the `<=1ms` bucket, giving no usable percentile resolution. The code already solved this exact "tens of microseconds, far below LATENCY_BUCKETS' 1 ms floor" problem with `STAGE_BUCKETS` (mod.rs:277-281), but STAGE_BUCKETS is gated behind `#[cfg(feature = "bench-trace")]` (mod.rs:277), so accept_latency needs an always-compiled microsecond-scale bucket set.
+- **Verdict:** **real** — accept_latency is wired to LATENCY_BUCKETS (1 ms floor, mod.rs:273) while measuring microsecond-scale accept-to-spawn CPU work (socket/mod.rs:144→203); the finer STAGE_BUCKETS is bench-trace-gated so the fix needs a new always-on constant.
+
+### 4. flush_shard "WAB is shutting down" comment misdescribes the permanent-shard-offline case
+- **File:** `crates/weir-server/src/worker.rs:168`
+- **Severity:** low (kept)
+- **Argument:** `flush_shard` ends `.ok(); // receiver gone means WAB is shutting down; discard silently` (worker.rs:168). But per the G-QUEUE-1 test (worker.rs:536-576, `offline_shard_nacks_records_without_panicking`), the receiver also disappears when a flusher has panic-capped-out and its shard is permanently offline while the daemon keeps running. In that case every batch routed to the shard is silently dropped here — correctly nacking via the dropped `ack_tx` carried inside the Batch (the test asserts the producer sees `TryRecvError::Closed`, i.e. a Nack, never a false `true`). The behavior is correct, but the comment frames a recurring steady-state data-path condition as a one-time shutdown event, which can mislead a maintainer into assuming silent drops only happen at teardown.
+- **Verdict:** **real** — comment at worker.rs:168 says the dropped receiver "means WAB is shutting down", but the G-QUEUE-1 test (worker.rs:536-576) proves the same path runs at steady state against a permanently-offline shard; correct behavior, inaccurate comment.
+
+## Refuted / dismissed
+
+(none — all four above are confirmed; the finding below is a real but info-level design note, not a defect.)
+
+### 5. QueueSender exposes len() with no is_empty()
+- **File:** `crates/weir-server/src/queue.rs:55`
+- **Severity:** info (kept)
+- **Argument:** `QueueSender::len()` is public (queue.rs:55-57) and consumed by the `weir_queue_depth` metric poll (per its doc comment, queue.rs:53-54); there is no companion `is_empty()` (grep for `is_empty` in queue.rs: none). This is the classic `clippy::len_without_is_empty` wart. It is not currently caught because weir-server has no clippy lint config — no `[lints]` table in any Cargo.toml and no `#![deny(clippy::...)]` in lib.rs (confirmed by grep). It will surface the moment a workspace clippy gate is added before 1.0. Additionally `len()` sums `t.len()` across all partition senders (queue.rs:56), so it is a cross-partition in-flight total, not a collection slot count — mildly misleading naming. Low-risk to add `is_empty()` or rename, but worth a deliberate decision before the API freezes at 1.0.
+- **Verdict:** **real** (info) — `len()` exists at queue.rs:55-57 with no `is_empty()` and no clippy gate present anywhere in the workspace, so the lint is latent; it is an API-design decision to make before the 1.0 freeze, not a runtime defect.
