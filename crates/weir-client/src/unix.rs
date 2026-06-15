@@ -83,6 +83,13 @@ pub struct WeirClient<S = UnixStream> {
     // underlying TcpStream to apply socket timeouts (F43).
     pub(crate) stream: S,
     default_durability: Option<Durability>,
+    /// Set once a response read fails (a timeout mid-frame, a partial/aborted
+    /// read, or a protocol violation). The stream is then in an indeterminate
+    /// state — leftover bytes from the aborted response could be mis-read as the
+    /// NEXT request's reply, acking a record the daemon never confirmed (a false
+    /// ack). Once poisoned, every method fails fast; the caller must reconnect
+    /// (G04).
+    poisoned: bool,
 }
 
 // ── Shared methods over any blocking Read+Write transport ──────────────────────
@@ -103,6 +110,7 @@ impl<S: Read + Write> WeirClient<S> {
         payload: impl AsRef<[u8]>,
         durability: Durability,
     ) -> Result<(), ClientError> {
+        self.ensure_usable()?;
         // copy_from_slice at the API boundary so downstream handling is zero-copy.
         let payload = weir_core::Payload::copy_from_slice(payload.as_ref());
         let len = payload.len() as u32;
@@ -137,6 +145,7 @@ impl<S: Read + Write> WeirClient<S> {
     /// `HealthCheckResponse`. Returns an error if the daemon is unreachable
     /// or responds with a Nack.
     pub fn health_check(&mut self) -> Result<(), ClientError> {
+        self.ensure_usable()?;
         let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0, 0);
         let frame = Envelope::new(header, vec![]).encode();
         self.stream.write_all(&frame)?;
@@ -151,7 +160,34 @@ impl<S: Read + Write> WeirClient<S> {
         }
     }
 
+    /// Returns the poisoned-connection error if a prior response read failed.
+    /// Once poisoned the stream may hold leftover bytes from an aborted response
+    /// that would be mis-read as this call's reply — a false ack — so we refuse
+    /// to use it (G04). The caller must drop the client and reconnect.
+    fn ensure_usable(&self) -> Result<(), ClientError> {
+        if self.poisoned {
+            return Err(ClientError::Protocol(
+                "client connection poisoned by a prior response-read error/timeout; \
+                 drop this client and reconnect before sending again"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_response(&mut self) -> Result<Envelope, ClientError> {
+        // Any failure here leaves the stream in an indeterminate state (a timeout
+        // mid-frame, a partial/aborted read, or a protocol violation): the unread
+        // tail of this response could be mis-read as the NEXT request's reply.
+        // Poison the client so every subsequent call fails fast (G04).
+        let result = self.read_response_inner();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn read_response_inner(&mut self) -> Result<Envelope, ClientError> {
         let mut header_buf = [0u8; HEADER_LEN];
         self.stream.read_exact(&mut header_buf)?;
 
@@ -195,6 +231,7 @@ impl<S: Read + Write> WeirClient<S> {
         Self {
             stream,
             default_durability,
+            poisoned: false,
         }
     }
 }
@@ -208,6 +245,7 @@ impl WeirClient<UnixStream> {
         Ok(Self {
             stream,
             default_durability: None,
+            poisoned: false,
         })
     }
 
@@ -232,14 +270,16 @@ impl WeirClient<UnixStream> {
         Self {
             stream,
             default_durability: None,
+            poisoned: false,
         }
     }
 
     /// Sets the read timeout on the underlying socket. `None` (the default)
     /// blocks indefinitely.
     ///
-    /// **Opt-in availability guard.** By default every method blocks in
-    /// [`read_response`][Self::push] waiting for the daemon's Ack/Nack, so a
+    /// **Opt-in availability guard.** By default every method blocks in the
+    /// response-read path (inside [`push`][Self::push] /
+    /// [`health_check`][Self::health_check]) waiting for the daemon's Ack/Nack, so a
     /// wedged daemon (hung flusher, `SIGSTOP`, half-open connection) would block
     /// a producer's hot path forever. With a read timeout set, a stalled reply
     /// surfaces as a [`ClientError::Io`] timeout instead; the producer can retry
@@ -387,5 +427,33 @@ mod tests {
             matches!(err, ClientError::Io(_)),
             "expected Io timeout, got {err:?}"
         );
+    }
+
+    #[test]
+    fn client_is_poisoned_after_a_read_failure() {
+        // G04: after a response read fails (here a timeout), the stream may hold
+        // leftover bytes that a subsequent read would mis-attribute to the next
+        // request — a false ack. The client must poison itself and reject further
+        // use fast, instead of reading again.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        c.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        // First push: the peer never replies → read times out → Io error.
+        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        assert!(matches!(first, ClientError::Io(_)), "{first:?}");
+
+        // Second push must fail FAST as poisoned, not block on another read.
+        let started = std::time::Instant::now();
+        let second = c.push(b"y", Durability::Sync).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "poisoned client must reject immediately, not read again"
+        );
+        match second {
+            ClientError::Protocol(msg) => assert!(msg.contains("poisoned"), "{msg}"),
+            other => panic!("expected a poisoned Protocol error, got {other:?}"),
+        }
     }
 }
