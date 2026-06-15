@@ -2,8 +2,9 @@
 
 > **TL;DR** — Build, point `wab_dir` at a directory you own, run.
 > The daemon listens on a Unix socket and serves Prometheus metrics
-> on `:9185`. With the `NoopSink` placeholder, records are accepted
-> and acked but not forwarded anywhere — that's intentional in v0.x.
+> on `127.0.0.1:9185`. With no sink configured, records are accepted,
+> acked, and drained to the built-in no-op sink (nothing downstream);
+> configure a sink (HTTP / MySQL / Postgres / ClickHouse) to forward them.
 
 This guide gets you to a running weir daemon in under five minutes,
 then walks through pushing your first record and reading the
@@ -38,12 +39,14 @@ chmod 0700 /tmp/weir-quickstart/run
 You should see output like:
 
 ```
-2026-05-26T15:23:01Z  INFO weir_server: starting weir-server  socket=/tmp/weir-quickstart/run/weir.sock wab_dir=/tmp/weir-quickstart/wab shards=1 workers=2
+2026-05-26T15:23:01Z  INFO weir_server: starting weir-server  socket=/tmp/weir-quickstart/run/weir.sock wab_dir=/tmp/weir-quickstart/wab shards=1 workers=1
 2026-05-26T15:23:01Z  INFO weir_server::wab: scanning for unsealed WAB segments
 2026-05-26T15:23:01Z  INFO weir_server::socket: socket listening  path=/tmp/weir-quickstart/run/weir.sock
-2026-05-26T15:23:01Z  INFO weir_server::metrics::server: metrics endpoint bound  addr=0.0.0.0:9185
+2026-05-26T15:23:01Z  INFO weir_server::metrics::server: metrics endpoint bound  addr=127.0.0.1:9185
 2026-05-26T15:23:01Z  INFO weir_server: pipeline assembled; awaiting connections
 ```
+
+(Exact log wording may vary by version; `workers` defaults to `shard_count`.)
 
 That's a fully-functional weir daemon. Leave it running and move on
 to pushing a record.
@@ -55,27 +58,30 @@ From another terminal, write a small Rust program against the
 
 ```rust
 // examples/hello.rs
-use weir_client::{WeirClient, Durability};
+use weir_client::WeirClient;
+use weir_core::Durability;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = WeirClient::connect("/tmp/weir-quickstart/run/weir.sock").await?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = WeirClient::connect("/tmp/weir-quickstart/run/weir.sock")?;
 
     // Push a 12-byte record with Sync durability (fsync before ack).
-    let payload = b"hello, weir";
-    client.push(payload, Durability::Sync).await?;
+    let payload = b"hello, weir!";
+    client.push(payload, Durability::Sync)?;
     println!("pushed {} bytes", payload.len());
 
     // Verify the daemon is healthy.
-    client.health_check().await?;
+    client.health_check()?;
     println!("health check ok");
 
     Ok(())
 }
 ```
 
+The client API is synchronous — one blocking socket round-trip per call,
+no async runtime required. Add `weir-client` and `weir-core` to your
+example/dev deps, then:
+
 ```bash
-# Add weir-client to your Cargo.toml dev/example deps, then:
 cargo run --release --example hello
 ```
 
@@ -96,7 +102,8 @@ record passes through silently — which is the production default).
 curl http://localhost:9185/metrics | head -30
 ```
 
-You'll see all 19 Prometheus metric families:
+You'll see weir's Prometheus metric families (the full catalogue is in
+[monitoring.md](../monitoring.md)):
 
 ```
 # HELP weir_records_accepted_total Records accepted from producers
@@ -121,15 +128,16 @@ When you called `client.push(...)`:
 2. The daemon validated the header (magic → version → CRC → payload
    cap), allocated a 12-byte buffer, read the payload, verified the
    payload CRC.
-3. The record was pushed onto the global queue. A worker thread
-   picked it up and routed it to shard 0's bridge channel.
-4. The bridge thread accumulated it into a batch. Because you asked
+3. The record was pushed onto the bounded queue. A worker thread
+   picked it up and routed it to shard 0's flusher.
+4. The shard's flusher accumulated it into a batch. Because you asked
    for `Sync` durability, the batch was fsynced immediately (no
    waiting for siblings).
 5. The daemon sent the Ack frame back. Your client returned.
-6. The drain thread later read the sealed WAB segment, "committed"
-   it via the `NoopSink` (which accepts everything), and wrote a
-   `.confirmed` sidecar so the segment can be safely deleted.
+6. The drain thread later read the sealed WAB segment, committed it
+   via the configured sink (the built-in no-op sink by default, which
+   accepts everything), and wrote a `.confirmed` sidecar so the
+   segment can be safely deleted.
 
 For the full pipeline detail, see
 [architecture.md](../architecture.md).
@@ -162,10 +170,11 @@ weir does not create the WAB directory (Postgres model). Create it
 with `mkdir -p` before starting the daemon.
 
 **Metrics endpoint not reachable from another container**
-The metrics server binds to `0.0.0.0:9185`. In Docker, ensure the
-port is mapped: `-p 127.0.0.1:9185:9185`. The 0.0.0.0 bind is **not**
-a security boundary — control access via the port mapping or
-firewall, not the bind address.
+The metrics server binds to `127.0.0.1:9185` by default (localhost
+only). To expose it, set `metrics_bind = "0.0.0.0"` (CLI
+`--metrics-bind`, env `WEIR_METRICS_BIND`) and map the port in Docker:
+`-p 127.0.0.1:9185:9185`. A `0.0.0.0` bind is **not** a security
+boundary — control access via the port mapping or firewall.
 
 **`Nack(PayloadTooLarge)`**
 Your record exceeded the configured `max_payload_bytes` (default 16
@@ -177,7 +186,7 @@ shrink the payload.
 - [Configuration reference](../operations/configuration.md) — every
   option, default, range, and when to tune.
 - [Install options](install.md) — building from source, container
-  images, Docker Compose, and (planned) `cargo install`.
+  images, Docker Compose, `cargo install`, and pre-built release binaries.
 - [Wire protocol](../wire_protocol.md) — frame layout if you're
   writing a non-Rust client.
 - [Security threat model](../security/threat-model.md) — what weir

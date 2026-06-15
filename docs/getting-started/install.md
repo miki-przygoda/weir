@@ -1,9 +1,9 @@
 # Installation
 
-> **TL;DR** — Today, build from source (`cargo build --release -p weir-server`)
-> or use the container image (`docker compose -f deploy/docker-compose.yml up`).
-> `cargo install weir-server` and pre-built release binaries are planned for
-> v1.0; not yet published.
+> **TL;DR** — `cargo install weir-server`, build from source
+> (`cargo build --release -p weir-server`), grab a pre-built binary from the
+> [GitHub Releases](https://github.com/miki-przygoda/weir/releases), or use the
+> container image (`docker compose -f deploy/docker/docker-compose.yml up`).
 
 Three supported install paths are covered below. All install paths
 produce the same `weir-server` daemon; the choice is purely about how
@@ -46,7 +46,7 @@ sudo ln -s "$(pwd)/target/release/weir-server" /usr/local/bin/weir-server
 ### Verify
 
 ```bash
-weir-server --help    # not yet implemented; will be added in v1.0
+weir-server --help    # prints the full flag/option reference
 weir-server --wab-dir /tmp/wab-test --socket-path /tmp/weir-test.sock
 # Ctrl-C to stop.
 ```
@@ -104,7 +104,7 @@ takes ~3–5 minutes; subsequent builds with unchanged dependencies are
 ### Run with Docker Compose
 
 ```bash
-docker compose -f deploy/docker-compose.yml up
+docker compose -f deploy/docker/docker-compose.yml up
 ```
 
 This mounts `./data/wab` for the WAB and exposes the metrics port on
@@ -210,7 +210,7 @@ cargo uninstall weir-server
 ### Container
 
 ```bash
-docker compose -f deploy/docker-compose.yml down
+docker compose -f deploy/docker/docker-compose.yml down
 docker rmi weir:latest
 ```
 
