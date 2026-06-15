@@ -121,7 +121,7 @@ if leftover:
 e = []; ew = e.append
 ew("# Escalations — your decisions needed (codebase sweep 2026-06-14)\n")
 ew("> The findings from the sweep that I did **not** change autonomously: each needs a product/API call or a redesign. Nothing here is load-bearing-broken. Fixed items + queued-safe items live in [`FINDINGS.md`](FINDINGS.md).\n")
-ew(f"**{len(escalated)} open decisions, grouped by what they touch.** Groups 1–2 are irreversible 1.0-freeze gates (decide before 1.0); Group 3 is reversible (land anytime). Jump to a group:\n")
+ew(f"**{len(escalated)} open decisions, grouped by what they touch.** Each group's tag marks whether it's an irreversible 1.0-freeze gate (decide before 1.0) or a reversible fix (land anytime). Jump to a group:\n")
 for title, tag, _blurb, members in group_order:
     ids = ", ".join(f["id"] for f in members)
     ew(f"- **[{title}](#{gh_anchor(title)})** — _{tag}_ ({ids})")

@@ -2,11 +2,10 @@
 
 > The findings from the sweep that I did **not** change autonomously: each needs a product/API call or a redesign. Nothing here is load-bearing-broken. Fixed items + queued-safe items live in [`FINDINGS.md`](FINDINGS.md).
 
-**10 open decisions, grouped by what they touch.** Groups 1–2 are irreversible 1.0-freeze gates (decide before 1.0); Group 3 is reversible (land anytime). Jump to a group:
+**6 open decisions, grouped by what they touch.** Each group's tag marks whether it's an irreversible 1.0-freeze gate (decide before 1.0) or a reversible fix (land anytime). Jump to a group:
 
 - **[Group 1 — Wire-protocol v1 freeze](#group-1--wire-protocol-v1-freeze)** — _irreversible · decide before 1.0_ (F25, F50, F52)
 - **[Group 2 — Public Rust API freeze](#group-2--public-rust-api-freeze)** — _irreversible · decide before 1.0_ (F41, F42, F48)
-- **[Group 3 — Reversible fixes (not freeze-gated)](#group-3--reversible-fixes-not-freeze-gated)** — _reversible · land anytime_ (F05, F43, F54, F24)
 
 ---
 
@@ -61,36 +60,3 @@ into_payload's doc (lib.rs:71) says it is used when a record must be dead-letter
 DecodeError (error.rs:13) and WeirError (error.rs:101) are exhaustive public enums with no #[non_exhaustive]; the same holds for ClientError (weir-client/unix.rs:11), CommitResult (sink-sdk:106, all-public fields) and SinkHealth (sink-sdk:115). The module doc at error.rs:8 says 'one variant per frame-validation step', so variant growth is the documented expectation — making every future validation step a major bump. Mark these #[non_exhaustive] before 1.0 (free now, impossible later). Correctly excludes the wire enums MessageType/Durability/NackReason whose repr is the contract.
 
 ➡️ Public error enums (`DecodeError`,`WeirError`,`ClientError`) + `SinkHealth` + `CommitResult` aren't `#[non_exhaustive]`, so any post-1.0 variant/field is breaking; the error model explicitly expects variant growth. **Recommend (freeze):** mark the error enums + `SinkHealth` `#[non_exhaustive]` before 1.0; pair `CommitResult` with F41.
-
-## Group 3 — Reversible fixes (not freeze-gated)
-_reversible · land anytime_
-
-Independent fixes, each touching a different subsystem (client, config, drain, queue). None locks an API or the wire, so any of these can land before OR after 1.0 — pick them off when convenient. F05 is the only one needing real work (a drain segment-retry redesign); F24 is trivial.
-
-### F05 — Retried multi-batch segment re-dead-letters earlier sub-batches, amplifying duplicate dead-letter files and thrashing the cap  
-*(medium · redesign · drain · `crates/weir-server/src/drain/mod.rs:529`)*
-
-process_segment commits sub-batches sequentially (527-547). If an early sub-batch dead-letters successfully and a later one returns Transient/Blocked, the whole segment is preserved and retried from record 0 (re-opened at 485); the early sub-batch dead-letters again via write_records (no dedup, dead_letter.rs:64-83), duplicating records/files and, when Blocked, feeding a cap-overshoot loop.
-
-➡️ Multi-batch segment retry re-dead-letters earlier sub-batches → duplicate dead-letter files. Duplicates are noise in a terminal inspection store, not data loss. A real fix needs per-sub-batch progress tracking within a segment retry (drain redesign). **Recommend:** defer post-1.0 unless observed.
-
-### F43 — Blocking client sets no socket read/write/connect timeouts; a wedged daemon blocks producers indefinitely  
-*(medium · guard · client-sdk-ctl · `crates/weir-client/src/unix.rs:177`)*
-
-connect/connect_with_default/from_stream (unix.rs:177-207) never set read or write timeouts and there is no connect timeout; connect_tls (tls.rs:37-74) likewise uses a plain blocking TcpStream::connect (tls.rs:70). read_response (unix.rs:136-160) blocks forever if the daemon accepts then never replies (flusher hang, SIGSTOP, half-open TCP). weir-ctl's scrape sets a 5s read timeout (main.rs:370), so the author knows the pattern; for a producer hot-path client the unbounded block is an availability hazard.
-
-➡️ The blocking client sets no read/write/connect timeouts, so a wedged daemon blocks a producer forever. A fix needs a DEFAULT timeout value (a judgment call — too short breaks slow-but-legit Sync acks under load) and/or a configurable setter. **Recommend:** add `set_read_timeout`/`set_write_timeout` setters (opt-in, no default behaviour change) + document; optionally a generous default (~30s).
-
-### F54 — Config-time warn! calls are silently dropped (tracing subscriber initialized after Config::load)  
-*(medium · bug-fix · config · `crates/weir-server/src/main.rs:185`)*
-
-Config::load() runs at main.rs:185; the only subscriber init is at main.rs:187-192, after. warn! emitted during config loading (file.rs:191/199 unknown-key net, mod.rs:596 dead_letter advisory) has no subscriber and is discarded, so TOML typos silently get defaults.
-
-➡️ Config-load `warn!`s (unknown TOML keys, the dead_letter <1MiB advisory) are discarded because the tracing subscriber is initialised AFTER `Config::load()` — so a TOML typo silently takes defaults. Fix needs either collecting the warnings and emitting them post-init, or a reloadable filter (bootstrap level → reload to config.log_level). **Recommend:** collect-and-emit.
-
-### F24 — QueueSender exposes len() with no is_empty()  
-*(info · decision · worker-queue-metrics · `crates/weir-server/src/queue.rs:55`)*
-
-QueueSender::len() is public (queue.rs:55-57, used by weir_queue_depth poll per queue.rs:53-54) with no companion is_empty() — the classic clippy::len_without_is_empty wart, latent because the workspace has no clippy lint config (no [lints] table in any Cargo.toml, no #![deny(clippy::...)] in lib.rs). len() also sums across partitions (queue.rs:56), so it is a cross-partition in-flight total, not a slot count — mildly misleading. Worth a deliberate decision before the 1.0 API freeze.
-
-➡️ `QueueSender::len()` has no `is_empty()` (clippy::len_without_is_empty), latent only because there's no clippy lint config. Trivial + safe. **Recommend:** add `is_empty()` (could also just be a queued-safe fix).
