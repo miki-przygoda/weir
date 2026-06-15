@@ -51,9 +51,23 @@ pub fn new<T>(partitions: usize) -> (QueueSender<T>, QueueReceiver<T>) {
 
 impl<T> QueueSender<T> {
     /// Total in-flight count summed across every partition. Used by the
-    /// `weir_queue_depth` metric poll task.
+    /// `weir_queue_depth` metric poll task. This is a cross-partition in-flight
+    /// total, not a free-slot count.
     pub fn len(&self) -> usize {
         self.txs.iter().map(|t| t.len()).sum()
+    }
+
+    /// True when every partition is empty (no records in flight). Companion to
+    /// [`len`](Self::len) — satisfies `clippy::len_without_is_empty` and reads
+    /// clearer than `len() == 0` at call sites.
+    ///
+    /// `allow(dead_code)`: `QueueSender` lives in a binary-internal module, so
+    /// `pub` doesn't escape the crate and the daemon has no internal caller
+    /// today (the depth poll uses `len`). It's kept for API completeness and
+    /// is exercised by the unit tests.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.txs.iter().all(|t| t.is_empty())
     }
 
     /// Blocking push, test-only. Production code routes through
@@ -167,6 +181,20 @@ mod tests {
         tx.push(1, 2); // partition 1
         tx.push(2, 3); // partition 0 (2 % 2)
         assert_eq!(tx.len(), 3);
+    }
+
+    #[test]
+    fn is_empty_tracks_in_flight_across_partitions() {
+        let (tx, rx) = new::<u32>(2);
+        let _r0 = rx.get(0);
+        let _r1 = rx.get(1);
+        assert!(tx.is_empty(), "a fresh queue is empty");
+        tx.push(1, 7); // partition 1
+        assert!(
+            !tx.is_empty(),
+            "is_empty must be false with a record in any partition"
+        );
+        assert_eq!(tx.len(), 1);
     }
 
     #[test]
