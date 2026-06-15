@@ -112,6 +112,13 @@ impl HttpSink {
 
         let client = Client::builder()
             .timeout(config.timeout)
+            // Never follow redirects. reqwest's default follows up to 10, and on a
+            // 301/302/303 it re-issues the POST as a BODILESS GET — if that lands a
+            // 2xx the sink would report the record committed though the payload was
+            // never delivered, and the drain would confirm+delete the segment: a
+            // false ack (G01). With redirects disabled a 3xx surfaces to
+            // post_record and is dead-lettered, never committed.
+            .redirect(reqwest::redirect::Policy::none())
             // Keep idle connections warm between batches. The drain calls
             // commit in a tight loop while a segment is being processed. Size
             // the idle pool to the in-flight concurrency so an HTTP/1.1 endpoint
@@ -161,6 +168,26 @@ impl HttpSink {
             // status code is the only signal).
             let _ = resp.bytes().await;
             return Ok(());
+        }
+
+        // A 3xx surfaces here only because redirect-following is disabled (G01).
+        // Treat it as a permanent misconfiguration — never committed: the
+        // configured sink URL should point straight at the ingest endpoint, not a
+        // redirector. Reported with the Location so the operator can repoint it.
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<no Location header>")
+                .to_string();
+            return Err(HttpSinkError::PermanentStatus {
+                status,
+                body_excerpt: format!(
+                    "unexpected redirect to '{location}'; redirects are not followed — \
+                     point sink_url directly at the ingest endpoint"
+                ),
+            });
         }
 
         if classify_status_transient(status) {
@@ -685,6 +712,27 @@ mod tests {
         let sink = HttpSink::new(cfg(&url)).unwrap();
         let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
         assert!(err.is_transient(), "408 must be transient: {err}");
+    }
+
+    #[tokio::test]
+    async fn http_redirect_is_dead_lettered_never_committed() {
+        // G01: a 3xx must NOT be followed (which would re-issue a bodiless GET
+        // and let a 2xx there masquerade as a committed record — a false ack).
+        // With redirects disabled the 302 surfaces and is dead-lettered.
+        let (url, _counter) = spawn_mock_server(vec![
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        let result = sink.commit(vec![p(b"alpha")]).await.unwrap();
+        assert!(
+            result.committed.is_empty(),
+            "a redirected POST must never be reported committed"
+        );
+        assert_eq!(result.dead_lettered.len(), 1);
+        let (_, reason) = &result.dead_lettered[0];
+        assert!(reason.contains("302"), "reason: {reason}");
+        assert!(reason.contains("redirect"), "reason: {reason}");
     }
 
     #[tokio::test]

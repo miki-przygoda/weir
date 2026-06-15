@@ -215,6 +215,11 @@ impl ClickHouseSink {
             // drain's coarse commit_timeout backstop fired (F32). Matches the HTTP
             // sink, which sets a client timeout.
             .timeout(config.timeout)
+            // Never follow redirects: a redirected INSERT POST that reqwest re-issues
+            // as a bodiless GET could return 2xx and be reported as committed though
+            // the rows were never inserted — a false ack (G01). A 3xx now surfaces to
+            // commit() and is dead-lettered, never committed. Matches the HTTP sink.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ClickHouseSinkBuildError::Client(e.to_string()))?;
         Ok(Self {
@@ -353,6 +358,23 @@ impl Sink for ClickHouseSink {
                 committed: batch,
                 dead_lettered: Vec::new(),
             })
+        } else if status.is_redirection() {
+            // Surfaces only because redirect-following is disabled (G01). An
+            // INSERT endpoint that redirects is a misconfiguration; dead-letter
+            // (permanent), never commit — the rows were not inserted here.
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<no Location header>")
+                .to_string();
+            Err(sql_common::SqlSinkError::permanent(
+                "clickhouse",
+                format!(
+                    "http {status}: unexpected redirect to '{location}'; point the sink URL \
+                     directly at the ClickHouse HTTP endpoint (redirects are not followed)"
+                ),
+            ))
         } else if status_is_transient(status) {
             Err(sql_common::SqlSinkError::transient(
                 "clickhouse",
@@ -738,6 +760,25 @@ mod tests {
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
         let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
         assert!(err.is_transient(), "429 must be transient: {err}");
+    }
+
+    #[tokio::test]
+    async fn commit_redirect_is_permanent_never_committed() {
+        // G01: a redirected INSERT must never be reported committed (the rows
+        // weren't inserted). Redirects are disabled, so the 302 surfaces and is
+        // dead-lettered (permanent).
+        let (url, _c) = spawn_ch_mock(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x",
+            "",
+            Duration::ZERO,
+        )
+        .await;
+        let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        assert!(!err.is_transient(), "a redirect must be permanent: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("302"), "{msg}");
+        assert!(msg.contains("redirect"), "{msg}");
     }
 
     #[tokio::test]
