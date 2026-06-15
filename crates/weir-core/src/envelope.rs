@@ -219,8 +219,14 @@ impl Envelope {
     /// — the payload is the single source of truth for the length on the wire.
     pub fn new(header: Header, payload: impl Into<Payload>) -> Self {
         let payload = payload.into();
+        // Saturate rather than `as u32`-truncate: a >= 4 GiB payload would
+        // otherwise wrap to a small length and desync the wire frame — the exact
+        // failure this "cannot desync" constructor exists to prevent (F49). Such
+        // a payload is far past MAX_PAYLOAD_HARD_CAP (16 MiB) and is rejected on
+        // decode; saturating to u32::MAX keeps it rejected instead of wrapping.
+        let payload_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         let header = Header {
-            payload_len: payload.len() as u32,
+            payload_len,
             ..header
         };
         Self { header, payload }

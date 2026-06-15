@@ -4,7 +4,9 @@ use std::{
     path::Path,
 };
 
-use weir_core::{Durability, Envelope, HEADER_LEN, Header, MessageType, NackReason};
+use weir_core::{
+    Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType, NackReason,
+};
 
 /// All errors that can be returned by [`WeirClient`] methods.
 #[derive(Debug)]
@@ -141,6 +143,17 @@ impl<S: Read + Write> WeirClient<S> {
             Header::decode(&header_buf).map_err(|e| ClientError::Protocol(e.to_string()))?;
 
         let payload_len = header.payload_len() as usize;
+        // Cap before allocating, mirroring the server's pre-allocation guard
+        // (Envelope::decode). A malformed or hostile daemon could otherwise
+        // declare payload_len up to u32::MAX and make the client allocate ~4 GiB
+        // for a response (F44). Daemon responses are tiny, so this never trips
+        // legitimately.
+        if payload_len > MAX_PAYLOAD_HARD_CAP {
+            return Err(ClientError::Protocol(format!(
+                "response payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP \
+                 ({MAX_PAYLOAD_HARD_CAP}); refusing to allocate"
+            )));
+        }
         let mut payload_buf = vec![0u8; payload_len];
         if payload_len > 0 {
             self.stream.read_exact(&mut payload_buf)?;
