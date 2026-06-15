@@ -2,38 +2,11 @@
 
 > The findings from the sweep that I did **not** change autonomously: each needs a product/API call or a redesign. Nothing here is load-bearing-broken. Fixed items + queued-safe items live in [`FINDINGS.md`](FINDINGS.md).
 
-**6 open decisions, grouped by what they touch.** Each group's tag marks whether it's an irreversible 1.0-freeze gate (decide before 1.0) or a reversible fix (land anytime). Jump to a group:
+**3 open decisions, grouped by what they touch.** Each group's tag marks whether it's an irreversible 1.0-freeze gate (decide before 1.0) or a reversible fix (land anytime). Jump to a group:
 
-- **[Group 1 — Wire-protocol v1 freeze](#group-1--wire-protocol-v1-freeze)** — _irreversible · decide before 1.0_ (F25, F50, F52)
 - **[Group 2 — Public Rust API freeze](#group-2--public-rust-api-freeze)** — _irreversible · decide before 1.0_ (F41, F42, F48)
 
 ---
-
-## Group 1 — Wire-protocol v1 freeze
-_irreversible · decide before 1.0_
-
-These lock the on-the-wire byte contract. Best decided together as one wire-freeze session, alongside the deferred wire-freeze hooks (reserved Nack-reason byte, language-neutral conformance vectors). Once 1.0 ships at WIRE_VERSION 1, changing any of these needs a version bump.
-
-### F25 — UnknownMessageType/UnknownDurability decode errors are nacked as the (documented-as-transient, keep-connection-open) InternalError reason, yet the connection is closed  
-*(medium · error-handling · socket · `crates/weir-server/src/socket/connection.rs:414`)*
-
-UnknownMessageType/UnknownDurability (envelope.rs:188/190) arise on a CRC-valid header (the CRC check at envelope.rs:178-185 runs first), so they are permanent client protocol errors. nack_for_decode_error's `_ =>` arm (connection.rs:414) maps them to WireNack::InternalError + MetricNack::internal_error; the decode site then closes the connection (connection.rs:150). docs/wire_protocol.md:147 documents Nack(InternalError) as 'open — transient', so the wire contract is contradicted, the case is indistinguishable from a real pipeline InternalError (retry-loops forever), and the internal_error metric is polluted by malformed client input.
-
-➡️ UnknownMessageType/UnknownDurability are nacked as `InternalError` (documented transient/keep-open) but the connection is then CLOSED — contradicting the wire contract. The clean fix needs either a dedicated Nack reason (a wire change) or deciding these stay open (the framing IS intact — valid header, unknown enum). **Recommend (freeze):** add a reserved `UnknownMessage` Nack reason in the wire-freeze cluster, or document+keep-open.
-
-### F50 — Header::new takes a payload_len argument that Envelope::new always overwrites — an API that invites desync  
-*(low · decision · core · `crates/weir-core/src/envelope.rs:98`)*
-
-Every production caller computes payload.len() as u32 and passes it to Header::new only for Envelope::new to overwrite it (unix.rs:90-92, connection.rs:431-437). For bare Header::encode without an Envelope (connection.rs:680-686), a caller can pass any value and produce a header whose declared length matches no payload — the desync the encapsulation work was meant to prevent. Dropping payload_len from Header::new (default 0, set by Envelope::new) would make the correct value the only reachable one.
-
-➡️ `Header::new` takes a `payload_len` that `Envelope::new` always overwrites, and a bare `Header::encode` can still desync. **Recommend (freeze):** drop `payload_len` from `Header::new` so it can only be set via `Envelope` (which derives it). Pairs with R2/F49.
-
-### F52 — Reserved flags byte is preserved verbatim on decode but never validated to be zero, foreclosing in-version flag evolution  
-*(info · decision · core · `crates/weir-core/src/envelope.rs:191`)*
-
-Header::decode reads flags = buf[7] (envelope.rs:191) and stores it without a == 0 check, despite the field doc (envelope.rs:91), lib doc, and docs/wire_protocol.md calling flags 'reserved; zero on write'. proptest_envelope.rs:170/180 asserts arbitrary nonzero flags round-trip, confirming a deliberate preserve-don't-reject choice. With WIRE_VERSION fixed at 1, a v1 daemon silently accepts and ignores any future flag bit, so flag semantics can only be added via a WIRE_VERSION bump. Worth an explicit decision/comment; rejecting nonzero flags now would preserve in-version flag evolution.
-
-➡️ Decode preserves arbitrary `flags` without checking zero, so a v1 daemon silently ignores future flag bits. **Recommend (freeze):** decide flag-evolution policy — reject nonzero now (clean error when a flag is added later) vs keep preserve-and-ignore. Tied to the wire-freeze cluster + reserved-Nack-byte decision.
 
 ## Group 2 — Public Rust API freeze
 _irreversible · decide before 1.0_

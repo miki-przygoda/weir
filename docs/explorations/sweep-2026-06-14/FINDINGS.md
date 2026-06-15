@@ -5,8 +5,8 @@
 ## TL;DR
 
 - **76 raw** → **60 confirmed-real** after adversarial verification (+ 1 uncertain, 1 refuted).
-- **Fixed: 54** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
-- **Needs your decision: 6** → all in **[`ESCALATIONS.md`](ESCALATIONS.md)** (separate file so they're easy to find).
+- **Fixed: 57** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
+- **Needs your decision: 3** → all in **[`ESCALATIONS.md`](ESCALATIONS.md)** (separate file so they're easy to find).
 - **Queued safe fixes: 0** — being worked through; this list shrinks as they land.
 
 ## ⚠️ Your decisions live in [`ESCALATIONS.md`](ESCALATIONS.md)
@@ -15,10 +15,7 @@ Quick index (full detail + recommendations in that file):
 
 - **F41** *(high, client-sdk-ctl)* — CommitResult partition invariant (committed ∪ dead_lettered = batch) is unenforced; the drain confirms+deletes the segment unconditionally on Ok
 - **F42** *(high, client-sdk-ctl)* — SinkRecord::into_payload is documented as the dead-letter recovery path but is bypassed for whole-batch permanent (and transient) errors
-- **F25** *(medium, socket)* — UnknownMessageType/UnknownDurability decode errors are nacked as the (documented-as-transient, keep-connection-open) InternalError reason, yet the connection is closed
 - **F48** *(medium, core)* — Public error enums and CommitResult are not #[non_exhaustive]; adding any variant/field after 1.0 is a breaking change
-- **F50** *(low, core)* — Header::new takes a payload_len argument that Envelope::new always overwrites — an API that invites desync
-- **F52** *(info, core)* — Reserved flags byte is preserved verbatim on decode but never validated to be zero, foreclosing in-version flag evolution
 
 ## ✅ Fixed
 
@@ -41,6 +38,7 @@ Quick index (full detail + recommendations in that file):
 | F17 | medium | wab | Recovery: no test for the oversized-payload_len boundary (record at exactly MAX_PAYLOAD_HARD_CAP must survive; one over must truncate) | `abe69c2` |
 | F20 | medium | worker-queue-metrics | Metrics HTTP server has no read/write timeout — slowloris permanently wedges the unauthenticated endpoint and blinds monitoring | `0530fd2` |
 | F21 | medium | worker-queue-metrics | Phase-2 coalesce starves co-located shards on a shared worker (worker_count < shard_count) | `9e5276a` |
+| F25 | medium | socket | UnknownMessageType/UnknownDurability decode errors are nacked as the (documented-as-transient, keep-connection-open) InternalError reason, yet the connection is closed | `9336e2f` |
 | F32 | medium | sink | ClickHouse response body read is not bounded by the sink's configured timeout (error path can hang to the drain backstop) | `7e15ac4` |
 | F34 | medium | sink | ClickHouse does not percent-decode URL credentials before HTTP basic auth (silent divergence from SQL sinks) | `7e15ac4` |
 | F38 | medium | sink | HTTP concurrency: no test asserts a transient mid-batch error actually cancels still-in-flight POSTs | `7daca2f` |
@@ -69,6 +67,7 @@ Quick index (full detail + recommendations in that file):
 | F46 | low | client-sdk-ctl | SDK doc overstates that health() is called after every commit attempt | `238a364` |
 | F47 | low | client-sdk-ctl | Client discards the daemon-version byte the server sends on a VersionMismatch Nack | `65a39fb` |
 | F49 | low | core | Envelope::new silently truncates payload length via payload.len() as u32, falsifying the documented 'cannot desync' invariant | `d04dd87` |
+| F50 | low | core | Header::new takes a payload_len argument that Envelope::new always overwrites — an API that invites desync | `06b7102` |
 | F51 | low | core | Payload newtype: PartialEq impls and the Borrow<[u8]> hashmap-key contract are untested | `b446533` |
 | F55 | low | config | Feature-gated [server] keys are silently dropped: in KNOWN_SERVER_KEYS but absent from RawConfig on builds without the feature | `b0f2e9b` |
 | F56 | low | config | HELP advertises feature-gated CLI flags that fail as generic 'unknown arguments' when the feature is off, with no feature hint | `b0f2e9b` |
@@ -77,6 +76,7 @@ Quick index (full detail + recommendations in that file):
 | F59 | low | config | Config derives Debug, exposing sink_url credentials, inconsistent with the project's deliberate bearer_token redaction | `b0f2e9b` |
 | F19 | info | wab | macOS data fsync uses F_BARRIERFSYNC (barrier) while directory durability uses plain fsync via sync_all — weaker than F_FULLFSYNC; an explicit, undertested tradeoff on the crown durability path | `238a364` |
 | F24 | info | worker-queue-metrics | QueueSender exposes len() with no is_empty() | `e6aa1e7` |
+| F52 | info | core | Reserved flags byte is preserved verbatim on decode but never validated to be zero, foreclosing in-version flag evolution | `9336e2f` |
 | F60 | info | config | u64 durations range-checked via `as usize` truncate on 32-bit targets, letting out-of-range values pass | `03cff76` |
 
 ## 🟡 Queued safe fixes (in progress)
