@@ -127,7 +127,7 @@ Key invariant: only records up to the first corrupt entry are replayed. A torn w
 
 ## Segment rotation
 
-A segment rotates (`should_rotate() == true`) when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Rotation happens inline in `ShardWriter::write_record`; the write that pushes the segment past the threshold also triggers the seal. The next write opens a new segment lazily.
+A segment rotates (`should_rotate() == true`) when `bytes_written >=` the configured `segment_max_bytes` (default 256 MiB via `SEGMENT_MAX_BYTES`; tunable from 4 KiB upward — see [configuration.md](operations/configuration.md)). Rotation happens inline in `ShardWriter::write_record`; the write that pushes the segment past the threshold also triggers the seal. The next write opens a new segment lazily.
 
 ---
 

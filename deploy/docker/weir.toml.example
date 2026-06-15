@@ -51,10 +51,14 @@ connection_read_timeout_secs = 30
 max_payload_bytes = 16777216
 
 # Port for the Prometheus /metrics HTTP endpoint.
-# Binds to 0.0.0.0:{metrics_port} for container/sidecar visibility.
-# Restrict access via firewall rules or port-mapping, not the bind address.
 # Env: WEIR_METRICS_PORT
 metrics_port = 9185
+
+# Bind address for the /metrics endpoint. Default 127.0.0.1 (localhost only).
+# Set to 0.0.0.0 for container/sidecar visibility; restrict access via firewall
+# rules or port-mapping (the endpoint is unauthenticated, not a security boundary).
+# Env: WEIR_METRICS_BIND
+metrics_bind = "127.0.0.1"
 
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.

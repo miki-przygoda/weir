@@ -162,7 +162,7 @@ BlockedDeadLetterFull
 
 ### Metrics (`src/metrics/`)
 
-19 Prometheus metrics registered with a `prometheus-client` registry. `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
+A family of Prometheus metrics registered with a `prometheus-client` registry (the full catalogue is in [monitoring.md](monitoring.md)). `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -186,7 +186,7 @@ BlockedDeadLetterFull
 | `weir_drain_state{state}` | gauge | Drain state (exactly one label = 1) |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Time in `BlockedDeadLetterFull`; alert target |
 
-`weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `0.0.0.0:{metrics_port}` and serves `GET /metrics` in OpenMetrics text format. The `0.0.0.0` bind is required so container-host scraping works without exec-into-container; restrict exposure via firewall / network namespace, not a localhost-only bind.
+`weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `metrics_bind:metrics_port` (default `127.0.0.1:9185`, localhost only) and serves `GET /metrics` in OpenMetrics text format. Set `metrics_bind = "0.0.0.0"` to allow container-host scraping; restrict exposure via firewall / network namespace, and note that `/metrics` is unauthenticated.
 
 ### Testing infrastructure
 

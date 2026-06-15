@@ -85,7 +85,7 @@ deliberate architectural choices; others are future work.
 | Linux capabilities / seccomp | Not applied. Operators should sandbox the binary externally if needed (systemd `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX`, `PrivateTmp=yes`, `ProtectSystem=strict`, etc.). |
 | Encrypted at-rest WAB | WAB segments are plaintext on disk. Use filesystem-level encryption (LUKS / dm-crypt) if payloads are sensitive. |
 | Signed audit log | Records are written verbatim; no per-record signature or hash chain beyond the per-record CRC. CRC catches accidental corruption, not deliberate tampering. |
-| Sink-side authorization | The sink trait (`crates/weir-server/src/sink/mod.rs`) is currently `NoopSink`. Real sinks will need their own auth to the downstream system; weir does not pass through producer identity. |
+| Sink-side authorization | Sinks (HTTP / MySQL / Postgres / ClickHouse, plus the built-in `noop`) carry their own credentials to the downstream system; weir does not pass through producer identity. Authorization to the downstream is the sink's / operator's responsibility. |
 | Concurrent-write protection on socket path | Two daemon instances pointed at the same `socket_path` will race. Operator's responsibility (one daemon per socket). |
 | Resource accounting per-client | All connections share the same `max_connections` budget. No per-uid quotas. A misbehaving client can consume up to the global cap. |
 

@@ -203,8 +203,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_sink_commit_duration_seconds` | histogram | Sink `commit()` call duration. |
 | `weir_sink_health` | gauge | 1 = healthy, 0 = down. |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
-| `weir_dead_letter_full` | gauge | 1 while the dead-letter cap is exceeded (drain blocked). |
-| `weir_dead_letter_blocked_duration_seconds` | histogram | How long the drain stayed blocked on a full dead-letter dir. |
+| `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |
+| `weir_dead_letter_blocked_duration_seconds` | gauge | Seconds since the drain entered BlockedDeadLetterFull (resets to 0 on exit); alert when it exceeds your threshold. |
 
 ### System / security
 | Metric | Type | Meaning |

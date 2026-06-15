@@ -106,9 +106,10 @@ sub-directory live here.
   chown weir:weir /var/lib/weir/wab
   chmod 0700 /var/lib/weir/wab
   ```
-- Subdirectories: `<wab_dir>/00000000/` per shard, `<wab_dir>/dead_letter/`
-  for permanently-rejected records, `<wab_dir>/quarantine/` for
-  corrupted segments quarantined during crash recovery.
+- Subdirectories: `<wab_dir>/shard_NN/` per shard (zero-padded index,
+  e.g. `shard_00`), `<wab_dir>/dead_letter/` for permanently-rejected
+  records, `<wab_dir>/quarantine/` for corrupted segments quarantined
+  during crash recovery.
 - Segment files are created mode `0o600`. At startup, every
   `.wab` / `.wab.sealed` / `.wab.confirmed` file is audited; any with
   permissions ≠ `0o600` increments
@@ -133,10 +134,11 @@ state size is bounded by transient backlog, not by total throughput.
 - **Env**: `WEIR_SHARD_COUNT`
 - **TOML**: `shard_count`
 
-Number of WAB shards. Each shard has its own segment file, its own
-flusher thread, and its own bridge thread. Records are routed to
-shards by the worker pool (currently round-robin; shard-aware routing
-is future work).
+Number of WAB shards. Each shard has its own segment file and its own
+flusher thread. Each connection is pinned to a shard round-robin at
+accept time (`connection_counter % shard_count`); every record on that
+connection goes to the same shard. Per-record shard-aware routing is
+future work.
 
 **When to tune**: increase only if fsync throughput is your bottleneck
 and you have parallel disk bandwidth. On a single SSD, multiple shards
@@ -196,7 +198,7 @@ are the sweet spot found by the empirical sweep.
 - **Env**: `WEIR_BATCH_SIZE`
 - **TOML**: `batch_size`
 
-Maximum records per fsync batch. When the bridge thread has
+Maximum records per fsync batch. When the flusher thread has
 accumulated this many records or `batch_deadline_ms` elapses,
 whichever comes first, the batch is fsynced and the per-record acks
 are returned.
@@ -222,7 +224,7 @@ landscape.
 - **Env**: `WEIR_BATCH_DEADLINE_MS`
 - **TOML**: `batch_deadline_ms`
 
-Maximum time the bridge thread waits to fill a batch before flushing
+Maximum time the flusher thread waits to fill a batch before flushing
 what it has. Caps tail latency in low-traffic regimes where
 `batch_size` would not be reached for a long time.
 
@@ -363,14 +365,36 @@ where you know record sizes are bounded (e.g. structured log records
 
 TCP port for the Prometheus `/metrics` HTTP endpoint.
 
-**Bind address**: the metrics server binds to `0.0.0.0:{metrics_port}`
-(not localhost). This is intentional — it makes the endpoint
-accessible from container hosts and sidecars. Restrict access via
-firewall rules or a `--publish 127.0.0.1:9185:9185` port mapping in
-Docker; **do not** rely on the bind address as a security boundary.
-
 **When to tune**: change if 9185 conflicts with another service, or
 to allow multiple weir instances on one host.
+
+#### `metrics_bind`
+
+- **Type**: IpAddr
+- **Default**: `127.0.0.1` (localhost only)
+- **CLI**: `--metrics-bind <addr>`
+- **Env**: `WEIR_METRICS_BIND`
+- **TOML**: `metrics_bind`
+
+Address the metrics server binds to. The default is localhost-only, so
+the endpoint is not exposed off-box without an explicit decision. To
+scrape from another host, sidecar, or container, set `0.0.0.0` (or a
+specific interface) and restrict access via firewall rules or a
+`--publish 127.0.0.1:9185:9185` port mapping in Docker. A `0.0.0.0`
+bind is **not** a security boundary — `/metrics` is unauthenticated.
+
+#### `metrics_max_connections`
+
+- **Type**: usize
+- **Default**: `8`
+- **Range**: 1–1024
+- **CLI**: `--metrics-max-connections <n>`
+- **Env**: `WEIR_METRICS_MAX_CONNECTIONS`
+- **TOML**: `metrics_max_connections`
+
+Maximum number of concurrent scrape connections to the `/metrics`
+endpoint. Bounds the resource cost of a misbehaving or hostile
+scraper; the default of 8 is generous for normal Prometheus scraping.
 
 ---
 
@@ -939,7 +963,7 @@ The daemon will:
 
 - Listen on `/run/weir/weir.sock`
 - Use `/var/lib/weir/wab` for WAB segments
-- Serve metrics on `0.0.0.0:9185`
+- Serve metrics on `127.0.0.1:9185` (localhost only; set `metrics_bind` to expose)
 - Use the (256, 1ms) batch defaults
 - Cap connections at 256, payload at 16 MiB
 - Drop idle connections after 30s
