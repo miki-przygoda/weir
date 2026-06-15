@@ -114,6 +114,27 @@ impl PartialEq<&[u8]> for Payload {
     }
 }
 
+// Reverse impls so equality reads both directions (`slice == payload`, not just
+// `payload == slice`). PartialEq is not symmetric across types unless both
+// orderings are implemented (G09).
+impl PartialEq<Payload> for [u8] {
+    fn eq(&self, other: &Payload) -> bool {
+        self == other.0.as_ref()
+    }
+}
+
+impl PartialEq<Payload> for Vec<u8> {
+    fn eq(&self, other: &Payload) -> bool {
+        self.as_slice() == other.0.as_ref()
+    }
+}
+
+impl PartialEq<Payload> for &[u8] {
+    fn eq(&self, other: &Payload) -> bool {
+        *self == other.0.as_ref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +197,24 @@ mod tests {
         assert_eq!(p, s);
         let s2: &[u8] = b"abcd";
         assert_ne!(p, s2);
+    }
+
+    /// G09: equality reads both directions — the reverse impls let `slice ==
+    /// payload` compile and agree with `payload == slice`.
+    #[test]
+    fn partial_eq_is_symmetric_across_types() {
+        let p = Payload::from_static(b"abc");
+        // [u8] == Payload
+        assert_eq!(*b"abc".as_slice(), p);
+        assert_ne!(*b"abd".as_slice(), p);
+        // Vec<u8> == Payload
+        assert_eq!(b"abc".to_vec(), p);
+        assert_ne!(b"ab".to_vec(), p);
+        // &[u8] == Payload
+        let s: &[u8] = b"abc";
+        assert_eq!(s, p);
+        let s2: &[u8] = b"abcd";
+        assert_ne!(s2, p);
     }
 
     /// The `Borrow<[u8]>` + derived `Hash` (over the inner `Bytes`) must agree
