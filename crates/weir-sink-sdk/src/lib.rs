@@ -34,7 +34,7 @@
 //!         for r in &batch {
 //!             println!("{} bytes", r.len());
 //!         }
-//!         Ok(CommitResult { committed: batch, dead_lettered: Vec::new() })
+//!         Ok(CommitResult::new(batch, Vec::new()))
 //!     }
 //!     async fn health(&self) -> SinkHealth {
 //!         SinkHealth::Healthy
@@ -103,12 +103,39 @@ pub trait SinkError: Send + Sync + std::error::Error + 'static {
 }
 
 /// The result of a successful [`Sink::commit`].
+///
+/// Build one with [`CommitResult::new`]. The fields are public for reading, but
+/// the type is `#[non_exhaustive]`, so a future release can add a field (or a
+/// constructor variant) without a breaking change — construct it through `new`
+/// rather than a struct literal.
+///
+/// Every record handed to [`Sink::commit`] must appear in exactly one of
+/// `committed` or `dead_lettered`. This partition invariant is enforced by the
+/// drain at runtime (it refuses to confirm a segment whose
+/// `committed.len() + dead_lettered.len()` does not cover the batch) rather than
+/// by this type, because the record type `R` carries no identity the constructor
+/// could check.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CommitResult<R> {
     /// Records the sink accepted.
     pub committed: Vec<R>,
     /// Records the sink permanently rejected, each with a human-readable reason.
     pub dead_lettered: Vec<(R, String)>,
+}
+
+impl<R> CommitResult<R> {
+    /// Builds a commit result from the accepted and permanently-rejected records.
+    ///
+    /// Every record passed to [`Sink::commit`] should appear in exactly one of the
+    /// two lists; see the type-level note for how the partition invariant is
+    /// enforced.
+    pub fn new(committed: Vec<R>, dead_lettered: Vec<(R, String)>) -> Self {
+        Self {
+            committed,
+            dead_lettered,
+        }
+    }
 }
 
 /// Coarse health signal from [`Sink::health`].
@@ -154,4 +181,30 @@ pub trait Sink: Send + Sync + 'static {
     /// after every individual commit (retries don't re-probe). Keep it cheap (a
     /// single ping / HEAD) — it runs under a timeout backstop on the drain thread.
     async fn health(&self) -> SinkHealth;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_result_new_keeps_both_partitions() {
+        let r = CommitResult::new(
+            vec![Payload::from(b"a".as_ref())],
+            vec![(Payload::from(b"b".as_ref()), "rejected".to_string())],
+        );
+        assert_eq!(r.committed.len(), 1);
+        assert_eq!(r.dead_lettered.len(), 1);
+        assert_eq!(&r.committed[0][..], b"a");
+        assert_eq!(&r.dead_lettered[0].0[..], b"b");
+        assert_eq!(r.dead_lettered[0].1, "rejected");
+    }
+
+    #[test]
+    fn the_payload_record_is_an_identity_round_trip() {
+        // The built-in pass-through record: from_payload/into_payload are inverses.
+        let p = Payload::from(b"weir".as_ref());
+        let recovered = <Payload as SinkRecord>::from_payload(p.clone()).into_payload();
+        assert_eq!(&recovered[..], &p[..]);
+    }
 }

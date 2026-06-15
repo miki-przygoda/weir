@@ -1141,17 +1141,14 @@ mod tests {
         }
 
         fn ok(batch: Vec<Payload>) -> MockResult {
-            Ok(CommitResult {
-                committed: batch,
-                dead_lettered: vec![],
-            })
+            Ok(CommitResult::new(batch, vec![]))
         }
 
         fn ok_with_dead_letter(committed: Vec<Payload>, dead: Vec<Payload>) -> MockResult {
-            Ok(CommitResult {
+            Ok(CommitResult::new(
                 committed,
-                dead_lettered: dead.into_iter().map(|p| (p, "rejected".into())).collect(),
-            })
+                dead.into_iter().map(|p| (p, "rejected".into())).collect(),
+            ))
         }
     }
 
@@ -1170,12 +1167,9 @@ mod tests {
                 std::future::pending::<()>().await;
             }
             let mut responses = self.responses.lock().unwrap();
-            let response = responses.pop_front().unwrap_or_else(|| {
-                Ok(CommitResult {
-                    committed: batch.clone(),
-                    dead_lettered: vec![],
-                })
-            });
+            let response = responses
+                .pop_front()
+                .unwrap_or_else(|| Ok(CommitResult::new(batch.clone(), vec![])));
             // Capture for introspection BEFORE returning the response so
             // tests see the same view the drain is about to act on.
             if let Ok(ref result) = response {
@@ -1315,10 +1309,8 @@ mod tests {
     #[test]
     fn commit_result_separates_committed_and_dead_lettered() {
         let p: Payload = Payload::from(b"hello".as_ref());
-        let result: CommitResult<Payload> = CommitResult {
-            committed: vec![p.clone()],
-            dead_lettered: vec![(p.clone(), "reason".into())],
-        };
+        let result: CommitResult<Payload> =
+            CommitResult::new(vec![p.clone()], vec![(p.clone(), "reason".into())]);
         assert_eq!(result.committed.len(), 1);
         assert_eq!(result.dead_lettered.len(), 1);
         assert_eq!(result.dead_lettered[0].0, p);

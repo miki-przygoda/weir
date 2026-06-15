@@ -266,10 +266,7 @@ impl Sink for MySqlSink {
 
     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, SqlSinkError> {
         if batch.is_empty() {
-            return Ok(CommitResult {
-                committed: Vec::new(),
-                dead_lettered: Vec::new(),
-            });
+            return Ok(CommitResult::new(Vec::new(), Vec::new()));
         }
 
         let sql = self.build_insert_sql(batch.len());
@@ -291,10 +288,7 @@ impl Sink for MySqlSink {
                     records = batch.len(),
                     "mysql sink committed batch as single INSERT"
                 );
-                Ok(CommitResult {
-                    committed: batch,
-                    dead_lettered: Vec::new(),
-                })
+                Ok(CommitResult::new(batch, Vec::new()))
             }
             Ok(Err(e)) => {
                 if !e.is_transient() {
@@ -305,10 +299,7 @@ impl Sink for MySqlSink {
                         "mysql sink permanently rejected batch; dead-lettering"
                     );
                     let dead_lettered = batch.into_iter().map(|r| (r, reason.clone())).collect();
-                    Ok(CommitResult {
-                        committed: Vec::new(),
-                        dead_lettered,
-                    })
+                    Ok(CommitResult::new(Vec::new(), dead_lettered))
                 } else {
                     Err(e)
                 }

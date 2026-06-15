@@ -386,10 +386,7 @@ impl Sink for HttpSink {
             }
         }
 
-        Ok(CommitResult {
-            committed,
-            dead_lettered,
-        })
+        Ok(CommitResult::new(committed, dead_lettered))
     }
 
     fn max_batch_size(&self) -> usize {

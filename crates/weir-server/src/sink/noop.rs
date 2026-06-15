@@ -29,10 +29,7 @@ impl Sink for NoopSink {
     type Error = NoopError;
 
     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, NoopError> {
-        Ok(CommitResult {
-            committed: batch,
-            dead_lettered: vec![],
-        })
+        Ok(CommitResult::new(batch, vec![]))
     }
 
     async fn health(&self) -> SinkHealth {

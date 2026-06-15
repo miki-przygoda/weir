@@ -317,10 +317,7 @@ impl Sink for ClickHouseSink {
         batch: Vec<Payload>,
     ) -> Result<CommitResult<Payload>, sql_common::SqlSinkError> {
         if batch.is_empty() {
-            return Ok(CommitResult {
-                committed: Vec::new(),
-                dead_lettered: Vec::new(),
-            });
+            return Ok(CommitResult::new(Vec::new(), Vec::new()));
         }
         let body = encode_rowbinary(&batch);
         let token = dedup_token(&batch);
@@ -354,10 +351,7 @@ impl Sink for ClickHouseSink {
 
         let status = resp.status();
         if status.is_success() {
-            Ok(CommitResult {
-                committed: batch,
-                dead_lettered: Vec::new(),
-            })
+            Ok(CommitResult::new(batch, Vec::new()))
         } else if status.is_redirection() {
             // Surfaces only because redirect-following is disabled (G01). An
             // INSERT endpoint that redirects is a misconfiguration; dead-letter
