@@ -536,6 +536,35 @@ mod tests {
     }
 
     #[test]
+    fn recovery_truncates_at_crc_mismatch_keeping_valid_prefix() {
+        let dir = tmp_dir("crc_mismatch");
+        let path = make_segment(&dir, 0, &[b"recordA", b"recordB"]);
+        // Flip a byte inside record B's PAYLOAD, leaving its length + CRC fields
+        // intact: the reader reads the 7-byte payload fully but the computed CRC no
+        // longer matches the stored one, so recovery must truncate at the last
+        // valid record (A) — the silent-bit-rot detection branch (S33). Layout:
+        // header 24 + record [4 len + 4 crc + 7 payload = 15]; record B's payload
+        // begins at 24 + 15 + 8 = 47.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[47] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+        let records: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "a CRC mismatch in record B must truncate to the valid prefix (A)"
+        );
+        assert_eq!(records[0], b"recordA" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn recover_open_segments_seals_every_segment_per_shard_deterministically() {
         use crate::wab::segment::{WabSegment, segment_path};
         let wab_dir = tmp_dir("recover_multi");
