@@ -5,17 +5,13 @@
 ## TL;DR
 
 - **76 raw** → **60 confirmed-real** after adversarial verification (+ 1 uncertain, 1 refuted).
-- **Fixed: 57** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
-- **Needs your decision: 3** → all in **[`ESCALATIONS.md`](ESCALATIONS.md)** (separate file so they're easy to find).
+- **Fixed: 60** — incl. the one CRITICAL data-loss bug (F12), every high-severity bug, and the mediums.
+- **Needs your decision: 0** → all in **[`ESCALATIONS.md`](ESCALATIONS.md)** (separate file so they're easy to find).
 - **Queued safe fixes: 0** — being worked through; this list shrinks as they land.
 
 ## ⚠️ Your decisions live in [`ESCALATIONS.md`](ESCALATIONS.md)
 
-Quick index (full detail + recommendations in that file):
-
-- **F41** *(high, client-sdk-ctl)* — CommitResult partition invariant (committed ∪ dead_lettered = batch) is unenforced; the drain confirms+deletes the segment unconditionally on Ok
-- **F42** *(high, client-sdk-ctl)* — SinkRecord::into_payload is documented as the dead-letter recovery path but is bypassed for whole-batch permanent (and transient) errors
-- **F48** *(medium, core)* — Public error enums and CommitResult are not #[non_exhaustive]; adding any variant/field after 1.0 is a breaking change
+_(all escalations resolved)_
 
 ## ✅ Fixed
 
@@ -28,6 +24,8 @@ Quick index (full detail + recommendations in that file):
 | F31 | high | sink | MySQL sink dead-letters live data on a recoverable connection-time auth/access failure (asymmetric with Postgres) | `a40dc0b` |
 | F37 | high | sink | ClickHouse sink commit() request/response classification has no in-process test (only an #[ignore] live-docker integration test) | `3c94aa3` |
 | F40 | high | client-sdk-ctl | weir-ctl `dl list` / `dl drop` silently see zero dead-letter segments (wrong suffix filter) | `ee2841e` |
+| F41 | high | client-sdk-ctl | CommitResult partition invariant (committed ∪ dead_lettered = batch) is unenforced; the drain confirms+deletes the segment unconditionally on Ok | `fef9199` |
+| F42 | high | client-sdk-ctl | SinkRecord::into_payload is documented as the dead-letter recovery path but is bypassed for whole-batch permanent (and transient) errors | `afcbed4` |
 | F53 | high | config | shard_count in 65..=256 with defaulted worker_count rejects a documented, in-range config with a misleading error | `7a499f7` |
 | F03 | medium | drain | Single permanently-rejected batch larger than dead_letter_max_bytes wedges the drain in a permanent block↔retry livelock | `02382df` |
 | F04 | medium | drain | Sink::health() is called with no timeout backstop; a hanging health() stalls the entire drain | `02382df` |
@@ -38,13 +36,14 @@ Quick index (full detail + recommendations in that file):
 | F17 | medium | wab | Recovery: no test for the oversized-payload_len boundary (record at exactly MAX_PAYLOAD_HARD_CAP must survive; one over must truncate) | `abe69c2` |
 | F20 | medium | worker-queue-metrics | Metrics HTTP server has no read/write timeout — slowloris permanently wedges the unauthenticated endpoint and blinds monitoring | `0530fd2` |
 | F21 | medium | worker-queue-metrics | Phase-2 coalesce starves co-located shards on a shared worker (worker_count < shard_count) | `9e5276a` |
-| F25 | medium | socket | UnknownMessageType/UnknownDurability decode errors are nacked as the (documented-as-transient, keep-connection-open) InternalError reason, yet the connection is closed | `9336e2f` |
+| F25 | medium | socket | UnknownMessageType/UnknownDurability decode errors are nacked as the (documented-as-transient, keep-connection-open) InternalError reason, yet the connection is closed | `538129e` |
 | F32 | medium | sink | ClickHouse response body read is not bounded by the sink's configured timeout (error path can hang to the drain backstop) | `7e15ac4` |
 | F34 | medium | sink | ClickHouse does not percent-decode URL credentials before HTTP basic auth (silent divergence from SQL sinks) | `7e15ac4` |
 | F38 | medium | sink | HTTP concurrency: no test asserts a transient mid-batch error actually cancels still-in-flight POSTs | `7daca2f` |
 | F39 | medium | sink | HTTP concurrency: no test pins record-to-outcome pairing (right payload in committed vs dead_lettered) under concurrent POSTs | `7daca2f` |
 | F43 | medium | client-sdk-ctl | Blocking client sets no socket read/write/connect timeouts; a wedged daemon blocks producers indefinitely | `0eaa4d5` |
 | F44 | medium | client-sdk-ctl | Client read_response allocates vec![0u8; payload_len] without the MAX_PAYLOAD_HARD_CAP guard the server applies before allocating | `d04dd87` |
+| F48 | medium | core | Public error enums and CommitResult are not #[non_exhaustive]; adding any variant/field after 1.0 is a breaking change | `54b4438` |
 | F54 | medium | config | Config-time warn! calls are silently dropped (tracing subscriber initialized after Config::load) | `5a2fa9d` |
 | F07 | low | drain | Dead-letter cap accounting omits fixed 60-byte per-file segment overhead, so dead_letter_max_bytes can be exceeded | `7acd6ee` |
 | F08 | low | drain | Swallowed rescan() error can wedge the drain blocked despite an operator-freed dead-letter directory | `02382df` |
@@ -76,7 +75,7 @@ Quick index (full detail + recommendations in that file):
 | F59 | low | config | Config derives Debug, exposing sink_url credentials, inconsistent with the project's deliberate bearer_token redaction | `b0f2e9b` |
 | F19 | info | wab | macOS data fsync uses F_BARRIERFSYNC (barrier) while directory durability uses plain fsync via sync_all — weaker than F_FULLFSYNC; an explicit, undertested tradeoff on the crown durability path | `238a364` |
 | F24 | info | worker-queue-metrics | QueueSender exposes len() with no is_empty() | `e6aa1e7` |
-| F52 | info | core | Reserved flags byte is preserved verbatim on decode but never validated to be zero, foreclosing in-version flag evolution | `9336e2f` |
+| F52 | info | core | Reserved flags byte is preserved verbatim on decode but never validated to be zero, foreclosing in-version flag evolution | `538129e` |
 | F60 | info | config | u64 durations range-checked via `as usize` truncate on 32-bit targets, letting out-of-range values pass | `03cff76` |
 
 ## 🟡 Queued safe fixes (in progress)

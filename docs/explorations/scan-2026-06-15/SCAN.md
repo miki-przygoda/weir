@@ -23,11 +23,11 @@
 | G14 G15 | `4203582` | metrics: accept-loop survives errors; no reserved-dir double-count |
 | G07 G08 G20 | `c52ba56` | config dead-code gate, DecodeError doc, cert-parse gating |
 
-**3 deferred to the Group 1/2 freeze review** (additive public-API on frozen crates — decided WITH the wire/API freeze, not unilaterally):
+**3 deferred to the Group 1/2 freeze review — now ALL RESOLVED** (decided WITH the wire/API freeze, not unilaterally):
 
-- **G09** — Payload's `PartialEq`-against-bytes impls are one-directional (`payload == slice` compiles, `slice == payload` doesn't). Adding the reverse impls is additive API on `weir-core` → fold into the Group 2 (Public Rust API) freeze decision.
-- **G18** — `Envelope::decode` silently ignores trailing bytes past `frame_len`. Documenting/testing the current behaviour is safe, but whether to *reject* trailing data is a wire-contract decision → Group 1 (Wire-protocol) freeze.
-- **G19** — the wire `TryFrom` error structs (`UnknownMessageType`/`UnknownDurability`/`UnknownNackReason`) aren't re-exported at the crate root. Re-exporting is additive API on `weir-core` → Group 2 freeze.
+- **G18** — `Envelope::decode` silently ignored trailing bytes past `frame_len`. **RESOLVED** (`13e239e`, Group 1 wire freeze): decode now requires the buffer to be exactly one frame; trailing data is rejected with the new `DecodeError::TrailingBytes`.
+- **G09** — Payload's `PartialEq`-against-bytes impls were one-directional. **RESOLVED** (`7eaf121`, Group 2 API freeze): added the three reverse impls so `slice == payload` compiles and agrees with `payload == slice`.
+- **G19** — the wire `TryFrom` error structs (`UnknownMessageType`/`UnknownDurability`/`UnknownNackReason`) weren't re-exported at the crate root. **RESOLVED** (`adece14`, Group 2 API freeze): re-exported flat next to the enums they belong to.
 
 **1 refuted** (see bottom).
 
