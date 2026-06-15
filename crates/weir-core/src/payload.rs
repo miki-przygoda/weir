@@ -18,27 +18,32 @@ pub struct Payload(Bytes);
 
 impl Payload {
     /// An empty payload.
+    #[must_use]
     pub fn new() -> Self {
         Payload(Bytes::new())
     }
 
     /// Wraps a `'static` byte slice without copying (O(1)).
+    #[must_use]
     pub fn from_static(bytes: &'static [u8]) -> Self {
         Payload(Bytes::from_static(bytes))
     }
 
     /// Copies a borrowed slice into a new ref-counted buffer.
+    #[must_use]
     pub fn copy_from_slice(data: &[u8]) -> Self {
         Payload(Bytes::copy_from_slice(data))
     }
 
     /// Borrows the payload as a byte slice.
+    #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
 
     /// Consumes the payload, returning the inner [`Bytes`] (the escape hatch for
     /// code that genuinely needs the `bytes` type).
+    #[must_use]
     pub fn into_bytes(self) -> Bytes {
         self.0
     }

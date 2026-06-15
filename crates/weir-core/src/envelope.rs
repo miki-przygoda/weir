@@ -103,6 +103,7 @@ impl Header {
     /// a bare `Header::encode` always declares `payload_len = 0`, so it is only
     /// valid for the genuinely-empty-payload frames (Ack / HealthCheck) that use
     /// it (F50).
+    #[must_use]
     pub fn new(message_type: MessageType, durability: Durability, flags: u8) -> Self {
         Self {
             version: WIRE_VERSION,
@@ -143,6 +144,7 @@ impl Header {
 
     /// Serialises the header to exactly `HEADER_LEN` bytes. CRC is computed here;
     /// the caller does not need to know the CRC coverage range.
+    #[must_use]
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut buf = [0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(&MAGIC);
@@ -228,6 +230,7 @@ impl Envelope {
     /// Builds a frame from a header and payload. The header's `payload_len` is
     /// overwritten with the payload's actual length, so the two cannot desync
     /// — the payload is the single source of truth for the length on the wire.
+    #[must_use]
     pub fn new(header: Header, payload: impl Into<Payload>) -> Self {
         let payload = payload.into();
         // Saturate rather than `as u32`-truncate: a >= 4 GiB payload would
@@ -254,6 +257,7 @@ impl Envelope {
     }
 
     /// Serialises the full frame: header bytes + payload bytes + payload CRC32 (LE).
+    #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len() + 4);
         out.extend_from_slice(&self.header.encode());

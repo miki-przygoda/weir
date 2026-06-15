@@ -97,6 +97,19 @@ pub struct WeirClient<S = UnixStream> {
     poisoned: bool,
 }
 
+// Manual Debug (not derived): a `#[derive(Debug)]` would require `S: Debug`, which
+// excludes `WeirClient<TlsStream>` (rustls's `StreamOwned` is not `Debug`). Print
+// the non-secret fields and omit the transport so every client type — Unix and
+// TLS — implements `Debug` (C-DEBUG, S40).
+impl<S> std::fmt::Debug for WeirClient<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeirClient")
+            .field("default_durability", &self.default_durability)
+            .field("poisoned", &self.poisoned)
+            .finish_non_exhaustive()
+    }
+}
+
 // ── Shared methods over any blocking Read+Write transport ──────────────────────
 
 impl<S: Read + Write> WeirClient<S> {

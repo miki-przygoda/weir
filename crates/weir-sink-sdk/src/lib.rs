@@ -142,6 +142,7 @@ impl<R> CommitResult<R> {
     /// Every record passed to [`Sink::commit`] should appear in exactly one of the
     /// two lists; see the type-level note for how the partition invariant is
     /// enforced.
+    #[must_use]
     pub fn new(committed: Vec<R>, dead_lettered: Vec<(R, String)>) -> Self {
         Self {
             committed,
