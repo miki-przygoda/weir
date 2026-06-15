@@ -269,7 +269,9 @@ impl Envelope {
     /// 1. Buffer length >= HEADER_LEN — check before any parsing.
     /// 2. Header decode (magic → version → CRC) — before touching payload.
     /// 3. `payload_len <= MAX_PAYLOAD_HARD_CAP` — rejection before any heap allocation.
-    /// 4. Buffer length >= HEADER_LEN + payload_len + 4 — check frame completeness.
+    /// 4. Buffer length == HEADER_LEN + payload_len + 4 — the buffer must be
+    ///    *exactly* one frame: shorter is `TruncatedFrame`, longer is `TrailingBytes`
+    ///    (the caller owns framing; the codec never silently discards a remainder — G18).
     /// 5. Payload CRC — validate after allocation, before returning data to caller.
     ///
     /// The socket layer applies an additional cap (`min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`)
@@ -297,6 +299,17 @@ impl Envelope {
         let frame_len = HEADER_LEN + payload_len + 4;
         if buf.len() < frame_len {
             return Err(DecodeError::TruncatedFrame);
+        }
+        // The buffer must be EXACTLY one frame. A longer buffer is rejected rather
+        // than decoding the first frame and discarding the rest: this crate is the
+        // executable wire reference, and silently dropping trailing bytes would let
+        // a desynced or concatenated stream lose records without error. The caller
+        // owns framing — weir's own socket/client paths read exactly frame_len and
+        // never reach this arm (G18).
+        if buf.len() > frame_len {
+            return Err(DecodeError::TrailingBytes {
+                extra: buf.len() - frame_len,
+            });
         }
 
         let payload = Payload::copy_from_slice(&buf[HEADER_LEN..HEADER_LEN + payload_len]);
@@ -583,6 +596,48 @@ mod tests {
             Envelope::decode(&encoded),
             Err(DecodeError::PayloadCrcMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn envelope_decode_rejects_trailing_bytes() {
+        // A buffer longer than one frame is rejected (G18) rather than decoding
+        // the first frame and silently discarding the rest — the codec never loses
+        // a remainder; the caller owns framing.
+        let env = Envelope::new(push_header(), b"hello".to_vec());
+        let mut encoded = env.encode();
+        encoded.extend_from_slice(b"garbage"); // 7 extra bytes
+        assert_eq!(
+            Envelope::decode(&encoded),
+            Err(DecodeError::TrailingBytes { extra: 7 })
+        );
+    }
+
+    #[test]
+    fn envelope_decode_accepts_exact_frame() {
+        // The boundary case: a buffer that is exactly one frame decodes cleanly.
+        let env = Envelope::new(push_header(), b"hello".to_vec());
+        let encoded = env.encode();
+        assert_eq!(Envelope::decode(&encoded).unwrap(), env);
+    }
+
+    #[test]
+    fn envelope_decode_trailing_bytes_checked_after_payload_too_large() {
+        // A 16-byte buffer declaring an over-cap payload returns PayloadTooLarge,
+        // not TrailingBytes: the cap check (step 3) precedes the frame-length check
+        // (step 4), so an over-cap declared length is rejected before allocation
+        // even though the buffer is "too short" for the declared frame.
+        let oversized_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
+        let mut header_bytes = push_header().encode();
+        header_bytes[8..12].copy_from_slice(&oversized_len.to_le_bytes());
+        let crc = crc32fast::hash(&header_bytes[..HEADER_CRC_COVERAGE]);
+        header_bytes[12..16].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            Envelope::decode(&header_bytes),
+            Err(DecodeError::PayloadTooLarge {
+                len: MAX_PAYLOAD_HARD_CAP + 1,
+                cap: MAX_PAYLOAD_HARD_CAP,
+            })
+        );
     }
 
     #[test]

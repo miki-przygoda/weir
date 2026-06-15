@@ -108,6 +108,26 @@ The server decodes in this order to minimise DoS surface. **This order is mandat
 5. **Payload read** — only after the cap check passes.
 6. **Payload CRC** — validates the payload bytes before the record is queued.
 
+The daemon reads the header and payload separately (it knows `payload_len` from
+the header before reading the payload), so it always consumes exactly one frame
+off the wire. Framing is the reader's responsibility.
+
+### Reference codec: one buffer, one frame
+
+The `weir-core` reference codec (`Envelope::decode`, the executable definition of
+this format) requires its input buffer to be **exactly one frame** —
+`HEADER_LEN + payload_len + 4` bytes:
+
+- a shorter buffer is rejected as `TruncatedFrame`;
+- a longer buffer is rejected as `TrailingBytes` (carrying the excess length).
+
+It does **not** decode the first frame and discard the remainder. An
+implementation that reads from a stream must therefore frame the bytes itself
+(read the 16-byte header, take `payload_len`, then read exactly
+`payload_len + 4` more bytes) rather than handing a multi-frame buffer to a
+single decode call. This keeps a desynced or concatenated stream from silently
+losing records (G18).
+
 ---
 
 ## CRC32 algorithm

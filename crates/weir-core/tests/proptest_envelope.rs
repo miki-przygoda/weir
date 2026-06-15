@@ -329,4 +329,22 @@ proptest! {
             ),
         }
     }
+
+    /// A valid frame with ANY non-empty suffix appended must decode to
+    /// `TrailingBytes` carrying the exact suffix length — the codec requires its
+    /// input to be exactly one frame and never silently discards a remainder (G18).
+    #[test]
+    fn trailing_bytes_rejected(
+        payload in arb_small_payload(),
+        suffix in proptest::collection::vec(any::<u8>(), 1..=64),
+    ) {
+        let env = Envelope::new(Header::new(MessageType::Push, Durability::Sync, 0), payload);
+        let mut bytes = env.encode();
+        let extra = suffix.len();
+        bytes.extend_from_slice(&suffix);
+        prop_assert_eq!(
+            Envelope::decode(&bytes),
+            Err(DecodeError::TrailingBytes { extra })
+        );
+    }
 }

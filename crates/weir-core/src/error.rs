@@ -59,6 +59,15 @@ pub enum DecodeError {
         /// The nonzero `flags` byte the frame carried.
         flags: u8,
     },
+    /// The buffer was longer than the single frame it declared. `Envelope::decode`
+    /// requires its input to be exactly one frame (`HEADER_LEN + payload_len + 4`
+    /// bytes): a longer buffer is rejected rather than decoding the first frame and
+    /// silently discarding the remainder, so the caller — not the codec — owns
+    /// framing and an over-long buffer surfaces as an error, not lost data (G18).
+    TrailingBytes {
+        /// The number of bytes past the declared frame length.
+        extra: usize,
+    },
 }
 
 impl fmt::Display for DecodeError {
@@ -102,6 +111,9 @@ impl fmt::Display for DecodeError {
             }
             Self::ReservedFlagsSet { flags } => {
                 write!(f, "reserved flags byte must be zero, got {flags:#04x}")
+            }
+            Self::TrailingBytes { extra } => {
+                write!(f, "buffer has {extra} byte(s) past the declared frame length")
             }
         }
     }
