@@ -14,7 +14,6 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use tracing::warn;
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -382,12 +381,34 @@ pub struct Config {
 }
 
 impl Config {
-    /// Loads config from all three layers (CLI > env > file > defaults) and validates.
-    pub fn load() -> Result<Self, ConfigError> {
+    /// Loads config from all three layers (CLI > env > file > defaults) and
+    /// validates.
+    ///
+    /// Returns the validated config plus any **advisory warnings** collected
+    /// during loading (unknown TOML keys, feature-gated keys, the small
+    /// dead-letter-cap advisory). The caller is expected to replay them through
+    /// `tracing` *after* the subscriber is initialised — `load()` runs before
+    /// the subscriber exists, so emitting them here would silently drop them and
+    /// a TOML typo would take defaults unnoticed (F54).
+    pub fn load() -> Result<(Self, Vec<String>), ConfigError> {
         let (cli, config_path) = cli::parse()?;
-        let file = file::read(&config_path)?;
+        let (file, mut warnings) = file::read(&config_path)?;
         let env = env::read()?;
-        Self::from_layers(cli, env, file)
+        let config = Self::from_layers(cli, env, file)?;
+
+        // Post-validation advisory: a tiny dead-letter cap causes frequent
+        // BlockedDeadLetterFull transitions. Collected here (not warn!'d inside
+        // from_layers) so it rides the same deferred-emit path as the file
+        // warnings and so from_layers stays subscriber-agnostic.
+        if config.dead_letter_max_bytes < 1_048_576 {
+            warnings.push(format!(
+                "dead_letter_max_bytes ({}) is very small; consider increasing to avoid \
+                 frequent BlockedDeadLetterFull transitions",
+                config.dead_letter_max_bytes
+            ));
+        }
+
+        Ok((config, warnings))
     }
 
     /// Merges three partial-config layers (CLI > env > file) against defaults.
@@ -621,13 +642,9 @@ impl Config {
                 reason: "must be greater than 0".into(),
             });
         }
-        if dead_letter_max_bytes < 1_048_576 {
-            warn!(
-                dead_letter_max_bytes,
-                "dead_letter_max_bytes is very small; consider increasing to avoid frequent \
-                 BlockedDeadLetterFull transitions"
-            );
-        }
+        // The "very small dead_letter_max_bytes" advisory is emitted by load()
+        // (collected, then replayed after the tracing subscriber inits) so it
+        // can't be silently dropped — see Config::load (F54).
 
         let dead_letter_check_interval_secs = merge!(dead_letter_check_interval_secs).unwrap_or(30);
         check_range(
@@ -1350,10 +1367,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn missing_config_file_returns_empty_partial() {
-        let result =
+        let (result, warnings) =
             file::read(Path::new("/weir_test_no_such_config_file_xyzzy_12345.toml")).unwrap();
         assert!(result.shard_count.is_none());
         assert!(result.wab_dir.is_none());
+        assert!(warnings.is_empty(), "a missing file yields no warnings");
     }
 
     // ── TCP + TLS config ──────────────────────────────────────────────────────

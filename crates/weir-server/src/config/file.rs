@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use tracing::warn;
 
 use super::{ConfigError, PartialConfig};
 
@@ -135,11 +134,15 @@ fn feature_compiled(feature: &str) -> bool {
     }
 }
 
-pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
+/// Reads the TOML config file, returning the parsed layer plus any advisory
+/// warnings (unknown / feature-gated keys). Warnings are returned rather than
+/// `warn!`'d because this runs before the tracing subscriber is initialised;
+/// `Config::load` replays them afterward (F54).
+pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PartialConfig::empty());
+            return Ok((PartialConfig::empty(), Vec::new()));
         }
         Err(e) => return Err(ConfigError::IoError { source: e }),
     };
@@ -149,7 +152,7 @@ pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
         source: Box::new(e),
     })?;
 
-    warn_unknown_keys(&value);
+    let warnings = collect_unknown_key_warnings(&value);
 
     let raw: RawConfig =
         value
@@ -160,62 +163,71 @@ pub(super) fn read(path: &Path) -> Result<PartialConfig, ConfigError> {
             })?;
 
     let s = raw.server.unwrap_or_default();
-    Ok(PartialConfig {
-        socket_path: s.socket_path.map(PathBuf::from),
-        wab_dir: s.wab_dir.map(PathBuf::from),
-        shard_count: s.shard_count,
-        worker_count: s.worker_count,
-        batch_size: s.batch_size,
-        batch_deadline_ms: s.batch_deadline_ms,
-        wab_segment_max_bytes: s.wab_segment_max_bytes,
-        max_connections: s.max_connections,
-        max_payload_bytes: s.max_payload_bytes,
-        metrics_port: s.metrics_port,
-        metrics_bind: s.metrics_bind,
-        metrics_max_connections: s.metrics_max_connections,
-        peer_uid_check: s.peer_uid_check,
-        shutdown_timeout_secs: s.shutdown_timeout_secs,
-        connection_read_timeout_secs: s.connection_read_timeout_secs,
-        sink_type: s.sink_type,
-        sink_url: s.sink_url,
-        sink_timeout_secs: s.sink_timeout_secs,
-        sink_max_batch_size: s.sink_max_batch_size,
-        sink_send_idempotency_key: s.sink_send_idempotency_key,
-        sink_http_concurrency: s.sink_http_concurrency,
-        #[cfg(feature = "mysql-sink")]
-        sink_mysql_table: s.sink_mysql_table,
-        #[cfg(feature = "mysql-sink")]
-        sink_mysql_column: s.sink_mysql_column,
-        #[cfg(feature = "mysql-sink")]
-        sink_mysql_insert_mode: s.sink_mysql_insert_mode,
-        #[cfg(feature = "postgres-sink")]
-        sink_postgres_table: s.sink_postgres_table,
-        #[cfg(feature = "postgres-sink")]
-        sink_postgres_column: s.sink_postgres_column,
-        #[cfg(feature = "postgres-sink")]
-        sink_postgres_insert_mode: s.sink_postgres_insert_mode,
-        #[cfg(feature = "clickhouse-sink")]
-        sink_clickhouse_database: s.sink_clickhouse_database,
-        #[cfg(feature = "clickhouse-sink")]
-        sink_clickhouse_table: s.sink_clickhouse_table,
-        #[cfg(feature = "clickhouse-sink")]
-        sink_clickhouse_column: s.sink_clickhouse_column,
-        dead_letter_max_bytes: s.dead_letter_max_bytes,
-        dead_letter_check_interval_secs: s.dead_letter_check_interval_secs,
-        log_level: s.log_level,
-        tcp_bind: s.tcp_bind,
-        tls_cert_path: s.tls_cert_path,
-        tls_key_path: s.tls_key_path,
-        tls_client_ca_path: s.tls_client_ca_path,
-        tls_handshake_timeout_secs: s.tls_handshake_timeout_secs,
-    })
+    Ok((
+        PartialConfig {
+            socket_path: s.socket_path.map(PathBuf::from),
+            wab_dir: s.wab_dir.map(PathBuf::from),
+            shard_count: s.shard_count,
+            worker_count: s.worker_count,
+            batch_size: s.batch_size,
+            batch_deadline_ms: s.batch_deadline_ms,
+            wab_segment_max_bytes: s.wab_segment_max_bytes,
+            max_connections: s.max_connections,
+            max_payload_bytes: s.max_payload_bytes,
+            metrics_port: s.metrics_port,
+            metrics_bind: s.metrics_bind,
+            metrics_max_connections: s.metrics_max_connections,
+            peer_uid_check: s.peer_uid_check,
+            shutdown_timeout_secs: s.shutdown_timeout_secs,
+            connection_read_timeout_secs: s.connection_read_timeout_secs,
+            sink_type: s.sink_type,
+            sink_url: s.sink_url,
+            sink_timeout_secs: s.sink_timeout_secs,
+            sink_max_batch_size: s.sink_max_batch_size,
+            sink_send_idempotency_key: s.sink_send_idempotency_key,
+            sink_http_concurrency: s.sink_http_concurrency,
+            #[cfg(feature = "mysql-sink")]
+            sink_mysql_table: s.sink_mysql_table,
+            #[cfg(feature = "mysql-sink")]
+            sink_mysql_column: s.sink_mysql_column,
+            #[cfg(feature = "mysql-sink")]
+            sink_mysql_insert_mode: s.sink_mysql_insert_mode,
+            #[cfg(feature = "postgres-sink")]
+            sink_postgres_table: s.sink_postgres_table,
+            #[cfg(feature = "postgres-sink")]
+            sink_postgres_column: s.sink_postgres_column,
+            #[cfg(feature = "postgres-sink")]
+            sink_postgres_insert_mode: s.sink_postgres_insert_mode,
+            #[cfg(feature = "clickhouse-sink")]
+            sink_clickhouse_database: s.sink_clickhouse_database,
+            #[cfg(feature = "clickhouse-sink")]
+            sink_clickhouse_table: s.sink_clickhouse_table,
+            #[cfg(feature = "clickhouse-sink")]
+            sink_clickhouse_column: s.sink_clickhouse_column,
+            dead_letter_max_bytes: s.dead_letter_max_bytes,
+            dead_letter_check_interval_secs: s.dead_letter_check_interval_secs,
+            log_level: s.log_level,
+            tcp_bind: s.tcp_bind,
+            tls_cert_path: s.tls_cert_path,
+            tls_key_path: s.tls_key_path,
+            tls_client_ca_path: s.tls_client_ca_path,
+            tls_handshake_timeout_secs: s.tls_handshake_timeout_secs,
+        },
+        warnings,
+    ))
 }
 
-fn warn_unknown_keys(value: &toml::Value) {
-    let Some(top) = value.as_table() else { return };
+/// Collects advisory warnings for unknown top-level keys, unknown `[server]`
+/// keys, and `[server]` keys that need a Cargo feature this binary lacks.
+/// Returns the messages instead of emitting them — see [`read`] (F54).
+fn collect_unknown_key_warnings(value: &toml::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(top) = value.as_table() else {
+        return warnings;
+    };
     for key in top.keys() {
         if key != "server" {
-            warn!(key = %key, "unknown top-level config key; ignoring");
+            warnings.push(format!("unknown top-level config key '{key}'; ignoring"));
         }
     }
     if let Some(server_val) = top.get("server")
@@ -235,18 +247,17 @@ fn warn_unknown_keys(value: &toml::Value) {
                 // it; nothing to warn about. Feature absent ⇒ the value was
                 // silently dropped, so tell the operator which feature it needs.
                 if !feature_compiled(feature) {
-                    warn!(
-                        key = %k,
-                        feature,
-                        "[server] config key requires a Cargo feature this binary was \
-                         built without; ignoring"
-                    );
+                    warnings.push(format!(
+                        "[server] config key '{k}' requires the '{feature}' Cargo feature, \
+                         which this binary was built without; ignoring"
+                    ));
                 }
                 continue;
             }
-            warn!(key = %k, "unknown [server] config key; ignoring");
+            warnings.push(format!("unknown [server] config key '{k}'; ignoring"));
         }
     }
+    warnings
 }
 
 #[cfg(test)]
@@ -289,9 +300,24 @@ mod tests {
         )
         .unwrap();
 
-        let partial = read(&path).expect("warn-only keys must not fail the parse");
+        let (partial, warnings) = read(&path).expect("warn-only keys must not fail the parse");
         // The recognised base key still applies.
         assert_eq!(partial.shard_count, Some(2));
+        // The unknown key is reported as a collected warning (F54) — not silently
+        // dropped — so Config::load can replay it after the subscriber inits.
+        assert!(
+            warnings.iter().any(|w| w.contains("totally_made_up_key")),
+            "unknown key must surface as a collected warning: {warnings:?}"
+        );
+        // On a build without clickhouse-sink the gated key is also a warning
+        // naming the feature.
+        #[cfg(not(feature = "clickhouse-sink"))]
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("sink_clickhouse_table") && w.contains("clickhouse-sink")),
+            "feature-gated key must surface a feature-naming warning: {warnings:?}"
+        );
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }

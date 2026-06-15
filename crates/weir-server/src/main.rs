@@ -38,7 +38,7 @@ use std::{
     time::Duration,
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
@@ -182,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         libc::umask(0o077);
     }
 
-    let config = Config::load()?;
+    let (config, config_warnings) = Config::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -190,6 +190,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Replay any advisory warnings collected during Config::load — it runs
+    // before this subscriber exists, so emitting them there would silently drop
+    // them (a TOML typo would take defaults unnoticed). See Config::load (F54).
+    for w in &config_warnings {
+        warn!("config: {w}");
+    }
 
     info!(
         socket = %config.socket_path.display(),
