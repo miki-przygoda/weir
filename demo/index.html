@@ -208,17 +208,20 @@
   const LAT = { Sync:0.39, Batched:0.39, Buffered:0.07, Naive:8.0 };
   const TIER_COLOR = { Sync:"#58a6ff", Batched:"#bc8cff", Buffered:"#3fb950" };
   const BATCH_SIZE = 8;          // records coalesced into one drained batch
-  const BATCH_DEADLINE = 900;    // ms (anim time) before a partial batch seals
+  const BATCH_DEADLINE = 1100;   // ms (anim time) before a partial batch seals
+  const SPAWN_GAP = 75;          // ms between staggered emissions of a pushed burst
 
   // ---- animation stage durations (anim ms) — illustrative, watchable ----
-  // weir lane stages: socket, wab-write, durability(point of ack), drain-wait handled separately
+  // The first hop (producer → ingress) is the SAME in both lanes — it's just the
+  // record leaving the producer. The lanes diverge AFTER that: weir does a fast
+  // LOCAL fsync then acks; naive blocks on the remote DB commit round-trip.
+  const FIRST_HOP = 380;
   const W = {
-    socket:420, wab:420,
-    fsync:{ Sync:520, Batched:520, Buffered:60 }, // time to durability point
-    drainCommit:760
+    socket: FIRST_HOP, wab: 240,
+    fsync:{ Sync:300, Batched:300, Buffered:50 }, // local durability point → ack
+    drainCommit:820
   };
-  const N = { net:560, commit:900 }; // naive: travel + serialized commit
-  const NAIVE_CONNS = 4;             // naive connection-pool concurrency
+  const N = { net: FIRST_HOP, commit: 1150 };     // equal first hop, then the long remote commit
 
   // ---- canvas geometry ----
   const cv = document.getElementById("cv");
@@ -232,22 +235,23 @@
 
   // x positions of nodes
   const xProd = 80, xEnd = 980;
-  // naive nodes
+  // naive nodes — first hop (Producer → send) is aligned with weir's Producer → Socket
   const naiveNodes = [
     {x:xProd, y:yN, label:"Producer"},
-    {x:520,   y:yN, label:"network"},
+    {x:300,   y:yN, label:"send"},
     {x:xEnd,  y:yN, label:"Database\n(commit/record)"}
   ];
   // weir ack-path nodes
   const weirNodes = [
     {x:xProd, y:yW, label:"Producer"},
     {x:300,   y:yW, label:"Socket"},
-    {x:520,   y:yW, label:"WAB\n(append+CRC)"},
-    {x:720,   y:yW, label:"fsync"},
-    {x:880,   y:yW, label:"ACK"}
+    {x:480,   y:yW, label:"WAB\n(append+CRC)"},
+    {x:680,   y:yW, label:"fsync"},
+    {x:860,   y:yW, label:"ACK"}
   ];
   // weir drain-path nodes (sealed segment -> drain -> sink)
-  const xSeg=520, xDrainBox=720, xSink=xEnd;
+  const xSeg=480, xDrainBox=680, xSink=xEnd;
+  const SOCKET_X = 300;   // crash reddens from here onward (the daemon); the Producer survives
 
   // ---- state ----
   let tier = "Sync";
@@ -262,7 +266,8 @@
   let wab = [];           // {id, durable:bool, color}
   let batchTimer = null;  // anim-time when current partial batch should seal
   const drainQueue = [];  // sealed batches awaiting commit: {ids, t0, committed}
-  let naiveActive = 0;    // naive connections in use
+  const spawnQueue = [];  // tiers waiting to be emitted (staggered) so a burst is visible
+  let spawnAcc = 0;       // accumulator for the stagger gap
 
   const metrics = {
     latN:[], latW:[],
@@ -287,39 +292,42 @@
   function avg(a){ return a.length ? a.reduce((x,y)=>x+y,0)/a.length : null; }
   function fmtMs(v){ return v==null ? "—" : (v<1 ? (v*1000|0)+" µs" : v.toFixed(1)+" ms"); }
 
-  // ---- spawn a record into both lanes ----
+  // ---- queue records for staggered emission so a +10 burst reads as many tokens ----
   function pushRecords(k){
-    for(let i=0;i<k;i++){
-      recId++;
-      const color = TIER_COLOR[tier];
-      // naive token
-      records.push({ id:recId, lane:"naive", stage:"queue", p:0, color, born:tNow,
-                     ackLat:null, acked:false, lost:false });
-      // weir token
-      records.push({ id:recId, lane:"weir", stage:"socket", p:0, color, tier, born:tNow,
-                     ackLat:null, acked:false, lost:false, durable:false });
-    }
+    for(let i=0;i<k;i++) spawnQueue.push(tier);
     log(`producer pushed ${k} record${k>1?"s":""} (${tier})`);
+  }
+  // emit one queued record into both lanes
+  function emitOne(t){
+    recId++;
+    const color = TIER_COLOR[t];
+    records.push({ id:recId, lane:"naive", stage:"net", p:0, color, born:tNow,
+                   ackLat:null, acked:false, lost:false });
+    records.push({ id:recId, lane:"weir", stage:"socket", p:0, color, tier:t, born:tNow,
+                   ackLat:null, acked:false, lost:false, durable:false });
   }
 
   // ---- per-frame simulation ----
   function step(dt){
     tNow += dt;
 
-    // advance naive tokens
+    // emit queued records on a stagger so a burst reads as many distinct tokens
+    if(spawnQueue.length){
+      spawnAcc += dt;
+      while(spawnQueue.length && spawnAcc >= SPAWN_GAP){ spawnAcc -= SPAWN_GAP; emitOne(spawnQueue.shift()); }
+    } else { spawnAcc = 0; }
+
+    // advance naive tokens — equal first hop (net), then the long remote commit.
+    // The producer is blocked the whole time; the ack only lands after the commit.
     for(const r of records){
       if(r.lane!=="naive" || r.done) continue;
-      if(r.stage==="queue"){
-        // wait for a free connection
-        if(naiveActive < NAIVE_CONNS){ naiveActive++; r.stage="net"; r.p=0; }
-      } else if(r.stage==="net"){
+      if(r.stage==="net"){
         r.p += dt / N.net;
         if(r.p>=1){ r.stage="commit"; r.p=0; }
       } else if(r.stage==="commit"){
         r.p += dt / N.commit;
         if(r.p>=1){
           r.stage="done"; r.done=true; r.acked=true; r.ackLat=LAT.Naive;
-          naiveActive--;
           metrics.ackN++; metrics.comN++;        // naive: 1 commit per record
           metrics.latN.push(LAT.Naive);
         }
@@ -412,27 +420,17 @@
       if(!w.durable){ lostBuffered++; metrics.lostW++; return false; }
       return true; // durable (Sync/Batched) survives in the WAB
     });
-    // weir tokens still pre-ack in flight: not acked → no false ack (not counted as loss)
+    // weir tokens still inside the daemon pre-ack (Socket onward) are lost — never
+    // acked, so no false ack; the Producer (still alive) retries them.
     for(const r of records){
       if(r.lane==="weir" && !r.done && (r.stage==="socket"||r.stage==="wab"||r.stage==="fsync")){
         markInflightLost(r);
       }
     }
-    // naive: records mid insert/commit (the host died holding them) are lost; their
-    // downstream outcome is unknown. Not-yet-sent queued records are not counted —
-    // the producer never handed them off.
-    let lostNaive=0;
-    for(const r of records){
-      if(r.lane==="naive" && !r.done && (r.stage==="net"||r.stage==="commit")){
-        r._sx=r.stage;
-        r.lost=true; r.done=true; r.lostAt=tNow; r.stage="lost-anim";
-        lostNaive++; metrics.lostN++;
-        naiveActive=Math.max(0,naiveActive-1);
-      }
-    }
-    log(`*** CRASH — daemon down. ${wab.length} durable segment record(s) safe in WAB. ***`, "ev-crash");
+    // The naive lane talks straight to the DB, not to weir — a weir-daemon crash
+    // leaves it completely untouched. It keeps running.
+    log(`*** weir daemon DOWN. ${wab.length} durable segment record(s) safe in the WAB; naive lane unaffected. ***`, "ev-crash");
     if(lostBuffered>0) log(`lost ${lostBuffered} Buffered record(s): acked but in the not-yet-fsynced window`, "ev-loss");
-    if(lostNaive>0) log(`naive lost ${lostNaive} in-flight record(s) — commit outcome unknown`, "ev-loss");
   }
 
   function restart(){
@@ -450,8 +448,8 @@
   }
 
   function reset(){
-    records.length=0; wab.length=0; drainQueue.length=0;
-    batchTimer=null; naiveActive=0; recId=0;
+    records.length=0; wab.length=0; drainQueue.length=0; spawnQueue.length=0;
+    batchTimer=null; spawnAcc=0; recId=0;
     Object.assign(metrics,{latN:[],latW:[],comN:0,comW:0,ackN:0,ackW:0,lostN:0,lostW:0,crashed:false});
     daemonUp=true; streaming=false;
     $("stream").classList.remove("on"); $("statusPill").textContent="running";
@@ -497,10 +495,8 @@
 
   function lerp(a,b,t){ return a+(b-a)*t; }
   function naivePos(r){
-    if(r.stage==="queue") return {x:naiveNodes[0].x, y:naiveNodes[0].y+22};
-    if(r.stage==="net")   return {x:lerp(naiveNodes[0].x,naiveNodes[2].x,r.p*0.7), y:yN};
-    if(r.stage==="commit")return {x:lerp(naiveNodes[2].x-180,naiveNodes[2].x,r.p), y:yN};
-    if(r.stage==="lost-anim") return {x:(r._sx==="commit"?naiveNodes[2].x-120:naiveNodes[1].x), y:yN};
+    if(r.stage==="net")   return {x:lerp(naiveNodes[0].x,naiveNodes[1].x,r.p), y:yN};
+    if(r.stage==="commit")return {x:lerp(naiveNodes[1].x,naiveNodes[2].x,r.p), y:yN};
     return {x:naiveNodes[2].x, y:yN};
   }
   function weirPos(r){
@@ -526,21 +522,22 @@
     for(let i=0;i<naiveNodes.length-1;i++) link(naiveNodes[i],naiveNodes[i+1]);
     naiveNodes.forEach(n=>node(n));
 
-    // weir ack-path links + nodes
-    const faded = !daemonUp;
-    for(let i=0;i<weirNodes.length-1;i++) link(weirNodes[i],weirNodes[i+1],faded);
-    weirNodes.forEach(n=>node(n,faded));
+    // weir ack-path links + nodes. On crash only the daemon (Socket onward) goes
+    // red/faded — the Producer (the client) stays alive.
+    const down = !daemonUp;
+    for(let i=0;i<weirNodes.length-1;i++) link(weirNodes[i],weirNodes[i+1], down && i>=1);
+    weirNodes.forEach((n,i)=>node(n, down && i>=1));
 
-    // drain path: WAB(seg) -> drain -> sink, drawn below the ack line
+    // drain path: WAB(seg) -> drain -> sink, drawn below the ack line (daemon-side)
     const segN={x:xSeg,y:yDrain,label:"sealed\nsegment"};
     const drN ={x:xDrainBox,y:yDrain,label:"drain"};
     const skN ={x:xSink,y:yDrain,label:"DB sink\n(batch)"};
     // connector from WAB node down to segment
-    ctx.save(); ctx.globalAlpha=faded?0.25:0.6; ctx.strokeStyle="#3a4452"; ctx.lineWidth=2;
+    ctx.save(); ctx.globalAlpha=down?0.25:0.6; ctx.strokeStyle="#3a4452"; ctx.lineWidth=2;
     ctx.setLineDash([4,4]); ctx.beginPath(); ctx.moveTo(xSeg,weirNodes[2].y+22); ctx.lineTo(xSeg,yDrain-22); ctx.stroke();
     ctx.setLineDash([]); ctx.restore();
-    link(segN,drN,faded); link(drN,skN,faded);
-    node(segN,faded); node(drN,faded); node(skN,faded);
+    link(segN,drN,down); link(drN,skN,down);
+    node(segN,down); node(drN,down); node(skN,down);
 
     // WAB depth indicator (records waiting to be drained)
     ctx.save();
@@ -553,12 +550,14 @@
       token(xSeg-30+col*12, yDrain-2-row*9, wab[i].durable?wab[i].color:"#d29922", 0.9, 4);
     }
 
-    // crash banner
+    // crash banner — only the daemon region (Socket onward) reddens; the Producer
+    // and the whole naive lane are untouched.
     if(!daemonUp){
+      const rx = SOCKET_X - 60;
       ctx.save(); ctx.fillStyle="rgba(248,81,73,0.08)";
-      ctx.fillRect(0,190,Wd,Ht-190);
-      ctx.fillStyle="#f85149"; ctx.font="700 14px var(--mono,monospace)"; ctx.textAlign="center";
-      ctx.fillText("DAEMON DOWN — durable WAB segments held; press Restart to replay", Wd/2, 200);
+      ctx.fillRect(rx,190,Wd-rx,Ht-190);
+      ctx.fillStyle="#f85149"; ctx.font="700 13px var(--mono,monospace)"; ctx.textAlign="center";
+      ctx.fillText("weir daemon DOWN — durable segments held; Restart to replay", (rx+Wd)/2, 205);
       ctx.restore();
     }
 
@@ -596,7 +595,7 @@
     $("mLostN").textContent = metrics.lostN;
     $("mLostW").textContent = metrics.lostW;
     $("mLostNote").textContent = metrics.crashed
-      ? (metrics.lostW===0 ? "weir: acked (Sync/Batched) recovered ✓" : "weir: Buffered window only")
+      ? (metrics.lostW===0 ? "weir recovers acked records - naive unaffected" : "weir: Buffered window lost - naive unaffected")
       : " ";
   }
 
