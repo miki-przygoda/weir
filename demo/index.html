@@ -226,7 +226,9 @@
   const minSeg = v => Math.max(v, 12);   // floor so a sub-ms tier is still visible
   const wabAnim   = t => minSeg(WEIR_ACK_US[t] * US_TO_ANIM * 0.3);
   const fsyncAnim = t => minSeg(WEIR_ACK_US[t] * US_TO_ANIM * 0.7);
-  const W = { socket: FIRST_HOP, drainCommit: NAIVE_COMMIT_ANIM * 1.2 };
+  const DRAIN_READ = 220;                  // local read of the sealed segment (fast)
+  const DRAIN_COMMIT = NAIVE_COMMIT_ANIM;  // remote batch INSERT — one round trip for N records
+  const W = { socket: FIRST_HOP };
   const N = { net: FIRST_HOP, commit: NAIVE_COMMIT_ANIM };
 
   // ---- canvas geometry ----
@@ -376,20 +378,25 @@
       if(batchTimer===null) batchTimer = tNow + BATCH_DEADLINE;
       if(wab.length>=BATCH_SIZE || tNow>=batchTimer){
         const take = wab.splice(0, Math.min(BATCH_SIZE, wab.length));
-        drainQueue.push({ ids:take.map(x=>x.id), durable:take.map(x=>x.durable), t0:tNow, p:0 });
+        drainQueue.push({ ids:take.map(x=>x.id), durable:take.map(x=>x.durable), t0:tNow, phase:"read", p:0 });
         batchTimer = wab.length>0 ? tNow + BATCH_DEADLINE : null;
         log(`drain: sealed segment of ${take.length} records → 1 commit`, "ev-drain");
       }
     }
 
-    // drain commits
+    // drain: read the sealed segment from LOCAL disk (fast), then commit the whole
+    // batch to the REMOTE db in one round trip (slow — the same internet as naive).
     for(const b of drainQueue){
-      if(b.done) continue;
-      if(!daemonUp){ continue; }       // drain paused while crashed
-      b.p += dt / W.drainCommit;
-      if(b.p>=1){
-        b.done=true; metrics.comW++;   // weir: 1 commit per batch (N→1)
-        log(`sink committed ${b.ids.length} records in 1 INSERT (segment confirmed)`, "ev-drain");
+      if(b.done || !daemonUp) continue;    // drain paused while crashed
+      if(b.phase==="read"){
+        b.p += dt / DRAIN_READ;
+        if(b.p>=1){ b.phase="commit"; b.p=0; }
+      } else {
+        b.p += dt / DRAIN_COMMIT;
+        if(b.p>=1){
+          b.done=true; metrics.comW++;     // weir: 1 commit per batch (N→1)
+          log(`sink committed ${b.ids.length} records in 1 INSERT (segment confirmed)`, "ev-drain");
+        }
       }
     }
 
@@ -576,10 +583,11 @@
       else if(r.stage==="ack"||r.stage==="acked-rest") col="#3fb950";
       token(pos.x,pos.y,col,alpha);
     }
-    // drain batch tokens moving seg->sink
+    // drain batch tokens: fast local read (seg→drain), then slow remote commit (drain→sink)
     for(const b of drainQueue){
       if(b.done) continue;
-      const x=lerp(xSeg,xSink,b.p), y=yDrain;
+      const x = b.phase==="read" ? lerp(xSeg,xDrainBox,b.p) : lerp(xDrainBox,xSink,b.p);
+      const y=yDrain;
       token(x,y,"#bc8cff",1,7);
       ctx.save(); ctx.fillStyle="#bc8cff"; ctx.font="10px var(--mono,monospace)"; ctx.textAlign="center";
       ctx.fillText("×"+b.ids.length, x, y-12); ctx.restore();
