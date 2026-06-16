@@ -358,7 +358,32 @@ fn drain_thread<S: Sink>(
                 processed,
             } => {
                 set_drain_state(&metrics, DrainStateValue::retrying_transient);
-                std::thread::sleep(next_delay);
+
+                // Interruptible backoff: consume next_delay in short slices via
+                // recv_timeout so a shutdown — which the drain only learns of as the
+                // drain channel disconnecting (all WAB flushers have exited) — cuts
+                // the wait short instead of sleeping out a multi-minute Retry-After.
+                // On disconnect we stop waiting but STILL run the retry below (its
+                // commit is bounded by commit_timeout), preserving the existing
+                // "complete in-flight work on shutdown" behaviour; the Draining loop
+                // then observes the same disconnect and exits. In production the
+                // channel only closes on shutdown, so the Retry-After delay is only
+                // ever cut at shutdown, never during normal operation. Segments that
+                // arrive during the wait are buffered (S15).
+                let wait_end = Instant::now() + next_delay;
+                loop {
+                    let remaining = wait_end.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let poll = remaining.min(Duration::from_millis(50));
+                    match drain_rx.recv_timeout(poll) {
+                        Ok(new_seg) => pending.push_back(new_seg),
+                        Err(RecvTimeoutError::Timeout) => {}
+                        // Channel closed (shutdown): stop waiting, finish the retry.
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
 
                 if retries_left == 0 {
                     error!(
@@ -2426,13 +2451,27 @@ mod tests {
             MockSink::ok(vec![Payload::from(b"hello".as_ref())]),
         ]));
         let metrics = noop_metrics();
-        run_drain(
-            rx,
-            tx,
-            sink.clone(),
-            fast_config(dir.clone()),
-            metrics.clone(),
-        );
+
+        // Hold the channel OPEN across the backoff. In production the drain channel
+        // only disconnects on shutdown, and the interruptible backoff (S15) cuts
+        // the Retry-After short ONLY on disconnect — so this exercises the
+        // normal-operation timing path. Dropping `tx` during the wait would
+        // (correctly) model a shutdown and cut the backoff; we drop it only after
+        // both commit attempts have happened.
+        let handle = spawn(rx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if sink.call_timestamps().len() >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the retry"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(tx);
+        handle.join().unwrap();
 
         let timestamps = sink.call_timestamps();
         assert_eq!(timestamps.len(), 2, "expected exactly two commit calls");
@@ -2447,6 +2486,62 @@ mod tests {
         // Final state: committed, confirmed.
         assert_eq!(records_committed(&metrics), 1);
         assert!(get_confirmed_path(&sealed).exists());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// S15: a long Retry-After must not stall shutdown. Once the drain is in the
+    /// backoff, closing the channel (the only shutdown signal the drain sees) must
+    /// interrupt the wait — the thread joins well within the 30s hint, leaving the
+    /// segment unconfirmed for replay on restart.
+    #[test]
+    fn retry_backoff_is_interrupted_by_shutdown() {
+        let dir = tmp_dir("retry_interrupt");
+        let sealed = make_sealed_segment(&dir, 0, &[b"x"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        const LONG: Duration = Duration::from_secs(30);
+        // All-transient with a long hint: without interruption the drain would
+        // sleep ~30s per attempt. With enough responses it can never confirm.
+        let responses: Vec<MockResult> = (0..=MAX_RETRIES + 1)
+            .map(|_| Err(MockError::TransientWithRetryAfter(LONG)))
+            .collect();
+        let sink = Arc::new(MockSink::with_responses(responses));
+        let metrics = noop_metrics();
+        let handle = spawn(rx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+
+        // Wait until the first commit attempt has happened (drain is now in backoff).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !sink.call_timestamps().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the first commit attempt"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Shutdown: drop the channel and assert the drain does NOT wait out the 30s
+        // backoff (it interrupts and unwinds its retries promptly).
+        let t = std::time::Instant::now();
+        drop(tx);
+        handle.join().unwrap();
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must interrupt the 30s backoff, took {elapsed:?}"
+        );
+        assert!(
+            !get_confirmed_path(&sealed).exists(),
+            "segment must be left unconfirmed on shutdown"
+        );
+        assert!(
+            sealed.exists(),
+            "segment preserved on disk for replay on restart"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }
