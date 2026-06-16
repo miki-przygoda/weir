@@ -208,20 +208,26 @@
   const LAT = { Sync:0.39, Batched:0.39, Buffered:0.07, Naive:8.0 };
   const TIER_COLOR = { Sync:"#58a6ff", Batched:"#bc8cff", Buffered:"#3fb950" };
   const BATCH_SIZE = 8;          // records coalesced into one drained batch
-  const BATCH_DEADLINE = 1100;   // ms (anim time) before a partial batch seals
+  const BATCH_DEADLINE = 1400;   // ms (anim time) before a partial batch seals
   const SPAWN_GAP = 75;          // ms between staggered emissions of a pushed burst
 
-  // ---- animation stage durations (anim ms) — illustrative, watchable ----
-  // The first hop (producer → ingress) is the SAME in both lanes — it's just the
-  // record leaving the producer. The lanes diverge AFTER that: weir does a fast
-  // LOCAL fsync then acks; naive blocks on the remote DB commit round-trip.
-  const FIRST_HOP = 380;
-  const W = {
-    socket: FIRST_HOP, wab: 240,
-    fsync:{ Sync:300, Batched:300, Buffered:50 }, // local durability point → ack
-    drainCommit:820
-  };
-  const N = { net: FIRST_HOP, commit: 1150 };     // equal first hop, then the long remote commit
+  // ---- timing model -----------------------------------------------------------
+  // The first hop (producer → ingress) is a fixed "set speed" handoff, identical in
+  // both lanes. Everything AFTER it is scaled to REAL latency: weir acks after a
+  // LOCAL fsync (~390µs Sync, ~70µs Buffered); naive blocks on a REMOTE DB commit
+  // round-trip (~8ms). So weir's local path runs ~20× faster than naive's commit on
+  // screen — and weir's own async drain commit crosses the same internet as naive,
+  // just off the critical path and batched N→1.
+  const FIRST_HOP = 300;                 // fixed equal handoff, both lanes
+  const NAIVE_COMMIT_US = 8000;          // ~8 ms remote insert + commit round trip
+  const WEIR_ACK_US = { Sync:390, Batched:390, Buffered:70 }; // local durable-write cost
+  const NAIVE_COMMIT_ANIM = 2000;        // realism anchor: anim ms for naive's commit
+  const US_TO_ANIM = NAIVE_COMMIT_ANIM / NAIVE_COMMIT_US;     // anim-ms per µs of real latency
+  const minSeg = v => Math.max(v, 12);   // floor so a sub-ms tier is still visible
+  const wabAnim   = t => minSeg(WEIR_ACK_US[t] * US_TO_ANIM * 0.3);
+  const fsyncAnim = t => minSeg(WEIR_ACK_US[t] * US_TO_ANIM * 0.7);
+  const W = { socket: FIRST_HOP, drainCommit: NAIVE_COMMIT_ANIM * 1.2 };
+  const N = { net: FIRST_HOP, commit: NAIVE_COMMIT_ANIM };
 
   // ---- canvas geometry ----
   const cv = document.getElementById("cv");
@@ -342,10 +348,10 @@
         if(r.p>=1){ r.stage = daemonUp ? "wab" : "lost-inflight"; r.p=0;
           if(!daemonUp){ markInflightLost(r); } }
       } else if(r.stage==="wab"){
-        r.p += dt / W.wab;
+        r.p += dt / wabAnim(r.tier);
         if(r.p>=1){ r.stage="fsync"; r.p=0; }
       } else if(r.stage==="fsync"){
-        const dur = W.fsync[r.tier];
+        const dur = fsyncAnim(r.tier);
         r.p += dt / dur;
         if(r.p>=1){
           // ACK happens here. Durable iff Sync/Batched (fsync'd) — Buffered is in-memory only.
