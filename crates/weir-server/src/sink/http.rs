@@ -695,6 +695,30 @@ mod tests {
         assert!(reason.contains("bad payload"), "reason: {reason}");
     }
 
+    /// Coverage gap (T12): a verbose/hostile 4xx body must NOT land unbounded in
+    /// the dead-letter reason — the excerpt is cut at 256 bytes.
+    #[tokio::test]
+    async fn http_permanent_status_truncates_large_body_excerpt() {
+        let body = "A".repeat(4096);
+        let resp = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        // spawn_mock_server wants &'static str; leak the owned response (test-only).
+        let resp: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, _counter) = spawn_mock_server(vec![resp]).await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        let result = sink.commit(vec![p(b"x")]).await.unwrap();
+        assert_eq!(result.dead_lettered.len(), 1);
+        let (_, reason) = &result.dead_lettered[0];
+        assert!(reason.contains("400"), "reason: {reason}");
+        assert!(
+            !reason.contains(&"A".repeat(300)),
+            "the 4096-byte body must be truncated to a bounded excerpt, not carried whole"
+        );
+    }
+
     #[tokio::test]
     async fn http_500_returns_transient_error() {
         let (url, _counter) = spawn_mock_server(vec![

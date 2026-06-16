@@ -145,6 +145,41 @@ mod tests {
         assert!(red.contains("<redacted>"));
     }
 
+    /// Coverage gap (T05/T09 / S28): read_body_capped returns at most `cap` bytes
+    /// regardless of how large a body the server sends, stopping once the cap is
+    /// reached (the network-read memory bound). Uses a tiny cap + a body well
+    /// past it, so no large allocation is needed to prove the branch.
+    #[cfg(feature = "http-sink")]
+    #[tokio::test]
+    async fn read_body_capped_stops_at_cap_on_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut tmp = [0u8; 1024];
+                let _ = sock.read(&mut tmp).await; // consume the request
+                let body = vec![b'Z'; 1000]; // far past the 16-byte cap below
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let bytes = read_body_capped(resp, 16).await;
+        assert_eq!(
+            bytes.len(),
+            16,
+            "read_body_capped must stop at the cap, not buffer the whole 1000-byte body"
+        );
+    }
+
     #[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
     #[test]
     fn sanitize_log_excerpt_strips_control_chars() {
