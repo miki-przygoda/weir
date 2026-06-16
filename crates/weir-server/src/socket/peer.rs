@@ -68,4 +68,18 @@ mod tests {
         assert_eq!(peer_uid_of(&a).unwrap(), our_uid);
         assert_eq!(peer_uid_of(&b).unwrap(), our_uid);
     }
+
+    /// S32: peer_uid must FAIL CLOSED. A non-socket fd carries no peer
+    /// credentials, so the credential syscall errors — peer_uid must surface that
+    /// error rather than ever returning a uid the accept loop would accept. This
+    /// pins the fail-closed contract the accept-loop refusal branch relies on.
+    #[test]
+    fn peer_uid_fails_closed_on_a_non_socket_fd() {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open("/dev/null").unwrap();
+        assert!(
+            peer_uid(f.as_raw_fd()).is_err(),
+            "peer_uid on a non-socket fd must fail closed, never return a uid"
+        );
+    }
 }
