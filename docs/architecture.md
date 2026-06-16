@@ -114,7 +114,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 | `sink_type` | Module | Records per `commit()` | Use |
 |------------|--------|--------------------|-----|
 | `noop` | `sink::noop::NoopSink` | accepts all, forwards nothing | soak-testing the daemon pipeline |
-| `http` | `sink::http::HttpSink` | one HTTP POST **per record** | endpoints that already accept POST bodies |
+| `http` | `sink::http::HttpSink` | one HTTP POST **per record**, up to `sink_http_concurrency` in flight | endpoints that already accept POST bodies |
 | `mysql` | `sink::mysql::MySqlSink` | one multi-row `INSERT` **per batch** | the IOPS-compression downstream |
 
 The `mysql` sink is the one that delivers on the headline claim: N
@@ -142,10 +142,10 @@ RetryingTransient
   ▼
 BlockedDeadLetterFull
   │  wake every dead_letter_check_interval; rescan dead_letter/ dir
-  │  bytes < cap → unblock, push segment to front of pending queue, Draining
+  │  bytes < cap → unblock; retry the SAME segment via RetryingTransient,
+  │      RESUMING past the sub-batches already durably processed (F05)
   │  bytes ≥ cap → stay blocked
-  │  channel disconnect + bytes < cap → confirm segment, exit
-  │  channel disconnect + bytes ≥ cap → exit without confirming (crash recovery replays)
+  │  bytes ≥ cap AND channel disconnect → exit without confirming (crash recovery replays)
 ```
 
 - **At-least-once delivery**: sinks must be idempotent. If the daemon crashes after a partial commit but before writing `.confirmed`, the full segment is replayed on restart.

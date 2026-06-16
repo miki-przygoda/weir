@@ -5,8 +5,115 @@ All notable changes to `weir` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Until v1.0, breaking changes may land in minor releases. Wire protocol version
-changes are tracked separately under **Wire protocol** below.
+From v1.0 onward, `weir` follows Semantic Versioning: a breaking change to the
+public Rust API of a published crate (`weir-core`, `weir-client`,
+`weir-sink-sdk`) or to the wire protocol requires a major version bump. Wire
+protocol version changes are tracked separately under **Wire protocol** below.
+
+---
+
+## [1.0.0] - 2026-06-15
+
+The 1.0 release. `weir` is now stable: the v1 wire protocol and the public Rust
+API are frozen, backed by Semantic Versioning. This release is the culmination of
+the post-0.9 hardening arc — four code-review passes, a deterministic-simulation
+campaign, and two deliberate freeze passes (wire, then API) — that closed every
+known data-loss path and locked the surfaces a 1.0 promises not to break.
+
+The headline is stability, not features. If you built against 0.9, the breaking
+changes below are small and mechanical; in exchange, everything you depend on at
+1.0 carries a SemVer guarantee.
+
+### Stability
+
+- **Wire protocol v1 is frozen.** The 16-byte frame, message types, durability
+  tiers, and Nack reason bytes are fixed. A new
+  [language-neutral conformance suite](docs/conformance.md)
+  (`docs/conformance/wire_v1_vectors.json`, 26 canonical vectors covering every
+  message type, all nine Nack reasons, and every decode-rejection case) lets a
+  non-Rust client or daemon prove byte-compatibility. `weir-core`'s own decoder
+  is tested against it.
+- **Public Rust API is frozen.** `weir-core`, `weir-client`, and `weir-sink-sdk`
+  carry the SemVer promise above. The public error enums (`DecodeError`,
+  `WeirError`, `ClientError`, `SinkHealth`) and `CommitResult` are
+  `#[non_exhaustive]`, so the model can grow post-1.0 without a breaking change.
+- **WAB on-disk format is stable** and crash-recovery replays unconfirmed
+  segments on restart, as before.
+
+### Breaking
+
+These are the only source-level breaks versus 0.9, all in service of the freeze:
+
+- **`Header::new` drops the `payload_len` argument** — its signature is now
+  `Header::new(message_type, durability, flags)`. `Envelope` is the single source
+  of truth for the on-wire length, so a header whose declared length disagrees
+  with its payload is unrepresentable.
+- **`Header` / `Envelope` fields are private**, accessed via methods
+  (`header.message_type()`, `envelope.payload()`, …) rather than field access.
+- **`Payload` is a newtype** (`struct Payload(Bytes)`) instead of a
+  `type Payload = bytes::Bytes` alias. It derefs to `[u8]` and converts from
+  `Vec<u8>` / `&[u8]` / `Bytes`, so most call sites are unaffected; its `Debug`
+  prints only the length, never the bytes.
+- **`CommitResult` is constructed with `CommitResult::new(committed, dead_lettered)`**
+  instead of a struct literal (it is now `#[non_exhaustive]`).
+- **The wire decoder is stricter:** a nonzero reserved `flags` byte and bytes
+  trailing a complete frame are now rejected (`ReservedFlagsSet`,
+  `TrailingBytes`) rather than ignored.
+
+### Added
+
+- **Conformance vectors** — `docs/conformance/wire_v1_vectors.json` plus a
+  generator and a Rust suite (`cargo test -p weir-core --test conformance`); see
+  [docs/conformance.md](docs/conformance.md).
+- **Two new Nack reasons** — `UnknownMessage` (0x08) for a CRC-valid header with
+  an unknown `message_type`/`durability` (a permanent, connection-closing error,
+  distinct from the transient keep-open `InternalError`), and `ReservedFlagsSet`
+  (0x09) for a nonzero reserved `flags` byte.
+- **Concurrent HTTP sink delivery** — the HTTP sink issues up to
+  `sink_http_concurrency` (default 8) per-record POSTs in flight, ordered, while
+  keeping per-record idempotency keys and dead-lettering.
+- **Client read/write timeouts** — opt-in `set_read_timeout` / `set_write_timeout`
+  on the Unix and TLS clients turn a silent stalled-daemon hang into a clean
+  error; the client also poisons itself on a desync so a stale frame can never be
+  read as the next call's reply.
+- **Symmetric `Payload` equality** (`slice == payload` as well as
+  `payload == slice`) and crate-root re-exports of the wire `TryFrom` error
+  structs (`UnknownMessageType`, `UnknownDurability`, `UnknownNackReason`).
+
+### Reliability
+
+The hardening passes found and fixed several latent **silent data-loss** paths
+that could acknowledge or confirm a record that was never durable:
+
+- **Recovery no longer resets the segment counter** after restart — the scan now
+  parses the counter from the `seg_NNNNNNNN` prefix across all extensions, so a
+  freshly recovered, undrained sealed segment can't be clobbered by the next seal.
+- **The drain never confirms-and-deletes a segment whose records weren't
+  delivered** — failed dead-letter writes, transient reader-open failures,
+  mid-segment read errors (now quarantined), and partial commit results are all
+  caught before a segment is reclaimed.
+- **The HTTP/SQL/ClickHouse sinks no longer false-ack** — redirects are not
+  followed (a redirected POST that returns 2xx is treated as undelivered),
+  backpressure (408/429) and 5xx are retried, and 4xx are dead-lettered.
+- **A torn write mid-batch can no longer ride another segment's fsync** — acks
+  are split by segment fate, surfaced by the deterministic-simulation harness.
+- **The drain thread is panic-supervised** (respawn capped at 10), parent
+  directories are fsynced after seal/rename, and empty Push payloads (which alias
+  the WAB end-of-records sentinel) are rejected at ingest.
+
+### Fixed
+
+- Numerous smaller correctness and robustness fixes across config parsing,
+  credential handling (URLs split at the last `@`; passwords redacted from
+  `Debug` and build errors), `accept(2)` resource-exhaustion backoff, quarantine
+  namespacing across shards, metrics accounting, and `weir-ctl` dead-letter
+  handling. Full detail in the git history for the `v1/phase-4-cleanup` branch.
+
+### Changed
+
+- **Drain retry resumes mid-segment** rather than reprocessing already-committed
+  sub-batches, so a transient failure partway through a large segment no longer
+  re-dead-letters earlier records on retry.
 
 ---
 
@@ -1313,12 +1420,13 @@ The five commits making up this pass:
 
 ## Wire protocol
 
-| Version | Status  | Notes                                              |
-|---------|---------|----------------------------------------------------|
-| v1      | current | See [docs/wire_protocol.md](docs/wire_protocol.md) |
+| Version | Status            | Notes                                              |
+|---------|-------------------|----------------------------------------------------|
+| v1      | current (frozen at 1.0) | See [docs/wire_protocol.md](docs/wire_protocol.md) and the [conformance vectors](docs/conformance.md) |
 
 ---
 
+[1.0.0]: https://github.com/miki-przygoda/weir/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/miki-przygoda/weir/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/miki-przygoda/weir/compare/v0.4.0...v0.5.0
 [0.3.0]: https://github.com/miki-przygoda/weir/compare/v0.2.0...v0.3.0

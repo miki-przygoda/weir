@@ -40,10 +40,13 @@ pub struct ConnectionConfig {
     /// Cap applied before allocation: `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
     /// The field already holds the effective minimum so no further clamping is needed here.
     pub max_payload_bytes: usize,
-    /// Maximum time the handler will sit in `read_exact` waiting for the next
-    /// byte. Caps slowloris-style attacks where a connected client never sends
-    /// (or sends only a partial frame) and would otherwise hold a semaphore
-    /// permit indefinitely.
+    /// Deadline applied to each `read_exact` phase of a frame — the 16-byte
+    /// header, the payload, and the 4-byte CRC are each bounded by this value.
+    /// It is a whole-phase deadline, not a strict per-byte idle timer: a client
+    /// that never sends (slowloris) and a client streaming a large payload
+    /// pathologically slowly (e.g. <~`payload_len`/`read_timeout` B/s) are both
+    /// cut off, so a connection can't hold a semaphore permit indefinitely. The
+    /// `weir_connection_idle_timeout` counter is bumped in either case.
     pub read_timeout: Duration,
     /// Maximum time the handler will wait on the WAB ack oneshot. See
     /// [`ACK_TIMEOUT`] for the production default and rationale; tests
@@ -155,10 +158,10 @@ where
         // Effective cap is min(config, hard cap). The hard cap is applied here
         // regardless of ConnectionConfig contents so the check holds even when
         // handle_connection is called directly (e.g. in tests) without run().
-        let payload_len = header.payload_len as usize;
+        let payload_len = header.payload_len() as usize;
         let cap = config.max_payload_bytes.min(MAX_PAYLOAD_HARD_CAP);
         if payload_len > cap {
-            let tv = durability_to_tier(header.durability);
+            let tv = durability_to_tier(header.durability());
             send_nack(stream.get_mut(), WireNack::PayloadTooLarge, &[]).await?;
             metrics
                 .records_nack
@@ -169,11 +172,40 @@ where
                 .inc();
             return Ok(());
         }
+        if payload_len == 0 && header.message_type() == MessageType::Push {
+            // An empty Push payload can't be represented in the WAB: a zero
+            // length prefix is the end-of-records sentinel, so storing one would
+            // truncate the segment (silently dropping records written after it).
+            // Reject at ingest rather than let it reach the WAB. This applies
+            // ONLY to Push — a HealthCheck frame legitimately carries a
+            // zero-length payload (see docs/wire_protocol.md) and must pass
+            // through to the dispatch below.
+            let tv = durability_to_tier(header.durability());
+            send_nack(stream.get_mut(), WireNack::EmptyPayload, &[]).await?;
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: tv,
+                    reason: MetricNack::empty_payload,
+                })
+                .inc();
+            return Ok(());
+        }
 
         // ── 4. Read payload ──────────────────────────────────────────────────
         // Accumulate into Vec<u8> then freeze to Bytes (O(1) ownership transfer).
+        // Raced against shutdown like the header read: a client stalled mid-frame
+        // at shutdown must not hold its semaphore permit until read_timeout and
+        // eat the drain window. No ack/nack has been sent for this frame, so the
+        // client sees the dropped connection as a failed push and retries — no
+        // false ack, no data loss (F26).
         let mut payload_buf = vec![0u8; payload_len];
-        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload_buf)).await {
+        let payload_read = tokio::select! {
+            biased;
+            res = tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload_buf)) => res,
+            _ = shutdown_rx.changed() => return Ok(()),
+        };
+        match payload_read {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -181,7 +213,7 @@ where
                 debug!(
                     payload_len,
                     timeout_secs = config.read_timeout.as_secs(),
-                    "connection idle past read_timeout during payload read; dropping"
+                    "connection exceeded read_timeout during payload read; dropping"
                 );
                 return Ok(());
             }
@@ -191,14 +223,19 @@ where
 
         // ── 5. Read and validate payload CRC ────────────────────────────────
         let mut crc_buf = [0u8; 4];
-        match tokio::time::timeout(config.read_timeout, stream.read_exact(&mut crc_buf)).await {
+        let crc_read = tokio::select! {
+            biased;
+            res = tokio::time::timeout(config.read_timeout, stream.read_exact(&mut crc_buf)) => res,
+            _ = shutdown_rx.changed() => return Ok(()),
+        };
+        match crc_read {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 metrics.connection_idle_timeout.inc();
                 debug!(
                     timeout_secs = config.read_timeout.as_secs(),
-                    "connection idle past read_timeout during CRC read; dropping"
+                    "connection exceeded read_timeout during CRC read; dropping"
                 );
                 return Ok(());
             }
@@ -206,7 +243,7 @@ where
         let expected_crc = u32::from_le_bytes(crc_buf);
         let computed_crc = crc32fast::hash(&payload);
         if expected_crc != computed_crc {
-            let tv = durability_to_tier(header.durability);
+            let tv = durability_to_tier(header.durability());
             send_nack(stream.get_mut(), WireNack::BadPayloadCrc, &[]).await?;
             metrics
                 .records_nack
@@ -219,9 +256,9 @@ where
         }
 
         // ── 6 & 7. Dispatch by message type ─────────────────────────────────
-        match header.message_type {
+        match header.message_type() {
             MessageType::Push => {
-                let tv = durability_to_tier(header.durability);
+                let tv = durability_to_tier(header.durability());
                 metrics
                     .records_accepted
                     .get_or_create(&TierLabel { tier: tv.clone() })
@@ -229,7 +266,7 @@ where
                 handle_push(
                     stream.get_mut(),
                     queue_tx.clone(),
-                    header.durability,
+                    header.durability(),
                     payload,
                     tv,
                     config.shard_id,
@@ -245,7 +282,7 @@ where
                     .await?;
             }
             _ => {
-                debug!(msg_type = ?header.message_type, "unexpected message type from client");
+                debug!(msg_type = ?header.message_type(), "unexpected message type from client");
                 send_nack(stream.get_mut(), WireNack::InternalError, &[]).await?;
                 metrics
                     .records_nack
@@ -392,6 +429,20 @@ fn nack_for_decode_error(e: &DecodeError) -> (WireNack, MetricNack, &'static [u8
         DecodeError::HeaderCrcMismatch { .. } => {
             (WireNack::BadHeaderCrc, MetricNack::bad_header_crc, &[])
         }
+        // CRC-valid header but an unrecognised message_type/durability byte: a
+        // PERMANENT client protocol error (version skew). Distinct from the
+        // transient, keep-open InternalError so the client can tell the two apart
+        // (F25). The connection is closed after the Nack (see the decode site).
+        DecodeError::UnknownMessageType(_) | DecodeError::UnknownDurability(_) => {
+            (WireNack::UnknownMessage, MetricNack::unknown_message, &[])
+        }
+        // Nonzero reserved flags: a permanent, connection-closing protocol error
+        // (the frame set a bit that must be zero in wire v1) — F52.
+        DecodeError::ReservedFlagsSet { .. } => (
+            WireNack::ReservedFlagsSet,
+            MetricNack::reserved_flags_set,
+            &[],
+        ),
         _ => (WireNack::InternalError, MetricNack::internal_error, &[]),
     }
 }
@@ -409,12 +460,7 @@ async fn send_nack<S: AsyncWrite + Unpin>(
     nack_payload.push(reason as u8);
     nack_payload.extend_from_slice(extra);
 
-    let header = Header::new(
-        MessageType::Nack,
-        Durability::Sync,
-        0,
-        nack_payload.len() as u32,
-    );
+    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
     let frame = Envelope::new(header, nack_payload).encode();
     stream.write_all(&frame).await
 }
@@ -427,7 +473,7 @@ async fn send_nack<S: AsyncWrite + Unpin>(
 fn ack_frame_bytes() -> &'static [u8] {
     static ACK_FRAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     ACK_FRAME.get_or_init(|| {
-        let header = Header::new(MessageType::Ack, Durability::Sync, 0, 0);
+        let header = Header::new(MessageType::Ack, Durability::Sync, 0);
         Envelope::new(header, Vec::new()).encode()
     })
 }
@@ -438,7 +484,7 @@ fn ack_frame_bytes() -> &'static [u8] {
 fn healthcheck_response_frame_bytes() -> &'static [u8] {
     static HEALTHCHECK_RESPONSE_FRAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     HEALTHCHECK_RESPONSE_FRAME.get_or_init(|| {
-        let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0);
+        let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0);
         Envelope::new(header, Vec::new()).encode()
     })
 }
@@ -510,9 +556,21 @@ mod tests {
 
     /// Encodes a complete Push frame (header + payload + payload CRC).
     fn push_frame(payload: &[u8]) -> Vec<u8> {
-        let header = Header::new(MessageType::Push, Durability::Sync, 0, payload.len() as u32);
+        let header = Header::new(MessageType::Push, Durability::Sync, 0);
         let env = Envelope::new(header, payload.to_vec());
         env.encode()
+    }
+
+    /// Builds an encoded Push header that DECLARES `payload_len` bytes without a
+    /// matching payload — used to test the read/timeout/shutdown paths where the
+    /// daemon waits for an advertised payload that never arrives. Header::new can
+    /// no longer desync the declared length (F50), so patch the field + CRC.
+    fn header_declaring(payload_len: u32) -> [u8; HEADER_LEN] {
+        let mut h = Header::new(MessageType::Push, Durability::Sync, 0).encode();
+        h[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        let crc = crc32fast::hash(&h[..12]);
+        h[12..16].copy_from_slice(&crc.to_le_bytes());
+        h
     }
 
     /// Reads one complete response frame (header + payload + 4-byte payload
@@ -529,13 +587,13 @@ mod tests {
         let mut header_buf = [0u8; HEADER_LEN];
         stream.read_exact(&mut header_buf).await.unwrap();
         let header = Header::decode(&header_buf).unwrap();
-        let mut payload = vec![0u8; header.payload_len as usize];
+        let mut payload = vec![0u8; header.payload_len() as usize];
         if !payload.is_empty() {
             stream.read_exact(&mut payload).await.unwrap();
         }
         let mut crc_buf = [0u8; 4];
         stream.read_exact(&mut crc_buf).await.unwrap();
-        (header.message_type, payload)
+        (header.message_type(), payload)
     }
 
     // ── Frame-level tests ─────────────────────────────────────────────────────
@@ -646,6 +704,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_message_type_returns_nack_unknown_message_and_closes() {
+        let mut client = spawn_handler(test_cfg()).await;
+        let mut frame = push_frame(b"data");
+        // Patch the message_type byte to an unrecognised value and recompute the
+        // header CRC so the frame passes magic/version/CRC and reaches typed-field
+        // parsing — exercising the UnknownMessageType → UnknownMessage path (F25).
+        frame[5] = 0xff;
+        let crc = crc32fast::hash(&frame[..12]).to_le_bytes();
+        frame[12..16].copy_from_slice(&crc);
+        client.write_all(&frame).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::UnknownMessage as u8);
+        // Permanent protocol error: the daemon closes the connection after the
+        // Nack so a client cannot retry the identical (never-valid) frame.
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).await.unwrap(),
+            0,
+            "connection must close after an UnknownMessage Nack"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonzero_flags_returns_nack_reserved_flags_and_closes() {
+        let mut client = spawn_handler(test_cfg()).await;
+        let mut frame = push_frame(b"data");
+        // Set a bit in the reserved flags byte and recompute the header CRC so the
+        // frame is structurally valid up to the flags check — exercising the
+        // ReservedFlagsSet path (F52).
+        frame[7] = 0x01;
+        let crc = crc32fast::hash(&frame[..12]).to_le_bytes();
+        frame[12..16].copy_from_slice(&crc);
+        client.write_all(&frame).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::ReservedFlagsSet as u8);
+        // Permanent protocol error: the daemon closes the connection after the Nack.
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).await.unwrap(),
+            0,
+            "connection must close after a ReservedFlagsSet Nack"
+        );
+    }
+
+    #[tokio::test]
     async fn max_payload_hard_cap_enforced_regardless_of_config() {
         // Config cap higher than MAX_PAYLOAD_HARD_CAP must still be rejected.
         // The effective cap is min(config, MAX_PAYLOAD_HARD_CAP).
@@ -657,14 +762,14 @@ mod tests {
         };
         let mut client = spawn_handler(cfg).await;
 
-        // Build a header claiming MAX_PAYLOAD_HARD_CAP + 1 bytes.
-        let header = Header::new(
-            MessageType::Push,
-            Durability::Sync,
-            0,
-            (MAX_PAYLOAD_HARD_CAP + 1) as u32,
-        );
-        let frame_header = header.encode();
+        // Build a header claiming MAX_PAYLOAD_HARD_CAP + 1 bytes. Header::new can
+        // no longer declare a length that disagrees with its payload (F50), so we
+        // patch the encoded header's payload_len field + recompute the header CRC
+        // to put the oversized declared length on the wire directly.
+        let mut frame_header = Header::new(MessageType::Push, Durability::Sync, 0).encode();
+        frame_header[8..12].copy_from_slice(&((MAX_PAYLOAD_HARD_CAP + 1) as u32).to_le_bytes());
+        let crc = crc32fast::hash(&frame_header[..12]);
+        frame_header[12..16].copy_from_slice(&crc.to_le_bytes());
         // Write just the header — server must reject before reading the payload.
         client.write_all(&frame_header).await.unwrap();
         // Dummy payload CRC placeholder (won't be read if cap check works).
@@ -673,6 +778,23 @@ mod tests {
         let (msg_type, payload) = read_response(&mut client).await;
         assert_eq!(msg_type, MessageType::Nack);
         assert_eq!(payload[0], NackReason::PayloadTooLarge as u8);
+    }
+
+    #[tokio::test]
+    async fn empty_payload_rejected_at_ingest() {
+        // A Push claiming a zero-length payload: the WAB cannot represent it (the
+        // length prefix is the end-of-records sentinel), so the server must Nack
+        // it at ingest before it reaches the WAB rather than let it truncate a
+        // segment.
+        let mut client = spawn_handler(test_cfg()).await;
+        let header = Header::new(MessageType::Push, Durability::Sync, 0);
+        client.write_all(&header.encode()).await.unwrap();
+        // Dummy payload CRC — not read; the empty-payload check fires first.
+        client.write_all(&[0u8; 4]).await.unwrap();
+
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::EmptyPayload as u8);
     }
 
     #[tokio::test]
@@ -905,7 +1027,7 @@ mod tests {
         let metrics_for_check = std::sync::Arc::clone(&metrics);
 
         // Send a header advertising a 1024-byte payload, then send NOTHING.
-        let header = Header::new(MessageType::Push, Durability::Sync, 0, 1024).encode();
+        let header = header_declaring(1024);
         let handle = tokio::spawn(handle_connection(
             server,
             queue_tx,
@@ -928,5 +1050,83 @@ mod tests {
             1,
             "connection_idle_timeout counter must increment on payload-read timeout"
         );
+    }
+
+    /// F26: a client stalled mid-payload at shutdown must be released promptly
+    /// via the shutdown race, not held until read_timeout. read_timeout is set
+    /// to 30 s so the test would hang for that long if the payload read ignored
+    /// the shutdown signal.
+    #[tokio::test]
+    async fn shutdown_releases_connection_stalled_mid_payload() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_secs(30),
+            shard_id: 0,
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Header advertising a 1 KiB payload, then send nothing → stall mid-frame.
+        let header = header_declaring(1024);
+        let handle = tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            shutdown_rx,
+        ));
+        client.write_all(&header).await.unwrap();
+        // Let the handler consume the header and block on the payload read.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler not released promptly on shutdown mid-payload")
+            .expect("handler task panicked")
+            .expect("handler returned Err");
+    }
+
+    /// F26: same as above but stalled mid-CRC (header + full payload received,
+    /// CRC withheld). Guards the second of the two reads the fix touched.
+    #[tokio::test]
+    async fn shutdown_releases_connection_stalled_mid_crc() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let cfg = ConnectionConfig {
+            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            read_timeout: Duration::from_secs(30),
+            ack_timeout: Duration::from_secs(30),
+            shard_id: 0,
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Header + the 5-byte payload, but withhold the 4-byte CRC → stall on CRC.
+        let header = header_declaring(5);
+        let handle = tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            metrics,
+            shutdown_rx,
+        ));
+        client.write_all(&header).await.unwrap();
+        client.write_all(b"hello").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("handler not released promptly on shutdown mid-CRC")
+            .expect("handler task panicked")
+            .expect("handler returned Err");
     }
 }

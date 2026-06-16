@@ -30,13 +30,18 @@
 //! - MySQL error codes 1205 (`ER_LOCK_WAIT_TIMEOUT`), 1213
 //!   (`ER_LOCK_DEADLOCK`), 1290 (`ER_OPTION_PREVENTS_STATEMENT`, e.g.
 //!   `--read-only`) → transient.
+//! - Access-denied codes 1045/1044/1142 → transient: a recoverable
+//!   misconfiguration (wrong password, missing grant), not the record's fault,
+//!   so the drain retries until it's fixed rather than dead-lettering live data.
+//!   This matches the Postgres sink, where a connection-time auth failure is a
+//!   non-DbError and already transient.
 //! - Codes 1062 (`ER_DUP_ENTRY`) — never seen under `INSERT IGNORE`; under
 //!   `plain` mode treated as transient so the drain retries the segment
 //!   after backoff, in case the duplicate is from a stale concurrent
 //!   writer rather than a re-commit.
-//! - All other server errors (syntax, missing table, missing column,
-//!   access denied, …) → permanent. The whole batch is dead-lettered
-//!   with the server-supplied error message so an operator can debug.
+//! - All other server errors (syntax, missing table, missing column, …) →
+//!   permanent. The whole batch is dead-lettered with the server-supplied
+//!   error message so an operator can debug.
 //!
 //! # Authentication
 //!
@@ -146,8 +151,13 @@ impl MySqlSink {
             .map_err(MySqlSinkBuildError::from)?;
         sql_common::validate_identifier("column", &config.column, IDENTIFIER_MAX_LEN)
             .map_err(MySqlSinkBuildError::from)?;
-        let opts = mysql_async::Opts::from_url(&config.url)
-            .map_err(|e| MySqlSinkBuildError::InvalidUrl(e.to_string()))?;
+        let opts = mysql_async::Opts::from_url(&config.url).map_err(|_e| {
+            // Do not surface the driver's error verbatim — it can embed the
+            // connection URL including the user:password@ component, leaking the
+            // password to stderr/logs. Report the redacted URL instead (the same
+            // redaction the Debug impl uses).
+            MySqlSinkBuildError::InvalidUrl(sql_common::redact_password(&config.url))
+        })?;
         let pool = Pool::new(opts);
         Ok(Self {
             config,
@@ -235,7 +245,16 @@ pub(crate) fn is_transient_server_code(code: u16) -> bool {
             | 1213  // ER_LOCK_DEADLOCK
             | 1290  // ER_OPTION_PREVENTS_STATEMENT (server in --read-only)
             | 1317  // ER_QUERY_INTERRUPTED
-            | 1062 // ER_DUP_ENTRY — see module docs (Plain mode only)
+            | 1062  // ER_DUP_ENTRY — see module docs (Plain mode only)
+            // Access-denied family — recoverable misconfiguration, NOT the
+            // record's fault, so retry (don't dead-letter live data) until the
+            // operator fixes the grant/password. This matches the Postgres sink,
+            // where a connection-time auth failure surfaces as a non-DbError and
+            // is already transient; classifying these as permanent was an
+            // asymmetry that lost live data on a fixable auth error (F31).
+            | 1045  // ER_ACCESS_DENIED_ERROR (bad user/password)
+            | 1044  // ER_DBACCESS_DENIED_ERROR (no access to database)
+            | 1142 // ER_TABLEACCESS_DENIED_ERROR (no access to table)
     )
 }
 
@@ -247,10 +266,7 @@ impl Sink for MySqlSink {
 
     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, SqlSinkError> {
         if batch.is_empty() {
-            return Ok(CommitResult {
-                committed: Vec::new(),
-                dead_lettered: Vec::new(),
-            });
+            return Ok(CommitResult::new(Vec::new(), Vec::new()));
         }
 
         let sql = self.build_insert_sql(batch.len());
@@ -272,10 +288,7 @@ impl Sink for MySqlSink {
                     records = batch.len(),
                     "mysql sink committed batch as single INSERT"
                 );
-                Ok(CommitResult {
-                    committed: batch,
-                    dead_lettered: Vec::new(),
-                })
+                Ok(CommitResult::new(batch, Vec::new()))
             }
             Ok(Err(e)) => {
                 if !e.is_transient() {
@@ -286,10 +299,7 @@ impl Sink for MySqlSink {
                         "mysql sink permanently rejected batch; dead-lettering"
                     );
                     let dead_lettered = batch.into_iter().map(|r| (r, reason.clone())).collect();
-                    Ok(CommitResult {
-                        committed: Vec::new(),
-                        dead_lettered,
-                    })
+                    Ok(CommitResult::new(Vec::new(), dead_lettered))
                 } else {
                     Err(e)
                 }
@@ -354,6 +364,26 @@ mod tests {
             MySqlSink::new(c).unwrap_err(),
             MySqlSinkBuildError::InvalidUrl(_)
         ));
+    }
+
+    #[test]
+    fn invalid_url_error_redacts_password() {
+        // A URL carrying a password but failing to parse: the build error must
+        // report the REDACTED url, never the driver's verbatim string (which can
+        // embed user:password@) — otherwise the password leaks to stderr/logs.
+        let mut c = cfg();
+        c.url = "mysql://user:supersecret@host:notaport/db".to_string();
+        let err = MySqlSink::new(c).unwrap_err();
+        assert!(
+            matches!(err, MySqlSinkBuildError::InvalidUrl(_)),
+            "expected InvalidUrl, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("<redacted>"), "url must be redacted: {msg}");
+        assert!(
+            !msg.contains("supersecret"),
+            "password must not leak: {msg}"
+        );
     }
 
     // The full identifier-validation matrix lives in
@@ -454,13 +484,15 @@ mod tests {
         assert!(is_transient_server_code(1213)); // deadlock
         assert!(is_transient_server_code(1290)); // read-only
         assert!(is_transient_server_code(1062)); // dup entry (Plain mode)
+        // Access-denied family — recoverable misconfig, retry not dead-letter (F31).
+        assert!(is_transient_server_code(1045)); // access denied (bad password)
+        assert!(is_transient_server_code(1044)); // db access denied
+        assert!(is_transient_server_code(1142)); // table access denied
 
-        // Things that must dead-letter — retrying won't help.
+        // Things that must dead-letter — retrying won't help (the data is at fault).
         assert!(!is_transient_server_code(1064)); // syntax error
         assert!(!is_transient_server_code(1146)); // no such table
         assert!(!is_transient_server_code(1054)); // bad field
-        assert!(!is_transient_server_code(1045)); // access denied
-        assert!(!is_transient_server_code(1044)); // db access denied
         assert!(!is_transient_server_code(1406)); // data too long for column
     }
 

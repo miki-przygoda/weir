@@ -68,6 +68,11 @@ pub struct HttpSinkConfig {
     /// Default: true. Set false only if your endpoint can't tolerate the
     /// extra header (e.g. strict CORS, header allow-lists).
     pub send_idempotency_key: bool,
+    /// Maximum number of per-record POSTs kept in flight per `commit()` batch.
+    /// The drain runs on one thread, but the POSTs are async, so up to this many
+    /// overlap their network round-trips — collapsing a segment's serial RTT
+    /// cost without changing the per-record protocol or failure granularity.
+    pub concurrency: usize,
 }
 
 impl std::fmt::Debug for HttpSinkConfig {
@@ -81,6 +86,7 @@ impl std::fmt::Debug for HttpSinkConfig {
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
             .field("send_idempotency_key", &self.send_idempotency_key)
+            .field("concurrency", &self.concurrency)
             .finish()
     }
 }
@@ -106,10 +112,20 @@ impl HttpSink {
 
         let client = Client::builder()
             .timeout(config.timeout)
+            // Never follow redirects. reqwest's default follows up to 10, and on a
+            // 301/302/303 it re-issues the POST as a BODILESS GET — if that lands a
+            // 2xx the sink would report the record committed though the payload was
+            // never delivered, and the drain would confirm+delete the segment: a
+            // false ack (G01). With redirects disabled a 3xx surfaces to
+            // post_record and is dead-lettered, never committed.
+            .redirect(reqwest::redirect::Policy::none())
             // Keep idle connections warm between batches. The drain calls
-            // commit in a tight loop while a segment is being processed.
+            // commit in a tight loop while a segment is being processed. Size
+            // the idle pool to the in-flight concurrency so an HTTP/1.1 endpoint
+            // has a connection ready for each concurrent POST (HTTP/2 multiplexes
+            // and needs fewer, but sizing up doesn't hurt).
             .pool_idle_timeout(Some(Duration::from_secs(60)))
-            .pool_max_idle_per_host(8)
+            .pool_max_idle_per_host(config.concurrency.max(1))
             .user_agent(concat!("weir/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(HttpSinkBuildError::ClientBuild)?;
@@ -131,9 +147,9 @@ impl HttpSink {
             req = req.bearer_auth(token.as_ref());
         }
 
-        // No-copy: reqwest::Body implements From<bytes::Bytes> — payload bytes
-        // are handed to reqwest without any allocation or memcopy.
-        let req = req.body(payload);
+        // No-copy: reqwest::Body implements From<bytes::Bytes> — the payload's
+        // inner Bytes is handed to reqwest without any allocation or memcopy.
+        let req = req.body(payload.into_bytes());
 
         let resp = match req.send().await {
             Ok(r) => r,
@@ -152,6 +168,26 @@ impl HttpSink {
             // status code is the only signal).
             let _ = resp.bytes().await;
             return Ok(());
+        }
+
+        // A 3xx surfaces here only because redirect-following is disabled (G01).
+        // Treat it as a permanent misconfiguration — never committed: the
+        // configured sink URL should point straight at the ingest endpoint, not a
+        // redirector. Reported with the Location so the operator can repoint it.
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<no Location header>")
+                .to_string();
+            return Err(HttpSinkError::PermanentStatus {
+                status,
+                body_excerpt: format!(
+                    "unexpected redirect to '{location}'; redirects are not followed — \
+                     point sink_url directly at the ingest endpoint"
+                ),
+            });
         }
 
         if classify_status_transient(status) {
@@ -303,14 +339,30 @@ impl Sink for HttpSink {
     type Error = HttpSinkError;
 
     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, HttpSinkError> {
-        let mut committed = Vec::with_capacity(batch.len());
-        let mut dead_lettered: Vec<(Payload, String)> = Vec::new();
+        use futures_util::stream::StreamExt;
 
-        for record in batch {
-            // Clone the Bytes handle (O(1) ref-bump) so we retain the record
-            // for committed/dead-lettered accounting while posting the original.
-            let posted = record.clone();
-            match self.post_record(posted).await {
+        let concurrency = self.config.concurrency.max(1);
+
+        // One POST per record (unchanged protocol + per-record Idempotency-Key
+        // + per-record dead-lettering), but up to `concurrency` in flight. The
+        // drain thread is single-threaded; these futures are async, so their
+        // network round-trips overlap — a 1000-record segment no longer pays
+        // 1000× the serial RTT. `buffered` (not `buffer_unordered`) keeps the
+        // results in batch order, so `committed` stays in submission order.
+        let stream = futures_util::stream::iter(batch)
+            .map(|record| async move {
+                // Clone the Bytes handle (O(1) ref-bump) so we keep the record
+                // for accounting while posting it.
+                let outcome = self.post_record(record.clone()).await;
+                (record, outcome)
+            })
+            .buffered(concurrency);
+        let mut stream = std::pin::pin!(stream);
+
+        let mut committed = Vec::new();
+        let mut dead_lettered: Vec<(Payload, String)> = Vec::new();
+        while let Some((record, outcome)) = stream.next().await {
+            match outcome {
                 Ok(()) => committed.push(record),
                 Err(HttpSinkError::PermanentStatus {
                     status,
@@ -324,19 +376,17 @@ impl Sink for HttpSink {
                     dead_lettered.push((record, format!("http {status}: {body_excerpt}")));
                 }
                 Err(e) => {
-                    // Transient: abort the batch so the drain retries the
-                    // whole segment. Records already committed in this call
-                    // may be re-sent — the idempotency contract on the
-                    // endpoint covers this (documented in sink/mod.rs).
+                    // Transient: abort the batch so the drain retries the whole
+                    // segment. Dropping the stream cancels any still-in-flight
+                    // POSTs. Records already committed in this call may be
+                    // re-sent — the endpoint's idempotency contract covers this
+                    // (documented in sink/mod.rs).
                     return Err(e);
                 }
             }
         }
 
-        Ok(CommitResult {
-            committed,
-            dead_lettered,
-        })
+        Ok(CommitResult::new(committed, dead_lettered))
     }
 
     fn max_batch_size(&self) -> usize {
@@ -344,11 +394,21 @@ impl Sink for HttpSink {
     }
 
     async fn health(&self) -> SinkHealth {
-        // Coarse health probe: HEAD the URL. If it returns 2xx/3xx, healthy;
-        // 4xx (other than auth challenges) suggests an endpoint misconfig
-        // (degraded); 5xx or transport failure suggests the endpoint is down.
+        // Coarse health probe: HEAD the URL. This probe is UNAUTHENTICATED —
+        // the bearer token is attached per-POST in commit(), not as a client
+        // default — so a 401/403 here is an expected auth challenge from a
+        // reachable endpoint, not a misconfiguration; the real (authenticated)
+        // commit path will succeed, so treat it as healthy. 2xx/3xx are
+        // healthy; other 4xx suggest an endpoint misconfig (degraded); 5xx or a
+        // transport failure suggests the endpoint is down.
         match self.client.head(&self.config.url).send().await {
             Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
+                SinkHealth::Healthy
+            }
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN =>
+            {
                 SinkHealth::Healthy
             }
             Ok(resp) if resp.status().is_client_error() => {
@@ -456,6 +516,38 @@ mod tests {
         None
     }
 
+    /// Reads a full HTTP request off `socket` and returns its body bytes (the
+    /// raw payload the sink POSTed). Returns an empty Vec if the connection
+    /// closes before the headers complete (e.g. the client cancelled the POST).
+    /// Lets content-routing mock servers decide the response per record so a
+    /// test can pin which payload got which outcome.
+    async fn read_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let header_end = loop {
+            match socket.read(&mut tmp).await {
+                Ok(0) | Err(_) => return Vec::new(),
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = find_double_crlf(&buf) {
+                        break pos;
+                    }
+                }
+            }
+        };
+        let header_str = String::from_utf8_lossy(&buf[..header_end]);
+        let content_length = parse_content_length(&header_str).unwrap_or(0);
+        let mut body = buf[header_end + 4..].to_vec();
+        while body.len() < content_length {
+            match socket.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&tmp[..n]),
+            }
+        }
+        body.truncate(content_length);
+        body
+    }
+
     fn cfg(url: &str) -> HttpSinkConfig {
         HttpSinkConfig {
             url: url.to_string(),
@@ -463,6 +555,7 @@ mod tests {
             max_batch_size: 100,
             bearer_token: None,
             send_idempotency_key: true,
+            concurrency: 8,
         }
     }
 
@@ -494,6 +587,76 @@ mod tests {
         // Give the mock server a moment to finish counting.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn http_commit_preserves_record_order_under_concurrency() {
+        // `buffered` (not `buffer_unordered`) keeps `committed` in submission
+        // order even though the POSTs run concurrently.
+        let (url, _counter) =
+            spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
+        let mut c = cfg(&url);
+        c.concurrency = 4;
+        let sink = HttpSink::new(c).unwrap();
+        let batch = vec![p(b"r0"), p(b"r1"), p(b"r2"), p(b"r3"), p(b"r4")];
+        let result = sink.commit(batch.clone()).await.unwrap();
+        assert_eq!(result.committed, batch);
+        assert!(result.dead_lettered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_posts_run_concurrently() {
+        // A server that holds every connection open until N of them are
+        // simultaneously connected, then releases all at once. If the sink
+        // POSTed serially, the 2nd POST would never start until the 1st
+        // returned — so the barrier (and thus the commit) would deadlock.
+        // Completing within the timeout proves the POSTs overlap.
+        use tokio::sync::Barrier;
+        const N: usize = 4;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let barrier = Arc::new(Barrier::new(N));
+        tokio::spawn(async move {
+            for _ in 0..N {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    // Read the request header block, then wait for all N peers.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if find_double_crlf(&buf).is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    barrier.wait().await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+
+        let mut c = cfg(&url);
+        c.concurrency = N;
+        let sink = HttpSink::new(c).unwrap();
+        let batch: Vec<Payload> = (0..N)
+            .map(|i| Payload::from(format!("rec{i}").into_bytes()))
+            .collect();
+        let result = tokio::time::timeout(Duration::from_secs(5), sink.commit(batch))
+            .await
+            .expect("commit deadlocked — POSTs did not run concurrently")
+            .unwrap();
+        assert_eq!(result.committed.len(), N);
     }
 
     #[tokio::test]
@@ -549,6 +712,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_redirect_is_dead_lettered_never_committed() {
+        // G01: a 3xx must NOT be followed (which would re-issue a bodiless GET
+        // and let a 2xx there masquerade as a committed record — a false ack).
+        // With redirects disabled the 302 surfaces and is dead-lettered.
+        let (url, _counter) = spawn_mock_server(vec![
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        let result = sink.commit(vec![p(b"alpha")]).await.unwrap();
+        assert!(
+            result.committed.is_empty(),
+            "a redirected POST must never be reported committed"
+        );
+        assert_eq!(result.dead_lettered.len(), 1);
+        let (_, reason) = &result.dead_lettered[0];
+        assert!(reason.contains("302"), "reason: {reason}");
+        assert!(reason.contains("redirect"), "reason: {reason}");
+    }
+
+    #[tokio::test]
     async fn http_401_dead_letters() {
         // 401 Unauthorized: permanent from the daemon's POV; retrying with
         // the same token won't change the answer.
@@ -575,8 +759,11 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_batch_committed_and_dead_lettered() {
-        // First request 200, second 400, third 200. Order of records in the
-        // batch determines which gets which response.
+        // This server cycles responses by request ARRIVAL order, which under
+        // concurrency 8 is non-deterministic — so this test pins only the COUNTS
+        // (2 committed, 1 dead-lettered). Record↔outcome pairing is pinned by
+        // http_pairs_each_record_with_its_own_outcome_under_concurrency (F39),
+        // which routes responses on request content instead.
         let (url, _counter) = spawn_mock_server(vec![
             "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
@@ -601,6 +788,124 @@ mod tests {
         let sink = HttpSink::new(cfg(&url)).unwrap();
         let err = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap_err();
         assert!(err.is_transient());
+    }
+
+    /// F39: under concurrency the completion order of POSTs is non-deterministic,
+    /// so a count-only assertion can't catch a record↔outcome mis-pairing. This
+    /// mock routes the response on request CONTENT (400 for b"bad", 200 else) and
+    /// asserts the RIGHT payload lands in committed vs dead_lettered.
+    #[tokio::test]
+    async fn http_pairs_each_record_with_its_own_outcome_under_concurrency() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let body = read_request_body(&mut socket).await;
+                    let response = if body == b"bad" {
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 3\r\n\r\nno!"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let mut c = cfg(&url);
+        c.concurrency = 8;
+        let sink = HttpSink::new(c).unwrap();
+        let result = sink
+            .commit(vec![p(b"good-1"), p(b"bad"), p(b"good-2")])
+            .await
+            .unwrap();
+
+        // committed holds exactly the two good payloads, in submission order
+        // (buffered preserves order even though POSTs complete out of order).
+        assert_eq!(result.committed, vec![p(b"good-1"), p(b"good-2")]);
+        // dead_lettered holds exactly the bad payload, with its 400 reason.
+        assert_eq!(result.dead_lettered.len(), 1);
+        assert_eq!(result.dead_lettered[0].0, p(b"bad"));
+        assert!(
+            result.dead_lettered[0].1.contains("400"),
+            "reason: {}",
+            result.dead_lettered[0].1
+        );
+    }
+
+    /// F38: a transient error early in the batch must CANCEL the still-in-flight
+    /// POSTs (the buffered stream is dropped on the early return), not wait them
+    /// out. The mock returns 500 immediately for b"boom" and stalls 10 s for any
+    /// other body; with boom first and concurrency >= batch size, commit must
+    /// return Err well under 10 s, and the stalled POSTs must never complete.
+    #[tokio::test]
+    async fn http_transient_cancels_in_flight_posts() {
+        const SLOW: Duration = Duration::from_secs(10);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_task = Arc::clone(&completed);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let completed = Arc::clone(&completed_task);
+                tokio::spawn(async move {
+                    let body = read_request_body(&mut socket).await;
+                    if body == b"boom" {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+                            )
+                            .await;
+                    } else {
+                        // Stall: respond only after SLOW. If the client cancels the
+                        // in-flight POST, this socket closes and we never reach the
+                        // increment — exactly what the test asserts.
+                        tokio::time::sleep(SLOW).await;
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                    let _ = socket.shutdown().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        let mut c = cfg(&url);
+        c.concurrency = 8;
+        let sink = HttpSink::new(c).unwrap();
+        // boom FIRST: `buffered` yields results in submission order, so its 500 is
+        // observed before the stalled ones, triggering the early-return + drop.
+        let batch = vec![p(b"boom"), p(b"slow-1"), p(b"slow-2"), p(b"slow-3")];
+
+        let start = tokio::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(3), sink.commit(batch))
+            .await
+            .expect("commit must return promptly, not wait out the stalled in-flight POSTs")
+            .unwrap_err();
+        assert!(err.is_transient(), "expected transient error, got: {err}");
+        assert!(
+            start.elapsed() < SLOW,
+            "commit waited on the stalled POSTs instead of cancelling them"
+        );
+
+        // Grace period far shorter than SLOW: only boom should have completed;
+        // the stalled POSTs must have been cancelled, not awaited.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            1,
+            "stalled in-flight POSTs were not cancelled on the transient error"
+        );
     }
 
     // ── Idempotency key tests ─────────────────────────────────────────────
@@ -728,6 +1033,41 @@ mod tests {
             "Idempotency-Key header should be absent when disabled, found:\n{}",
             headers[0]
         );
+    }
+
+    // ── Health probe tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn health_treats_auth_challenge_as_healthy() {
+        // The HEAD probe is unauthenticated; a 401/403 from a reachable
+        // endpoint is an expected auth challenge, not a misconfig. The
+        // authenticated commit path still works, so report healthy.
+        for resp in [
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let (url, _counter) = spawn_mock_server(vec![resp]).await;
+            let sink = HttpSink::new(cfg(&url)).unwrap();
+            assert!(
+                matches!(sink.health().await, SinkHealth::Healthy),
+                "{resp} should be healthy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_treats_other_4xx_as_degraded_and_5xx_as_down() {
+        let (url, _c) =
+            spawn_mock_server(vec!["HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"]).await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        assert!(matches!(sink.health().await, SinkHealth::Degraded(_)));
+
+        let (url, _c) = spawn_mock_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        assert!(matches!(sink.health().await, SinkHealth::Down(_)));
     }
 
     // ── Retry-After header tests ──────────────────────────────────────────

@@ -333,6 +333,7 @@ fn metrics_all_families_registered() {
         "weir_accept_latency_seconds",
         "weir_connection_idle_timeout",
         "weir_connection_rejected_peer_uid",
+        "weir_accept_resource_exhaustion",
         "weir_connections_aborted_at_shutdown",
         "weir_ack_timeout",
         // TLS
@@ -357,6 +358,7 @@ fn metrics_all_families_registered() {
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
         "weir_drain_state",
+        "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",
     ];
 
@@ -494,10 +496,20 @@ fn new_connection_accepted_after_previous_client_drops() {
 // ── Payload edge cases ────────────────────────────────────────────────────────
 
 #[test]
-fn empty_payload_is_accepted() {
+fn empty_payload_is_rejected() {
+    // An empty Push payload collides with the WAB end-of-records sentinel
+    // (a zero-length prefix), so the server rejects it at ingest with
+    // Nack(EmptyPayload) rather than risk truncating a segment. HealthCheck
+    // frames also carry a zero-length payload but are unaffected — see
+    // `health_check_returns_ok`.
+    use weir_core::NackReason;
     let srv = weir_server!("empty_payload").start();
     let mut client = srv.client();
-    client.push(b"", Durability::Sync).unwrap();
+    let err = client.push(b"", Durability::Sync).unwrap_err();
+    assert!(
+        matches!(err, ClientError::Nack(NackReason::EmptyPayload)),
+        "expected Nack(EmptyPayload), got {err:?}"
+    );
 }
 
 #[test]
@@ -545,17 +557,22 @@ fn payload_size_boundary_enforced() {
             io::{Read, Write},
             os::unix::net::UnixStream as RawStream,
         };
-        use weir_core::{HEADER_LEN, Header, MessageType, NackReason};
+        use weir_core::{Envelope, HEADER_LEN, Header, MessageType, NackReason};
 
         let mut stream = RawStream::connect(&srv.socket_path).expect("raw connect");
-        let header = Header::new(
-            MessageType::Push,
-            Durability::Batched,
-            0,
-            (MAX_PAYLOAD_HARD_CAP + 1) as u32,
-        );
+        // Header::new can no longer declare a length that disagrees with its
+        // payload (F50), so build a full frame whose Envelope derives the over-cap
+        // length from a real (discarded) payload, and transmit ONLY its 16-byte
+        // header. The server must reject on the declared length before reading any
+        // body bytes.
+        let oversize = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        let frame = Envelope::new(
+            Header::new(MessageType::Push, Durability::Batched, 0),
+            oversize,
+        )
+        .encode();
         stream
-            .write_all(&header.encode())
+            .write_all(&frame[..HEADER_LEN])
             .expect("write header for over-cap push");
 
         // Read response header.
@@ -565,7 +582,7 @@ fn payload_size_boundary_enforced() {
             .expect("read response header");
         let resp_header = Header::decode(&resp_header_buf).expect("decode response header");
         assert_eq!(
-            resp_header.message_type,
+            resp_header.message_type(),
             MessageType::Nack,
             "expected Nack response for over-cap header"
         );
@@ -573,7 +590,7 @@ fn payload_size_boundary_enforced() {
         // The wire format puts the NackReason as the first byte of the
         // payload (see `send_nack` in src/socket/connection.rs). Read the
         // payload and verify the reason byte.
-        let mut payload = vec![0u8; resp_header.payload_len as usize];
+        let mut payload = vec![0u8; resp_header.payload_len() as usize];
         if !payload.is_empty() {
             stream.read_exact(&mut payload).expect("read nack payload");
         }
@@ -1090,12 +1107,7 @@ fn stalled_client_does_not_block_other_connections() {
 
     // Pre-encode one Push frame for the stalled client to send.
     let payload = b"stall";
-    let header = Header::new(
-        MessageType::Push,
-        Durability::Buffered,
-        0,
-        payload.len() as u32,
-    );
+    let header = Header::new(MessageType::Push, Durability::Buffered, 0);
     let frame = Envelope::new(header, payload.to_vec()).encode();
 
     let stop_stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1157,12 +1169,7 @@ fn partial_frame_does_not_corrupt_next_connection() {
 
     // Build a valid Push frame with a 64-byte payload.
     let payload = vec![0xabu8; 64];
-    let header = Header::new(
-        MessageType::Push,
-        Durability::Buffered,
-        0,
-        payload.len() as u32,
-    );
+    let header = Header::new(MessageType::Push, Durability::Buffered, 0);
     let frame = Envelope::new(header, payload).encode();
 
     {

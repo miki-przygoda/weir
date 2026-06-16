@@ -1,7 +1,7 @@
 [features]
 default = ["http-sink", "mysql-sink", "postgres-sink"]
-# HTTP sink: POSTs each record to a configurable URL.
-http-sink = ["dep:reqwest", "dep:sha2"]
+# HTTP sink: POSTs each record to a configurable URL (concurrent per-record POSTs).
+http-sink = ["dep:reqwest", "dep:sha2", "dep:futures-util"]
 # MySQL sink: writes batches via multi-row INSERT.
 mysql-sink = ["dep:mysql_async", "_sql-sink"]
 # PostgreSQL sink: writes batches via multi-row INSERT.
@@ -41,11 +41,11 @@ name = "weir-server"
 path = "src/main.rs"
 
 [dependencies]
-weir-core = { path = "../weir-core", version = "0.9.0" }
+weir-core = { path = "../weir-core", version = "1.0.0" }
 # Sink trait + error contract. Extracted into its own published crate so third
 # parties can write sinks without depending on the daemon; the built-in sinks
 # (http/mysql/postgres/clickhouse/noop) implement these traits.
-weir-sink-sdk = { path = "../weir-sink-sdk", version = "0.9.0" }
+weir-sink-sdk = { path = "../weir-sink-sdk", version = "1.0.0" }
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = [
@@ -82,6 +82,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 # can deduplicate retries that follow the drain's at-least-once contract.
 # RustCrypto pure-Rust SHA-2, no system dependency.
 sha2 = { version = "0.10", optional = true }
+# Bounded-concurrency stream combinator (`buffered`) for the HTTP sink's parallel
+# per-record POSTs. Already in the tree via reqwest, so it adds no compile cost;
+# default-features = false keeps it to the `std` stream adapters we use.
+futures-util = { version = "0.3", default-features = false, features = [
+    "std",
+], optional = true }
 # MySQL sink: async client with pooling. default-features = false drops
 # native-tls / flate2 / time-related features; we only need the connection,
 # the protocol, and rustls for TLS to production servers.
@@ -135,3 +141,8 @@ rcgen = "0.13"
 # wab::dst harness. Only the seed-regression replay test touches JSON; the
 # harness itself needs no serialisation at runtime.
 serde_json = "1"
+# Property-based fault-list exploration for the wab::dst harness: generates and
+# SHRINKS (seed, fault-list, record-count) triples against the durability
+# invariants, so any future regression auto-minimises to a smallest reproducer.
+# Already a dev-dep of weir-core/weir-client.
+proptest = "1"

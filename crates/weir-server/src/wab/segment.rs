@@ -22,7 +22,7 @@ use weir_core::MAX_PAYLOAD_HARD_CAP;
 /// The running `file_crc_hasher` accumulates CRC32 over every byte written to the
 /// file (including the header), so the footer's `file_crc32` field requires no
 /// full-file re-read at seal time.
-pub struct WabSegment {
+pub(crate) struct WabSegment {
     file: File,
     path: PathBuf,
     /// Total bytes written to the file (header + records). Used for rotation.
@@ -46,9 +46,11 @@ impl WabSegment {
     /// Creates a new segment file at `path`.
     ///
     /// Uses `O_CREAT | O_EXCL | O_NOFOLLOW` to prevent symlink attacks and
-    /// ensure the file is newly created. The caller must guarantee `path` does
-    /// not already exist.
-    pub fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
+    /// ensure the file is newly created. `O_EXCL` *enforces* non-existence: if
+    /// `path` already exists the call returns [`io::ErrorKind::AlreadyExists`]
+    /// rather than truncating or appending, so the caller never has to check
+    /// first (and a racing creator can't be silently clobbered).
+    pub(crate) fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
         // O_NOFOLLOW: reject symlinks at the target path (prevents TOCTOU redirect).
         // mode 0o600: segment files are private to the daemon; no group/other read.
         #[cfg(unix)]
@@ -78,6 +80,11 @@ impl WabSegment {
         };
 
         seg.file.write_all(&header)?;
+        // Make the new file's directory entry durable. Records written here are
+        // group-fsynced for their *data*, but the dirent that links this file into
+        // the shard dir is only crash-durable after a parent-dir fsync — without
+        // it, a crash could orphan a file whose Sync records we acked as durable.
+        fsync_parent_dir(path)?;
         Ok(seg)
     }
 
@@ -87,10 +94,22 @@ impl WabSegment {
     ///
     /// Uses checked arithmetic throughout: a panic here means the segment has grown
     /// beyond addressable bounds, which is unrecoverable.
-    pub fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_record(&mut self, payload: &[u8]) -> io::Result<()> {
         if self.poisoned {
             return Err(io::Error::other(
                 "segment is poisoned by a previous partial write",
+            ));
+        }
+        // Defense-in-depth: an empty payload serialises to a zero length prefix,
+        // which is the end-of-records sentinel — writing one would truncate the
+        // segment on the next read. Empty payloads are rejected at ingest
+        // (NackReason::EmptyPayload), so this should be unreachable, but the WAB
+        // is the hard durability boundary and must never store a record it can't
+        // read back.
+        if payload.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty payload cannot be represented in a WAB segment",
             ));
         }
         let payload_len = u32::try_from(payload.len()).map_err(|_| {
@@ -180,14 +199,14 @@ impl WabSegment {
     ///
     /// Linux: `fdatasync` — flushes data and critical metadata without waiting for
     /// directory entry updates.
-    pub fn fsync(&self) -> io::Result<()> {
+    pub(crate) fn fsync(&self) -> io::Result<()> {
         platform_fsync(&self.file)
     }
 
     /// Returns true if the segment has reached or exceeded the configured
     /// rotation threshold. The threshold is owned by `ShardWriter` so a single
     /// `WabSegment` instance can be reused under different policies (e.g. tests).
-    pub fn should_rotate(&self, max_bytes: u64) -> bool {
+    pub(crate) fn should_rotate(&self, max_bytes: u64) -> bool {
         self.bytes_written >= max_bytes
     }
 
@@ -195,7 +214,7 @@ impl WabSegment {
     /// code reads the in-memory counter directly during `seal()` to write
     /// the segment footer.
     #[cfg(test)]
-    pub fn record_count(&self) -> u64 {
+    pub(crate) fn record_count(&self) -> u64 {
         self.record_count
     }
 
@@ -233,16 +252,39 @@ impl WabSegment {
     ///
     /// Consumes `self` to ensure the segment cannot be written to after sealing.
     /// Returns the path of the newly sealed file.
-    pub fn seal(self) -> io::Result<PathBuf> {
+    pub(crate) fn seal(self) -> io::Result<PathBuf> {
         let active_path = self.finalize_to_disk()?;
         let sealed_path = sealed_path_for(&active_path);
+        // Refuse to clobber an existing sealed segment. rename(2) silently
+        // REPLACES its destination; if next_counter ever regressed (e.g. a failed
+        // startup counter-scan defaulting to 1), sealing seg_NNNNNNNN.wab over a
+        // recovered-but-undrained seg_NNNNNNNN.wab.sealed would lose acked records
+        // — the F12/G02 data-loss hole. The flusher already refuses to start at an
+        // unestablished counter (wab/mod.rs), so this is belt-and-suspenders that
+        // turns any residual overwrite into a loud error rather than silent loss.
+        // Single-writer-per-shard, so the check→rename window is not a TOCTOU risk.
+        if sealed_path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to seal '{}' over existing '{}' — would overwrite a sealed segment",
+                    active_path.display(),
+                    sealed_path.display()
+                ),
+            ));
+        }
         std::fs::rename(&active_path, &sealed_path)?;
+        // Publish the rename durably: without a parent-dir fsync a crash can lose
+        // the .wab.sealed dirent. (Recovery would re-seal the orphaned .wab, so
+        // this is lower-stakes than the create-time fsync above — but it keeps the
+        // documented "seal is the durability commit point" honest.)
+        fsync_parent_dir(&sealed_path)?;
         Ok(sealed_path)
     }
 }
 
 /// Derives the `.wab.sealed` path from an active `.wab` path.
-pub fn sealed_path_for(active_path: &Path) -> PathBuf {
+pub(crate) fn sealed_path_for(active_path: &Path) -> PathBuf {
     let mut p = active_path.to_owned();
     let name = p
         .file_name()
@@ -254,14 +296,33 @@ pub fn sealed_path_for(active_path: &Path) -> PathBuf {
     p
 }
 
-/// Derives the segment counter from a file stem like `seg_00000001`.
-pub fn segment_counter_from_path(path: &Path) -> Option<u64> {
-    let stem = path.file_stem()?.to_str()?;
-    stem.strip_prefix("seg_")?.parse().ok()
+/// Derives the segment counter from a segment filename regardless of which
+/// lifecycle extension it carries — `seg_00000001.wab`, `seg_00000001.wab.sealed`,
+/// and `seg_00000001.wab.confirmed` all yield `1`. The counter is the digit run
+/// immediately after the `seg_` prefix; everything after it is ignored.
+///
+/// Counting EVERY on-disk segment (not just active `.wab` files) is load-bearing:
+/// after crash recovery seals the active segment, a shard directory can hold only
+/// `.wab.sealed` (and `.wab.confirmed`) files awaiting drain. If the counter scan
+/// ignored those, a fresh writer would reset `next_counter` to 1 and its first
+/// segment's seal-rename would silently overwrite a recovered-but-undrained
+/// sealed segment — data loss. `file_stem()` strips only the *last* extension, so
+/// it left `seg_00000001.wab` on a sealed file and failed to parse; we parse the
+/// leading digit run directly to avoid that.
+pub(crate) fn segment_counter_from_path(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix("seg_")?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
 }
 
 /// Formats a segment file name for a given shard directory and counter.
-pub fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
+pub(crate) fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
     shard_dir.join(format!("seg_{counter:08}{EXT_ACTIVE}"))
 }
 
@@ -271,7 +332,7 @@ pub fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
 /// `fsync`/`seal` faults on a seeded schedule. Held as a `Box<dyn SegmentHandle>`
 /// so `ShardWriter`'s rotate/seal lifecycle is backend-agnostic. The single
 /// vtable hop per write/fsync is negligible against the real syscall it guards.
-pub trait SegmentHandle: Send {
+pub(crate) trait SegmentHandle: Send {
     /// Append one record. Mirrors [`WabSegment::write_record`].
     fn write_record(&mut self, payload: &[u8]) -> io::Result<()>;
     /// Sync the segment to stable storage. Mirrors [`WabSegment::fsync`].
@@ -289,19 +350,21 @@ pub trait SegmentHandle: Send {
 /// (real files); the DST harness injects a fault-aware store. Held as
 /// `Arc<dyn SegmentStore>` so the generic stays out of the public
 /// [`super::spawn`] signature.
-pub trait SegmentStore: Send + Sync {
+pub(crate) trait SegmentStore: Send + Sync {
     /// Create a fresh active segment at `path` for `shard_id`.
     fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>>;
-    /// Counter values of every active segment file in `dir`. Sealed (`.wab.sealed`)
-    /// files do not parse via [`segment_counter_from_path`] and so are skipped —
-    /// this matches the historical scan, which only advanced past active segments.
-    /// Used by [`ShardWriter::scan_and_advance_counter`].
+    /// Counter values of every segment file in `dir` — active (`.wab`), sealed
+    /// (`.wab.sealed`), AND confirmed (`.wab.confirmed`). All lifecycle states
+    /// must be counted so [`ShardWriter::scan_and_advance_counter`] advances past
+    /// recovered-but-undrained sealed segments; counting only active files lets a
+    /// post-recovery writer reuse a counter and overwrite a sealed segment (data
+    /// loss). Used by [`ShardWriter::scan_and_advance_counter`].
     fn segment_counters(&self, dir: &Path) -> io::Result<Vec<u64>>;
 }
 
 /// Production [`SegmentStore`]: real files on the local filesystem via
 /// [`WabSegment`].
-pub struct FsSegmentStore;
+pub(crate) struct FsSegmentStore;
 
 impl SegmentStore for FsSegmentStore {
     fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>> {
@@ -336,7 +399,7 @@ impl SegmentHandle for WabSegment {
 }
 
 /// Manages the active segment for one shard. Opens the segment lazily on first write.
-pub struct ShardWriter {
+pub(crate) struct ShardWriter {
     shard_id: u16,
     shard_dir: PathBuf,
     /// Counter used to name the next segment file (incremented on each rotation).
@@ -366,7 +429,7 @@ impl ShardWriter {
     /// counter-scan flows through it. Production injects [`FsSegmentStore`] at
     /// the flusher's single construction point (see [`super::spawn`]); the DST
     /// harness injects a fault-injecting store.
-    pub fn new_with_store(
+    pub(crate) fn new_with_store(
         shard_id: u16,
         shard_dir: PathBuf,
         segment_max_bytes: u64,
@@ -387,7 +450,7 @@ impl ShardWriter {
     /// Sets `next_counter` to one past the highest existing segment counter in the
     /// shard directory. Called during startup so new segments don't collide with
     /// existing (sealed) ones.
-    pub fn scan_and_advance_counter(&mut self) -> io::Result<()> {
+    pub(crate) fn scan_and_advance_counter(&mut self) -> io::Result<()> {
         let max = self
             .store
             .segment_counters(&self.shard_dir)?
@@ -410,7 +473,7 @@ impl ShardWriter {
     /// The orphaned file is left on disk; crash recovery seals it and the drain
     /// reader stops at the first invalid record — records written successfully
     /// before the failure remain drainable.
-    pub fn write_record(&mut self, payload: &[u8]) -> io::Result<Option<PathBuf>> {
+    pub(crate) fn write_record(&mut self, payload: &[u8]) -> io::Result<Option<PathBuf>> {
         self.ensure_open()?;
         if let Err(e) = self
             .active
@@ -435,7 +498,7 @@ impl ShardWriter {
     }
 
     /// Fsyncs the current active segment. No-op if no segment is open.
-    pub fn fsync_current(&self) -> io::Result<()> {
+    pub(crate) fn fsync_current(&self) -> io::Result<()> {
         if let Some(seg) = &self.active {
             seg.fsync()?;
         }
@@ -444,7 +507,7 @@ impl ShardWriter {
 
     /// Seals the current active segment and returns its sealed path.
     /// Returns `None` if no segment is currently open.
-    pub fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
+    pub(crate) fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
         match self.active.take() {
             Some(seg) => Ok(Some(seg.seal()?)),
             None => Ok(None),
@@ -476,9 +539,17 @@ impl ShardWriter {
 #[cfg(target_os = "macos")]
 fn platform_fsync(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    // F_BARRIERFSYNC (85): flushes data to persistent storage with a write barrier,
-    // ensuring ordering without waiting for all pending media writes. Faster than
-    // F_FULLFSYNC while still providing the ordering guarantee the WAB requires.
+    // F_BARRIERFSYNC (85): issues a write barrier — data reaches the drive and is
+    // ordered before later writes — without forcing the drive's volatile cache to
+    // the medium. This is a DELIBERATE durability/throughput tradeoff (F19): unlike
+    // F_FULLFSYNC, a barrier does NOT guarantee survival of a sudden power loss on a
+    // drive with a non-volatile-safe write cache (most consumer SSDs). It matches
+    // what fdatasync provides on Linux for typical configurations and is the
+    // platform-recommended fast path; operators who need power-loss durability on
+    // such hardware should ensure the drive honours cache-flush/barriers (or front
+    // the WAB with a battery/capacitor-backed cache). The crown invariant
+    // (acked-true ⇒ on stable storage) holds under an OS crash; the residual is the
+    // hardware-cache-on-power-loss case.
     let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) };
     if ret == -1 {
         return Err(io::Error::last_os_error());
@@ -491,12 +562,39 @@ fn platform_fsync(file: &File) -> io::Result<()> {
     file.sync_data() // fdatasync on Linux
 }
 
+/// Fsyncs the parent directory of `path` so a preceding create or rename of that
+/// entry is durable across a crash.
+///
+/// `platform_fsync` makes a file's *data* durable, but POSIX only guarantees the
+/// *directory entry* (the create/rename that links the file into its dir) is
+/// durable after an fsync on the parent directory. Without this, a crash right
+/// after [`WabSegment::create`] could orphan a file whose records we later ack as
+/// durable, and a crash right after [`WabSegment::seal`]'s rename could lose the
+/// `.wab.sealed` publication. Opening a directory read-only and fsync-ing its fd
+/// flushes its entries on Linux and macOS (`F_BARRIERFSYNC` is file-specific; the
+/// plain `fsync` behind `sync_all` is the directory-durability primitive).
+///
+/// No-op on Windows: the WAB's `fdatasync`-based durability model is Unix-first,
+/// and opening a directory as a `File` is not portable there.
+#[cfg(not(windows))]
+pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    pub fn tmp_dir(label: &str) -> PathBuf {
+    pub(crate) fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weir_seg_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -524,6 +622,32 @@ mod tests {
         assert!(sealed.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
         assert!(!path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn fsync_parent_dir_smoke() {
+        // The dir-fsync helper used after create/seal/.confirmed to make directory
+        // entries crash-durable (B4). Must succeed for a file in a real directory
+        // and be a harmless no-op when there is no parent component.
+        let dir = tmp_dir("fsyncdir");
+        let path = dir.join("seg_00000001.wab");
+        fs::write(&path, b"x").unwrap();
+        fsync_parent_dir(&path).unwrap();
+        fsync_parent_dir(std::path::Path::new("no_parent_component")).unwrap();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn write_record_rejects_empty_payload() {
+        // An empty payload would serialise to the end-of-records sentinel and
+        // truncate the segment — the WAB must reject it (defense-in-depth behind
+        // the ingest-layer NackReason::EmptyPayload check).
+        let dir = tmp_dir("emptyrec");
+        let path = dir.join("seg_00000001.wab");
+        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let err = seg.write_record(b"").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -626,6 +750,123 @@ mod tests {
         );
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn segment_counter_from_path_parses_all_lifecycle_extensions() {
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000001.wab")),
+            Some(1)
+        );
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000007.wab.sealed")),
+            Some(7)
+        );
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000042.wab.confirmed")),
+            Some(42)
+        );
+        assert_eq!(segment_counter_from_path(Path::new("/s/README")), None);
+        assert_eq!(segment_counter_from_path(Path::new("/s/seg_abc.wab")), None);
+    }
+
+    #[test]
+    fn scan_and_advance_counter_advances_past_sealed_segments() {
+        // Regression for the recovery counter-reset data-loss bug: after crash
+        // recovery seals the active segment, the shard dir can hold only
+        // seg_00000001.wab.sealed (recovered, awaiting drain). A fresh writer MUST
+        // advance past it — otherwise its first seal renames seg_00000001.wab over
+        // the recovered, undrained sealed segment and loses those records.
+        let dir = tmp_dir("scan_past_sealed");
+        let active = segment_path(&dir, 1);
+        let mut seg = WabSegment::create(&active, 0).unwrap();
+        seg.write_record(b"recovered-record").unwrap();
+        let sealed = seg.seal().unwrap();
+        assert!(
+            sealed
+                .to_string_lossy()
+                .ends_with("seg_00000001.wab.sealed")
+        );
+        let original = fs::read(&sealed).unwrap();
+
+        // Fresh writer over the same shard dir, as at startup post-recovery.
+        let metrics = Arc::new(Metrics::new().0);
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            metrics,
+            Arc::new(FsSegmentStore),
+        );
+        writer.scan_and_advance_counter().unwrap();
+
+        // New ingest -> new segment -> seal. It must NOT reuse counter 1.
+        writer.write_record(b"new-record").unwrap();
+        let new_sealed = writer.seal_current().unwrap().expect("a segment was open");
+        assert!(
+            new_sealed
+                .to_string_lossy()
+                .ends_with("seg_00000002.wab.sealed"),
+            "new segment reused a counter: {}",
+            new_sealed.display()
+        );
+        // The recovered segment survived untouched.
+        assert!(sealed.exists(), "recovered sealed segment was deleted");
+        assert_eq!(
+            fs::read(&sealed).unwrap(),
+            original,
+            "recovered sealed segment was overwritten"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// G02 (defense-in-depth): seal() must refuse to rename an active segment
+    /// over an EXISTING .wab.sealed rather than silently clobber it. This is the
+    /// last-line guard behind the flusher's refusal to start at an unestablished
+    /// counter — even if the counter ever regressed, no sealed segment is lost.
+    #[test]
+    fn seal_refuses_to_overwrite_an_existing_sealed_segment() {
+        let dir = tmp_dir("seal_no_clobber");
+        let active = segment_path(&dir, 1);
+        let mut seg = WabSegment::create(&active, 0).unwrap();
+        seg.write_record(b"would-clobber").unwrap();
+
+        // Pre-place the sealed target (as a recovered, undrained sealed segment).
+        let sealed_target = sealed_path_for(&active);
+        fs::write(&sealed_target, b"PRE-EXISTING-RECOVERED-SEGMENT").unwrap();
+
+        let err = seg.seal().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        // The pre-existing sealed segment is untouched.
+        assert_eq!(
+            fs::read(&sealed_target).unwrap(),
+            b"PRE-EXISTING-RECOVERED-SEGMENT",
+            "seal clobbered an existing sealed segment"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// G02 (precondition): a failing segment-counter scan (here forced via an
+    /// unreadable dir, modelling a transient EMFILE/ENOMEM read_dir failure) must
+    /// ERROR and leave next_counter at its default 1 — NOT silently advance. The
+    /// flusher reacts to that error by going offline rather than sealing at an
+    /// unestablished counter that could overwrite a recovered sealed segment.
+    #[test]
+    fn scan_and_advance_counter_errors_on_unreadable_dir_leaving_counter_unadvanced() {
+        let metrics = Arc::new(Metrics::new().0);
+        let missing =
+            std::env::temp_dir().join(format!("weir_g02_no_such_shard_dir_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&missing);
+        let mut writer =
+            ShardWriter::new_with_store(0, missing, 1024 * 1024, metrics, Arc::new(FsSegmentStore));
+        let err = writer.scan_and_advance_counter().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            writer.next_counter, 1,
+            "a failed scan must not advance next_counter past its default"
+        );
     }
 
     #[test]

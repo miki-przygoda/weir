@@ -14,7 +14,9 @@
 //! Draining
 //!   │  Permanent error AND dead-letter cap exceeded
 //!   ▼
-//! BlockedDeadLetterFull  ──(cap clears)──▶  Draining (same segment, retry from start)
+//! BlockedDeadLetterFull  ──(cap clears)──▶  RetryingTransient (same segment,
+//!                                            RESUMING past already-processed
+//!                                            sub-batches — see F05)
 //! ```
 //!
 //! # Confirmed files
@@ -57,6 +59,7 @@ pub const MAX_RETRIES: u32 = 3;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct DrainConfig {
     /// Root WAB directory (used to locate and create the dead-letter directory).
     pub wab_dir: PathBuf,
@@ -87,10 +90,17 @@ enum DrainState {
         segment: PathBuf,
         retries_left: u32,
         next_delay: Duration,
+        /// Records of this segment already durably processed by earlier
+        /// sub-batches; the retry resumes past them rather than re-committing /
+        /// re-dead-lettering them (F05).
+        processed: u64,
     },
     BlockedDeadLetterFull {
         segment: PathBuf,
         blocked_since: Instant,
+        /// Records already durably processed before the block; the post-headroom
+        /// retry resumes past them (F05).
+        processed: u64,
     },
 }
 
@@ -99,10 +109,20 @@ enum ProcessResult {
     Confirmed { record_count: u64 },
     /// Sink returned a transient error. Retry the segment after `retry_after`
     /// (if the sink supplied a hint, e.g. an HTTP Retry-After header) or
-    /// after the drain's exponential-backoff delay (if `None`).
-    Transient { retry_after: Option<Duration> },
-    /// Dead-letter cap would be exceeded. Block until capacity frees.
-    BlockedDeadLetter,
+    /// after the drain's exponential-backoff delay (if `None`). `processed` is
+    /// the number of records the *earlier* sub-batches of this attempt durably
+    /// committed/dead-lettered — the retry skips them (F05).
+    Transient {
+        retry_after: Option<Duration>,
+        processed: u64,
+    },
+    /// Dead-letter cap would be exceeded. Block until capacity frees. `processed`
+    /// carries the durable progress so the post-headroom retry resumes past the
+    /// already-handled sub-batches (F05).
+    BlockedDeadLetter { processed: u64 },
+    /// A record failed to read mid-segment. The readable prefix was delivered and
+    /// the segment was quarantined for manual recovery — do not retry or delete.
+    Quarantined,
 }
 
 enum BatchResult {
@@ -124,8 +144,63 @@ pub fn spawn<S: Sink + 'static>(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("weir-drain".into())
-        .spawn(move || drain_thread(drain_rx, sink, config, metrics))
+        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics))
         .expect("failed to spawn drain thread")
+}
+
+/// Maximum times the drain is respawned after a panic before giving up — past
+/// this, delivery stops and the WAB accumulates on disk until restart (the same
+/// policy as the WAB flusher supervisor).
+const MAX_DRAIN_RESPAWNS: u32 = 10;
+
+/// Runs [`drain_thread`] under panic supervision. A panic in the drain (a sink
+/// impl, `process_segment`, `confirm_and_delete`, …) is caught and the drain is
+/// respawned with a fresh runtime + dead-letter writer, reading from the same
+/// channel so buffered segments survive. Without this, a single panic would kill
+/// delivery permanently while producers keep being acked and the WAB grows
+/// unbounded. The segment in flight at panic time is not re-delivered this run,
+/// but it is durable on disk and replayed on the next restart.
+fn run_drain_supervised<S: Sink>(
+    drain_rx: crossbeam_channel::Receiver<PathBuf>,
+    sink: Arc<S>,
+    config: DrainConfig,
+    metrics: Arc<Metrics>,
+) {
+    let mut attempts = 0u32;
+    loop {
+        let rx = drain_rx.clone();
+        let sink = Arc::clone(&sink);
+        let cfg = config.clone();
+        let m = Arc::clone(&metrics);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            drain_thread(rx, sink, cfg, m)
+        }));
+        match result {
+            // Clean exit: the channel closed (all flushers gone). Done.
+            Ok(()) => break,
+            Err(_) => {
+                attempts += 1;
+                metrics.drain_panics.inc();
+                if attempts >= MAX_DRAIN_RESPAWNS {
+                    error!(
+                        attempts,
+                        "drain thread panicked too many times; giving up — delivery is \
+                         stopped and the WAB will accumulate on disk until restart"
+                    );
+                    break;
+                }
+                error!(
+                    attempts,
+                    max = MAX_DRAIN_RESPAWNS,
+                    "drain thread panicked; respawning"
+                );
+                std::thread::sleep(Duration::from_millis(
+                    100u64.saturating_mul(attempts as u64),
+                ));
+            }
+        }
+    }
+    info!("drain supervisor exiting");
 }
 
 // ── Drain state helper ────────────────────────────────────────────────────────
@@ -156,6 +231,13 @@ fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
             error!(reason = %reason, "sink health: down");
             (0.0, 0.0, 1.0)
         }
+        // SinkHealth is #[non_exhaustive] (F48): report an unrecognised future
+        // state as degraded so the gauge still moves off "healthy" and operators
+        // get a signal rather than a silently-stuck reading.
+        _ => {
+            warn!("sink health: unrecognised state; reporting as degraded");
+            (0.0, 1.0, 0.0)
+        }
     };
     metrics
         .sink_health
@@ -175,6 +257,23 @@ fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
             state: SinkHealthState::down,
         })
         .set(down);
+}
+
+/// Probes [`Sink::health`] under a timeout backstop and maps a hang to `Down`.
+///
+/// The drain runs on a single-threaded runtime; an un-timed `health()` that
+/// hangs would wedge the entire drain — the idle loop would never return to
+/// `recv` (missing shutdown), and the blocked-state poll would never reach its
+/// `channel_closed` check. Mirrors the `commit()` timeout backstop so a
+/// misbehaving sink degrades the health gauge instead of stalling delivery.
+fn probe_health<S: Sink>(rt: &tokio::runtime::Runtime, sink: &S, timeout: Duration) -> SinkHealth {
+    match rt.block_on(async { tokio::time::timeout(timeout, sink.health()).await }) {
+        Ok(health) => health,
+        Err(_elapsed) => SinkHealth::Down(format!(
+            "health probe exceeded {}s backstop",
+            timeout.as_secs()
+        )),
+    }
 }
 
 // ── Drain thread ──────────────────────────────────────────────────────────────
@@ -201,6 +300,15 @@ fn drain_thread<S: Sink>(
     let mut state = DrainState::Draining;
     let mut pending: VecDeque<PathBuf> = VecDeque::new();
 
+    // The start of the current dead-letter-full blocking episode, if any. An
+    // episode spans a flapping cap (unblock → reblock the same segment without
+    // intervening progress): `enter_blocked` increments `dead_letter_full` and
+    // stamps `blocked_since` only when this is `None`, and reuses the stored
+    // instant otherwise, so a flap counts as ONE episode and the blocked-duration
+    // gauge keeps climbing rather than resetting. Cleared (and the gauge reset)
+    // when a segment is actually confirmed or quarantined — genuine progress (F09).
+    let mut block_episode: Option<Instant> = None;
+
     'outer: loop {
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
@@ -218,7 +326,7 @@ fn drain_thread<S: Sink>(
                         match drain_rx.recv_timeout(HEALTH_POLL_INTERVAL) {
                             Ok(p) => break p,
                             Err(RecvTimeoutError::Timeout) => {
-                                let health = rt.block_on(sink.health());
+                                let health = probe_health(&rt, &*sink, config.commit_timeout);
                                 set_sink_health(&metrics, health);
                             }
                             Err(RecvTimeoutError::Disconnected) => break 'outer,
@@ -226,18 +334,20 @@ fn drain_thread<S: Sink>(
                     }
                 };
 
+                // Fresh segment → process from the start (skip = 0).
                 let result = rt.block_on(process_segment(
                     &segment,
                     &*sink,
                     &config,
                     &metrics,
                     &mut dead_letter,
+                    0,
                 ));
 
-                let health = rt.block_on(sink.health());
+                let health = probe_health(&rt, &*sink, config.commit_timeout);
                 set_sink_health(&metrics, health);
 
-                transition_from_draining(segment, result, &config, &metrics)
+                transition_from_draining(segment, result, &config, &metrics, &mut block_episode)
             }
 
             // ── RetryingTransient ─────────────────────────────────────────────
@@ -245,6 +355,7 @@ fn drain_thread<S: Sink>(
                 segment,
                 retries_left,
                 next_delay,
+                processed,
             } => {
                 set_drain_state(&metrics, DrainStateValue::retrying_transient);
                 std::thread::sleep(next_delay);
@@ -256,25 +367,30 @@ fn drain_thread<S: Sink>(
                     );
                     DrainState::Draining
                 } else {
+                    // Resume past the sub-batches already durably processed (F05).
                     let result = rt.block_on(process_segment(
                         &segment,
                         &*sink,
                         &config,
                         &metrics,
                         &mut dead_letter,
+                        processed,
                     ));
-                    match result {
-                        ProcessResult::Confirmed { record_count } => {
-                            confirm_and_delete(&segment, record_count, &metrics);
-                            DrainState::Draining
-                        }
-                        ProcessResult::Transient { retry_after } => DrainState::RetryingTransient {
+                    // Subsequent failure: spend one retry and double the delay
+                    // (exponential backoff). retries_left is >= 1 here — the
+                    // == 0 case returned above.
+                    next_state_after_process(
+                        segment,
+                        result,
+                        &metrics,
+                        &mut block_episode,
+                        |segment, retry_after, processed| DrainState::RetryingTransient {
                             segment,
                             retries_left: retries_left - 1,
                             next_delay: next_retry_delay(next_delay * 2, retry_after),
+                            processed,
                         },
-                        ProcessResult::BlockedDeadLetter => enter_blocked(segment, &metrics),
-                    }
+                    )
                 }
             }
 
@@ -282,6 +398,7 @@ fn drain_thread<S: Sink>(
             DrainState::BlockedDeadLetterFull {
                 segment,
                 blocked_since,
+                processed,
             } => {
                 set_drain_state(&metrics, DrainStateValue::blocked_dead_letter_full);
                 metrics
@@ -309,7 +426,13 @@ fn drain_thread<S: Sink>(
                 }
 
                 // Rescan so external deletions (e.g. operator cleanup) are reflected.
-                let _ = dead_letter.rescan();
+                // A failed rescan leaves total_bytes stale at its at-cap value, so
+                // the unblock check below can't clear and the drain stays blocked
+                // even after the operator frees the dir — surface it rather than
+                // swallowing (F08).
+                if let Err(e) = dead_letter.rescan() {
+                    warn!(error = %e, "drain: dead-letter rescan failed while blocked; total_bytes may be stale until the next successful rescan");
+                }
                 metrics
                     .dead_letter_bytes_on_disk
                     .set(dead_letter.total_bytes() as f64);
@@ -319,13 +442,34 @@ fn drain_thread<S: Sink>(
                 // while we were waiting on dead-letter headroom; without
                 // this poll the gauge would be stuck at whatever value the
                 // last segment commit produced.
-                let health = rt.block_on(sink.health());
+                let health = probe_health(&rt, &*sink, config.commit_timeout);
                 set_sink_health(&metrics, health);
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
-                    // Headroom available — retry the preserved segment from the beginning.
-                    metrics.dead_letter_blocked_duration.set(0.0);
-                    pending.push_front(segment);
-                    DrainState::Draining
+                    // Headroom available — retry the preserved segment, RESUMING
+                    // past the sub-batches already durably processed (skip =
+                    // processed) rather than from record 0, so earlier sub-batches
+                    // aren't re-committed/re-dead-lettered (F05). Route through
+                    // RetryingTransient — the state that carries `processed`; fresh
+                    // segments still arrive via pending/the channel and are picked
+                    // up by Draining.
+                    //
+                    // Seed next_delay with base_retry_delay (NOT zero): the retry
+                    // fires after the base delay, and crucially, if it then hits a
+                    // transient SINK error, next_state_after_process doubles a
+                    // non-zero base into real exponential backoff — a zero seed
+                    // would double to zero and busy-loop with no backoff (G12).
+                    //
+                    // Do NOT clear the episode or reset the duration gauge here: if
+                    // the retry immediately re-blocks (a flapping cap) it's the same
+                    // episode and the duration must keep climbing. The gauge resets
+                    // only when a segment is actually confirmed/quarantined — see
+                    // next_state_after_process (F09).
+                    DrainState::RetryingTransient {
+                        segment,
+                        retries_left: config.max_retries,
+                        next_delay: config.base_retry_delay,
+                        processed,
+                    }
                 } else if channel_closed {
                     // No headroom and shutdown requested — leave segment unconfirmed.
                     // Crash recovery will replay it on next start.
@@ -338,6 +482,7 @@ fn drain_thread<S: Sink>(
                     DrainState::BlockedDeadLetterFull {
                         segment,
                         blocked_since,
+                        processed,
                     }
                 }
             }
@@ -347,23 +492,71 @@ fn drain_thread<S: Sink>(
     info!("drain thread exiting");
 }
 
+/// Maps a [`ProcessResult`] to the next [`DrainState`]. The three terminal
+/// outcomes are identical whether we arrived from a first attempt or a retry —
+/// `Confirmed` confirms+deletes and moves on, `BlockedDeadLetter` enters the
+/// blocked state, `Quarantined` (handled inside `process_segment`) moves on.
+/// Only the `Transient → RetryingTransient` backoff differs between the two
+/// callers (fresh budget vs. decremented/exponential), so each supplies it via
+/// `on_transient`. This is the single source of truth for the non-retry
+/// transitions — see the `Draining` and `RetryingTransient` arms in `run`.
+fn next_state_after_process(
+    segment: PathBuf,
+    result: ProcessResult,
+    metrics: &Metrics,
+    block_episode: &mut Option<Instant>,
+    on_transient: impl FnOnce(PathBuf, Option<Duration>, u64) -> DrainState,
+) -> DrainState {
+    match result {
+        ProcessResult::Confirmed { record_count } => {
+            confirm_and_delete(&segment, record_count, metrics);
+            end_block_episode(block_episode, metrics);
+            DrainState::Draining
+        }
+        ProcessResult::Transient {
+            retry_after,
+            processed,
+        } => on_transient(segment, retry_after, processed),
+        ProcessResult::BlockedDeadLetter { processed } => {
+            enter_blocked(segment, metrics, block_episode, processed)
+        }
+        // Segment was quarantined inside process_segment — move on.
+        ProcessResult::Quarantined => {
+            end_block_episode(block_episode, metrics);
+            DrainState::Draining
+        }
+    }
+}
+
 fn transition_from_draining(
     segment: PathBuf,
     result: ProcessResult,
     config: &DrainConfig,
     metrics: &Metrics,
+    block_episode: &mut Option<Instant>,
 ) -> DrainState {
-    match result {
-        ProcessResult::Confirmed { record_count } => {
-            confirm_and_delete(&segment, record_count, metrics);
-            DrainState::Draining
-        }
-        ProcessResult::Transient { retry_after } => DrainState::RetryingTransient {
+    // First failure for this segment: a fresh retry budget and the base delay.
+    next_state_after_process(
+        segment,
+        result,
+        metrics,
+        block_episode,
+        |segment, retry_after, processed| DrainState::RetryingTransient {
             segment,
             retries_left: config.max_retries,
             next_delay: next_retry_delay(config.base_retry_delay, retry_after),
+            processed,
         },
-        ProcessResult::BlockedDeadLetter => enter_blocked(segment, metrics),
+    )
+}
+
+/// Ends the current dead-letter-full blocking episode (if one is open) because
+/// a segment was just confirmed or quarantined — genuine forward progress. The
+/// blocked-duration gauge is reset to zero only here, never on a transient
+/// unblock, so a flapping cap doesn't repeatedly zero it (F09).
+fn end_block_episode(block_episode: &mut Option<Instant>, metrics: &Metrics) {
+    if block_episode.take().is_some() {
+        metrics.dead_letter_blocked_duration.set(0.0);
     }
 }
 
@@ -384,13 +577,31 @@ fn next_retry_delay(default: Duration, hint: Option<Duration>) -> Duration {
     chosen.min(MAX_RETRY_DELAY)
 }
 
-fn enter_blocked(segment: PathBuf, metrics: &Metrics) -> DrainState {
-    let blocked_since = Instant::now();
-    metrics.dead_letter_full.inc();
+fn enter_blocked(
+    segment: PathBuf,
+    metrics: &Metrics,
+    block_episode: &mut Option<Instant>,
+    processed: u64,
+) -> DrainState {
+    // Increment the counter and stamp the episode start only on a genuine new
+    // episode. If `block_episode` is already set we re-entered blocked after a
+    // transient unblock of the same pressure (a flapping cap) — reuse the stored
+    // instant so `dead_letter_full` counts distinct episodes and the duration
+    // gauge keeps climbing rather than resetting (F09).
+    let blocked_since = match *block_episode {
+        Some(started) => started,
+        None => {
+            let now = Instant::now();
+            metrics.dead_letter_full.inc();
+            *block_episode = Some(now);
+            now
+        }
+    };
     set_drain_state(metrics, DrainStateValue::blocked_dead_letter_full);
     DrainState::BlockedDeadLetterFull {
         segment,
         blocked_since,
+        processed,
     }
 }
 
@@ -402,54 +613,138 @@ async fn process_segment<S: Sink>(
     config: &DrainConfig,
     metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
+    skip: u64,
 ) -> ProcessResult {
     let reader = match SegmentReader::open(segment) {
         Ok(r) => r,
-        Err(e) => {
-            error!(path = %segment.display(), error = %e, "drain: cannot open segment; skipping");
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Already gone (deleted out-of-band, or a double-send). Nothing to
+            // deliver and nothing to preserve — a genuine no-op.
+            warn!(path = %segment.display(), "drain: segment not found; treating as already-consumed");
             return ProcessResult::Confirmed { record_count: 0 };
+        }
+        Err(e) => {
+            // Any other open failure — transient I/O (fd exhaustion, ENOMEM, a
+            // momentary read error) or post-seal corruption (bad magic/version).
+            // Confirming here would DELETE a segment full of undelivered records on
+            // a transient blip. Preserve it: a transient error clears on retry, and
+            // a genuinely corrupt segment ends up left on disk for manual recovery
+            // (and is quarantined by crash recovery on the next restart).
+            error!(path = %segment.display(), error = %e, "drain: cannot open segment; preserving for retry");
+            return ProcessResult::Transient {
+                retry_after: None,
+                processed: skip,
+            };
         }
     };
 
     let max_batch = sink.max_batch_size().max(1);
-    let mut total_records: u64 = 0;
+    // `read_index` counts every record the reader yields (including the `skip`
+    // prefix already handled on a prior attempt). `durable_through` is how many
+    // records have been durably committed/dead-lettered — it starts at `skip`
+    // and advances only when a sub-batch returns Ok, so a Transient/Blocked
+    // result reports exactly the prefix the next retry can skip (F05).
+    let mut read_index: u64 = 0;
+    let mut durable_through: u64 = skip;
     let mut batch: Vec<Payload> = Vec::with_capacity(max_batch);
 
+    let mut read_failed = false;
     for result in reader {
         let payload = match result {
             Ok(p) => p,
             Err(e) => {
-                error!(path = %segment.display(), error = %e, "drain: segment read error; stopping here");
+                // A record failed to read mid-stream (post-seal corruption, or a
+                // transient read error). The corrupt record and everything after it
+                // are unreachable via the sequential reader, so we deliver the
+                // readable prefix and then quarantine the segment below — never
+                // confirm+delete it, which would silently drop the unread tail.
+                error!(path = %segment.display(), error = %e, "drain: segment read error; will quarantine after delivering the readable prefix");
+                read_failed = true;
                 break;
             }
         };
-        total_records += 1;
+        read_index += 1;
+        // Skip the prefix already durably processed by a previous attempt so we
+        // don't re-commit / re-dead-letter it (F05).
+        //
+        // The SegmentReader has already decoded + CRC-verified this skipped record
+        // by the time we drop it, so a resumed retry re-walks (re-reads + re-CRCs)
+        // the whole processed prefix (G13). That's accepted: retries are the
+        // uncommon path and bounded by max_retries, and the work is a cheap
+        // sequential scan — not worth a seek/fast-forward API on the
+        // durability-critical reader right before the 1.0 freeze.
+        if read_index <= skip {
+            continue;
+        }
         batch.push(payload);
 
         if batch.len() >= max_batch {
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
+            let n = full_batch.len() as u64;
             match commit_batch(&full_batch, sink, config, metrics, dead_letter).await {
-                BatchResult::Ok => {}
+                BatchResult::Ok => durable_through += n,
                 BatchResult::Transient { retry_after } => {
-                    return ProcessResult::Transient { retry_after };
+                    return ProcessResult::Transient {
+                        retry_after,
+                        processed: durable_through,
+                    };
                 }
-                BatchResult::Blocked => return ProcessResult::BlockedDeadLetter,
+                BatchResult::Blocked => {
+                    return ProcessResult::BlockedDeadLetter {
+                        processed: durable_through,
+                    };
+                }
             }
         }
     }
 
     if !batch.is_empty() {
+        let n = batch.len() as u64;
         match commit_batch(&batch, sink, config, metrics, dead_letter).await {
-            BatchResult::Ok => {}
+            BatchResult::Ok => durable_through += n,
             BatchResult::Transient { retry_after } => {
-                return ProcessResult::Transient { retry_after };
+                return ProcessResult::Transient {
+                    retry_after,
+                    processed: durable_through,
+                };
             }
-            BatchResult::Blocked => return ProcessResult::BlockedDeadLetter,
+            BatchResult::Blocked => {
+                return ProcessResult::BlockedDeadLetter {
+                    processed: durable_through,
+                };
+            }
         }
     }
+    if read_failed {
+        // Readable prefix delivered; move the segment (with its unreadable tail) to
+        // the quarantine dir for manual recovery rather than deleting it. If the
+        // quarantine move itself fails, leave the segment on disk (recovery will
+        // re-encounter it) — still never silently dropped.
+        match crate::wab::recovery::quarantine(
+            segment,
+            &config.wab_dir,
+            "drain: mid-segment read error",
+        ) {
+            Ok(()) => {
+                metrics.recovery_segments_quarantined.inc();
+            }
+            Err(qe) => {
+                error!(path = %segment.display(), error = %qe, "drain: failed to quarantine unreadable segment; left on disk");
+            }
+        }
+        return ProcessResult::Quarantined;
+    }
+
+    // Clean path only: every readable record is now durably processed
+    // (durable_through == the full count). Asserted AFTER the read_failed
+    // early-return — on a resumed segment (skip > 0) that then hits a mid-prefix
+    // read error, durable_through == skip < read_index, which is expected and
+    // handled above by quarantine; asserting before that check would trip on a
+    // legitimate state (G10).
+    debug_assert_eq!(durable_through, read_index);
 
     ProcessResult::Confirmed {
-        record_count: total_records,
+        record_count: read_index,
     }
 }
 
@@ -493,6 +788,26 @@ async fn commit_batch<S: Sink>(
     };
     match commit {
         Ok(commit_result) => {
+            // The Sink contract is that committed ∪ dead_lettered partitions the
+            // input batch. A (non-conforming, third-party) sink that drops a
+            // record from BOTH vectors would otherwise have the segment
+            // confirmed-and-deleted with that record neither delivered nor
+            // dead-lettered — a silent false ack with zero detection (F02).
+            // Refuse to confirm: preserve the segment, retry, and surface it
+            // loudly. Built-in sinks always partition, so this never fires for
+            // them. (The deeper fix — encoding the invariant in the SDK type — is
+            // tracked as F41.)
+            let accounted = commit_result.committed.len() + commit_result.dead_lettered.len();
+            if accounted != payloads.len() {
+                error!(
+                    input = payloads.len(),
+                    committed = commit_result.committed.len(),
+                    dead_lettered = commit_result.dead_lettered.len(),
+                    "drain: sink CommitResult does not account for every record; preserving \
+                     segment instead of confirming (likely a Sink contract violation)"
+                );
+                return BatchResult::Transient { retry_after: None };
+            }
             metrics
                 .sink_commit_duration
                 .observe(t.elapsed().as_secs_f64());
@@ -512,7 +827,20 @@ async fn commit_batch<S: Sink>(
 
                 let estimated = estimated_write_bytes(&dead_payloads);
                 if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
-                    return BatchResult::Blocked;
+                    if estimated > config.dead_letter_max_bytes {
+                        // This batch alone exceeds the cap, so blocking could never
+                        // clear (even an empty dir won't fit it) — that would wedge
+                        // the drain forever in a block↔retry livelock (F03). The cap
+                        // bounds steady-state growth, not a single oversized
+                        // permanent rejection; write it anyway (overshoot once).
+                        warn!(
+                            estimated,
+                            cap = config.dead_letter_max_bytes,
+                            "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
+                        );
+                    } else {
+                        return BatchResult::Blocked;
+                    }
                 }
 
                 match dead_letter.write_records(&dead_payloads) {
@@ -528,7 +856,15 @@ async fn commit_batch<S: Sink>(
                             .set(dead_letter.total_bytes() as f64);
                     }
                     Err(e) => {
-                        error!(error = %e, "drain: failed to write dead-letter records");
+                        // The records were rejected by the sink AND could not be
+                        // dead-lettered (e.g. ENOSPC on the dead-letter dir — exactly
+                        // when pressure peaks). Falling through to Ok would confirm
+                        // and DELETE the segment with these records neither delivered
+                        // nor dead-lettered: silent data loss. Treat it as transient
+                        // so the segment is preserved and retried (the already-
+                        // committed records re-send under the at-least-once contract).
+                        error!(error = %e, "drain: failed to write dead-letter records; preserving segment for retry");
+                        return BatchResult::Transient { retry_after: None };
                     }
                 }
             }
@@ -564,7 +900,18 @@ async fn commit_batch<S: Sink>(
 
             let estimated = estimated_write_bytes(payloads);
             if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
-                return BatchResult::Blocked;
+                if estimated > config.dead_letter_max_bytes {
+                    // Batch alone exceeds the cap — blocking could never clear, so
+                    // write it anyway rather than livelock the drain (F03). The cap
+                    // bounds steady-state growth, not one oversized permanent batch.
+                    warn!(
+                        estimated,
+                        cap = config.dead_letter_max_bytes,
+                        "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
+                    );
+                } else {
+                    return BatchResult::Blocked;
+                }
             }
 
             match dead_letter.write_records(payloads) {
@@ -580,21 +927,32 @@ async fn commit_batch<S: Sink>(
                         .set(dead_letter.total_bytes() as f64);
                 }
                 Err(dl_err) => {
-                    error!(error = %dl_err, "drain: failed to write dead-letter records for permanent error");
+                    // The batch hit a permanent sink error AND could not be
+                    // dead-lettered. Confirming here would DELETE the segment with
+                    // the records neither delivered nor dead-lettered — silent data
+                    // loss. Preserve the segment by retrying; the dead-letter write
+                    // typically succeeds once disk pressure clears, or the drain
+                    // blocks on the dead-letter cap (would_exceed_cap above).
+                    error!(error = %dl_err, "drain: failed to dead-letter records for permanent error; preserving segment for retry");
+                    return BatchResult::Transient { retry_after: None };
                 }
             }
 
-            // Segment can be confirmed: we've either dead-lettered the records or
-            // logged the failure. Leaving the segment unconsumed would replay the
-            // same permanent-error records on every restart.
+            // Dead-letter write succeeded: the records are durably re-homed, so the
+            // segment can be confirmed. Leaving it unconsumed would replay the same
+            // permanent-error records on every restart.
             BatchResult::Ok
         }
     }
 }
 
-/// Rough byte estimate for WAB record overhead + payload.
+/// Byte estimate for the dead-letter segment that `payloads` would seal into —
+/// header + per-record overhead + payloads + sentinel + footer. Delegates to the
+/// single source of truth so the `would_exceed_cap` pre-check matches the real
+/// sealed file size; the previous estimate omitted the ~60-byte segment framing,
+/// letting each write creep past `dead_letter_max_bytes` (F07).
 fn estimated_write_bytes(payloads: &[Payload]) -> u64 {
-    payloads.iter().map(|p| p.len() as u64 + 8).sum()
+    dead_letter::estimated_segment_bytes(payloads)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -698,6 +1056,9 @@ mod tests {
         /// `pending()`), modelling a sink with no internal timeout. The drain's
         /// backstop `commit_timeout` must cancel these.
         hang_calls: u64,
+        /// Number of initial `commit()` calls that panic, to drive the drain's
+        /// panic supervisor.
+        panic_calls: u64,
         max_batch: usize,
         /// Wall-clock instant of every `commit()` call. Tests that need to
         /// measure inter-call gaps (e.g. retry-after observance) read this
@@ -720,6 +1081,7 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
+                panic_calls: 0,
                 max_batch: 1000,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -735,6 +1097,7 @@ mod tests {
                 responses: Mutex::new(responses.into_iter().collect()),
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
+                panic_calls: 0,
                 max_batch,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -747,6 +1110,15 @@ mod tests {
         fn with_hang(hang_calls: u64, responses: impl IntoIterator<Item = MockResult>) -> Self {
             Self {
                 hang_calls,
+                ..Self::with_responses(responses)
+            }
+        }
+
+        /// A sink whose first `panic_calls` `commit()` invocations panic, to drive
+        /// the drain's panic supervisor (then falls back to `responses`).
+        fn with_panic(panic_calls: u64, responses: impl IntoIterator<Item = MockResult>) -> Self {
+            Self {
+                panic_calls,
                 ..Self::with_responses(responses)
             }
         }
@@ -776,17 +1148,14 @@ mod tests {
         }
 
         fn ok(batch: Vec<Payload>) -> MockResult {
-            Ok(CommitResult {
-                committed: batch,
-                dead_lettered: vec![],
-            })
+            Ok(CommitResult::new(batch, vec![]))
         }
 
         fn ok_with_dead_letter(committed: Vec<Payload>, dead: Vec<Payload>) -> MockResult {
-            Ok(CommitResult {
+            Ok(CommitResult::new(
                 committed,
-                dead_lettered: dead.into_iter().map(|p| (p, "rejected".into())).collect(),
-            })
+                dead.into_iter().map(|p| (p, "rejected".into())).collect(),
+            ))
         }
     }
 
@@ -797,17 +1166,17 @@ mod tests {
         async fn commit(&self, batch: Vec<Payload>) -> MockResult {
             let nth = self.call_count.fetch_add(1, Ordering::Relaxed) + 1;
             self.call_timestamps.lock().unwrap().push(Instant::now());
+            if nth <= self.panic_calls {
+                panic!("mock sink: induced panic on commit #{nth}");
+            }
             if nth <= self.hang_calls {
                 // Hang forever; the drain's backstop timeout cancels this future.
                 std::future::pending::<()>().await;
             }
             let mut responses = self.responses.lock().unwrap();
-            let response = responses.pop_front().unwrap_or_else(|| {
-                Ok(CommitResult {
-                    committed: batch.clone(),
-                    dead_lettered: vec![],
-                })
-            });
+            let response = responses
+                .pop_front()
+                .unwrap_or_else(|| Ok(CommitResult::new(batch.clone(), vec![])));
             // Capture for introspection BEFORE returning the response so
             // tests see the same view the drain is about to act on.
             if let Ok(ref result) = response {
@@ -873,6 +1242,10 @@ mod tests {
 
     fn dl_full_count(m: &Metrics) -> u64 {
         m.dead_letter_full.get()
+    }
+
+    fn drain_panics(m: &Metrics) -> u64 {
+        m.drain_panics.get()
     }
 
     fn drain_is_blocked(m: &Metrics) -> bool {
@@ -943,10 +1316,8 @@ mod tests {
     #[test]
     fn commit_result_separates_committed_and_dead_lettered() {
         let p: Payload = Payload::from(b"hello".as_ref());
-        let result: CommitResult<Payload> = CommitResult {
-            committed: vec![p.clone()],
-            dead_lettered: vec![(p.clone(), "reason".into())],
-        };
+        let result: CommitResult<Payload> =
+            CommitResult::new(vec![p.clone()], vec![(p.clone(), "reason".into())]);
         assert_eq!(result.committed.len(), 1);
         assert_eq!(result.dead_lettered.len(), 1);
         assert_eq!(result.dead_lettered[0].0, p);
@@ -1026,6 +1397,58 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// F05: a retried multi-batch segment must NOT re-commit / re-dead-letter the
+    /// sub-batches that already succeeded. With max_batch_size = 1 the two records
+    /// are separate sub-batches: A is dead-lettered, B is transient (segment
+    /// retried). The retry must RESUME at B — the sink sees A, B, B (3 commits),
+    /// not a restart at A (which would be 4) — so A is neither re-committed nor
+    /// re-dead-lettered.
+    #[test]
+    fn retry_resumes_past_already_processed_sub_batches() {
+        let dir = tmp_dir("f05_resume");
+        let sealed = make_sealed_segment(&dir, 0, &[b"A", b"B"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        // Attempt 1: commit([A]) → permanent (dead-letter A); commit([B]) →
+        // transient (retry). Attempt 2 resumes at B: commit([B]) → ok.
+        let sink = Arc::new(MockSink::with_batch_size(
+            1,
+            [
+                Err(MockError::Permanent),
+                Err(MockError::Transient),
+                MockSink::ok(vec![Payload::from(b"B".as_ref())]),
+            ],
+        ));
+        let metrics = noop_metrics();
+        run_drain(
+            rx,
+            tx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            metrics.clone(),
+        );
+
+        assert_eq!(
+            sink.call_count(),
+            3,
+            "retry must resume at B (A,B,B = 3 commits), not restart at A (4)"
+        );
+        assert_eq!(
+            records_dead_lettered(&metrics),
+            1,
+            "A must be dead-lettered exactly once, not again on the retry"
+        );
+        assert_eq!(records_committed(&metrics), 1, "B committed once");
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "segment confirmed after resuming the retry"
+        );
+        assert!(!sealed.exists(), "sealed segment deleted after confirm");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// Concern #2: a sink whose `commit()` hangs (a third-party sink with no
     /// internal timeout) must not stall the drain forever. The backstop
     /// `commit_timeout` fires → the batch is treated as transient → the segment
@@ -1064,6 +1487,232 @@ mod tests {
         assert!(get_confirmed_path(&sealed).exists());
         assert!(!sealed.exists());
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B1: a failed dead-letter write must NOT confirm the segment ──────────
+    // Regression for a silent-data-loss bug: when the sink permanently rejects
+    // records AND the dead-letter write also fails (e.g. ENOSPC on the dead-letter
+    // dir — exactly when dead-letter pressure peaks), the old code logged the error
+    // and fell through to BatchResult::Ok → the segment was confirmed and DELETED
+    // with the records neither delivered nor dead-lettered. The fix returns
+    // Transient so the segment is preserved and retried (and left on disk if
+    // retries exhaust), never silently dropped. We fault the dead-letter store by
+    // removing its directory so write_records fails deterministically.
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn permanent_error_with_failed_dead_letter_write_is_transient_not_ok() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("b1_perm_dlfail");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+
+        let sink = MockSink::with_responses([Err(MockError::Permanent)]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let payloads = vec![Payload::from(b"r1".as_ref()), Payload::from(b"r2".as_ref())];
+
+        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        assert!(
+            matches!(result, BatchResult::Transient { .. }),
+            "permanent sink error + failed dead-letter write must be Transient (preserve \
+             segment), not Ok (which confirms + deletes it → silent data loss)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn partial_dead_letter_with_failed_write_is_transient_not_ok() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("b1_partial_dlfail");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+
+        // commit() succeeds but reports one record permanently rejected; the
+        // follow-up dead-letter write then fails.
+        let sink = MockSink::with_responses([MockSink::ok_with_dead_letter(
+            vec![Payload::from(b"ok".as_ref())],
+            vec![Payload::from(b"bad".as_ref())],
+        )]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let payloads = vec![
+            Payload::from(b"ok".as_ref()),
+            Payload::from(b"bad".as_ref()),
+        ];
+
+        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        assert!(
+            matches!(result, BatchResult::Transient { .. }),
+            "successful commit with a failed dead-letter write must be Transient \
+             (preserve segment), not Ok"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B2: an open failure must not silently confirm+delete a good segment ──
+    // SegmentReader::open fails on transient I/O (fd exhaustion, ENOMEM) as well
+    // as on permanent corruption. The old code returned Confirmed{0} for ANY open
+    // error → the segment was deleted, discarding undelivered records on a
+    // transient blip. The fix preserves the segment (Transient) for everything
+    // except NotFound (already gone → genuine no-op).
+
+    #[test]
+    fn corrupt_segment_open_is_preserved_not_deleted() {
+        let dir = tmp_dir("b2_corrupt");
+        let shard_dir = dir.join("shard_00");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        // A file with bad magic → SegmentReader::open errors (InvalidData),
+        // standing in for any non-NotFound open failure (transient or corrupt).
+        let seg = segment_path(&shard_dir, 1);
+        let sealed = seg.with_extension("wab.sealed");
+        std::fs::write(&sealed, b"NOTWEIR-not-a-valid-segment-header-xxxx").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
+
+        assert!(
+            sealed.exists(),
+            "an unopenable segment must be left on disk for recovery, not deleted"
+        );
+        assert!(
+            !get_confirmed_path(&sealed).exists(),
+            "an unopenable segment must not be confirmed"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn missing_segment_open_is_confirmed_noop() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("b2_missing");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_responses([]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let missing = dir.join("shard_00").join("does_not_exist.wab.sealed");
+
+        let result = block_on(process_segment(
+            &missing, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(result, ProcessResult::Confirmed { record_count: 0 }),
+            "a NotFound segment is already gone → Confirmed no-op (nothing to preserve)"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B7: the drain survives a sink panic and keeps delivering ─────────────
+    #[test]
+    fn drain_survives_sink_panic_and_keeps_delivering() {
+        let dir = tmp_dir("b7_panic");
+        let shard_dir = dir.join("shard_00");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mk = |counter: u64, payload: &[u8]| {
+            let p = segment_path(&shard_dir, counter);
+            let mut s = WabSegment::create(&p, 0).unwrap();
+            s.write_record(payload).unwrap();
+            s.seal().unwrap()
+        };
+        let _seg_a = mk(1, b"a");
+        let seg_b = mk(2, b"b");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(_seg_a.clone()).unwrap();
+        tx.send(seg_b.clone()).unwrap();
+
+        // Panic on the first commit (segment A); the supervisor must catch it,
+        // respawn the drain, and still deliver segment B. (A is durable on disk
+        // and would be replayed on a real restart — it is not re-delivered here.)
+        let sink = Arc::new(MockSink::with_panic(1, []));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+
+        assert!(
+            drain_panics(&metrics) >= 1,
+            "the sink panic must be counted"
+        );
+        assert!(
+            get_confirmed_path(&seg_b).exists(),
+            "the drain must survive the panic and confirm the following segment"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B5: a mid-segment read error quarantines, never confirm+deletes ──────
+    #[test]
+    fn mid_segment_read_error_quarantines_not_deletes() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("b5_midcorrupt");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1", b"r2"]);
+        // Corrupt record 2's payload so the reader yields record 1 then errors on
+        // record 2. Layout: 24 header + record1 [4 len + 4 crc + 2 payload] = 34;
+        // record2 payload begins at 42.
+        let mut bytes = std::fs::read(&sealed).unwrap();
+        bytes[42] ^= 0xff;
+        std::fs::write(&sealed, &bytes).unwrap();
+
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_responses([]); // commits whatever prefix it's given
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+
+        let result = block_on(process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(result, ProcessResult::Quarantined),
+            "a mid-segment read error must quarantine, not confirm+delete the tail"
+        );
+        assert!(
+            !sealed.exists(),
+            "the unreadable segment must be moved out of the shard dir (quarantined)"
+        );
+        let q = dir.join("quarantine");
+        assert!(
+            q.is_dir() && std::fs::read_dir(&q).unwrap().count() == 1,
+            "the segment must be preserved in the quarantine dir for manual recovery"
+        );
+        assert_eq!(
+            records_dead_lettered(&metrics),
+            0,
+            "no dead-lettering — the prefix is delivered, the tail is quarantined"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B6: a failed .confirmed write must not delete the segment ────────────
+    #[test]
+    fn confirmed_write_failure_preserves_segment() {
+        let dir = tmp_dir("b6_confirm_fail");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1"]);
+        // Block the .confirmed write: put a directory where the sidecar file would
+        // go, so File::create fails deterministically.
+        let confirmed = get_confirmed_path(&sealed);
+        std::fs::create_dir_all(&confirmed).unwrap();
+
+        let metrics = noop_metrics();
+        super::confirmed::confirm_and_delete(&sealed, 1, &metrics);
+
+        assert!(
+            sealed.exists(),
+            "segment must be preserved when the .confirmed write fails (re-drained on restart)"
+        );
+        assert_eq!(
+            segments_confirmed(&metrics),
+            0,
+            "must not mark the segment confirmed when the .confirmed write failed"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1415,6 +2064,43 @@ mod tests {
         );
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// F09: a flapping cap (unblock → reblock the same pressure without
+    /// intervening progress) must count as ONE episode — `dead_letter_full`
+    /// increments once and `blocked_since` is preserved — while a genuine
+    /// confirm ends the episode and resets the duration gauge.
+    #[test]
+    fn block_episode_counts_once_across_flap_then_resets_on_progress() {
+        let (m, _reg) = Metrics::new();
+        let mut episode: Option<Instant> = None;
+        let seg = PathBuf::from("/tmp/weir-f09-seg");
+
+        // First genuine entry: counts and stamps the episode start.
+        let _ = enter_blocked(seg.clone(), &m, &mut episode, 0);
+        assert_eq!(m.dead_letter_full.get(), 1);
+        let first_start = episode.expect("episode stamped on entry");
+
+        // Re-enter blocked after a transient unblock (no confirm in between):
+        // must NOT re-increment and must reuse the original start instant.
+        let _ = enter_blocked(seg.clone(), &m, &mut episode, 0);
+        assert_eq!(m.dead_letter_full.get(), 1, "flap must not re-increment");
+        assert_eq!(
+            episode.expect("episode still open"),
+            first_start,
+            "blocked_since preserved across flap"
+        );
+
+        // Genuine progress (a segment confirmed): end the episode and reset the
+        // duration gauge to zero.
+        m.dead_letter_blocked_duration.set(5.0);
+        end_block_episode(&mut episode, &m);
+        assert!(episode.is_none(), "episode cleared on progress");
+        assert_eq!(m.dead_letter_blocked_duration.get(), 0.0);
+
+        // A brand-new episode after a real end counts again.
+        let _ = enter_blocked(seg, &m, &mut episode, 0);
+        assert_eq!(m.dead_letter_full.get(), 2, "new episode after end counts");
     }
 
     #[test]

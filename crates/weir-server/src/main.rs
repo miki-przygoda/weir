@@ -9,13 +9,36 @@ mod socket;
 mod wab;
 mod worker;
 
+/// Shared accept/reject cases for the two independent path-format validators —
+/// `socket::validate_socket_path` and `config::validate_path_format_inner`.
+/// They are deliberately NOT merged (separate trust-boundary checks in separate
+/// layers), so this vector is the drift guard: both test modules run every case
+/// through their own validator and must agree. Adding a rule to one validator
+/// without the other now fails a test here.
+#[cfg(test)]
+pub(crate) mod path_validation_test_vectors {
+    /// `(path, should_pass)` — cross-platform format rules (absolute, no `..`).
+    pub(crate) const CASES: &[(&str, bool)] = &[
+        ("/run/weir/weir.sock", true),
+        ("/var/lib/weir/data", true),
+        ("relative/path.sock", false),
+        ("weir.sock", false),
+        ("/var/../etc/weir.sock", false),
+        ("/run/weir/../weir.sock", false),
+    ];
+
+    /// Null-byte cases. The null check is `#[cfg(unix)]` in both validators.
+    #[cfg(unix)]
+    pub(crate) const UNIX_ONLY_CASES: &[(&str, bool)] = &[("/run/weir\0/x.sock", false)];
+}
+
 use std::{
     path::Path,
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 use config::{Config, SinkType};
 use drain::{DrainConfig, MAX_RETRIES};
@@ -40,6 +63,17 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
     for entry in dir.flatten() {
         let shard_path = entry.path();
         if !shard_path.is_dir() {
+            continue;
+        }
+        // Skip the daemon's reserved subdirs — they aren't shards. dead_letter/
+        // (dl_*.wab.sealed) has its own weir_dead_letter_bytes_on_disk gauge, and
+        // quarantine/ holds forensic .wab.sealed copies; counting either here
+        // would double-count live-segment bytes (G15, mirrors recovery's skip).
+        let dir_name = shard_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if dir_name == "dead_letter" || dir_name == "quarantine" {
             continue;
         }
         let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
@@ -104,6 +138,39 @@ fn spawn_tls_reload_task(
     });
 }
 
+/// Returns the configured sink URL, or a clear startup error if it's absent.
+/// Config validation already guarantees it's set for URL-requiring sinks, so
+/// this is belt-and-suspenders — but a `Result` beats a panic on the startup
+/// path, and one message replaces five near-identical `.expect` strings.
+#[cfg(any(
+    feature = "http-sink",
+    feature = "mysql-sink",
+    feature = "postgres-sink",
+    feature = "clickhouse-sink"
+))]
+fn require_sink_url(
+    config: &Config,
+    sink_label: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    config.sink_url.0.clone().ok_or_else(|| {
+        format!("sink_type = {sink_label} requires a sink URL (set --sink-url or WEIR_SINK_URL)")
+            .into()
+    })
+}
+
+/// Wraps a built sink and spawns the drain — the tail shared by every sink arm.
+/// `drain::spawn` is generic over the sink but returns the same
+/// `JoinHandle<()>`, so each arm produces a uniform handle for the join
+/// sequence later in `main`.
+fn build_and_spawn_drain<S: sink::Sink + 'static>(
+    sink: S,
+    drain_rx: crossbeam_channel::Receiver<std::path::PathBuf>,
+    drain_config: DrainConfig,
+    metrics: Arc<metrics::Metrics>,
+) -> std::thread::JoinHandle<()> {
+    drain::spawn(drain_rx, Arc::new(sink), drain_config, metrics)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -126,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         libc::umask(0o077);
     }
 
-    let config = Config::load()?;
+    let (config, config_warnings) = Config::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -134,6 +201,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Replay any advisory warnings collected during Config::load — it runs
+    // before this subscriber exists, so emitting them there would silently drop
+    // them (a TOML typo would take defaults unnoticed). See Config::load (F54).
+    for w in &config_warnings {
+        warn!("config: {w}");
+    }
 
     info!(
         socket = %config.socket_path.display(),
@@ -175,6 +249,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Drain channel ─────────────────────────────────────────────────────────
 
     let (drain_tx, drain_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(256);
+    // Startup-only sender for replaying sealed-but-unconfirmed segments from a
+    // previous run. Replay runs AFTER the drain consumer is spawned (below) so
+    // the blocking bounded-channel sends drain live instead of dead-locking the
+    // startup thread on a recovery backlog larger than the channel capacity (B3).
+    // Dropped immediately after replay so it doesn't keep the channel open at
+    // shutdown.
+    let replay_tx = drain_tx.clone();
 
     // ── Coalesce hint: shared EWMA of fsync latency ───────────────────────────
     //
@@ -236,19 +317,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let drain_handle = match config.sink_type {
         SinkType::Noop => {
             info!("sink: noop (records committed-and-forgotten)");
-            drain::spawn(
-                drain_rx,
-                Arc::new(NoopSink),
-                drain_config,
-                Arc::clone(&metrics),
-            )
+            build_and_spawn_drain(NoopSink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "http-sink")]
         SinkType::Http => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = Http");
+            let url = require_sink_url(&config, "http")?;
             // Bearer token read from env at startup (never from config file).
             // Logged only as a presence boolean — the token itself never reaches
             // a log line.
@@ -261,6 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bearer = bearer_token.is_some(),
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
+                concurrency = config.sink_http_concurrency,
                 "sink: http"
             );
             let http_cfg = HttpSinkConfig {
@@ -269,18 +343,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_batch_size: config.sink_max_batch_size,
                 bearer_token,
                 send_idempotency_key: config.sink_send_idempotency_key,
+                concurrency: config.sink_http_concurrency,
             };
             let sink = HttpSink::new(http_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "mysql-sink")]
         SinkType::Mysql => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = Mysql");
+            let url = require_sink_url(&config, "mysql")?;
             let insert_mode = config.sink_mysql_insert_mode;
             info!(
                 // URL omitted from the log line — it contains credentials.
@@ -305,14 +377,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = MySqlSink::new(mysql_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build MySQL sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "postgres-sink")]
         SinkType::Postgres => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = Postgres");
+            let url = require_sink_url(&config, "postgres")?;
             info!(
                 // URL omitted from the log line for the same reason as MySQL.
                 table = %config.sink_postgres_table,
@@ -333,14 +402,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = PostgresSink::new(pg_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "clickhouse-sink")]
         SinkType::ClickHouse => {
-            let url = config
-                .sink_url
-                .clone()
-                .expect("config validation guarantees sink_url is set when sink_type = ClickHouse");
+            let url = require_sink_url(&config, "clickhouse")?;
             info!(
                 // URL omitted from the log line — it may carry credentials.
                 database = %config.sink_clickhouse_database,
@@ -361,9 +427,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = ClickHouseSink::new(ch_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build ClickHouse sink: {e}"))
             })?;
-            drain::spawn(drain_rx, Arc::new(sink), drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
         }
     };
+
+    // ── Replay recovery backlog (drain consumer is now live) ──────────────────
+    //
+    // Replay sealed-but-unconfirmed segments from a previous run now that the
+    // drain thread is consuming. Done here rather than inside wab::spawn so the
+    // blocking sends into the bounded drain channel are drained live — a backlog
+    // larger than the channel capacity would otherwise dead-lock startup (B3).
+    // Runs before the socket binds, so the recovery backlog is queued ahead of
+    // any newly-accepted traffic.
+    wab::replay_unconfirmed(&config.wab_dir, config.shard_count, &replay_tx, &metrics)?;
+    drop(replay_tx); // release the startup sender so shutdown can close the drain channel
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
 
@@ -685,5 +762,35 @@ mod tuning_tests {
         assert_eq!(recommended_agent_count(16), 7);
         // 32-core: 30 / 2 = 15.
         assert_eq!(recommended_agent_count(32), 15);
+    }
+}
+
+#[cfg(test)]
+mod wab_bytes_tests {
+    use super::compute_wab_bytes_on_disk;
+
+    /// G15: the gauge counts only live shard-segment bytes — the dead_letter/ and
+    /// quarantine/ reserved subdirs (which carry .wab.sealed files too) must be
+    /// skipped, or their bytes would be double-counted against their own gauges.
+    #[test]
+    fn compute_wab_bytes_skips_dead_letter_and_quarantine() {
+        let root = std::env::temp_dir().join(format!("weir_g15_{}", std::process::id()));
+        let shard = root.join("shard_00");
+        let dl = root.join("dead_letter");
+        let q = root.join("quarantine");
+        for d in [&shard, &dl, &q] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // 100 live shard bytes; 999 in dead_letter; 999 in quarantine.
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        std::fs::write(dl.join("dl_00000001.wab.sealed"), vec![0u8; 999]).unwrap();
+        std::fs::write(q.join("shard_00__seg_00000001.wab.sealed"), vec![0u8; 999]).unwrap();
+
+        assert_eq!(
+            compute_wab_bytes_on_disk(&root),
+            100,
+            "only live shard segments count; dead_letter + quarantine are skipped"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

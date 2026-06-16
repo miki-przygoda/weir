@@ -2,17 +2,33 @@ use std::{
     io::{self, Read, Write},
     os::unix::net::UnixStream,
     path::Path,
+    time::Duration,
 };
 
-use weir_core::{Durability, Envelope, HEADER_LEN, Header, MessageType, NackReason};
+use weir_core::{
+    Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType, NackReason,
+};
 
 /// All errors that can be returned by [`WeirClient`] methods.
+///
+/// `#[non_exhaustive]`: the client error set may grow post-1.0 (it already gained
+/// `VersionMismatch` during the 1.0 hardening), so downstream matches must carry
+/// a wildcard arm and adding a variant later is not a breaking change.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ClientError {
     /// An I/O error on the underlying socket.
     Io(io::Error),
     /// The daemon sent a Nack with a recognised reason.
     Nack(NackReason),
+    /// The daemon rejected the frame because its wire version differs from the
+    /// client's. Carries the daemon's `WIRE_VERSION` (the second Nack-payload
+    /// byte) so the caller can report both sides and decide whether to upgrade
+    /// the daemon or downgrade the client.
+    VersionMismatch {
+        /// The wire-protocol version the daemon speaks.
+        daemon_version: u8,
+    },
     /// The daemon sent a Nack with an unrecognised reason byte.
     UnknownNack(u8),
     /// The daemon's response violated the wire protocol.
@@ -26,6 +42,11 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::Io(e) => write!(f, "socket I/O error: {e}"),
             Self::Nack(r) => write!(f, "server nack: {r:?}"),
+            Self::VersionMismatch { daemon_version } => write!(
+                f,
+                "wire version mismatch: daemon speaks v{daemon_version}, this client speaks v{}",
+                weir_core::WIRE_VERSION
+            ),
             Self::UnknownNack(b) => write!(f, "server nack with unknown reason {b:#04x}"),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::NoDefaultDurability => {
@@ -63,8 +84,17 @@ impl From<io::Error> for ClientError {
 /// Drop the client to close the connection. The daemon treats EOF as a clean
 /// disconnect.
 pub struct WeirClient<S = UnixStream> {
-    stream: S,
+    // pub(crate) so the TLS connector (a sibling module) can reach the
+    // underlying TcpStream to apply socket timeouts (F43).
+    pub(crate) stream: S,
     default_durability: Option<Durability>,
+    /// Set once a response read fails (a timeout mid-frame, a partial/aborted
+    /// read, or a protocol violation). The stream is then in an indeterminate
+    /// state — leftover bytes from the aborted response could be mis-read as the
+    /// NEXT request's reply, acking a record the daemon never confirmed (a false
+    /// ack). Once poisoned, every method fails fast; the caller must reconnect
+    /// (G04).
+    poisoned: bool,
 }
 
 // ── Shared methods over any blocking Read+Write transport ──────────────────────
@@ -85,17 +115,17 @@ impl<S: Read + Write> WeirClient<S> {
         payload: impl AsRef<[u8]>,
         durability: Durability,
     ) -> Result<(), ClientError> {
+        self.ensure_usable()?;
         // copy_from_slice at the API boundary so downstream handling is zero-copy.
         let payload = weir_core::Payload::copy_from_slice(payload.as_ref());
-        let len = payload.len() as u32;
-        let header = Header::new(MessageType::Push, durability, 0, len);
+        let header = Header::new(MessageType::Push, durability, 0);
         let frame = Envelope::new(header, payload).encode();
         self.stream.write_all(&frame)?;
 
         let resp = self.read_response()?;
-        match resp.header.message_type {
+        match resp.header().message_type() {
             MessageType::Ack => Ok(()),
-            MessageType::Nack => Err(nack_error(&resp.payload)),
+            MessageType::Nack => Err(nack_error(resp.payload())),
             other => Err(ClientError::Protocol(format!(
                 "expected Ack or Nack, got {other:?}"
             ))),
@@ -119,28 +149,67 @@ impl<S: Read + Write> WeirClient<S> {
     /// `HealthCheckResponse`. Returns an error if the daemon is unreachable
     /// or responds with a Nack.
     pub fn health_check(&mut self) -> Result<(), ClientError> {
-        let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0, 0);
+        self.ensure_usable()?;
+        let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0);
         let frame = Envelope::new(header, vec![]).encode();
         self.stream.write_all(&frame)?;
 
         let resp = self.read_response()?;
-        match resp.header.message_type {
+        match resp.header().message_type() {
             MessageType::HealthCheckResponse => Ok(()),
-            MessageType::Nack => Err(nack_error(&resp.payload)),
+            MessageType::Nack => Err(nack_error(resp.payload())),
             other => Err(ClientError::Protocol(format!(
                 "expected HealthCheckResponse, got {other:?}"
             ))),
         }
     }
 
+    /// Returns the poisoned-connection error if a prior response read failed.
+    /// Once poisoned the stream may hold leftover bytes from an aborted response
+    /// that would be mis-read as this call's reply — a false ack — so we refuse
+    /// to use it (G04). The caller must drop the client and reconnect.
+    fn ensure_usable(&self) -> Result<(), ClientError> {
+        if self.poisoned {
+            return Err(ClientError::Protocol(
+                "client connection poisoned by a prior response-read error/timeout; \
+                 drop this client and reconnect before sending again"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn read_response(&mut self) -> Result<Envelope, ClientError> {
+        // Any failure here leaves the stream in an indeterminate state (a timeout
+        // mid-frame, a partial/aborted read, or a protocol violation): the unread
+        // tail of this response could be mis-read as the NEXT request's reply.
+        // Poison the client so every subsequent call fails fast (G04).
+        let result = self.read_response_inner();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn read_response_inner(&mut self) -> Result<Envelope, ClientError> {
         let mut header_buf = [0u8; HEADER_LEN];
         self.stream.read_exact(&mut header_buf)?;
 
         let header =
             Header::decode(&header_buf).map_err(|e| ClientError::Protocol(e.to_string()))?;
 
-        let payload_len = header.payload_len as usize;
+        let payload_len = header.payload_len() as usize;
+        // Cap before allocating, mirroring the server's pre-allocation guard
+        // (Envelope::decode). A malformed or hostile daemon could otherwise
+        // declare payload_len up to u32::MAX and make the client allocate ~4 GiB
+        // for a response (F44). Daemon responses are tiny, so this never trips
+        // legitimately.
+        if payload_len > MAX_PAYLOAD_HARD_CAP {
+            return Err(ClientError::Protocol(format!(
+                "response payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP \
+                 ({MAX_PAYLOAD_HARD_CAP}); refusing to allocate"
+            )));
+        }
         let mut payload_buf = vec![0u8; payload_len];
         if payload_len > 0 {
             self.stream.read_exact(&mut payload_buf)?;
@@ -166,6 +235,7 @@ impl<S: Read + Write> WeirClient<S> {
         Self {
             stream,
             default_durability,
+            poisoned: false,
         }
     }
 }
@@ -179,6 +249,7 @@ impl WeirClient<UnixStream> {
         Ok(Self {
             stream,
             default_durability: None,
+            poisoned: false,
         })
     }
 
@@ -203,13 +274,46 @@ impl WeirClient<UnixStream> {
         Self {
             stream,
             default_durability: None,
+            poisoned: false,
         }
+    }
+
+    /// Sets the read timeout on the underlying socket. `None` (the default)
+    /// blocks indefinitely.
+    ///
+    /// **Opt-in availability guard.** By default every method blocks in the
+    /// response-read path (inside [`push`][Self::push] /
+    /// [`health_check`][Self::health_check]) waiting for the daemon's Ack/Nack, so a
+    /// wedged daemon (hung flusher, `SIGSTOP`, half-open connection) would block
+    /// a producer's hot path forever. With a read timeout set, a stalled reply
+    /// surfaces as a [`ClientError::Io`] timeout instead; the producer can retry
+    /// — the record may still have been durably written, which the at-least-once
+    /// contract covers. Pick a value comfortably above the daemon's Sync ack
+    /// latency under load: the daemon's own `ACK_TIMEOUT` is 30 s, so e.g.
+    /// 45–60 s lets the daemon's Nack win rather than racing it.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    /// Sets the write timeout on the underlying socket. `None` (the default)
+    /// blocks indefinitely. See [`set_read_timeout`][Self::set_read_timeout] for
+    /// the rationale — this bounds a stalled `write_all` of the request frame.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(timeout)
     }
 }
 
 fn nack_error(payload: &[u8]) -> ClientError {
     match payload.first().copied() {
         Some(b) => match NackReason::try_from(b) {
+            // A VersionMismatch Nack carries the daemon's WIRE_VERSION as a
+            // second payload byte (`[0x02, daemon_version]`). Surface it so the
+            // caller can report both sides; fall back to the bare reason if the
+            // daemon (somehow) omitted it.
+            Ok(NackReason::VersionMismatch) => match payload.get(1).copied() {
+                Some(daemon_version) => ClientError::VersionMismatch { daemon_version },
+                None => ClientError::Nack(NackReason::VersionMismatch),
+            },
             Ok(r) => ClientError::Nack(r),
             Err(_) => ClientError::UnknownNack(b),
         },
@@ -244,24 +348,111 @@ mod tests {
             let mut hdr = [0u8; weir_core::HEADER_LEN];
             server_end.read_exact(&mut hdr).unwrap();
             let h = weir_core::Header::decode(&hdr).unwrap();
-            let mut rest = vec![0u8; h.payload_len as usize + 4];
+            let mut rest = vec![0u8; h.payload_len() as usize + 4];
             server_end.read_exact(&mut rest).unwrap();
             // Send back an Ack so push_default can complete.
             let ack = weir_core::Envelope::new(
-                weir_core::Header::new(
-                    weir_core::MessageType::Ack,
-                    weir_core::Durability::Sync,
-                    0,
-                    0,
-                ),
+                weir_core::Header::new(weir_core::MessageType::Ack, weir_core::Durability::Sync, 0),
                 vec![],
             )
             .encode();
             server_end.write_all(&ack).unwrap();
-            h.durability
+            h.durability()
         });
 
         c.push_default(b"hello").unwrap();
         assert_eq!(reader.join().unwrap(), Durability::Batched);
+    }
+
+    #[test]
+    fn nack_error_surfaces_daemon_version_on_version_mismatch() {
+        // Daemon sends `[VersionMismatch (0x02), daemon_wire_version]`.
+        let payload = [NackReason::VersionMismatch as u8, 7];
+        match nack_error(&payload) {
+            ClientError::VersionMismatch { daemon_version } => assert_eq!(daemon_version, 7),
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nack_error_version_mismatch_without_version_byte_falls_back() {
+        // A malformed VersionMismatch Nack with no second byte must not panic;
+        // it degrades to the bare reason.
+        let payload = [NackReason::VersionMismatch as u8];
+        assert!(matches!(
+            nack_error(&payload),
+            ClientError::Nack(NackReason::VersionMismatch)
+        ));
+    }
+
+    #[test]
+    fn nack_error_other_reasons_unaffected() {
+        let payload = [NackReason::PayloadTooLarge as u8];
+        assert!(matches!(
+            nack_error(&payload),
+            ClientError::Nack(NackReason::PayloadTooLarge)
+        ));
+    }
+
+    // ── F43: opt-in socket timeouts ───────────────────────────────────────────
+
+    #[test]
+    fn set_read_timeout_applies_to_socket() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let c = WeirClient::from_stream(a);
+        c.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        assert_eq!(
+            c.stream.read_timeout().unwrap(),
+            Some(Duration::from_millis(250))
+        );
+        // None clears it back to blocking.
+        c.set_read_timeout(None).unwrap();
+        assert_eq!(c.stream.read_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn read_timeout_bounds_a_silent_daemon_instead_of_blocking_forever() {
+        // `_b` is the daemon end: it's held open (so the connection stays up)
+        // but never replies. Without a read timeout, push would block forever.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        c.set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        // push writes the (tiny) frame, then blocks reading the reply that never
+        // comes → the timeout fires → an Io error rather than an indefinite hang.
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::Io(_)),
+            "expected Io timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn client_is_poisoned_after_a_read_failure() {
+        // G04: after a response read fails (here a timeout), the stream may hold
+        // leftover bytes that a subsequent read would mis-attribute to the next
+        // request — a false ack. The client must poison itself and reject further
+        // use fast, instead of reading again.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        c.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        // First push: the peer never replies → read times out → Io error.
+        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        assert!(matches!(first, ClientError::Io(_)), "{first:?}");
+
+        // Second push must fail FAST as poisoned, not block on another read.
+        let started = std::time::Instant::now();
+        let second = c.push(b"y", Durability::Sync).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "poisoned client must reject immediately, not read again"
+        );
+        match second {
+            ClientError::Protocol(msg) => assert!(msg.contains("poisoned"), "{msg}"),
+            other => panic!("expected a poisoned Protocol error, got {other:?}"),
+        }
     }
 }

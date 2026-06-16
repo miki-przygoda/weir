@@ -1,0 +1,223 @@
+{
+  "wire_version": 1,
+  "max_payload_hard_cap": 16777216,
+  "description": "Canonical conformance vectors for the weir v1 wire protocol. Each vector is a hex-encoded byte buffer plus the result a conformant decoder MUST produce. 'decode' is \"ok\" for a buffer that is exactly one valid frame (the message_type / durability / flags / payload_hex fields give the decoded header and payload), or the name of the rejection error otherwise. CRCs are IEEE / ISO-3309 CRC-32 (zlib / crc32fast). See docs/wire_protocol.md for the format and docs/conformance.md for how to use these vectors.",
+  "vectors": [
+    {
+      "name": "push_hello_sync",
+      "notes": "Push of \"hello\" at Sync durability.",
+      "hex": "57454952010101000500000066ad7d3c68656c6c6f86a61036",
+      "decode": "ok",
+      "message_type": "Push",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "68656c6c6f"
+    },
+    {
+      "name": "push_batched",
+      "notes": "Push at Batched durability exercises durability byte 0x02.",
+      "hex": "57454952010102000200000071e73e277762bafd1b82",
+      "decode": "ok",
+      "message_type": "Push",
+      "durability": "Batched",
+      "flags": 0,
+      "payload_hex": "7762"
+    },
+    {
+      "name": "push_buffered",
+      "notes": "Push at Buffered durability exercises durability byte 0x03.",
+      "hex": "5745495201010300010000003a9bd7fe788316dc8c",
+      "decode": "ok",
+      "message_type": "Push",
+      "durability": "Buffered",
+      "flags": 0,
+      "payload_hex": "78"
+    },
+    {
+      "name": "ack",
+      "notes": "Ack response: empty payload, payload CRC of zero bytes is 0x00000000.",
+      "hex": "574549520102010000000000c9474b3a00000000",
+      "decode": "ok",
+      "message_type": "Ack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": ""
+    },
+    {
+      "name": "healthcheck",
+      "notes": "HealthCheck request: empty payload.",
+      "hex": "574549520104010000000000f3729b5900000000",
+      "decode": "ok",
+      "message_type": "HealthCheck",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": ""
+    },
+    {
+      "name": "healthcheck_response",
+      "notes": "HealthCheckResponse: empty payload.",
+      "hex": "5745495201050100000000004779ecff00000000",
+      "decode": "ok",
+      "message_type": "HealthCheckResponse",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": ""
+    },
+    {
+      "name": "nack_bad_magic",
+      "notes": "Nack reason BadMagic.",
+      "hex": "574549520103010001000000182b8024011bdf05a5",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "01"
+    },
+    {
+      "name": "nack_version_mismatch",
+      "notes": "Nack reason VersionMismatch \u2014 payload carries the daemon's WIRE_VERSION as a second byte.",
+      "hex": "574549520103010002000000f68435360201eb40e804",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "0201"
+    },
+    {
+      "name": "nack_bad_header_crc",
+      "notes": "Nack reason BadHeaderCrc.",
+      "hex": "574549520103010001000000182b80240337be0b4b",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "03"
+    },
+    {
+      "name": "nack_payload_too_large",
+      "notes": "Nack reason PayloadTooLarge.",
+      "hex": "574549520103010001000000182b802404942b6fd5",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "04"
+    },
+    {
+      "name": "nack_bad_payload_crc",
+      "notes": "Nack reason BadPayloadCrc.",
+      "hex": "574549520103010001000000182b802405021b68a2",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "05"
+    },
+    {
+      "name": "nack_internal_error",
+      "notes": "Nack reason InternalError (transient; connection kept open).",
+      "hex": "574549520103010001000000182b802406b84a613b",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "06"
+    },
+    {
+      "name": "nack_empty_payload",
+      "notes": "Nack reason EmptyPayload.",
+      "hex": "574549520103010001000000182b8024072e7a664c",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "07"
+    },
+    {
+      "name": "nack_unknown_message",
+      "notes": "Nack reason UnknownMessage (permanent; connection closed).",
+      "hex": "574549520103010001000000182b802408bf67d9dc",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "08"
+    },
+    {
+      "name": "nack_reserved_flags_set",
+      "notes": "Nack reason ReservedFlagsSet (permanent; connection closed).",
+      "hex": "574549520103010001000000182b8024092957deab",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "09"
+    },
+    {
+      "name": "reject_bad_magic",
+      "notes": "First four bytes are not \"WEIR\".",
+      "hex": "58585858010101000400000003cac1846461746163f3f3ad",
+      "decode": "BadMagic"
+    },
+    {
+      "name": "reject_version_mismatch",
+      "notes": "Version byte 0x02 with a valid CRC.",
+      "hex": "574549520201010004000000e0cd4e0a6461746163f3f3ad",
+      "decode": "VersionMismatch"
+    },
+    {
+      "name": "reject_unknown_message_type",
+      "notes": "message_type 0xFF with a valid CRC.",
+      "hex": "5745495201ff010004000000878b80b06461746163f3f3ad",
+      "decode": "UnknownMessageType"
+    },
+    {
+      "name": "reject_unknown_durability",
+      "notes": "durability 0xFF with a valid CRC.",
+      "hex": "574549520101ff00040000006ab259ab6461746163f3f3ad",
+      "decode": "UnknownDurability"
+    },
+    {
+      "name": "reject_bad_header_crc",
+      "notes": "Header CRC field corrupted.",
+      "hex": "574549520101010004000000fccac1846461746163f3f3ad",
+      "decode": "HeaderCrcMismatch"
+    },
+    {
+      "name": "reject_reserved_flags_set",
+      "notes": "flags byte 0x01 (reserved; must be zero in v1).",
+      "hex": "574549520101010104000000b3e3a1b96461746163f3f3ad",
+      "decode": "ReservedFlagsSet"
+    },
+    {
+      "name": "reject_payload_too_large",
+      "notes": "Header alone declares payload_len = MAX_PAYLOAD_HARD_CAP + 1; rejected before any allocation, before the frame-length check.",
+      "hex": "574549520101010001000001a70a18c4",
+      "decode": "PayloadTooLarge"
+    },
+    {
+      "name": "reject_truncated_header",
+      "notes": "Buffer shorter than the 16-byte header.",
+      "hex": "57454952010101000400000003cac1",
+      "decode": "TruncatedFrame"
+    },
+    {
+      "name": "reject_truncated_payload",
+      "notes": "Header declares a 5-byte payload but the buffer is cut short of the full frame.",
+      "hex": "57454952010101000500000066ad7d3c68656c6c6f86a610",
+      "decode": "TruncatedFrame"
+    },
+    {
+      "name": "reject_bad_payload_crc",
+      "notes": "Trailing payload CRC corrupted.",
+      "hex": "57454952010101000500000066ad7d3c68656c6c6f86a610c9",
+      "decode": "PayloadCrcMismatch"
+    },
+    {
+      "name": "reject_trailing_bytes",
+      "notes": "A complete frame followed by 4 extra bytes; the buffer must be exactly one frame (G18).",
+      "hex": "574549520101010002000000df95aaa16869ac2a93d8deadbeef",
+      "decode": "TrailingBytes"
+    }
+  ]
+}

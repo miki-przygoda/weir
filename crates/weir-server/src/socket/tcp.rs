@@ -170,18 +170,25 @@ pub async fn run(
                         let n = conn_counter.fetch_add(1, Ordering::Relaxed);
                         cfg.shard_id = (n % shard_count) as u32;
                         let m = Arc::clone(&metrics);
-                        let handler_shutdown = handler_shutdown_rx.clone();
+                        let mut handler_shutdown = handler_shutdown_rx.clone();
 
                         join_set.spawn(async move {
                             let _permit = permit;
 
-                            // ── TLS handshake under a timeout ────────────────
-                            let tls_stream = match time::timeout(
-                                handshake_timeout,
-                                acceptor.accept(stream),
-                            )
-                            .await
-                            {
+                            // ── TLS handshake under a timeout, raced against
+                            // shutdown ───────────────────────────────────────
+                            // A client that completes the TCP accept then stalls
+                            // mid-TLS-handshake at shutdown must not hold its
+                            // permit + JoinSet slot until handshake_timeout,
+                            // eating the drain window and forcing abort_all (F29).
+                            // No application data has been exchanged yet, so
+                            // dropping on shutdown is clean.
+                            let handshake = tokio::select! {
+                                biased;
+                                res = time::timeout(handshake_timeout, acceptor.accept(stream)) => res,
+                                _ = handler_shutdown.changed() => return,
+                            };
+                            let tls_stream = match handshake {
                                 Ok(Ok(s)) => s,
                                 Ok(Err(e)) => {
                                     let reason = classify_handshake_error(&e);
@@ -215,8 +222,15 @@ pub async fn run(
                             // Subject CN is NOT a security control (the mTLS
                             // verifier already proved a CA-signed client cert);
                             // it's purely diagnostic. See client_cert_cn.
-                            let cn = client_cert_cn(&tls_stream);
-                            debug!(%peer_addr, client_cn = ?cn, "TLS handshake ok");
+                            //
+                            // Gate the parse behind the active level: client_cert_cn
+                            // parses + allocates from the full X.509 cert on every
+                            // successful handshake, and it's only ever used in this
+                            // debug! field — wasted work when DEBUG is off (G20).
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                let cn = client_cert_cn(&tls_stream);
+                                debug!(%peer_addr, client_cn = ?cn, "TLS handshake ok");
+                            }
 
                             if let Err(e) =
                                 handle_connection(tls_stream, tx, cfg, m, handler_shutdown).await
@@ -234,6 +248,14 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!(error = %e, "TCP accept error");
+                        if super::is_accept_resource_exhaustion(&e) {
+                            // Same rationale as the Unix loop: the pending
+                            // connection stays queued, so an immediate retry
+                            // busy-spins. Back off to yield the CPU until a
+                            // descriptor or buffer frees.
+                            metrics.accept_resource_exhaustion.inc();
+                            time::sleep(super::ACCEPT_BACKOFF_ON_EXHAUSTION).await;
+                        }
                     }
                 }
             }

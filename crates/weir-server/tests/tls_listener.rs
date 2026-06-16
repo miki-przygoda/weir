@@ -110,7 +110,7 @@ fn tls_connect(addr: SocketAddr, config: Arc<ClientConfig>) -> std::io::Result<T
 /// Encodes a Push frame (header + payload + payload CRC), identical wire shape
 /// to the connection-layer tests' `push_frame`.
 fn push_frame(payload: &[u8]) -> Vec<u8> {
-    let header = Header::new(MessageType::Push, Durability::Sync, 0, payload.len() as u32);
+    let header = Header::new(MessageType::Push, Durability::Sync, 0);
     Envelope::new(header, payload.to_vec()).encode()
 }
 
@@ -125,13 +125,13 @@ fn push_one(stream: &mut TlsClient, payload: &[u8]) -> std::io::Result<MessageTy
     stream.read_exact(&mut header_buf)?;
     let header = Header::decode(&header_buf)
         .map_err(|e| std::io::Error::other(format!("decode response header: {e:?}")))?;
-    let mut payload_buf = vec![0u8; header.payload_len as usize];
+    let mut payload_buf = vec![0u8; header.payload_len() as usize];
     if !payload_buf.is_empty() {
         stream.read_exact(&mut payload_buf)?;
     }
     let mut crc = [0u8; 4];
     stream.read_exact(&mut crc)?;
-    Ok(header.message_type)
+    Ok(header.message_type())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────────

@@ -18,15 +18,33 @@ use weir_core::MAX_PAYLOAD_HARD_CAP;
 /// Scans all shard directories under `wab_dir` and runs crash recovery on any
 /// unsealed `.wab` files found. Sealed files are left untouched by this function;
 /// the replay pass (in `spawn`) handles those.
-pub fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
-    for entry in fs::read_dir(wab_dir)? {
-        let entry = entry?;
-        let shard_dir = entry.path();
+///
+/// Shard directories are processed in sorted (name) order rather than
+/// `read_dir`'s OS-arbitrary order. The recovery outcome is order-independent —
+/// each shard is recovered in isolation — but a deterministic order keeps the
+/// recovery logs reproducible and removes a latent `read_dir`-order dependence
+/// from the durability path.
+pub(crate) fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
+    // Collect first (propagating any dirent error, as the streaming `?` did)
+    // so we can sort before processing.
+    let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    shard_dirs.sort();
+
+    for shard_dir in shard_dirs {
         if !shard_dir.is_dir() {
             continue;
         }
         let name = shard_dir.file_name().unwrap_or_default().to_string_lossy();
-        if name == "quarantine" {
+        // Skip the daemon's own reserved subdirectories. `quarantine/` holds
+        // unrecoverable segments parked for an operator. `dead_letter/` holds
+        // segment-format files (dl_NNNNNNNN.wab[.sealed]) owned by the
+        // DeadLetterWriter, which manages their dl_ counter and size accounting;
+        // a crash mid-write can leave an active dl_*.wab there, and recovery must
+        // NOT treat dead_letter/ as a shard dir and re-seal that file — doing so
+        // bypasses dead-letter accounting and counter ownership (F16).
+        if name == "quarantine" || name == "dead_letter" {
             continue;
         }
         audit_segment_modes(&shard_dir, metrics);
@@ -79,20 +97,31 @@ fn audit_segment_modes(shard_dir: &Path, metrics: &Arc<Metrics>) {
 }
 
 fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
-    for entry in fs::read_dir(shard_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("wab")
-            && path.to_string_lossy().ends_with(EXT_ACTIVE)
-        {
-            info!(path = %path.display(), "recovering unsealed WAB segment");
-            match recover_segment(&path, wab_dir, metrics) {
-                Ok(sealed) => {
-                    info!(sealed = %sealed.display(), "recovery complete");
-                }
-                Err(e) => {
-                    error!(path = %path.display(), error = %e, "recovery failed; segment left for manual inspection");
-                }
+    // Collect the unsealed `.wab` segments (propagating any dirent error, as the
+    // streaming `?` did) and sort so recovery seals them in a deterministic
+    // counter order rather than read_dir's OS-arbitrary order. Each segment is
+    // sealed in isolation, so the outcome is order-independent; the sort is for
+    // reproducible logs and to keep the durability path free of read_dir-order
+    // dependence.
+    let mut active: Vec<PathBuf> = fs::read_dir(shard_dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| {
+            path.extension().and_then(|e| e.to_str()) == Some("wab")
+                && path.to_string_lossy().ends_with(EXT_ACTIVE)
+        })
+        .collect();
+    active.sort();
+
+    for path in active {
+        info!(path = %path.display(), "recovering unsealed WAB segment");
+        match recover_segment(&path, wab_dir, metrics) {
+            Ok(sealed) => {
+                info!(sealed = %sealed.display(), "recovery complete");
+            }
+            Err(e) => {
+                error!(path = %path.display(), error = %e, "recovery failed; segment left for manual inspection");
             }
         }
     }
@@ -107,7 +136,11 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
 ///
 /// If the header has bad magic or an unknown version, the segment is quarantined
 /// rather than silently skipped or left in place.
-pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<PathBuf> {
+pub(crate) fn recover_segment(
+    path: &Path,
+    wab_dir: &Path,
+    metrics: &Arc<Metrics>,
+) -> io::Result<PathBuf> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -294,6 +327,12 @@ pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> i
 
     let sealed = sealed_path_for(path);
     fs::rename(path, &sealed)?;
+    // Make the rename's dirent crash-durable, exactly as WabSegment::seal does
+    // (B4). Without this a crash right after recovery could lose the .wab.sealed
+    // dirent and re-present the segment as an unsealed .wab on the next start —
+    // recovery is idempotent so no data is lost, but the parent fsync keeps the
+    // recovered seal as durable as a live one (F14).
+    super::segment::fsync_parent_dir(&sealed)?;
 
     info!(
         sealed = %sealed.display(),
@@ -306,13 +345,29 @@ pub fn recover_segment(path: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> i
 /// Moves a corrupt file to `<wab_dir>/quarantine/` and logs the reason.
 /// Failure to quarantine is returned as an error so the caller can decide
 /// whether to abort or continue.
-pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
+///
+/// Segment counters are shard-local — every `ShardWriter` starts at 1 — so the
+/// same basename (e.g. `seg_00000001.wab`) exists in every shard directory.
+/// Quarantining by basename alone into one flat directory would let one
+/// shard's corrupt segment silently clobber another's via `rename(2)`,
+/// destroying a forensic artifact. We therefore prefix the destination with
+/// the source's parent (shard) directory name, and never overwrite an existing
+/// quarantined file (the same shard+counter can recur across a restart once the
+/// original is moved out of the shard dir and the counter resets) — a free
+/// suffix is found first.
+pub(crate) fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
     let quarantine_dir = wab_dir.join("quarantine");
     super::create_dir_private(quarantine_dir.clone())?;
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let dest = quarantine_dir.join(file_name);
+    let shard_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown_shard".to_string());
+    let base = format!("{shard_name}__{}", file_name.to_string_lossy());
+    let dest = non_clobbering_dest(&quarantine_dir, &base)?;
     error!(
         path = %path.display(),
         dest = %dest.display(),
@@ -322,6 +377,32 @@ pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
     fs::rename(path, &dest)
 }
 
+/// Returns a path inside `dir` based on `base` that does not yet exist, so the
+/// caller's `rename` cannot silently overwrite an earlier quarantined file.
+/// Tries `base`, then `base.1`, `base.2`, … There is a small TOCTOU between
+/// the existence check and the caller's rename; quarantine is a best-effort
+/// forensic path and the shard-prefixed `base` already makes a same-name
+/// collision rare, so probing for a free name is sufficient.
+fn non_clobbering_dest(dir: &Path, base: &str) -> io::Result<PathBuf> {
+    let first = dir.join(base);
+    if !first.try_exists()? {
+        return Ok(first);
+    }
+    for n in 1..=10_000u32 {
+        let candidate = dir.join(format!("{base}.{n}"));
+        if !candidate.try_exists()? {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "quarantine: exhausted unique names for '{base}' in {}",
+            dir.display()
+        ),
+    ))
+}
+
 /// Checks the `.confirmed` file for a sealed segment and returns whether it is
 /// valid (safe to skip replay).
 ///
@@ -329,12 +410,10 @@ pub fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
 /// - Bad CRC or unknown version: quarantines the segment and its `.confirmed` file,
 ///   returns `Err` so the caller knows to skip this segment entirely.
 /// - Valid: returns `Ok(true)`.
-pub fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
-    let confirmed_path = {
-        let s = sealed_path.to_string_lossy();
-        let base = s.strip_suffix(EXT_SEALED).unwrap_or(&s);
-        PathBuf::from(format!("{base}{EXT_CONFIRMED}"))
-    };
+pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
+    // Shared sealed→confirmed name mapping (the drain's write side uses the
+    // same helper) — see crate::wab::format::confirmed_path_for.
+    let confirmed_path = super::format::confirmed_path_for(sealed_path);
 
     if !confirmed_path.exists() {
         return Ok(false);
@@ -443,6 +522,206 @@ mod tests {
     }
 
     #[test]
+    fn recover_open_segments_seals_every_segment_per_shard_deterministically() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let wab_dir = tmp_dir("recover_multi");
+        let shard_dir = wab_dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // Two unsealed segments in one shard, distinct counters. Recovery
+        // iterates read_dir, so this exercises the sort that makes the seal
+        // order deterministic (counter order) instead of OS-arbitrary.
+        for (counter, payload) in [(1u64, b"seg-one" as &[u8]), (2, b"seg-two")] {
+            let path = segment_path(&shard_dir, counter);
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(payload).unwrap();
+            // Left active (unsealed) on purpose — recovery must seal it.
+        }
+
+        recover_open_segments(&wab_dir, &noop_metrics()).unwrap();
+
+        // Both segments are sealed and every record survives, in counter order.
+        let mut sealed: Vec<PathBuf> = fs::read_dir(&shard_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(".wab.sealed"))
+            .collect();
+        sealed.sort();
+        assert_eq!(sealed.len(), 2, "both segments must be sealed");
+
+        let mut recovered: Vec<Vec<u8>> = Vec::new();
+        for path in &sealed {
+            for rec in crate::wab::SegmentReader::open(path).unwrap() {
+                recovered.push(rec.unwrap().to_vec());
+            }
+        }
+        assert_eq!(recovered, vec![b"seg-one".to_vec(), b"seg-two".to_vec()]);
+
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    /// F16: recovery must NOT descend into `dead_letter/` and re-seal a torn
+    /// `dl_*.wab` there. Those files (and their dl_ counter) are owned by the
+    /// DeadLetterWriter; re-sealing one bypasses dead-letter accounting.
+    #[test]
+    fn recover_open_segments_skips_dead_letter_dir() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let wab_dir = tmp_dir("recover_skips_dl");
+
+        // A real shard with an active segment — recovery MUST seal this one.
+        let shard_dir = wab_dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+        let shard_seg = segment_path(&shard_dir, 1);
+        WabSegment::create(&shard_seg, 0)
+            .unwrap()
+            .write_record(b"live")
+            .unwrap();
+
+        // A torn (still-active) dead-letter segment, segment-format so that
+        // WITHOUT the skip recovery would re-seal it.
+        let dl_dir = wab_dir.join("dead_letter");
+        fs::create_dir_all(&dl_dir).unwrap();
+        let dl_seg = dl_dir.join("dl_00000001.wab");
+        WabSegment::create(&dl_seg, 0)
+            .unwrap()
+            .write_record(b"dead")
+            .unwrap();
+
+        recover_open_segments(&wab_dir, &noop_metrics()).unwrap();
+
+        // The shard segment was sealed (active gone, a .wab.sealed appeared)…
+        let shard_sealed = fs::read_dir(&shard_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().to_string_lossy().ends_with(".wab.sealed"));
+        assert!(!shard_seg.exists(), "active shard segment should be gone");
+        assert!(shard_sealed, "shard segment should have been sealed");
+        // …but the dead-letter file is untouched: still active, never sealed.
+        assert!(
+            dl_seg.exists(),
+            "dead_letter dl_*.wab must be left in place"
+        );
+        assert!(
+            !dl_dir.join("dl_00000001.wab.sealed").exists(),
+            "recovery must not re-seal a dead_letter segment"
+        );
+
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    /// Appends raw bytes to an active `.wab` segment after the WabSegment that
+    /// created it has been dropped (and so flushed). Used to splice in a crafted
+    /// trailing field (oversized length, sentinel) that the writer would never
+    /// emit, to exercise recovery's defensive decode branches.
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+    }
+
+    /// F17 boundary: a record whose length field is exactly MAX_PAYLOAD_HARD_CAP
+    /// is a LEGAL record and must be recovered, not truncated. Guards the `>` in
+    /// the oversized-payload_len check against a `>=` off-by-one that would
+    /// silently drop the largest legal records on recovery.
+    #[test]
+    fn recovery_recovers_record_at_exactly_max_payload_cap() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("recover_max_payload");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(&vec![0xABu8; MAX_PAYLOAD_HARD_CAP])
+                .unwrap();
+        }
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "the max-size record must survive recovery"
+        );
+        assert_eq!(
+            recovered[0].len(),
+            MAX_PAYLOAD_HARD_CAP,
+            "recovered record must be exactly MAX_PAYLOAD_HARD_CAP bytes"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F17 just-over: a record whose length field is MAX_PAYLOAD_HARD_CAP + 1 is
+    /// treated as corruption; recovery truncates at the last valid record. We
+    /// splice only the 4-byte oversized length field (recovery rejects it before
+    /// reading any payload), so no giant buffer is needed.
+    #[test]
+    fn recovery_truncates_at_oversized_payload_len() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("recover_oversized");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"keep-me").unwrap();
+        }
+        // Splice an oversized length field where the next record would start.
+        let oversized = (MAX_PAYLOAD_HARD_CAP as u32 + 1).to_le_bytes();
+        append_raw(&path, &oversized);
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "recovery must truncate at the last valid record, keeping only it"
+        );
+        assert_eq!(recovered[0], b"keep-me" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F18: a partial seal (sentinel written, footer/rename not) must be handled
+    /// gracefully — recovery stops at the sentinel and recovers exactly the
+    /// pre-sentinel records.
+    #[test]
+    fn recovery_stops_at_partial_seal_sentinel() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("recover_sentinel");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"before-sentinel").unwrap();
+        }
+        // A sentinel is a zero-length record-length field (4 zero bytes), written
+        // by a seal before the footer/rename. Splice one in with no footer.
+        append_raw(&path, &[0u8; 4]);
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "recovery must stop at the sentinel, recovering only pre-sentinel records"
+        );
+        assert_eq!(recovered[0], b"before-sentinel" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn recovery_quarantines_bad_magic() {
         let dir = tmp_dir("badmagic");
         let path = make_segment(&dir, 0, &[b"x"]);
@@ -461,6 +740,65 @@ mod tests {
         assert!(dir.join("quarantine").exists());
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_preserves_same_named_segments_from_different_shards() {
+        // Segment counters are shard-local, so seg_00000001.wab exists in every
+        // shard dir. Quarantining the same basename from two shards must not let
+        // one clobber the other.
+        let wab_dir = tmp_dir("quarantine_crossshard");
+        let shard0 = wab_dir.join("shard_00");
+        let shard1 = wab_dir.join("shard_01");
+        fs::create_dir_all(&shard0).unwrap();
+        fs::create_dir_all(&shard1).unwrap();
+
+        let seg0 = shard0.join("seg_00000001.wab");
+        let seg1 = shard1.join("seg_00000001.wab");
+        fs::write(&seg0, b"corrupt-from-shard-0").unwrap();
+        fs::write(&seg1, b"corrupt-from-shard-1").unwrap();
+
+        quarantine(&seg0, &wab_dir, "test shard 0").unwrap();
+        quarantine(&seg1, &wab_dir, "test shard 1").unwrap();
+
+        // Both originals moved out.
+        assert!(!seg0.exists());
+        assert!(!seg1.exists());
+
+        // Both forensic artifacts survive, distinctly named, with their
+        // original contents intact (no clobber).
+        let q = wab_dir.join("quarantine");
+        let d0 = fs::read(q.join("shard_00__seg_00000001.wab")).unwrap();
+        let d1 = fs::read(q.join("shard_01__seg_00000001.wab")).unwrap();
+        assert_eq!(d0, b"corrupt-from-shard-0");
+        assert_eq!(d1, b"corrupt-from-shard-1");
+
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    #[test]
+    fn quarantine_does_not_clobber_same_shard_recurrence() {
+        // A restart can reset a shard's counter and recreate seg_00000001.wab
+        // after the original was quarantined. The second quarantine of the same
+        // shard+counter must get a distinct name, not overwrite the first.
+        let wab_dir = tmp_dir("quarantine_recurrence");
+        let shard0 = wab_dir.join("shard_00");
+        fs::create_dir_all(&shard0).unwrap();
+
+        let seg = shard0.join("seg_00000001.wab");
+        fs::write(&seg, b"first-corrupt").unwrap();
+        quarantine(&seg, &wab_dir, "first").unwrap();
+
+        fs::write(&seg, b"second-corrupt").unwrap();
+        quarantine(&seg, &wab_dir, "second").unwrap();
+
+        let q = wab_dir.join("quarantine");
+        let first = fs::read(q.join("shard_00__seg_00000001.wab")).unwrap();
+        let second = fs::read(q.join("shard_00__seg_00000001.wab.1")).unwrap();
+        assert_eq!(first, b"first-corrupt");
+        assert_eq!(second, b"second-corrupt");
+
+        fs::remove_dir_all(wab_dir).ok();
     }
 
     #[test]

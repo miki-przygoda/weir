@@ -16,14 +16,15 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         metrics_port: env_parse("WEIR_METRICS_PORT")?,
         metrics_bind: env_string("WEIR_METRICS_BIND")?,
         metrics_max_connections: env_parse("WEIR_METRICS_MAX_CONNECTIONS")?,
-        peer_uid_check: env_parse("WEIR_PEER_UID_CHECK")?,
+        peer_uid_check: env_bool("WEIR_PEER_UID_CHECK")?,
         shutdown_timeout_secs: env_parse("WEIR_SHUTDOWN_TIMEOUT_SECS")?,
         connection_read_timeout_secs: env_parse("WEIR_CONNECTION_READ_TIMEOUT_SECS")?,
         sink_type: env_string("WEIR_SINK_TYPE")?,
         sink_url: env_string("WEIR_SINK_URL")?,
         sink_timeout_secs: env_parse("WEIR_SINK_TIMEOUT_SECS")?,
         sink_max_batch_size: env_parse("WEIR_SINK_MAX_BATCH_SIZE")?,
-        sink_send_idempotency_key: env_parse("WEIR_SINK_SEND_IDEMPOTENCY_KEY")?,
+        sink_send_idempotency_key: env_bool("WEIR_SINK_SEND_IDEMPOTENCY_KEY")?,
+        sink_http_concurrency: env_parse("WEIR_SINK_HTTP_CONCURRENCY")?,
         #[cfg(feature = "mysql-sink")]
         sink_mysql_table: env_string("WEIR_SINK_MYSQL_TABLE")?,
         #[cfg(feature = "mysql-sink")]
@@ -66,6 +67,16 @@ fn env_string(key: &'static str) -> Result<Option<String>, ConfigError> {
 
 fn env_path(key: &'static str) -> Result<Option<PathBuf>, ConfigError> {
     Ok(env_string(key)?.map(PathBuf::from))
+}
+
+/// Parses a boolean env var leniently (`true/false`, `1/0`, `yes/no`, `on/off`).
+/// See [`super::parse_bool`] — `env_parse::<bool>` would reject everything but
+/// exact `true`/`false` (F57).
+fn env_bool(key: &'static str) -> Result<Option<bool>, ConfigError> {
+    match env_string(key)? {
+        None => Ok(None),
+        Some(v) => super::parse_bool(key, &v).map(Some),
+    }
 }
 
 fn env_parse<T>(key: &'static str) -> Result<Option<T>, ConfigError>

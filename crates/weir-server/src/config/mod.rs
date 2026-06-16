@@ -14,7 +14,6 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use tracing::warn;
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -196,6 +195,7 @@ pub(crate) struct PartialConfig {
     pub sink_timeout_secs: Option<u64>,
     pub sink_max_batch_size: Option<usize>,
     pub sink_send_idempotency_key: Option<bool>,
+    pub sink_http_concurrency: Option<usize>,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: Option<String>,
     #[cfg(feature = "mysql-sink")]
@@ -231,6 +231,29 @@ impl PartialConfig {
 }
 
 // ── Final config ──────────────────────────────────────────────────────────────
+
+/// The sink URL, wrapped so the derived `Config: Debug` cannot leak the
+/// password component into a `?config` log line — the same operator-credentials
+/// hygiene the SQL sink configs apply to their own `Debug` impls (F59). Derefs
+/// to the inner `Option<String>` for transparent read access.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct RedactedUrl(pub Option<String>);
+
+impl std::ops::Deref for RedactedUrl {
+    type Target = Option<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RedactedUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some(url) => write!(f, "Some({:?})", crate::sink::redact_url_password(url)),
+            None => f.write_str("None"),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -280,23 +303,28 @@ pub struct Config {
     pub shutdown_timeout_secs: u64,
     pub connection_read_timeout_secs: u64,
     pub sink_type: SinkType,
-    // These four fields are only read by the non-noop sink arms in main.rs.
-    // When no non-noop sink feature is enabled they are dead code; suppress
-    // the lint so `cargo clippy -- -D warnings` stays clean on noop-only builds.
+    // These fields are read by the non-noop sink arms in main.rs (http / mysql /
+    // postgres / clickhouse — see require_sink_url's four-feature gate). When NONE
+    // of those features is enabled they are dead code; the allow keeps
+    // `cargo clippy -- -D warnings` clean on a noop-only / no-default-features
+    // build. The gate must match require_sink_url's feature set (incl.
+    // clickhouse-sink), else a clickhouse-only build would wrongly suppress (G07).
     #[cfg_attr(
         not(any(
             feature = "http-sink",
             feature = "mysql-sink",
-            feature = "postgres-sink"
+            feature = "postgres-sink",
+            feature = "clickhouse-sink"
         )),
         allow(dead_code)
     )]
-    pub sink_url: Option<String>,
+    pub sink_url: RedactedUrl,
     #[cfg_attr(
         not(any(
             feature = "http-sink",
             feature = "mysql-sink",
-            feature = "postgres-sink"
+            feature = "postgres-sink",
+            feature = "clickhouse-sink"
         )),
         allow(dead_code)
     )]
@@ -305,7 +333,8 @@ pub struct Config {
         not(any(
             feature = "http-sink",
             feature = "mysql-sink",
-            feature = "postgres-sink"
+            feature = "postgres-sink",
+            feature = "clickhouse-sink"
         )),
         allow(dead_code)
     )]
@@ -313,6 +342,10 @@ pub struct Config {
     // sink_send_idempotency_key is only consumed by the http-sink arm.
     #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
     pub sink_send_idempotency_key: bool,
+    /// Max HTTP POSTs the http sink keeps in flight per `commit()` batch.
+    /// Only consumed by the http-sink arm.
+    #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
+    pub sink_http_concurrency: usize,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: String,
     #[cfg(feature = "mysql-sink")]
@@ -354,12 +387,34 @@ pub struct Config {
 }
 
 impl Config {
-    /// Loads config from all three layers (CLI > env > file > defaults) and validates.
-    pub fn load() -> Result<Self, ConfigError> {
+    /// Loads config from all three layers (CLI > env > file > defaults) and
+    /// validates.
+    ///
+    /// Returns the validated config plus any **advisory warnings** collected
+    /// during loading (unknown TOML keys, feature-gated keys, the small
+    /// dead-letter-cap advisory). The caller is expected to replay them through
+    /// `tracing` *after* the subscriber is initialised — `load()` runs before
+    /// the subscriber exists, so emitting them here would silently drop them and
+    /// a TOML typo would take defaults unnoticed (F54).
+    pub fn load() -> Result<(Self, Vec<String>), ConfigError> {
         let (cli, config_path) = cli::parse()?;
-        let file = file::read(&config_path)?;
+        let (file, mut warnings) = file::read(&config_path)?;
         let env = env::read()?;
-        Self::from_layers(cli, env, file)
+        let config = Self::from_layers(cli, env, file)?;
+
+        // Post-validation advisory: a tiny dead-letter cap causes frequent
+        // BlockedDeadLetterFull transitions. Collected here (not warn!'d inside
+        // from_layers) so it rides the same deferred-emit path as the file
+        // warnings and so from_layers stays subscriber-agnostic.
+        if config.dead_letter_max_bytes < 1_048_576 {
+            warnings.push(format!(
+                "dead_letter_max_bytes ({}) is very small; consider increasing to avoid \
+                 frequent BlockedDeadLetterFull transitions",
+                config.dead_letter_max_bytes
+            ));
+        }
+
+        Ok((config, warnings))
     }
 
     /// Merges three partial-config layers (CLI > env > file) against defaults.
@@ -389,7 +444,13 @@ impl Config {
         let shard_count = merge!(shard_count).unwrap_or(1);
         check_range("shard_count", shard_count, 1, 256)?;
 
-        let worker_count = merge!(worker_count).unwrap_or(shard_count);
+        // worker_count defaults to the shard count (one worker per shard is the
+        // throughput sweet spot), but capped at the field's own max of 64 — a
+        // valid shard_count of 65..=256 would otherwise produce a defaulted
+        // worker_count that fails the range check below with a misleading error,
+        // rejecting a config where the user only set shard_count (F53). An
+        // EXPLICIT worker_count > 64 is still (correctly) rejected.
+        let worker_count = merge!(worker_count).unwrap_or_else(|| shard_count.min(64));
         check_range("worker_count", worker_count, 1, 64)?;
 
         // Defaults from docs/benchmarks/batch-tuning.md: (256, 1ms) is the sweet
@@ -398,7 +459,7 @@ impl Config {
         check_range("batch_size", batch_size, 1, 100_000)?;
 
         let batch_deadline_ms = merge!(batch_deadline_ms).unwrap_or(1);
-        check_range("batch_deadline_ms", batch_deadline_ms as usize, 1, 60_000)?;
+        check_range("batch_deadline_ms", batch_deadline_ms, 1, 60_000)?;
 
         // Default 256 MiB matches the historical hard-coded behaviour.
         // Lower bound 4 KiB so the segment header (one page) fits;
@@ -477,7 +538,7 @@ impl Config {
         let connection_read_timeout_secs = merge!(connection_read_timeout_secs).unwrap_or(30);
         check_range(
             "connection_read_timeout_secs",
-            connection_read_timeout_secs as usize,
+            connection_read_timeout_secs,
             1,
             600,
         )?;
@@ -522,7 +583,7 @@ impl Config {
         }
 
         let sink_timeout_secs = merge!(sink_timeout_secs).unwrap_or(10);
-        check_range("sink_timeout_secs", sink_timeout_secs as usize, 1, 300)?;
+        check_range("sink_timeout_secs", sink_timeout_secs, 1, 300)?;
 
         let sink_max_batch_size = merge!(sink_max_batch_size).unwrap_or(100);
         check_range("sink_max_batch_size", sink_max_batch_size, 1, 10_000)?;
@@ -531,6 +592,12 @@ impl Config {
         // that may have been accepted; the Idempotency-Key header lets the
         // endpoint dedupe without computing the hash itself.
         let sink_send_idempotency_key = merge!(sink_send_idempotency_key).unwrap_or(true);
+
+        // HTTP sink concurrency: the drain is single-threaded but the POSTs are
+        // async, so up to N run concurrently per commit batch — the I/O waits
+        // overlap, collapsing a segment's serial RTT cost. Default 8.
+        let sink_http_concurrency = merge!(sink_http_concurrency).unwrap_or(8);
+        check_range("sink_http_concurrency", sink_http_concurrency, 1, 1024)?;
 
         // MySQL sink: identifier validation happens inside MySqlSink::new at
         // startup (strict [A-Za-z_][A-Za-z0-9_]{0,63} rule, single source of
@@ -581,23 +648,24 @@ impl Config {
                 reason: "must be greater than 0".into(),
             });
         }
-        if dead_letter_max_bytes < 1_048_576 {
-            warn!(
-                dead_letter_max_bytes,
-                "dead_letter_max_bytes is very small; consider increasing to avoid frequent \
-                 BlockedDeadLetterFull transitions"
-            );
-        }
+        // The "very small dead_letter_max_bytes" advisory is emitted by load()
+        // (collected, then replayed after the tracing subscriber inits) so it
+        // can't be silently dropped — see Config::load (F54).
 
         let dead_letter_check_interval_secs = merge!(dead_letter_check_interval_secs).unwrap_or(30);
         check_range(
             "dead_letter_check_interval_secs",
-            dead_letter_check_interval_secs as usize,
+            dead_letter_check_interval_secs,
             1,
             3_600,
         )?;
 
-        let log_level = merge!(log_level).unwrap_or_else(|| "info".into());
+        // Treat an empty / whitespace-only value as unset → "info". Otherwise an
+        // empty WEIR_LOG_LEVEL="" wins the merge and main's EnvFilter::try_new("")
+        // builds an empty filter that disables ALL logging silently (F58).
+        let log_level = merge!(log_level)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "info".into());
 
         // ── TCP + TLS ────────────────────────────────────────────────────────────
         let tcp_bind_str = merge!(tcp_bind);
@@ -665,10 +733,11 @@ impl Config {
             shutdown_timeout_secs,
             connection_read_timeout_secs,
             sink_type,
-            sink_url,
+            sink_url: RedactedUrl(sink_url),
             sink_timeout_secs,
             sink_max_batch_size,
             sink_send_idempotency_key,
+            sink_http_concurrency,
             #[cfg(feature = "mysql-sink")]
             sink_mysql_table,
             #[cfg(feature = "mysql-sink")]
@@ -784,6 +853,30 @@ where
     }
 }
 
+// ── Boolean parsing helper ──────────────────────────────────────────────────────
+
+/// Lenient boolean parse for env-var and CLI string values. Accepts the common
+/// spellings (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`) case-insensitively
+/// and trims surrounding whitespace.
+///
+/// `bool::from_str` — the previous parser for these fields — accepted only the
+/// exact lowercase `true`/`false`, so `WEIR_PEER_UID_CHECK=1` or
+/// `--sink-send-idempotency-key TRUE` aborted startup with an opaque parse error
+/// (F57). TOML booleans are unaffected (they have a native bool type).
+pub(crate) fn parse_bool(field: &'static str, raw: &str) -> Result<bool, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidValue {
+            field,
+            reason: format!(
+                "'{}' is not a valid boolean; use true/false, 1/0, yes/no, or on/off",
+                raw.trim()
+            ),
+        }),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -824,10 +917,11 @@ mod tests {
         assert_eq!(c.shutdown_timeout_secs, 30);
         assert_eq!(c.connection_read_timeout_secs, 30);
         assert_eq!(c.sink_type, SinkType::Noop);
-        assert_eq!(c.sink_url, None);
+        assert!(c.sink_url.is_none());
         assert_eq!(c.sink_timeout_secs, 10);
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
+        assert_eq!(c.sink_http_concurrency, 8);
         #[cfg(feature = "mysql-sink")]
         assert_eq!(c.sink_mysql_table, "weir_records");
         #[cfg(feature = "mysql-sink")]
@@ -866,6 +960,46 @@ mod tests {
             c.worker_count, 4,
             "worker_count should default to shard_count (4) when not explicitly set"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F53: a valid shard_count of 65..=256 with worker_count unset must NOT be
+    /// rejected. The defaulted worker_count is capped at its own max (64) instead
+    /// of inheriting the larger shard_count and failing the range check.
+    #[test]
+    fn large_shard_count_with_defaulted_worker_count_is_accepted() {
+        let dir = tmp_dir("large_shard");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(128),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect("shard_count=128 with defaulted worker_count must be accepted");
+        assert_eq!(c.shard_count, 128);
+        assert_eq!(c.worker_count, 64, "defaulted worker_count caps at 64");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// An EXPLICIT worker_count above the max is still rejected.
+    #[test]
+    fn explicit_worker_count_over_max_is_rejected() {
+        let dir = tmp_dir("explicit_worker_over");
+        let err = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(128),
+                worker_count: Some(128),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("worker_count"), "{err}");
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1216,12 +1350,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_path_format_matches_shared_vector() {
+        // Drift guard: the same cases must produce the same accept/reject from
+        // socket::validate_socket_path — see socket's twin test.
+        for (path, should_pass) in crate::path_validation_test_vectors::CASES {
+            assert_eq!(
+                validate_path_format("test", Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_path_format({path:?})"
+            );
+        }
+        #[cfg(unix)]
+        for (path, should_pass) in crate::path_validation_test_vectors::UNIX_ONLY_CASES {
+            assert_eq!(
+                validate_path_format("test", Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_path_format({path:?})"
+            );
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     fn missing_config_file_returns_empty_partial() {
-        let result =
+        let (result, warnings) =
             file::read(Path::new("/weir_test_no_such_config_file_xyzzy_12345.toml")).unwrap();
         assert!(result.shard_count.is_none());
         assert!(result.wab_dir.is_none());
+        assert!(warnings.is_empty(), "a missing file yields no warnings");
     }
 
     // ── TCP + TLS config ──────────────────────────────────────────────────────
@@ -1300,5 +1456,77 @@ mod tests {
         // (which would also contain the substring "tls").
         assert!(err.to_string().contains("feature"), "{err}");
         fs::remove_dir_all(dir).ok();
+    }
+
+    // ── parse_bool (F57) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_bool_truthy_values() {
+        for t in [
+            "true", "TRUE", "True", "1", "yes", "YES", "on", "ON", "  true  ",
+        ] {
+            assert!(parse_bool("field", t).unwrap(), "input {t:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_falsey_values() {
+        for f in [
+            "false", "FALSE", "False", "0", "no", "NO", "off", "OFF", "  0  ",
+        ] {
+            assert!(!parse_bool("field", f).unwrap(), "input {f:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_rejects_garbage_with_helpful_message() {
+        let err = parse_bool("peer_uid_check", "maybe").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("peer_uid_check"), "{msg}");
+        assert!(msg.contains("not a valid boolean"), "{msg}");
+        // The message lists the accepted spellings.
+        assert!(msg.contains("true/false"), "{msg}");
+    }
+
+    // ── RedactedUrl Debug (F59) ───────────────────────────────────────────────
+
+    #[test]
+    fn config_debug_redacts_sink_url_password() {
+        let dir = tmp_dir("debug_redact");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                // A credentialed URL — the password must never appear in Debug.
+                sink_url: Some("mysql://admin:s3cr3t@db.internal:3306/weir".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("s3cr3t"), "password leaked in Debug: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "redaction marker missing: {dbg}"
+        );
+        // Scheme/user/host stay visible for operator diagnostics.
+        assert!(dbg.contains("admin"), "{dbg}");
+        assert!(dbg.contains("db.internal"), "{dbg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn redacted_url_debug_none_is_none() {
+        assert_eq!(format!("{:?}", RedactedUrl(None)), "None");
+    }
+
+    #[test]
+    fn redacted_url_debug_unauthenticated_url_unchanged() {
+        // No userinfo ⇒ nothing to redact; the URL is shown as-is.
+        let r = RedactedUrl(Some("https://example.com/ingest".into()));
+        let dbg = format!("{r:?}");
+        assert!(dbg.contains("https://example.com/ingest"), "{dbg}");
+        assert!(!dbg.contains("<redacted>"), "{dbg}");
     }
 }

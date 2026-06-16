@@ -18,3 +18,9 @@ bytes = "1"
 
 [dev-dependencies]
 proptest = "1"
+# serde_json is a TEST-ONLY dependency used by tests/conformance.rs to load the
+# language-neutral conformance vectors (docs/conformance/wire_v1_vectors.json).
+# This does not contradict the "serde intentionally excluded" note above: that
+# concerns the crate's *runtime/published* surface (the daemon never links it).
+# Parsed via serde_json::Value (no derive), so no proc-macro build deps are pulled.
+serde_json = "1"

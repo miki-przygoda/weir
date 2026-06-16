@@ -1,9 +1,9 @@
-pub mod clock;
+pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
-pub mod dst;
-pub mod format;
-pub mod recovery;
-pub mod segment;
+pub(crate) mod dst;
+pub(crate) mod format;
+pub(crate) mod recovery;
+pub(crate) mod segment;
 
 use std::{
     fs::{self, File},
@@ -19,7 +19,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::Batch;
@@ -44,18 +44,18 @@ pub(crate) fn ewma_update_us(current_us: u64, sample_us: u64) -> u64 {
 }
 
 /// Configuration for the WAB subsystem.
-pub struct WabConfig {
+pub(crate) struct WabConfig {
     /// Number of shards (one flusher thread per shard).
-    pub shard_count: usize,
+    pub(crate) shard_count: usize,
     /// Maximum number of records per flush batch.
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
     /// Maximum time to accumulate a batch before flushing.
-    pub batch_deadline: Duration,
+    pub(crate) batch_deadline: Duration,
     /// Rotation threshold in bytes. The active segment is sealed and a new one
     /// opened once `bytes_written` reaches this value. Default 256 MiB matches
     /// the historical hard-coded behaviour; tests and storage-constrained
     /// deployments may set it lower.
-    pub segment_max_bytes: u64,
+    pub(crate) segment_max_bytes: u64,
 }
 
 impl Default for WabConfig {
@@ -72,10 +72,10 @@ impl Default for WabConfig {
 /// Returned by `spawn`. Drop `shard_txs` to initiate shutdown (flusher threads
 /// exit when their receiver disconnects), then join the handles to wait for all
 /// segments to be sealed.
-pub struct WabHandle {
+pub(crate) struct WabHandle {
     /// One sender per shard. Drop all of them to signal shutdown.
-    pub shard_txs: Vec<Sender<Batch>>,
-    pub join_handles: Vec<thread::JoinHandle<()>>,
+    pub(crate) shard_txs: Vec<Sender<Batch>>,
+    pub(crate) join_handles: Vec<thread::JoinHandle<()>>,
 }
 
 fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
@@ -214,7 +214,7 @@ pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
 /// `coalesce_hint` is an `Arc<AtomicU64>` holding the EWMA of fsync latency in
 /// microseconds (init 200). Each flusher thread updates it after every fsync;
 /// the worker threads read it to size their coalesce window.
-pub fn spawn(
+pub(crate) fn spawn(
     wab_dir: PathBuf,
     config: WabConfig,
     drain_tx: Sender<PathBuf>,
@@ -230,10 +230,13 @@ pub fn spawn(
     // Phase 1 (calling thread): crash recovery — unsealed .wab → .wab.sealed
     recover_open_segments(&wab_dir, &metrics)?;
 
-    // Phase 2 (calling thread): replay sealed-but-unconfirmed segments
-    replay_unconfirmed(&wab_dir, config.shard_count, &drain_tx, &metrics)?;
+    // NOTE: replay of sealed-but-unconfirmed segments is intentionally NOT done
+    // here. The caller invokes `replay_unconfirmed` AFTER the drain consumer is
+    // spawned — otherwise the blocking sends into the bounded drain channel would
+    // dead-lock the startup thread once the recovery backlog exceeds the channel
+    // capacity and no consumer exists yet (B3).
 
-    // Phase 3: one flusher thread per shard
+    // Phase 2: one flusher thread per shard
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let mut shard_txs = Vec::with_capacity(config.shard_count);
     let mut join_handles = Vec::with_capacity(config.shard_count);
@@ -300,7 +303,11 @@ pub fn spawn(
     })
 }
 
-fn replay_unconfirmed(
+/// Replays sealed-but-unconfirmed segments from a previous run by sending their
+/// paths to the drain. MUST be called only after the drain consumer is running:
+/// the sends block on the bounded drain channel, so with no consumer a backlog
+/// larger than the channel capacity would dead-lock the caller (B3).
+pub(crate) fn replay_unconfirmed(
     wab_dir: &Path,
     shard_count: usize,
     drain_tx: &Sender<PathBuf>,
@@ -311,9 +318,14 @@ fn replay_unconfirmed(
         if !sdir.exists() {
             continue;
         }
+        // Propagate (don't filter_map(.ok())) a dirent error: silently skipping a
+        // sealed-but-unconfirmed segment here would drop records that were acked
+        // durable but never delivered. Failing startup loudly is the safe choice
+        // — recovery is re-run on the next start (F15).
         let mut sealed_segments: Vec<PathBuf> = fs::read_dir(&sdir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
+            .map(|e| e.map(|e| e.path()))
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
             .collect();
         sealed_segments.sort(); // ascending counter order
@@ -324,7 +336,17 @@ fn replay_unconfirmed(
                     info!(sealed = %sealed.display(), "skipping replay — segment already confirmed");
                 }
                 Ok(false) => {
-                    let record_count = read_segment_record_count(&sealed).unwrap_or(0);
+                    // A footer-read failure here only undercounts the
+                    // recovery_records_replayed metric (the segment is still
+                    // queued + delivered); surface it rather than silently
+                    // reporting 0 so the undercount is explainable.
+                    let record_count = match read_segment_record_count(&sealed) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
+                            0
+                        }
+                    };
                     info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
                     metrics.recovery_records_replayed.inc_by(record_count);
                     drain_tx.send(sealed).map_err(|_| {
@@ -349,6 +371,19 @@ fn replay_unconfirmed(
 /// 8 bytes are `record_count` as a u64 LE (see wab/format.rs for the layout).
 fn read_segment_record_count(path: &Path) -> io::Result<u64> {
     let mut file = fs::File::open(path)?;
+    // Guard the seek-from-end: a file shorter than the footer would seek to a
+    // negative offset, which surfaces as a cryptic platform error ("Invalid
+    // argument") rather than a clear cause. Reject it explicitly first.
+    let len = file.metadata()?.len();
+    if len < SEGMENT_FOOTER_LEN as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "segment '{}' is {len} bytes, shorter than the {SEGMENT_FOOTER_LEN}-byte footer",
+                path.display()
+            ),
+        ));
+    }
     file.seek(SeekFrom::End(-(SEGMENT_FOOTER_LEN as i64)))?;
     let mut footer = [0u8; 8];
     file.read_exact(&mut footer)?;
@@ -401,8 +436,37 @@ fn flusher_thread<C: BlockingClock>(
         Arc::clone(&metrics),
         store,
     );
-    if let Err(e) = writer.scan_and_advance_counter() {
-        warn!(shard = shard_id, error = %e, "failed to scan segment counters; starting at 1");
+    // Establish the segment counter before sealing anything. A failure here is
+    // NOT benign: defaulting to 1 while crash recovery has already sealed
+    // undrained seg_NNNNNNNN.wab.sealed files would let the first seal's rename
+    // overwrite one of them — silent loss of acked-but-undrained records (the F12
+    // hole, re-reachable via a transient read_dir failure under fd/mem pressure —
+    // G02). Retry briefly to ride out a transient blip; if it still fails, refuse
+    // to seal at an unestablished counter and take the shard offline (return →
+    // work_rx drops → workers Nack; no respawn). The crown invariant — never a
+    // false ack — outranks this shard's availability; a restart re-runs recovery.
+    {
+        let mut attempt = 0u32;
+        loop {
+            match writer.scan_and_advance_counter() {
+                Ok(()) => break,
+                Err(e) if attempt < 3 => {
+                    attempt += 1;
+                    warn!(shard = shard_id, error = %e, attempt, "segment-counter scan failed; retrying before giving up");
+                    clock.sleep(Duration::from_millis(50u64.saturating_mul(attempt as u64)));
+                }
+                Err(e) => {
+                    error!(
+                        shard = shard_id,
+                        error = %e,
+                        "segment-counter scan failed repeatedly; refusing to seal at an \
+                         unestablished counter (would risk overwriting a recovered sealed \
+                         segment) — taking shard offline; records will Nack until restart"
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     // Scratch buffer pre-touch: fault in the backing page before the first record arrives.
@@ -480,7 +544,9 @@ fn flusher_thread<C: BlockingClock>(
                     state: SegmentState::sealed,
                 })
                 .inc();
-            drain_tx.send(sealed).ok();
+            if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
+                warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed on shutdown; sealed segment is durable and will be delivered on restart");
+            }
         }
         Ok(None) => {
             info!(
@@ -584,7 +650,9 @@ fn flush_batch(
                         state: SegmentState::sealed,
                     })
                     .inc();
-                drain_tx.send(sealed).ok();
+                if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
+                    warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed; sealed segment is durable and will be delivered on restart");
+                }
                 durable_acks.append(&mut pending_acks);
                 #[cfg(feature = "bench-trace")]
                 durable_ts.append(&mut pending_ts);
@@ -688,13 +756,13 @@ fn fsync_observed(
 /// Streams records without materialising the whole segment. Applies
 /// `MAX_PAYLOAD_HARD_CAP` before every heap allocation to bound memory usage
 /// during recovery. Stops at the end-of-records sentinel or on the first error.
-pub struct SegmentReader {
+pub(crate) struct SegmentReader {
     reader: BufReader<File>,
     done: bool,
 }
 
 impl SegmentReader {
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
@@ -815,6 +883,74 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(got, payloads);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn read_segment_record_count_rejects_short_file_clearly() {
+        let dir = tmp_dir("shortfooter");
+        let path = dir.join("truncated.wab.sealed");
+        // Shorter than the footer — the seek-from-end would otherwise go
+        // negative and yield a cryptic platform error.
+        fs::write(&path, b"xy").unwrap();
+        let err = read_segment_record_count(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(err.to_string().contains("shorter than"), "{err}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── B3: recovery replay must not dead-lock on the bounded drain channel ──
+    #[test]
+    fn replay_needs_a_live_consumer_for_backlog_over_channel_capacity() {
+        // replay_unconfirmed blocking-sends each sealed-but-unconfirmed segment
+        // into the bounded drain channel. If the backlog exceeds the channel
+        // capacity and no consumer is draining, the send blocks forever — the
+        // startup deadlock (B3). The fix is in the startup wiring: the drain
+        // consumer is spawned BEFORE replay runs. This test characterises the
+        // hazard — replay blocks without a consumer, and streams the whole backlog
+        // once one exists.
+        let dir = tmp_dir("replay_consumer");
+        let shard_dir = shard_dir_path(&dir, 0);
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        const N: u64 = 300; // > the bounded(256) drain channel capacity
+        for i in 1..=N {
+            let path = segment_path(&shard_dir, i);
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"replayed").unwrap();
+            seg.seal().unwrap();
+        }
+
+        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let dir_for_replay = dir.clone();
+        let replay = std::thread::spawn(move || {
+            let metrics = Arc::new(crate::metrics::Metrics::new().0);
+            replay_unconfirmed(&dir_for_replay, 1, &tx, &metrics).unwrap();
+            let _ = done_tx.send(());
+            // tx dropped here → the consumer below sees the channel disconnect.
+        });
+
+        // No consumer yet: replay fills the channel and blocks (the deadlock).
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "replay must block on a full channel with no consumer (the B3 deadlock)"
+        );
+
+        // Live consumer → replay streams the remaining backlog and completes.
+        let consumer = std::thread::spawn(move || {
+            let mut count = 0u64;
+            while rx.recv().is_ok() {
+                count += 1;
+            }
+            count
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replay must complete once a consumer drains the channel");
+        let received = consumer.join().unwrap();
+        replay.join().unwrap();
+        assert_eq!(received, N, "every backlog segment must reach the drain");
         fs::remove_dir_all(dir).ok();
     }
 

@@ -154,11 +154,15 @@ The defense for this is **operational, not in-process**:
 - A non-default deployment that places the socket under a world-writable
   directory (e.g. `/tmp/weir.sock`) re-opens the window. Don't do that.
 
-The `bind_hardened` code does not attempt to verify the parent directory's
-ownership or mode at startup — that decision is left to the operator, and
-documented here. A future change could add an opt-in `require_private_parent`
-config flag that calls `fstatat` on the dirfd and refuses to start if the
-parent is group- or world-writable.
+At startup `bind_hardened` `fstat`s the pinned parent dirfd and emits a
+`WARN` (`warn_if_parent_world_writable`) if the parent is group- or
+world-writable — `/tmp` (0o1777) trips it. The warning notes the sticky bit
+explicitly, because the sticky bit only restricts *deletion*, not *creation*,
+so it does not close the rename race. The daemon does **not** refuse to start:
+operators legitimately place sockets under `/tmp` during development, and a
+hard refusal would break them. A future change could add an opt-in
+`require_private_parent` config flag that promotes this warning to a
+start-time refusal for hardened deployments.
 
 ## What is tested
 
@@ -180,6 +184,11 @@ The unit tests in `crates/weir-server/src/socket/mod.rs::tests` cover:
   parent does not exist.
 - `bind_hardened_fails_when_parent_is_symlink` — `O_NOFOLLOW` on the
   parent open refuses a symlinked last-component parent.
+- `is_group_or_other_writable_classifies_modes` — the world-writable
+  predicate: private modes (0o700/0o600) are clean, group/world-writable
+  and `/tmp`-style 0o1777 are flagged, bare sticky/setuid bits are not.
+- `bind_hardened_warns_but_succeeds_on_world_writable_parent` — a 0o1777
+  parent triggers the warning but the bind still succeeds (warn, don't refuse).
 - `stat_at_dir_observes_inode_swap` — building-block test that confirms
   the snapshot mechanism actually detects an inode change at a directory-
   relative name.

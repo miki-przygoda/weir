@@ -204,6 +204,15 @@ pub async fn run(
                     }
                     Err(e) => {
                         error!(error = %e, "accept error");
+                        if is_accept_resource_exhaustion(&e) {
+                            // The pending connection stays in the kernel accept
+                            // queue, so retrying immediately busy-spins at 100%
+                            // CPU and floods the log until an fd frees. Back off
+                            // to yield the CPU. The shutdown signal still wins
+                            // because the select! re-evaluates after the sleep.
+                            metrics.accept_resource_exhaustion.inc();
+                            time::sleep(ACCEPT_BACKOFF_ON_EXHAUSTION).await;
+                        }
                     }
                 }
             }
@@ -241,16 +250,76 @@ pub async fn run(
         }
     }
 
+    // Remove the socket file. On Unix use the same hardened dirfd + fstatat
+    // (S_IFSOCK) + unlinkat sequence as startup cleanup so a by-name remove
+    // can't be redirected by an attacker who swapped a different inode in at
+    // the path under a group/world-writable parent — the exact TOCTOU pattern
+    // the bind path was hardened against (F28). Best-effort: the daemon is
+    // exiting, so a failure is logged, not fatal.
+    #[cfg(unix)]
+    remove_socket_hardened(&config.socket_path);
+    #[cfg(not(unix))]
     let _ = std::fs::remove_file(&config.socket_path);
     Ok(())
+}
+
+/// Hardened shutdown-time removal of the socket file: open the parent dir,
+/// confirm the entry is still a socket (not a swapped-in symlink/file), and
+/// `unlinkat` it. Mirrors `cleanup_existing_socket` so removal never acts on an
+/// attacker-controlled name (F28). A missing file is success; a non-socket
+/// entry is refused (and logged).
+#[cfg(unix)]
+fn remove_socket_hardened(path: &Path) {
+    let result = (|| -> io::Result<()> {
+        let (parent, basename) = split_parent_basename(path)?;
+        let dirfd = open_parent_dirfd(parent)?;
+        let _dirfd_guard = OwnedDirFd(dirfd);
+        cleanup_existing_socket(dirfd, basename, path)
+    })();
+    if let Err(e) = result {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "socket manager: could not remove socket file at shutdown"
+        );
+    }
 }
 
 async fn drain_join_set(join_set: &mut JoinSet<()>) {
     while join_set.join_next().await.is_some() {}
 }
 
+/// Backoff applied when `accept(2)` fails with a resource-exhaustion errno.
+/// Long enough to yield the CPU and let a descriptor or buffer be returned,
+/// short enough that throughput recovers promptly once pressure clears.
+#[cfg(unix)]
+pub(super) const ACCEPT_BACKOFF_ON_EXHAUSTION: Duration = Duration::from_millis(50);
+
+/// True if an `accept(2)` error is a transient resource-exhaustion condition
+/// (out of file descriptors or socket buffers). On these the pending
+/// connection stays in the kernel accept queue, so an immediate retry returns
+/// the same error and the loop busy-spins at 100% CPU while flooding the log.
+/// The fix is to back off briefly; the condition clears once an fd frees.
+///
+/// `ECONNABORTED` is deliberately excluded — there the client aborted before
+/// `accept` completed, the queue entry is consumed, and retrying immediately
+/// is correct (no spin).
+#[cfg(unix)]
+pub(super) fn is_accept_resource_exhaustion(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+    )
+}
+
 /// Validates a socket path: absolute, no `..`, no null bytes.
-/// Matches the same rules as `validate_path` in `wab/mod.rs`.
+///
+/// These are the same format rules as `config::validate_path_format_inner`
+/// (the config-layer check for `wab_dir`/`socket_path`). The two are kept
+/// deliberately separate — each guards its own trust boundary in its own layer
+/// — rather than merged into one shared helper. The shared test vector
+/// `crate::path_validation_test_vectors::CASES` runs both validators over the
+/// same accept/reject cases so their rules cannot silently drift apart.
 pub fn validate_socket_path(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
@@ -307,6 +376,12 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
     let dirfd = open_parent_dirfd(parent)?;
     let _dirfd_guard = OwnedDirFd(dirfd);
 
+    // The one irreducible bind(2)→fstatat race window (below) is fully closed
+    // only when the socket's parent directory is writable by the daemon user
+    // alone. Warn if it is group/world-writable (e.g. /tmp) so the operator can
+    // move the socket somewhere private — see docs/security/socket-bind.md.
+    warn_if_parent_world_writable(dirfd, parent);
+
     cleanup_existing_socket(dirfd, basename, path)?;
 
     // bind(2) does not follow a symlink at the final component for AF_UNIX
@@ -325,10 +400,16 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
     // other file-creation path in weir specifies its mode bits explicitly
     // (WAB segments 0o600, dirs 0o700), so the temporary tightening is
     // invisible to those paths. A tighter umask is also a safer default.
-    let saved_umask = umask_set(0o177);
-    let bind_result = UnixListener::bind(path);
-    let _ = umask_set(saved_umask);
-    let listener = bind_result?;
+    //
+    // The restore is RAII-guarded so an unwind (or the `?` below) between
+    // tightening and restoring cannot leak umask 0o177 process-wide, silently
+    // tightening every later file/dir creation (F30). The guard is scoped to
+    // this block so the umask is restored the instant bind returns — the
+    // fstatat checks that follow create nothing.
+    let listener = {
+        let _umask_guard = UmaskGuard(umask_set(0o177));
+        UnixListener::bind(path)?
+    };
 
     // Snapshot the inode bind created. The window between bind(2) and this
     // fstatat is the only un-closeable race window (Linux has no `bind_at`
@@ -503,6 +584,48 @@ fn stat_at_dir(dirfd: libc::c_int, basename: &std::ffi::OsStr) -> io::Result<lib
     Ok(st)
 }
 
+/// Warn if the socket's parent directory is group- or world-writable.
+///
+/// The hardened bind sequence closes every TOCTOU window it can, but the
+/// final `bind(2)`→`fstatat` gap is only fully closed when no other user can
+/// create entries in the parent directory. A group/world-writable parent
+/// (e.g. `/tmp`, mode 0o1777) leaves that gap exploitable. We can't refuse to
+/// start — operators legitimately place sockets under `/tmp` during
+/// development — but we surface it loudly so it's a deliberate choice.
+///
+/// `dirfd` is the parent directory fd already held by `bind_hardened`; we
+/// `fstat` it rather than re-resolving `parent` by path to avoid a fresh
+/// TOCTOU window. `fstat` is one of the few operations permitted on an
+/// `O_PATH` fd, so this works on Linux as well as the macOS `O_RDONLY` fallback.
+#[cfg(unix)]
+fn warn_if_parent_world_writable(dirfd: libc::c_int, parent: &Path) {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // Safety: dirfd is a valid directory fd held by the caller; &mut st is a
+    // writable libc::stat the kernel fills in.
+    let rc = unsafe { libc::fstat(dirfd, &mut st) };
+    if rc == 0 && is_group_or_other_writable(st.st_mode) {
+        // A sticky bit (e.g. /tmp's 0o1777) limits deletion to the owner but
+        // does NOT stop other users creating new entries, so the bind-race
+        // window stays open regardless. Mention it so the warning isn't
+        // dismissed as "but it has the sticky bit".
+        let sticky = (st.st_mode & libc::S_ISVTX) != 0;
+        warn!(
+            mode = format!("{:#o}", st.st_mode & 0o7777),
+            sticky,
+            parent = %parent.display(),
+            "socket parent directory is group/world-writable; the bind-time race \
+             window (see docs/security/socket-bind.md) is not fully closed — place \
+             the socket in a directory writable only by the daemon user",
+        );
+    }
+}
+
+/// True if `mode` grants write to group or other (the `0o020`/`0o002` bits).
+#[cfg(unix)]
+fn is_group_or_other_writable(mode: libc::mode_t) -> bool {
+    (mode & 0o022) != 0
+}
+
 /// RAII guard that closes a directory fd on drop. The dirfd is held only as
 /// long as the bind sequence; we don't keep it open after `run` returns.
 #[cfg(unix)]
@@ -517,6 +640,19 @@ impl Drop for OwnedDirFd {
                 libc::close(self.0);
             }
         }
+    }
+}
+
+/// RAII guard that restores the process umask on drop. Wraps the saved umask
+/// (the value returned by the tightening `umask_set`), so an unwind between
+/// tightening and restoring can't leak the tightened value process-wide (F30).
+#[cfg(unix)]
+struct UmaskGuard(libc::mode_t);
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        let _ = umask_set(self.0);
     }
 }
 
@@ -578,6 +714,27 @@ mod tests {
     #[test]
     fn validate_socket_path_accepts_valid_absolute() {
         assert!(validate_socket_path(Path::new("/run/weir/weir.sock")).is_ok());
+    }
+
+    #[test]
+    fn validate_socket_path_matches_shared_vector() {
+        // Drift guard: the same cases must produce the same accept/reject from
+        // config::validate_path_format_inner — see config's twin test.
+        for (path, should_pass) in crate::path_validation_test_vectors::CASES {
+            assert_eq!(
+                validate_socket_path(Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_socket_path({path:?})"
+            );
+        }
+        #[cfg(unix)]
+        for (path, should_pass) in crate::path_validation_test_vectors::UNIX_ONLY_CASES {
+            assert_eq!(
+                validate_socket_path(Path::new(path)).is_ok(),
+                *should_pass,
+                "validate_socket_path({path:?})"
+            );
+        }
     }
 
     // ── Hardened bind ─────────────────────────────────────────────────────────
@@ -692,6 +849,127 @@ mod tests {
             after_bind, 0o022,
             "bind_hardened must restore process umask to its pre-call value, got {after_bind:#o}"
         );
+    }
+
+    /// F30: the RAII guard restores the saved umask on drop, including the
+    /// unwind/early-return path that a bare save/restore statement would miss.
+    #[test]
+    #[cfg(unix)]
+    fn umask_guard_restores_on_drop() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Baseline 0o022.
+        unsafe {
+            libc::umask(0o022);
+        }
+        {
+            // Tighten to 0o177; the guard captures the returned 0o022.
+            let _guard = UmaskGuard(umask_set(0o177));
+            // Read the live umask without disturbing it (set to its own value).
+            let live = unsafe { libc::umask(0o177) };
+            assert_eq!(
+                live, 0o177,
+                "umask must be tightened while the guard is alive"
+            );
+        }
+        // Guard dropped → 0o022 restored. Read it back (and re-set to 0o022).
+        let after = unsafe { libc::umask(0o022) };
+        assert_eq!(
+            after, 0o022,
+            "UmaskGuard must restore the saved umask on drop, got {after:#o}"
+        );
+    }
+
+    /// F28: hardened shutdown removal unlinks a real socket via the dirfd path.
+    #[test]
+    #[cfg(unix)]
+    fn remove_socket_hardened_unlinks_a_socket() {
+        let path = tmp_socket_path("rm_sock");
+        std::fs::remove_file(&path).ok();
+        let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(path.exists());
+        remove_socket_hardened(&path);
+        assert!(!path.exists(), "hardened removal must unlink the socket");
+    }
+
+    /// F28: hardened removal refuses to unlink a non-socket entry (an attacker
+    /// swap), the same guard the startup cleanup applies.
+    #[test]
+    #[cfg(unix)]
+    fn remove_socket_hardened_refuses_non_socket() {
+        let path = tmp_socket_path("rm_nonsock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        remove_socket_hardened(&path); // logs, must not remove
+        assert!(
+            path.exists(),
+            "hardened removal must refuse a non-socket entry"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F28: a missing socket file is a no-op (clean shutdown after the file was
+    /// already removed out-of-band).
+    #[test]
+    #[cfg(unix)]
+    fn remove_socket_hardened_missing_is_noop() {
+        let path = tmp_socket_path("rm_missing");
+        std::fs::remove_file(&path).ok();
+        assert!(!path.exists());
+        remove_socket_hardened(&path); // must not panic
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_group_or_other_writable_classifies_modes() {
+        // Private modes: only the owner can write.
+        assert!(!is_group_or_other_writable(0o700));
+        assert!(!is_group_or_other_writable(0o755));
+        assert!(!is_group_or_other_writable(0o600));
+        // Group-writable.
+        assert!(is_group_or_other_writable(0o770));
+        assert!(is_group_or_other_writable(0o775));
+        // World-writable, including the /tmp sticky-bit mode.
+        assert!(is_group_or_other_writable(0o777));
+        assert!(is_group_or_other_writable(0o1777));
+        // The sticky/setuid/setgid bits alone (no write bits) are not writable.
+        assert!(!is_group_or_other_writable(0o1700));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn is_accept_resource_exhaustion_classifies_errnos() {
+        // Resource-exhaustion errnos warrant a backoff.
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(
+                is_accept_resource_exhaustion(&io::Error::from_raw_os_error(errno)),
+                "errno {errno} should back off"
+            );
+        }
+        // ECONNABORTED (client aborted pre-accept) and non-errno errors do not.
+        assert!(!is_accept_resource_exhaustion(
+            &io::Error::from_raw_os_error(libc::ECONNABORTED)
+        ));
+        assert!(!is_accept_resource_exhaustion(&io::Error::other(
+            "synthetic"
+        )));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_hardened_warns_but_succeeds_on_world_writable_parent() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // A 0o1777 (/tmp-like) parent leaves the bind race open. We warn, but
+        // must NOT fail the bind — operators legitimately use such directories.
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("weir_ww_parent_{}_{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let path = dir.join("weir.sock");
+        let listener = bind_hardened(&path).expect("bind must succeed despite loose parent");
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 //! Connects to a weir daemon's TCP+mTLS listener using the same aws-lc-rs
 //! provider and rustls 0.23 API that the server side uses.
 
-use std::{io::BufReader, net::TcpStream, path::Path, sync::Arc};
+use std::{io, io::BufReader, net::TcpStream, path::Path, sync::Arc, time::Duration};
 
 use rustls_pki_types::ServerName;
 use weir_core::Durability;
@@ -11,6 +11,10 @@ use weir_core::Durability;
 use crate::{ClientError, WeirClient};
 
 /// TLS configuration for [`WeirClient::connect_tls`].
+///
+/// `Debug`/`Clone` are safe to derive: every field is a path, a borrowed `str`,
+/// or a `Durability` — no key material, only filesystem paths (G16).
+#[derive(Debug, Clone)]
 pub struct ClientTlsConfig<'a> {
     /// Path to the PEM-encoded client certificate file.
     pub client_cert: &'a Path,
@@ -72,6 +76,20 @@ impl WeirClient<TlsStream> {
 
         Ok(Self::from_parts(stream, cfg.default_durability))
     }
+
+    /// Sets the read timeout on the underlying TCP socket. `None` (the default)
+    /// blocks indefinitely. Same opt-in availability rationale as the Unix
+    /// client's [`set_read_timeout`][WeirClient::set_read_timeout] — a wedged
+    /// daemon would otherwise block a producer forever in `read_response`.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.sock.set_read_timeout(timeout)
+    }
+
+    /// Sets the write timeout on the underlying TCP socket. `None` (the default)
+    /// blocks indefinitely. See [`set_read_timeout`][Self::set_read_timeout].
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.stream.sock.set_write_timeout(timeout)
+    }
 }
 
 // ── PEM helpers ────────────────────────────────────────────────────────────────
@@ -87,4 +105,47 @@ fn load_key(p: &Path) -> Result<rustls_pki_types::PrivateKeyDer<'static>, Client
     let mut rd = BufReader::new(std::fs::File::open(p)?);
     rustls_pemfile::private_key(&mut rd)?
         .ok_or_else(|| ClientError::Protocol("no private key in file".into()))
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+//
+// The full mTLS handshake round-trip (connect_tls against a live daemon,
+// cert-rejection paths, the timeout setters on a real TlsStream) is covered by
+// the `tls_listener` integration suite in weir-server/tests. These unit tests
+// cover the PEM-loader error mapping the integration suite can't easily hit
+// (G03).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_file(label: &str, contents: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("weir_tls_{label}_{}.pem", std::process::id()));
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_key_missing_file_is_io_error() {
+        let err = load_key(Path::new("/weir_no_such_key_xyzzy.pem")).unwrap_err();
+        assert!(matches!(err, ClientError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn load_certs_missing_file_is_io_error() {
+        let err = load_certs(Path::new("/weir_no_such_cert_xyzzy.pem")).unwrap_err();
+        assert!(matches!(err, ClientError::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn load_key_file_without_a_key_is_protocol_error() {
+        // A readable file that contains no PEM private key → the None branch maps
+        // to a clear Protocol error rather than a panic or a silent empty key.
+        let p = tmp_file("nokey", b"not a pem private key\n");
+        let err = load_key(&p).unwrap_err();
+        match err {
+            ClientError::Protocol(msg) => assert!(msg.contains("no private key"), "{msg}"),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+        std::fs::remove_file(&p).ok();
+    }
 }

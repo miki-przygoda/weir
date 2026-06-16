@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use prometheus_client::{encoding::text::encode, registry::Registry};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -16,6 +18,18 @@ use tokio::{
     sync::Semaphore,
     task::JoinHandle,
 };
+use tracing::debug;
+
+/// Backoff after an accept() error, to avoid a hot spin on a persistent
+/// condition (e.g. EMFILE) while keeping metrics exposition alive.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Per-connection I/O deadline for a scrape. A scrape is a single tiny request
+/// and a small response against a local Prometheus; anything slower than this is
+/// a stuck or slowloris peer. Bounding read+write stops such a peer from parking
+/// a handler (and its semaphore permit) forever — which would exhaust the small
+/// connection pool and blind monitoring until restart.
+const SCRAPE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawns the metrics HTTP server as a detached tokio task.
 ///
@@ -43,8 +57,18 @@ pub(crate) fn spawn(
 async fn serve(listener: TcpListener, registry: Arc<Registry>, max_connections: usize) {
     let semaphore = Arc::new(Semaphore::new(max_connections));
     loop {
-        let Ok((stream, _peer)) = listener.accept().await else {
-            return;
+        let (stream, _peer) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                // A transient accept error (ECONNABORTED, or resource exhaustion
+                // like EMFILE) must NOT take metrics exposition down permanently —
+                // the previous `else { return }` did exactly that. Log, back off
+                // briefly to avoid a hot spin on a persistent error, and continue;
+                // Prometheus retries on its next scrape regardless (G14).
+                debug!(error = %e, "metrics: accept error; backing off and continuing");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
         };
         // try_acquire_owned never blocks; if the cap is reached we drop the
         // connection immediately. Prometheus will retry on its next scrape
@@ -62,9 +86,16 @@ async fn serve(listener: TcpListener, registry: Arc<Registry>, max_connections: 
 }
 
 async fn handle(mut stream: TcpStream, registry: Arc<Registry>) {
-    // Drain the request headers (we don't inspect them — any path returns metrics).
+    // Drain the request headers (we don't inspect them — any path returns
+    // metrics). Bounded by SCRAPE_IO_TIMEOUT so a silent peer can't park this
+    // handler (and its semaphore permit) forever (F20).
     let mut buf = [0u8; 4096];
-    let _ = stream.read(&mut buf).await;
+    if tokio::time::timeout(SCRAPE_IO_TIMEOUT, stream.read(&mut buf))
+        .await
+        .is_err()
+    {
+        return; // request read timed out — drop the connection, releasing the permit
+    }
 
     // Encode the registry into the OpenMetrics text format.
     let mut body = String::new();
@@ -84,8 +115,13 @@ async fn handle(mut stream: TcpStream, registry: Arc<Registry>) {
         body_bytes.len()
     );
 
-    let _ = stream.write_all(response_head.as_bytes()).await;
-    let _ = stream.write_all(body_bytes).await;
+    // Bound the writes too: a peer that stops reading mid-response must not pin
+    // the handler/permit (F20).
+    let write = async {
+        stream.write_all(response_head.as_bytes()).await?;
+        stream.write_all(body_bytes).await
+    };
+    let _ = tokio::time::timeout(SCRAPE_IO_TIMEOUT, write).await;
 }
 
 #[cfg(test)]

@@ -1,3 +1,5 @@
+//! The [`NackReason`] byte that prefixes every Nack message payload.
+
 /// Reason byte carried as the first byte of every Nack message payload.
 /// Wire values are fixed and must not change without a WIRE_VERSION bump.
 ///
@@ -7,12 +9,37 @@
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NackReason {
+    /// Frame did not start with the `b"WEIR"` magic.
     BadMagic = 0x01,
+    /// Frame's version byte did not equal the daemon's `WIRE_VERSION`. The Nack
+    /// payload's second byte carries the daemon's version (see above).
     VersionMismatch = 0x02,
+    /// Header CRC32 did not match the header bytes.
     BadHeaderCrc = 0x03,
+    /// Declared `payload_len` exceeded the daemon's effective cap.
     PayloadTooLarge = 0x04,
+    /// Payload CRC32 did not match the payload bytes.
     BadPayloadCrc = 0x05,
+    /// The daemon hit an internal error (e.g. queue saturation); transient.
     InternalError = 0x06,
+    /// The push carried a zero-length payload, which the WAB cannot represent:
+    /// an empty record's length prefix is four zero bytes, identical to the
+    /// end-of-records sentinel, so storing one would truncate the segment.
+    /// Rejected at ingest.
+    EmptyPayload = 0x07,
+    /// The frame's header was structurally valid (magic, version, and header CRC
+    /// all passed) but carried a `message_type` or `durability` byte this daemon
+    /// does not recognise — a PERMANENT client protocol error (typically version
+    /// skew). Distinct from `InternalError` (a transient daemon-side condition
+    /// that keeps the connection open): the daemon closes the connection after
+    /// this Nack. Retrying the identical frame will not succeed (F25).
+    UnknownMessage = 0x08,
+    /// The frame's header was structurally valid but set one or more bits in the
+    /// reserved `flags` byte, which must be zero in wire v1. A daemon rejects
+    /// such a frame rather than silently ignoring a flag it does not understand
+    /// (which could mean a producer believed a semantic flag took effect when it
+    /// did not). Permanent; the daemon closes the connection (F52).
+    ReservedFlagsSet = 0x09,
 }
 
 /// Error returned when a `u8` does not map to a known `NackReason` variant.
@@ -39,6 +66,9 @@ impl TryFrom<u8> for NackReason {
             0x04 => Ok(NackReason::PayloadTooLarge),
             0x05 => Ok(NackReason::BadPayloadCrc),
             0x06 => Ok(NackReason::InternalError),
+            0x07 => Ok(NackReason::EmptyPayload),
+            0x08 => Ok(NackReason::UnknownMessage),
+            0x09 => Ok(NackReason::ReservedFlagsSet),
             v => Err(UnknownNackReason(v)),
         }
     }
@@ -72,12 +102,25 @@ mod tests {
             NackReason::try_from(0x06).unwrap(),
             NackReason::InternalError
         );
+        assert_eq!(
+            NackReason::try_from(0x07).unwrap(),
+            NackReason::EmptyPayload
+        );
+        assert_eq!(
+            NackReason::try_from(0x08).unwrap(),
+            NackReason::UnknownMessage
+        );
+        assert_eq!(
+            NackReason::try_from(0x09).unwrap(),
+            NackReason::ReservedFlagsSet
+        );
     }
 
     #[test]
     fn try_from_returns_unknown_for_unrecognised_byte() {
-        let err = NackReason::try_from(0x07).unwrap_err();
-        assert_eq!(err.0, 0x07);
+        // 0x0A is the first unassigned reason byte (0x01..=0x09 are known).
+        let err = NackReason::try_from(0x0A).unwrap_err();
+        assert_eq!(err.0, 0x0A);
         let err = NackReason::try_from(0x00).unwrap_err();
         assert_eq!(err.0, 0x00);
         let err = NackReason::try_from(0xff).unwrap_err();
@@ -92,6 +135,9 @@ mod tests {
         assert_eq!(NackReason::PayloadTooLarge as u8, 0x04);
         assert_eq!(NackReason::BadPayloadCrc as u8, 0x05);
         assert_eq!(NackReason::InternalError as u8, 0x06);
+        assert_eq!(NackReason::EmptyPayload as u8, 0x07);
+        assert_eq!(NackReason::UnknownMessage as u8, 0x08);
+        assert_eq!(NackReason::ReservedFlagsSet as u8, 0x09);
     }
 
     /// Verifies the VersionMismatch Nack payload is [reason_byte, daemon_version_byte].

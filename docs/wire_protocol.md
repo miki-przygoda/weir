@@ -6,7 +6,7 @@ weir uses a binary framing protocol over Unix sockets. Each frame is a fixed 16-
 
 The `WIRE_VERSION` constant in `weir-core::version` is the single source of truth. Version negotiation is strict-equality: no forward or backward compatibility across versions. A future-version frame is not silently parsed as v1 — only `version == WIRE_VERSION` is accepted. This is intentional: silently parsing a v2 frame as v1 would corrupt the record when the v2 layout differs.
 
-The payload is opaque bytes to weir. `weir-core` exposes `pub type Payload = Vec<u8>`. Producers choose their own serialisation format (protobuf, bincode, raw, etc.).
+The payload is opaque bytes to weir. `weir-core` exposes `Payload`, a newtype over ref-counted `bytes::Bytes` that derefs to `[u8]` (so clones through the drain are O(1)). Producers choose their own serialisation format (protobuf, bincode, raw, etc.).
 
 ---
 
@@ -70,6 +70,27 @@ Byte 1: (VersionMismatch only) daemon's WIRE_VERSION
 | 0x04 | PayloadTooLarge   | none                                 |
 | 0x05 | BadPayloadCrc     | none                                 |
 | 0x06 | InternalError     | none                                 |
+| 0x07 | EmptyPayload      | none                                 |
+| 0x08 | UnknownMessage    | none                                 |
+| 0x09 | ReservedFlagsSet  | none                                 |
+
+Reason bytes `0x0A`–`0xFF` are reserved for future use; a client that receives
+an unrecognised reason byte should surface it (e.g. log the raw byte) rather
+than assume a specific meaning.
+
+`UnknownMessage` (`0x08`) is sent when a frame's header passes magic / version /
+header-CRC validation but carries a `message_type` or `durability` byte the
+daemon does not recognise — a **permanent** protocol error (typically version
+skew). It is distinct from `InternalError`: the daemon **closes** the connection
+after it, and retrying the identical frame will not succeed.
+
+`ReservedFlagsSet` (`0x09`) is sent when a frame's header is otherwise valid but
+sets one or more bits in the reserved `flags` byte (byte 7), which **must be
+zero** in wire v1. The daemon rejects such a frame rather than silently ignoring
+the flag — a producer must never believe an unrecognised flag took effect. Like
+`UnknownMessage` this is **permanent** and the daemon **closes** the connection
+after it. Introducing flag semantics in a future version is therefore an
+explicit, `WIRE_VERSION`-gated change.
 
 The `VersionMismatch` second byte lets a client produce a specific error:
 > "daemon is on wire protocol v1; this client is built against v2 — upgrade the daemon or downgrade the client."
@@ -86,6 +107,26 @@ The server decodes in this order to minimise DoS surface. **This order is mandat
 4. **Payload length cap** — `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)` checked **before any heap allocation**. Exceeding the cap returns `PayloadTooLarge` and closes the connection without reading the payload bytes.
 5. **Payload read** — only after the cap check passes.
 6. **Payload CRC** — validates the payload bytes before the record is queued.
+
+The daemon reads the header and payload separately (it knows `payload_len` from
+the header before reading the payload), so it always consumes exactly one frame
+off the wire. Framing is the reader's responsibility.
+
+### Reference codec: one buffer, one frame
+
+The `weir-core` reference codec (`Envelope::decode`, the executable definition of
+this format) requires its input buffer to be **exactly one frame** —
+`HEADER_LEN + payload_len + 4` bytes:
+
+- a shorter buffer is rejected as `TruncatedFrame`;
+- a longer buffer is rejected as `TrailingBytes` (carrying the excess length).
+
+It does **not** decode the first frame and discard the remainder. An
+implementation that reads from a stream must therefore frame the bytes itself
+(read the 16-byte header, take `payload_len`, then read exactly
+`payload_len + 4` more bytes) rather than handing a multi-frame buffer to a
+single decode call. This keeps a desynced or concatenated stream from silently
+losing records (G18).
 
 ---
 
@@ -155,6 +196,8 @@ fresh connection.
 | Push with bad header CRC | closed after Nack(BadHeaderCrc) |
 | Push with `payload_len > cap` | closed after Nack(PayloadTooLarge) |
 | Push with bad payload CRC | closed after Nack(BadPayloadCrc) |
+| Push with unknown message_type / durability | closed after Nack(UnknownMessage) |
+| Push with a nonzero reserved `flags` byte | closed after Nack(ReservedFlagsSet) |
 | Idle past `connection_read_timeout_secs` mid-frame | closed silently (slowloris guard); no Nack |
 
 Validation-failure closes are deliberate — once the framing has
@@ -286,6 +329,15 @@ Run `cargo test -p weir-core --test reference_frames` to confirm a
 local build matches the published wire format. Implementers of
 non-Rust clients can copy the constants directly to verify their
 encoders.
+
+For a complete, **language-neutral** suite — covering every message
+type, all nine Nack reason bytes, and one rejection vector per decode
+error (bad magic, version mismatch, bad CRC, oversize payload,
+truncation, reserved flags, trailing bytes, …) — see
+[`conformance.md`](conformance.md) and the machine-readable
+[`conformance/wire_v1_vectors.json`](conformance/wire_v1_vectors.json).
+weir's own decoder is checked against that file by
+`cargo test -p weir-core --test conformance`.
 
 ---
 

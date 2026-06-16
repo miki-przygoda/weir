@@ -1437,4 +1437,58 @@ mod tests {
                 .run();
         }
     }
+
+    // ── Property-based fault-list exploration ──────────────────────────────────
+    //
+    // The seed sweep above varies the *seed* (payloads + interleavings) under a
+    // fixed per-scenario fault. proptest instead varies the *fault list* itself
+    // — a list of durability-barrier faults at arbitrary record positions — and,
+    // crucially, SHRINKS any failure to a minimal (seed, fault-list, records)
+    // reproducer. The durability invariant is asserted inside `SimSpec::run`
+    // (`assert_invariant` panics with a seed repro on violation), which is
+    // exactly the signal proptest needs: a clean run = the invariant held for
+    // that case; a panic = proptest minimises the inputs and prints the smallest
+    // counterexample. No bug exists today, so this is a standing guard that
+    // auto-minimises the day a regression reintroduces one.
+    mod proptest_faults {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Faults that act on the bare SyncFlush durability path. `PanicOnFsync`
+        /// is deliberately excluded — it belongs to the panic-supervised
+        /// scenario; in SyncFlush its panic would propagate as a (spurious) test
+        /// failure rather than exercise the no-false-ack invariant. `nth` ranges
+        /// past the largest record count we generate; a fault whose `nth` never
+        /// fires is simply a no-op, which keeps the strategy independent of the
+        /// generated record count.
+        fn sync_flush_fault() -> impl Strategy<Value = Fault> {
+            prop_oneof![
+                (1u64..=8).prop_map(|nth| Fault::FsyncReturns { nth }),
+                (1u64..=8).prop_map(|nth| Fault::ShortWriteOn { nth }),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            /// "An ack is never a false ack" (I1) holds for SyncFlush under any
+            /// combination of up to three durability-barrier faults. proptest
+            /// shrinks any violation to a minimal reproducer.
+            #[test]
+            fn sync_flush_never_false_acks_under_arbitrary_faults(
+                seed in any::<u64>(),
+                records in 1usize..=8,
+                faults in prop::collection::vec(sync_flush_fault(), 0..=3),
+            ) {
+                // run() asserts I1 in-harness; a violation panics and proptest
+                // minimises (seed, faults, records).
+                SimSpec {
+                    seed,
+                    scenario: Scenario::SyncFlush { records },
+                    faults,
+                }
+                .run();
+            }
+        }
+    }
 }

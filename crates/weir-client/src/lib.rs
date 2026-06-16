@@ -15,6 +15,7 @@
 //! client.push(b"hello world", Durability::Batched).unwrap();
 //! # }
 //! ```
+#![deny(missing_docs)]
 
 #[cfg(unix)]
 mod unix;

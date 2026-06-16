@@ -1,3 +1,6 @@
+//! Wire-protocol version and the absolute payload-size ceiling — the protocol
+//! constants every layer shares.
+
 /// Current wire protocol version. Strict equality is enforced on decode — no forward compatibility.
 /// Incrementing this value is a breaking change: all clients must be updated before the daemon.
 pub const WIRE_VERSION: u8 = 1;

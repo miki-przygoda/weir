@@ -11,11 +11,13 @@
 
 - [Configuration reference](operations/configuration.md)
 - [TCP + mutual TLS](operations/tcp-mtls.md)
+- [Monitoring](monitoring.md)
 
 # Protocol
 
 - [Wire protocol](wire_protocol.md)
 - [WAB on-disk format](wab_format.md)
+- [Conformance vectors](conformance.md)
 
 # Architecture
 

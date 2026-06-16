@@ -51,6 +51,9 @@ pub enum NackReason {
     payload_too_large,
     bad_payload_crc,
     internal_error,
+    empty_payload,
+    unknown_message,
+    reserved_flags_set,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -170,6 +173,13 @@ pub(crate) struct Metrics {
     /// healthy deployment; non-zero suggests an attempted bypass of the
     /// socket file's mode bits or a misconfigured producer.
     pub connection_rejected_peer_uid: Counter<u64, AtomicU64>,
+    /// Counts `accept(2)` failures due to resource exhaustion (EMFILE/ENFILE/
+    /// ENOBUFS/ENOMEM). On these the accept loop backs off briefly before
+    /// retrying, because the pending connection stays in the kernel queue and
+    /// an immediate retry would busy-spin. A rising value means the daemon is
+    /// out of file descriptors or socket buffers — raise the fd ulimit or
+    /// lower `max_connections`.
+    pub accept_resource_exhaustion: Counter<u64, AtomicU64>,
     /// Counts in-flight connections that were force-aborted because they
     /// didn't drain within `shutdown_timeout_secs`. Each aborted connection
     /// may correspond to a push whose record was written to the WAB but
@@ -208,6 +218,11 @@ pub(crate) struct Metrics {
     /// restarts — any non-zero value requires operator attention. Check logs
     /// for the shard_id and panic payload.
     pub wab_flusher_panics: Counter<u64, AtomicU64>,
+    /// weir-drain thread panics caught and respawned by its supervisor. Sustained
+    /// values indicate a logic bug in the sink/drain path; if the supervisor
+    /// exhausts its respawn budget, delivery stops and the WAB accumulates on disk
+    /// until the daemon restarts.
+    pub drain_panics: Counter<u64, AtomicU64>,
     /// fsync / fdatasync calls that returned an error. A non-zero value is a
     /// durability hazard: the kernel buffered the write but couldn't push it
     /// to stable storage. Producers whose records were in the failed fsync
@@ -259,6 +274,15 @@ pub(crate) struct Metrics {
 /// Latency histogram buckets covering 1 ms–1 s; suitable for fsync and network round-trips.
 const LATENCY_BUCKETS: &[f64] = &[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
 
+/// Buckets for `accept_latency`, which measures only accept→semaphore→spawn —
+/// microsecond-scale CPU work that would all land in LATENCY_BUCKETS' first
+/// (1 ms) bucket, making the histogram useless (F22). Spans 10 µs–10 ms so the
+/// distribution is actually visible; always compiled (unlike the bench-trace
+/// STAGE_BUCKETS).
+const ACCEPT_BUCKETS: &[f64] = &[
+    0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250, 0.000_500, 0.001, 0.0025, 0.005, 0.01,
+];
+
 /// Finer buckets for the per-stage breakdown — queue/write stages are tens of
 /// microseconds, far below LATENCY_BUCKETS' 1 ms floor. Only used under bench-trace.
 #[cfg(feature = "bench-trace")]
@@ -299,15 +323,16 @@ impl Metrics {
             "Total records rejected (Nack), by durability tier and rejection reason"
         );
         let accept_latency = reg!(
-            Histogram::new(LATENCY_BUCKETS.iter().copied()),
+            Histogram::new(ACCEPT_BUCKETS.iter().copied()),
             "weir_accept_latency_seconds",
             "Wall-clock time from socket accept to spawn of the connection handler"
         );
         let connection_idle_timeout = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_connection_idle_timeout",
-            "Connections dropped because the handler sat in read_exact longer than \
-             connection_read_timeout_secs without receiving the next byte"
+            "Connections dropped because a frame read phase (header, payload, or CRC) \
+             exceeded connection_read_timeout_secs — whether the client was idle or \
+             merely streaming pathologically slowly"
         );
         let connection_rejected_peer_uid = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -315,6 +340,13 @@ impl Metrics {
             "Connections refused by the peer-credential check (peer uid != daemon uid, \
              or credential lookup failed). Any non-zero value suggests an attempted \
              bypass of the socket file's 0o600 mode or a misconfigured producer."
+        );
+        let accept_resource_exhaustion = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_accept_resource_exhaustion",
+            "accept(2) failures due to resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM). \
+             The accept loop backs off briefly on each. A rising value means the daemon is \
+             out of file descriptors or socket buffers."
         );
         let connections_aborted_at_shutdown = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -363,6 +395,14 @@ impl Metrics {
              (records routed to it receive Nack(InternalError)) until the daemon \
              restarts. Any non-zero value requires operator attention; check logs \
              for the shard_id and panic payload."
+        );
+        let drain_panics = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_panics",
+            "weir-drain thread panics caught and respawned by its supervisor. \
+             Sustained values indicate a logic bug in the sink/drain path; if the \
+             supervisor exhausts its respawn budget, delivery stops and the WAB \
+             accumulates on disk until restart."
         );
         let wab_fsync_failures = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -466,6 +506,7 @@ impl Metrics {
             accept_latency,
             connection_idle_timeout,
             connection_rejected_peer_uid,
+            accept_resource_exhaustion,
             connections_aborted_at_shutdown,
             ack_timeout,
             tls_handshake_failures,
@@ -474,6 +515,7 @@ impl Metrics {
             wab_bytes_on_disk,
             wab_fsync_duration,
             wab_flusher_panics,
+            drain_panics,
             wab_fsync_failures,
             sink_commit_duration,
             sink_commit_records,

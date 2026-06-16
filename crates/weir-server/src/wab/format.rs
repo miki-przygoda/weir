@@ -55,6 +55,7 @@
 //! If the WAB is on a network filesystem or shared storage, the security model
 //! does not hold. This is an explicit assumption, not a weakness to be fixed.
 
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Identifies a WAB segment file. Distinct from `weir-core`'s wire magic `b"WEIR"` —
@@ -87,6 +88,17 @@ pub const EXT_ACTIVE: &str = ".wab";
 pub const EXT_SEALED: &str = ".wab.sealed";
 /// Extension for confirmation files.
 pub const EXT_CONFIRMED: &str = ".wab.confirmed";
+
+/// Derives the `.wab.confirmed` sidecar path from a `.wab.sealed` path by
+/// swapping the extension. The single source of truth for the sealed→confirmed
+/// name mapping — the drain writes the sidecar and recovery reads it, so the
+/// two MUST agree exactly. Kept here because this module owns the extension
+/// constants. (`pub` to match the rest of this facade module — see lib.rs.)
+pub fn confirmed_path_for(sealed: &Path) -> PathBuf {
+    let s = sealed.to_string_lossy();
+    let base = s.strip_suffix(EXT_SEALED).unwrap_or(&s);
+    PathBuf::from(format!("{base}{EXT_CONFIRMED}"))
+}
 
 /// Returns unix nanoseconds as `i64`. Overflows after year 2262; on overflow returns
 /// `i64::MAX` rather than wrapping silently (the `as i64` cast would wrap to negative).
@@ -288,5 +300,19 @@ mod tests {
     #[test]
     fn unix_nanos_now_is_positive() {
         assert!(unix_nanos_now() > 0);
+    }
+
+    #[test]
+    fn confirmed_path_for_swaps_sealed_extension() {
+        assert_eq!(
+            confirmed_path_for(Path::new("/var/lib/weir/shard_00/seg_00000001.wab.sealed")),
+            Path::new("/var/lib/weir/shard_00/seg_00000001.wab.confirmed"),
+        );
+        // No `.wab.sealed` suffix → the confirmed extension is appended as-is
+        // (the `unwrap_or` fallback), matching both call sites byte-for-byte.
+        assert_eq!(
+            confirmed_path_for(Path::new("/x/odd_name")),
+            Path::new("/x/odd_name.wab.confirmed"),
+        );
     }
 }

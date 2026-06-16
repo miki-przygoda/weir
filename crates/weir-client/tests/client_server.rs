@@ -20,7 +20,7 @@ mod tests {
     };
 
     use weir_client::{ClientError, WeirClient};
-    use weir_core::{Durability, HEADER_LEN, Header, MessageType, NackReason};
+    use weir_core::{Durability, Envelope, HEADER_LEN, Header, MessageType, NackReason};
 
     // ── Mock server helpers ───────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ mod tests {
         }
 
         let header = Header::decode(&header_buf).expect("mock server: decode header");
-        let payload_len = header.payload_len as usize;
+        let payload_len = header.payload_len() as usize;
 
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
@@ -62,31 +62,32 @@ mod tests {
             .read_exact(&mut crc_buf)
             .expect("mock server: read CRC");
 
-        Some((header.message_type, payload))
+        Some((header.message_type(), payload))
     }
 
     /// Writes an Ack frame (empty payload) to `stream`.
     fn write_ack(stream: &mut UnixStream) {
-        let header = Header::new(MessageType::Ack, Durability::Sync, 0, 0).encode();
+        let header = Header::new(MessageType::Ack, Durability::Sync, 0).encode();
         let crc = crc32fast::hash(&[]).to_le_bytes();
         stream.write_all(&header).unwrap();
         stream.write_all(&crc).unwrap();
     }
 
-    /// Writes a Nack frame with `reason` to `stream`.
+    /// Writes a Nack frame with `reason` to `stream`. Built via Envelope so the
+    /// header's payload_len matches the 1-byte reason payload (Header::new no
+    /// longer takes a length — F50).
     fn write_nack(stream: &mut UnixStream, reason: NackReason) {
-        let payload = [reason as u8];
-        let header =
-            Header::new(MessageType::Nack, Durability::Sync, 0, payload.len() as u32).encode();
-        let crc = crc32fast::hash(&payload).to_le_bytes();
-        stream.write_all(&header).unwrap();
-        stream.write_all(&payload).unwrap();
-        stream.write_all(&crc).unwrap();
+        let frame = Envelope::new(
+            Header::new(MessageType::Nack, Durability::Sync, 0),
+            vec![reason as u8],
+        )
+        .encode();
+        stream.write_all(&frame).unwrap();
     }
 
     /// Writes a HealthCheckResponse frame to `stream`.
     fn write_health_check_response(stream: &mut UnixStream) {
-        let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0, 0).encode();
+        let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0).encode();
         let crc = crc32fast::hash(&[]).to_le_bytes();
         stream.write_all(&header).unwrap();
         stream.write_all(&crc).unwrap();
