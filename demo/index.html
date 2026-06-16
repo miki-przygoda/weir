@@ -186,7 +186,7 @@
       </div>
       <div class="stat">
         <span class="k">crash safety</span>
-        <span class="v"><b class="em" id="wLost">0</b> lost <span class="note" id="wLostNote">— acked records replay from the WAB</span></span>
+        <span class="v">lost <b class="lat" id="wLost">0</b> · recovered <b class="em" id="wRecov">0</b> <span class="note" id="wLostNote">— acked records replay from the WAB</span></span>
       </div>
     </div>
   </div>
@@ -288,7 +288,7 @@
   const drainQueue = [];        // {ids, durable, phase, p}
   const spawnQueue = [];
   let spawnAcc = 0;
-  const metrics = { latN:[], latW:[], e2eN:[], e2eW:[], comN:0, comW:0, ackN:0, ackW:0, lostW:0, crashed:false };
+  const metrics = { latN:[], latW:[], e2eN:[], e2eW:[], comN:0, comW:0, ackN:0, ackW:0, lostW:0, safeW:0, recovered:false, crashed:false };
 
   // ---- helpers ----
   const $ = id => document.getElementById(id);
@@ -415,21 +415,25 @@
     for(const r of records){
       if(r.lane==="weir" && !r.done && (r.stage==="socket"||r.stage==="wab"||r.stage==="fsync")) markInflightLost(r);
     }
-    log(`*** weir daemon DOWN. ${wab.length} durable record(s) safe in the WAB; naive lane unaffected. ***`, "ev-crash");
+    // durable records that survive in the WAB (held in the holding pen + any already
+    // in a sealed segment heading to the sink) — these replay on restart.
+    metrics.safeW = wab.length + drainQueue.reduce((s,b)=> s + (b.done?0:b.ids.length), 0);
+    metrics.recovered = false;
+    log(`*** weir daemon DOWN. ${metrics.safeW} durable record(s) safe in the WAB; naive lane unaffected. ***`, "ev-crash");
     if(lostBuffered>0) log(`lost ${lostBuffered} Buffered record(s): acked but in the not-yet-fsynced window`, "ev-loss");
   }
   function restart(){
     if(daemonUp) return;
-    daemonUp=true; $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
-    const recovered = wab.length;
+    daemonUp=true; metrics.recovered=true;
+    $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
     log(`daemon restarting — scanning WAB for unconfirmed segments…`, "ev-recover");
-    if(recovered>0){ log(`recovered ${recovered} durable record(s) from ${Math.ceil(recovered/BATCH_SIZE)||1} unconfirmed segment(s); replaying`, "ev-recover"); batchTimer = tNow + 200; }
+    if(metrics.safeW>0){ log(`recovered ${metrics.safeW} durable record(s) from ${Math.ceil(wab.length/BATCH_SIZE)||1} unconfirmed segment(s); replaying`, "ev-recover"); batchTimer = tNow + 200; }
     else log(`no unconfirmed segments — clean restart`, "ev-recover");
   }
   function reset(){
     records.length=0; wab.length=0; drainQueue.length=0; spawnQueue.length=0;
     batchTimer=null; spawnAcc=0; recId=0;
-    Object.assign(metrics,{latN:[],latW:[],e2eN:[],e2eW:[],comN:0,comW:0,ackN:0,ackW:0,lostW:0,crashed:false});
+    Object.assign(metrics,{latN:[],latW:[],e2eN:[],e2eW:[],comN:0,comW:0,ackN:0,ackW:0,lostW:0,safeW:0,recovered:false,crashed:false});
     daemonUp=true; streaming=false;
     $("stream").classList.remove("on"); $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
     $("log").innerHTML=""; log("reset.");
@@ -531,9 +535,12 @@
     $("wCom").textContent=metrics.comW;
     $("wRatio").textContent = metrics.comW>0 ? `— ${metrics.ackW} records → ${metrics.comW} commit${metrics.comW>1?"s":""} (${(metrics.ackW/metrics.comW).toFixed(1)}:1)` : "— batched N→1";
     $("wLost").textContent=metrics.lostW;
-    $("wLostNote").textContent = metrics.crashed
-      ? (metrics.lostW===0 ? "— acked (Sync/Batched) recovered on restart" : "— Buffered window only; Sync/Batched recovered")
-      : "— acked records replay from the WAB";
+    $("wRecov").textContent=metrics.recovered ? metrics.safeW : 0;
+    $("wLostNote").textContent = !metrics.crashed
+      ? "— acked records replay from the WAB"
+      : (!metrics.recovered
+          ? `— ${metrics.safeW} durable held in WAB; press Restart to replay${metrics.lostW?" · Buffered window lost":""}`
+          : `— ${metrics.safeW} durable replayed${metrics.lostW?` · ${metrics.lostW} Buffered-window record(s) lost for good`:""}`);
   }
 
   function frame(ts){
