@@ -14,13 +14,12 @@ all-features = true
 
 [features]
 default = []
-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]
+tls = ["dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
 weir-core = { path = "../weir-core", version = "1.0.0" }
 crc32fast = "1"
 rustls = { version = "0.23", optional = true }
-rustls-pemfile = { version = "2", optional = true }
 rustls-pki-types = { version = "1", optional = true }
 
 [dev-dependencies]

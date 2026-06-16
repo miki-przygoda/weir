@@ -7,7 +7,7 @@
 //!
 //! Crypto provider: aws-lc-rs, explicitly, to match the rest of the workspace.
 
-use std::{fs::File, io::BufReader, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use arc_swap::ArcSwap;
 use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
@@ -41,18 +41,18 @@ impl std::fmt::Display for TlsConfigError {
 impl std::error::Error for TlsConfigError {}
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsConfigError> {
+    use rustls_pki_types::pem::PemObject;
     let p = path.display().to_string();
-    let file = File::open(path).map_err(|source| TlsConfigError::Io {
+    // Read the file ourselves so a missing/unreadable file stays a clean Io error;
+    // parse the PEM via rustls-pki-types (S16 — off the unmaintained
+    // rustls-pemfile).
+    let pem = std::fs::read(path).map_err(|source| TlsConfigError::Io {
         path: p.clone(),
         source,
     })?;
-    let mut rd = BufReader::new(file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut rd)
+    let certs: Vec<_> = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
-        .map_err(|source| TlsConfigError::Io {
-            path: p.clone(),
-            source,
-        })?;
+        .map_err(|_| TlsConfigError::NoCertsFound(p.clone()))?;
     if certs.is_empty() {
         return Err(TlsConfigError::NoCertsFound(p));
     }
@@ -60,18 +60,13 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsConfigErro
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
+    use rustls_pki_types::pem::PemObject;
     let p = path.display().to_string();
-    let file = File::open(path).map_err(|source| TlsConfigError::Io {
+    let pem = std::fs::read(path).map_err(|source| TlsConfigError::Io {
         path: p.clone(),
         source,
     })?;
-    let mut rd = BufReader::new(file);
-    rustls_pemfile::private_key(&mut rd)
-        .map_err(|source| TlsConfigError::Io {
-            path: p.clone(),
-            source,
-        })?
-        .ok_or(TlsConfigError::NoPrivateKey(p))
+    PrivateKeyDer::from_pem_slice(&pem).map_err(|_| TlsConfigError::NoPrivateKey(p))
 }
 
 /// Build a rustls `ServerConfig` that requires mutual TLS.

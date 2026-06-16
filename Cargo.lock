@@ -3071,7 +3071,6 @@ dependencies = [
  "crc32fast",
  "proptest",
  "rustls",
- "rustls-pemfile",
  "rustls-pki-types",
  "weir-core",
 ]
@@ -3113,7 +3112,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
- "rustls-pemfile",
  "rustls-pki-types",
  "serde",
  "serde_json",

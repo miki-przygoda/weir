@@ -31,15 +31,17 @@ use weir_testkit::{tls::TlsFixture, weir_server};
 // ── PEM loading ────────────────────────────────────────────────────────────────
 
 fn load_certs(path: &std::path::Path) -> Vec<rustls_pki_types::CertificateDer<'static>> {
-    let mut rd = std::io::BufReader::new(std::fs::File::open(path).unwrap());
-    rustls_pemfile::certs(&mut rd)
+    use rustls_pki_types::pem::PemObject;
+    let pem = std::fs::read(path).unwrap();
+    rustls_pki_types::CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
         .unwrap()
 }
 
 fn load_key(path: &std::path::Path) -> rustls_pki_types::PrivateKeyDer<'static> {
-    let mut rd = std::io::BufReader::new(std::fs::File::open(path).unwrap());
-    rustls_pemfile::private_key(&mut rd).unwrap().unwrap()
+    use rustls_pki_types::pem::PemObject;
+    let pem = std::fs::read(path).unwrap();
+    rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem).unwrap()
 }
 
 fn root_store(ca_path: &std::path::Path) -> RootCertStore {

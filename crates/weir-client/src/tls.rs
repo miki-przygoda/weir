@@ -3,7 +3,7 @@
 //! Connects to a weir daemon's TCP+mTLS listener using the same aws-lc-rs
 //! provider and rustls 0.23 API that the server side uses.
 
-use std::{io, io::BufReader, net::TcpStream, path::Path, sync::Arc, time::Duration};
+use std::{io, net::TcpStream, path::Path, sync::Arc, time::Duration};
 
 use rustls_pki_types::ServerName;
 use weir_core::Durability;
@@ -95,16 +95,23 @@ impl WeirClient<TlsStream> {
 // ── PEM helpers ────────────────────────────────────────────────────────────────
 
 fn load_certs(p: &Path) -> Result<Vec<rustls_pki_types::CertificateDer<'static>>, ClientError> {
-    let mut rd = BufReader::new(std::fs::File::open(p)?);
-    rustls_pemfile::certs(&mut rd)
+    use rustls_pki_types::pem::PemObject;
+    // Read the file ourselves so a missing/unreadable file stays a clean
+    // ClientError::Io; parse the PEM via rustls-pki-types (S16 — off the
+    // unmaintained rustls-pemfile).
+    let pem = std::fs::read(p)?;
+    rustls_pki_types::CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
-        .map_err(ClientError::from)
+        .map_err(|e| {
+            ClientError::Protocol(format!("invalid certificate PEM in {}: {e}", p.display()))
+        })
 }
 
 fn load_key(p: &Path) -> Result<rustls_pki_types::PrivateKeyDer<'static>, ClientError> {
-    let mut rd = BufReader::new(std::fs::File::open(p)?);
-    rustls_pemfile::private_key(&mut rd)?
-        .ok_or_else(|| ClientError::Protocol("no private key in file".into()))
+    use rustls_pki_types::pem::PemObject;
+    let pem = std::fs::read(p)?;
+    rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem)
+        .map_err(|e| ClientError::Protocol(format!("no private key in file {}: {e}", p.display())))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
