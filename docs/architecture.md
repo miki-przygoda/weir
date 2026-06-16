@@ -21,10 +21,7 @@ Work queue            (bounded MPMC, src/queue.rs)
   │  crossbeam_channel, QUEUE_CAPACITY = 65 536
   ▼
 Worker pool           (std::thread, src/worker.rs)
-  │  per-shard Batch channels (Vec<WorkUnit>)
-  ▼
-Bridge threads        (std::thread, src/main.rs)   [one per shard]
-  │  WorkUnit → WabRecord (direct field mapping; shared ack type)
+  │  per-shard Batch channel (crossbeam Sender<Batch>) — direct, no bridge hop
   ▼
 WAB flusher threads   (std::thread, src/wab/)
   │  per-shard segment files
@@ -42,9 +39,9 @@ Dead-letter writer    (src/drain/dead_letter.rs)   [on permanent rejection]
 
 ### Runtime boundary
 
-The socket layer is async (tokio). Everything downstream runs on `std::thread` with blocking I/O. The only async/sync crossing is `task::spawn_blocking` in `handle_connection`, which moves the blocking `push_timeout` call onto tokio's blocking thread pool.
+The socket layer is async (tokio). Everything downstream runs on `std::thread` with blocking I/O. The async/sync crossing is the enqueue in `handle_connection`: the common path is a lock-free `queue_tx.try_push(...)` that returns immediately without leaving the async task. Only when the shard partition is full does it fall back to `task::spawn_blocking`, which moves the blocking `push_timeout` call (with the queue-push timeout) onto tokio's blocking thread pool so the async worker is never parked on a full queue.
 
-Under sustained load, if every active connection is simultaneously blocked waiting for a queue slot, all `spawn_blocking` threads fill up and new connections stall at the socket layer. `max_connections` must therefore be ≤ the tokio blocking thread pool limit (default: 512).
+Under sustained load, if every active connection is simultaneously blocked in that `spawn_blocking` fallback waiting for a queue slot, all blocking threads fill up and new connections stall at the socket layer. `max_connections` must therefore be ≤ the tokio blocking thread pool limit (default: 512).
 
 ---
 
@@ -190,15 +187,15 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 
 ### Testing infrastructure
 
-**System tests** (`crates/weir-server/tests/system.rs`, 41 tests, Unix-only):
+**System tests** (`crates/weir-server/tests/system.rs`, Unix-only):
 
 Each test spawns a real `weir-server` binary via `env!("CARGO_BIN_EXE_weir-server")` with its own temp directory, socket path, WAB directory, and metrics port. A global process mutex serialises server spawning so the suite runs safely with any `--test-threads` value. Tests are written against the client library (`weir-client`) and the raw wire protocol where needed.
 
 Coverage includes: basic push/ack round-trips, all three durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, socket takeover data safety, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
 
-**Load tests** (`crates/weir-server/tests/load.rs`, 9 scenarios):
+**Load tests** (`crates/weir-server/tests/load.rs`):
 
-Throughput and latency measurements for single-threaded, thundering-herd, connection-churn, fire-and-forget overload, latency, and saturation-ramp scenarios. Results are emitted as `BENCH: {json}` lines; `deploy/avg_benchmarks.py` averages multiple runs and writes `docs/benchmarks.md`. CI runs 5 passes at each of two batch deadlines (1ms and 2ms) and commits the averaged result on pushes to `main`.
+Throughput and latency measurements for single-threaded, thundering-herd, connection-churn, fire-and-forget overload, latency, and saturation-ramp scenarios. Results are emitted as `BENCH: {json}` lines; `deploy/avg_benchmarks.py` averages multiple runs and writes `docs/benchmarks/latest.md` and appends a row to `docs/benchmarks/history.md` (the `docs/benchmarks.md` index is hand-maintained). CI runs 5 passes at each of two batch deadlines (1ms and 2ms) and commits the averaged result on pushes to `main`.
 
 ---
 

@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-avg_benchmarks.py  <results_file>  <output_md>
+avg_benchmarks.py  <results_file>  <output_md>  [history_md]
 
 Reads BENCH: {json} lines collected from multiple cargo-test runs,
-averages the numeric fields across runs for each scenario, and rewrites
-docs/benchmarks.md with updated tables.
+averages the numeric fields across runs for each scenario, and writes the
+averaged tables to <output_md> (CI passes docs/benchmarks/latest.md),
+optionally appending one summary row to <history_md>
+(docs/benchmarks/history.md). The docs/benchmarks.md index is
+hand-maintained and is NOT written by this script.
 
 Each input line must look like:
     BENCH: {"scenario":"...", "threads":N, ...}
