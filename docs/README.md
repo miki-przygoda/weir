@@ -24,7 +24,8 @@ source.
 Two short docs to get you from zero to a running daemon with records flowing.
 
 - [**install.md**](getting-started/install.md) — Build from source,
-  container, or `cargo install` (planned). Verification + uninstall.
+  container, or `cargo install` (lands with the 1.0 crates.io release).
+  Verification + uninstall.
 - [**quickstart.md**](getting-started/quickstart.md) — 5-minute hello
   world: run the daemon, push a record from a tiny Rust client,
   verify the metrics endpoint, troubleshoot common issues.
