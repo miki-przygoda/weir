@@ -35,6 +35,12 @@ batch_size = 256
 # Env: WEIR_BATCH_DEADLINE_MS
 batch_deadline_ms = 1
 
+# Refuse any connection whose peer effective uid does not match the daemon's
+# (SO_PEERCRED / getpeereid). Fail-closed; the application-level access control
+# on the Unix socket. Leave on unless a trusted helper must connect as a
+# different uid. Env: WEIR_PEER_UID_CHECK
+peer_uid_check = true
+
 # Maximum concurrent producer connections. Range: 1-512.
 # Must be <= the tokio blocking thread pool limit (default 512) because each
 # active connection occupies one spawn_blocking slot while pushing to the queue.

@@ -83,6 +83,35 @@ socket paths when running multiple daemons on one host.
 
 ---
 
+#### `peer_uid_check`
+
+- **Type**: bool
+- **Default**: `true`
+- **CLI**: `--peer-uid-check <true|false>`
+- **Env**: `WEIR_PEER_UID_CHECK`
+- **TOML**: `peer_uid_check`
+
+The application-level access control on the Unix socket path. When
+enabled (the default), the accept loop reads each peer's effective uid
+(`SO_PEERCRED` on Linux, `getpeereid` on macOS) and **refuses any
+connection whose peer euid does not match the daemon's** — closing the
+socket before any frame is read. It is **fail-closed**: if the peer
+credential lookup itself fails, the connection is refused. Every refusal
+increments `weir_connection_rejected_peer_uid_total`.
+
+This is the narrow application-level complement to the socket file's
+`0o600` permissions: even if the socket's permissions or parent directory
+are looser than intended, a same-host process running as a different user
+cannot connect. It applies only to the Unix transport; the TCP + mutual-TLS
+listener authenticates clients by certificate instead.
+
+**When to change the default**: set to `false` only when a trusted helper
+must connect as a *different* uid than the daemon (e.g. a sidecar under a
+separate service account) and you are deliberately relying on socket
+permissions alone. Leaving it on is strongly recommended.
+
+---
+
 #### `wab_dir`
 
 - **Type**: absolute path to an existing directory
@@ -489,7 +518,7 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ### Sink selection
 
-Weir ships with four built-in sinks:
+Weir ships with five built-in sinks:
 
 | `sink_type` | What it does | When to use |
 |------------|--------------|------|
@@ -497,24 +526,26 @@ Weir ships with four built-in sinks:
 | `"http"` | POSTs each record to `sink_url`; up to `sink_http_concurrency` POSTs in flight per batch | endpoints that already accept POST bodies |
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 | `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
+| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
 
 #### `sink_type`
 
-- **Type**: string (`"noop"`, `"http"`, `"mysql"`, or `"postgres"`)
+- **Type**: string (`"noop"`, `"http"`, `"mysql"`, `"postgres"`, or `"clickhouse"`)
 - **Default**: `"noop"`
 - **CLI**: `--sink-type <value>`
 - **Env**: `WEIR_SINK_TYPE`
 - **TOML**: `sink_type`
 
-**When to change**: set to `"http"`, `"mysql"`, or `"postgres"` once a
-real downstream is available; leave at `"noop"` until then.
+**When to change**: set to `"http"`, `"mysql"`, `"postgres"`, or
+`"clickhouse"` once a real downstream is available; leave at `"noop"`
+until then.
 
 ---
 
 #### `sink_url`
 
 - **Type**: URL string
-- **Default**: none (required when `sink_type` is `"http"`, `"mysql"`, or `"postgres"`)
+- **Default**: none (required when `sink_type` is `"http"`, `"mysql"`, `"postgres"`, or `"clickhouse"`)
 - **Validation**: parsed at startup; invalid URLs fail fast.
 - **CLI**: `--sink-url <url>`
 - **Env**: `WEIR_SINK_URL`
