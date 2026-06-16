@@ -65,13 +65,24 @@ producer-facing latency to one local socket round-trip and one local
 fsync, while preserving end-to-end durability via the WAB, and
 amortises downstream cost via bulk drain.
 
+**Use weir when** a high-rate producer must not block on a slow or
+flaky downstream, and must not lose records it has already been told are
+safe — even across a crash. The classic fit is "fire a record at a local
+socket, get a durable ack in microseconds, let the database catch up in
+bulk."
+
+**Don't reach for weir when** you need fan-out or pub/sub (use a message
+broker), when you can already tolerate writing straight to the database
+synchronously, or when losing un-acked in-flight data on crash is
+acceptable (an in-process channel is simpler). See [Non-goals](#non-goals-v1).
+
 ## Crates
 
 | Crate           | Type       | Description                                                                                          |
 |-----------------|------------|------------------------------------------------------------------------------------------------------|
 | `weir-core`     | lib        | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`, `Payload`. Cross-platform.   |
 | `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
-| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships two examples (`push_simple`, `health_check`). Benchmark coverage lives in `weir-server/tests/load.rs`. |
+| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract, published standalone so downstream authors can write custom sinks without depending on the daemon internals. |
 | `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop). |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
