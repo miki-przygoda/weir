@@ -128,14 +128,44 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
     Ok(())
 }
 
+/// Quarantines a corrupt segment AND records it in the quarantine metrics, then
+/// returns the `InvalidData` error describing why. Every header-validation
+/// quarantine site funnels through here so the `recovery_segments_quarantined`
+/// counter and the `wab_segments{state=quarantined}` gauge are ALWAYS bumped —
+/// previously the short-header branch quarantined invisibly to operators alerting
+/// on those metrics, unlike the bad-magic and bad-version branches (L00). If the
+/// quarantine move itself fails, that error is returned as-is and the metrics are
+/// not bumped (nothing was quarantined).
+fn quarantine_and_count(
+    path: &Path,
+    wab_dir: &Path,
+    metrics: &Arc<Metrics>,
+    reason: &str,
+) -> io::Error {
+    if let Err(qe) = quarantine(path, wab_dir, reason) {
+        return qe;
+    }
+    metrics.recovery_segments_quarantined.inc();
+    metrics
+        .wab_segments
+        .get_or_create(&SegmentStateLabel {
+            state: SegmentState::quarantined,
+        })
+        .inc();
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: quarantined — {reason}", path.display()),
+    )
+}
+
 /// Recovers a single unsealed `.wab` file.
 ///
 /// Validates the segment header, replays records verifying per-record CRC,
 /// truncates at the first corrupt or incomplete record, writes the sentinel and
 /// footer, and renames to `.wab.sealed`. Returns the path of the sealed file.
 ///
-/// If the header has bad magic or an unknown version, the segment is quarantined
-/// rather than silently skipped or left in place.
+/// If the header is too short, has bad magic, or an unknown version, the segment
+/// is quarantined (and counted) rather than silently skipped or left in place.
 pub(crate) fn recover_segment(
     path: &Path,
     wab_dir: &Path,
@@ -163,13 +193,11 @@ pub(crate) fn recover_segment(
     match reader.read_exact(&mut header_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            quarantine(path, wab_dir, "file is shorter than the segment header")?;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{}: quarantined — shorter than segment header",
-                    path.display()
-                ),
+            return Err(quarantine_and_count(
+                path,
+                wab_dir,
+                metrics,
+                "shorter than segment header",
             ));
         }
         Err(e) => return Err(e),
@@ -181,18 +209,7 @@ pub(crate) fn recover_segment(
             SEGMENT_MAGIC,
             &header_buf[0..4]
         );
-        quarantine(path, wab_dir, &reason)?;
-        metrics.recovery_segments_quarantined.inc();
-        metrics
-            .wab_segments
-            .get_or_create(&SegmentStateLabel {
-                state: SegmentState::quarantined,
-            })
-            .inc();
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: quarantined — {reason}", path.display()),
-        ));
+        return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
     if header_buf[4] != FORMAT_VERSION {
@@ -200,18 +217,7 @@ pub(crate) fn recover_segment(
             "unknown format version: expected {FORMAT_VERSION}, got {}",
             header_buf[4]
         );
-        quarantine(path, wab_dir, &reason)?;
-        metrics.recovery_segments_quarantined.inc();
-        metrics
-            .wab_segments
-            .get_or_create(&SegmentStateLabel {
-                state: SegmentState::quarantined,
-            })
-            .inc();
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: quarantined — {reason}", path.display()),
-        ));
+        return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
     // ── Replay records ───────────────────────────────────────────────────────
@@ -599,6 +605,49 @@ mod tests {
         assert_eq!(records[1], b"record2" as &[u8]);
         assert!(!path.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// L00: a segment whose header was torn off (file shorter than the 24-byte
+    /// header) is quarantined AND counted — like the bad-magic and bad-version
+    /// branches — so operators alerting on the quarantine metrics see it. Before
+    /// the fix this branch quarantined invisibly (no metric bump).
+    #[test]
+    fn recovery_short_header_quarantines_and_counts() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        use crate::wab::segment::segment_path;
+        let dir = tmp_dir("short_header");
+        let path = segment_path(&dir, 1);
+        fs::write(&path, b"WEI").unwrap(); // 3 bytes — shorter than the 24-byte header
+
+        let metrics = noop_metrics();
+        let err = recover_segment(&path, &dir, &metrics).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string().contains("shorter than segment header"),
+            "{err}"
+        );
+        assert!(
+            !path.exists(),
+            "the short segment must be quarantined (moved)"
+        );
+        assert!(dir.join("quarantine").is_dir());
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "a short-header quarantine must increment recovery_segments_quarantined (L00)"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "a short-header quarantine must bump wab_segments{{quarantined}} (L00)"
+        );
 
         fs::remove_dir_all(dir).ok();
     }
