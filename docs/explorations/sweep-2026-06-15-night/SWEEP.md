@@ -442,3 +442,33 @@ Disposition: auto-fix everything **gated** (fmt + clippy + touched-crate tests; 
 Plus **S16 code migration** (rustls-pemfile → rustls_pki_types::pem) deferred:
 the advisory is allow-listed in `deny.toml` with rationale; the migration is a
 post-1.0 TLS-loader change.
+
+---
+
+## Follow-up: flagged items resolved (2026-06-16)
+
+All five flagged items + the S16 migration were worked through with the user.
+**45 of 46 now fixed; 1 (S34) documented-as-deferred.**
+
+- **S09 — FIXED** (`fix(server)`): the TCP+mTLS listener's JoinHandle is now
+  awaited after `socket::run` returns, so its graceful drain completes before
+  `drop(rt)` instead of being cancelled.
+- **S15 — FIXED** (`fix(drain)`): the retry backoff is now interruptible via
+  `recv_timeout`; a shutdown (drain-channel disconnect) cuts a multi-minute
+  Retry-After short while still completing the in-flight retry. The retry_after
+  timing test was reworked to hold the channel open (normal-operation path) and a
+  new test proves a 30s hint is interrupted on shutdown.
+- **S28 — FIXED** (`fix(sink)`): a shared `read_body_capped` (64 KiB) bounds
+  response-body memory on the HTTP success/error and ClickHouse 4xx paths.
+- **S32 — FIXED** (`test(socket)`): peer_uid fail-closed test on a non-socket fd.
+- **S16 — FIXED** (`refactor(tls)!`): weir's PEM loaders (client, server,
+  test harness) migrated to `rustls_pki_types::pem`; the `rustls-pemfile` direct
+  dependency is dropped. It remains transitive via `mysql_async`, so the
+  RUSTSEC-2025-0134 ignore stays in `deny.toml` (updated rationale).
+- **S34 — DEFERRED (documented):** the metrics accept-loop `continue`-on-error
+  (G14) is a 4-line guard not unit-testable without mocking the `TcpListener`;
+  the metrics server already has 200-OK / content-type / metric-name /
+  connection-cap coverage. Left as the single open item.
+
+Full gate green after all fixes: fmt; clippy default·all-features·no-default;
+cargo-deny; bin 355; system 38; tls 4; dst 13; load 13.
