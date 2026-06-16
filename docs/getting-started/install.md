@@ -1,9 +1,10 @@
 # Installation
 
-> **TL;DR** — `cargo install weir-server`, build from source
-> (`cargo build --release -p weir-server`), grab a pre-built binary from the
+> **TL;DR** — build from source (`cargo build --release -p weir-server`),
+> grab a pre-built binary from the
 > [GitHub Releases](https://github.com/miki-przygoda/weir/releases), or use the
 > container image (`docker compose -f deploy/docker/docker-compose.yml up`).
+> `cargo install weir-server` lands with the 1.0 crates.io release (see below).
 
 Three supported install paths are covered below. All install paths
 produce the same `weir-server` daemon; the choice is purely about how
@@ -13,7 +14,8 @@ you want to build, deploy, and update it.
 
 ### Prerequisites
 
-- **Rust 1.85+** (edition 2024). `rustup default stable` is enough.
+- **Rust 1.88+** (edition 2024) — the declared MSRV (`rust-version` in
+  `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
 - A Unix host (Linux or macOS). weir-server does not build on Windows
   due to Unix-only socket APIs; `weir-core` and `weir-client` do.
 - ~500 MB free disk (build artifacts).
@@ -29,7 +31,7 @@ cargo build --release -p weir-server
 The binary lands at `./target/release/weir-server`. It's a single
 statically-linked-ish executable (links libc and libdl; everything else
 is in the binary). Strip with `strip target/release/weir-server` if
-you care about size (~15 MB → ~8 MB).
+you care about size (~9.5 MB → ~8.3 MB).
 
 ### Install to PATH
 
@@ -149,17 +151,17 @@ Neither is published yet.
 
 ## `cargo install`
 
-With the 1.0 crates published to crates.io:
+> **Status:** the crates are not on crates.io yet — publishing is part of
+> the 1.0 release rollout. Until then, use the from-source path above. Once
+> published, this will work:
 
 ```bash
 cargo install weir-server
 ```
 
-This fetches the latest published version, builds it with the host's
-Rust toolchain, and installs to `~/.cargo/bin/weir-server`. The wire
-protocol and public API are frozen at 1.0 under Semantic Versioning, so
-the version caveat that kept earlier builds off crates.io no longer
-applies.
+It will fetch the latest published version, build it with the host's Rust
+toolchain, and install to `~/.cargo/bin/weir-server`. The wire protocol and
+public API are frozen at 1.0 under Semantic Versioning.
 
 ## Pre-built release binaries
 

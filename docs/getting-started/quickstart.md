@@ -14,7 +14,8 @@ see [configuration.md](../operations/configuration.md).
 
 ## Prerequisites
 
-- **Rust 1.85+** (edition 2024) — `rustup toolchain install stable`
+- **Rust 1.88+** (edition 2024) — `rustup toolchain install stable` (1.88
+  is the declared MSRV, enforced in CI)
 - **Unix host** — Linux or macOS. weir-server does not run on Windows;
   the `weir-core` and `weir-client` crates are cross-platform.
 - **A writable directory** — for the WAB segments. Anywhere works;
@@ -53,8 +54,18 @@ to pushing a record.
 
 ## Push your first record
 
-From another terminal, write a small Rust program against the
-`weir-client` crate:
+**Fastest path — the bundled example.** From the weir checkout, in a
+second terminal, run the ready-made `push_simple` example against the
+socket from the run above. No project setup, no deps to wire up:
+
+```bash
+cargo run --release -p weir-client --example push_simple -- \
+    --socket /tmp/weir-quickstart/run/weir.sock --count 5
+```
+
+**From your own project.** When you're ready to push from your own code,
+add `weir-client` and `weir-core` as dependencies and write a small
+program against the synchronous client API:
 
 ```rust
 // examples/hello.rs
@@ -115,9 +126,8 @@ weir_records_ack_total{tier="sync"} 1
 ...
 ```
 
-The full metrics catalogue lives in
-[architecture.md](../architecture.md#metrics) (will move to
-`docs/reference/metrics.md` in a later phase).
+The full metrics catalogue — every family, its labels, and the alerts
+that matter — lives in [monitoring.md](../monitoring.md).
 
 ## What just happened
 
