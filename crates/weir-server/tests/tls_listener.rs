@@ -20,7 +20,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -232,6 +232,52 @@ fn expired_client_cert_is_rejected() {
     assert!(
         !got_ack,
         "a client with an expired certificate must never be acked"
+    );
+
+    srv.shutdown();
+}
+
+/// Coverage gap (T04 / F29): a client that completes the TCP handshake but never
+/// sends a TLS ClientHello must be dropped within ~handshake_timeout, not pin the
+/// shared max_connections permit. Proves the handshake-timeout branch fires,
+/// closes the connection, and records the failure metric.
+#[test]
+fn tls_handshake_timeout_drops_stalled_tcp_client() {
+    let fx = TlsFixture::generate("hs_timeout");
+    let srv = weir_server!("tls_hs_timeout")
+        .tls(&fx)
+        .extra_config("tls_handshake_timeout_secs = 1")
+        .start();
+    let addr = srv.tcp_addr();
+
+    // Complete the TCP handshake but send nothing. The daemon must drop us.
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let start = Instant::now();
+    let mut buf = [0u8; 1];
+    // Server closes the connection → read returns Ok(0) (EOF). If it wrongly kept
+    // the connection open, the 5s read timeout fires and elapsed blows the bound.
+    let n = sock.read(&mut buf).unwrap_or(0);
+    let elapsed = start.elapsed();
+    assert_eq!(
+        n, 0,
+        "the stalled-handshake connection must be closed by the server"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "must be dropped within ~handshake_timeout (1s), took {elapsed:?}"
+    );
+
+    let body = srv.scrape_metrics();
+    let failures = body
+        .lines()
+        .find(|l| l.starts_with("weir_tls_handshake_failures_total{reason=\"timeout\"}"))
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        failures >= 1,
+        "a handshake timeout must increment weir_tls_handshake_failures_total{{reason=\"timeout\"}}, got {failures}"
     );
 
     srv.shutdown();

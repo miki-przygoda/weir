@@ -803,6 +803,55 @@ fn wab_data_preserved_across_crash_restart() {
     );
 }
 
+/// Coverage gap (T07): the full crown-invariant loop across a crash. The existing
+/// crash tests stop at the replay-queue metric; this extends to the DELIVERY +
+/// CONFIRM end state — after a SIGKILL + restart, every acked record is actually
+/// delivered to the sink and confirmed, not merely re-queued. The default no-op
+/// sink always commits Ok, so any shortfall is a real recovery/drain bug.
+#[test]
+fn acked_records_delivered_to_sink_and_confirmed_after_crash_restart() {
+    const N: u32 = 25;
+    let mut srv = weir_server!("crash_to_sink").start();
+    let mut client = srv.client();
+    let mut acked = 0u32;
+    for i in 0..N {
+        if client
+            .push(format!("c2s-{i}").as_bytes(), Durability::Sync)
+            .is_ok()
+        {
+            acked += 1;
+        }
+    }
+    drop(client);
+    thread::sleep(Duration::from_millis(150));
+
+    srv.kill_ungracefully();
+    srv.restart_in_place();
+
+    // Poll the committed counter until the recovered records are delivered to the
+    // sink and confirmed (crash → recovery → replay → drain → sink → confirm).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut committed;
+    loop {
+        committed = parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        );
+        if committed >= u64::from(acked) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {committed}/{acked} acked records were delivered + confirmed after restart"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        committed >= u64::from(acked),
+        "every acked record ({acked}) must be delivered to the sink after restart, got {committed}"
+    );
+}
+
 // ── Fault injection ───────────────────────────────────────────────────────────
 
 #[test]
