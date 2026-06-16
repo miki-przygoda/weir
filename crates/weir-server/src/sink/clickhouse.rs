@@ -617,6 +617,23 @@ mod tests {
         assert_eq!(percent_decode("plain"), "plain");
     }
 
+    /// Coverage gap (T13 / F34): consecutive %XX escapes must be accumulated as
+    /// BYTES and decoded as UTF-8 — not one Latin-1 char at a time — so a
+    /// credential with non-ASCII characters authenticates as the intended string.
+    #[test]
+    fn percent_decode_assembles_multibyte_utf8() {
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("%E2%82%AC"), "\u{20AC}"); // € (3-byte)
+        assert_eq!(percent_decode("a%C3%A9b"), "aéb");
+    }
+
+    /// Coverage gap (T13): a %XX sequence that yields invalid UTF-8 goes through
+    /// from_utf8_lossy — a replacement char, never a panic on the commit path.
+    #[test]
+    fn percent_decode_invalid_utf8_is_lossy_not_panic() {
+        assert_eq!(percent_decode("%FF"), "\u{FFFD}");
+    }
+
     #[test]
     fn split_credentials_handles_at_sign_in_password() {
         // A '@' in the password must not split mid-password: the wrong split

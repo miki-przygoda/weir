@@ -1533,4 +1533,120 @@ mod tests {
         assert!(dbg.contains("https://example.com/ingest"), "{dbg}");
         assert!(!dbg.contains("<redacted>"), "{dbg}");
     }
+
+    /// Coverage gap (T06 / F58): an empty or whitespace-only log_level must fall
+    /// back to "info", not pass an empty string through to EnvFilter::try_new("")
+    /// (which would disable ALL logging).
+    #[test]
+    fn empty_log_level_falls_back_to_info_not_silent() {
+        let dir = tmp_dir("loglevel_empty");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                log_level: Some(String::new()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            c.log_level, "info",
+            "empty log_level must fall back to info"
+        );
+        fs::remove_dir_all(&dir).ok();
+
+        let dir = tmp_dir("loglevel_ws");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                log_level: Some("   ".to_string()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            c.log_level, "info",
+            "whitespace-only log_level must fall back to info (trim, not just is_empty)"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Coverage gap (T14): a non-IpAddr metrics_bind is rejected at load, naming
+    /// the field; a valid bare IP parses through.
+    #[test]
+    fn metrics_bind_invalid_ip_rejected_and_valid_parsed() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let dir = tmp_dir("metrics_bind_bad");
+        let err = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                metrics_bind: Some("not-an-ip".to_string()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("metrics_bind"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+
+        let dir = tmp_dir("metrics_bind_ok");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                metrics_bind: Some("0.0.0.0".to_string()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.metrics_bind, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Coverage gap (T10 / S42): when tcp_bind is set, a relative or
+    /// `..`-traversing tls_*_path is rejected with PathInvalid naming the field —
+    /// the same format validation socket_path/wab_dir get.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tcp_bind_rejects_relative_or_traversing_tls_paths() {
+        let dir = tmp_dir("tls_path_fmt");
+        let abs_ok = dir.join("ok.pem");
+        fs::write(&abs_ok, b"x").unwrap();
+        let build = |cert: PathBuf, key: PathBuf, ca: PathBuf| {
+            let mut cli = PartialConfig::empty();
+            cli.tcp_bind = Some("127.0.0.1:7100".to_string());
+            cli.tls_cert_path = Some(cert);
+            cli.tls_key_path = Some(key);
+            cli.tls_client_ca_path = Some(ca);
+            Config::from_layers(
+                cli,
+                PartialConfig::empty(),
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    ..PartialConfig::empty()
+                },
+            )
+        };
+
+        let err = build(
+            PathBuf::from("relative/cert.pem"),
+            abs_ok.clone(),
+            abs_ok.clone(),
+        )
+        .expect_err("a relative tls_cert_path must be rejected (S42)");
+        assert!(matches!(err, ConfigError::PathInvalid { .. }), "{err}");
+        assert!(err.to_string().contains("tls_cert_path"), "{err}");
+
+        let err = build(abs_ok.clone(), dir.join("../escape.pem"), abs_ok.clone())
+            .expect_err("a traversing tls_key_path must be rejected (S42)");
+        assert!(matches!(err, ConfigError::PathInvalid { .. }), "{err}");
+        assert!(err.to_string().contains("tls_key_path"), "{err}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

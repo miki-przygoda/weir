@@ -95,3 +95,49 @@ where
             }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Coverage gap (T15 / F57): env bools go through the lenient parse_bool
+    /// (1/0, yes/no, on/off, case-insensitive), not bool::from_str; an
+    /// unrecognised spelling errors; an unset var is None.
+    #[test]
+    fn env_bool_accepts_lenient_spellings() {
+        // Unique key so this doesn't clobber real config env vars.
+        let k = "WEIR_TEST_LENIENT_BOOL_COVERAGE";
+        // SAFETY: serial test, key is unique and removed at the end.
+        unsafe { std::env::set_var(k, "1") }
+        assert_eq!(env_bool(k).unwrap(), Some(true));
+        unsafe { std::env::set_var(k, "off") }
+        assert_eq!(env_bool(k).unwrap(), Some(false));
+        unsafe { std::env::set_var(k, "TRUE") }
+        assert_eq!(
+            env_bool(k).unwrap(),
+            Some(true),
+            "env bools must use lenient parse_bool, not bool::from_str"
+        );
+        unsafe { std::env::set_var(k, "garbage") }
+        assert!(
+            env_bool(k).is_err(),
+            "an unrecognised bool spelling must surface a ConfigError"
+        );
+        unsafe { std::env::remove_var(k) }
+        assert_eq!(env_bool(k).unwrap(), None, "an unset var is None");
+    }
+
+    /// Coverage gap (T15): a non-numeric integer env var surfaces a
+    /// ConfigError::ParseError naming the field, not a panic or silent default.
+    #[test]
+    fn env_parse_wraps_parse_errors_with_field_name() {
+        let k = "WEIR_TEST_PARSE_INT_COVERAGE";
+        unsafe { std::env::set_var(k, "not-a-number") }
+        let err = env_parse::<usize>(k).unwrap_err();
+        match err {
+            ConfigError::ParseError { field, .. } => assert_eq!(field, k),
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+        unsafe { std::env::remove_var(k) }
+    }
+}

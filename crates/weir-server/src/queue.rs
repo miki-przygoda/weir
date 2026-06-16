@@ -302,4 +302,36 @@ mod tests {
     fn new_panics_with_zero_partitions() {
         let _ = new::<u32>(0);
     }
+
+    /// Coverage gap (T16): try_push hands the unit BACK on a full partition so the
+    /// caller can fall through to push_timeout, and succeeds again once drained.
+    #[test]
+    fn try_push_returns_unit_back_when_full_then_ok_when_drained() {
+        let (tx, rx) = new_with_capacity::<u32>(1, 1);
+        let recv = rx.get(0);
+        assert!(
+            tx.try_push(0, 1).is_ok(),
+            "fast path succeeds with capacity"
+        );
+        assert_eq!(
+            tx.try_push(0, 2),
+            Err(2),
+            "a full partition must hand the unit back, not drop it"
+        );
+        assert_eq!(recv.recv().unwrap(), 1);
+        assert!(tx.try_push(0, 3).is_ok(), "capacity restored after a drain");
+    }
+
+    /// Coverage gap (T16): a disconnected partition (all receivers dropped) also
+    /// hands the unit back rather than losing it.
+    #[test]
+    fn try_push_returns_unit_back_when_disconnected() {
+        let (tx, rx) = new_with_capacity::<u32>(1, 1);
+        drop(rx);
+        assert_eq!(
+            tx.try_push(0, 99),
+            Err(99),
+            "a disconnected partition must hand the unit back"
+        );
+    }
 }
