@@ -564,6 +564,102 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// Coverage gap (T02): the mid-PAYLOAD truncation branch. Existing tests hit
+    /// mid-CRC-field, CRC-mismatch, oversized-len, and sentinel; none reads a full
+    /// len+crc prefix then a short payload. A regression mishandling a short
+    /// payload read (treating it as a zero-length record, or not breaking) would
+    /// otherwise go uncaught.
+    #[test]
+    fn recovery_truncates_mid_payload_keeping_valid_prefix() {
+        let dir = tmp_dir("crash_mid_payload");
+        let path = make_segment(&dir, 0, &[b"record1", b"record2", b"record3"]);
+
+        // header(24) + rec1(15) + rec2(15) + rec3 len(4) + rec3 crc(4) + 3 of 7
+        // payload bytes = 65: the len + crc fields read fully, the payload read
+        // hits UnexpectedEof — the distinct mid-payload branch.
+        let truncate_at = 24 + 15 + 15 + 4 + 4 + 3;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(truncate_at)
+            .unwrap();
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+        let records: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "a payload torn mid-bytes must truncate to the last whole record (rec2)"
+        );
+        assert_eq!(records[0], b"record1" as &[u8]);
+        assert_eq!(records[1], b"record2" as &[u8]);
+        assert!(!path.exists());
+        assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coverage gap (T03): fault isolation across siblings. A segment whose
+    /// recovery FAILS (bad magic → quarantine → Err) must be skipped without
+    /// aborting recovery of the other healthy segments in the same shard dir, and
+    /// recover_open_segments must still return Ok. The corrupt counter (1) sorts
+    /// first, so this also proves the failure doesn't short-circuit the loop.
+    #[test]
+    fn recover_open_segments_isolates_a_corrupt_segment_from_healthy_siblings() {
+        use crate::wab::segment::{WabSegment, sealed_path_for, segment_path};
+        use std::io::Write;
+        let wab_dir = tmp_dir("recover_isolate_corrupt");
+        let shard_dir = wab_dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // Segment 1: valid then magic-corrupted → recover_segment quarantines + Errs.
+        let corrupt = segment_path(&shard_dir, 1);
+        let mut s1 = WabSegment::create(&corrupt, 0).unwrap();
+        s1.write_record(b"healthy-1").unwrap();
+        drop(s1);
+        {
+            let mut f = fs::OpenOptions::new().write(true).open(&corrupt).unwrap();
+            f.write_all(b"XXXX").unwrap();
+        }
+
+        // Segment 2: healthy, left active — must still be sealed.
+        let healthy = segment_path(&shard_dir, 2);
+        let mut s2 = WabSegment::create(&healthy, 0).unwrap();
+        s2.write_record(b"healthy-2").unwrap();
+        drop(s2);
+
+        let metrics = noop_metrics();
+        recover_open_segments(&wab_dir, &metrics).unwrap();
+
+        let healthy_sealed = sealed_path_for(&healthy);
+        assert!(
+            healthy_sealed.exists(),
+            "healthy sibling must be sealed despite the corrupt neighbour"
+        );
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&healthy_sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0], b"healthy-2" as &[u8]);
+
+        assert!(
+            !corrupt.exists(),
+            "the corrupt segment must be moved out of the shard dir (quarantined)"
+        );
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "the corrupt segment must be counted as quarantined"
+        );
+
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
     #[test]
     fn recover_open_segments_seals_every_segment_per_shard_deterministically() {
         use crate::wab::segment::{WabSegment, segment_path};

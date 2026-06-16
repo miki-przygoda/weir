@@ -1793,6 +1793,45 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Coverage gap (T11 / G10): a RESUMED segment (skip > 0) that then hits a
+    /// read error must still quarantine. The read_failed early-return fires before
+    /// the debug_assert_eq!(durable_through, read_index), so a resume into a
+    /// now-corrupt segment never panics in debug and never confirm+deletes the
+    /// unread tail. The existing F05 resume test only covers the clean-resume case;
+    /// the existing read-error quarantine test only covers skip == 0.
+    #[test]
+    fn resumed_segment_with_read_error_quarantines_not_panics() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("g10_resume_corrupt");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1", b"r2", b"r3"]);
+        // Corrupt record 2's payload so the reader yields r1 then errors at r2
+        // (offset 42 = start of record 2's payload, per the skip==0 sibling test).
+        let mut bytes = std::fs::read(&sealed).unwrap();
+        bytes[42] ^= 0xff;
+        std::fs::write(&sealed, &bytes).unwrap();
+
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_responses([]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+
+        // Resume as if record 1 was already durably processed on a prior attempt.
+        let result = block_on(process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, 1,
+        ));
+        assert!(
+            matches!(result, ProcessResult::Quarantined),
+            "a resumed segment that hits a read error must quarantine, not confirm or panic"
+        );
+        assert!(!sealed.exists(), "the segment must be moved to quarantine");
+        assert_eq!(
+            records_dead_lettered(&metrics),
+            0,
+            "the skipped prefix must not be re-dead-lettered; the tail is quarantined"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     // ── S01: a post-seal tail truncation must quarantine, never confirm+delete ──
     #[test]
     fn post_seal_tail_truncation_quarantines_not_confirms() {
@@ -2027,6 +2066,40 @@ mod tests {
             "segment must not be confirmed on blocked shutdown"
         );
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coverage gap (T00 / F03): a single permanently-rejected batch whose sealed
+    /// size ALONE exceeds dead_letter_max_bytes must be written anyway (overshoot
+    /// once) and return Ok — NOT Blocked. Blocking on it would livelock: even an
+    /// empty dir can't hold it. The existing blocked test only covers a batch that
+    /// fits once the dir drains; the over-cap-single-batch arm was untested.
+    #[test]
+    fn oversized_dead_letter_batch_overshoots_cap_instead_of_blocking() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("f03_overshoot_perm");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        // Cap far below the minimum sealed-segment framing (~60 bytes) so any
+        // non-empty batch is "oversized".
+        let config = tight_dl_config(dir.clone(), 10);
+        let metrics = noop_metrics();
+        let sink = MockSink::with_responses([Err(MockError::Permanent)]);
+        let payloads = vec![Payload::from(b"a-record".as_ref())];
+
+        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        assert!(
+            matches!(result, BatchResult::Ok),
+            "a single batch larger than the cap must be written anyway (overshoot), not Blocked"
+        );
+        assert_eq!(
+            records_dead_lettered(&metrics),
+            1,
+            "the oversized batch must actually be written"
+        );
+        assert!(
+            dl.total_bytes() > config.dead_letter_max_bytes,
+            "the dir is intentionally over-cap after the one-time overshoot"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

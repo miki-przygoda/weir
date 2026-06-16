@@ -1034,6 +1034,85 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// Coverage gap (T01): replay must SKIP a segment that already has a valid
+    /// `.confirmed` sidecar (delivered + confirmed on a prior run, not yet GC'd)
+    /// while still replaying its unconfirmed sibling — the at-least-once + dedup
+    /// invariant's "don't re-deliver an already-confirmed segment" half.
+    #[test]
+    fn replay_skips_already_confirmed_segment() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        let dir = tmp_dir("replay_skip_confirmed");
+        let shard_dir = shard_dir_path(&dir, 0);
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // seg 1: sealed AND confirmed (delivered last run; segment not yet deleted).
+        let p1 = segment_path(&shard_dir, 1);
+        let mut s1 = WabSegment::create(&p1, 0).unwrap();
+        s1.write_record(b"already-delivered").unwrap();
+        let sealed1 = s1.seal().unwrap();
+        fs::write(confirmed_path_for(&sealed1), build_confirmed(0, 1, 1)).unwrap();
+
+        // seg 2: sealed, NOT confirmed (genuinely undrained).
+        let p2 = segment_path(&shard_dir, 2);
+        let mut s2 = WabSegment::create(&p2, 0).unwrap();
+        s2.write_record(b"needs-delivery").unwrap();
+        let sealed2 = s2.seal().unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        replay_unconfirmed(&dir, 1, &tx, &metrics).unwrap();
+        drop(tx);
+
+        let queued: Vec<PathBuf> = rx.iter().collect();
+        assert_eq!(
+            queued.len(),
+            1,
+            "only the unconfirmed segment may be replayed; got {queued:?}"
+        );
+        assert_eq!(
+            queued[0], sealed2,
+            "the undrained segment must be the one queued, not the confirmed one"
+        );
+        let _ = sealed1;
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coverage gap (T08): a corrupt/forged per-record length field exceeding
+    /// MAX_PAYLOAD_HARD_CAP must be rejected with InvalidData BEFORE any
+    /// allocation — the disk-read DoS bound. Existing reader tests cover CRC
+    /// mismatch and round-trip but not the cap branch.
+    #[test]
+    fn segment_reader_rejects_oversized_record_len_before_allocation() {
+        let dir = tmp_dir("rd_oversized_len");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"keep-me").unwrap();
+        } // drop flushes
+
+        // Splice an over-cap record-length field where the next record would begin.
+        let oversized = (MAX_PAYLOAD_HARD_CAP as u32 + 1).to_le_bytes();
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&oversized).unwrap();
+        }
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        let first = reader.next().expect("a record").expect("valid record");
+        assert_eq!(first, b"keep-me" as &[u8]);
+        let err = reader
+            .next()
+            .expect("an item")
+            .expect_err("an over-cap length must be an Err, never a giant allocation");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string().contains("exceeds MAX_PAYLOAD_HARD_CAP"),
+            "error must name the cap: {err}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn segment_reader_detects_crc_mismatch() {
         let dir = tmp_dir("rdcrc");
