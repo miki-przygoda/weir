@@ -104,9 +104,10 @@ The server decodes in this order to minimise DoS surface. **This order is mandat
 1. **Magic** — cheapest check; eliminates non-weir traffic before any further work.
 2. **Version** — checked before header CRC so a v2 client gets `VersionMismatch` (actionable) rather than `HeaderCrcMismatch` (confusing) when the frame layout has shifted between versions.
 3. **Header CRC** — validates the remaining header bytes are uncorrupted.
-4. **Payload length cap** — `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)` checked **before any heap allocation**. Exceeding the cap returns `PayloadTooLarge` and closes the connection without reading the payload bytes.
-5. **Payload read** — only after the cap check passes.
-6. **Payload CRC** — validates the payload bytes before the record is queued.
+4. **Header field parsing** — only after the header CRC passes are the `message_type`, `durability`, and reserved `flags` bytes interpreted. An unknown `message_type` (or `durability`) yields `UnknownMessage`; a nonzero reserved `flags` byte yields `ReservedFlagsSet`. Both close the connection. (Steps 1–4 are `Header::decode` in `weir-core`.)
+5. **Payload length cap** — `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)` checked **before any heap allocation**. Exceeding the cap returns `PayloadTooLarge` and closes the connection without reading the payload bytes. A zero-length `Push` payload is rejected here with `EmptyPayload` (a `HealthCheck` legitimately carries none).
+6. **Payload read** — only after the cap check passes.
+7. **Payload CRC** — validates the payload bytes before the record is queued.
 
 The daemon reads the header and payload separately (it knows `payload_len` from
 the header before reading the payload), so it always consumes exactly one frame
@@ -184,7 +185,7 @@ fresh connection.
 | Event | Connection |
 |-------|-----------|
 | Push → Ack | open |
-| Push → Nack(InternalError) | open — queue saturation, transient |
+| Push → Nack(InternalError) | open — covers transient daemon-side conditions: queue saturation, ack timeout, or a non-durable write (write/fsync error). The record's durable outcome is **unknown**; the producer should retry. |
 | HealthCheck → HealthCheckResponse | open |
 
 ### When the server closes the connection
@@ -195,6 +196,7 @@ fresh connection.
 | Push with unknown version | closed after Nack(VersionMismatch) |
 | Push with bad header CRC | closed after Nack(BadHeaderCrc) |
 | Push with `payload_len > cap` | closed after Nack(PayloadTooLarge) |
+| Push with a zero-length payload | closed after Nack(EmptyPayload) |
 | Push with bad payload CRC | closed after Nack(BadPayloadCrc) |
 | Push with unknown message_type / durability | closed after Nack(UnknownMessage) |
 | Push with a nonzero reserved `flags` byte | closed after Nack(ReservedFlagsSet) |
