@@ -88,7 +88,7 @@ Offset  Size  Field         Description
 ──────  ────  ────────────  ──────────────────────────────────────
  0       4    magic         b"WCON"
  4       1    version       1
- 5       3    reserved      0x00
+ 5       3    reserved      0x00 — zero on write; reserved for future flags
  8       8    sealed_at     i64 LE — copied from segment footer
 16       8    record_count  u64 LE — copied from segment footer
 24       8    drained_at    i64 LE — Unix timestamp, nanoseconds
