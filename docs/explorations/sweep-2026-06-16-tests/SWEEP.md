@@ -70,3 +70,23 @@ suite. No production logic changed.
   funnel all three quarantine branches through one helper that always increments.
   A test is intentionally NOT added (it would lock in the current zero-metric
   behavior); add it alongside the fix.
+
+---
+
+## Follow-up: flagged items resolved (2026-06-16)
+
+Both open flagged items (this sweep's L00 + the night sweep's S34) are now done.
+
+- **L00 — FIXED** (`fix(wab)`): all three header-validation quarantine sites in
+  `recover_segment` now funnel through a `quarantine_and_count` helper that always
+  bumps `recovery_segments_quarantined` + `wab_segments{quarantined}`. The
+  short-header branch is no longer invisible. New test
+  `recovery_short_header_quarantines_and_counts`.
+- **S34 — covered** (`test(metrics)`): `endpoint_survives_problematic_connections`
+  pins the metrics accept-loop's survival across a no-request close and a junk
+  request. The OS-level `accept()` error branch itself is not injectable without
+  an fd-exhaustion hack or a production accept-source abstraction (documented in
+  the test); the 4-line guard is covered by inspection + the survival property.
+
+**Every sweep finding (this sweep + the night sweep + the flagged set) is now
+resolved.** Full gate green: clippy ×3; fmt; bin 374; DST 300-seed; system 39.
