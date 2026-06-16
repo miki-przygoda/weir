@@ -165,10 +165,10 @@ impl HttpSink {
 
         let status = resp.status();
         if status.is_success() {
-            // Drain the body to release the connection back to the pool.
-            // We don't care about the response body for v0 (the endpoint's
-            // status code is the only signal).
-            let _ = resp.bytes().await;
+            // Drain the body (capped) to release the connection back to the pool.
+            // We don't care about the response body — the status code is the only
+            // signal — so a hostile downstream can't make us buffer it (S28).
+            let _ = crate::sink::read_body_capped(resp, crate::sink::RESPONSE_BODY_CAP).await;
             return Ok(());
         }
 
@@ -215,17 +215,14 @@ impl HttpSink {
         // Permanent. Capture a short body excerpt for the dead-letter reason
         // string so operators can debug what the endpoint complained about.
         // Cap at 256 bytes to avoid logging unbounded server output.
-        let body_excerpt = match resp.bytes().await {
-            Ok(bytes) => {
-                let cut = bytes.len().min(256);
-                // Strip control characters: the body is downstream-controlled and
-                // is interpolated into log lines and the dead-letter reason, so a
-                // hostile endpoint could otherwise inject forged log records or
-                // terminal escape sequences (S29).
-                crate::sink::sanitize_log_excerpt(&String::from_utf8_lossy(&bytes[..cut]))
-            }
-            Err(_) => String::from("<body read failed>"),
-        };
+        // Read at most the cap (S28), then take a 256-byte excerpt. Strip control
+        // characters: the body is downstream-controlled and is interpolated into
+        // log lines and the dead-letter reason, so a hostile endpoint could
+        // otherwise inject forged log records or terminal escape sequences (S29).
+        let bytes = crate::sink::read_body_capped(resp, crate::sink::RESPONSE_BODY_CAP).await;
+        let cut = bytes.len().min(256);
+        let body_excerpt =
+            crate::sink::sanitize_log_excerpt(&String::from_utf8_lossy(&bytes[..cut]));
         Err(HttpSinkError::PermanentStatus {
             status,
             body_excerpt,

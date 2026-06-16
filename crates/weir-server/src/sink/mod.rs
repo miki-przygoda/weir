@@ -78,6 +78,36 @@ pub(crate) fn sanitize_log_excerpt(s: &str) -> String {
         .collect()
 }
 
+/// Upper bound on how many response-body bytes a sink will buffer. Success bodies
+/// are discarded and error bodies are truncated to a short excerpt, so 64 KiB is
+/// ample for any legitimate endpoint while capping peak memory at
+/// `concurrency × 64 KiB` against a hostile/compromised downstream (S28).
+#[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
+pub(crate) const RESPONSE_BODY_CAP: usize = 64 * 1024;
+
+/// Reads at most `cap` bytes of a response body, then stops — dropping the rest
+/// (and the connection, which is fine: a partially-read response is not pooled).
+/// Bounds memory regardless of what the downstream sends; the success path
+/// discards the body and the error path only needs a short excerpt (S28).
+#[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    while buf.len() < cap {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (cap - buf.len()).min(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break; // hit the cap mid-chunk
+                }
+            }
+            Ok(None) => break, // end of body
+            Err(_) => break,   // read error — return what we have so far
+        }
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
