@@ -97,6 +97,12 @@ acceptable (an in-process channel is simpler). See [Non-goals](#non-goals-v1).
 The default transport is the Unix domain socket; an optional TCP + mutual-TLS
 listener is available behind the `tls` feature for cross-host producers.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, the exact pre-PR
+gate (the same checks CI runs), and the heavier test suites. Security issues
+go through [SECURITY.md](SECURITY.md), not public issues.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).
