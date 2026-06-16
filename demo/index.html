@@ -149,6 +149,10 @@
         <span class="v">avg <b class="lat em" id="nAvg">—</b> · p99 <b class="lat" id="nP99">—</b> · max <b class="lat" id="nMax">—</b></span>
       </div>
       <div class="stat">
+        <span class="k">end-to-end (in DB)</span>
+        <span class="v">avg <b class="lat" id="nE2eAvg">—</b> · p99 <b class="lat" id="nE2eP99">—</b> · max <b class="lat" id="nE2eMax">—</b> <span class="note">— = producer-facing (synchronous)</span></span>
+      </div>
+      <div class="stat">
         <span class="k">database commits</span>
         <span class="v"><b class="em" id="nCom">0</b> <span class="note">— 1 per record</span></span>
       </div>
@@ -171,6 +175,10 @@
       <div class="stat">
         <span class="k">producer-facing latency (ack)</span>
         <span class="v">avg <b class="lat em" id="wAvg">—</b> · p99 <b class="lat" id="wP99">—</b> · max <b class="lat" id="wMax">—</b></span>
+      </div>
+      <div class="stat">
+        <span class="k">end-to-end (in DB)</span>
+        <span class="v">avg <b class="lat" id="wE2eAvg">—</b> · p99 <b class="lat" id="wE2eP99">—</b> · max <b class="lat" id="wE2eMax">—</b> <span class="note">— ack + batch wait + commit</span></span>
       </div>
       <div class="stat">
         <span class="k">database commits</span>
@@ -225,6 +233,7 @@
 
   const BATCH_SIZE = 8;
   const BATCH_DEADLINE = 1400;     // anim ms before a partial batch seals
+  const BATCH_DEADLINE_US = 1500;  // real batch-deadline budget, for the end-to-end model
   const SPAWN_GAP = 75;            // anim ms between staggered emissions of a burst
 
   // ---- timing model ----
@@ -279,7 +288,7 @@
   const drainQueue = [];        // {ids, durable, phase, p}
   const spawnQueue = [];
   let spawnAcc = 0;
-  const metrics = { latN:[], latW:[], comN:0, comW:0, ackN:0, ackW:0, lostW:0, crashed:false };
+  const metrics = { latN:[], latW:[], e2eN:[], e2eW:[], comN:0, comW:0, ackN:0, ackW:0, lostW:0, crashed:false };
 
   // ---- helpers ----
   const $ = id => document.getElementById(id);
@@ -324,7 +333,8 @@
       } else if(r.stage==="commit"){
         r.p += dt / (r.commitUs * US_TO_ANIM);
         if(r.p>=1){ r.stage="done"; r.done=true; r.acked=true;
-          metrics.ackN++; metrics.comN++; metrics.latN.push(r.commitUs); }
+          metrics.ackN++; metrics.comN++;
+          metrics.latN.push(r.commitUs); metrics.e2eN.push(r.commitUs); } // naive: ack == in-DB
       }
     }
 
@@ -345,7 +355,7 @@
           r.durable = (r.tier!=="Buffered");
           if(r.tier==="Buffered") log(`ack #${r.id} (buffered, not yet fsynced)`, "ev-ack");
           else log(`${r.tier==="Sync"?"fsync":"group fsync"} → ack #${r.id} (durable)`, "ev-fsync");
-          wab.push({ id:r.id, durable:r.durable, color:r.color });
+          wab.push({ id:r.id, durable:r.durable, color:r.color, ackUs:r.ackUs, ackAnim:tNow });
         }
       } else if(r.stage==="ack"){
         r.p += dt / 200;
@@ -358,7 +368,11 @@
       if(batchTimer===null) batchTimer = tNow + BATCH_DEADLINE;
       if(wab.length>=BATCH_SIZE || tNow>=batchTimer){
         const take = wab.splice(0, Math.min(BATCH_SIZE, wab.length));
-        drainQueue.push({ ids:take.map(x=>x.id), phase:"read", p:0 });
+        // end-to-end per record = durable ack + time waited for the batch + the
+        // batch's remote commit (the same internet cost naive pays, shared by N).
+        const commitUs = jitter(NAIVE_COMMIT_US);
+        const e2e = take.map(e => e.ackUs + (tNow - e.ackAnim) * (BATCH_DEADLINE_US/BATCH_DEADLINE) + commitUs);
+        drainQueue.push({ ids:take.map(x=>x.id), phase:"read", p:0, e2e });
         batchTimer = wab.length>0 ? tNow + BATCH_DEADLINE : null;
         log(`drain: sealed segment of ${take.length} records → 1 commit`, "ev-drain");
       }
@@ -371,7 +385,7 @@
         b.p += dt / DRAIN_READ; if(b.p>=1){ b.phase="commit"; b.p=0; }
       } else {
         b.p += dt / NAIVE_COMMIT_ANIM;
-        if(b.p>=1){ b.done=true; metrics.comW++;
+        if(b.p>=1){ b.done=true; metrics.comW++; metrics.e2eW.push(...b.e2e);
           log(`sink committed ${b.ids.length} records in 1 INSERT (segment confirmed)`, "ev-drain"); }
       }
     }
@@ -415,7 +429,7 @@
   function reset(){
     records.length=0; wab.length=0; drainQueue.length=0; spawnQueue.length=0;
     batchTimer=null; spawnAcc=0; recId=0;
-    Object.assign(metrics,{latN:[],latW:[],comN:0,comW:0,ackN:0,ackW:0,lostW:0,crashed:false});
+    Object.assign(metrics,{latN:[],latW:[],e2eN:[],e2eW:[],comN:0,comW:0,ackN:0,ackW:0,lostW:0,crashed:false});
     daemonUp=true; streaming=false;
     $("stream").classList.remove("on"); $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
     $("log").innerHTML=""; log("reset.");
@@ -511,6 +525,8 @@
   function updateMetrics(){
     $("nAvg").textContent=fmtUs(avg(metrics.latN)); $("nP99").textContent=fmtUs(pct(metrics.latN,99)); $("nMax").textContent=fmtUs(mx(metrics.latN));
     $("wAvg").textContent=fmtUs(avg(metrics.latW)); $("wP99").textContent=fmtUs(pct(metrics.latW,99)); $("wMax").textContent=fmtUs(mx(metrics.latW));
+    $("nE2eAvg").textContent=fmtUs(avg(metrics.e2eN)); $("nE2eP99").textContent=fmtUs(pct(metrics.e2eN,99)); $("nE2eMax").textContent=fmtUs(mx(metrics.e2eN));
+    $("wE2eAvg").textContent=fmtUs(avg(metrics.e2eW)); $("wE2eP99").textContent=fmtUs(pct(metrics.e2eW,99)); $("wE2eMax").textContent=fmtUs(mx(metrics.e2eW));
     $("nCom").textContent=metrics.comN;
     $("wCom").textContent=metrics.comW;
     $("wRatio").textContent = metrics.comW>0 ? `— ${metrics.ackW} records → ${metrics.comW} commit${metrics.comW>1?"s":""} (${(metrics.ackW/metrics.comW).toFixed(1)}:1)` : "— batched N→1";
