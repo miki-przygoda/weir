@@ -519,7 +519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
         // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
         #[cfg(feature = "tls")]
-        let tcp_shutdown_tx = {
+        let (tcp_shutdown_tx, tcp_join) = {
             use socket::tcp::{self, TcpConfig};
             use socket::tls::ReloadableServerConfig;
 
@@ -573,7 +573,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Pass a clone of the shared semaphore so Unix + TCP draw
                     // from the same permit pool — true global cap.
                     let tcp_sem = Arc::clone(&conn_sem);
-                    tokio::spawn(async move {
+                    let tcp_join = tokio::spawn(async move {
                         // tcp::run owns the handler-shutdown watch internally and
                         // signals handlers BEFORE draining — no extra plumbing needed here.
                         let res = tcp::run(
@@ -591,9 +591,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
 
-                    Some(tcp_shutdown_tx)
+                    (Some(tcp_shutdown_tx), Some(tcp_join))
                 }
-                None => None,
+                None => (None, None),
             }
         };
 
@@ -642,6 +642,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             // On non-Unix builds weir-server is not supported; just wait for shutdown.
             let _ = shutdown_rx.await;
+        }
+
+        // Await the TCP+mTLS listener's graceful drain before leaving the runtime.
+        // The signal handler already fired `tcp_shutdown_tx`, so `tcp::run` is
+        // draining its in-flight connections; without this await `drop(rt)` below
+        // would cancel that drain the moment the Unix loop returns (e.g. when there
+        // are no Unix connections), severing live TCP connections instead of
+        // letting them finish within `shutdown_timeout_secs` (S09).
+        #[cfg(feature = "tls")]
+        if let Some(h) = tcp_join {
+            let _ = h.await;
         }
 
         Ok::<(), std::io::Error>(())
