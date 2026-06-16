@@ -39,6 +39,13 @@ mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
 
 Full walk-through, including pushing your first record: [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md).
 
+## Demo
+
+[`demo/index.html`](demo/index.html) is a self-contained, browser-only
+simulation — push records, toggle the durability tier, crash the daemon, and
+watch unconfirmed segments replay, side by side with a naive
+insert-per-record baseline. No build step; open the file directly.
+
 ## Documentation
 
 Start at [`docs/`](docs/) — the docs landing page is the recommended
