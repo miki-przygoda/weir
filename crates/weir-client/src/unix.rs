@@ -112,6 +112,11 @@ pub struct WeirClient<S = UnixStream> {
     /// ack). Once poisoned, every method fails fast; the caller must reconnect
     /// (G04).
     poisoned: bool,
+    /// Set once the daemon Nacked a frame for a reason that closes the connection
+    /// (every Nack except the transient `InternalError`). The connection is then
+    /// cleanly dead — the next call would otherwise just hit a broken pipe — so we
+    /// fail fast with a clear "reconnect" error instead (QA#2).
+    closed_after_nack: bool,
 }
 
 // Manual Debug (not derived): a `#[derive(Debug)]` would require `S: Debug`, which
@@ -123,6 +128,7 @@ impl<S> std::fmt::Debug for WeirClient<S> {
         f.debug_struct("WeirClient")
             .field("default_durability", &self.default_durability)
             .field("poisoned", &self.poisoned)
+            .field("closed_after_nack", &self.closed_after_nack)
             .finish_non_exhaustive()
     }
 }
@@ -170,11 +176,11 @@ impl<S: Read + Write> WeirClient<S> {
             // over its configured cap) and closed the connection before we finished
             // streaming — its Nack can already be sitting in our receive buffer.
             // Read it so the caller sees the real reason instead of a broken-pipe.
-            // Either way the connection is now dead, so poison the client.
+            // Either way the connection is now dead.
             if let Ok(resp) = self.read_response()
                 && resp.header().message_type() == MessageType::Nack
             {
-                self.poisoned = true;
+                self.closed_after_nack = true;
                 return Err(nack_error(resp.payload()));
             }
             self.poisoned = true;
@@ -184,11 +190,22 @@ impl<S: Read + Write> WeirClient<S> {
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::Ack => Ok(()),
-            MessageType::Nack => Err(nack_error(resp.payload())),
+            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
             other => Err(ClientError::Protocol(format!(
                 "expected Ack or Nack, got {other:?}"
             ))),
         }
+    }
+
+    /// Records that a Nack closed the connection (every reason except the
+    /// transient `InternalError`, which the daemon keeps open) so the next call
+    /// fails fast with a clear reconnect error rather than a broken pipe (QA#2).
+    /// Returns the error unchanged for convenient `Err(self.note_nack(e))` use.
+    fn note_nack(&mut self, err: ClientError) -> ClientError {
+        if !matches!(err, ClientError::Nack(NackReason::InternalError)) {
+            self.closed_after_nack = true;
+        }
+        err
     }
 
     /// Pushes at the connection's default durability tier.
@@ -216,7 +233,7 @@ impl<S: Read + Write> WeirClient<S> {
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::HealthCheckResponse => Ok(()),
-            MessageType::Nack => Err(nack_error(resp.payload())),
+            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
             other => Err(ClientError::Protocol(format!(
                 "expected HealthCheckResponse, got {other:?}"
             ))),
@@ -228,6 +245,13 @@ impl<S: Read + Write> WeirClient<S> {
     /// that would be mis-read as this call's reply — a false ack — so we refuse
     /// to use it (G04). The caller must drop the client and reconnect.
     fn ensure_usable(&self) -> Result<(), ClientError> {
+        if self.closed_after_nack {
+            return Err(ClientError::Protocol(
+                "connection closed by the daemon after a Nack; \
+                 drop this client and reconnect before sending again"
+                    .into(),
+            ));
+        }
         if self.poisoned {
             return Err(ClientError::Protocol(
                 "client connection poisoned by a prior response-read error/timeout; \
@@ -295,6 +319,7 @@ impl<S: Read + Write> WeirClient<S> {
             stream,
             default_durability,
             poisoned: false,
+            closed_after_nack: false,
         }
     }
 }
@@ -309,6 +334,7 @@ impl WeirClient<UnixStream> {
             stream,
             default_durability: None,
             poisoned: false,
+            closed_after_nack: false,
         })
     }
 
@@ -334,6 +360,7 @@ impl WeirClient<UnixStream> {
             stream,
             default_durability: None,
             poisoned: false,
+            closed_after_nack: false,
         }
     }
 
@@ -508,6 +535,86 @@ mod tests {
             matches!(err, ClientError::Nack(NackReason::PayloadTooLarge)),
             "expected Nack(PayloadTooLarge) surfaced from the buffered reply, got {err:?}"
         );
+    }
+
+    // ── Bug #2: a connection-closing Nack must give a clear next-call error ──────
+
+    // Reads one full frame (header + payload + CRC) off a server-side stream.
+    fn drain_one_frame(s: &mut std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        let mut hdr = [0u8; weir_core::HEADER_LEN];
+        s.read_exact(&mut hdr).unwrap();
+        let n = weir_core::Header::decode(&hdr).unwrap().payload_len() as usize + 4;
+        let mut rest = vec![0u8; n];
+        s.read_exact(&mut rest).unwrap();
+    }
+
+    fn nack_frame(reason: NackReason) -> Vec<u8> {
+        weir_core::Envelope::new(
+            weir_core::Header::new(weir_core::MessageType::Nack, weir_core::Durability::Sync, 0),
+            vec![reason as u8],
+        )
+        .encode()
+    }
+
+    #[test]
+    fn closing_nack_makes_next_call_fail_with_a_clear_reconnect_error() {
+        // The daemon closes the connection after a validation Nack. Before the fix,
+        // the next push hit the dead socket and returned a bare broken-pipe; now it
+        // fails fast with a clear "reconnect" error.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            server_end.write_all(&nack_frame(NackReason::EmptyPayload)).unwrap();
+            // drop server_end → connection closes, as the daemon does after a Nack.
+        });
+        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(first, ClientError::Nack(NackReason::EmptyPayload)),
+            "first push should surface the real reason, got {first:?}"
+        );
+        // Second call must NOT be a broken-pipe — it must clearly say reconnect.
+        match c.push(b"y", Durability::Sync).unwrap_err() {
+            ClientError::Protocol(msg) => assert!(
+                msg.contains("closed by the daemon after a Nack") && msg.contains("reconnect"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected a clear reconnect Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn internal_error_nack_keeps_connection_usable() {
+        // InternalError is transient — the daemon keeps the connection open — so the
+        // client must NOT mark it closed, and a retry on the same connection works.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            server_end.write_all(&nack_frame(NackReason::InternalError)).unwrap();
+            drain_one_frame(&mut server_end); // the retry
+            let ack = weir_core::Envelope::new(
+                weir_core::Header::new(weir_core::MessageType::Ack, weir_core::Durability::Sync, 0),
+                vec![],
+            )
+            .encode();
+            server_end.write_all(&ack).unwrap();
+        });
+        let first = c.push(b"a", Durability::Sync).unwrap_err();
+        assert!(
+            matches!(first, ClientError::Nack(NackReason::InternalError)),
+            "got {first:?}"
+        );
+        assert!(
+            !c.closed_after_nack,
+            "InternalError is transient and must not close the connection"
+        );
+        c.push(b"b", Durability::Sync).unwrap(); // retry on the same connection succeeds
+        server.join().unwrap();
     }
 
     // ── F43: opt-in socket timeouts ───────────────────────────────────────────
