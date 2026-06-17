@@ -16,7 +16,7 @@ replays after a crash.
 
 `~69 µs` Buffered ack p50 · `~2,550` Sync RPS · `~58,600` saturation RPS
 *(single box, sandboxed CI runners — see [benchmarks](docs/benchmarks.md))* ·
-5 built-in sinks · v1 wire + Rust API frozen under SemVer
+5 built-in sinks (4 in a default build; `clickhouse` opt-in) · v1 wire + Rust API frozen under SemVer
 
 **▶ [Try the demo](demo/index.html)** — a self-contained, browser-only
 simulation of the pipeline: push records, flip the durability tier, crash the
@@ -30,7 +30,8 @@ browser. *(Hosted version coming with the public launch.)*
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
 > format for non-Rust implementers. The WAB on-disk format is stable and
 > unconfirmed segments replay on restart. Built-in sinks: `noop`, `http`,
-> `mysql`, `postgres`, `clickhouse` (see [Crates](#crates) and the
+> `mysql`, `postgres` in the default build, plus `clickhouse` behind the opt-in
+> `clickhouse-sink` Cargo feature (see [Crates](#crates) and the
 > [configuration reference](docs/operations/configuration.md)). WAB flusher and
 > drain threads are panic-supervised. Publishing to crates.io with the 1.0 release.
 

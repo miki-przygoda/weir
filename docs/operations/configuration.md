@@ -518,7 +518,10 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ### Sink selection
 
-Weir ships with five built-in sinks:
+Weir ships with five built-in sinks. The **default build** compiles in `noop`,
+`http`, `mysql`, and `postgres`; `clickhouse` is compiled in only when you build
+with the opt-in `clickhouse-sink` Cargo feature (a default binary rejects
+`sink_type = "clickhouse"` with a clear "built without it" error):
 
 | `sink_type` | What it does | When to use |
 |------------|--------------|------|
@@ -526,7 +529,7 @@ Weir ships with five built-in sinks:
 | `"http"` | POSTs each record to `sink_url`; up to `sink_http_concurrency` POSTs in flight per batch | endpoints that already accept POST bodies |
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 | `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
-| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
+| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` (**requires the `clickhouse-sink` build feature**) | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
 
 #### `sink_type`
 
