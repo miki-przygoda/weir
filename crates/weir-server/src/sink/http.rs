@@ -158,8 +158,19 @@ impl HttpSink {
             Err(e) => {
                 // Network-layer errors are all transient. Connect refused,
                 // DNS failure, timeout, broken pipe — drain retries.
-                debug!(error = %e, "sink POST failed at transport layer");
-                return Err(HttpSinkError::Transport(e.to_string()));
+                //
+                // Defence in depth (S31): this string is stored in
+                // `Transport` and re-logged at warn! by the drain on *every*
+                // retry, so a `scheme://user:pass@host` sink URL must never
+                // bleed its password here. reqwest 0.12 already strips URL
+                // userinfo from its error Display (it lifts it into a Basic-auth
+                // header), but we own the redaction rather than delegating the
+                // guarantee to a transitive dep's formatting — `redact_url_password`
+                // is a no-op when no userinfo is present, so the useful host
+                // diagnostic survives.
+                let rendered = crate::sink::redact_url_password(&e.to_string());
+                debug!(error = %rendered, "sink POST failed at transport layer");
+                return Err(HttpSinkError::Transport(rendered));
             }
         };
 
@@ -418,7 +429,12 @@ impl Sink for HttpSink {
                 SinkHealth::Degraded(format!("HEAD returned {}", resp.status()))
             }
             Ok(resp) => SinkHealth::Down(format!("HEAD returned {}", resp.status())),
-            Err(e) => SinkHealth::Down(format!("HEAD failed: {e}")),
+            // Redact any URL password the transport error might carry (S31); see
+            // the matching note on the commit path.
+            Err(e) => SinkHealth::Down(format!(
+                "HEAD failed: {}",
+                crate::sink::redact_url_password(&e.to_string())
+            )),
         }
     }
 }
@@ -800,6 +816,40 @@ mod tests {
             "connect refused must be transient: {err}"
         );
         assert!(matches!(err, HttpSinkError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn transport_error_does_not_leak_url_password() {
+        // S31: a reqwest transport error must NOT carry the sink URL's password
+        // into the error string. That string is stored in HttpSinkError::Transport
+        // and re-logged at warn! by the drain on every retry (drain/mod.rs), so a
+        // `https://user:pass@host` URL + a brief outage would otherwise print the
+        // password to stderr/journald repeatedly. reqwest's Error Display appends
+        // ` for url (<url>)` with the FULL url (incl. userinfo) unless stripped.
+        let sink =
+            HttpSink::new(cfg("http://weiruser:s3cr3t-passw0rd@127.0.0.1:1/ingest")).unwrap();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        assert!(err.is_transient(), "connect refused must be transient: {err}");
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("s3cr3t-passw0rd"),
+            "URL password leaked into the transport error string: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_down_does_not_leak_url_password() {
+        // S31: the health HEAD probe's failure message is surfaced to operators;
+        // it must not embed the URL password either.
+        let sink =
+            HttpSink::new(cfg("http://weiruser:s3cr3t-passw0rd@127.0.0.1:1/ingest")).unwrap();
+        match sink.health().await {
+            SinkHealth::Down(msg) => assert!(
+                !msg.contains("s3cr3t-passw0rd"),
+                "URL password leaked into health Down message: {msg}"
+            ),
+            other => panic!("expected Down for a closed port, got {other:?}"),
+        }
     }
 
     #[tokio::test]

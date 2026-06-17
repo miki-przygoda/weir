@@ -143,6 +143,15 @@ mod tests {
         let red = redact_url_password("postgres://admin:sup3rS3cret@db:5432/app");
         assert!(!red.contains("sup3rS3cret"), "password leaked: {red}");
         assert!(red.contains("<redacted>"));
+        // A URL embedded in surrounding text — the exact shape of a reqwest
+        // transport error ("...for url (<url>)"), which the HTTP sink runs through
+        // this helper (S31). The password must be redacted even mid-string.
+        let red = redact_url_password(
+            "error sending request for url (https://u:sup3rS3cret@host/ingest)",
+        );
+        assert!(!red.contains("sup3rS3cret"), "password leaked: {red}");
+        assert!(red.contains("<redacted>"));
+        assert!(red.contains("host/ingest"), "host diagnostic lost: {red}");
     }
 
     /// Coverage gap (T05/T09 / S28): read_body_capped returns at most `cap` bytes
