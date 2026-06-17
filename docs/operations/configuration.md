@@ -467,10 +467,23 @@ before the orchestrator SIGKILLs.
 
 ### Dead-letter queue
 
-When the sink permanently rejects a record (transient retries
-exhausted, or sink classifies as permanent), the record is appended
-to a dead-letter segment under `<wab_dir>/dead_letter/`. The two
-options below cap that directory's growth.
+When the sink **permanently** rejects a record (the sink classifies it
+as permanent — e.g. an HTTP 4xx, or a SQL constraint violation), the
+record is appended to a dead-letter segment under
+`<wab_dir>/dead_letter/`. The two options below cap that directory's growth.
+
+> **Dead-letter vs. stranded — they are different.** Exhausting `max_retries`
+> on a *transient* failure does **not** dead-letter; the segment is left in the
+> WAB and re-attempted on the next daemon restart (it increments
+> `weir_drain_segments_stranded_total`, not the dead-letter metrics). Only
+> *permanent* rejections land in the dead-letter directory.
+
+**Reprocessing dead-lettered records.** There is **no built-in requeue** in
+1.0: `weir-ctl dl` supports `list` (count + bytes) and `drop` (delete all)
+only. Dead-lettered records are held for manual handling — inspect the segment
+files under `<wab_dir>/dead_letter/`, fix the downstream cause, and re-submit
+them through your producer if needed. An automated requeue path is tracked for
+a post-1.0 release.
 
 #### `dead_letter_max_bytes`
 
@@ -498,8 +511,9 @@ loop is slow (alerts → human → mitigation can be 15+ minutes); smaller
 when the dead-letter directory shares a disk with the WAB and you
 want a hard cap before WAB writes fail.
 
-**Operational note**: alert on `weir_drain_state{state="blocked_dead_letter_full"} == 1`.
-Alert-recipe details land with the Phase 2 observability doc.
+**Operational note**: alert on `weir_drain_state{state="blocked_dead_letter_full"} == 1`
+(the shipped `WeirDrainBlocked` rule). See [monitoring.md](../monitoring.md) for the
+full alert catalogue and runbook.
 
 ---
 
