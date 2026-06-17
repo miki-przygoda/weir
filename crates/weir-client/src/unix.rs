@@ -31,6 +31,19 @@ pub enum ClientError {
     },
     /// The daemon sent a Nack with an unrecognised reason byte.
     UnknownNack(u8),
+    /// The payload exceeds the protocol hard cap and was rejected locally,
+    /// before any bytes were sent. The daemon would always reject a payload this
+    /// large (and a large frame can race the daemon's Nack-and-close, surfacing as
+    /// a bare broken-pipe), so the client rejects it up front with no round-trip.
+    /// A deployment's configured `max_payload_bytes` may be lower than this cap; a
+    /// payload over that lower limit is reported by the daemon as
+    /// [`ClientError::Nack`]`(`[`NackReason::PayloadTooLarge`]`)`.
+    PayloadTooLarge {
+        /// The rejected payload's length in bytes.
+        len: usize,
+        /// The protocol hard cap ([`weir_core::MAX_PAYLOAD_HARD_CAP`]).
+        limit: usize,
+    },
     /// The daemon's response violated the wire protocol.
     Protocol(String),
     /// `push_default` was called but no default durability was set.
@@ -48,6 +61,10 @@ impl std::fmt::Display for ClientError {
                 weir_core::WIRE_VERSION
             ),
             Self::UnknownNack(b) => write!(f, "server nack with unknown reason {b:#04x}"),
+            Self::PayloadTooLarge { len, limit } => write!(
+                f,
+                "payload too large: {len} bytes exceeds the {limit}-byte protocol hard cap"
+            ),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::NoDefaultDurability => {
                 write!(f, "push_default called but no default durability was set")
@@ -129,11 +146,40 @@ impl<S: Read + Write> WeirClient<S> {
         durability: Durability,
     ) -> Result<(), ClientError> {
         self.ensure_usable()?;
+        let bytes = payload.as_ref();
+        // Local guard against the protocol hard cap. The daemon always rejects a
+        // payload this large, and for a big frame it Nacks then closes the
+        // connection before we finish streaming — so the Nack races our write and
+        // would surface as a bare broken-pipe. Reject up front, no round-trip, with
+        // a clear typed error. (A deployment's configured cap may be lower than the
+        // hard cap; a payload over that lower limit still goes to the daemon and is
+        // handled by the write-error recovery below.)
+        if bytes.len() > MAX_PAYLOAD_HARD_CAP {
+            return Err(ClientError::PayloadTooLarge {
+                len: bytes.len(),
+                limit: MAX_PAYLOAD_HARD_CAP,
+            });
+        }
         // copy_from_slice at the API boundary so downstream handling is zero-copy.
-        let payload = weir_core::Payload::copy_from_slice(payload.as_ref());
+        let payload = weir_core::Payload::copy_from_slice(bytes);
         let header = Header::new(MessageType::Push, durability, 0);
         let frame = Envelope::new(header, payload).encode();
-        self.stream.write_all(&frame)?;
+
+        if let Err(write_err) = self.stream.write_all(&frame) {
+            // The write failed partway. The daemon may have Nacked (e.g. a payload
+            // over its configured cap) and closed the connection before we finished
+            // streaming — its Nack can already be sitting in our receive buffer.
+            // Read it so the caller sees the real reason instead of a broken-pipe.
+            // Either way the connection is now dead, so poison the client.
+            if let Ok(resp) = self.read_response()
+                && resp.header().message_type() == MessageType::Nack
+            {
+                self.poisoned = true;
+                return Err(nack_error(resp.payload()));
+            }
+            self.poisoned = true;
+            return Err(write_err.into());
+        }
 
         let resp = self.read_response()?;
         match resp.header().message_type() {
@@ -405,6 +451,63 @@ mod tests {
             nack_error(&payload),
             ClientError::Nack(NackReason::PayloadTooLarge)
         ));
+    }
+
+    // ── Bug #1: oversized payloads must surface as PayloadTooLarge, not broken-pipe ──
+
+    #[test]
+    fn push_rejects_over_hard_cap_locally() {
+        // A payload above the protocol hard cap is rejected locally, before any
+        // bytes hit the wire — no round-trip, and the connection stays usable.
+        let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let oversized = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        let err = c.push(&oversized, Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::PayloadTooLarge { len, limit }
+                if len == MAX_PAYLOAD_HARD_CAP + 1 && limit == MAX_PAYLOAD_HARD_CAP),
+            "expected a local PayloadTooLarge, got {err:?}"
+        );
+        assert!(!c.poisoned, "a local rejection must not poison the connection");
+    }
+
+    #[test]
+    fn push_surfaces_payload_too_large_nack_when_server_closes_mid_write() {
+        // Mirrors the daemon's over-configured-cap path: read only the header, send
+        // Nack(PayloadTooLarge), then close without draining the payload. Before the
+        // fix the client's large write hit the closed socket and returned a bare
+        // broken-pipe, hiding the Nack. Now the Nack is read from the receive buffer
+        // and surfaced — whether the write fails partway or just-barely succeeds.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut hdr = [0u8; weir_core::HEADER_LEN];
+            server_end.read_exact(&mut hdr).unwrap();
+            let nack = weir_core::Envelope::new(
+                weir_core::Header::new(
+                    weir_core::MessageType::Nack,
+                    weir_core::Durability::Sync,
+                    0,
+                ),
+                vec![NackReason::PayloadTooLarge as u8],
+            )
+            .encode();
+            server_end.write_all(&nack).unwrap();
+            // drop server_end here → connection closes without reading the payload.
+        });
+
+        // 2 MiB: above any default socket buffer (so the write blocks then fails
+        // once the server stops reading and closes), but under the hard cap (so it
+        // is not caught by the local pre-check).
+        let payload = vec![0u8; 2 * 1024 * 1024];
+        let err = c.push(&payload, Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(err, ClientError::Nack(NackReason::PayloadTooLarge)),
+            "expected Nack(PayloadTooLarge) surfaced from the buffered reply, got {err:?}"
+        );
     }
 
     // ── F43: opt-in socket timeouts ───────────────────────────────────────────
