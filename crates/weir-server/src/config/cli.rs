@@ -65,9 +65,9 @@ OPTIONS:
 ENVIRONMENT:
     Every option above can be set via WEIR_<UPPER_SNAKE_NAME>.
     WEIR_SINK_BEARER_TOKEN is env-only (never sourced from --sink-* flags
-    or the config file). For sink_type = \"mysql\", set the URL — which
-    contains credentials — via WEIR_SINK_URL rather than the TOML file
-    so secrets never land on disk.
+    or the config file). When the sink URL carries credentials
+    (mysql/postgres/clickhouse), prefer setting it via WEIR_SINK_URL rather
+    than the TOML file (sink_url) so the password is not written to disk.
 
 NOTES:
     The --sink-mysql-*, --sink-postgres-*, and --sink-clickhouse-* flags

@@ -20,7 +20,7 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -31,15 +31,17 @@ use weir_testkit::{tls::TlsFixture, weir_server};
 // ── PEM loading ────────────────────────────────────────────────────────────────
 
 fn load_certs(path: &std::path::Path) -> Vec<rustls_pki_types::CertificateDer<'static>> {
-    let mut rd = std::io::BufReader::new(std::fs::File::open(path).unwrap());
-    rustls_pemfile::certs(&mut rd)
+    use rustls_pki_types::pem::PemObject;
+    let pem = std::fs::read(path).unwrap();
+    rustls_pki_types::CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
         .unwrap()
 }
 
 fn load_key(path: &std::path::Path) -> rustls_pki_types::PrivateKeyDer<'static> {
-    let mut rd = std::io::BufReader::new(std::fs::File::open(path).unwrap());
-    rustls_pemfile::private_key(&mut rd).unwrap().unwrap()
+    use rustls_pki_types::pem::PemObject;
+    let pem = std::fs::read(path).unwrap();
+    rustls_pki_types::PrivateKeyDer::from_pem_slice(&pem).unwrap()
 }
 
 fn root_store(ca_path: &std::path::Path) -> RootCertStore {
@@ -51,7 +53,7 @@ fn root_store(ca_path: &std::path::Path) -> RootCertStore {
 }
 
 /// Builds a rustls `ClientConfig` with the fixture CA as roots and the given
-/// client identity (cert + key). aws-lc-rs provider, explicitly, to match the
+/// client identity (cert + key). ring provider, explicitly, to match the
 /// server. Returns an `Err` only if rustls rejects the cert/key pair at build
 /// time (it doesn't for our fixtures).
 fn client_config_with_cert(
@@ -59,7 +61,7 @@ fn client_config_with_cert(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> Arc<ClientConfig> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -71,7 +73,7 @@ fn client_config_with_cert(
 
 /// Builds a rustls `ClientConfig` that presents NO client certificate.
 fn client_config_no_auth(ca_path: &std::path::Path) -> Arc<ClientConfig> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -230,6 +232,52 @@ fn expired_client_cert_is_rejected() {
     assert!(
         !got_ack,
         "a client with an expired certificate must never be acked"
+    );
+
+    srv.shutdown();
+}
+
+/// Coverage gap (T04 / F29): a client that completes the TCP handshake but never
+/// sends a TLS ClientHello must be dropped within ~handshake_timeout, not pin the
+/// shared max_connections permit. Proves the handshake-timeout branch fires,
+/// closes the connection, and records the failure metric.
+#[test]
+fn tls_handshake_timeout_drops_stalled_tcp_client() {
+    let fx = TlsFixture::generate("hs_timeout");
+    let srv = weir_server!("tls_hs_timeout")
+        .tls(&fx)
+        .extra_config("tls_handshake_timeout_secs = 1")
+        .start();
+    let addr = srv.tcp_addr();
+
+    // Complete the TCP handshake but send nothing. The daemon must drop us.
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let start = Instant::now();
+    let mut buf = [0u8; 1];
+    // Server closes the connection → read returns Ok(0) (EOF). If it wrongly kept
+    // the connection open, the 5s read timeout fires and elapsed blows the bound.
+    let n = sock.read(&mut buf).unwrap_or(0);
+    let elapsed = start.elapsed();
+    assert_eq!(
+        n, 0,
+        "the stalled-handshake connection must be closed by the server"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "must be dropped within ~handshake_timeout (1s), took {elapsed:?}"
+    );
+
+    let body = srv.scrape_metrics();
+    let failures = body
+        .lines()
+        .find(|l| l.starts_with("weir_tls_handshake_failures_total{reason=\"timeout\"}"))
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(
+        failures >= 1,
+        "a handshake timeout must increment weir_tls_handshake_failures_total{{reason=\"timeout\"}}, got {failures}"
     );
 
     srv.shutdown();

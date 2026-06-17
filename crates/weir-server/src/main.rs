@@ -311,12 +311,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // sink hangs without honouring its internal timeout.
         commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
     };
+    // Surface the configured sink type as a metric so operators (and
+    // `weir-ctl metrics`) can see whether records actually go downstream or to
+    // the discard-everything noop sink.
+    metrics
+        .sink_info
+        .get_or_create(&metrics::SinkInfoLabel {
+            sink_type: config.sink_type.as_str().to_string(),
+        })
+        .set(1.0);
+
     // Sink selection. drain::spawn is generic over the sink type but returns
     // the same JoinHandle<()> regardless, so both arms produce a uniform
     // drain_handle for the join sequence later in this function.
     let drain_handle = match config.sink_type {
         SinkType::Noop => {
-            info!("sink: noop (records committed-and-forgotten)");
+            warn!(
+                "sink: noop — records are acked and DISCARDED, not forwarded anywhere. \
+                 This is for soak-testing the pipeline; set --sink-type to deliver downstream."
+            );
             build_and_spawn_drain(NoopSink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "http-sink")]
@@ -330,7 +343,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|t| !t.is_empty())
                 .map(Arc::from);
             info!(
-                url = %url,
+                // The URL may carry userinfo (user:password@host); redact the
+                // password so it never reaches a log line (S25).
+                url = %crate::sink::redact_url_password(&url),
                 bearer = bearer_token.is_some(),
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
@@ -453,7 +468,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the
         // security reasoning around exposing this surface on the network.
         let metrics_listener =
-            tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port)).await?;
+            tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port))
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to bind metrics endpoint to {}:{} ({e}) — another process \
+                             (often another weir-server instance) is using that port. Change it \
+                             with --metrics-port / WEIR_METRICS_PORT (or --metrics-bind / \
+                             WEIR_METRICS_BIND).",
+                            config.metrics_bind, config.metrics_port
+                        ),
+                    )
+                })?;
         metrics::server::spawn(
             metrics_listener,
             Arc::clone(&registry),
@@ -517,7 +545,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
         // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
         #[cfg(feature = "tls")]
-        let tcp_shutdown_tx = {
+        let (tcp_shutdown_tx, tcp_join) = {
             use socket::tcp::{self, TcpConfig};
             use socket::tls::ReloadableServerConfig;
 
@@ -571,7 +599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Pass a clone of the shared semaphore so Unix + TCP draw
                     // from the same permit pool — true global cap.
                     let tcp_sem = Arc::clone(&conn_sem);
-                    tokio::spawn(async move {
+                    let tcp_join = tokio::spawn(async move {
                         // tcp::run owns the handler-shutdown watch internally and
                         // signals handlers BEFORE draining — no extra plumbing needed here.
                         let res = tcp::run(
@@ -589,9 +617,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
 
-                    Some(tcp_shutdown_tx)
+                    (Some(tcp_shutdown_tx), Some(tcp_join))
                 }
-                None => None,
+                None => (None, None),
             }
         };
 
@@ -640,6 +668,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             // On non-Unix builds weir-server is not supported; just wait for shutdown.
             let _ = shutdown_rx.await;
+        }
+
+        // Await the TCP+mTLS listener's graceful drain before leaving the runtime.
+        // The signal handler already fired `tcp_shutdown_tx`, so `tcp::run` is
+        // draining its in-flight connections; without this await `drop(rt)` below
+        // would cancel that drain the moment the Unix loop returns (e.g. when there
+        // are no Unix connections), severing live TCP connections instead of
+        // letting them finish within `shutdown_timeout_secs` (S09).
+        #[cfg(feature = "tls")]
+        if let Some(h) = tcp_join {
+            let _ = h.await;
         }
 
         Ok::<(), std::io::Error>(())

@@ -3,6 +3,7 @@ name = "weir-client"
 description = "Client library for the weir daemon"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["weir", "client", "durability", "ingestion", "ipc"]
@@ -13,13 +14,15 @@ all-features = true
 
 [features]
 default = []
-tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-pki-types"]
+tls = ["dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
 weir-core = { path = "../weir-core", version = "1.0.0" }
 crc32fast = "1"
-rustls = { version = "0.23", optional = true }
-rustls-pemfile = { version = "2", optional = true }
+# Crypto provider unified on `ring` workspace-wide (no aws-lc-rs). default-features
+# = false drops rustls's default aws_lc_rs provider; the client names the provider
+# explicitly via `builder_with_provider(ring::default_provider())`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"], optional = true }
 rustls-pki-types = { version = "1", optional = true }
 
 [dev-dependencies]

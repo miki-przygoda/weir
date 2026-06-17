@@ -29,6 +29,12 @@
     - [Environments](benchmarks/environments.md)
     - [Batch-tuning sweep](benchmarks/batch-tuning.md)
     - [Agent count vs cores](benchmarks/agent-count-tuning.md)
+    - [Archive: Phase 3 results](benchmarks/phase3-results.md)
+    - [Archive: Phase 3 stage baseline](benchmarks/phase3-stage-baseline.md)
+    - [Archive: Phase 3 after bridge removal](benchmarks/phase3-stage-after-bridge-removal.md)
+    - [Archive: Snapshot 2026-06-13 (Mac)](benchmarks/snapshot-2026-06-13-mac.md)
+    - [Archive: Snapshot 2026-06-13 (beast)](benchmarks/snapshot-2026-06-13-beast.md)
+    - [Archive: Snapshot 2026-06-13 (comparison)](benchmarks/snapshot-2026-06-13-comparison.md)
 
 # Security
 

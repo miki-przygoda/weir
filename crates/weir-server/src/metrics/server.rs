@@ -236,4 +236,37 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 200 OK"));
         }
     }
+
+    /// S34: the accept loop keeps serving after connections that fail at the
+    /// handler level — each problematic connection is isolated to its own task and
+    /// never takes the loop down. The OS-level `accept()` error branch
+    /// (ECONNABORTED / EMFILE, the G14 `continue`) cannot be injected against a
+    /// real `TcpListener` without an fd-exhaustion hack or an accept-source
+    /// abstraction in production; this test pins the observable survival property
+    /// that fix exists to protect.
+    #[tokio::test]
+    async fn endpoint_survives_problematic_connections() {
+        use tokio::io::AsyncWriteExt;
+        let (_metrics, registry) = Metrics::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = spawn(listener, Arc::new(registry), 8);
+
+        // A connection that opens then immediately closes without a request.
+        drop(TcpStream::connect(addr).await.unwrap());
+        // A connection that sends a few junk bytes then closes mid-stream.
+        {
+            let mut bad = TcpStream::connect(addr).await.unwrap();
+            let _ = bad.write_all(b"GARBAGE not http").await;
+        }
+        // Let the server accept and dispatch both before we scrape.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The loop must still be alive and serving.
+        let response = scrape(addr).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "metrics server stopped serving after problematic connections: {response}"
+        );
+    }
 }

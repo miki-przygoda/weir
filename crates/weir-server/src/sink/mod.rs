@@ -63,3 +63,140 @@ pub(crate) fn redact_url_password(url: &str) -> String {
     let tail = &rest[at..];
     format!("{}://{}:<redacted>{}", &url[..scheme_end], user, tail)
 }
+
+/// Replaces ASCII/Unicode control characters with `.` for safe logging.
+///
+/// Downstream sink response bodies are interpolated into log lines and
+/// dead-letter reason strings. Without this, a hostile or compromised endpoint
+/// could embed newlines (forging extra log records) or terminal escape sequences
+/// in its body and have the daemon emit them verbatim (S29). Only the HTTP and
+/// ClickHouse sinks read a response body, so it is compiled only for those.
+#[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
+pub(crate) fn sanitize_log_excerpt(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
+}
+
+/// Upper bound on how many response-body bytes a sink will buffer. Success bodies
+/// are discarded and error bodies are truncated to a short excerpt, so 64 KiB is
+/// ample for any legitimate endpoint while capping peak memory at
+/// `concurrency × 64 KiB` against a hostile/compromised downstream (S28).
+#[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
+pub(crate) const RESPONSE_BODY_CAP: usize = 64 * 1024;
+
+/// Reads at most `cap` bytes of a response body, then stops — dropping the rest
+/// (and the connection, which is fine: a partially-read response is not pooled).
+/// Bounds memory regardless of what the downstream sends; the success path
+/// discards the body and the error path only needs a short excerpt (S28).
+#[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    while buf.len() < cap {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (cap - buf.len()).min(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break; // hit the cap mid-chunk
+                }
+            }
+            Ok(None) => break, // end of body
+            Err(_) => break,   // read error — return what we have so far
+        }
+    }
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_url_password_covers_adversarial_inputs() {
+        // No userinfo → unchanged.
+        assert_eq!(
+            redact_url_password("https://host/path"),
+            "https://host/path"
+        );
+        // Simple user:pass.
+        assert_eq!(
+            redact_url_password("https://u:p@host/path"),
+            "https://u:<redacted>@host/path"
+        );
+        // Password containing '@' must split at the LAST '@', not leak the tail.
+        assert_eq!(
+            redact_url_password("https://u:p@ss@host/db"),
+            "https://u:<redacted>@host/db"
+        );
+        // A '@' in the path must not be mistaken for the userinfo separator.
+        assert_eq!(
+            redact_url_password("https://host/p@th"),
+            "https://host/p@th"
+        );
+        // Username only (no password) → unchanged (nothing to redact).
+        assert_eq!(
+            redact_url_password("https://user@host/x"),
+            "https://user@host/x"
+        );
+        // The literal password must never survive in the output.
+        let red = redact_url_password("postgres://admin:sup3rS3cret@db:5432/app");
+        assert!(!red.contains("sup3rS3cret"), "password leaked: {red}");
+        assert!(red.contains("<redacted>"));
+        // A URL embedded in surrounding text — the exact shape of a reqwest
+        // transport error ("...for url (<url>)"), which the HTTP sink runs through
+        // this helper (S31). The password must be redacted even mid-string.
+        let red = redact_url_password(
+            "error sending request for url (https://u:sup3rS3cret@host/ingest)",
+        );
+        assert!(!red.contains("sup3rS3cret"), "password leaked: {red}");
+        assert!(red.contains("<redacted>"));
+        assert!(red.contains("host/ingest"), "host diagnostic lost: {red}");
+    }
+
+    /// Coverage gap (T05/T09 / S28): read_body_capped returns at most `cap` bytes
+    /// regardless of how large a body the server sends, stopping once the cap is
+    /// reached (the network-read memory bound). Uses a tiny cap + a body well
+    /// past it, so no large allocation is needed to prove the branch.
+    #[cfg(feature = "http-sink")]
+    #[tokio::test]
+    async fn read_body_capped_stops_at_cap_on_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut tmp = [0u8; 1024];
+                let _ = sock.read(&mut tmp).await; // consume the request
+                let body = vec![b'Z'; 1000]; // far past the 16-byte cap below
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let bytes = read_body_capped(resp, 16).await;
+        assert_eq!(
+            bytes.len(),
+            16,
+            "read_body_capped must stop at the cap, not buffer the whole 1000-byte body"
+        );
+    }
+
+    #[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]
+    #[test]
+    fn sanitize_log_excerpt_strips_control_chars() {
+        assert_eq!(
+            sanitize_log_excerpt("ok\n2026 INFO forged log line\r\x1b[31m"),
+            "ok.2026 INFO forged log line..[31m"
+        );
+        // Normal text and non-control Unicode pass through untouched.
+        assert_eq!(sanitize_log_excerpt("plain café"), "plain café");
+    }
+}

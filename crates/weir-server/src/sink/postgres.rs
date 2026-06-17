@@ -55,9 +55,11 @@
 //! # Authentication
 //!
 //! Credentials are taken from the connection URL
-//! (`postgres://user:pass@host:5432/db`). The URL is read from
-//! `WEIR_SINK_URL` at startup; never sourced from the TOML config.
-//! `Debug` impls redact the password before logging.
+//! (`postgres://user:pass@host:5432/db`). Prefer setting the URL via the
+//! `WEIR_SINK_URL` environment variable so the embedded password never lands
+//! on disk. The URL can also be set via `--sink-url` or the TOML config
+//! (`sink_url`), but a credential-bearing URL written to TOML is stored on
+//! disk in plaintext. `Debug` impls redact the password before logging.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -245,16 +247,14 @@ impl PostgresSink {
 /// Builds the rustls `ClientConfig` used by `Manager::from_config` when
 /// the URL opts in via `?sslmode=require`. Uses webpki-roots (bundled
 /// Mozilla CA store, no host system-CA dependency) and explicitly
-/// selects aws-lc-rs as the crypto provider via `builder_with_provider`.
+/// selects ring as the crypto provider via `builder_with_provider`.
 ///
-/// The explicit provider selection matters: both `aws-lc-rs` and `ring`
-/// transitively end up in the build (mysql_async / reqwest pull rustls
-/// with `ring`; `tokio-postgres-rustls` pulls it with `aws-lc-rs`), so
-/// rustls's auto-detect panics with "could not determine
-/// CryptoProvider" if we use the default builder. Naming the provider
-/// here picks aws-lc-rs deterministically without touching the
-/// process-global default (so this code is safe to call multiple times
-/// and never races with other rustls users in the same binary).
+/// Naming the provider explicitly (rather than the default `builder()`)
+/// avoids rustls's "could not determine CryptoProvider" auto-detect path
+/// entirely, and keeps this code robust even if a future dependency
+/// reintroduces a second provider. It also never touches the
+/// process-global default, so this is safe to call multiple times and
+/// never races with other rustls users in the same binary.
 ///
 /// Called once per `PostgresSink::new` call (i.e. once at daemon
 /// startup), so memoisation would buy nothing.
@@ -263,10 +263,10 @@ fn build_tls_connector() -> MakeRustlsConnect {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
     let client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
+        rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
-    .expect("aws-lc-rs default provider supports the safe TLS versions")
+    .expect("ring default provider supports the safe TLS versions")
     .with_root_certificates(root_store)
     .with_no_client_auth();
     MakeRustlsConnect::new(client_config)
@@ -571,7 +571,7 @@ mod tests {
     /// picks `MakeRustlsConnect`, hands it to `Manager::from_config`.
     /// Catches a regression where the URL parser fails to surface
     /// sslmode or `build_tls_connector` panics under
-    /// `aws_lc_rs::default_provider()` initialisation.
+    /// `ring::default_provider()` initialisation.
     #[test]
     fn sslmode_require_builds_sink_with_tls_connector() {
         let mut c = cfg();

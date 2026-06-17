@@ -3,6 +3,7 @@ name = "weir-core"
 description = "Shared types, wire protocol, and error types for weir"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["wire-protocol", "durability", "wal", "ingestion", "buffer"]

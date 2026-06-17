@@ -9,25 +9,41 @@ contributors should consult before adding a new attack surface.
 
 ### Unix socket path
 
-Weir's access control for local producers is the **Unix domain socket file's
-permissions**. The daemon binds the socket at `socket_path` with mode 0o600.
-Anyone who can `connect(2)` to that path can push records.
+Weir's access control for local producers has two layers. The first is the
+**Unix domain socket file's permissions**: the daemon binds the socket at
+`socket_path` with mode 0o600. The second — and the primary
+application-level control — is the **default-on peer-uid check**
+(`peer_uid_check`, default `true`): on every accept the daemon reads the
+peer's effective uid (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and
+**refuses any connection whose peer euid does not match the daemon's own**,
+closing the socket before a single frame is read. It is fail-closed — if
+the credential lookup fails, the connection is refused — and each refusal
+increments `weir_connection_rejected_peer_uid_total`.
 
 This means:
 
-- The set of clients trusted to push records = the set of OS users who can
-  open the socket file = the daemon's own uid (and root).
+- With `peer_uid_check` on (the default), the set of clients trusted to push
+  records = exactly the single OS uid equal to the daemon's effective uid.
+  Root is **not** implicitly trusted: a process running as root cannot push
+  to a daemon running as a non-root user, because root's euid (0) does not
+  match the daemon's. (If the daemon itself runs as root, then root is the
+  trusted uid — but running as root is discouraged; see the assumptions
+  below.)
+- With `peer_uid_check` disabled, the access control falls back to the
+  socket file's permissions alone, so the trusted set becomes any OS user
+  who can `connect(2)` to the socket path.
 - A separate daemon-group model is not currently supported. If you need
   group-readable access, set the parent directory mode appropriately and
   the daemon socket mode to 0o660 in a future config option (not yet
   implemented).
-- No application-level authentication on the Unix path. Every connected
-  client is treated as fully authorised.
+- Beyond the peer-uid check there is no per-client application-level
+  authentication on the Unix path: a connection that passes the uid check is
+  treated as fully authorised, and payloads are opaque bytes.
 
 ### TCP + mutual TLS path (optional, `--features tls`)
 
 When `tcp_bind` is configured, remote producers connect over **mandatory
-mutual TLS** (rustls, aws-lc-rs provider). The trust model differs from the
+mutual TLS** (rustls, ring provider). The trust model differs from the
 Unix path:
 
 - **Client cert required.** Every TCP client must present a certificate
@@ -57,13 +73,15 @@ Threats the daemon defends against:
 
 | Threat | Defense |
 |---|---|
-| Malformed wire frames causing OOM or DoS | Strict validation order: magic → version → header CRC → payload cap → allocation → payload CRC. No allocation occurs before bounds checks. See `crates/weir-core/src/envelope.rs` and `crates/weir-server/src/socket/connection.rs`. |
+| Local producer running as a different uid | Default-on peer-uid check (`peer_uid_check`): the accept loop refuses any connection whose peer euid (`SO_PEERCRED`/`getpeereid`) does not match the daemon's, fail-closed, before any frame is read. Increments `weir_connection_rejected_peer_uid_total`. The application-level complement to the socket's 0o600 mode. |
+| Malformed wire frames causing OOM or DoS | Strict validation order: magic → version → header CRC → header fields (message_type/durability/flags) → payload cap → allocation → payload CRC. No allocation occurs before bounds checks. See `crates/weir-core/src/envelope.rs` and `crates/weir-server/src/socket/connection.rs`. |
 | Oversized payloads | `max_payload_bytes` config cap (≤ `MAX_PAYLOAD_HARD_CAP = 16 MiB`) checked before allocation. |
 | Connection flood | `max_connections` semaphore (default 256, max 512). Connections beyond cap are dropped immediately. |
+| Aggregate memory amplification (many large payloads at once) | Each in-flight payload buffer is sized to the *actual* frame (no eager `max_payload_bytes` allocation), and concurrency is bounded by `max_connections`, so worst-case transient receive memory is `max_connections × max_payload_bytes`. With the defaults (256 × 16 MiB) that is **≈ 4 GiB** if every connection simultaneously streams a max-size payload. There is **no global byte budget** across connections in 1.0 — size `max_connections` and `max_payload_bytes` for the host's RAM, and lower `max_payload_bytes` (it caps individual records) if you do not need 16 MiB records. A cross-connection memory budget with admission control is tracked for a post-1.0 release. |
 | Slowloris / stalled clients | `connection_read_timeout_secs` (default 30s, range 1–600) wraps every `read_exact` in `tokio::time::timeout`. Idle connections are dropped and the counter `weir_connection_idle_timeout_total` increments. |
 | Queue saturation | `QUEUE_PUSH_TIMEOUT` (5s) caps the time a connection blocks waiting for a queue slot. Excess is nacked, not held. |
 | Socket bind path TOCTOU | `bind_hardened` (see `docs/security/socket-bind.md`) uses dirfd + AT_SYMLINK_NOFOLLOW + umask-tightened bind to eliminate the post-bind chmod vulnerability. |
-| Symlink attacks on WAB files | Segment creation uses `O_CREAT \| O_EXCL \| O_NOFOLLOW` with explicit mode 0o600. Recovery reopens with `O_NOFOLLOW` before truncate. |
+| Symlink attacks on WAB files | Segment creation uses `O_CREAT \| O_EXCL \| O_NOFOLLOW` with explicit mode 0o600. Recovery uses `O_NOFOLLOW` on **both** passes — the read/validation open and the truncate/seal open — so a symlink swapped in at the segment path is refused in either case. |
 | Stale socket files | Detected and replaced atomically; refuses to remove anything that isn't a socket. |
 | WAB segment tampering (mode tightening) | `audit_segment_modes` runs at startup and warns on any `.wab`/`.wab.sealed`/`.wab.confirmed` file whose permissions are not 0o600. Increments `weir_wab_unexpected_mode_total`. |
 | Bad CRCs (header or payload) | Reject with `Nack(BadHeaderCrc \| BadPayloadCrc)` and close the connection; counter incremented. |
@@ -85,7 +103,7 @@ deliberate architectural choices; others are future work.
 | Linux capabilities / seccomp | Not applied. Operators should sandbox the binary externally if needed (systemd `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX`, `PrivateTmp=yes`, `ProtectSystem=strict`, etc.). |
 | Encrypted at-rest WAB | WAB segments are plaintext on disk. Use filesystem-level encryption (LUKS / dm-crypt) if payloads are sensitive. |
 | Signed audit log | Records are written verbatim; no per-record signature or hash chain beyond the per-record CRC. CRC catches accidental corruption, not deliberate tampering. |
-| Sink-side authorization | The sink trait (`crates/weir-server/src/sink/mod.rs`) is currently `NoopSink`. Real sinks will need their own auth to the downstream system; weir does not pass through producer identity. |
+| Sink-side authorization | Sinks (HTTP / MySQL / Postgres / ClickHouse, plus the built-in `noop`) carry their own credentials to the downstream system; weir does not pass through producer identity. Authorization to the downstream is the sink's / operator's responsibility. |
 | Concurrent-write protection on socket path | Two daemon instances pointed at the same `socket_path` will race. Operator's responsibility (one daemon per socket). |
 | Resource accounting per-client | All connections share the same `max_connections` budget. No per-uid quotas. A misbehaving client can consume up to the global cap. |
 

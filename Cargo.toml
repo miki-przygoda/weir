@@ -12,6 +12,10 @@ resolver = "2"
 [workspace.package]
 version = "1.0.0"
 edition = "2024"
+# MSRV: edition 2024 needs 1.85, but the code uses `if let … && …` let-chains
+# (stable 1.88), so 1.88 is the honest floor. Declared so a future bump is an
+# explicit, visible change rather than a silent break for downstream consumers (S39).
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/miki-przygoda/weir"
 

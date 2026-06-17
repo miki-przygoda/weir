@@ -83,6 +83,35 @@ socket paths when running multiple daemons on one host.
 
 ---
 
+#### `peer_uid_check`
+
+- **Type**: bool
+- **Default**: `true`
+- **CLI**: `--peer-uid-check <true|false>`
+- **Env**: `WEIR_PEER_UID_CHECK`
+- **TOML**: `peer_uid_check`
+
+The application-level access control on the Unix socket path. When
+enabled (the default), the accept loop reads each peer's effective uid
+(`SO_PEERCRED` on Linux, `getpeereid` on macOS) and **refuses any
+connection whose peer euid does not match the daemon's** — closing the
+socket before any frame is read. It is **fail-closed**: if the peer
+credential lookup itself fails, the connection is refused. Every refusal
+increments `weir_connection_rejected_peer_uid_total`.
+
+This is the narrow application-level complement to the socket file's
+`0o600` permissions: even if the socket's permissions or parent directory
+are looser than intended, a same-host process running as a different user
+cannot connect. It applies only to the Unix transport; the TCP + mutual-TLS
+listener authenticates clients by certificate instead.
+
+**When to change the default**: set to `false` only when a trusted helper
+must connect as a *different* uid than the daemon (e.g. a sidecar under a
+separate service account) and you are deliberately relying on socket
+permissions alone. Leaving it on is strongly recommended.
+
+---
+
 #### `wab_dir`
 
 - **Type**: absolute path to an existing directory
@@ -106,9 +135,10 @@ sub-directory live here.
   chown weir:weir /var/lib/weir/wab
   chmod 0700 /var/lib/weir/wab
   ```
-- Subdirectories: `<wab_dir>/00000000/` per shard, `<wab_dir>/dead_letter/`
-  for permanently-rejected records, `<wab_dir>/quarantine/` for
-  corrupted segments quarantined during crash recovery.
+- Subdirectories: `<wab_dir>/shard_NN/` per shard (zero-padded index,
+  e.g. `shard_00`), `<wab_dir>/dead_letter/` for permanently-rejected
+  records, `<wab_dir>/quarantine/` for corrupted segments quarantined
+  during crash recovery.
 - Segment files are created mode `0o600`. At startup, every
   `.wab` / `.wab.sealed` / `.wab.confirmed` file is audited; any with
   permissions ≠ `0o600` increments
@@ -133,10 +163,11 @@ state size is bounded by transient backlog, not by total throughput.
 - **Env**: `WEIR_SHARD_COUNT`
 - **TOML**: `shard_count`
 
-Number of WAB shards. Each shard has its own segment file, its own
-flusher thread, and its own bridge thread. Records are routed to
-shards by the worker pool (currently round-robin; shard-aware routing
-is future work).
+Number of WAB shards. Each shard has its own segment file and its own
+flusher thread. Each connection is pinned to a shard round-robin at
+accept time (`connection_counter % shard_count`); every record on that
+connection goes to the same shard. Per-record shard-aware routing is
+future work.
 
 **When to tune**: increase only if fsync throughput is your bottleneck
 and you have parallel disk bandwidth. On a single SSD, multiple shards
@@ -196,7 +227,7 @@ are the sweet spot found by the empirical sweep.
 - **Env**: `WEIR_BATCH_SIZE`
 - **TOML**: `batch_size`
 
-Maximum records per fsync batch. When the bridge thread has
+Maximum records per fsync batch. When the flusher thread has
 accumulated this many records or `batch_deadline_ms` elapses,
 whichever comes first, the batch is fsynced and the per-record acks
 are returned.
@@ -222,7 +253,7 @@ landscape.
 - **Env**: `WEIR_BATCH_DEADLINE_MS`
 - **TOML**: `batch_deadline_ms`
 
-Maximum time the bridge thread waits to fill a batch before flushing
+Maximum time the flusher thread waits to fill a batch before flushing
 what it has. Caps tail latency in low-traffic regimes where
 `batch_size` would not be reached for a long time.
 
@@ -348,6 +379,14 @@ startup error.
 where you know record sizes are bounded (e.g. structured log records
 ≤ 64 KiB). Leave at the default for general workloads.
 
+**Memory sizing**: in-flight payload buffers are sized to the actual
+frame, but there is no global byte budget across connections, so the
+worst-case transient receive memory is `max_connections × max_payload_bytes`
+(with the defaults, 256 × 16 MiB ≈ 4 GiB if every connection streams a
+max-size payload at once). On memory-constrained hosts, lower
+`max_payload_bytes` and/or `max_connections` accordingly. See the
+[threat model](../security/threat-model.md).
+
 ---
 
 ### Metrics endpoint
@@ -363,14 +402,36 @@ where you know record sizes are bounded (e.g. structured log records
 
 TCP port for the Prometheus `/metrics` HTTP endpoint.
 
-**Bind address**: the metrics server binds to `0.0.0.0:{metrics_port}`
-(not localhost). This is intentional — it makes the endpoint
-accessible from container hosts and sidecars. Restrict access via
-firewall rules or a `--publish 127.0.0.1:9185:9185` port mapping in
-Docker; **do not** rely on the bind address as a security boundary.
-
 **When to tune**: change if 9185 conflicts with another service, or
 to allow multiple weir instances on one host.
+
+#### `metrics_bind`
+
+- **Type**: IpAddr
+- **Default**: `127.0.0.1` (localhost only)
+- **CLI**: `--metrics-bind <addr>`
+- **Env**: `WEIR_METRICS_BIND`
+- **TOML**: `metrics_bind`
+
+Address the metrics server binds to. The default is localhost-only, so
+the endpoint is not exposed off-box without an explicit decision. To
+scrape from another host, sidecar, or container, set `0.0.0.0` (or a
+specific interface) and restrict access via firewall rules or a
+`--publish 127.0.0.1:9185:9185` port mapping in Docker. A `0.0.0.0`
+bind is **not** a security boundary — `/metrics` is unauthenticated.
+
+#### `metrics_max_connections`
+
+- **Type**: usize
+- **Default**: `8`
+- **Range**: 1–1024
+- **CLI**: `--metrics-max-connections <n>`
+- **Env**: `WEIR_METRICS_MAX_CONNECTIONS`
+- **TOML**: `metrics_max_connections`
+
+Maximum number of concurrent scrape connections to the `/metrics`
+endpoint. Bounds the resource cost of a misbehaving or hostile
+scraper; the default of 8 is generous for normal Prometheus scraping.
 
 ---
 
@@ -406,10 +467,23 @@ before the orchestrator SIGKILLs.
 
 ### Dead-letter queue
 
-When the sink permanently rejects a record (transient retries
-exhausted, or sink classifies as permanent), the record is appended
-to a dead-letter segment under `<wab_dir>/dead_letter/`. The two
-options below cap that directory's growth.
+When the sink **permanently** rejects a record (the sink classifies it
+as permanent — e.g. an HTTP 4xx, or a SQL constraint violation), the
+record is appended to a dead-letter segment under
+`<wab_dir>/dead_letter/`. The two options below cap that directory's growth.
+
+> **Dead-letter vs. stranded — they are different.** Exhausting `max_retries`
+> on a *transient* failure does **not** dead-letter; the segment is left in the
+> WAB and re-attempted on the next daemon restart (it increments
+> `weir_drain_segments_stranded_total`, not the dead-letter metrics). Only
+> *permanent* rejections land in the dead-letter directory.
+
+**Reprocessing dead-lettered records.** There is **no built-in requeue** in
+1.0: `weir-ctl dl` supports `list` (count + bytes) and `drop` (delete all)
+only. Dead-lettered records are held for manual handling — inspect the segment
+files under `<wab_dir>/dead_letter/`, fix the downstream cause, and re-submit
+them through your producer if needed. An automated requeue path is tracked for
+a post-1.0 release.
 
 #### `dead_letter_max_bytes`
 
@@ -437,8 +511,9 @@ loop is slow (alerts → human → mitigation can be 15+ minutes); smaller
 when the dead-letter directory shares a disk with the WAB and you
 want a hard cap before WAB writes fail.
 
-**Operational note**: alert on `weir_drain_state{state="blocked_dead_letter_full"} == 1`.
-Alert-recipe details land with the Phase 2 observability doc.
+**Operational note**: alert on `weir_drain_state{state="blocked_dead_letter_full"} == 1`
+(the shipped `WeirDrainBlocked` rule). See [monitoring.md](../monitoring.md) for the
+full alert catalogue and runbook.
 
 ---
 
@@ -465,7 +540,10 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ### Sink selection
 
-Weir ships with four built-in sinks:
+Weir ships with five built-in sinks. The **default build** compiles in `noop`,
+`http`, `mysql`, and `postgres`; `clickhouse` is compiled in only when you build
+with the opt-in `clickhouse-sink` Cargo feature (a default binary rejects
+`sink_type = "clickhouse"` with a clear "built without it" error):
 
 | `sink_type` | What it does | When to use |
 |------------|--------------|------|
@@ -473,24 +551,26 @@ Weir ships with four built-in sinks:
 | `"http"` | POSTs each record to `sink_url`; up to `sink_http_concurrency` POSTs in flight per batch | endpoints that already accept POST bodies |
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 | `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
+| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` (**requires the `clickhouse-sink` build feature**) | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
 
 #### `sink_type`
 
-- **Type**: string (`"noop"`, `"http"`, `"mysql"`, or `"postgres"`)
+- **Type**: string (`"noop"`, `"http"`, `"mysql"`, `"postgres"`, or `"clickhouse"`)
 - **Default**: `"noop"`
 - **CLI**: `--sink-type <value>`
 - **Env**: `WEIR_SINK_TYPE`
 - **TOML**: `sink_type`
 
-**When to change**: set to `"http"`, `"mysql"`, or `"postgres"` once a
-real downstream is available; leave at `"noop"` until then.
+**When to change**: set to `"http"`, `"mysql"`, `"postgres"`, or
+`"clickhouse"` once a real downstream is available; leave at `"noop"`
+until then.
 
 ---
 
 #### `sink_url`
 
 - **Type**: URL string
-- **Default**: none (required when `sink_type` is `"http"`, `"mysql"`, or `"postgres"`)
+- **Default**: none (required when `sink_type` is `"http"`, `"mysql"`, `"postgres"`, or `"clickhouse"`)
 - **Validation**: parsed at startup; invalid URLs fail fast.
 - **CLI**: `--sink-url <url>`
 - **Env**: `WEIR_SINK_URL`
@@ -499,8 +579,17 @@ real downstream is available; leave at `"noop"` until then.
 For `sink_type = "http"`: the endpoint that receives one POST per
 record. For `sink_type = "mysql"`: the `mysql://user:password@host:port/db`
 connection URL. For `sink_type = "postgres"`: the
-`postgres://user:password@host:port/database` connection URL. **Set this
-via `WEIR_SINK_URL`, not the TOML file**, so credentials never land on disk.
+`postgres://user:password@host:port/database` connection URL. When the URL
+carries credentials, **prefer setting it via `WEIR_SINK_URL` rather than the
+TOML file** so the password is not written to disk — `sink_url` is accepted in
+TOML, but a credential-bearing URL placed there is stored in plaintext.
+
+Mind the other exposure surfaces: passing `--sink-url` on the **command line**
+puts the credential in the process argv, visible via `ps aux` to any same-uid
+process; and even `WEIR_SINK_URL` is readable via `/proc/<pid>/environ` or
+`ps eww`. The env var is the best of the three (off disk, out of `ps aux`);
+restrict who can read the daemon's `/proc` entry. The password is always
+redacted in weir's own logs and the config-debug line regardless of source.
 
 For HTTP, the body is the raw payload bytes; `Content-Type` is
 `application/octet-stream`. The endpoint is expected to return:
@@ -512,6 +601,20 @@ For HTTP, the body is the raw payload bytes; `Content-Type` is
 
 Network-layer failures (connect refused, DNS failure, timeout) are
 treated as transient.
+
+**`MAX_RETRIES` is a fixed `3`** (100 ms base delay, doubling) — it is **not**
+currently configurable via flag/env/TOML. Once a segment exhausts its retries it
+is left on disk ("stranded"), increments `weir_drain_segments_stranded_total`,
+and is re-attempted **only on daemon restart** — not automatically when the sink
+recovers. See [monitoring.md](../monitoring.md#weirsegmentstranded).
+
+**Health probe (`HEAD`).** weir periodically sends an HTTP `HEAD` to `sink_url`
+to populate `weir_sink_health`. A reachable endpoint that doesn't implement HEAD
+— common for POST-only ingest APIs, returning **405** or **501** — or one that
+issues an auth challenge (**401/403**) is treated as **healthy**: records are
+delivered via POST and the real health signal is commit success, so these do not
+flap the sink to `down`. Other 4xx read as `degraded`; other 5xx or a transport
+failure read as `down`. (An endpoint that answers HEAD with 2xx/3xx is simplest.)
 
 **Retry-After honoring**: when the endpoint returns a transient
 status (408, 429, or 5xx) with a `Retry-After: <seconds>` header,
@@ -565,6 +668,14 @@ dead-letter state.
 
 **When to tune**: lower for endpoints that prefer many small calls; the
 default 100 is a balanced point for most deployments.
+
+> **Keep this stable for dedup-by-batch sinks (ClickHouse).** The ClickHouse
+> sink's `insert_deduplication_token` is a hash of the **per-`commit` batch**.
+> Changing `sink_max_batch_size` across a restart re-splits a replayed segment
+> into different batches with different tokens, so ClickHouse no longer
+> recognises them as duplicates and you get **double-counting** on replay. Pick a
+> value and freeze it for the life of the deployment. (The HTTP sink's per-record
+> `Idempotency-Key` is unaffected — it's per record, not per batch.)
 
 ---
 
@@ -813,7 +924,7 @@ The Postgres URL contains credentials. **Always** supply it via
 Debug impl redacts the password before logging.
 
 **TLS support: opt-in via `?sslmode=require` in the URL.** The Postgres
-sink uses `tokio-postgres-rustls` (webpki-roots, aws-lc-rs) when the
+sink uses `tokio-postgres-rustls` (webpki-roots, ring) when the
 URL's `sslmode` query parameter is `require`, and `NoTls` otherwise.
 Opt-in semantics rather than auto-detect: an upgrade does not silently
 enable TLS on a previously-cleartext deployment.
@@ -827,7 +938,7 @@ WEIR_SINK_URL=postgres://user:pw@db.example.com:5432/weir?sslmode=require
 ```
 
 Cert verification uses the Mozilla root store bundled via
-`webpki-roots` — no host-system CA configuration required. The aws-lc-rs
+`webpki-roots` — no host-system CA configuration required. The ring
 crypto provider is explicitly selected (the same one weir uses for
 mysql+tls and for outbound reqwest TLS), keeping the binary's
 code-signing surface at one provider.
@@ -939,7 +1050,7 @@ The daemon will:
 
 - Listen on `/run/weir/weir.sock`
 - Use `/var/lib/weir/wab` for WAB segments
-- Serve metrics on `0.0.0.0:9185`
+- Serve metrics on `127.0.0.1:9185` (localhost only; set `metrics_bind` to expose)
 - Use the (256, 1ms) batch defaults
 - Cap connections at 256, payload at 16 MiB
 - Drop idle connections after 30s

@@ -21,13 +21,14 @@ bench-trace = []
 dst = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.
-tls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls-pki-types", "dep:arc-swap", "dep:x509-parser", "dep:rustls"]
+tls = ["dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap", "dep:rustls"]
 
 [package]
 name = "weir-server"
 description = "The weir daemon"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["durability", "write-buffer", "wal", "daemon", "ingestion"]
@@ -63,7 +64,9 @@ core_affinity = "0.8"
 prometheus-client = "0.22"
 pico-args = "0.5"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+# Config is parsed, never serialised, so drop the `display` (serialize) half of
+# toml's default features — only `parse` is needed.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # thiserror is OK to add here even though weir-core deliberately excludes it
 # (see weir-core/Cargo.toml comment): weir-server already pulls syn/quote/
@@ -91,9 +94,11 @@ futures-util = { version = "0.3", default-features = false, features = [
 # MySQL sink: async client with pooling. default-features = false drops
 # native-tls / flate2 / time-related features; we only need the connection,
 # the protocol, and rustls for TLS to production servers.
-mysql_async = { version = "0.34", default-features = false, features = [
+mysql_async = { version = "0.37", default-features = false, features = [
     "minimal-rust",
     "rustls-tls",
+    "ring",
+    "tls12",
 ], optional = true }
 # Postgres sink: tokio-postgres + deadpool-postgres for connection pooling.
 # Mirrors the MySQL sink's pool-based connection model.
@@ -102,37 +107,36 @@ deadpool-postgres = { version = "0.14", default-features = false, features = [
     "rt_tokio_1",
 ], optional = true }
 # Postgres TLS connector — opt-in via the URL's `?sslmode=require` query
-# parameter. aws-lc-rs is already the workspace's crypto provider (via
-# reqwest's rustls and mysql_async); webpki-roots gives a bundled CA
-# store so the sink doesn't depend on the host's system CA configuration.
-# default-features = false keeps the dep surface tight; the explicit
-# features pin both choices.
+# parameter. ring is the single crypto provider across the workspace (reqwest,
+# mysql_async, the tls feature); webpki-roots gives a bundled CA store so the
+# sink doesn't depend on the host's system CA configuration. default-features =
+# false keeps the dep surface tight; the explicit features pin both choices.
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = [
-    "aws-lc-rs",
+    "ring",
     "webpki-roots",
 ], optional = true }
 # rustls is shared between postgres-sink (postgres.rs ClientConfig/RootCertStore)
 # and the tls feature (socket/tls.rs). Both feature entries list `dep:rustls`.
-# Default features kept ON: rustls's defaults pull in `aws_lc_rs` (the workspace
-# crypto provider), `tls12`, `logging`, `prefer-post-quantum`, and `std` — all
-# desirable for a server binary. default-features = false caused a "could not
-# determine CryptoProvider" panic at `ClientConfig::builder()` time because
-# cargo's feature unification across the multiple rustls dependents didn't carry
-# `aws_lc_rs` through to OUR builder call site.
-rustls = { version = "0.23", optional = true }
+# The crypto provider is unified on `ring` workspace-wide (drops aws-lc-rs and its
+# aws-lc-sys/cmake C build). default-features = false here turns OFF rustls's
+# default `aws_lc_rs` provider; we re-add `ring`, `tls12`, `logging`, `std`.
+# `prefer-post-quantum` is intentionally NOT re-added — it requires aws_lc_rs.
+# The earlier "could not determine CryptoProvider" panic only affects the
+# implicit `ClientConfig::builder()`; every call site here uses
+# `builder_with_provider(ring::default_provider())`, so the provider is explicit.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"], optional = true }
 webpki-roots = { version = "1", optional = true }
 # TLS listener (feature = "tls"). tokio-rustls 0.26 tracks rustls 0.23.
-# Pinned to the aws-lc-rs crypto provider already used across the workspace.
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"], optional = true }
-rustls-pemfile = { version = "2", optional = true }
+# Pinned to the `ring` crypto provider used across the workspace.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 rustls-pki-types = { version = "1", optional = true }
 # Hot-reloadable ServerConfig (SIGHUP cert rotation without dropping conns).
 arc-swap = { version = "1", optional = true }
-# Client-cert CN extraction for tracing spans.
-x509-parser = { version = "0.16", optional = true }
 
 [dev-dependencies]
-weir-client = { path = "../weir-client" }
+# `tls` is enabled so the mTLS benchmark (tests/load_tls.rs) can use the client's
+# connect_tls; weir-server's own `tls` feature can't forward to a dev-dependency.
+weir-client = { path = "../weir-client", features = ["tls"] }
 weir-testkit = { path = "../weir-testkit" }
 ureq = "2"
 # Generates throwaway CA / server / client certs for the TLS integration tests.

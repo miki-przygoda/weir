@@ -35,6 +35,12 @@ batch_size = 256
 # Env: WEIR_BATCH_DEADLINE_MS
 batch_deadline_ms = 1
 
+# Refuse any connection whose peer effective uid does not match the daemon's
+# (SO_PEERCRED / getpeereid). Fail-closed; the application-level access control
+# on the Unix socket. Leave on unless a trusted helper must connect as a
+# different uid. Env: WEIR_PEER_UID_CHECK
+peer_uid_check = true
+
 # Maximum concurrent producer connections. Range: 1-512.
 # Must be <= the tokio blocking thread pool limit (default 512) because each
 # active connection occupies one spawn_blocking slot while pushing to the queue.
@@ -51,10 +57,14 @@ connection_read_timeout_secs = 30
 max_payload_bytes = 16777216
 
 # Port for the Prometheus /metrics HTTP endpoint.
-# Binds to 0.0.0.0:{metrics_port} for container/sidecar visibility.
-# Restrict access via firewall rules or port-mapping, not the bind address.
 # Env: WEIR_METRICS_PORT
 metrics_port = 9185
+
+# Bind address for the /metrics endpoint. Default 127.0.0.1 (localhost only).
+# Set to 0.0.0.0 for container/sidecar visibility; restrict access via firewall
+# rules or port-mapping (the endpoint is unauthenticated, not a security boundary).
+# Env: WEIR_METRICS_BIND
+metrics_bind = "127.0.0.1"
 
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.

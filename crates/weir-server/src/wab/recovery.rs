@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File},
+    fs,
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -128,20 +128,64 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
     Ok(())
 }
 
+/// Quarantines a corrupt segment AND records it in the quarantine metrics, then
+/// returns the `InvalidData` error describing why. Every header-validation
+/// quarantine site funnels through here so the `recovery_segments_quarantined`
+/// counter and the `wab_segments{state=quarantined}` gauge are ALWAYS bumped —
+/// previously the short-header branch quarantined invisibly to operators alerting
+/// on those metrics, unlike the bad-magic and bad-version branches (L00). If the
+/// quarantine move itself fails, that error is returned as-is and the metrics are
+/// not bumped (nothing was quarantined).
+fn quarantine_and_count(
+    path: &Path,
+    wab_dir: &Path,
+    metrics: &Arc<Metrics>,
+    reason: &str,
+) -> io::Error {
+    if let Err(qe) = quarantine(path, wab_dir, reason) {
+        return qe;
+    }
+    metrics.recovery_segments_quarantined.inc();
+    metrics
+        .wab_segments
+        .get_or_create(&SegmentStateLabel {
+            state: SegmentState::quarantined,
+        })
+        .inc();
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: quarantined — {reason}", path.display()),
+    )
+}
+
 /// Recovers a single unsealed `.wab` file.
 ///
 /// Validates the segment header, replays records verifying per-record CRC,
 /// truncates at the first corrupt or incomplete record, writes the sentinel and
 /// footer, and renames to `.wab.sealed`. Returns the path of the sealed file.
 ///
-/// If the header has bad magic or an unknown version, the segment is quarantined
-/// rather than silently skipped or left in place.
+/// If the header is too short, has bad magic, or an unknown version, the segment
+/// is quarantined (and counted) rather than silently skipped or left in place.
 pub(crate) fn recover_segment(
     path: &Path,
     wab_dir: &Path,
     metrics: &Arc<Metrics>,
 ) -> io::Result<PathBuf> {
-    let file = File::open(path)?;
+    // O_NOFOLLOW on the read pass too, matching the write pass below: a segment
+    // path that is a symlink (swapped in by an attacker with write access to the
+    // WAB dir) must fail the open rather than be followed to an attacker-chosen
+    // target. The threat model claims segment opens don't follow symlinks; this
+    // makes the read side honour that (S26).
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)?;
     let mut reader = BufReader::new(file);
 
     // ── Validate header ──────────────────────────────────────────────────────
@@ -149,13 +193,11 @@ pub(crate) fn recover_segment(
     match reader.read_exact(&mut header_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            quarantine(path, wab_dir, "file is shorter than the segment header")?;
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "{}: quarantined — shorter than segment header",
-                    path.display()
-                ),
+            return Err(quarantine_and_count(
+                path,
+                wab_dir,
+                metrics,
+                "shorter than segment header",
             ));
         }
         Err(e) => return Err(e),
@@ -167,18 +209,7 @@ pub(crate) fn recover_segment(
             SEGMENT_MAGIC,
             &header_buf[0..4]
         );
-        quarantine(path, wab_dir, &reason)?;
-        metrics.recovery_segments_quarantined.inc();
-        metrics
-            .wab_segments
-            .get_or_create(&SegmentStateLabel {
-                state: SegmentState::quarantined,
-            })
-            .inc();
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: quarantined — {reason}", path.display()),
-        ));
+        return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
     if header_buf[4] != FORMAT_VERSION {
@@ -186,18 +217,7 @@ pub(crate) fn recover_segment(
             "unknown format version: expected {FORMAT_VERSION}, got {}",
             header_buf[4]
         );
-        quarantine(path, wab_dir, &reason)?;
-        metrics.recovery_segments_quarantined.inc();
-        metrics
-            .wab_segments
-            .get_or_create(&SegmentStateLabel {
-                state: SegmentState::quarantined,
-            })
-            .inc();
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: quarantined — {reason}", path.display()),
-        ));
+        return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
     // ── Replay records ───────────────────────────────────────────────────────
@@ -519,6 +539,174 @@ mod tests {
         assert_eq!(records[1], b"record2" as &[u8]);
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recovery_truncates_at_crc_mismatch_keeping_valid_prefix() {
+        let dir = tmp_dir("crc_mismatch");
+        let path = make_segment(&dir, 0, &[b"recordA", b"recordB"]);
+        // Flip a byte inside record B's PAYLOAD, leaving its length + CRC fields
+        // intact: the reader reads the 7-byte payload fully but the computed CRC no
+        // longer matches the stored one, so recovery must truncate at the last
+        // valid record (A) — the silent-bit-rot detection branch (S33). Layout:
+        // header 24 + record [4 len + 4 crc + 7 payload = 15]; record B's payload
+        // begins at 24 + 15 + 8 = 47.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[47] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+        let records: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "a CRC mismatch in record B must truncate to the valid prefix (A)"
+        );
+        assert_eq!(records[0], b"recordA" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coverage gap (T02): the mid-PAYLOAD truncation branch. Existing tests hit
+    /// mid-CRC-field, CRC-mismatch, oversized-len, and sentinel; none reads a full
+    /// len+crc prefix then a short payload. A regression mishandling a short
+    /// payload read (treating it as a zero-length record, or not breaking) would
+    /// otherwise go uncaught.
+    #[test]
+    fn recovery_truncates_mid_payload_keeping_valid_prefix() {
+        let dir = tmp_dir("crash_mid_payload");
+        let path = make_segment(&dir, 0, &[b"record1", b"record2", b"record3"]);
+
+        // header(24) + rec1(15) + rec2(15) + rec3 len(4) + rec3 crc(4) + 3 of 7
+        // payload bytes = 65: the len + crc fields read fully, the payload read
+        // hits UnexpectedEof — the distinct mid-payload branch.
+        let truncate_at = 24 + 15 + 15 + 4 + 4 + 3;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(truncate_at)
+            .unwrap();
+
+        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+        let records: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "a payload torn mid-bytes must truncate to the last whole record (rec2)"
+        );
+        assert_eq!(records[0], b"record1" as &[u8]);
+        assert_eq!(records[1], b"record2" as &[u8]);
+        assert!(!path.exists());
+        assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// L00: a segment whose header was torn off (file shorter than the 24-byte
+    /// header) is quarantined AND counted — like the bad-magic and bad-version
+    /// branches — so operators alerting on the quarantine metrics see it. Before
+    /// the fix this branch quarantined invisibly (no metric bump).
+    #[test]
+    fn recovery_short_header_quarantines_and_counts() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        use crate::wab::segment::segment_path;
+        let dir = tmp_dir("short_header");
+        let path = segment_path(&dir, 1);
+        fs::write(&path, b"WEI").unwrap(); // 3 bytes — shorter than the 24-byte header
+
+        let metrics = noop_metrics();
+        let err = recover_segment(&path, &dir, &metrics).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string().contains("shorter than segment header"),
+            "{err}"
+        );
+        assert!(
+            !path.exists(),
+            "the short segment must be quarantined (moved)"
+        );
+        assert!(dir.join("quarantine").is_dir());
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "a short-header quarantine must increment recovery_segments_quarantined (L00)"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "a short-header quarantine must bump wab_segments{{quarantined}} (L00)"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coverage gap (T03): fault isolation across siblings. A segment whose
+    /// recovery FAILS (bad magic → quarantine → Err) must be skipped without
+    /// aborting recovery of the other healthy segments in the same shard dir, and
+    /// recover_open_segments must still return Ok. The corrupt counter (1) sorts
+    /// first, so this also proves the failure doesn't short-circuit the loop.
+    #[test]
+    fn recover_open_segments_isolates_a_corrupt_segment_from_healthy_siblings() {
+        use crate::wab::segment::{WabSegment, sealed_path_for, segment_path};
+        use std::io::Write;
+        let wab_dir = tmp_dir("recover_isolate_corrupt");
+        let shard_dir = wab_dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // Segment 1: valid then magic-corrupted → recover_segment quarantines + Errs.
+        let corrupt = segment_path(&shard_dir, 1);
+        let mut s1 = WabSegment::create(&corrupt, 0).unwrap();
+        s1.write_record(b"healthy-1").unwrap();
+        drop(s1);
+        {
+            let mut f = fs::OpenOptions::new().write(true).open(&corrupt).unwrap();
+            f.write_all(b"XXXX").unwrap();
+        }
+
+        // Segment 2: healthy, left active — must still be sealed.
+        let healthy = segment_path(&shard_dir, 2);
+        let mut s2 = WabSegment::create(&healthy, 0).unwrap();
+        s2.write_record(b"healthy-2").unwrap();
+        drop(s2);
+
+        let metrics = noop_metrics();
+        recover_open_segments(&wab_dir, &metrics).unwrap();
+
+        let healthy_sealed = sealed_path_for(&healthy);
+        assert!(
+            healthy_sealed.exists(),
+            "healthy sibling must be sealed despite the corrupt neighbour"
+        );
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&healthy_sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0], b"healthy-2" as &[u8]);
+
+        assert!(
+            !corrupt.exists(),
+            "the corrupt segment must be moved out of the shard dir (quarantined)"
+        );
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "the corrupt segment must be counted as quarantined"
+        );
+
+        fs::remove_dir_all(wab_dir).ok();
     }
 
     #[test]

@@ -16,8 +16,10 @@ use weir_core::Durability;
 
 /// Default daemon Unix socket. Override with `--socket`.
 const DEFAULT_SOCKET: &str = "/run/weir/weir.sock";
-/// Default `/metrics` endpoint. Override with `--addr`.
-const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9090";
+/// Default `/metrics` endpoint. Override with `--addr`. Matches the daemon's
+/// metrics default (config `metrics_port` = 9185); a mismatch would make
+/// `weir-ctl metrics` fail out-of-the-box against a default daemon (S27).
+const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9185";
 
 #[derive(Parser)]
 #[command(
@@ -375,7 +377,10 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
         segs.len(),
         fmt_bytes(dropped_bytes)
     );
-    println!("note: if the daemon is running, restart it so its dead-letter accounting refreshes.");
+    println!(
+        "note: a running daemon refreshes its dead-letter accounting \
+         (weir_dead_letter_bytes_on_disk) on its next health-poll cycle — no restart needed."
+    );
     if !failures.is_empty() {
         return Err(format!(
             "{} dead-letter segment(s) could not be removed:\n  {}",
@@ -446,6 +451,7 @@ fn print_summary(body: &str) {
 
     // Health flags worth surfacing loudly.
     let sink_health = active_label(body, "weir_sink_health", "state").unwrap_or_else(|| "?".into());
+    let sink_type = active_label(body, "weir_sink_info", "sink_type").unwrap_or_else(|| "?".into());
 
     println!("── weir ──────────────────────────────────");
     println!("ingest    accepted {accepted}  ack {acked}  nack {nacked}");
@@ -454,13 +460,19 @@ fn print_summary(body: &str) {
         wab_bytes / 1_048_576.0
     );
     println!("queue     depth {queue_depth}");
-    println!("sink      health: {sink_health}");
+    println!("sink      type: {sink_type}  health: {sink_health}");
     println!(
         "dead-ltr  {:.1} MiB on disk",
         dead_letter_bytes / 1_048_576.0
     );
 
     // Loud warnings for the durability hazards.
+    if sink_type == "noop" {
+        println!(
+            "\n⚠ sink: noop — records are acked then DISCARDED, not delivered downstream. \
+             Set --sink-type (http/mysql/postgres/clickhouse) to forward records."
+        );
+    }
     if panics > 0 {
         println!("\n⚠ flusher panics: {panics} — a shard is offline until restart");
     }

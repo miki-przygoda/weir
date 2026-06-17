@@ -313,15 +313,50 @@ pub(crate) fn replay_unconfirmed(
     drain_tx: &Sender<PathBuf>,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
-    for shard_id in 0..shard_count {
-        let sdir = shard_dir_path(wab_dir, shard_id);
-        if !sdir.exists() {
+    // Enumerate EVERY shard directory on disk, not just 0..shard_count. recovery
+    // (recover_open_segments) already seals active segments in all of them;
+    // scanning only the configured range here would strand sealed-but-unconfirmed
+    // segments in shard dirs whose index is >= shard_count after an operator
+    // REDUCED shard_count across a restart — records acked durable but then never
+    // replayed, confirmed, or dead-lettered (S05). The drain is shard-agnostic, so
+    // draining an orphaned dir's backlog is correct; the dir is left empty once
+    // its segments confirm. Propagate dirent errors (don't filter .ok()): a
+    // silently-skipped sealed segment is silently-dropped acked data.
+    let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<io::Result<Vec<_>>>()?;
+    shard_dirs.sort();
+
+    for sdir in shard_dirs {
+        if !sdir.is_dir() {
             continue;
         }
-        // Propagate (don't filter_map(.ok())) a dirent error: silently skipping a
-        // sealed-but-unconfirmed segment here would drop records that were acked
-        // durable but never delivered. Failing startup loudly is the safe choice
-        // — recovery is re-run on the next start (F15).
+        let name = sdir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        // Skip the daemon's reserved subdirs (mirrors recover_open_segments):
+        // quarantine/ holds parked segments; dead_letter/ is owned by the
+        // DeadLetterWriter and must not be replayed as a shard.
+        if name == "quarantine" || name == "dead_letter" {
+            continue;
+        }
+        // A shard directory beyond the configured count means shard_count was
+        // reduced with undrained data present. Its backlog is recovered here (not
+        // stranded), but surface the misconfiguration so the operator notices.
+        if let Some(idx) = name
+            .strip_prefix("shard_")
+            .and_then(|n| n.parse::<usize>().ok())
+            && idx >= shard_count
+        {
+            warn!(
+                shard_dir = %sdir.display(),
+                idx,
+                shard_count,
+                "draining backlog from a shard directory beyond the configured shard_count (shard_count reduced across a restart?); records are recovered, not stranded"
+            );
+        }
         let mut sealed_segments: Vec<PathBuf> = fs::read_dir(&sdir)?
             .map(|e| e.map(|e| e.path()))
             .collect::<io::Result<Vec<_>>>()?
@@ -369,7 +404,12 @@ pub(crate) fn replay_unconfirmed(
 /// Reads `record_count` from the footer of a sealed segment file without reading
 /// all records. The footer occupies the last `SEGMENT_FOOTER_LEN` bytes; its first
 /// 8 bytes are `record_count` as a u64 LE (see wab/format.rs for the layout).
-fn read_segment_record_count(path: &Path) -> io::Result<u64> {
+///
+/// `pub(crate)` so the drain can cross-check the footer's authoritative count
+/// against the number of records it actually read, catching a post-seal tail
+/// truncation that the sequential reader would otherwise see as a clean end of
+/// stream (S01).
+pub(crate) fn read_segment_record_count(path: &Path) -> io::Result<u64> {
     let mut file = fs::File::open(path)?;
     // Guard the seek-from-end: a file shorter than the footer would seek to a
     // negative offset, which surfaces as a cryptic platform error ("Invalid
@@ -951,6 +991,125 @@ mod tests {
         let received = consumer.join().unwrap();
         replay.join().unwrap();
         assert_eq!(received, N, "every backlog segment must reach the drain");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── S05: replay must drain shard dirs beyond the configured shard_count ──────
+    #[test]
+    fn replay_drains_shard_dirs_beyond_configured_count() {
+        // An operator who REDUCES shard_count across a restart must not strand
+        // sealed-but-unconfirmed segments in the now-orphaned shard dirs. Recovery
+        // already seals active segments in every dir; replay must likewise scan
+        // every dir, not just 0..shard_count (S05).
+        let dir = tmp_dir("replay_orphan_shards");
+        for s in 0..4u16 {
+            let shard_dir = shard_dir_path(&dir, s as usize);
+            fs::create_dir_all(&shard_dir).unwrap();
+            let path = segment_path(&shard_dir, 1);
+            let mut seg = WabSegment::create(&path, s).unwrap();
+            seg.write_record(b"orphaned").unwrap();
+            seg.seal().unwrap();
+        }
+
+        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        // Configured shard_count = 2, but 4 shard dirs hold backlog on disk.
+        replay_unconfirmed(&dir, 2, &tx, &metrics).unwrap();
+        drop(tx);
+
+        let received: Vec<String> = rx.iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(
+            received.len(),
+            4,
+            "all 4 shard dirs' segments must replay, including the 2 beyond shard_count"
+        );
+        assert!(
+            received.iter().any(|n| n.contains("shard_02")),
+            "orphaned shard_02 backlog must be drained, not stranded"
+        );
+        assert!(
+            received.iter().any(|n| n.contains("shard_03")),
+            "orphaned shard_03 backlog must be drained, not stranded"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coverage gap (T01): replay must SKIP a segment that already has a valid
+    /// `.confirmed` sidecar (delivered + confirmed on a prior run, not yet GC'd)
+    /// while still replaying its unconfirmed sibling — the at-least-once + dedup
+    /// invariant's "don't re-deliver an already-confirmed segment" half.
+    #[test]
+    fn replay_skips_already_confirmed_segment() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        let dir = tmp_dir("replay_skip_confirmed");
+        let shard_dir = shard_dir_path(&dir, 0);
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // seg 1: sealed AND confirmed (delivered last run; segment not yet deleted).
+        let p1 = segment_path(&shard_dir, 1);
+        let mut s1 = WabSegment::create(&p1, 0).unwrap();
+        s1.write_record(b"already-delivered").unwrap();
+        let sealed1 = s1.seal().unwrap();
+        fs::write(confirmed_path_for(&sealed1), build_confirmed(0, 1, 1)).unwrap();
+
+        // seg 2: sealed, NOT confirmed (genuinely undrained).
+        let p2 = segment_path(&shard_dir, 2);
+        let mut s2 = WabSegment::create(&p2, 0).unwrap();
+        s2.write_record(b"needs-delivery").unwrap();
+        let sealed2 = s2.seal().unwrap();
+
+        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        replay_unconfirmed(&dir, 1, &tx, &metrics).unwrap();
+        drop(tx);
+
+        let queued: Vec<PathBuf> = rx.iter().collect();
+        assert_eq!(
+            queued.len(),
+            1,
+            "only the unconfirmed segment may be replayed; got {queued:?}"
+        );
+        assert_eq!(
+            queued[0], sealed2,
+            "the undrained segment must be the one queued, not the confirmed one"
+        );
+        let _ = sealed1;
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Coverage gap (T08): a corrupt/forged per-record length field exceeding
+    /// MAX_PAYLOAD_HARD_CAP must be rejected with InvalidData BEFORE any
+    /// allocation — the disk-read DoS bound. Existing reader tests cover CRC
+    /// mismatch and round-trip but not the cap branch.
+    #[test]
+    fn segment_reader_rejects_oversized_record_len_before_allocation() {
+        let dir = tmp_dir("rd_oversized_len");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"keep-me").unwrap();
+        } // drop flushes
+
+        // Splice an over-cap record-length field where the next record would begin.
+        let oversized = (MAX_PAYLOAD_HARD_CAP as u32 + 1).to_le_bytes();
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&oversized).unwrap();
+        }
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        let first = reader.next().expect("a record").expect("valid record");
+        assert_eq!(first, b"keep-me" as &[u8]);
+        let err = reader
+            .next()
+            .expect("an item")
+            .expect_err("an over-cap length must be an Err, never a giant allocation");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(
+            err.to_string().contains("exceeds MAX_PAYLOAD_HARD_CAP"),
+            "error must name the cap: {err}"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

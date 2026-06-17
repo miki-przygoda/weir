@@ -30,7 +30,7 @@ listener addresses this with **mandatory mutual TLS**:
   allowlist — possession of a valid CA-signed cert is sufficient authority.
   To revoke a client, rotate the CA (see [Out of scope](#out-of-scope) for
   why CRL/OCSP are not implemented).
-- **TLS implementation: rustls with the aws-lc-rs crypto provider.** No
+- **TLS implementation: rustls with the ring crypto provider.** No
   system OpenSSL dependency; the crypto provider is selected explicitly so
   the binary's code-signing surface stays at one provider.
 
@@ -241,22 +241,26 @@ cargo add weir-client --features tls
 ### `WeirClient::connect_tls`
 
 ```rust
-use weir_client::{WeirClient, ClientTlsConfig, Durability};
+use std::path::Path;
+use weir_client::{ClientTlsConfig, WeirClient};
+use weir_core::Durability;
 
-let client = WeirClient::connect_tls(
+// The client API is synchronous — no async runtime required.
+let mut client = WeirClient::connect_tls(
     "weir.internal.example.com:7100",
     ClientTlsConfig {
-        client_cert: "/path/to/client.crt".into(),
-        client_key:  "/path/to/client.key".into(),
-        ca_cert:     "/path/to/ca.crt".into(),
-        // Must match a SAN in the server cert
-        server_name: "weir.internal.example.com".into(),
-        // Default durability when push_default() is used
-        default_durability: Durability::Sync,
+        // Paths are borrowed (&Path); the config borrows, it does not own.
+        client_cert: Path::new("/path/to/client.crt"),
+        client_key:  Path::new("/path/to/client.key"),
+        ca_cert:     Path::new("/path/to/ca.crt"),
+        // Must match a SAN in the server cert.
+        server_name: "weir.internal.example.com",
+        // Tier used by push_default(); None requires a tier per push.
+        default_durability: Some(Durability::Sync),
     },
-).await?;
+)?;
 
-client.push(b"hello", Durability::Sync).await?;
+client.push(b"hello", Durability::Sync)?;
 ```
 
 The client validates the server certificate against `ca_cert`. The

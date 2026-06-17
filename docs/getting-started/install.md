@@ -1,9 +1,10 @@
 # Installation
 
-> **TL;DR** — Today, build from source (`cargo build --release -p weir-server`)
-> or use the container image (`docker compose -f deploy/docker-compose.yml up`).
-> `cargo install weir-server` and pre-built release binaries are planned for
-> v1.0; not yet published.
+> **TL;DR** — build from source (`cargo build --release -p weir-server`),
+> grab a pre-built binary from the
+> [GitHub Releases](https://github.com/miki-przygoda/weir/releases), or use the
+> container image (`docker compose -f deploy/docker/docker-compose.yml up`).
+> `cargo install weir-server` lands with the 1.0 crates.io release (see below).
 
 Three supported install paths are covered below. All install paths
 produce the same `weir-server` daemon; the choice is purely about how
@@ -13,7 +14,8 @@ you want to build, deploy, and update it.
 
 ### Prerequisites
 
-- **Rust 1.85+** (edition 2024). `rustup default stable` is enough.
+- **Rust 1.88+** (edition 2024) — the declared MSRV (`rust-version` in
+  `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
 - A Unix host (Linux or macOS). weir-server does not build on Windows
   due to Unix-only socket APIs; `weir-core` and `weir-client` do.
 - ~500 MB free disk (build artifacts).
@@ -29,7 +31,7 @@ cargo build --release -p weir-server
 The binary lands at `./target/release/weir-server`. It's a single
 statically-linked-ish executable (links libc and libdl; everything else
 is in the binary). Strip with `strip target/release/weir-server` if
-you care about size (~15 MB → ~8 MB).
+you care about size (~9.5 MB → ~8.3 MB).
 
 ### Install to PATH
 
@@ -46,7 +48,7 @@ sudo ln -s "$(pwd)/target/release/weir-server" /usr/local/bin/weir-server
 ### Verify
 
 ```bash
-weir-server --help    # not yet implemented; will be added in v1.0
+weir-server --help    # prints the full flag/option reference
 weir-server --wab-dir /tmp/wab-test --socket-path /tmp/weir-test.sock
 # Ctrl-C to stop.
 ```
@@ -104,7 +106,7 @@ takes ~3–5 minutes; subsequent builds with unchanged dependencies are
 ### Run with Docker Compose
 
 ```bash
-docker compose -f deploy/docker-compose.yml up
+docker compose -f deploy/docker/docker-compose.yml up
 ```
 
 This mounts `./data/wab` for the WAB and exposes the metrics port on
@@ -149,17 +151,17 @@ Neither is published yet.
 
 ## `cargo install`
 
-With the 1.0 crates published to crates.io:
+> **Status:** the crates are not on crates.io yet — publishing is part of
+> the 1.0 release rollout. Until then, use the from-source path above. Once
+> published, this will work:
 
 ```bash
 cargo install weir-server
 ```
 
-This fetches the latest published version, builds it with the host's
-Rust toolchain, and installs to `~/.cargo/bin/weir-server`. The wire
-protocol and public API are frozen at 1.0 under Semantic Versioning, so
-the version caveat that kept earlier builds off crates.io no longer
-applies.
+It will fetch the latest published version, build it with the host's Rust
+toolchain, and install to `~/.cargo/bin/weir-server`. The wire protocol and
+public API are frozen at 1.0 under Semantic Versioning.
 
 ## Pre-built release binaries
 
@@ -175,27 +177,36 @@ container paths above.
 After installing via any method:
 
 ```bash
-weir-server --wab-dir /tmp/wab --socket-path /tmp/weir.sock &
+# The daemon does not create its directories (Postgres model) — make them first.
+mkdir -p /tmp/weir-verify/wab /tmp/weir-verify/run && chmod 0700 /tmp/weir-verify/run
+weir-server --wab-dir /tmp/weir-verify/wab --socket-path /tmp/weir-verify/run/weir.sock &
 DAEMON_PID=$!
 
 # Wait a moment for startup.
 sleep 1
 
-# Metrics endpoint should respond.
-curl -fsS http://localhost:9185/metrics | grep -E "^weir_records_accepted" | head -1
+# Metrics endpoint should respond. weir_drain_state is pre-initialised on
+# startup, so it has data on the very first scrape (no producer needed).
+curl -fsS http://localhost:9185/metrics | grep '^weir_drain_state'
 
 # Clean up.
 kill -TERM $DAEMON_PID
 wait $DAEMON_PID
+rm -rf /tmp/weir-verify
 ```
 
-Expected output:
+Expected output (exactly one state is `1`):
 
 ```
-weir_records_accepted_total{tier="sync"} 0
+weir_drain_state{state="draining"} 1
+weir_drain_state{state="retrying_transient"} 0
+weir_drain_state{state="blocked_dead_letter_full"} 0
 ```
 
-Zero acceptances is correct — no producer has connected yet.
+That confirms the daemon started and the metrics endpoint is live. (Counter
+families like `weir_records_accepted_total` only emit a data line once a record
+of that durability tier has been pushed, so they won't appear yet — that's
+expected.)
 
 ## Uninstalling
 
@@ -210,7 +221,7 @@ cargo uninstall weir-server
 ### Container
 
 ```bash
-docker compose -f deploy/docker-compose.yml down
+docker compose -f deploy/docker/docker-compose.yml down
 docker rmi weir:latest
 ```
 

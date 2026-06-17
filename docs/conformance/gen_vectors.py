@@ -106,6 +106,22 @@ for byte, slug, desc in NACK_REASONS:
     ok(f"nack_{slug}", f"Nack reason {desc}.",
        frame(MT["Nack"], DUR["Sync"], payload), "Nack", "Sync", 0, payload)
 
+# ── Forward-compat / response-filler coverage (decode ok) ─────────────────────
+# A Nack carrying a reserved reason byte still decodes as a Nack frame — the
+# reason's *meaning* is forward-compatible (a client surfaces the raw byte). This
+# pins a non-Rust decoder's forward-compat path, which the per-reason vectors above
+# (0x01–0x09) don't exercise.
+ok("nack_reserved_reason",
+   "Nack with a reserved reason byte (0x0A): decodes as a Nack frame; the reason's "
+   "meaning is forward-compatible and clients surface the raw byte.",
+   frame(MT["Nack"], DUR["Sync"], bytes([0x0A])), "Nack", "Sync", 0, bytes([0x0A]))
+# Responses carry a durability *filler* byte that clients must ignore. Pin that a
+# non-Sync filler still decodes (here an Ack with Buffered, 0x03).
+ok("ack_nonsync_durability_filler",
+   "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must "
+   "ignore the durability field on responses.",
+   frame(MT["Ack"], DUR["Buffered"], b""), "Ack", "Buffered", 0, b"")
+
 # ── Rejection vectors (decode must error with the named variant) ──────────────
 # bad magic
 raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data"))

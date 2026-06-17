@@ -31,6 +31,19 @@ pub enum ClientError {
     },
     /// The daemon sent a Nack with an unrecognised reason byte.
     UnknownNack(u8),
+    /// The payload exceeds the protocol hard cap and was rejected locally,
+    /// before any bytes were sent. The daemon would always reject a payload this
+    /// large (and a large frame can race the daemon's Nack-and-close, surfacing as
+    /// a bare broken-pipe), so the client rejects it up front with no round-trip.
+    /// A deployment's configured `max_payload_bytes` may be lower than this cap; a
+    /// payload over that lower limit is reported by the daemon as
+    /// [`ClientError::Nack`]`(`[`NackReason::PayloadTooLarge`]`)`.
+    PayloadTooLarge {
+        /// The rejected payload's length in bytes.
+        len: usize,
+        /// The protocol hard cap ([`weir_core::MAX_PAYLOAD_HARD_CAP`]).
+        limit: usize,
+    },
     /// The daemon's response violated the wire protocol.
     Protocol(String),
     /// `push_default` was called but no default durability was set.
@@ -48,6 +61,10 @@ impl std::fmt::Display for ClientError {
                 weir_core::WIRE_VERSION
             ),
             Self::UnknownNack(b) => write!(f, "server nack with unknown reason {b:#04x}"),
+            Self::PayloadTooLarge { len, limit } => write!(
+                f,
+                "payload too large: {len} bytes exceeds the {limit}-byte protocol hard cap"
+            ),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::NoDefaultDurability => {
                 write!(f, "push_default called but no default durability was set")
@@ -95,6 +112,25 @@ pub struct WeirClient<S = UnixStream> {
     /// ack). Once poisoned, every method fails fast; the caller must reconnect
     /// (G04).
     poisoned: bool,
+    /// Set once the daemon Nacked a frame for a reason that closes the connection
+    /// (every Nack except the transient `InternalError`). The connection is then
+    /// cleanly dead — the next call would otherwise just hit a broken pipe — so we
+    /// fail fast with a clear "reconnect" error instead (QA#2).
+    closed_after_nack: bool,
+}
+
+// Manual Debug (not derived): a `#[derive(Debug)]` would require `S: Debug`, which
+// excludes `WeirClient<TlsStream>` (rustls's `StreamOwned` is not `Debug`). Print
+// the non-secret fields and omit the transport so every client type — Unix and
+// TLS — implements `Debug` (C-DEBUG, S40).
+impl<S> std::fmt::Debug for WeirClient<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeirClient")
+            .field("default_durability", &self.default_durability)
+            .field("poisoned", &self.poisoned)
+            .field("closed_after_nack", &self.closed_after_nack)
+            .finish_non_exhaustive()
+    }
 }
 
 // ── Shared methods over any blocking Read+Write transport ──────────────────────
@@ -110,26 +146,72 @@ impl<S: Read + Write> WeirClient<S> {
     /// Blocks until the daemon replies. On `Ack` the record is durably stored
     /// according to the requested tier. On `Nack` returns the reason as
     /// [`ClientError::Nack`].
+    ///
+    /// An `Ack` means the record is durably **buffered** at the requested tier —
+    /// **not** that it has reached the downstream sink yet (the daemon drains in
+    /// batches once a segment seals). See the crate-level "Ack vs. delivery" note.
+    #[must_use = "a dropped push result hides whether the record was acked; an \
+                  unhandled Nack also closes the connection"]
     pub fn push(
         &mut self,
         payload: impl AsRef<[u8]>,
         durability: Durability,
     ) -> Result<(), ClientError> {
         self.ensure_usable()?;
+        let bytes = payload.as_ref();
+        // Local guard against the protocol hard cap. The daemon always rejects a
+        // payload this large, and for a big frame it Nacks then closes the
+        // connection before we finish streaming — so the Nack races our write and
+        // would surface as a bare broken-pipe. Reject up front, no round-trip, with
+        // a clear typed error. (A deployment's configured cap may be lower than the
+        // hard cap; a payload over that lower limit still goes to the daemon and is
+        // handled by the write-error recovery below.)
+        if bytes.len() > MAX_PAYLOAD_HARD_CAP {
+            return Err(ClientError::PayloadTooLarge {
+                len: bytes.len(),
+                limit: MAX_PAYLOAD_HARD_CAP,
+            });
+        }
         // copy_from_slice at the API boundary so downstream handling is zero-copy.
-        let payload = weir_core::Payload::copy_from_slice(payload.as_ref());
+        let payload = weir_core::Payload::copy_from_slice(bytes);
         let header = Header::new(MessageType::Push, durability, 0);
         let frame = Envelope::new(header, payload).encode();
-        self.stream.write_all(&frame)?;
+
+        if let Err(write_err) = self.stream.write_all(&frame) {
+            // The write failed partway. The daemon may have Nacked (e.g. a payload
+            // over its configured cap) and closed the connection before we finished
+            // streaming — its Nack can already be sitting in our receive buffer.
+            // Read it so the caller sees the real reason instead of a broken-pipe.
+            // Either way the connection is now dead.
+            if let Ok(resp) = self.read_response()
+                && resp.header().message_type() == MessageType::Nack
+            {
+                self.closed_after_nack = true;
+                return Err(nack_error(resp.payload()));
+            }
+            self.poisoned = true;
+            return Err(write_err.into());
+        }
 
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::Ack => Ok(()),
-            MessageType::Nack => Err(nack_error(resp.payload())),
+            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
             other => Err(ClientError::Protocol(format!(
                 "expected Ack or Nack, got {other:?}"
             ))),
         }
+    }
+
+    /// Records that a Nack closed the connection (every reason except the
+    /// transient `InternalError`, which the daemon keeps open) so the next call
+    /// fails fast with a clear reconnect error rather than a broken pipe (QA#2).
+    /// Returns the error unchanged for convenient `Err(self.note_nack(e))` use.
+    fn note_nack(&mut self, err: ClientError) -> ClientError {
+        if !matches!(err, ClientError::Nack(NackReason::InternalError)) {
+            self.closed_after_nack = true;
+        }
+        err
     }
 
     /// Pushes at the connection's default durability tier.
@@ -157,7 +239,7 @@ impl<S: Read + Write> WeirClient<S> {
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::HealthCheckResponse => Ok(()),
-            MessageType::Nack => Err(nack_error(resp.payload())),
+            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
             other => Err(ClientError::Protocol(format!(
                 "expected HealthCheckResponse, got {other:?}"
             ))),
@@ -169,6 +251,13 @@ impl<S: Read + Write> WeirClient<S> {
     /// that would be mis-read as this call's reply — a false ack — so we refuse
     /// to use it (G04). The caller must drop the client and reconnect.
     fn ensure_usable(&self) -> Result<(), ClientError> {
+        if self.closed_after_nack {
+            return Err(ClientError::Protocol(
+                "connection closed by the daemon after a Nack; \
+                 drop this client and reconnect before sending again"
+                    .into(),
+            ));
+        }
         if self.poisoned {
             return Err(ClientError::Protocol(
                 "client connection poisoned by a prior response-read error/timeout; \
@@ -236,6 +325,7 @@ impl<S: Read + Write> WeirClient<S> {
             stream,
             default_durability,
             poisoned: false,
+            closed_after_nack: false,
         }
     }
 }
@@ -250,6 +340,7 @@ impl WeirClient<UnixStream> {
             stream,
             default_durability: None,
             poisoned: false,
+            closed_after_nack: false,
         })
     }
 
@@ -275,6 +366,7 @@ impl WeirClient<UnixStream> {
             stream,
             default_durability: None,
             poisoned: false,
+            closed_after_nack: false,
         }
     }
 
@@ -392,6 +484,150 @@ mod tests {
             nack_error(&payload),
             ClientError::Nack(NackReason::PayloadTooLarge)
         ));
+    }
+
+    // ── Bug #1: oversized payloads must surface as PayloadTooLarge, not broken-pipe ──
+
+    #[test]
+    fn push_rejects_over_hard_cap_locally() {
+        // A payload above the protocol hard cap is rejected locally, before any
+        // bytes hit the wire — no round-trip, and the connection stays usable.
+        let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let oversized = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        let err = c.push(&oversized, Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::PayloadTooLarge { len, limit }
+                if len == MAX_PAYLOAD_HARD_CAP + 1 && limit == MAX_PAYLOAD_HARD_CAP),
+            "expected a local PayloadTooLarge, got {err:?}"
+        );
+        assert!(
+            !c.poisoned,
+            "a local rejection must not poison the connection"
+        );
+    }
+
+    #[test]
+    fn push_surfaces_payload_too_large_nack_when_server_closes_mid_write() {
+        // Mirrors the daemon's over-configured-cap path: read only the header, send
+        // Nack(PayloadTooLarge), then close without draining the payload. Before the
+        // fix the client's large write hit the closed socket and returned a bare
+        // broken-pipe, hiding the Nack. Now the Nack is read from the receive buffer
+        // and surfaced — whether the write fails partway or just-barely succeeds.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut hdr = [0u8; weir_core::HEADER_LEN];
+            server_end.read_exact(&mut hdr).unwrap();
+            let nack = weir_core::Envelope::new(
+                weir_core::Header::new(
+                    weir_core::MessageType::Nack,
+                    weir_core::Durability::Sync,
+                    0,
+                ),
+                vec![NackReason::PayloadTooLarge as u8],
+            )
+            .encode();
+            server_end.write_all(&nack).unwrap();
+            // drop server_end here → connection closes without reading the payload.
+        });
+
+        // 2 MiB: above any default socket buffer (so the write blocks then fails
+        // once the server stops reading and closes), but under the hard cap (so it
+        // is not caught by the local pre-check).
+        let payload = vec![0u8; 2 * 1024 * 1024];
+        let err = c.push(&payload, Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(err, ClientError::Nack(NackReason::PayloadTooLarge)),
+            "expected Nack(PayloadTooLarge) surfaced from the buffered reply, got {err:?}"
+        );
+    }
+
+    // ── Bug #2: a connection-closing Nack must give a clear next-call error ──────
+
+    // Reads one full frame (header + payload + CRC) off a server-side stream.
+    fn drain_one_frame(s: &mut std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        let mut hdr = [0u8; weir_core::HEADER_LEN];
+        s.read_exact(&mut hdr).unwrap();
+        let n = weir_core::Header::decode(&hdr).unwrap().payload_len() as usize + 4;
+        let mut rest = vec![0u8; n];
+        s.read_exact(&mut rest).unwrap();
+    }
+
+    fn nack_frame(reason: NackReason) -> Vec<u8> {
+        weir_core::Envelope::new(
+            weir_core::Header::new(weir_core::MessageType::Nack, weir_core::Durability::Sync, 0),
+            vec![reason as u8],
+        )
+        .encode()
+    }
+
+    #[test]
+    fn closing_nack_makes_next_call_fail_with_a_clear_reconnect_error() {
+        // The daemon closes the connection after a validation Nack. Before the fix,
+        // the next push hit the dead socket and returned a bare broken-pipe; now it
+        // fails fast with a clear "reconnect" error.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            server_end
+                .write_all(&nack_frame(NackReason::EmptyPayload))
+                .unwrap();
+            // drop server_end → connection closes, as the daemon does after a Nack.
+        });
+        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(first, ClientError::Nack(NackReason::EmptyPayload)),
+            "first push should surface the real reason, got {first:?}"
+        );
+        // Second call must NOT be a broken-pipe — it must clearly say reconnect.
+        match c.push(b"y", Durability::Sync).unwrap_err() {
+            ClientError::Protocol(msg) => assert!(
+                msg.contains("closed by the daemon after a Nack") && msg.contains("reconnect"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected a clear reconnect Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn internal_error_nack_keeps_connection_usable() {
+        // InternalError is transient — the daemon keeps the connection open — so the
+        // client must NOT mark it closed, and a retry on the same connection works.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            server_end
+                .write_all(&nack_frame(NackReason::InternalError))
+                .unwrap();
+            drain_one_frame(&mut server_end); // the retry
+            let ack = weir_core::Envelope::new(
+                weir_core::Header::new(weir_core::MessageType::Ack, weir_core::Durability::Sync, 0),
+                vec![],
+            )
+            .encode();
+            server_end.write_all(&ack).unwrap();
+        });
+        let first = c.push(b"a", Durability::Sync).unwrap_err();
+        assert!(
+            matches!(first, ClientError::Nack(NackReason::InternalError)),
+            "got {first:?}"
+        );
+        assert!(
+            !c.closed_after_nack,
+            "InternalError is transient and must not close the connection"
+        );
+        c.push(b"b", Durability::Sync).unwrap(); // retry on the same connection succeeds
+        server.join().unwrap();
     }
 
     // ── F43: opt-in socket timeouts ───────────────────────────────────────────

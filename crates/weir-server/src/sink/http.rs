@@ -78,7 +78,9 @@ pub struct HttpSinkConfig {
 impl std::fmt::Debug for HttpSinkConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpSinkConfig")
-            .field("url", &self.url)
+            // The URL may carry userinfo (user:password@host); redact the password
+            // so it never lands in a Debug-formatted log line (S25).
+            .field("url", &crate::sink::redact_url_password(&self.url))
             .field("timeout", &self.timeout)
             .field("max_batch_size", &self.max_batch_size)
             .field(
@@ -156,17 +158,28 @@ impl HttpSink {
             Err(e) => {
                 // Network-layer errors are all transient. Connect refused,
                 // DNS failure, timeout, broken pipe — drain retries.
-                debug!(error = %e, "sink POST failed at transport layer");
-                return Err(HttpSinkError::Transport(e.to_string()));
+                //
+                // Defence in depth (S31): this string is stored in
+                // `Transport` and re-logged at warn! by the drain on *every*
+                // retry, so a `scheme://user:pass@host` sink URL must never
+                // bleed its password here. reqwest 0.12 already strips URL
+                // userinfo from its error Display (it lifts it into a Basic-auth
+                // header), but we own the redaction rather than delegating the
+                // guarantee to a transitive dep's formatting — `redact_url_password`
+                // is a no-op when no userinfo is present, so the useful host
+                // diagnostic survives.
+                let rendered = crate::sink::redact_url_password(&e.to_string());
+                debug!(error = %rendered, "sink POST failed at transport layer");
+                return Err(HttpSinkError::Transport(rendered));
             }
         };
 
         let status = resp.status();
         if status.is_success() {
-            // Drain the body to release the connection back to the pool.
-            // We don't care about the response body for v0 (the endpoint's
-            // status code is the only signal).
-            let _ = resp.bytes().await;
+            // Drain the body (capped) to release the connection back to the pool.
+            // We don't care about the response body — the status code is the only
+            // signal — so a hostile downstream can't make us buffer it (S28).
+            let _ = crate::sink::read_body_capped(resp, crate::sink::RESPONSE_BODY_CAP).await;
             return Ok(());
         }
 
@@ -213,13 +226,14 @@ impl HttpSink {
         // Permanent. Capture a short body excerpt for the dead-letter reason
         // string so operators can debug what the endpoint complained about.
         // Cap at 256 bytes to avoid logging unbounded server output.
-        let body_excerpt = match resp.bytes().await {
-            Ok(bytes) => {
-                let cut = bytes.len().min(256);
-                String::from_utf8_lossy(&bytes[..cut]).into_owned()
-            }
-            Err(_) => String::from("<body read failed>"),
-        };
+        // Read at most the cap (S28), then take a 256-byte excerpt. Strip control
+        // characters: the body is downstream-controlled and is interpolated into
+        // log lines and the dead-letter reason, so a hostile endpoint could
+        // otherwise inject forged log records or terminal escape sequences (S29).
+        let bytes = crate::sink::read_body_capped(resp, crate::sink::RESPONSE_BODY_CAP).await;
+        let cut = bytes.len().min(256);
+        let body_excerpt =
+            crate::sink::sanitize_log_excerpt(&String::from_utf8_lossy(&bytes[..cut]));
         Err(HttpSinkError::PermanentStatus {
             status,
             body_excerpt,
@@ -398,8 +412,15 @@ impl Sink for HttpSink {
         // the bearer token is attached per-POST in commit(), not as a client
         // default — so a 401/403 here is an expected auth challenge from a
         // reachable endpoint, not a misconfiguration; the real (authenticated)
-        // commit path will succeed, so treat it as healthy. 2xx/3xx are
-        // healthy; other 4xx suggest an endpoint misconfig (degraded); 5xx or a
+        // commit path will succeed, so treat it as healthy. 2xx/3xx are healthy.
+        //
+        // 405 Method Not Allowed / 501 Not Implemented mean the endpoint is
+        // REACHABLE but simply doesn't implement HEAD — extremely common for
+        // POST-only ingest APIs (observability collectors, webhooks). Treating
+        // those as "down" was a recurring false-alarm: the sink delivers every
+        // record via POST while the gauge reads down and the log spams ERROR.
+        // The real signal is commit success, so treat HEAD-unsupported as healthy.
+        // Other 4xx suggest an endpoint misconfig (degraded); other 5xx or a
         // transport failure suggests the endpoint is down.
         match self.client.head(&self.config.url).send().await {
             Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
@@ -407,7 +428,9 @@ impl Sink for HttpSink {
             }
             Ok(resp)
                 if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                    || resp.status() == reqwest::StatusCode::FORBIDDEN =>
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN
+                    || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    || resp.status() == reqwest::StatusCode::NOT_IMPLEMENTED =>
             {
                 SinkHealth::Healthy
             }
@@ -415,7 +438,12 @@ impl Sink for HttpSink {
                 SinkHealth::Degraded(format!("HEAD returned {}", resp.status()))
             }
             Ok(resp) => SinkHealth::Down(format!("HEAD returned {}", resp.status())),
-            Err(e) => SinkHealth::Down(format!("HEAD failed: {e}")),
+            // Redact any URL password the transport error might carry (S31); see
+            // the matching note on the commit path.
+            Err(e) => SinkHealth::Down(format!(
+                "HEAD failed: {}",
+                crate::sink::redact_url_password(&e.to_string())
+            )),
         }
     }
 }
@@ -559,6 +587,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn debug_redacts_bearer_token_and_url_password() {
+        // Lock the credential-redaction contract: neither the bearer token nor a
+        // URL password may appear in Debug output (S30 / S25).
+        let mut c = cfg("https://user:sup3rS3cret@example.com/ingest");
+        c.bearer_token = Some(Arc::from("t0p-s3cret-token"));
+        let dbg = format!("{c:?}");
+        assert!(
+            !dbg.contains("t0p-s3cret-token"),
+            "bearer token leaked in Debug: {dbg}"
+        );
+        assert!(
+            !dbg.contains("sup3rS3cret"),
+            "URL password leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"));
+    }
+
     #[tokio::test]
     async fn empty_url_rejected_at_build() {
         let mut c = cfg("");
@@ -674,6 +720,30 @@ mod tests {
         assert!(reason.contains("bad payload"), "reason: {reason}");
     }
 
+    /// Coverage gap (T12): a verbose/hostile 4xx body must NOT land unbounded in
+    /// the dead-letter reason — the excerpt is cut at 256 bytes.
+    #[tokio::test]
+    async fn http_permanent_status_truncates_large_body_excerpt() {
+        let body = "A".repeat(4096);
+        let resp = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        // spawn_mock_server wants &'static str; leak the owned response (test-only).
+        let resp: &'static str = Box::leak(resp.into_boxed_str());
+        let (url, _counter) = spawn_mock_server(vec![resp]).await;
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        let result = sink.commit(vec![p(b"x")]).await.unwrap();
+        assert_eq!(result.dead_lettered.len(), 1);
+        let (_, reason) = &result.dead_lettered[0];
+        assert!(reason.contains("400"), "reason: {reason}");
+        assert!(
+            !reason.contains(&"A".repeat(300)),
+            "the 4096-byte body must be truncated to a bounded excerpt, not carried whole"
+        );
+    }
+
     #[tokio::test]
     async fn http_500_returns_transient_error() {
         let (url, _counter) = spawn_mock_server(vec![
@@ -755,6 +825,43 @@ mod tests {
             "connect refused must be transient: {err}"
         );
         assert!(matches!(err, HttpSinkError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn transport_error_does_not_leak_url_password() {
+        // S31: a reqwest transport error must NOT carry the sink URL's password
+        // into the error string. That string is stored in HttpSinkError::Transport
+        // and re-logged at warn! by the drain on every retry (drain/mod.rs), so a
+        // `https://user:pass@host` URL + a brief outage would otherwise print the
+        // password to stderr/journald repeatedly. reqwest's Error Display appends
+        // ` for url (<url>)` with the FULL url (incl. userinfo) unless stripped.
+        let sink =
+            HttpSink::new(cfg("http://weiruser:s3cr3t-passw0rd@127.0.0.1:1/ingest")).unwrap();
+        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        assert!(
+            err.is_transient(),
+            "connect refused must be transient: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("s3cr3t-passw0rd"),
+            "URL password leaked into the transport error string: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_down_does_not_leak_url_password() {
+        // S31: the health HEAD probe's failure message is surfaced to operators;
+        // it must not embed the URL password either.
+        let sink =
+            HttpSink::new(cfg("http://weiruser:s3cr3t-passw0rd@127.0.0.1:1/ingest")).unwrap();
+        match sink.health().await {
+            SinkHealth::Down(msg) => assert!(
+                !msg.contains("s3cr3t-passw0rd"),
+                "URL password leaked into health Down message: {msg}"
+            ),
+            other => panic!("expected Down for a closed port, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1051,6 +1158,24 @@ mod tests {
             assert!(
                 matches!(sink.health().await, SinkHealth::Healthy),
                 "{resp} should be healthy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_treats_head_unsupported_as_healthy() {
+        // 405/501 mean the endpoint is reachable but doesn't implement HEAD —
+        // common for POST-only ingest APIs. The sink delivers fine via POST, so
+        // these must NOT flap the sink to "down" (recurring usage-sweep finding).
+        for resp in [
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let (url, _counter) = spawn_mock_server(vec![resp]).await;
+            let sink = HttpSink::new(cfg(&url)).unwrap();
+            assert!(
+                matches!(sink.health().await, SinkHealth::Healthy),
+                "{resp} should be healthy (endpoint reachable, HEAD unsupported)"
             );
         }
     }

@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — live pipeline demo</title>
+<meta name="description" content="An interactive, browser-only simulation of weir: a durable write buffer. Compare a naive synchronous-insert-per-record stack with weir — durable acks, N→1 commits, crash-safe — at the same speed." />
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c232c; --line:#30363d;
+    --fg:#e6edf3; --dim:#8b949e; --accent:#58a6ff; --accent2:#3fb950;
+    --warn:#d29922; --bad:#f85149; --batched:#bc8cff;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:var(--sans);
+         line-height:1.5; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1080px; margin:0 auto; padding:24px 20px 64px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; letter-spacing:-0.01em; }
+  h1 .v { color:var(--accent2); font-family:var(--mono); font-size:1rem; vertical-align:middle; }
+  .tag { color:var(--dim); margin:0 0 20px; font-size:0.98rem; }
+  .intro { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:14px 18px; margin-bottom:20px; font-size:0.93rem; }
+  .intro b { color:var(--fg); }
+  .invariant { color:var(--accent2); font-family:var(--mono); }
+
+  .controls { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center;
+              background:var(--panel); border:1px solid var(--line); border-radius:10px;
+              padding:14px 16px; margin-bottom:18px; position:sticky; top:0; z-index:5; }
+  .controls .group { display:flex; gap:8px; align-items:center; }
+  .controls .label { color:var(--dim); font-size:0.78rem; text-transform:uppercase;
+                     letter-spacing:0.06em; margin-right:2px; }
+  button { font-family:var(--sans); font-size:0.9rem; color:var(--fg); background:var(--panel2);
+           border:1px solid var(--line); border-radius:7px; padding:7px 13px; cursor:pointer;
+           transition:background .12s,border-color .12s; }
+  button:hover { background:#28313b; border-color:#475260; }
+  button:active { transform:translateY(1px); }
+  button.danger { background:#f8514922; border-color:#f85149; color:#ffb3ad; }
+  button.danger:hover { background:#f8514933; }
+  button.on { background:#3fb95022; border-color:#3fb950; color:#aef0bd; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; }
+  .seg button { border:0; border-radius:0; border-right:1px solid var(--line); }
+  .seg button:last-child { border-right:0; }
+  .seg button.sel { background:#28313b; color:#fff; box-shadow:inset 0 -2px 0 var(--tier,var(--accent)); }
+
+  .section { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+             padding:14px 16px 16px; margin-bottom:18px; }
+  .section.weir { border-color:#2c4a36; }
+  .sec-head { display:flex; align-items:baseline; gap:10px; margin:0 2px 10px; }
+  .sec-head h2 { font-size:1.05rem; margin:0; letter-spacing:-0.01em; }
+  .sec-head .naive-t { color:var(--warn); }
+  .sec-head .weir-t { color:var(--accent2); }
+  .sec-head .sub { color:var(--dim); font-size:0.85rem; }
+  .sec-head .pill { margin-left:auto; font-family:var(--mono); font-size:0.74rem;
+                    padding:2px 9px; border-radius:20px; border:1px solid var(--accent2); color:var(--accent2); }
+  .sec-head .pill.down { border-color:var(--bad); color:var(--bad); }
+  canvas { width:100%; height:auto; display:block; background:#0c1117;
+           border:1px solid var(--line); border-radius:8px; }
+
+  .stats { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
+  .stat { flex:1 1 0; min-width:150px; background:#0c1117; border:1px solid var(--line);
+          border-radius:8px; padding:9px 12px; }
+  .stat .k { display:block; font-size:0.68rem; color:var(--dim); text-transform:uppercase;
+             letter-spacing:0.07em; margin-bottom:3px; }
+  .stat .v { font-family:var(--mono); font-size:0.86rem; }
+  .stat .v b { font-weight:600; }
+  .stat .v b.lat { color:var(--fg); }
+  .naive .stat .v .em { color:var(--warn); }
+  .weir  .stat .v .em { color:var(--accent2); }
+  .stat .note { color:var(--dim); font-size:0.78rem; }
+
+  .log { background:#0a0e14; border:1px solid var(--line); border-radius:10px; padding:10px 14px;
+         font-family:var(--mono); font-size:0.8rem; height:140px; overflow-y:auto; margin-top:4px; }
+  .log div { padding:1px 0; color:var(--dim); white-space:pre-wrap; }
+  .log .ev-ack { color:var(--accent2); }
+  .log .ev-fsync { color:var(--accent); }
+  .log .ev-drain { color:var(--batched); }
+  .log .ev-crash { color:var(--bad); font-weight:bold; }
+  .log .ev-recover { color:var(--warn); }
+  .log .ev-loss { color:var(--bad); }
+
+  details { margin-top:22px; background:var(--panel); border:1px solid var(--line);
+            border-radius:10px; padding:4px 18px; }
+  summary { cursor:pointer; padding:10px 0; font-weight:600; }
+  details p, details li { font-size:0.9rem; color:var(--dim); }
+  details code { font-family:var(--mono); color:var(--fg); background:#0a0e14; padding:1px 5px; border-radius:4px; }
+  .foot { color:var(--dim); font-size:0.82rem; margin-top:24px; text-align:center; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .card.full { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
+  .card.full h3 { margin:0 0 8px; font-size:0.72rem; color:var(--dim); text-transform:uppercase; letter-spacing:0.07em; }
+  @media (max-width:720px){ .controls{position:static;} .stat{min-width:120px;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>weir <span class="v">live demo</span></h1>
+  <p class="tag">A durable write buffer — same speed as a direct insert, but crash-safe and N→1 on the database.</p>
+
+  <div class="intro">
+    <b>The pitch.</b> A "usual" setup inserts each record straight into the database and blocks the
+    producer until it commits. weir instead takes the record over a local socket, writes it to a
+    CRC-checked <b>Write-Ahead Buffer</b>, fsyncs per the durability tier, and <b>acks</b> the
+    producer — then drains <b>batches</b> downstream, collapsing N commits into one. You get two
+    things the direct path can't: <span class="invariant">an ack is never a false ack</span> (an
+    acked record is durable and replays across a crash) and far fewer database commits — at a
+    producer-facing latency that's as fast or faster than the direct insert. The honest tradeoff:
+    a record lands in the database a beat <em>later</em>, via the batched drain.
+    Push records below and compare the two stacks. <em>Browser simulation; latencies are modeled on
+    weir's benchmarks, with per-record jitter.</em>
+  </div>
+
+  <div class="controls">
+    <div class="group">
+      <span class="label">Push</span>
+      <button id="push1">+1</button>
+      <button id="push10">+10</button>
+      <button id="stream">Stream</button>
+    </div>
+    <div class="group">
+      <span class="label">Durability</span>
+      <span class="seg" id="tierSeg">
+        <button data-tier="Sync" class="sel" title="fsync before ACK — durable before the producer is told 'ok'.">Sync</button>
+        <button data-tier="Batched" title="Written before ACK; one group fsync per batch. Durable before ACK, fewer fsyncs.">Batched</button>
+        <button data-tier="Buffered" title="ACK after the in-memory write only. Fastest — but a crash can lose the not-yet-fsynced window.">Buffered</button>
+      </span>
+    </div>
+    <div class="group">
+      <span class="label">Daemon</span>
+      <button id="crash" class="danger">Crash daemon</button>
+      <button id="restart">Restart</button>
+    </div>
+    <div class="group" style="margin-left:auto">
+      <button id="reset">Reset</button>
+    </div>
+  </div>
+
+  <!-- NAIVE section -->
+  <div class="section naive">
+    <div class="sec-head">
+      <h2><span class="naive-t">Naive</span></h2>
+      <span class="sub">direct synchronous insert — one commit per record, producer blocks until it lands</span>
+    </div>
+    <canvas id="cvN" width="1040" height="140"></canvas>
+    <div class="stats">
+      <div class="stat">
+        <span class="k">producer-facing latency</span>
+        <span class="v">avg <b class="lat em" id="nAvg">—</b> · p99 <b class="lat" id="nP99">—</b> · max <b class="lat" id="nMax">—</b></span>
+      </div>
+      <div class="stat">
+        <span class="k">end-to-end (in DB)</span>
+        <span class="v">avg <b class="lat" id="nE2eAvg">—</b> · p99 <b class="lat" id="nE2eP99">—</b> · max <b class="lat" id="nE2eMax">—</b> <span class="note">— = producer-facing (synchronous)</span></span>
+      </div>
+      <div class="stat">
+        <span class="k">database commits</span>
+        <span class="v"><b class="em" id="nCom">0</b> <span class="note">— 1 per record</span></span>
+      </div>
+      <div class="stat">
+        <span class="k">crash safety</span>
+        <span class="v"><span class="note">in-flight inserts lost; only committed rows survive — no replay</span></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- weir section -->
+  <div class="section weir">
+    <div class="sec-head">
+      <h2><span class="weir-t">weir</span></h2>
+      <span class="sub">local durable ack, then batched drain — N→1 commits, crash-safe</span>
+      <span class="pill" id="statusPill">running</span>
+    </div>
+    <canvas id="cvW" width="1040" height="250"></canvas>
+    <div class="stats">
+      <div class="stat">
+        <span class="k">producer-facing latency (ack)</span>
+        <span class="v">avg <b class="lat em" id="wAvg">—</b> · p99 <b class="lat" id="wP99">—</b> · max <b class="lat" id="wMax">—</b></span>
+      </div>
+      <div class="stat">
+        <span class="k">end-to-end (in DB)</span>
+        <span class="v">avg <b class="lat" id="wE2eAvg">—</b> · p99 <b class="lat" id="wE2eP99">—</b> · max <b class="lat" id="wE2eMax">—</b> <span class="note">— ack + batch wait + commit</span></span>
+      </div>
+      <div class="stat">
+        <span class="k">database commits</span>
+        <span class="v"><b class="em" id="wCom">0</b> <span class="note" id="wRatio">— batched N→1</span></span>
+      </div>
+      <div class="stat">
+        <span class="k">crash safety</span>
+        <span class="v">lost <b class="lat" id="wLost">0</b> · recovered <b class="em" id="wRecov">0</b> <span class="note" id="wLostNote">— acked records replay from the WAB</span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h3>Event log</h3>
+    <div class="log" id="log"></div>
+  </div>
+
+  <details>
+    <summary>How faithful is this to real weir?</summary>
+    <p>The motion is illustrative, but the model follows weir's real semantics, and per-record
+       latencies are drawn from a long-tailed distribution (hence the avg / p99 / max):</p>
+    <ul>
+      <li><b>The first hop is the same in both lanes</b> — getting the record off the producer. The
+        stacks diverge after it: weir does a fast <em>local</em> fsync and acks (~0.4 ms Sync); the
+        naive path blocks on the <em>remote</em> commit round-trip (~8 ms). Same database, so weir's
+        drain commit costs the same as a naive commit — but one trip carries the whole batch.</li>
+      <li><b>Sync</b> — <code>fsync</code> before the ack; zero acked-record loss on crash.</li>
+      <li><b>Batched</b> — written before the ack, one group <code>fsync</code> per batch; still
+        durable before the ack, far fewer fsyncs.</li>
+      <li><b>Buffered</b> — ack after the in-memory write only; fastest, but a crash can lose the
+        not-yet-fsynced window (shown as lost — weir is honest about the tradeoff).</li>
+      <li><b>Crash recovery</b> — on restart weir replays every sealed-but-unconfirmed segment, so
+        anything durably acked is redelivered. The naive lane talks straight to the DB and is
+        independent of the weir daemon.</li>
+      <li><b>End-to-end</b> — a record reaches the database <em>later</em> under weir (it waits to be
+        batched). weir trades end-to-end freshness for fast durable acks, far fewer commits, and
+        producer/​downstream decoupling — not for raw insert speed.</li>
+    </ul>
+  </details>
+
+  <p class="foot">Browser-only simulation of <a href="https://github.com/miki-przygoda/weir">weir</a>.
+     Real weir speaks a 16-byte-header wire protocol over a Unix socket (or TCP + mutual TLS).</p>
+</div>
+
+<script>
+"use strict";
+(function(){
+  // ---- modeled real latencies (µs) ----
+  const WEIR_ACK_US = { Sync:390, Batched:390, Buffered:70 };  // local durable-write cost
+  const NAIVE_COMMIT_US = 8000;                                 // remote insert+commit round trip
+  const TIER_COLOR = { Sync:"#58a6ff", Batched:"#bc8cff", Buffered:"#3fb950" };
+
+  const BATCH_SIZE = 8;
+  const BATCH_DEADLINE = 1400;     // anim ms before a partial batch seals
+  const BATCH_DEADLINE_US = 1500;  // real batch-deadline budget, for the end-to-end model
+  const SPAWN_GAP = 75;            // anim ms between staggered emissions of a burst
+
+  // ---- timing model ----
+  // First hop (producer → ingress) is a fixed equal "set speed" handoff. Everything
+  // after it is scaled to REAL (jittered) latency via one µs→anim factor, so weir's
+  // local path runs ~20× faster than naive's remote commit. weir's async drain
+  // commit crosses the same internet as naive (slow), off the critical path.
+  const FIRST_HOP = 300;
+  const NAIVE_COMMIT_ANIM = 2000;                       // realism anchor for ~8 ms
+  const US_TO_ANIM = NAIVE_COMMIT_ANIM / NAIVE_COMMIT_US; // anim-ms per µs
+  const DRAIN_READ = 220;                               // local read of the sealed segment (fast)
+  const minSeg = v => Math.max(v, 10);
+
+  // Long-tailed jitter: most records near base, a few far out (the p99 / p99.9 tail).
+  function jitter(baseUs){
+    const r = Math.random();
+    let m;
+    if(r < 0.90) m = 0.75 + Math.random()*0.5;     // body:   0.75–1.25×
+    else if(r < 0.99) m = 1.25 + Math.random()*1.75; // shoulder: 1.25–3×
+    else m = 3 + Math.random()*9;                   // tail:   3–12×
+    return baseUs * m;
+  }
+
+  // ---- canvases ----
+  const cvN = document.getElementById("cvN"), ctxN = cvN.getContext("2d");
+  const cvW = document.getElementById("cvW"), ctxW = cvW.getContext("2d");
+
+  // ---- geometry ----
+  const PRX = 110, ING_X = 330, DBX = 930;     // producer / ingress / database (shared X)
+  const yN = 78;                                // naive row (in cvN)
+  const naiveNodes = [
+    {x:PRX,   y:yN, label:"Producer"},
+    {x:ING_X, y:yN, label:"network"},
+    {x:DBX,   y:yN, label:"Database"},
+  ];
+  const yA = 66, yD = 182;                      // weir ack row / drain row (in cvW)
+  const ackNodes = [
+    {x:PRX,   y:yA, label:"Producer"},
+    {x:ING_X, y:yA, label:"socket"},
+    {x:520,   y:yA, label:"WAB"},
+    {x:710,   y:yA, label:"fsync"},
+    {x:900,   y:yA, label:"ack"},
+  ];
+  const segNode={x:520,y:yD,label:"segment"}, drainNode={x:710,y:yD,label:"drain"}, dbNode={x:DBX,y:yD,label:"Database"};
+
+  // ---- state ----
+  let tier = "Sync", daemonUp = true, streaming = false;
+  let tNow = 0, lastFrame = null, recId = 0;
+  const records = [];
+  let wab = [];                 // {id, durable, color}
+  let batchTimer = null;
+  const drainQueue = [];        // {ids, durable, phase, p}
+  const spawnQueue = [];
+  let spawnAcc = 0;
+  const metrics = { latN:[], latW:[], e2eN:[], e2eW:[], comN:0, comW:0, ackN:0, ackW:0, lostW:0, safeW:0, recovered:false, crashed:false };
+
+  // ---- helpers ----
+  const $ = id => document.getElementById(id);
+  function log(msg, cls){
+    const el = document.createElement("div");
+    if(cls) el.className = cls;
+    el.textContent = `[${(tNow/1000).toFixed(2).padStart(6," ")}s] ${msg}`;
+    const box = $("log"); box.appendChild(el);
+    while(box.children.length > 200) box.removeChild(box.firstChild);
+    box.scrollTop = box.scrollHeight;
+  }
+  const avg = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
+  function pct(a,p){ if(!a.length) return null; const s=[...a].sort((x,y)=>x-y); return s[Math.min(s.length-1, Math.floor(p/100*s.length))]; }
+  const mx = a => a.length ? Math.max(...a) : null;
+  function fmtUs(v){ if(v==null) return "—"; return v<1000 ? Math.round(v)+" µs" : (v/1000).toFixed(v<10000?2:1)+" ms"; }
+
+  // ---- spawning (staggered) ----
+  function pushRecords(k){ for(let i=0;i<k;i++) spawnQueue.push(tier); log(`producer pushed ${k} record${k>1?"s":""} (${tier})`); }
+  function emitOne(t){
+    recId++; const color = TIER_COLOR[t];
+    records.push({ id:recId, lane:"naive", stage:"net", p:0, color, commitUs:jitter(NAIVE_COMMIT_US), acked:false, lost:false });
+    records.push({ id:recId, lane:"weir", stage:"socket", p:0, color, tier:t, ackUs:jitter(WEIR_ACK_US[t]), acked:false, lost:false, durable:false });
+  }
+  // Animation duration is scaled from the (jittered) real latency, but CAPPED so a
+  // rare tail spike doesn't make a token crawl on screen for many seconds. The full
+  // jittered value still feeds the avg/p99/max stats — only the motion is capped.
+  const animUs = (us, baseUs) => Math.min(us, baseUs * 3);
+  const wabDur   = r => minSeg(animUs(r.ackUs, WEIR_ACK_US[r.tier]) * US_TO_ANIM * 0.3);
+  const fsyncDur = r => minSeg(animUs(r.ackUs, WEIR_ACK_US[r.tier]) * US_TO_ANIM * 0.7);
+
+  // ---- simulation ----
+  function step(dt){
+    tNow += dt;
+
+    if(spawnQueue.length){
+      spawnAcc += dt;
+      while(spawnQueue.length && spawnAcc >= SPAWN_GAP){ spawnAcc -= SPAWN_GAP; emitOne(spawnQueue.shift()); }
+    } else spawnAcc = 0;
+
+    // naive: equal first hop (net), then the long remote commit; producer blocked throughout.
+    for(const r of records){
+      if(r.lane!=="naive" || r.done) continue;
+      if(r.stage==="net"){
+        r.p += dt / FIRST_HOP;
+        if(r.p>=1){ r.stage="commit"; r.p=0; }
+      } else if(r.stage==="commit"){
+        r.p += dt / (animUs(r.commitUs, NAIVE_COMMIT_US) * US_TO_ANIM);
+        if(r.p>=1){ r.stage="done"; r.done=true; r.acked=true;
+          metrics.ackN++; metrics.comN++;
+          metrics.latN.push(r.commitUs); metrics.e2eN.push(r.commitUs); } // naive: ack == in-DB
+      }
+    }
+
+    // weir: first hop, then local WAB write + fsync → ack (fast, jittered).
+    for(const r of records){
+      if(r.lane!=="weir" || r.done) continue;
+      if(r.stage==="socket"){
+        r.p += dt / FIRST_HOP;
+        if(r.p>=1){ r.p=0; if(daemonUp){ r.stage="wab"; } else markInflightLost(r); }
+      } else if(r.stage==="wab"){
+        r.p += dt / wabDur(r);
+        if(r.p>=1){ r.stage="fsync"; r.p=0; }
+      } else if(r.stage==="fsync"){
+        r.p += dt / fsyncDur(r);
+        if(r.p>=1){
+          r.stage="ack"; r.p=0; r.acked=true;
+          metrics.ackW++; metrics.latW.push(r.ackUs);
+          r.durable = (r.tier!=="Buffered");
+          if(r.tier==="Buffered") log(`ack #${r.id} (buffered, not yet fsynced)`, "ev-ack");
+          else log(`${r.tier==="Sync"?"fsync":"group fsync"} → ack #${r.id} (durable)`, "ev-fsync");
+          wab.push({ id:r.id, durable:r.durable, color:r.color, ackUs:r.ackUs, ackAnim:tNow });
+        }
+      } else if(r.stage==="ack"){
+        r.p += dt / 200;
+        if(r.p>=1){ r.done=true; r.stage="acked-rest"; }
+      }
+    }
+
+    // seal a batch when full or the deadline passes
+    if(daemonUp && wab.length>0){
+      if(batchTimer===null) batchTimer = tNow + BATCH_DEADLINE;
+      if(wab.length>=BATCH_SIZE || tNow>=batchTimer){
+        const take = wab.splice(0, Math.min(BATCH_SIZE, wab.length));
+        // end-to-end per record = durable ack + time waited for the batch + the
+        // batch's remote commit (the same internet cost naive pays, shared by N).
+        const commitUs = jitter(NAIVE_COMMIT_US);
+        const e2e = take.map(e => e.ackUs + (tNow - e.ackAnim) * (BATCH_DEADLINE_US/BATCH_DEADLINE) + commitUs);
+        drainQueue.push({ ids:take.map(x=>x.id), phase:"read", p:0, e2e });
+        batchTimer = wab.length>0 ? tNow + BATCH_DEADLINE : null;
+        log(`drain: sealed segment of ${take.length} records → 1 commit`, "ev-drain");
+      }
+    }
+
+    // drain: local read (fast) then remote batch commit (slow)
+    for(const b of drainQueue){
+      if(b.done || !daemonUp) continue;
+      if(b.phase==="read"){
+        b.p += dt / DRAIN_READ; if(b.p>=1){ b.phase="commit"; b.p=0; }
+      } else {
+        b.p += dt / NAIVE_COMMIT_ANIM;
+        if(b.p>=1){ b.done=true; metrics.comW++; metrics.e2eW.push(...b.e2e);
+          log(`sink committed ${b.ids.length} records in 1 INSERT (segment confirmed)`, "ev-drain"); }
+      }
+    }
+
+    // prune
+    for(let i=records.length-1;i>=0;i--){
+      const r=records[i];
+      if(r.done && r.stage!=="lost-anim" && tNow-(r.doneAt||(r.doneAt=tNow))>700) records.splice(i,1);
+      else if(r.lost && tNow-(r.lostAt||tNow)>1400) records.splice(i,1);
+    }
+    for(let i=drainQueue.length-1;i>=0;i--){
+      if(drainQueue[i].done && tNow-(drainQueue[i].cAt||(drainQueue[i].cAt=tNow))>700) drainQueue.splice(i,1);
+    }
+
+    if(streaming && Math.random() < dt/650) pushRecords(1);
+  }
+
+  function markInflightLost(r){ r._sx=r.stage; r.lost=true; r.stage="lost-anim"; r.lostAt=tNow; r.done=true;
+    log(`record #${r.id} in-flight at crash — never acked (producer retries)`, "ev-loss"); }
+
+  function crash(){
+    if(!daemonUp) return;
+    daemonUp=false; metrics.crashed=true;
+    $("statusPill").textContent="crashed"; $("statusPill").classList.add("down");
+    let lostBuffered=0;
+    wab = wab.filter(w=>{ if(!w.durable){ lostBuffered++; metrics.lostW++; return false; } return true; });
+    for(const r of records){
+      if(r.lane==="weir" && !r.done && (r.stage==="socket"||r.stage==="wab"||r.stage==="fsync")) markInflightLost(r);
+    }
+    // durable records that survive in the WAB (held in the holding pen + any already
+    // in a sealed segment heading to the sink) — these replay on restart.
+    metrics.safeW = wab.length + drainQueue.reduce((s,b)=> s + (b.done?0:b.ids.length), 0);
+    metrics.recovered = false;
+    log(`*** weir daemon DOWN. ${metrics.safeW} durable record(s) safe in the WAB; naive lane unaffected. ***`, "ev-crash");
+    if(lostBuffered>0) log(`lost ${lostBuffered} Buffered record(s): acked but in the not-yet-fsynced window`, "ev-loss");
+  }
+  function restart(){
+    if(daemonUp) return;
+    daemonUp=true; metrics.recovered=true;
+    $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
+    log(`daemon restarting — scanning WAB for unconfirmed segments…`, "ev-recover");
+    if(metrics.safeW>0){ log(`recovered ${metrics.safeW} durable record(s) from ${Math.ceil(wab.length/BATCH_SIZE)||1} unconfirmed segment(s); replaying`, "ev-recover"); batchTimer = tNow + 200; }
+    else log(`no unconfirmed segments — clean restart`, "ev-recover");
+  }
+  function reset(){
+    records.length=0; wab.length=0; drainQueue.length=0; spawnQueue.length=0;
+    batchTimer=null; spawnAcc=0; recId=0;
+    Object.assign(metrics,{latN:[],latW:[],e2eN:[],e2eW:[],comN:0,comW:0,ackN:0,ackW:0,lostW:0,safeW:0,recovered:false,crashed:false});
+    daemonUp=true; streaming=false;
+    $("stream").classList.remove("on"); $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
+    $("log").innerHTML=""; log("reset.");
+  }
+
+  // ---- drawing ----
+  function rrect(ctx,x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y);
+    ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+  function node(ctx,n,faded){
+    ctx.save(); ctx.globalAlpha=faded?0.32:1;
+    const w=92,h=38,x=n.x-w/2,y=n.y-h/2;
+    rrect(ctx,x,y,w,h,8); ctx.fillStyle="#1c232c"; ctx.fill();
+    ctx.strokeStyle=faded?"#5a2a2a":"#30363d"; ctx.lineWidth=1; ctx.stroke();
+    ctx.fillStyle="#cdd9e5"; ctx.font="600 12px var(--mono,monospace)"; ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillText(n.label, n.x, n.y);
+    ctx.restore();
+  }
+  function link(ctx,a,b,faded){ ctx.save(); ctx.globalAlpha=faded?0.22:0.7; ctx.strokeStyle="#3a4452"; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(a.x+46,a.y); ctx.lineTo(b.x-46,b.y); ctx.stroke(); ctx.restore(); }
+  function token(ctx,x,y,color,alpha,r){ ctx.save(); ctx.globalAlpha=alpha??1; ctx.beginPath(); ctx.arc(x,y,r||6,0,Math.PI*2);
+    ctx.fillStyle=color; ctx.shadowColor=color; ctx.shadowBlur=8; ctx.fill(); ctx.restore(); }
+  function lerp(a,b,t){ return a+(b-a)*t; }
+
+  function naivePos(r){
+    if(r.stage==="net")    return {x:lerp(naiveNodes[0].x,naiveNodes[1].x,r.p), y:yN};
+    if(r.stage==="commit") return {x:lerp(naiveNodes[1].x,naiveNodes[2].x,r.p), y:yN};
+    return {x:naiveNodes[2].x, y:yN};
+  }
+  function weirPos(r){
+    const idx={socket:0,wab:1,fsync:2,ack:3}[r.stage];
+    if(idx===undefined){
+      if(r.stage==="lost-anim"){ const f={socket:1,wab:2,fsync:3}[r._sx]||1; return {x:ackNodes[f].x, y:yA}; }
+      return {x:ackNodes[4].x, y:yA};
+    }
+    return {x:lerp(ackNodes[idx].x,ackNodes[idx+1].x,r.p), y:yA};
+  }
+
+  function drawNaive(){
+    const ctx=ctxN; ctx.clearRect(0,0,cvN.width,cvN.height);
+    for(let i=0;i<naiveNodes.length-1;i++) link(ctx,naiveNodes[i],naiveNodes[i+1]);
+    naiveNodes.forEach(n=>node(ctx,n));
+    for(const r of records){
+      if(r.lane!=="naive") continue;
+      const pos=naivePos(r); let col=r.color, a=1;
+      if(r.lost){ col="#f85149"; a=Math.max(0.15,1-(tNow-(r.lostAt||tNow))/1400); }
+      else if(r.acked) col="#3fb950";
+      token(ctx,pos.x,pos.y,col,a);
+    }
+  }
+  function drawWeir(){
+    const ctx=ctxW; ctx.clearRect(0,0,cvW.width,cvW.height);
+    const down=!daemonUp;
+    // ack path: producer normal; socket onward reddens on crash
+    for(let i=0;i<ackNodes.length-1;i++) link(ctx,ackNodes[i],ackNodes[i+1], down && i>=1);
+    ackNodes.forEach((n,i)=>node(ctx,n, down && i>=1));
+    // dashed connector WAB → segment
+    ctx.save(); ctx.globalAlpha=down?0.22:0.55; ctx.strokeStyle="#3a4452"; ctx.lineWidth=2; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(segNode.x, ackNodes[2].y+19); ctx.lineTo(segNode.x, yD-19); ctx.stroke();
+    ctx.setLineDash([]); ctx.restore();
+    // drain path (daemon-side)
+    link(ctx,segNode,drainNode,down); link(ctx,drainNode,dbNode,down);
+    node(ctx,segNode,down); node(ctx,drainNode,down); node(ctx,dbNode,down);
+    // WAB depth
+    ctx.save(); ctx.fillStyle="#8b949e"; ctx.font="11px var(--mono,monospace)"; ctx.textAlign="center";
+    ctx.fillText(`WAB: ${wab.length} unconfirmed`, segNode.x, yD+34); ctx.restore();
+    for(let i=0;i<wab.length;i++){ const c=Math.floor(i/6), r2=i%6;
+      token(ctx, segNode.x-28+c*11, yD-3-r2*9, wab[i].durable?wab[i].color:"#d29922", 0.9, 4); }
+    // crash overlay (daemon region only)
+    if(down){
+      const rx=ING_X-58;
+      ctx.save(); ctx.fillStyle="rgba(248,81,73,0.08)"; ctx.fillRect(rx,0,cvW.width-rx,cvW.height);
+      ctx.fillStyle="#f85149"; ctx.font="700 13px var(--mono,monospace)"; ctx.textAlign="center";
+      ctx.fillText("daemon DOWN — durable segments held; Restart to replay", (rx+cvW.width)/2, 30); ctx.restore();
+    }
+    // ack-path tokens
+    for(const r of records){
+      if(r.lane!=="weir") continue;
+      const pos=weirPos(r); let col=r.color, a=1;
+      if(r.lost){ col="#f85149"; a=Math.max(0.15,1-(tNow-(r.lostAt||tNow))/1400); }
+      else if(r.stage==="ack"||r.stage==="acked-rest") col="#3fb950";
+      token(ctx,pos.x,pos.y,col,a);
+    }
+    // drain batch tokens: read (seg→drain) then commit (drain→DB)
+    for(const b of drainQueue){
+      if(b.done) continue;
+      const x=b.phase==="read"?lerp(segNode.x,drainNode.x,b.p):lerp(drainNode.x,dbNode.x,b.p);
+      token(ctx,x,yD,"#bc8cff",1,7);
+      ctx.save(); ctx.fillStyle="#bc8cff"; ctx.font="10px var(--mono,monospace)"; ctx.textAlign="center";
+      ctx.fillText("×"+b.ids.length, x, yD-12); ctx.restore();
+    }
+  }
+
+  function updateMetrics(){
+    $("nAvg").textContent=fmtUs(avg(metrics.latN)); $("nP99").textContent=fmtUs(pct(metrics.latN,99)); $("nMax").textContent=fmtUs(mx(metrics.latN));
+    $("wAvg").textContent=fmtUs(avg(metrics.latW)); $("wP99").textContent=fmtUs(pct(metrics.latW,99)); $("wMax").textContent=fmtUs(mx(metrics.latW));
+    $("nE2eAvg").textContent=fmtUs(avg(metrics.e2eN)); $("nE2eP99").textContent=fmtUs(pct(metrics.e2eN,99)); $("nE2eMax").textContent=fmtUs(mx(metrics.e2eN));
+    $("wE2eAvg").textContent=fmtUs(avg(metrics.e2eW)); $("wE2eP99").textContent=fmtUs(pct(metrics.e2eW,99)); $("wE2eMax").textContent=fmtUs(mx(metrics.e2eW));
+    $("nCom").textContent=metrics.comN;
+    $("wCom").textContent=metrics.comW;
+    $("wRatio").textContent = metrics.comW>0 ? `— ${metrics.ackW} records → ${metrics.comW} commit${metrics.comW>1?"s":""} (${(metrics.ackW/metrics.comW).toFixed(1)}:1)` : "— batched N→1";
+    $("wLost").textContent=metrics.lostW;
+    $("wRecov").textContent=metrics.recovered ? metrics.safeW : 0;
+    $("wLostNote").textContent = !metrics.crashed
+      ? "— acked records replay from the WAB"
+      : (!metrics.recovered
+          ? `— ${metrics.safeW} durable held in WAB; press Restart to replay${metrics.lostW?" · Buffered window lost":""}`
+          : `— ${metrics.safeW} durable replayed${metrics.lostW?` · ${metrics.lostW} Buffered-window record(s) lost for good`:""}`);
+  }
+
+  function frame(ts){
+    if(lastFrame===null) lastFrame=ts;
+    let dt=ts-lastFrame; lastFrame=ts; if(dt>80) dt=80;
+    step(dt); drawNaive(); drawWeir(); updateMetrics();
+    requestAnimationFrame(frame);
+  }
+
+  // ---- controls ----
+  $("push1").onclick=()=>pushRecords(1);
+  $("push10").onclick=()=>pushRecords(10);
+  $("stream").onclick=e=>{ streaming=!streaming; e.target.classList.toggle("on",streaming); };
+  $("crash").onclick=crash; $("restart").onclick=restart; $("reset").onclick=reset;
+  document.querySelectorAll("#tierSeg button").forEach(b=>{
+    b.onclick=()=>{ tier=b.dataset.tier;
+      document.querySelectorAll("#tierSeg button").forEach(x=>x.classList.remove("sel"));
+      b.classList.add("sel"); b.parentElement.style.setProperty("--tier", TIER_COLOR[tier]); };
+  });
+  document.querySelector('#tierSeg button.sel').parentElement.style.setProperty("--tier", TIER_COLOR.Sync);
+
+  log("ready — push some records; compare the two stacks, then try Crash daemon + Restart.");
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

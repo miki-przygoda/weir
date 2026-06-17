@@ -135,7 +135,11 @@ impl std::error::Error for DecodeError {}
 /// `#[non_exhaustive]`: more top-level error categories may be added post-1.0
 /// (the crate currently only decodes, but the type is the public error root), so
 /// downstream matches must carry a wildcard arm.
-#[derive(Debug)]
+///
+/// Derives `PartialEq`/`Eq` to match its contained [`DecodeError`], so callers can
+/// assert on a `WeirError` directly (S45). If a future variant ever wraps a
+/// non-`Eq` payload (e.g. `io::Error`), drop these derives and document why.
+#[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum WeirError {
     /// A wire frame failed to decode.

@@ -125,12 +125,24 @@ data loss), but delivery is stalled.
 transient errors with backoff; sustained `down` means the sink needs attention.
 Records stay safe on disk until it recovers.
 
+#### WeirSegmentStranded
+The drain exhausted `max_retries` (a fixed 3) of **transient** sink failures on a
+segment and abandoned it on disk. The data is durable (no loss), but delivery for
+that segment has stopped — and it is only re-attempted on the next daemon
+**restart**, NOT automatically when the sink recovers.
+**Respond:** fix the sink (correlate with `WeirSinkDown` / `weir_sink_health`),
+then **restart the daemon** to replay the stranded segment(s). `weir-ctl segments`
+lists the sealed-but-undelivered files. Distinct from `WeirDeadLettered`, which is
+for *permanent* rejections.
+
 #### WeirDeadLettered
 The sink **permanently** rejected records (e.g. a 4xx). They are written to the
 dead-letter directory for manual handling — not retried.
 **Respond:** inspect the dead-letter files and the sink's rejection reason
 (a schema mismatch, auth failure, malformed payload). Fix the upstream cause;
-`weir-ctl dl` inspects/clears the directory. `dl replay` is a Phase-5 addition.
+`weir-ctl dl` (list/drop) inspects/clears the directory. There is **no built-in
+requeue in 1.0** — reprocessing is manual (extract the records and re-submit them
+through a producer).
 
 ### Ingest / backpressure
 
@@ -162,8 +174,9 @@ directory.
 (`tls` feature) Repeated mutual-TLS handshake failures — client-cert
 expiry/rotation, a CA mismatch, or a probe hitting the TCP port.
 **Respond:** check client certificate validity and the CA bundle. A burst right
-after a cert rotation suggests the new certs aren't trusted; `weir_tls_config_reloads_total`
-confirms whether a SIGHUP reload landed.
+after a cert rotation suggests the new certs aren't trusted;
+`weir_tls_config_reloads_total{outcome="ok"}` confirms whether a SIGHUP
+reload landed (and `outcome="failed"` that it was rejected).
 
 ---
 
@@ -187,6 +200,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_wab_fsync_duration_seconds` | histogram | **The dominant latency signal.** Per-fsync duration. |
 | `weir_wab_fsync_failures_total` | counter | fsync returned an error. **Must be 0.** |
 | `weir_wab_flusher_panics_total` | counter | Flusher thread panics. **Must be 0.** |
+| `weir_drain_panics_total` | counter | weir-drain thread panics caught and respawned by its supervisor. **Must be 0**; sustained values indicate a sink/drain logic bug, and exhausting the respawn budget stops delivery. |
 | `weir_wab_segments_total{state}` | counter | Lifecycle: `open` → `sealed` → `confirmed`; `quarantined` on corruption. |
 | `weir_wab_bytes_on_disk` | gauge | Un-drained segment bytes. |
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
@@ -201,16 +215,18 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_drain_state{state}` | gauge | One of `draining` / `retrying_transient` / `blocked_dead_letter_full` is 1. |
 | `weir_sink_commit_records_total{outcome}` | counter | `committed` / `retried` / `dead_lettered` per record. |
 | `weir_sink_commit_duration_seconds` | histogram | Sink `commit()` call duration. |
-| `weir_sink_health` | gauge | 1 = healthy, 0 = down. |
+| `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1`; `degraded` is an early warning. |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
-| `weir_dead_letter_full` | gauge | 1 while the dead-letter cap is exceeded (drain blocked). |
-| `weir_dead_letter_blocked_duration_seconds` | histogram | How long the drain stayed blocked on a full dead-letter dir. |
+| `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |
+| `weir_dead_letter_blocked_duration_seconds` | gauge | Seconds since the drain entered BlockedDeadLetterFull (resets to 0 on exit); alert when it exceeds your threshold. |
+| `weir_drain_segments_stranded_total` | counter | Segments abandoned after exhausting `max_retries` **transient** sink failures. The segment stays on disk and is only re-attempted on daemon restart, so any increase means delivery has stalled for at least one segment. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`; once the sink recovers, restart the daemon to replay the stranded segment(s). Distinct from `weir_dead_letter_full_total` (permanent rejections). |
 
 ### System / security
 | Metric | Type | Meaning |
 |---|---|---|
 | `weir_connection_rejected_peer_uid_total` | counter | Connections rejected by the `SO_PEERCRED` UID check. |
+| `weir_accept_resource_exhaustion_total` | counter | `accept(2)` failures from resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM); the accept loop backs off on each. A rising value means the daemon is near an fd/memory limit. |
 | `weir_connection_idle_timeout_total` | counter | Connections dropped for read-idle (slowloris guard). |
 | `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown after the grace period. |
 | `weir_tls_handshake_failures_total` | counter | (tls) Mutual-TLS handshake failures. |
-| `weir_tls_config_reloads_total` | counter | (tls) Successful SIGHUP cert reloads. |
+| `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. |

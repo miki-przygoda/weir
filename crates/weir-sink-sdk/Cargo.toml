@@ -3,6 +3,7 @@ name = "weir-sink-sdk"
 description = "Sink trait and error contract for building sinks for the weir daemon"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords = ["weir", "sink", "ingestion", "database", "async"]
@@ -12,6 +13,7 @@ categories = ["database", "asynchronous"]
 all-features = true
 
 [dependencies]
-# The only dependency: the payload type (a re-exported `bytes::Bytes`). Sink
-# authors implement these traits without pulling in the daemon.
+# The only dependency: weir-core, for the `Payload` type — a newtype wrapper over
+# `bytes::Bytes` (not a re-export; see the R1 newtype rationale). Sink authors
+# implement these traits without pulling in the daemon.
 weir-core = { path = "../weir-core", version = "1.0.0" }

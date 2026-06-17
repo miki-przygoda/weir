@@ -325,7 +325,10 @@ fn metrics_all_families_registered() {
     // new metric to `metrics/mod.rs` without updating this list fails
     // here loudly — preventing the "test passes because we forgot to
     // assert on the new metric" failure mode.
-    let expected: &[&str] = &[
+    // `mut` is used only under `bench-trace` (the extend below); allow it
+    // unconditionally so the default-feature build stays warning-clean.
+    #[allow(unused_mut)]
+    let mut expected: Vec<&str> = vec![
         // Wire/socket layer
         "weir_records_accepted",
         "weir_records_ack",
@@ -349,6 +352,7 @@ fn metrics_all_families_registered() {
         "weir_sink_commit_duration_seconds",
         "weir_sink_commit_records",
         "weir_sink_health",
+        "weir_sink_info",
         "weir_queue_depth",
         // Recovery
         "weir_recovery_records_replayed",
@@ -357,12 +361,23 @@ fn metrics_all_families_registered() {
         // Dead letter
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
+        "weir_drain_segments_stranded",
         "weir_drain_state",
         "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",
     ];
+    // The per-stage latency histograms register only under the `bench-trace`
+    // feature (which `--all-features` turns on). Include them there so the
+    // family-count drift check matches in that build too.
+    #[cfg(feature = "bench-trace")]
+    expected.extend([
+        "weir_stage_queue_seconds",
+        "weir_stage_bridge_wait_seconds",
+        "weir_stage_write_seconds",
+        "weir_stage_total_seconds",
+    ]);
 
-    for family in expected {
+    for family in &expected {
         assert!(
             body.contains(&format!("# HELP {family}")),
             "metric family not registered in /metrics: {family}"
@@ -800,6 +815,55 @@ fn wab_data_preserved_across_crash_restart() {
         replayed >= u64::from(acked),
         "expected weir_recovery_records_replayed_total >= {acked} (acked pre-crash), \
          got {replayed} — recovery did not replay the preserved bytes"
+    );
+}
+
+/// Coverage gap (T07): the full crown-invariant loop across a crash. The existing
+/// crash tests stop at the replay-queue metric; this extends to the DELIVERY +
+/// CONFIRM end state — after a SIGKILL + restart, every acked record is actually
+/// delivered to the sink and confirmed, not merely re-queued. The default no-op
+/// sink always commits Ok, so any shortfall is a real recovery/drain bug.
+#[test]
+fn acked_records_delivered_to_sink_and_confirmed_after_crash_restart() {
+    const N: u32 = 25;
+    let mut srv = weir_server!("crash_to_sink").start();
+    let mut client = srv.client();
+    let mut acked = 0u32;
+    for i in 0..N {
+        if client
+            .push(format!("c2s-{i}").as_bytes(), Durability::Sync)
+            .is_ok()
+        {
+            acked += 1;
+        }
+    }
+    drop(client);
+    thread::sleep(Duration::from_millis(150));
+
+    srv.kill_ungracefully();
+    srv.restart_in_place();
+
+    // Poll the committed counter until the recovered records are delivered to the
+    // sink and confirmed (crash → recovery → replay → drain → sink → confirm).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut committed;
+    loop {
+        committed = parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        );
+        if committed >= u64::from(acked) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {committed}/{acked} acked records were delivered + confirmed after restart"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        committed >= u64::from(acked),
+        "every acked record ({acked}) must be delivered to the sink after restart, got {committed}"
     );
 }
 
