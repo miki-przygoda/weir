@@ -557,8 +557,10 @@ until then.
 For `sink_type = "http"`: the endpoint that receives one POST per
 record. For `sink_type = "mysql"`: the `mysql://user:password@host:port/db`
 connection URL. For `sink_type = "postgres"`: the
-`postgres://user:password@host:port/database` connection URL. **Set this
-via `WEIR_SINK_URL`, not the TOML file**, so credentials never land on disk.
+`postgres://user:password@host:port/database` connection URL. When the URL
+carries credentials, **prefer setting it via `WEIR_SINK_URL` rather than the
+TOML file** so the password is not written to disk — `sink_url` is accepted in
+TOML, but a credential-bearing URL placed there is stored in plaintext.
 
 For HTTP, the body is the raw payload bytes; `Content-Type` is
 `application/octet-stream`. The endpoint is expected to return:

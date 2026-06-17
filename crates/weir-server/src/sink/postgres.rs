@@ -55,9 +55,11 @@
 //! # Authentication
 //!
 //! Credentials are taken from the connection URL
-//! (`postgres://user:pass@host:5432/db`). The URL is read from
-//! `WEIR_SINK_URL` at startup; never sourced from the TOML config.
-//! `Debug` impls redact the password before logging.
+//! (`postgres://user:pass@host:5432/db`). Prefer setting the URL via the
+//! `WEIR_SINK_URL` environment variable so the embedded password never lands
+//! on disk. The URL can also be set via `--sink-url` or the TOML config
+//! (`sink_url`), but a credential-bearing URL written to TOML is stored on
+//! disk in plaintext. `Debug` impls redact the password before logging.
 
 use std::sync::Arc;
 use std::time::Duration;
