@@ -379,6 +379,14 @@ startup error.
 where you know record sizes are bounded (e.g. structured log records
 ≤ 64 KiB). Leave at the default for general workloads.
 
+**Memory sizing**: in-flight payload buffers are sized to the actual
+frame, but there is no global byte budget across connections, so the
+worst-case transient receive memory is `max_connections × max_payload_bytes`
+(with the defaults, 256 × 16 MiB ≈ 4 GiB if every connection streams a
+max-size payload at once). On memory-constrained hosts, lower
+`max_payload_bytes` and/or `max_connections` accordingly. See the
+[threat model](../security/threat-model.md).
+
 ---
 
 ### Metrics endpoint
