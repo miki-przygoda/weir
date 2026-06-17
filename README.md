@@ -1,31 +1,47 @@
 # weir
 
+[![CI](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
+<!-- crates.io + docs.rs badges to be added in the same commit as the 1.0 crates.io publish -->
+
 A durable, high-throughput write buffer for Rust.
 
-Producers write records to the `weir` daemon over a Unix domain socket.
-The daemon validates each record, writes it to a CRC32-checksummed
-Write-Ahead Buffer (WAB), fsyncs according to the configured durability
-tier, ACKs the producer, and asynchronously drains batches to a
-user-implemented `Sink`. WAB segments are not reclaimed until the sink
-confirms the batch. On restart, any unconfirmed segments are replayed
-automatically.
+**Fire a record at a local socket, get a durable ack in microseconds, and let
+your database catch up in bulk.** weir writes each record to a CRC32-checksummed
+write-ahead buffer, fsyncs it according to the durability tier you ask for, acks
+the producer, then drains records to your sink in batches — turning N per-record
+commits into 1. **An ack is never a false ack:** an acked record is on disk and
+replays after a crash.
 
-> **Status — 1.0.** The v1 wire protocol and the public Rust API
-> (`weir-core`, `weir-client`, `weir-sink-sdk`) are **frozen under
-> [Semantic Versioning](https://semver.org/)**, with a
-> [language-neutral conformance suite](docs/conformance.md) pinning the
-> wire format for non-Rust implementers. The WAB on-disk format is stable
-> and unconfirmed segments replay on restart.
->
-> Five built-in sinks (feature-gated; `noop` always compiled): `noop` for
-> soak-testing, `http` (concurrent per-record POSTs, transient/permanent
-> classification), `mysql` (multi-row `INSERT` per batch — the
-> IOPS-compression sink: N records → 1 statement → 1 server-side commit),
-> `postgres` (the same shape with `ON CONFLICT DO NOTHING`, TLS opt-in via
-> `?sslmode=require`), and `clickhouse` (HTTP `RowBinary` inserts with a
-> sha256 `insert_deduplication_token` for replay safety). WAB flusher and
-> drain threads are panic-supervised. Publishing to crates.io with the 1.0
-> release.
+`~69 µs` Buffered ack p50 · `~2,550` Sync RPS · `~58,600` saturation RPS
+*(single box, sandboxed CI runners — see [benchmarks](docs/benchmarks.md))* ·
+5 built-in sinks · v1 wire + Rust API frozen under SemVer
+
+**▶ [Try the demo](demo/index.html)** — a self-contained, browser-only
+simulation of the pipeline: push records, flip the durability tier, crash the
+daemon mid-flight, and watch unconfirmed segments replay, side by side with a
+naive insert-per-record baseline. No build step — open `demo/index.html` in any
+browser. *(Hosted version coming with the public launch.)*
+
+> **Status — 1.0.** The v1 wire protocol and public Rust API (`weir-core`,
+> `weir-client`, `weir-sink-sdk`) are frozen under
+> [Semantic Versioning](https://semver.org/), with a
+> [language-neutral conformance suite](docs/conformance.md) pinning the wire
+> format for non-Rust implementers. The WAB on-disk format is stable and
+> unconfirmed segments replay on restart. Built-in sinks: `noop`, `http`,
+> `mysql`, `postgres`, `clickhouse` (see [Crates](#crates) and the
+> [configuration reference](docs/operations/configuration.md)). WAB flusher and
+> drain threads are panic-supervised. Publishing to crates.io with the 1.0 release.
+
+## How it works
+
+Producers write records to the `weir` daemon over a Unix domain socket (or
+TCP + mutual TLS). The daemon validates each record, writes it to the
+CRC32-checksummed Write-Ahead Buffer, fsyncs per the durability tier, acks the
+producer, and asynchronously drains batches to a `Sink`. WAB segments are not
+reclaimed until the sink confirms the batch; on restart, unconfirmed segments
+are replayed automatically.
 
 ## Quickstart
 
@@ -39,13 +55,6 @@ mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
 
 Full walk-through, including pushing your first record: [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md).
 
-## Demo
-
-[`demo/index.html`](demo/index.html) is a self-contained, browser-only
-simulation — push records, toggle the durability tier, crash the daemon, and
-watch unconfirmed segments replay, side by side with a naive
-insert-per-record baseline. No build step; open the file directly.
-
 ## Documentation
 
 Start at [`docs/`](docs/) — the docs landing page is the recommended
@@ -58,7 +67,7 @@ entry point. The structure:
 | **Protocol**       | [wire format](docs/wire_protocol.md), [WAB format](docs/wab_format.md), [conformance vectors](docs/conformance.md) (language-neutral test vectors for non-Rust clients) |
 | **Architecture**   | [internals](docs/architecture.md), [benchmarks](docs/benchmarks.md)       |
 | **Security**       | [threat model](docs/security/threat-model.md), [socket-bind hardening](docs/security/socket-bind.md), [container hardening](docs/security/container.md) — reporting policy at [SECURITY.md](SECURITY.md) |
-| **Testing**        | [system-test audit](docs/testing/test-audit.md) (verdicts on all 41 system tests), [sink integration suite](docs/testing/sink-integration.md) (docker-compose runner for the SQL sinks), [fuzzing](docs/testing/fuzzing.md) (`cargo-fuzz` targets for the trust-boundary parsers) |
+| **Testing**        | [system-test audit](docs/testing/test-audit.md) (verdicts on every system test), [sink integration suite](docs/testing/sink-integration.md) (docker-compose runner for the SQL sinks), [fuzzing](docs/testing/fuzzing.md) (`cargo-fuzz` targets for the trust-boundary parsers) |
 
 The full version history is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -83,6 +92,42 @@ broker), when you can already tolerate writing straight to the database
 synchronously, or when losing un-acked in-flight data on crash is
 acceptable (an in-process channel is simpler). See [Non-goals](#non-goals-v1).
 
+## How weir compares
+
+weir fills a specific gap: a **fast, durable, local write-ahead point** in front
+of a slow or flaky downstream — typically a SQL database — that acks your
+producer in **microseconds** and then **compresses N buffered records into 1
+downstream commit**, surviving crashes by replaying unconfirmed segments. It does
+this **without running a message broker**. That niche sits between three
+well-trodden categories, and weir is deliberately *none* of them: not a broker
+(no pub/sub or fan-out — one producer stream → one sink), not embedded (a daemon,
+not a linked library), and not a database (the buffer isn't queryable).
+
+| Project | Category | Great at | Why you'd pick weir instead |
+|---|---|---|---|
+| **Kafka** / **Redpanda** | Streaming broker | Multi-consumer fan-out, replayable topics, horizontal scale | One stream → one DB without running a broker (or a Connect + JDBC sink) just to batch writes |
+| **NATS JetStream** / **NSQ** | Durable messaging | Subject/topic pub/sub, edge & realtime fan-out | A fsync-before-ack durability contract + N→1 SQL-commit delivery, not a subscribe/pull broker |
+| **Apache Pulsar** | Streaming + tiered storage | Multi-tenant, geo-replicated, millions of topics | One binary on one host, not brokers + BookKeeper |
+| **Chronicle Queue** | Embedded durable queue (JVM) | Ultra-low-latency persisted IPC inside the JVM | A language-agnostic *daemon* that also owns the drain into your database, not an in-process library you read back yourself |
+| **RocksDB** / **sled** / **bbolt** | Embedded KV store + WAL | Queryable embedded persistence inside your app | A standalone buffer that drains to a sink and reclaims itself, not a queryable store you link in |
+| **Vector** | Observability pipeline | Telemetry collection, transforms, routing with disk buffers | An application-facing durable ack + transactional N→1 commits into one SQL DB, not a general telemetry router |
+| **Fluentd** / **Fluent Bit** / **Beats** | Log shippers | Log/metric forwarding with file buffering and retries | Your producer is an application needing a durable write-ahead point in front of its DB, not a logging agent |
+
+**Reach for weir when** an application produces records faster than your database
+wants to commit them, you need a **durable ack now** (not after a network
+round-trip to a broker), and you want **many records to become one transactional
+`INSERT`/commit** against MySQL, Postgres, ClickHouse, or an HTTP endpoint — from
+a single local daemon with crash-safe replay. **Reach for something else when**
+you need multiple consumers / pub/sub / fan-out (Kafka, Redpanda, NATS, Pulsar,
+NSQ), an embedded queryable store (RocksDB, sled, bbolt) or in-JVM low-latency
+queue (Chronicle Queue), or a telemetry pipeline with transforms and many
+destinations (Vector, Fluentd, Fluent Bit, Beats).
+
+*No popular project combines all three of weir's defining properties — a local
+microsecond fsync'd ack, N→1 transactional SQL-commit compression, and a
+non-broker single binary. Comparisons reflect public positioning as of June 2026,
+not benchmarks.*
+
 ## Crates
 
 | Crate           | Type       | Description                                                                                          |
@@ -103,6 +148,20 @@ acceptable (an in-process channel is simpler). See [Non-goals](#non-goals-v1).
 
 The default transport is the Unix domain socket; an optional TCP + mutual-TLS
 listener is available behind the `tls` feature for cross-host producers.
+
+## How it earns the "durable" claim
+
+- **The invariant:** an ack is never a false ack — an acked record is on disk and
+  replays after a crash. Every design choice serves this.
+- **Deterministic simulation (DST):** the WAB durability invariants are checked
+  under injected crash/fault schedules with **replayable seeds**, on every CI run
+  (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md).
+- **Language-neutral conformance vectors:** canonical hex frames plus the result
+  a conformant decoder must produce for every message type, all nine Nack
+  reasons, and each rejection case — run your own codec against them
+  ([docs/conformance.md](docs/conformance.md)).
+- **Cross-platform CI:** `fmt` + `clippy` across the feature matrix + `cargo-deny`
+  + the full test suites + a monitoring-stack end-to-end smoke test, on every push.
 
 ## Contributing
 
