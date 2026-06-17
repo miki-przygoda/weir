@@ -5,11 +5,9 @@
 [advisories]
 version = 2
 yanked = "deny"
-# RUSTSEC-2025-0134: rustls-pemfile is unmaintained. weir's own TLS loaders were
-# migrated off it to rustls_pki_types::pem (S16), so this is now a TRANSITIVE-only
-# dependency via mysql_async; it can only clear when mysql_async updates upstream.
-# An explicit, documented exception, not a silent pass.
-ignore = ["RUSTSEC-2025-0134"]
+# No active ignores. (RUSTSEC-2025-0134 / rustls-pemfile unmaintained was cleared
+# by the mysql_async 0.34 -> 0.37 upgrade, which dropped the transitive
+# rustls-pemfile dependency.)
 
 [licenses]
 version = 2
