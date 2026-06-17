@@ -50,6 +50,17 @@
 //! records already committed. Implementations **must** handle duplicates
 //! gracefully (upsert, `INSERT IGNORE`, a content-derived dedup key, etc.). This
 //! is the explicit durability trade-off, not a protocol weakness.
+//!
+//! # Running your sink in the daemon
+//!
+//! This crate lets you **implement and test** a sink against a stable trait,
+//! independent of the daemon's internals. *Running* it is a separate matter: the
+//! released `weir-server` binary wires only the built-in sinks selected by the
+//! `sink_type` config. There is **no dynamic plugin or registration path yet** —
+//! to run a custom sink today you build a `weir-server` with your sink compiled
+//! into the sink-selection path (effectively a small fork). A first-class
+//! entry-point for downstream sinks is a candidate for a future minor release;
+//! because it is purely additive it would be a SemVer-compatible change.
 
 // The drain is always generic over `S: Sink` and stores `Arc<S>` — it never uses
 // `dyn Sink`. So the Send-bound ergonomics the `async_fn_in_trait` lint warns
