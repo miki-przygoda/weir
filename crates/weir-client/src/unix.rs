@@ -501,7 +501,10 @@ mod tests {
                 if len == MAX_PAYLOAD_HARD_CAP + 1 && limit == MAX_PAYLOAD_HARD_CAP),
             "expected a local PayloadTooLarge, got {err:?}"
         );
-        assert!(!c.poisoned, "a local rejection must not poison the connection");
+        assert!(
+            !c.poisoned,
+            "a local rejection must not poison the connection"
+        );
     }
 
     #[test]
@@ -573,7 +576,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             use std::io::Write;
             drain_one_frame(&mut server_end);
-            server_end.write_all(&nack_frame(NackReason::EmptyPayload)).unwrap();
+            server_end
+                .write_all(&nack_frame(NackReason::EmptyPayload))
+                .unwrap();
             // drop server_end → connection closes, as the daemon does after a Nack.
         });
         let first = c.push(b"x", Durability::Sync).unwrap_err();
@@ -601,7 +606,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             use std::io::Write;
             drain_one_frame(&mut server_end);
-            server_end.write_all(&nack_frame(NackReason::InternalError)).unwrap();
+            server_end
+                .write_all(&nack_frame(NackReason::InternalError))
+                .unwrap();
             drain_one_frame(&mut server_end); // the retry
             let ack = weir_core::Envelope::new(
                 weir_core::Header::new(weir_core::MessageType::Ack, weir_core::Durability::Sync, 0),

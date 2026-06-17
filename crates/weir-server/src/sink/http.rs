@@ -829,7 +829,10 @@ mod tests {
         let sink =
             HttpSink::new(cfg("http://weiruser:s3cr3t-passw0rd@127.0.0.1:1/ingest")).unwrap();
         let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
-        assert!(err.is_transient(), "connect refused must be transient: {err}");
+        assert!(
+            err.is_transient(),
+            "connect refused must be transient: {err}"
+        );
         let rendered = err.to_string();
         assert!(
             !rendered.contains("s3cr3t-passw0rd"),
