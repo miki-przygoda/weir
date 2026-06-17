@@ -360,6 +360,7 @@ fn metrics_all_families_registered() {
         // Dead letter
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
+        "weir_drain_segments_stranded",
         "weir_drain_state",
         "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",

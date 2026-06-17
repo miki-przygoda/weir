@@ -104,6 +104,15 @@ groups:
           description: "The configured sink reports itself unhealthy. The WAB keeps buffering durably (no data loss), but delivery is stalled. Check the downstream system."
           runbook: "docs/monitoring.md#weirsinkdown"
 
+      - alert: WeirSegmentStranded
+        expr: increase(weir_drain_segments_stranded_total{job=~"weir"}[15m]) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir stranded a WAB segment on {{ $labels.instance }} — delivery stalled"
+          description: "The drain exhausted max_retries of TRANSIENT sink failures on a segment and abandoned it on disk; it is only re-attempted on daemon restart. The data is durable (no loss), but delivery for that segment has stopped. Fix the sink (correlate with WeirSinkDown), then restart the daemon to replay the stranded segment."
+          runbook: "docs/monitoring.md#weirsegmentstranded"
+
       - alert: WeirDeadLettered
         expr: increase(weir_sink_commit_records_total{job=~"weir", outcome="dead_lettered"}[15m]) > 0
         for: 0m

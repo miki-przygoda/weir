@@ -264,6 +264,12 @@ pub(crate) struct Metrics {
     /// Increments once per entry into `BlockedDeadLetterFull`, not once per wake cycle.
     /// Semantics: "how many distinct blocking events over daemon lifetime."
     pub dead_letter_full: Counter<u64, AtomicU64>,
+    /// Increments once each time the drain abandons a segment after exhausting
+    /// `max_retries` transient sink failures. The segment is left on disk and is
+    /// only re-attempted on daemon restart, so any non-zero value means delivery
+    /// has stalled for at least one segment — the silent counterpart to the
+    /// `error!` log emitted on the same event.
+    pub drain_segments_stranded: Counter<u64, AtomicU64>,
     /// Gauge vector: exactly one state label value is 1 at any time; the others are 0.
     pub drain_state: Family<DrainStateLabel, Gauge<f64, AtomicU64>>,
     /// Seconds elapsed since the drain entered `BlockedDeadLetterFull`. Resets to 0
@@ -460,6 +466,16 @@ impl Metrics {
              represents a distinct episode where a permanently-rejected record could not be \
              dead-lettered due to cap exhaustion. Operator intervention required."
         );
+        let drain_segments_stranded = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_segments_stranded",
+            "WAB segments abandoned by the drain after exhausting max_retries transient \
+             sink failures. The segment is left on disk and is only re-attempted on daemon \
+             restart (crash-recovery replay), so any non-zero value means delivery has \
+             stalled for at least one segment. Investigate the sink (see weir_sink_health) \
+             and restart once it recovers. Distinct from weir_dead_letter_full, which counts \
+             PERMANENT rejections; this counts TRANSIENT failures that never succeeded."
+        );
         let drain_state = reg!(
             Family::<DrainStateLabel, Gauge<f64, AtomicU64>>::default(),
             "weir_drain_state",
@@ -526,6 +542,7 @@ impl Metrics {
             wab_unexpected_mode,
             dead_letter_bytes_on_disk,
             dead_letter_full,
+            drain_segments_stranded,
             drain_state,
             dead_letter_blocked_duration,
             #[cfg(feature = "bench-trace")]
@@ -637,6 +654,7 @@ mod tests {
             "weir_recovery_segments_quarantined",
             "weir_dead_letter_bytes_on_disk",
             "weir_dead_letter_full",
+            "weir_drain_segments_stranded",
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
         ];

@@ -386,9 +386,11 @@ fn drain_thread<S: Sink>(
                 }
 
                 if retries_left == 0 {
+                    metrics.drain_segments_stranded.inc();
                     error!(
                         path = %segment.display(),
-                        "drain: max retries exhausted; segment left on disk for manual recovery"
+                        "drain: max retries exhausted; segment left on disk for manual recovery \
+                         (weir_drain_segments_stranded_total incremented; re-attempted on restart)"
                     );
                     DrainState::Draining
                 } else {
@@ -1916,13 +1918,21 @@ mod tests {
             .map(|_| Err(MockError::Transient))
             .collect();
         let sink = Arc::new(MockSink::with_responses(responses));
-        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink, fast_config(dir.clone()), Arc::clone(&metrics));
 
         assert!(
             sealed.exists(),
             "segment must remain on disk after max retries"
         );
         assert!(!get_confirmed_path(&sealed).exists(), "no confirmed file");
+        // The strand must be observable: an operator alerts on this counter, not
+        // on a one-time error! log line.
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            1,
+            "stranding a segment must increment weir_drain_segments_stranded_total"
+        );
 
         std::fs::remove_dir_all(dir).ok();
     }

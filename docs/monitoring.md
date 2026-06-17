@@ -207,6 +207,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
 | `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Seconds since the drain entered BlockedDeadLetterFull (resets to 0 on exit); alert when it exceeds your threshold. |
+| `weir_drain_segments_stranded_total` | counter | Segments abandoned after exhausting `max_retries` **transient** sink failures. The segment stays on disk and is only re-attempted on daemon restart, so any increase means delivery has stalled for at least one segment. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`; once the sink recovers, restart the daemon to replay the stranded segment(s). Distinct from `weir_dead_letter_full_total` (permanent rejections). |
 
 ### System / security
 | Metric | Type | Meaning |
