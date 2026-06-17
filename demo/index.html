@@ -312,8 +312,12 @@
     records.push({ id:recId, lane:"naive", stage:"net", p:0, color, commitUs:jitter(NAIVE_COMMIT_US), acked:false, lost:false });
     records.push({ id:recId, lane:"weir", stage:"socket", p:0, color, tier:t, ackUs:jitter(WEIR_ACK_US[t]), acked:false, lost:false, durable:false });
   }
-  const wabDur   = r => minSeg(r.ackUs * US_TO_ANIM * 0.3);
-  const fsyncDur = r => minSeg(r.ackUs * US_TO_ANIM * 0.7);
+  // Animation duration is scaled from the (jittered) real latency, but CAPPED so a
+  // rare tail spike doesn't make a token crawl on screen for many seconds. The full
+  // jittered value still feeds the avg/p99/max stats — only the motion is capped.
+  const animUs = (us, baseUs) => Math.min(us, baseUs * 3);
+  const wabDur   = r => minSeg(animUs(r.ackUs, WEIR_ACK_US[r.tier]) * US_TO_ANIM * 0.3);
+  const fsyncDur = r => minSeg(animUs(r.ackUs, WEIR_ACK_US[r.tier]) * US_TO_ANIM * 0.7);
 
   // ---- simulation ----
   function step(dt){
@@ -331,7 +335,7 @@
         r.p += dt / FIRST_HOP;
         if(r.p>=1){ r.stage="commit"; r.p=0; }
       } else if(r.stage==="commit"){
-        r.p += dt / (r.commitUs * US_TO_ANIM);
+        r.p += dt / (animUs(r.commitUs, NAIVE_COMMIT_US) * US_TO_ANIM);
         if(r.p>=1){ r.stage="done"; r.done=true; r.acked=true;
           metrics.ackN++; metrics.comN++;
           metrics.latN.push(r.commitUs); metrics.e2eN.push(r.commitUs); } // naive: ack == in-DB
