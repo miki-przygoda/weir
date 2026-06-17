@@ -14,8 +14,9 @@ the producer, then drains records to your sink in batches — turning N per-reco
 commits into 1. **An ack is never a false ack:** an acked record is on disk and
 replays after a crash.
 
-`~69 µs` Buffered ack p50 · `~2,550` Sync RPS · `~58,600` saturation RPS
-*(single box, sandboxed CI runners — see [benchmarks](docs/benchmarks.md))* ·
+`~69 µs` Buffered (non-durable) ack p50 · `~364 µs` durable Sync ack p50 ·
+`~2,550` Sync RPS · `~58,600` RPS at the 48-connection cap
+*(indicative — single box, sandboxed CI runners; reproduce on your own hardware, see [benchmarks](docs/benchmarks.md))* ·
 5 built-in sinks (4 in a default build; `clickhouse` opt-in) · v1 wire + Rust API frozen under SemVer
 
 **▶ [Try the demo](demo/index.html)** — a self-contained, browser-only
@@ -51,8 +52,17 @@ cargo build --release -p weir-server
 mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
 ./target/release/weir-server \
     --wab-dir /tmp/weir/wab \
-    --socket-path /tmp/weir/run/weir.sock
+    --socket-path /tmp/weir/run/weir.sock \
+    --sink-type http --sink-url https://your-endpoint.example/ingest
 ```
+
+> **Ack ≠ delivered — and the default sink discards everything.** A successful
+> push means the record is durably *buffered* on disk, not that it reached a
+> downstream. With **no `--sink-type`, the sink defaults to `noop`, which acks
+> then DISCARDS every record** (it's for soak-testing). Set `--sink-type`
+> (`http`/`mysql`/`postgres`/`clickhouse`) + `--sink-url` to actually deliver.
+> Records also only drain once a WAB segment seals, so a few small records won't
+> reach the sink until shutdown — see the quickstart.
 
 Full walk-through, including pushing your first record: [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md).
 
@@ -153,7 +163,11 @@ listener is available behind the `tls` feature for cross-host producers.
 ## How it earns the "durable" claim
 
 - **The invariant:** an ack is never a false ack — an acked record is on disk and
-  replays after a crash. Every design choice serves this.
+  replays after a crash. Every design choice serves this. (On Linux, durability
+  is `fdatasync`. On macOS, weir uses `F_BARRIERFSYNC`, which orders writes and
+  survives process crashes but is **not** guaranteed to survive sudden power loss
+  on consumer SSDs with a volatile write cache — macOS is best treated as a dev
+  platform; run production on Linux.)
 - **Deterministic simulation (DST):** the WAB durability invariants are checked
   under injected crash/fault schedules with **replayable seeds**, on every CI run
   (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md).

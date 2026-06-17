@@ -30,7 +30,7 @@ listener addresses this with **mandatory mutual TLS**:
   allowlist — possession of a valid CA-signed cert is sufficient authority.
   To revoke a client, rotate the CA (see [Out of scope](#out-of-scope) for
   why CRL/OCSP are not implemented).
-- **TLS implementation: rustls with the aws-lc-rs crypto provider.** No
+- **TLS implementation: rustls with the ring crypto provider.** No
   system OpenSSL dependency; the crypto provider is selected explicitly so
   the binary's code-signing surface stays at one provider.
 

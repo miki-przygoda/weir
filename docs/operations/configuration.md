@@ -584,6 +584,13 @@ carries credentials, **prefer setting it via `WEIR_SINK_URL` rather than the
 TOML file** so the password is not written to disk — `sink_url` is accepted in
 TOML, but a credential-bearing URL placed there is stored in plaintext.
 
+Mind the other exposure surfaces: passing `--sink-url` on the **command line**
+puts the credential in the process argv, visible via `ps aux` to any same-uid
+process; and even `WEIR_SINK_URL` is readable via `/proc/<pid>/environ` or
+`ps eww`. The env var is the best of the three (off disk, out of `ps aux`);
+restrict who can read the daemon's `/proc` entry. The password is always
+redacted in weir's own logs and the config-debug line regardless of source.
+
 For HTTP, the body is the raw payload bytes; `Content-Type` is
 `application/octet-stream`. The endpoint is expected to return:
 
@@ -594,6 +601,20 @@ For HTTP, the body is the raw payload bytes; `Content-Type` is
 
 Network-layer failures (connect refused, DNS failure, timeout) are
 treated as transient.
+
+**`MAX_RETRIES` is a fixed `3`** (100 ms base delay, doubling) — it is **not**
+currently configurable via flag/env/TOML. Once a segment exhausts its retries it
+is left on disk ("stranded"), increments `weir_drain_segments_stranded_total`,
+and is re-attempted **only on daemon restart** — not automatically when the sink
+recovers. See [monitoring.md](../monitoring.md#weirsegmentstranded).
+
+**Health probe (`HEAD`).** weir periodically sends an HTTP `HEAD` to `sink_url`
+to populate `weir_sink_health`. A reachable endpoint that doesn't implement HEAD
+— common for POST-only ingest APIs, returning **405** or **501** — or one that
+issues an auth challenge (**401/403**) is treated as **healthy**: records are
+delivered via POST and the real health signal is commit success, so these do not
+flap the sink to `down`. Other 4xx read as `degraded`; other 5xx or a transport
+failure read as `down`. (An endpoint that answers HEAD with 2xx/3xx is simplest.)
 
 **Retry-After honoring**: when the endpoint returns a transient
 status (408, 429, or 5xx) with a `Retry-After: <seconds>` header,
@@ -647,6 +668,14 @@ dead-letter state.
 
 **When to tune**: lower for endpoints that prefer many small calls; the
 default 100 is a balanced point for most deployments.
+
+> **Keep this stable for dedup-by-batch sinks (ClickHouse).** The ClickHouse
+> sink's `insert_deduplication_token` is a hash of the **per-`commit` batch**.
+> Changing `sink_max_batch_size` across a restart re-splits a replayed segment
+> into different batches with different tokens, so ClickHouse no longer
+> recognises them as duplicates and you get **double-counting** on replay. Pick a
+> value and freeze it for the life of the deployment. (The HTTP sink's per-record
+> `Idempotency-Key` is unaffected — it's per record, not per batch.)
 
 ---
 
@@ -895,7 +924,7 @@ The Postgres URL contains credentials. **Always** supply it via
 Debug impl redacts the password before logging.
 
 **TLS support: opt-in via `?sslmode=require` in the URL.** The Postgres
-sink uses `tokio-postgres-rustls` (webpki-roots, aws-lc-rs) when the
+sink uses `tokio-postgres-rustls` (webpki-roots, ring) when the
 URL's `sslmode` query parameter is `require`, and `NoTls` otherwise.
 Opt-in semantics rather than auto-detect: an upgrade does not silently
 enable TLS on a previously-cleartext deployment.
@@ -909,7 +938,7 @@ WEIR_SINK_URL=postgres://user:pw@db.example.com:5432/weir?sslmode=require
 ```
 
 Cert verification uses the Mozilla root store bundled via
-`webpki-roots` — no host-system CA configuration required. The aws-lc-rs
+`webpki-roots` — no host-system CA configuration required. The ring
 crypto provider is explicitly selected (the same one weir uses for
 mysql+tls and for outbound reqwest TLS), keeping the binary's
 code-signing surface at one provider.

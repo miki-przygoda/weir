@@ -125,12 +125,24 @@ data loss), but delivery is stalled.
 transient errors with backoff; sustained `down` means the sink needs attention.
 Records stay safe on disk until it recovers.
 
+#### WeirSegmentStranded
+The drain exhausted `max_retries` (a fixed 3) of **transient** sink failures on a
+segment and abandoned it on disk. The data is durable (no loss), but delivery for
+that segment has stopped — and it is only re-attempted on the next daemon
+**restart**, NOT automatically when the sink recovers.
+**Respond:** fix the sink (correlate with `WeirSinkDown` / `weir_sink_health`),
+then **restart the daemon** to replay the stranded segment(s). `weir-ctl segments`
+lists the sealed-but-undelivered files. Distinct from `WeirDeadLettered`, which is
+for *permanent* rejections.
+
 #### WeirDeadLettered
 The sink **permanently** rejected records (e.g. a 4xx). They are written to the
 dead-letter directory for manual handling — not retried.
 **Respond:** inspect the dead-letter files and the sink's rejection reason
 (a schema mismatch, auth failure, malformed payload). Fix the upstream cause;
-`weir-ctl dl` inspects/clears the directory. `dl replay` is a Phase-5 addition.
+`weir-ctl dl` (list/drop) inspects/clears the directory. There is **no built-in
+requeue in 1.0** — reprocessing is manual (extract the records and re-submit them
+through a producer).
 
 ### Ingest / backpressure
 

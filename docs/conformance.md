@@ -89,8 +89,19 @@ cargo test -p weir-core --test conformance
 with weir-core, and checks the result — and, for `"ok"` vectors, that re-encoding
 round-trips to the same bytes.
 
-**Other languages:** load the JSON, hex-decode each `hex`, run your decoder, and
-assert the outcome matches `decode` (and the header/payload fields when `"ok"`).
+**Other languages:** a ready-to-run reference harness ships at
+[`conformance/run_vectors.py`](conformance/run_vectors.py) (stdlib-only Python).
+It includes a small reference codec that passes all vectors, so it doubles as a
+worked non-Rust implementation:
+
+```bash
+python3 docs/conformance/run_vectors.py   # "28/28 vectors passed"; non-zero exit on mismatch
+```
+
+To validate **your own** client, replace its `decode_frame()` / `encode_frame()`
+with adapters over your codec and run it unchanged. (Or, from scratch: load the
+JSON, hex-decode each `hex`, run your decoder, and assert the outcome matches
+`decode` — and the header/payload fields when `"ok"`.)
 
 ## Regenerating the vectors (maintainers)
 

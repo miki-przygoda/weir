@@ -43,7 +43,7 @@ This means:
 ### TCP + mutual TLS path (optional, `--features tls`)
 
 When `tcp_bind` is configured, remote producers connect over **mandatory
-mutual TLS** (rustls, aws-lc-rs provider). The trust model differs from the
+mutual TLS** (rustls, ring provider). The trust model differs from the
 Unix path:
 
 - **Client cert required.** Every TCP client must present a certificate
