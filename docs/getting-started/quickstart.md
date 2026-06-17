@@ -175,7 +175,7 @@ A regular file (or symlink) exists at the socket path. The daemon
 refuses to remove it as a safety check — manually inspect and
 remove if it's safe to do so.
 
-**`config error: wab_dir does not exist`**
+**`invalid path for 'wab_dir': cannot canonicalize '…': No such file or directory`**
 weir does not create the WAB directory (Postgres model). Create it
 with `mkdir -p` before starting the daemon.
 

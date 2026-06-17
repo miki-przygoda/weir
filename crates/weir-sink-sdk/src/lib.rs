@@ -59,7 +59,9 @@
 
 /// Opaque record payload bytes (re-exported from `weir-core`). A newtype over
 /// ref-counted `bytes::Bytes` that derefs to `[u8]`, so clones through the drain
-/// are O(1).
+/// are O(1). Sinks normally *receive* `Payload`s from the drain; to build one
+/// yourself (e.g. in a unit test) use `Payload::copy_from_slice(bytes)`,
+/// `Payload::from(&b"..."[..])`, or `Payload::from(vec_of_u8)`.
 pub use weir_core::Payload;
 
 /// A record type carried through the drain pipeline.

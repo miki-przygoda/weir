@@ -177,27 +177,36 @@ container paths above.
 After installing via any method:
 
 ```bash
-weir-server --wab-dir /tmp/wab --socket-path /tmp/weir.sock &
+# The daemon does not create its directories (Postgres model) — make them first.
+mkdir -p /tmp/weir-verify/wab /tmp/weir-verify/run && chmod 0700 /tmp/weir-verify/run
+weir-server --wab-dir /tmp/weir-verify/wab --socket-path /tmp/weir-verify/run/weir.sock &
 DAEMON_PID=$!
 
 # Wait a moment for startup.
 sleep 1
 
-# Metrics endpoint should respond.
-curl -fsS http://localhost:9185/metrics | grep -E "^weir_records_accepted" | head -1
+# Metrics endpoint should respond. weir_drain_state is pre-initialised on
+# startup, so it has data on the very first scrape (no producer needed).
+curl -fsS http://localhost:9185/metrics | grep '^weir_drain_state'
 
 # Clean up.
 kill -TERM $DAEMON_PID
 wait $DAEMON_PID
+rm -rf /tmp/weir-verify
 ```
 
-Expected output:
+Expected output (exactly one state is `1`):
 
 ```
-weir_records_accepted_total{tier="sync"} 0
+weir_drain_state{state="draining"} 1
+weir_drain_state{state="retrying_transient"} 0
+weir_drain_state{state="blocked_dead_letter_full"} 0
 ```
 
-Zero acceptances is correct — no producer has connected yet.
+That confirms the daemon started and the metrics endpoint is live. (Counter
+families like `weir_records_accepted_total` only emit a data line once a record
+of that durability tier has been pushed, so they won't appear yet — that's
+expected.)
 
 ## Uninstalling
 

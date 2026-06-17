@@ -1,6 +1,6 @@
 # Security policy
 
-Weir is a local write-ahead daemon. On the default transport its trust
+weir is a local write-ahead daemon. On the default transport its trust
 boundary is the Unix domain socket file's permissions, backed by a
 default-on peer-uid check that refuses any connection whose peer euid does
 not match the daemon's. The optional TCP + mutual-TLS listener (the `tls`
@@ -31,7 +31,7 @@ timelines depending on severity and complexity.
 
 ## Supported versions
 
-Weir follows [Semantic Versioning](https://semver.org/). Security fixes
+weir follows [Semantic Versioning](https://semver.org/). Security fixes
 land on `main` and ship in the latest `1.x` release; there are no LTS
 branches, so running the most recent `1.x` is the supported configuration.
 
