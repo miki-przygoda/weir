@@ -113,6 +113,8 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 | `noop` | `sink::noop::NoopSink` | accepts all, forwards nothing | soak-testing the daemon pipeline |
 | `http` | `sink::http::HttpSink` | one HTTP POST **per record**, up to `sink_http_concurrency` in flight | endpoints that already accept POST bodies |
 | `mysql` | `sink::mysql::MySqlSink` | one multi-row `INSERT` **per batch** | the IOPS-compression downstream |
+| `postgres` | `sink::postgres::PostgresSink` | one multi-row `INSERT … ON CONFLICT DO NOTHING` **per batch** | the IOPS-compression downstream on Postgres |
+| `clickhouse` | `sink::clickhouse::ClickHouseSink` | one HTTP `INSERT … FORMAT RowBinary` **per batch** (opt-in `clickhouse-sink` feature) | bulk inserts into ClickHouse with replay-safe dedup |
 
 The `mysql` sink is the one that delivers on the headline claim: N
 records push → 1 INSERT statement → 1 server-side commit. The

@@ -96,7 +96,11 @@ groups:
           runbook: "docs/monitoring.md#weirdrainblocked"
 
       - alert: WeirSinkDown
-        expr: min by (instance) (weir_sink_health{job=~"weir"}) == 0
+        # weir_sink_health is a gauge vector with exactly one of state=healthy/
+        # degraded/down set to 1 (the others 0). Match the `down` series directly —
+        # a `min by (instance) (...) == 0` form would always be 0 (two labels are
+        # always 0) and so fire permanently.
+        expr: weir_sink_health{job=~"weir", state="down"} == 1
         for: 5m
         labels: { severity: warning }
         annotations:
