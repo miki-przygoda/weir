@@ -311,6 +311,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // sink hangs without honouring its internal timeout.
         commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
     };
+    // Surface the configured sink type as a metric so operators (and
+    // `weir-ctl metrics`) can see whether records actually go downstream or to
+    // the discard-everything noop sink.
+    metrics
+        .sink_info
+        .get_or_create(&metrics::SinkInfoLabel {
+            sink_type: config.sink_type.as_str().to_string(),
+        })
+        .set(1.0);
+
     // Sink selection. drain::spawn is generic over the sink type but returns
     // the same JoinHandle<()> regardless, so both arms produce a uniform
     // drain_handle for the join sequence later in this function.
@@ -458,7 +468,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the
         // security reasoning around exposing this surface on the network.
         let metrics_listener =
-            tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port)).await?;
+            tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port))
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "failed to bind metrics endpoint to {}:{} ({e}) — another process \
+                             (often another weir-server instance) is using that port. Change it \
+                             with --metrics-port / WEIR_METRICS_PORT (or --metrics-bind / \
+                             WEIR_METRICS_BIND).",
+                            config.metrics_bind, config.metrics_port
+                        ),
+                    )
+                })?;
         metrics::server::spawn(
             metrics_listener,
             Arc::clone(&registry),

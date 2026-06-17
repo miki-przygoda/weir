@@ -84,6 +84,22 @@ pub enum SinkType {
 }
 
 impl SinkType {
+    /// The wire/config name of this sink type (inverse of [`SinkType::parse`]),
+    /// used for the `weir_sink_info{sink_type=…}` metric label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SinkType::Noop => "noop",
+            #[cfg(feature = "http-sink")]
+            SinkType::Http => "http",
+            #[cfg(feature = "mysql-sink")]
+            SinkType::Mysql => "mysql",
+            #[cfg(feature = "postgres-sink")]
+            SinkType::Postgres => "postgres",
+            #[cfg(feature = "clickhouse-sink")]
+            SinkType::ClickHouse => "clickhouse",
+        }
+    }
+
     fn parse(s: &str) -> Result<Self, ConfigError> {
         match s {
             "noop" => Ok(SinkType::Noop),

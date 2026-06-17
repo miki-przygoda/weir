@@ -298,8 +298,17 @@ async fn drain_join_set(join_set: &mut JoinSet<()>) {
 /// stable typed error through the tokio-rustls `io::Error` boundary.
 fn classify_handshake_error(e: &std::io::Error) -> TlsHandshakeFailureReason {
     let msg = e.to_string();
-    if msg.contains("CertificateRequired") || msg.contains("certificate required") {
+    if msg.contains("NoCertificatesPresented")
+        || msg.contains("peer sent no certificates")
+        || msg.contains("CertificateRequired")
+        || msg.contains("certificate required")
+    {
         // The client presented no certificate but the verifier requires one.
+        // As the SERVER, rustls surfaces this as `NoCertificatesPresented`
+        // ("peer sent no certificates") — NOT the `CertificateRequired` alert
+        // string, which is what the *client* sees. Match the server-side strings
+        // first so this label actually fires (the documented unauthorized-probe
+        // alert depends on it); the client-side strings are kept for safety.
         TlsHandshakeFailureReason::no_client_cert
     } else if msg.contains("InvalidCertificate")
         || msg.contains("UnknownIssuer")
@@ -333,11 +342,20 @@ mod tests {
 
     #[test]
     fn classify_no_client_cert() {
-        let e = std::io::Error::other("received fatal alert: CertificateRequired");
-        assert_eq!(
-            classify_handshake_error(&e),
-            TlsHandshakeFailureReason::no_client_cert
-        );
+        // The SERVER-side string rustls actually emits when a client presents no
+        // cert — this is the one that must classify, since weir is the server.
+        for msg in [
+            "peer sent no certificates", // rustls Error::NoCertificatesPresented Display
+            "NoCertificatesPresented",
+            "received fatal alert: CertificateRequired", // client-side, kept for safety
+        ] {
+            let e = std::io::Error::other(msg);
+            assert_eq!(
+                classify_handshake_error(&e),
+                TlsHandshakeFailureReason::no_client_cert,
+                "{msg:?} should classify as no_client_cert"
+            );
+        }
     }
 
     #[test]

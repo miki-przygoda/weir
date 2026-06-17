@@ -352,6 +352,7 @@ fn metrics_all_families_registered() {
         "weir_sink_commit_duration_seconds",
         "weir_sink_commit_records",
         "weir_sink_health",
+        "weir_sink_info",
         "weir_queue_depth",
         // Recovery
         "weir_recovery_records_replayed",

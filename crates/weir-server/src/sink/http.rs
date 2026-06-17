@@ -412,8 +412,15 @@ impl Sink for HttpSink {
         // the bearer token is attached per-POST in commit(), not as a client
         // default — so a 401/403 here is an expected auth challenge from a
         // reachable endpoint, not a misconfiguration; the real (authenticated)
-        // commit path will succeed, so treat it as healthy. 2xx/3xx are
-        // healthy; other 4xx suggest an endpoint misconfig (degraded); 5xx or a
+        // commit path will succeed, so treat it as healthy. 2xx/3xx are healthy.
+        //
+        // 405 Method Not Allowed / 501 Not Implemented mean the endpoint is
+        // REACHABLE but simply doesn't implement HEAD — extremely common for
+        // POST-only ingest APIs (observability collectors, webhooks). Treating
+        // those as "down" was a recurring false-alarm: the sink delivers every
+        // record via POST while the gauge reads down and the log spams ERROR.
+        // The real signal is commit success, so treat HEAD-unsupported as healthy.
+        // Other 4xx suggest an endpoint misconfig (degraded); other 5xx or a
         // transport failure suggests the endpoint is down.
         match self.client.head(&self.config.url).send().await {
             Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
@@ -421,7 +428,9 @@ impl Sink for HttpSink {
             }
             Ok(resp)
                 if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                    || resp.status() == reqwest::StatusCode::FORBIDDEN =>
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN
+                    || resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    || resp.status() == reqwest::StatusCode::NOT_IMPLEMENTED =>
             {
                 SinkHealth::Healthy
             }
@@ -1149,6 +1158,24 @@ mod tests {
             assert!(
                 matches!(sink.health().await, SinkHealth::Healthy),
                 "{resp} should be healthy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_treats_head_unsupported_as_healthy() {
+        // 405/501 mean the endpoint is reachable but doesn't implement HEAD —
+        // common for POST-only ingest APIs. The sink delivers fine via POST, so
+        // these must NOT flap the sink to "down" (recurring usage-sweep finding).
+        for resp in [
+            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let (url, _counter) = spawn_mock_server(vec![resp]).await;
+            let sink = HttpSink::new(cfg(&url)).unwrap();
+            assert!(
+                matches!(sink.health().await, SinkHealth::Healthy),
+                "{resp} should be healthy (endpoint reachable, HEAD unsupported)"
             );
         }
     }

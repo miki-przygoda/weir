@@ -60,6 +60,11 @@ pub use unix::{ClientError, WeirClient};
 /// single crate import (`weir_client::Durability`).
 pub use weir_core::Durability;
 
+/// Re-export of [`weir_core::NackReason`] — the payload of [`ClientError::Nack`].
+/// Re-exported so consumers can match on the reason (e.g. to distinguish the
+/// connection-closing Nacks) without taking a direct dependency on `weir-core`.
+pub use weir_core::NackReason;
+
 #[cfg(all(unix, feature = "tls"))]
 mod tls;
 

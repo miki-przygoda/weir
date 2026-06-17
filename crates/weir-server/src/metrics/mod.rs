@@ -98,6 +98,15 @@ pub enum SinkHealthState {
     down,
 }
 
+/// Info-style label carrying the configured sink type. The active sink's series
+/// is set to 1.0 so operators (and `weir-ctl metrics`) can tell whether the sink
+/// is a real downstream or the discard-everything `noop`. A `String` rather than
+/// an enum so a feature-gated sink (`clickhouse`) needs no `cfg` here.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct SinkInfoLabel {
+    pub sink_type: String,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct DrainStateLabel {
     pub state: DrainStateValue,
@@ -235,6 +244,8 @@ pub(crate) struct Metrics {
     pub sink_commit_duration: Histogram,
     pub sink_commit_records: Family<OutcomeLabel, Counter<u64, AtomicU64>>,
     pub sink_health: Family<SinkHealthLabel, Gauge<f64, AtomicU64>>,
+    /// Configured sink type, set to 1.0 for the active sink (see [`SinkInfoLabel`]).
+    pub sink_info: Family<SinkInfoLabel, Gauge<f64, AtomicU64>>,
     pub queue_depth: Gauge<f64, AtomicU64>,
 
     // ── Recovery ──────────────────────────────────────────────────────────────
@@ -433,6 +444,12 @@ impl Metrics {
             "weir_sink_health",
             "Current sink health state (1 = active, 0 = inactive for each state label)"
         );
+        let sink_info = reg!(
+            Family::<SinkInfoLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_sink_info",
+            "Configured sink type, set to 1 for the active sink. sink_type=\"noop\" means \
+             records are acked then DISCARDED (not forwarded downstream)."
+        );
         let queue_depth = reg!(
             Gauge::<f64, AtomicU64>::default(),
             "weir_queue_depth",
@@ -536,6 +553,7 @@ impl Metrics {
             sink_commit_duration,
             sink_commit_records,
             sink_health,
+            sink_info,
             queue_depth,
             recovery_records_replayed,
             recovery_segments_quarantined,
@@ -649,6 +667,7 @@ mod tests {
             "weir_sink_commit_duration_seconds",
             "weir_sink_commit_records",
             "weir_sink_health",
+            "weir_sink_info",
             "weir_queue_depth",
             "weir_recovery_records_replayed",
             "weir_recovery_segments_quarantined",

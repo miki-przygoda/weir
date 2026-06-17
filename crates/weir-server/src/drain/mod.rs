@@ -328,6 +328,17 @@ fn drain_thread<S: Sink>(
                             Err(RecvTimeoutError::Timeout) => {
                                 let health = probe_health(&rt, &*sink, config.commit_timeout);
                                 set_sink_health(&metrics, health);
+                                // Refresh the dead-letter size gauge on the idle
+                                // poll too, so an out-of-band `weir-ctl dl drop`
+                                // (an operator deleting files while the daemon
+                                // runs) is reflected. Without this the gauge only
+                                // re-stats in the blocked state, so on an otherwise
+                                // idle daemon it would read stale until restart.
+                                if dead_letter.rescan().is_ok() {
+                                    metrics
+                                        .dead_letter_bytes_on_disk
+                                        .set(dead_letter.total_bytes() as f64);
+                                }
                             }
                             Err(RecvTimeoutError::Disconnected) => break 'outer,
                         }
