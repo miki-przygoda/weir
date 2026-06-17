@@ -154,6 +154,26 @@
       "payload_hex": "09"
     },
     {
+      "name": "nack_reserved_reason",
+      "notes": "Nack with a reserved reason byte (0x0A): decodes as a Nack frame; the reason's meaning is forward-compatible and clients surface the raw byte.",
+      "hex": "574549520103010001000000182b80240a9306d732",
+      "decode": "ok",
+      "message_type": "Nack",
+      "durability": "Sync",
+      "flags": 0,
+      "payload_hex": "0a"
+    },
+    {
+      "name": "ack_nonsync_durability_filler",
+      "notes": "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must ignore the durability field on responses.",
+      "hex": "574549520102030000000000c2e6837700000000",
+      "decode": "ok",
+      "message_type": "Ack",
+      "durability": "Buffered",
+      "flags": 0,
+      "payload_hex": ""
+    },
+    {
       "name": "reject_bad_magic",
       "notes": "First four bytes are not \"WEIR\".",
       "hex": "58585858010101000400000003cac1846461746163f3f3ad",

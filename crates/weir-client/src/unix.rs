@@ -146,6 +146,12 @@ impl<S: Read + Write> WeirClient<S> {
     /// Blocks until the daemon replies. On `Ack` the record is durably stored
     /// according to the requested tier. On `Nack` returns the reason as
     /// [`ClientError::Nack`].
+    ///
+    /// An `Ack` means the record is durably **buffered** at the requested tier —
+    /// **not** that it has reached the downstream sink yet (the daemon drains in
+    /// batches once a segment seals). See the crate-level "Ack vs. delivery" note.
+    #[must_use = "a dropped push result hides whether the record was acked; an \
+                  unhandled Nack also closes the connection"]
     pub fn push(
         &mut self,
         payload: impl AsRef<[u8]>,

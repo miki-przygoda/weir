@@ -316,7 +316,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // drain_handle for the join sequence later in this function.
     let drain_handle = match config.sink_type {
         SinkType::Noop => {
-            info!("sink: noop (records committed-and-forgotten)");
+            warn!(
+                "sink: noop — records are acked and DISCARDED, not forwarded anywhere. \
+                 This is for soak-testing the pipeline; set --sink-type to deliver downstream."
+            );
             build_and_spawn_drain(NoopSink, drain_rx, drain_config, Arc::clone(&metrics))
         }
         #[cfg(feature = "http-sink")]

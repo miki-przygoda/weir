@@ -152,6 +152,16 @@ When you called `client.push(...)`:
 For the full pipeline detail, see
 [architecture.md](../architecture.md).
 
+> **Ack ≠ delivered.** A successful `push` means the record is durably
+> *buffered* (fsynced for `Sync`/`Batched`), **not** that it has reached the
+> sink. The drain forwards records only after a WAB segment *seals* — at its
+> size threshold (`segment_max_bytes`, default 256 MiB) or on shutdown. So with
+> a handful of small records the sink isn't touched until you stop the daemon,
+> and with the default `noop` sink nothing is forwarded at all (it's a soak-test
+> sink). Confirm acceptance with `weir_records_ack_total`, not the sink-commit
+> metric; to force a drain in a demo, send `SIGTERM` (graceful shutdown seals
+> the open segment).
+
 ## Cleaning up
 
 ```bash
