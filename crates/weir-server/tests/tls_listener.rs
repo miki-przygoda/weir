@@ -53,7 +53,7 @@ fn root_store(ca_path: &std::path::Path) -> RootCertStore {
 }
 
 /// Builds a rustls `ClientConfig` with the fixture CA as roots and the given
-/// client identity (cert + key). aws-lc-rs provider, explicitly, to match the
+/// client identity (cert + key). ring provider, explicitly, to match the
 /// server. Returns an `Err` only if rustls rejects the cert/key pair at build
 /// time (it doesn't for our fixtures).
 fn client_config_with_cert(
@@ -61,7 +61,7 @@ fn client_config_with_cert(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> Arc<ClientConfig> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -73,7 +73,7 @@ fn client_config_with_cert(
 
 /// Builds a rustls `ClientConfig` that presents NO client certificate.
 fn client_config_no_auth(ca_path: &std::path::Path) -> Arc<ClientConfig> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()

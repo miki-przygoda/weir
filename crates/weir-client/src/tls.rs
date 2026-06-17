@@ -1,6 +1,6 @@
 //! Blocking mutual-TLS client connector (feature = "tls").
 //!
-//! Connects to a weir daemon's TCP+mTLS listener using the same aws-lc-rs
+//! Connects to a weir daemon's TCP+mTLS listener using the same ring
 //! provider and rustls 0.23 API that the server side uses.
 
 use std::{io, net::TcpStream, path::Path, sync::Arc, time::Duration};
@@ -54,9 +54,9 @@ impl WeirClient<TlsStream> {
         let certs = load_certs(cfg.client_cert)?;
         let key = load_key(cfg.client_key)?;
 
-        // Build rustls ClientConfig using aws-lc-rs provider (matches the server).
+        // Build rustls ClientConfig using the ring provider (matches the server).
         let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(|e| ClientError::Protocol(format!("tls versions: {e}")))?

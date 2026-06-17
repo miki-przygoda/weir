@@ -19,7 +19,10 @@ tls = ["dep:rustls", "dep:rustls-pki-types"]
 [dependencies]
 weir-core = { path = "../weir-core", version = "1.0.0" }
 crc32fast = "1"
-rustls = { version = "0.23", optional = true }
+# Crypto provider unified on `ring` workspace-wide (no aws-lc-rs). default-features
+# = false drops rustls's default aws_lc_rs provider; the client names the provider
+# explicitly via `builder_with_provider(ring::default_provider())`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"], optional = true }
 rustls-pki-types = { version = "1", optional = true }
 
 [dev-dependencies]

@@ -5,7 +5,7 @@
 //! SIGHUP can hot-swap freshly-rotated certs without dropping connections — the
 //! TCP accept loop reads the current `Arc<ServerConfig>` at each accept.
 //!
-//! Crypto provider: aws-lc-rs, explicitly, to match the rest of the workspace.
+//! Crypto provider: ring, explicitly, to match the rest of the workspace.
 
 use std::{path::Path, sync::Arc};
 
@@ -73,7 +73,7 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsConfigError> {
 ///
 /// The server presents `cert_path` / `key_path` to the client, and the client
 /// MUST present a certificate signed by the CA in `client_ca_path`. The
-/// aws-lc-rs crypto provider is used explicitly, matching the workspace
+/// ring crypto provider is used explicitly, matching the workspace
 /// convention.
 pub fn build_server_config(
     cert_path: &Path,
@@ -94,9 +94,9 @@ pub fn build_server_config(
     // ≥1 root — `roots.is_empty()` can never be true here.
 
     // `builder_with_provider` requires the client cert verifier to use the same
-    // provider as the server config.  Both calls below pass the aws-lc-rs
-    // provider explicitly; neither relies on any global default.
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    // provider as the server config.  Both calls below pass the ring provider
+    // explicitly; neither relies on any global default.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     // `WebPkiClientVerifier::builder_with_provider(...).build()` produces a
     // verifier with the default (Deny) anonymous policy, meaning a client

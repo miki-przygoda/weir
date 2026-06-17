@@ -218,19 +218,13 @@ pub async fn run(
                                 }
                             };
 
-                            // Best-effort client-cert CN for the tracing span.
-                            // Subject CN is NOT a security control (the mTLS
-                            // verifier already proved a CA-signed client cert);
-                            // it's purely diagnostic. See client_cert_cn.
-                            //
-                            // Gate the parse behind the active level: client_cert_cn
-                            // parses + allocates from the full X.509 cert on every
-                            // successful handshake, and it's only ever used in this
-                            // debug! field — wasted work when DEBUG is off (G20).
-                            if tracing::enabled!(tracing::Level::DEBUG) {
-                                let cn = client_cert_cn(&tls_stream);
-                                debug!(%peer_addr, client_cn = ?cn, "TLS handshake ok");
-                            }
+                            // The mTLS verifier has already proved the client
+                            // presented a CA-signed certificate by this point.
+                            // (The client-cert Subject CN used to be logged here
+                            // as a purely-diagnostic span field, but that pulled a
+                            // full X.509 parser into the build for a debug-only
+                            // label; dropped to keep the tls build slim.)
+                            debug!(%peer_addr, "TLS handshake ok");
 
                             if let Err(e) =
                                 handle_connection(tls_stream, tx, cfg, m, handler_shutdown).await
@@ -331,25 +325,6 @@ fn classify_handshake_error(e: &std::io::Error) -> TlsHandshakeFailureReason {
     } else {
         TlsHandshakeFailureReason::other
     }
-}
-
-/// Best-effort client-certificate Common Name for the tracing span.
-///
-/// Returns `None` when no peer certificate is present or it can't be parsed.
-/// This is purely diagnostic: the mTLS verifier has already proven the client
-/// presented a CA-signed certificate before this runs, so the CN is not used
-/// for any authorization decision. (Test fixtures set every Subject CN to the
-/// generic rcgen value, so callers must NOT key behaviour off this.)
-fn client_cert_cn<IO>(stream: &tokio_rustls::server::TlsStream<IO>) -> Option<String> {
-    let (_io, conn) = stream.get_ref();
-    let cert = conn.peer_certificates()?.first()?;
-    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).ok()?;
-    parsed
-        .subject()
-        .iter_common_name()
-        .next()
-        .and_then(|cn| cn.as_str().ok())
-        .map(|s| s.to_string())
 }
 
 #[cfg(test)]
