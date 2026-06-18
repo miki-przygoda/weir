@@ -237,7 +237,7 @@ mod tests {
     /// `Sink` impl against the stable contract (no daemon, no runtime).
     #[test]
     fn a_custom_sink_can_be_driven_and_unit_tested() {
-        use std::cell::Cell;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Debug)]
         struct Never;
@@ -254,15 +254,12 @@ mod tests {
         }
 
         struct CountingSink {
-            committed: Cell<usize>,
+            committed: AtomicUsize,
         }
         impl Sink for CountingSink {
             type Record = Payload;
             type Error = Never;
-            async fn commit(
-                &self,
-                batch: Vec<Payload>,
-            ) -> Result<CommitResult<Payload>, Never> {
+            async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Never> {
                 let (mut ok, mut dead) = (Vec::new(), Vec::new());
                 for r in batch {
                     if r.as_ref() == b"reject" {
@@ -271,7 +268,7 @@ mod tests {
                         ok.push(r);
                     }
                 }
-                self.committed.set(self.committed.get() + ok.len());
+                self.committed.fetch_add(ok.len(), Ordering::Relaxed);
                 Ok(CommitResult::new(ok, dead))
             }
             async fn health(&self) -> SinkHealth {
@@ -280,7 +277,7 @@ mod tests {
         }
 
         let sink = CountingSink {
-            committed: Cell::new(0),
+            committed: AtomicUsize::new(0),
         };
         let batch = vec![
             Payload::copy_from_slice(b"keep-1"),
@@ -291,7 +288,7 @@ mod tests {
         assert_eq!(result.committed.len(), 2);
         assert_eq!(result.dead_lettered.len(), 1);
         assert_eq!(&result.dead_lettered[0].0[..], b"reject");
-        assert_eq!(sink.committed.get(), 2);
+        assert_eq!(sink.committed.load(Ordering::Relaxed), 2);
         assert!(matches!(block_on(sink.health()), SinkHealth::Healthy));
     }
 

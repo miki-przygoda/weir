@@ -887,9 +887,20 @@ mod tests {
         let segs = dl_segments(&dl).unwrap();
         assert_eq!(segs.len(), 2);
         let summary = dry_run_summary(&segs);
-        assert_eq!(summary.total_records, 2, "only the 2 readable records count");
-        assert_eq!(summary.unreadable.len(), 1, "the corrupt segment is flagged");
-        assert!(summary.unreadable[0].contains("record 0"), "{:?}", summary.unreadable);
+        assert_eq!(
+            summary.total_records, 2,
+            "only the 2 readable records count"
+        );
+        assert_eq!(
+            summary.unreadable.len(),
+            1,
+            "the corrupt segment is flagged"
+        );
+        assert!(
+            summary.unreadable[0].contains("record 0"),
+            "{:?}",
+            summary.unreadable
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
