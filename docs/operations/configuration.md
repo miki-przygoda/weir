@@ -752,7 +752,12 @@ must implement its own dedup — usually by hashing the body server-side.
 > already carry their own dedup id. If your workload has repeating payloads,
 > either set `sink_send_idempotency_key = false` (and let the endpoint dedupe on
 > its own record id), or ensure each record embeds a unique field. (A future
-> per-record dedup token is parked for a WAB-format revision.)
+> per-record dedup token — `sha256(segment_id ‖ offset ‖ payload)`, stable across
+> retries but distinct per record — is parked for an on-disk WAB-format revision;
+> see "Generalized dedup token → WAB format v2" in
+> [`docs/explorations/parked-future-directions.md`](../explorations/parked-future-directions.md).
+> It can't be done without a format change because the sink today receives no
+> per-record identity, only the payload bytes.)
 
 ---
 

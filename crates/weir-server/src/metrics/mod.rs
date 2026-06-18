@@ -292,8 +292,14 @@ pub(crate) struct Metrics {
     pub dead_letter_blocked_duration: Gauge<f64, AtomicU64>,
 }
 
-/// Latency histogram buckets covering 1 ms–1 s; suitable for fsync and network round-trips.
-const LATENCY_BUCKETS: &[f64] = &[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+/// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
+/// round-trips. The 2.5/5/10 s tail keeps a multi-second p99.9 quantifiable
+/// instead of saturating at the old 1 s top bucket — a failing disk or saturated
+/// network storage can push fsync well past a second and the critical alert
+/// needs the real value (escalation #12).
+const LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Buckets for `accept_latency`, which measures only accept→semaphore→spawn —
 /// microsecond-scale CPU work that would all land in LATENCY_BUCKETS' first
