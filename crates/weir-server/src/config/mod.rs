@@ -517,7 +517,12 @@ impl Config {
         // Idle-seal threshold. 0 = disabled (historical behaviour); otherwise seal
         // an idle active segment after this many seconds. Capped at a day.
         let wab_segment_max_age_secs = merge!(wab_segment_max_age_secs).unwrap_or(0);
-        check_range("wab_segment_max_age_secs", wab_segment_max_age_secs, 0, 86_400)?;
+        check_range(
+            "wab_segment_max_age_secs",
+            wab_segment_max_age_secs,
+            0,
+            86_400,
+        )?;
 
         let max_connections = merge!(max_connections).unwrap_or(256);
         check_range("max_connections", max_connections, 1, 512)?;
@@ -733,7 +738,12 @@ impl Config {
         // recovery; raise it to probe a flaky sink less often.
         let health_poll_interval_secs = merge!(health_poll_interval_secs)
             .unwrap_or_else(|| crate::drain::HEALTH_POLL_INTERVAL.as_secs());
-        check_range("health_poll_interval_secs", health_poll_interval_secs, 1, 3_600)?;
+        check_range(
+            "health_poll_interval_secs",
+            health_poll_interval_secs,
+            1,
+            3_600,
+        )?;
 
         // Treat an empty / whitespace-only value as unset → "info". Otherwise an
         // empty WEIR_LOG_LEVEL="" wins the merge and main's EnvFilter::try_new("")

@@ -1348,7 +1348,11 @@ mod tests {
             result.dead_lettered[0].1
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "one POST of the framable records");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "one POST of the framable records"
+        );
     }
 
     #[tokio::test]
