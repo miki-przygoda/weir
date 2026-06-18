@@ -329,6 +329,17 @@ fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
+/// Counts records that contain an embedded `\n` or `\r` — i.e. records that
+/// cannot be safely framed in an NDJSON batch (one record per line). Used only
+/// to emit a loud warning in `commit_ndjson`; the records are still sent (the
+/// caller already accepted them as durable).
+fn count_unframable_records(batch: &[Payload]) -> usize {
+    batch
+        .iter()
+        .filter(|r| r.as_ref().iter().any(|&b| b == b'\n' || b == b'\r'))
+        .count()
+}
+
 /// Returns true if the HTTP status code should be classified as transient
 /// (the drain should retry) vs permanent (dead-letter).
 fn classify_status_transient(status: StatusCode) -> bool {
@@ -484,6 +495,21 @@ impl HttpSink {
     ) -> Result<CommitResult<Payload>, HttpSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult::new(vec![], vec![]));
+        }
+        // NDJSON framing is one record per line, so a record that itself contains
+        // a newline silently corrupts the framing (the endpoint reads it as
+        // multiple records). weir can't reject it without changing what "durable"
+        // means for that record (see the dead-letter-routing option deferred to a
+        // config decision), so at minimum warn loudly so the misuse is visible.
+        let unframable = count_unframable_records(&batch);
+        if unframable > 0 {
+            warn!(
+                unframable,
+                batch = batch.len(),
+                "NDJSON sink: {unframable} record(s) contain an embedded newline and will \
+                 corrupt batch framing — use per-record mode (sink_http_batch=none) for \
+                 payloads that may contain newlines"
+            );
         }
         // Join records with '\n' (each record terminated by a newline).
         let total: usize = batch.iter().map(|r| r.len() + 1).sum();
@@ -1275,6 +1301,35 @@ mod tests {
             "Idempotency-Key not over the joined body: {} (want {expected_key})",
             key_lines[0]
         );
+    }
+
+    #[test]
+    fn count_unframable_records_flags_embedded_newlines() {
+        // Records with \n or \r corrupt NDJSON framing; clean records don't.
+        let batch = vec![
+            p(b"clean"),
+            p(b"has\nnewline"),
+            p(b"has\rcarriage"),
+            p(b"also-clean"),
+        ];
+        assert_eq!(count_unframable_records(&batch), 2);
+        assert_eq!(count_unframable_records(&[p(b"a"), p(b"b")]), 0);
+        assert_eq!(count_unframable_records(&[]), 0);
+    }
+
+    #[tokio::test]
+    async fn ndjson_still_commits_records_with_embedded_newlines() {
+        // The guard only warns — embedded-newline records are still sent (the
+        // caller already accepted them durable). Behaviour is unchanged; the
+        // warning is the operator-visible signal.
+        let (url, counter) =
+            spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let batch = vec![p(b"clean"), p(b"line1\nline2")];
+        let result = sink.commit(batch.clone()).await.unwrap();
+        assert_eq!(result.committed, batch);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

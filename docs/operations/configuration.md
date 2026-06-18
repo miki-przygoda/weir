@@ -787,8 +787,11 @@ without taking its batch-mates with it, use `none`.
 
 **Records must contain no embedded newlines** in `ndjson` mode — a `\n`
 inside a payload would be read by the endpoint as a record boundary.
-weir does not escape or reject them; the framing assumes line-delimited
-records (the normal case for log/event payloads).
+weir does not escape or reject them (the framing assumes line-delimited
+records, the normal case for log/event payloads), but it **logs a `warn!`**
+naming how many records in a batch contain an embedded `\n`/`\r` so the
+misuse is visible. If your payloads can contain newlines, use per-record
+mode (`sink_http_batch = "none"`).
 
 **Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
 is sent for the whole batch, computed over the joined body. Because the
