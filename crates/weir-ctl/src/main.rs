@@ -38,7 +38,7 @@ enum Command {
     /// Check that the daemon is alive and answering on its socket.
     Health {
         /// Path to the daemon's Unix socket.
-        #[arg(long, default_value = DEFAULT_SOCKET)]
+        #[arg(long, alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
     /// Push a single record (debugging / smoke testing).
@@ -49,7 +49,7 @@ enum Command {
         #[arg(long, default_value = "batched", value_parser = parse_durability)]
         durability: Durability,
         /// Path to the daemon's Unix socket.
-        #[arg(long, default_value = DEFAULT_SOCKET)]
+        #[arg(long, alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
     /// Scrape the daemon's Prometheus endpoint and print a health summary.
@@ -64,7 +64,7 @@ enum Command {
     /// Inspect the on-disk WAB: active/sealed/confirmed segments + bytes per shard.
     Segments {
         /// Path to the daemon's WAB directory (the `wab_dir` config value).
-        #[arg(long)]
+        #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
     },
     /// Inspect and manage the dead-letter store.
@@ -78,13 +78,13 @@ enum DlCommand {
     /// List dead-letter segments (count + bytes).
     List {
         /// Path to the daemon's WAB directory.
-        #[arg(long)]
+        #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
     },
     /// Delete ALL dead-letter segments. Irreversible — defaults to a dry run.
     Drop {
         /// Path to the daemon's WAB directory.
-        #[arg(long)]
+        #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
         /// Actually delete. Without this flag, prints what would be deleted.
         #[arg(long)]
@@ -97,10 +97,10 @@ enum DlCommand {
     /// run (the sink's idempotency key dedupes identical payloads).
     Requeue {
         /// Path to the daemon's WAB directory.
-        #[arg(long)]
+        #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
         /// Daemon Unix socket to push the records back through.
-        #[arg(long, default_value = DEFAULT_SOCKET)]
+        #[arg(long, alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
         /// Durability tier for the re-pushed records: sync | batched | buffered.
         #[arg(long, default_value = "batched", value_parser = parse_durability)]
@@ -188,11 +188,27 @@ fn cmd_push(socket: &Path, payload: &[u8], durability: Durability) -> Result<(),
 fn cmd_metrics(addr: &str, raw: bool) -> Result<(), String> {
     let body = scrape(addr)?;
     if raw {
+        // --raw dumps whatever the endpoint returned, unchanged.
         print!("{body}");
         return Ok(());
     }
+    // A summary built from an endpoint with no weir_* series would print a tidy
+    // all-zeros "healthy" report — which against the wrong port or a non-weir
+    // service is actively misleading. Fail loudly instead.
+    if !has_weir_metrics(&body) {
+        return Err(format!(
+            "no weir metrics found at {addr} — is this a weir daemon's /metrics endpoint, \
+             and is --addr correct? (default {DEFAULT_METRICS_ADDR})"
+        ));
+    }
     print_summary(&body);
     Ok(())
+}
+
+/// True if the exposition contains at least one `weir_` series line — i.e. this
+/// really is a weir daemon's `/metrics`, not the wrong port or another service.
+fn has_weir_metrics(body: &str) -> bool {
+    body.lines().any(|l| l.starts_with("weir_"))
 }
 
 /// On-disk segment accounting for one shard directory.
@@ -752,6 +768,19 @@ fn active_label(body: &str, metric: &str, label: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_weir_metrics_detects_weir_series() {
+        // A real weir exposition has weir_ series; the wrong port / another
+        // service does not.
+        assert!(has_weir_metrics(
+            "# HELP weir_records_accepted ...\nweir_records_accepted_total{tier=\"sync\"} 3"
+        ));
+        assert!(!has_weir_metrics(
+            "# HELP go_gc_duration_seconds ...\ngo_goroutines 12"
+        ));
+        assert!(!has_weir_metrics(""));
+    }
 
     #[test]
     fn dl_segments_finds_sealed_files_not_just_bare_wab() {
