@@ -44,6 +44,13 @@ batch_deadline_ms = 1
 # 256 MiB. Env: WEIR_WAB_SEGMENT_MAX_BYTES
 wab_segment_max_bytes = 268435456
 
+# Idle seal: seal + drain an active segment after this many seconds with no new
+# records, instead of waiting to fill wab_segment_max_bytes / for shutdown.
+# 0 = disabled (default). Set it (e.g. 5-30) on LOW-VOLUME deployments so a quiet
+# segment's records reach the sink promptly. Range: 0-86400.
+# Env: WEIR_WAB_SEGMENT_MAX_AGE_SECS
+wab_segment_max_age_secs = 0
+
 # Refuse any connection whose peer effective uid does not match the daemon's
 # (SO_PEERCRED / getpeereid). Fail-closed; the application-level access control
 # on the Unix socket. Leave on unless a trusted helper must connect as a

@@ -296,6 +296,34 @@ cost over more records.
 
 ---
 
+#### `wab_segment_max_age_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `0` (disabled)
+- **Range**: 0 – 86400
+- **CLI**: `--wab-segment-max-age-secs <n>`
+- **Env**: `WEIR_WAB_SEGMENT_MAX_AGE_SECS`
+- **TOML**: `wab_segment_max_age_secs`
+
+Opt-in **idle seal**: when > 0, the WAB flusher seals the active segment (handing
+it to the drain) after it has gone this many seconds with no new records, instead
+of waiting to reach `wab_segment_max_bytes` or for shutdown. `0` (default)
+preserves the historical behaviour — a segment seals only on the size threshold
+or shutdown.
+
+**Why it exists**: a **low-volume** deployment can write a handful of small
+records and then go quiet; with size-only sealing those records stay durable on
+disk but never reach the sink until 256 MiB accumulates or the daemon restarts —
+which reads as "weir isn't delivering." Set this (e.g. `5`–`30`) so a quiet
+segment drains promptly. On-disk format is unchanged; this only affects *when* a
+normal seal happens.
+
+**When to tune**: set it on edge/low-throughput deployments where timely delivery
+matters more than maximal per-segment batching; leave it `0` on high-throughput
+deployments where segments fill quickly on their own.
+
+---
+
 ### Connection limits
 
 #### `max_connections`

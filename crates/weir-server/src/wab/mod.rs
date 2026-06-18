@@ -61,6 +61,11 @@ pub(crate) struct WabConfig {
     /// the historical hard-coded behaviour; tests and storage-constrained
     /// deployments may set it lower.
     pub(crate) segment_max_bytes: u64,
+    /// Optional idle-seal: if set, a flusher seals its active segment (handing it
+    /// to the drain) after this much time with no new records, instead of waiting
+    /// to fill `segment_max_bytes` or for shutdown. `None` (default) preserves the
+    /// historical behaviour. Lets low-volume deployments deliver promptly.
+    pub(crate) segment_max_age: Option<Duration>,
 }
 
 impl Default for WabConfig {
@@ -70,6 +75,7 @@ impl Default for WabConfig {
             batch_size: 256,
             batch_deadline: Duration::from_millis(1),
             segment_max_bytes: crate::wab::format::SEGMENT_MAX_BYTES,
+            segment_max_age: None,
         }
     }
 }
@@ -257,6 +263,7 @@ pub(crate) fn spawn(
         let batch_size = config.batch_size;
         let batch_deadline = config.batch_deadline;
         let segment_max_bytes = config.segment_max_bytes;
+        let segment_max_age = config.segment_max_age;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
         let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
 
@@ -288,6 +295,7 @@ pub(crate) fn spawn(
                             batch_size,
                             batch_deadline,
                             segment_max_bytes,
+                            segment_max_age,
                             core_id,
                             metrics_for_flusher,
                             coalesce_hint,
@@ -459,6 +467,7 @@ fn flusher_thread<C: BlockingClock>(
     batch_size: usize,
     batch_deadline: Duration,
     segment_max_bytes: u64,
+    segment_max_age: Option<Duration>,
     core_id: Option<core_affinity::CoreId>,
     metrics: Arc<Metrics>,
     coalesce_hint: Arc<AtomicU64>,
@@ -546,6 +555,14 @@ fn flusher_thread<C: BlockingClock>(
     let mut batches: Vec<Batch> = Vec::new();
     let mut record_count = 0usize;
 
+    // Idle-seal bookkeeping (opt-in via segment_max_age; None = off). Tracks when
+    // records were last flushed to the active segment so we can seal it after it
+    // sits idle, handing it to the drain instead of waiting to fill
+    // segment_max_bytes or for shutdown. Uses real time (not the BlockingClock
+    // seam) — only active when the operator opts in, so DST, which never sets
+    // segment_max_age, is unaffected.
+    let mut last_write_at: Option<Instant> = None;
+
     loop {
         // Block on the first Batch (or detect channel close / deadline).
         match clock.recv_timeout(&work_rx, batch_deadline) {
@@ -565,6 +582,42 @@ fn flusher_thread<C: BlockingClock>(
                         &coalesce_hint,
                     );
                     record_count = 0;
+                    last_write_at = Some(Instant::now());
+                } else if let Some(max_age) = segment_max_age {
+                    // No new records this cycle: if the active segment has been
+                    // idle past max_age, seal it so the drain delivers it now
+                    // rather than at the next rotation/shutdown (low-volume
+                    // timely-delivery; the open segment always holds >=1 record).
+                    let idle_enough = last_write_at.is_some_and(|t| t.elapsed() >= max_age);
+                    if idle_enough && writer.has_active_segment() {
+                        match writer.seal_current() {
+                            Ok(Some(sealed)) => {
+                                metrics
+                                    .wab_segments
+                                    .get_or_create(&SegmentStateLabel {
+                                        state: SegmentState::sealed,
+                                    })
+                                    .inc();
+                                if let Err(crossbeam_channel::SendError(unsent)) =
+                                    drain_tx.send(sealed)
+                                {
+                                    error!(
+                                        shard = shard_id,
+                                        path = %unsent.display(),
+                                        "drain channel closed; idle-sealed segment not handed off \
+                                         (recovered on restart via replay)"
+                                    );
+                                }
+                                last_write_at = None;
+                            }
+                            Ok(None) => last_write_at = None,
+                            Err(e) => warn!(
+                                shard = shard_id,
+                                error = %e,
+                                "idle-seal failed; will retry next cycle (segment stays active)"
+                            ),
+                        }
+                    }
                 }
                 continue;
             }
@@ -592,6 +645,10 @@ fn flusher_thread<C: BlockingClock>(
             &coalesce_hint,
         );
         record_count = 0;
+        // Records just hit the active segment — restart the idle-seal clock.
+        if segment_max_age.is_some() {
+            last_write_at = Some(Instant::now());
+        }
     }
 
     // Graceful shutdown: seal the active segment and send to drain.

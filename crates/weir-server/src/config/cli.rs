@@ -118,6 +118,9 @@ pub(super) fn parse_from(
         wab_segment_max_bytes: pargs
             .opt_value_from_str("--wab-segment-max-bytes")
             .map_err(pico_err)?,
+        wab_segment_max_age_secs: pargs
+            .opt_value_from_str("--wab-segment-max-age-secs")
+            .map_err(pico_err)?,
         max_connections: pargs
             .opt_value_from_str("--max-connections")
             .map_err(pico_err)?,

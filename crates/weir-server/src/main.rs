@@ -285,6 +285,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch_size: config.batch_size,
         batch_deadline: Duration::from_millis(config.batch_deadline_ms),
         segment_max_bytes: config.wab_segment_max_bytes,
+        // 0 = idle-seal disabled (historical behaviour).
+        segment_max_age: (config.wab_segment_max_age_secs > 0)
+            .then(|| Duration::from_secs(config.wab_segment_max_age_secs)),
     };
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),

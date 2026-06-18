@@ -517,6 +517,15 @@ impl ShardWriter {
         }
     }
 
+    /// Whether an active (unsealed) segment is currently open. Because a segment
+    /// is opened lazily on the first `write_record`, an open segment always holds
+    /// at least one record — so this doubles as "are there unsealed records?",
+    /// which the idle/age-based seal uses to decide whether sealing now would
+    /// hand a non-empty segment to the drain.
+    pub(crate) fn has_active_segment(&self) -> bool {
+        self.active.is_some()
+    }
+
     fn ensure_open(&mut self) -> io::Result<()> {
         if self.active.is_none() {
             let path = segment_path(&self.shard_dir, self.next_counter);

@@ -296,6 +296,36 @@ fn records_written_to_wab_on_disk() {
     );
 }
 
+#[test]
+fn idle_seal_drains_low_volume_segment_without_shutdown() {
+    // With wab_segment_max_age_secs set, a lone record's segment is sealed and
+    // drained after it sits idle — instead of waiting to fill wab_segment_max_bytes
+    // (256 MiB) or for shutdown. Without the knob a single record never seals, so
+    // the committed counter would stay 0 here. The noop sink commits whatever it's
+    // handed, so a non-zero committed count proves the segment sealed + drained.
+    let srv = weir_server!("idle_seal")
+        .extra_config("wab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    client.push(b"lonely-record", Durability::Batched).unwrap();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+    // Poll past the 1s idle-seal threshold + the drain hop.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while committed() == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        committed() >= 1,
+        "idle-seal should have sealed + drained the lone record (committed stayed 0)"
+    );
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]

@@ -198,6 +198,7 @@ pub(crate) struct PartialConfig {
     pub batch_size: Option<usize>,
     pub batch_deadline_ms: Option<u64>,
     pub wab_segment_max_bytes: Option<u64>,
+    pub wab_segment_max_age_secs: Option<u64>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
@@ -293,6 +294,11 @@ pub struct Config {
     pub batch_size: usize,
     pub batch_deadline_ms: u64,
     pub wab_segment_max_bytes: u64,
+    /// Idle-seal threshold in seconds. `0` (default) disables it: the active
+    /// segment seals only at `wab_segment_max_bytes` or shutdown. When > 0, a
+    /// segment idle for this long is sealed and drained — timely delivery for
+    /// low-volume deployments.
+    pub wab_segment_max_age_secs: u64,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
@@ -508,6 +514,10 @@ impl Config {
                 ),
             });
         }
+        // Idle-seal threshold. 0 = disabled (historical behaviour); otherwise seal
+        // an idle active segment after this many seconds. Capped at a day.
+        let wab_segment_max_age_secs = merge!(wab_segment_max_age_secs).unwrap_or(0);
+        check_range("wab_segment_max_age_secs", wab_segment_max_age_secs, 0, 86_400)?;
 
         let max_connections = merge!(max_connections).unwrap_or(256);
         check_range("max_connections", max_connections, 1, 512)?;
@@ -793,6 +803,7 @@ impl Config {
             batch_size,
             batch_deadline_ms,
             wab_segment_max_bytes,
+            wab_segment_max_age_secs,
             max_connections,
             max_payload_bytes,
             metrics_port,
@@ -984,6 +995,7 @@ mod tests {
         assert_eq!(c.batch_size, 256);
         assert_eq!(c.batch_deadline_ms, 1);
         assert_eq!(c.wab_segment_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(c.wab_segment_max_age_secs, 0);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
