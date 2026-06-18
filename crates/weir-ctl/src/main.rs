@@ -153,9 +153,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// Connects to the daemon's Unix socket, turning a connect failure into an
+/// operator-friendly error. A failed connect almost always means the daemon
+/// isn't running or `--socket` points at the wrong path, so we say so rather
+/// than surface a bare `No such file or directory`.
+fn connect_client(socket: &Path) -> Result<WeirClient, String> {
+    WeirClient::connect(socket).map_err(|e| {
+        format!(
+            "connect {}: {e}\n  hint: is the weir daemon running, and is --socket the right path? \
+             (default {DEFAULT_SOCKET})",
+            socket.display()
+        )
+    })
+}
+
 fn cmd_health(socket: &Path) -> Result<(), String> {
     let mut client =
-        WeirClient::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+        connect_client(socket)?;
     client
         .health_check()
         .map_err(|e| format!("health check failed: {e}"))?;
@@ -165,7 +179,7 @@ fn cmd_health(socket: &Path) -> Result<(), String> {
 
 fn cmd_push(socket: &Path, payload: &[u8], durability: Durability) -> Result<(), String> {
     let mut client =
-        WeirClient::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+        connect_client(socket)?;
     client
         .push(payload, durability)
         .map_err(|e| format!("push failed: {e}"))?;
@@ -254,8 +268,19 @@ fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
         shards.push(st);
     }
 
-    if shards.is_empty() && dl_files == 0 {
-        println!("no shard directories under {}", wab_dir.display());
+    if shards.is_empty() {
+        if dl_files == 0 {
+            println!("no shard directories under {}", wab_dir.display());
+        } else {
+            // The daemon hasn't created shard dirs yet (or this is a stale wab_dir),
+            // but there are dead-letter files — show just those, not an empty table.
+            println!("no shard directories yet under {}", wab_dir.display());
+            println!(
+                "dead-letter: {}, {}",
+                plural(dl_files, "file", "files"),
+                fmt_bytes(dl_bytes)
+            );
+        }
         return Ok(());
     }
 
@@ -289,7 +314,11 @@ fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
     );
     println!("(active = being written; sealed = awaiting drain; confirmed = drained marker)");
     if dl_files > 0 {
-        println!("dead-letter: {dl_files} file(s), {}", fmt_bytes(dl_bytes));
+        println!(
+            "dead-letter: {}, {}",
+            plural(dl_files, "file", "files"),
+            fmt_bytes(dl_bytes)
+        );
     }
     Ok(())
 }
@@ -457,10 +486,13 @@ fn cmd_dl_requeue(
                 Err(e) => unreadable.push(e),
             }
         }
+        // Report readable-of-total so the segment count reconciles with `dl list`
+        // (which counts every segment, readable or not).
         println!(
-            "would requeue {total_records} record(s) from {} dead-letter segment(s) under {} \
-             through {}",
+            "would requeue {total_records} record(s) from {} of {} dead-letter segment(s) \
+             under {} through {}",
             segs.len() - unreadable.len(),
+            segs.len(),
             dl_dir.display(),
             socket.display(),
         );
@@ -471,8 +503,9 @@ fn cmd_dl_requeue(
         );
         if !unreadable.is_empty() {
             println!(
-                "\n⚠ {} segment(s) could not be read and would be SKIPPED:\n  {}",
+                "\n⚠ {} of {} segment(s) could not be read and would be SKIPPED:\n  {}",
                 unreadable.len(),
+                segs.len(),
                 unreadable.join("\n  ")
             );
         }
@@ -483,7 +516,7 @@ fn cmd_dl_requeue(
     // deleted only after ALL of its records are re-accepted, so a crash bounds
     // duplication to at most the in-flight segment.
     let mut client =
-        WeirClient::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+        connect_client(socket)?;
 
     let mut total_requeued: u64 = 0;
     let mut segments_cleared: usize = 0;
@@ -623,18 +656,17 @@ fn print_summary(body: &str) {
     let sink_health = active_label(body, "weir_sink_health", "state").unwrap_or_else(|| "?".into());
     let sink_type = active_label(body, "weir_sink_info", "sink_type").unwrap_or_else(|| "?".into());
 
+    // Labels padded to a single consistent width so the values line up.
     println!("── weir ──────────────────────────────────");
-    println!("ingest    accepted {accepted}  ack {acked}  nack {nacked}");
+    println!("{:<10} accepted {accepted}  ack {acked}  nack {nacked}", "ingest");
     println!(
-        "durability fsync avg {fsync_avg_ms:.2} ms  wab {:.1} MiB on disk",
-        wab_bytes / 1_048_576.0
+        "{:<10} fsync avg {fsync_avg_ms:.2} ms  wab {} on disk",
+        "durability",
+        fmt_bytes(wab_bytes as u64)
     );
-    println!("queue     depth {queue_depth}");
-    println!("sink      type: {sink_type}  health: {sink_health}");
-    println!(
-        "dead-ltr  {:.1} MiB on disk",
-        dead_letter_bytes / 1_048_576.0
-    );
+    println!("{:<10} depth {queue_depth}", "queue");
+    println!("{:<10} type: {sink_type}  health: {sink_health}", "sink");
+    println!("{:<10} {} on disk", "dead-ltr", fmt_bytes(dead_letter_bytes as u64));
 
     // Loud warnings for the durability hazards.
     if sink_type == "noop" {
@@ -644,16 +676,28 @@ fn print_summary(body: &str) {
         );
     }
     if panics > 0 {
-        println!("\n⚠ flusher panics: {panics} — a shard is offline until restart");
+        println!(
+            "\n⚠ flusher {} — a shard is offline until restart",
+            plural(panics, "panic", "panics")
+        );
     }
     if fsync_failures > 0 {
         println!(
-            "⚠ fsync failures: {fsync_failures} — DURABILITY HAZARD (data may not be on stable storage)"
+            "⚠ {} — DURABILITY HAZARD (data may not be on stable storage)",
+            plural(fsync_failures, "fsync failure", "fsync failures")
         );
     }
     if nacked > 0 {
-        println!("ℹ {nacked} records nacked — check producer behaviour / capacity");
+        println!(
+            "ℹ {} nacked — check producer behaviour / capacity",
+            plural(nacked, "record", "records")
+        );
     }
+}
+
+/// `"1 record"` / `"3 records"` — count-aware singular/plural for summary lines.
+fn plural(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 /// For a gauge-vector family where exactly one label value is 1.0 (e.g.
