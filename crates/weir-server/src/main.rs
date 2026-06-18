@@ -310,6 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
         // sink hangs without honouring its internal timeout.
         commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
+        health_poll_interval: drain::HEALTH_POLL_INTERVAL,
     };
     // Surface the configured sink type as a metric so operators (and
     // `weir-ctl metrics`) can see whether records actually go downstream or to

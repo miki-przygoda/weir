@@ -627,7 +627,12 @@ impl Config {
         let sink_max_retries = merge!(sink_max_retries).unwrap_or(crate::drain::MAX_RETRIES);
         check_range("sink_max_retries", sink_max_retries, 0, 100)?;
         let sink_retry_base_delay_ms = merge!(sink_retry_base_delay_ms).unwrap_or(100);
-        check_range("sink_retry_base_delay_ms", sink_retry_base_delay_ms, 1, 60_000)?;
+        check_range(
+            "sink_retry_base_delay_ms",
+            sink_retry_base_delay_ms,
+            1,
+            60_000,
+        )?;
 
         // MySQL sink: identifier validation happens inside MySqlSink::new at
         // startup (strict [A-Za-z_][A-Za-z0-9_]{0,63} rule, single source of

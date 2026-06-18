@@ -303,30 +303,33 @@ pub(crate) fn spawn(
     })
 }
 
-/// Replays sealed-but-unconfirmed segments from a previous run by sending their
-/// paths to the drain. MUST be called only after the drain consumer is running:
-/// the sends block on the bounded drain channel, so with no consumer a backlog
-/// larger than the channel capacity would dead-lock the caller (B3).
-pub(crate) fn replay_unconfirmed(
+/// Scans every shard directory under `wab_dir` for sealed-but-unconfirmed
+/// segments (`.wab.sealed` with no `.confirmed` sidecar), returning their paths
+/// in ascending per-shard counter order. Already-confirmed segments are skipped;
+/// a segment that fails the confirmed check is quarantined by `check_confirmed`
+/// and skipped. Shared by startup [`replay_unconfirmed`] and the drain's
+/// sink-recovery rescan of stranded segments.
+///
+/// Enumerates EVERY shard directory on disk, not just `0..shard_count` —
+/// scanning only the configured range would strand sealed-but-unconfirmed
+/// segments in dirs whose index is >= shard_count after an operator REDUCED
+/// shard_count across a restart (acked-durable data never replayed, S05). The
+/// drain is shard-agnostic, so draining an orphaned dir's backlog is correct.
+/// Dirent errors propagate (no `.ok()` filtering): a silently-skipped sealed
+/// segment is silently-dropped acked data.
+///
+/// `shard_count` only drives the "backlog beyond the configured count" advisory;
+/// pass `None` (e.g. from the recovery rescan) to skip it.
+pub(crate) fn scan_unconfirmed_sealed(
     wab_dir: &Path,
-    shard_count: usize,
-    drain_tx: &Sender<PathBuf>,
-    metrics: &Arc<Metrics>,
-) -> io::Result<()> {
-    // Enumerate EVERY shard directory on disk, not just 0..shard_count. recovery
-    // (recover_open_segments) already seals active segments in all of them;
-    // scanning only the configured range here would strand sealed-but-unconfirmed
-    // segments in shard dirs whose index is >= shard_count after an operator
-    // REDUCED shard_count across a restart — records acked durable but then never
-    // replayed, confirmed, or dead-lettered (S05). The drain is shard-agnostic, so
-    // draining an orphaned dir's backlog is correct; the dir is left empty once
-    // its segments confirm. Propagate dirent errors (don't filter .ok()): a
-    // silently-skipped sealed segment is silently-dropped acked data.
+    shard_count: Option<usize>,
+) -> io::Result<Vec<PathBuf>> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
     shard_dirs.sort();
 
+    let mut unconfirmed = Vec::new();
     for sdir in shard_dirs {
         if !sdir.is_dir() {
             continue;
@@ -342,12 +345,10 @@ pub(crate) fn replay_unconfirmed(
         if name == "quarantine" || name == "dead_letter" {
             continue;
         }
-        // A shard directory beyond the configured count means shard_count was
-        // reduced with undrained data present. Its backlog is recovered here (not
-        // stranded), but surface the misconfiguration so the operator notices.
-        if let Some(idx) = name
-            .strip_prefix("shard_")
-            .and_then(|n| n.parse::<usize>().ok())
+        if let Some(shard_count) = shard_count
+            && let Some(idx) = name
+                .strip_prefix("shard_")
+                .and_then(|n| n.parse::<usize>().ok())
             && idx >= shard_count
         {
             warn!(
@@ -368,35 +369,49 @@ pub(crate) fn replay_unconfirmed(
         for sealed in sealed_segments {
             match check_confirmed(&sealed, wab_dir) {
                 Ok(true) => {
-                    info!(sealed = %sealed.display(), "skipping replay — segment already confirmed");
+                    info!(sealed = %sealed.display(), "skipping — segment already confirmed");
                 }
-                Ok(false) => {
-                    // A footer-read failure here only undercounts the
-                    // recovery_records_replayed metric (the segment is still
-                    // queued + delivered); surface it rather than silently
-                    // reporting 0 so the undercount is explainable.
-                    let record_count = match read_segment_record_count(&sealed) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
-                            0
-                        }
-                    };
-                    info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
-                    metrics.recovery_records_replayed.inc_by(record_count);
-                    drain_tx.send(sealed).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "drain channel closed during startup replay",
-                        )
-                    })?;
-                }
+                Ok(false) => unconfirmed.push(sealed),
                 Err(e) => {
                     // check_confirmed quarantined the segment; skip it.
-                    warn!(error = %e, "skipping quarantined segment during replay");
+                    warn!(error = %e, "skipping quarantined segment");
                 }
             }
         }
+    }
+    Ok(unconfirmed)
+}
+
+/// Replays sealed-but-unconfirmed segments from a previous run by sending their
+/// paths to the drain. MUST be called only after the drain consumer is running:
+/// the sends block on the bounded drain channel, so with no consumer a backlog
+/// larger than the channel capacity would dead-lock the caller (B3).
+pub(crate) fn replay_unconfirmed(
+    wab_dir: &Path,
+    shard_count: usize,
+    drain_tx: &Sender<PathBuf>,
+    metrics: &Arc<Metrics>,
+) -> io::Result<()> {
+    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count))? {
+        // A footer-read failure here only undercounts the
+        // recovery_records_replayed metric (the segment is still queued +
+        // delivered); surface it rather than silently reporting 0 so the
+        // undercount is explainable.
+        let record_count = match read_segment_record_count(&sealed) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
+                0
+            }
+        };
+        info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
+        metrics.recovery_records_replayed.inc_by(record_count);
+        drain_tx.send(sealed).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "drain channel closed during startup replay",
+            )
+        })?;
     }
     Ok(())
 }

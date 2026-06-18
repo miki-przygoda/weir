@@ -80,6 +80,10 @@ pub struct DrainConfig {
     /// timeout). On elapse, the commit is treated as a transient error and the
     /// segment is retried.
     pub commit_timeout: Duration,
+    /// How often the idle drain re-probes sink health (and, on a down→up
+    /// recovery, rescans for stranded segments to re-drain). Default
+    /// [`HEALTH_POLL_INTERVAL`]; shortened in tests.
+    pub health_poll_interval: Duration,
 }
 
 // ── Internal state machine types ──────────────────────────────────────────────
@@ -276,6 +280,53 @@ fn probe_health<S: Sink>(rt: &tokio::runtime::Runtime, sink: &S, timeout: Durati
     }
 }
 
+/// Probes sink health, updates the `weir_sink_health` gauge, and — on a down→up
+/// recovery edge (was not-healthy, now healthy) — rescans the WAB for stranded
+/// (sealed-but-unconfirmed) segments and re-queues any not already pending, so a
+/// recovered sink drains its backlog automatically rather than waiting for a
+/// daemon restart. Returns the new health-ok state for the caller's
+/// `prev_health_ok`.
+fn probe_and_resume_stranded<S: Sink>(
+    rt: &tokio::runtime::Runtime,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    pending: &mut VecDeque<PathBuf>,
+    prev_health_ok: bool,
+) -> bool {
+    let health = probe_health(rt, sink, config.commit_timeout);
+    let now_ok = matches!(health, SinkHealth::Healthy);
+    set_sink_health(metrics, health);
+
+    if now_ok && !prev_health_ok {
+        // `None` shard_count: skip the beyond-configured-count advisory — that's
+        // a startup-replay concern, not a recovery one.
+        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None) {
+            Ok(sealed) => {
+                let mut resumed = 0u64;
+                for seg in sealed {
+                    if !pending.contains(&seg) {
+                        pending.push_back(seg);
+                        resumed += 1;
+                    }
+                }
+                if resumed > 0 {
+                    metrics.drain_segments_resumed.inc_by(resumed);
+                    info!(
+                        resumed,
+                        "drain: sink recovered; re-queued stranded segment(s) for delivery"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                error = %e,
+                "drain: sink recovered but the stranded-segment rescan failed; will retry on the next recovery edge"
+            ),
+        }
+    }
+    now_ok
+}
+
 // ── Drain thread ──────────────────────────────────────────────────────────────
 
 fn drain_thread<S: Sink>(
@@ -309,6 +360,12 @@ fn drain_thread<S: Sink>(
     // when a segment is actually confirmed or quarantined — genuine progress (F09).
     let mut block_episode: Option<Instant> = None;
 
+    // Tracks the sink's last-observed health so we can detect a down→up recovery
+    // edge and re-drain stranded segments. Starts `true` (startup replay already
+    // handled any pre-existing unconfirmed segments, so the first healthy probe
+    // is not a recovery). Set `false` whenever a segment strands.
+    let mut prev_health_ok = true;
+
     'outer: loop {
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
@@ -323,11 +380,21 @@ fn drain_thread<S: Sink>(
                     // gauge stays current even on an idle daemon. Channel
                     // closure (all WAB flushers exited) still ends the loop.
                     loop {
-                        match drain_rx.recv_timeout(HEALTH_POLL_INTERVAL) {
+                        match drain_rx.recv_timeout(config.health_poll_interval) {
                             Ok(p) => break p,
                             Err(RecvTimeoutError::Timeout) => {
-                                let health = probe_health(&rt, &*sink, config.commit_timeout);
-                                set_sink_health(&metrics, health);
+                                // Probe sink health; on a down→up recovery edge
+                                // this re-queues any stranded segments into
+                                // `pending` so a recovered sink drains its backlog
+                                // without a daemon restart.
+                                prev_health_ok = probe_and_resume_stranded(
+                                    &rt,
+                                    &*sink,
+                                    &config,
+                                    &metrics,
+                                    &mut pending,
+                                    prev_health_ok,
+                                );
                                 // Refresh the dead-letter size gauge on the idle
                                 // poll too, so an out-of-band `weir-ctl dl drop`
                                 // (an operator deleting files while the daemon
@@ -338,6 +405,12 @@ fn drain_thread<S: Sink>(
                                     metrics
                                         .dead_letter_bytes_on_disk
                                         .set(dead_letter.total_bytes() as f64);
+                                }
+                                // A recovery rescan may have re-queued a stranded
+                                // segment — process it now rather than waiting for
+                                // the next channel send.
+                                if let Some(p) = pending.pop_front() {
+                                    break p;
                                 }
                             }
                             Err(RecvTimeoutError::Disconnected) => break 'outer,
@@ -355,6 +428,11 @@ fn drain_thread<S: Sink>(
                     0,
                 ));
 
+                // Just refresh the health gauge here — the stranded-segment
+                // rescan runs only at the idle poll (below), where `pending` is
+                // empty and no segment is mid-confirm, so it can't re-queue the
+                // segment currently being processed. `prev_health_ok` is managed
+                // by the strand (sets it false) and the idle poll (recovery edge).
                 let health = probe_health(&rt, &*sink, config.commit_timeout);
                 set_sink_health(&metrics, health);
 
@@ -398,10 +476,15 @@ fn drain_thread<S: Sink>(
 
                 if retries_left == 0 {
                     metrics.drain_segments_stranded.inc();
+                    // The sink is failing; mark it down so the next healthy probe
+                    // registers as a down→up recovery edge and re-drains this
+                    // stranded segment without waiting for a restart.
+                    prev_health_ok = false;
                     error!(
                         path = %segment.display(),
-                        "drain: max retries exhausted; segment left on disk for manual recovery \
-                         (weir_drain_segments_stranded_total incremented; re-attempted on restart)"
+                        "drain: max retries exhausted; segment left on disk (stranded) — \
+                         weir_drain_segments_stranded_total incremented; re-drained automatically \
+                         when the sink recovers, or on restart"
                     );
                     DrainState::Draining
                 } else {
@@ -598,12 +681,11 @@ fn end_block_episode(block_episode: &mut Option<Instant>, metrics: &Metrics) {
     }
 }
 
-/// How often the drain polls `Sink::health()` while idle (waiting on the
-/// channel) or while blocked on a full dead-letter directory. Keeps the
-/// `weir_sink_health{state}` gauge fresh even when no segments are flowing.
-/// Not currently configurable; 30 s matches the default
+/// Default for [`DrainConfig::health_poll_interval`]: how often the idle drain
+/// re-probes `Sink::health()` (keeping the `weir_sink_health{state}` gauge fresh
+/// and driving the stranded-segment recovery rescan). 30 s matches the default
 /// `dead_letter_check_interval_secs` for symmetry.
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+pub const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Picks the next retry delay. If the sink supplied a `Retry-After`-style
 /// hint, honour it; otherwise fall back to `default` (typically the
@@ -1372,6 +1454,8 @@ mod tests {
             base_retry_delay: Duration::from_millis(1),
             max_retries: MAX_RETRIES,
             commit_timeout: Duration::from_secs(30),
+            // Short so the stranded-segment recovery rescan fires promptly in tests.
+            health_poll_interval: Duration::from_millis(50),
         }
     }
 
@@ -1949,6 +2033,63 @@ mod tests {
     }
 
     #[test]
+    fn stranded_segment_resumes_when_sink_recovers() {
+        // 4a auto-resume: a segment strands (transient failures exhaust
+        // max_retries), then the sink recovers — the drain's down→up recovery
+        // rescan must re-queue and deliver it WITHOUT a daemon restart.
+        let dir = tmp_dir("resume");
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+
+        // initial + MAX_RETRIES transient commits → strand; the resumed commit
+        // then gets MockSink's default Ok (responses exhausted) → delivered.
+        let responses: Vec<MockResult> = (0..=MAX_RETRIES)
+            .map(|_| Err(MockError::Transient))
+            .collect();
+        let sink = Arc::new(MockSink::with_responses(responses));
+        let metrics = noop_metrics();
+
+        // tx is kept OPEN (unlike run_drain) so the drain reaches the idle
+        // health-poll where the recovery rescan runs.
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+        );
+        tx.send(sealed.clone()).unwrap();
+
+        // Wait for strand → recovery → delivery (idle health-poll is 50ms).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while records_committed(&metrics) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            1,
+            "segment must strand once before recovery"
+        );
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            1,
+            "recovery must re-queue the stranded segment (weir_drain_segments_resumed_total)"
+        );
+        assert!(
+            records_committed(&metrics) >= 1,
+            "resumed segment must be delivered to the sink"
+        );
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "resumed segment must be confirmed after delivery"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn multiple_segments_second_processed_after_first_exhausts_retries() {
         let dir = tmp_dir("two_segs");
         let shard_dir = dir.join("shard_00");
@@ -1972,9 +2113,15 @@ mod tests {
             .map(|_| Err(MockError::Transient))
             .collect();
         responses.push(MockSink::ok(vec![Payload::from(b"seg2".as_ref())]));
+        // seg1's resume (after seg2 confirms) gets MockSink's default Ok.
         let sink = Arc::new(MockSink::with_responses(responses));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
+        // seg2 is delivered without being blocked by seg1 exhausting its retries
+        // (a stranded segment doesn't stall the queue). seg1 stays stranded here
+        // because run_drain drops the channel, so the drain never reaches the idle
+        // poll where the sink-recovery rescan runs (that path is covered by
+        // stranded_segment_resumes_when_sink_recovers).
         assert!(seg1.exists(), "seg1 left on disk after exhausted retries");
         assert!(!seg2.exists(), "seg2 confirmed and deleted");
         assert!(get_confirmed_path(&seg2).exists());

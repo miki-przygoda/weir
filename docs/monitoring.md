@@ -126,14 +126,17 @@ transient errors with backoff; sustained `down` means the sink needs attention.
 Records stay safe on disk until it recovers.
 
 #### WeirSegmentStranded
-The drain exhausted `max_retries` (a fixed 3) of **transient** sink failures on a
-segment and abandoned it on disk. The data is durable (no loss), but delivery for
-that segment has stopped — and it is only re-attempted on the next daemon
-**restart**, NOT automatically when the sink recovers.
-**Respond:** fix the sink (correlate with `WeirSinkDown` / `weir_sink_health`),
-then **restart the daemon** to replay the stranded segment(s). `weir-ctl segments`
-lists the sealed-but-undelivered files. Distinct from `WeirDeadLettered`, which is
-for *permanent* rejections.
+The drain exhausted `sink_max_retries` (default 3) of **transient** sink failures
+on a segment and left it on disk ("stranded"). The data is durable (no loss), but
+delivery for that segment is paused.
+**Respond:** fix the sink (correlate with `WeirSinkDown` / `weir_sink_health`).
+Once the sink **recovers**, the drain **automatically re-drains** stranded
+segments on the next health poll — watch `weir_drain_segments_resumed_total`
+converge toward `weir_drain_segments_stranded_total` and the alert clear. A daemon
+restart also replays them. If the gap persists, the sink isn't healthy yet (or is
+recovering then re-failing); `weir-ctl segments` lists the sealed-but-undelivered
+files. Raise `sink_max_retries` / `sink_retry_base_delay_ms` to ride out longer
+outages before stranding. Distinct from `WeirDeadLettered` (*permanent* rejections).
 
 #### WeirDeadLettered
 The sink **permanently** rejected records (e.g. a 4xx). They are written to the
@@ -219,7 +222,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
 | `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Seconds since the drain entered BlockedDeadLetterFull (resets to 0 on exit); alert when it exceeds your threshold. |
-| `weir_drain_segments_stranded_total` | counter | Segments abandoned after exhausting `max_retries` **transient** sink failures. The segment stays on disk and is only re-attempted on daemon restart, so any increase means delivery has stalled for at least one segment. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`; once the sink recovers, restart the daemon to replay the stranded segment(s). Distinct from `weir_dead_letter_full_total` (permanent rejections). |
+| `weir_drain_segments_stranded_total` | counter | Segments left on disk after exhausting `sink_max_retries` **transient** sink failures. The data is durable; delivery is paused. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`. They are re-drained automatically when the sink recovers (see below) or on restart. Distinct from `weir_dead_letter_full_total` (permanent rejections). |
+| `weir_drain_segments_resumed_total` | counter | Stranded segments re-queued for delivery after a sink health **recovery** (down→up). Convergence with `weir_drain_segments_stranded_total` means an outage's backlog has been picked back up; a persistent gap means segments are still stranded (sink not healthy yet). |
 
 ### System / security
 | Metric | Type | Meaning |
