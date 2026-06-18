@@ -807,13 +807,13 @@ commits every record in the batch, a permanent `4xx` dead-letters the
 retries the whole segment. If you need a single bad record dead-lettered
 without taking its batch-mates with it, use `none`.
 
-**Records must contain no embedded newlines** in `ndjson` mode — a `\n`
-inside a payload would be read by the endpoint as a record boundary.
-weir does not escape or reject them (the framing assumes line-delimited
-records, the normal case for log/event payloads), but it **logs a `warn!`**
-naming how many records in a batch contain an embedded `\n`/`\r` so the
-misuse is visible. If your payloads can contain newlines, use per-record
-mode (`sink_http_batch = "none"`).
+**Records with embedded newlines are dead-lettered** in `ndjson` mode — a
+`\n`/`\r` inside a payload can't be NDJSON-framed (the endpoint would read one
+record as several). Rather than silently corrupt the batch, weir routes those
+records straight to the dead-letter store with a clear reason (and logs a
+`warn!`); only the clean records are POSTed. If your payloads can contain
+newlines, use per-record mode (`sink_http_batch = "none"`), where each record is
+its own POST body and newlines are fine.
 
 **Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
 is sent for the whole batch, computed over the joined body. Because the

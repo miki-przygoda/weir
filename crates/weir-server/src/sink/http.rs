@@ -329,15 +329,11 @@ fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-/// Counts records that contain an embedded `\n` or `\r` — i.e. records that
-/// cannot be safely framed in an NDJSON batch (one record per line). Used only
-/// to emit a loud warning in `commit_ndjson`; the records are still sent (the
-/// caller already accepted them as durable).
-fn count_unframable_records(batch: &[Payload]) -> usize {
-    batch
-        .iter()
-        .filter(|r| r.as_ref().iter().any(|&b| b == b'\n' || b == b'\r'))
-        .count()
+/// True if a record contains an embedded `\n`/`\r` and so cannot be safely
+/// framed in an NDJSON batch (one record per line) — `commit_ndjson`
+/// dead-letters these instead of corrupting the batch.
+fn record_is_unframable(record: &Payload) -> bool {
+    record.as_ref().iter().any(|&b| b == b'\n' || b == b'\r')
 }
 
 /// Returns true if the HTTP status code should be classified as transient
@@ -484,11 +480,17 @@ impl HttpSink {
         Ok(CommitResult::new(committed, dead_lettered))
     }
 
-    /// NDJSON-batch commit: the whole batch goes in ONE POST as newline-delimited
-    /// bodies, with a single per-batch Idempotency-Key. The endpoint returns one
-    /// status, so the result is all-or-nothing: 2xx commits the whole batch, a
-    /// permanent 4xx dead-letters the whole batch, and a transient error retries
-    /// the whole segment. Records must contain no embedded newlines.
+    /// NDJSON-batch commit: the framable records go in ONE POST as newline-
+    /// delimited bodies, with a single per-batch Idempotency-Key. The endpoint
+    /// returns one status, so the POST is all-or-nothing for those records: 2xx
+    /// commits them, a permanent 4xx dead-letters them, a transient error retries
+    /// the whole segment.
+    ///
+    /// Records containing an embedded `\n`/`\r` cannot be NDJSON-framed (the
+    /// endpoint would read one record as several), so rather than silently
+    /// corrupt the batch they are **dead-lettered** with a clear reason and never
+    /// sent. Use `sink_http_batch = "none"` (per-record mode) for payloads that
+    /// may contain newlines.
     async fn commit_ndjson(
         &self,
         batch: Vec<Payload>,
@@ -496,31 +498,42 @@ impl HttpSink {
         if batch.is_empty() {
             return Ok(CommitResult::new(vec![], vec![]));
         }
-        // NDJSON framing is one record per line, so a record that itself contains
-        // a newline silently corrupts the framing (the endpoint reads it as
-        // multiple records). weir can't reject it without changing what "durable"
-        // means for that record (see the dead-letter-routing option deferred to a
-        // config decision), so at minimum warn loudly so the misuse is visible.
-        let unframable = count_unframable_records(&batch);
-        if unframable > 0 {
+        // Partition off the records that can't be framed; dead-letter them rather
+        // than corrupt the batch (escalation #3).
+        let (framable, unframable): (Vec<Payload>, Vec<Payload>) =
+            batch.into_iter().partition(|r| !record_is_unframable(r));
+        let mut dead_lettered: Vec<(Payload, String)> = unframable
+            .into_iter()
+            .map(|r| {
+                (
+                    r,
+                    "record contains an embedded newline; cannot be NDJSON-framed \
+                     (use sink_http_batch=none for newline-bearing payloads)"
+                        .to_string(),
+                )
+            })
+            .collect();
+        if !dead_lettered.is_empty() {
             warn!(
-                unframable,
-                batch = batch.len(),
-                "NDJSON sink: {unframable} record(s) contain an embedded newline and will \
-                 corrupt batch framing — use per-record mode (sink_http_batch=none) for \
-                 payloads that may contain newlines"
+                count = dead_lettered.len(),
+                "NDJSON sink: dead-lettering record(s) with an embedded newline that can't be \
+                 framed; use per-record mode (sink_http_batch=none) for newline-bearing payloads"
             );
         }
-        // Join records with '\n' (each record terminated by a newline).
-        let total: usize = batch.iter().map(|r| r.len() + 1).sum();
+        if framable.is_empty() {
+            return Ok(CommitResult::new(vec![], dead_lettered));
+        }
+
+        // Join the framable records with '\n' (each record terminated by a newline).
+        let total: usize = framable.iter().map(|r| r.len() + 1).sum();
         let mut body = Vec::with_capacity(total);
-        for r in &batch {
+        for r in &framable {
             body.extend_from_slice(r.as_ref());
             body.push(b'\n');
         }
 
         match self.post_batch(body).await {
-            Ok(()) => Ok(CommitResult::new(batch, vec![])),
+            Ok(()) => Ok(CommitResult::new(framable, dead_lettered)),
             Err(HttpSinkError::PermanentStatus {
                 status,
                 body_excerpt,
@@ -528,14 +541,16 @@ impl HttpSink {
                 warn!(
                     status = %status,
                     body = %body_excerpt,
-                    count = batch.len(),
+                    count = framable.len(),
                     "NDJSON batch permanently rejected by HTTP sink; dead-lettering the whole batch"
                 );
                 let reason = format!("http {status} (ndjson batch): {body_excerpt}");
-                let dead = batch.into_iter().map(|r| (r, reason.clone())).collect();
-                Ok(CommitResult::new(vec![], dead))
+                dead_lettered.extend(framable.into_iter().map(|r| (r, reason.clone())));
+                Ok(CommitResult::new(vec![], dead_lettered))
             }
-            // Transient (or transport): retry the whole segment.
+            // Transient (or transport): retry the whole segment. The unframable
+            // records re-partition identically on the retry and are dead-lettered
+            // once the framable POST eventually succeeds.
             Err(e) => Err(e),
         }
     }
@@ -1304,32 +1319,50 @@ mod tests {
     }
 
     #[test]
-    fn count_unframable_records_flags_embedded_newlines() {
+    fn record_is_unframable_flags_embedded_newlines() {
         // Records with \n or \r corrupt NDJSON framing; clean records don't.
-        let batch = vec![
-            p(b"clean"),
-            p(b"has\nnewline"),
-            p(b"has\rcarriage"),
-            p(b"also-clean"),
-        ];
-        assert_eq!(count_unframable_records(&batch), 2);
-        assert_eq!(count_unframable_records(&[p(b"a"), p(b"b")]), 0);
-        assert_eq!(count_unframable_records(&[]), 0);
+        assert!(record_is_unframable(&p(b"has\nnewline")));
+        assert!(record_is_unframable(&p(b"has\rcarriage")));
+        assert!(!record_is_unframable(&p(b"clean")));
+        assert!(!record_is_unframable(&p(b"")));
     }
 
     #[tokio::test]
-    async fn ndjson_still_commits_records_with_embedded_newlines() {
-        // The guard only warns — embedded-newline records are still sent (the
-        // caller already accepted them durable). Behaviour is unchanged; the
-        // warning is the operator-visible signal.
+    async fn ndjson_dead_letters_records_with_embedded_newlines() {
+        // Unframable records (embedded \n) are dead-lettered, not sent — only the
+        // clean records go in the POST. Partition invariant: committed +
+        // dead_lettered covers the whole batch.
         let (url, counter) =
             spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
-        let batch = vec![p(b"clean"), p(b"line1\nline2")];
-        let result = sink.commit(batch.clone()).await.unwrap();
-        assert_eq!(result.committed, batch);
+        let result = sink
+            .commit(vec![p(b"clean"), p(b"line1\nline2"), p(b"also-clean")])
+            .await
+            .unwrap();
+        assert_eq!(result.committed, vec![p(b"clean"), p(b"also-clean")]);
+        assert_eq!(result.dead_lettered.len(), 1);
+        assert_eq!(result.dead_lettered[0].0, p(b"line1\nline2"));
+        assert!(
+            result.dead_lettered[0].1.contains("embedded newline"),
+            "reason: {}",
+            result.dead_lettered[0].1
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "one POST of the framable records");
+    }
+
+    #[tokio::test]
+    async fn ndjson_all_unframable_makes_no_request() {
+        // If every record is unframable, there's nothing to POST — all go to
+        // dead-letter and the endpoint is never hit.
+        let (url, counter) =
+            spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let result = sink.commit(vec![p(b"a\nb"), p(b"c\rd")]).await.unwrap();
+        assert!(result.committed.is_empty());
+        assert_eq!(result.dead_lettered.len(), 2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
