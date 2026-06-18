@@ -2061,9 +2061,11 @@ mod tests {
             1,
             "recovery must re-queue the stranded segment (weir_drain_segments_resumed_total)"
         );
-        assert!(
-            records_committed(&metrics) >= 1,
-            "resumed segment must be delivered to the sink"
+        assert_eq!(
+            records_committed(&metrics),
+            1,
+            "resumed segment must be delivered to the sink EXACTLY once \
+             (>= 1 would miss a double-delivery of the re-queued segment)"
         );
         assert!(
             get_confirmed_path(&sealed).exists(),

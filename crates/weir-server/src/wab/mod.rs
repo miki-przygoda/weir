@@ -999,6 +999,74 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// Directly exercises `scan_unconfirmed_sealed` on the `shard_count = None`
+    /// path — the entry point the 4a sink-recovery rescan
+    /// (`drain::probe_and_resume_stranded`) uses. That path is otherwise only
+    /// covered indirectly (the drain resume test queues a *single* segment, and
+    /// the replay tests always pass `Some(count)`), so the cross-shard ordering
+    /// and confirmed-skip behaviour of the recovery scan itself is untested.
+    ///
+    /// Asserts the contract the rescan relies on: every sealed-but-unconfirmed
+    /// segment across ALL shard dirs is returned in deterministic ascending
+    /// order, already-confirmed segments are skipped, and `None` neither filters
+    /// dirs by index nor warns (it must still scan dirs a `Some` count would flag
+    /// as "beyond configured count" — recovery must not strand them).
+    #[test]
+    fn scan_unconfirmed_sealed_none_count_returns_all_shards_ordered_skipping_confirmed() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        let dir = tmp_dir("scan_none_recovery");
+
+        // shard_00: two unconfirmed sealed segments (counters 1 and 2).
+        let sd0 = shard_dir_path(&dir, 0);
+        fs::create_dir_all(&sd0).unwrap();
+        let s0_1 = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 1), 0).unwrap();
+            s.write_record(b"a").unwrap();
+            s.seal().unwrap()
+        };
+        let s0_2 = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 2), 0).unwrap();
+            s.write_record(b"b").unwrap();
+            s.seal().unwrap()
+        };
+
+        // shard_01: one CONFIRMED (must be skipped) + one unconfirmed sealed.
+        let sd1 = shard_dir_path(&dir, 1);
+        fs::create_dir_all(&sd1).unwrap();
+        let s1_confirmed = {
+            let mut s = WabSegment::create(&segment_path(&sd1, 1), 1).unwrap();
+            s.write_record(b"done").unwrap();
+            s.seal().unwrap()
+        };
+        fs::write(confirmed_path_for(&s1_confirmed), build_confirmed(1, 1, 1)).unwrap();
+        let s1_2 = {
+            let mut s = WabSegment::create(&segment_path(&sd1, 2), 1).unwrap();
+            s.write_record(b"c").unwrap();
+            s.seal().unwrap()
+        };
+
+        // shard_05: an "orphaned" dir whose index would be >= a small configured count.
+        let sd5 = shard_dir_path(&dir, 5);
+        fs::create_dir_all(&sd5).unwrap();
+        let s5_1 = {
+            let mut s = WabSegment::create(&segment_path(&sd5, 1), 5).unwrap();
+            s.write_record(b"orphan").unwrap();
+            s.seal().unwrap()
+        };
+
+        let got = scan_unconfirmed_sealed(&dir, None).unwrap();
+        assert!(
+            !got.contains(&s1_confirmed),
+            "the confirmed segment must be skipped by the recovery scan: {got:?}"
+        );
+        assert_eq!(
+            got,
+            vec![s0_1, s0_2, s1_2, s5_1],
+            "all unconfirmed sealed segments across every shard dir, ascending"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
     /// Coverage gap (T08): a corrupt/forged per-record length field exceeding
     /// MAX_PAYLOAD_HARD_CAP must be rejected with InvalidData BEFORE any
     /// allocation — the disk-read DoS bound. Existing reader tests cover CRC
