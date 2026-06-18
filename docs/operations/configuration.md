@@ -731,6 +731,41 @@ rate-limit aggressively or can't handle concurrent connections.
 
 ---
 
+#### `sink_max_retries`
+
+- **Type**: u32
+- **Default**: `3`
+- **Range**: 0–100
+- **CLI**: `--sink-max-retries <n>`
+- **Env**: `WEIR_SINK_MAX_RETRIES`
+- **TOML**: `sink_max_retries`
+
+How many times the drain retries a segment on a **transient** sink error
+(with exponential backoff seeded by `sink_retry_base_delay_ms`) before it
+gives up and **strands** the segment on disk. A stranded segment is durable
+(no data loss) but undelivered; it is re-drained automatically when the sink
+health recovers, or on the next daemon restart. `0` strands on the first
+transient failure. Increments `weir_drain_segments_stranded_total` on strand.
+
+**When to tune**: raise it to ride out longer downstream outages without
+stranding (each extra retry waits up to the backoff cap of 5 minutes); lower
+it if you'd rather strand quickly and rely on the recovery rescan / restart.
+
+#### `sink_retry_base_delay_ms`
+
+- **Type**: u64 (milliseconds)
+- **Default**: `100`
+- **Range**: 1–60000
+- **CLI**: `--sink-retry-base-delay-ms <n>`
+- **Env**: `WEIR_SINK_RETRY_BASE_DELAY_MS`
+- **TOML**: `sink_retry_base_delay_ms`
+
+The first transient-retry backoff delay; it doubles on each subsequent retry
+(capped at 5 minutes), and a downstream `Retry-After` header overrides it when
+present. With the defaults the retry delays are 100 ms → 200 ms → 400 ms.
+
+---
+
 #### `WEIR_SINK_BEARER_TOKEN` (env-only)
 
 - **Type**: string

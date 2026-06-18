@@ -212,6 +212,8 @@ pub(crate) struct PartialConfig {
     pub sink_max_batch_size: Option<usize>,
     pub sink_send_idempotency_key: Option<bool>,
     pub sink_http_concurrency: Option<usize>,
+    pub sink_max_retries: Option<u32>,
+    pub sink_retry_base_delay_ms: Option<u64>,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: Option<String>,
     #[cfg(feature = "mysql-sink")]
@@ -362,6 +364,11 @@ pub struct Config {
     /// Only consumed by the http-sink arm.
     #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
     pub sink_http_concurrency: usize,
+    /// Transient-retry attempts per segment before it is stranded on disk
+    /// (left for the recovery rescan / restart to re-drain).
+    pub sink_max_retries: u32,
+    /// Base (first) transient-retry backoff in milliseconds; doubles each retry.
+    pub sink_retry_base_delay_ms: u64,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: String,
     #[cfg(feature = "mysql-sink")]
@@ -614,6 +621,13 @@ impl Config {
         // overlap, collapsing a segment's serial RTT cost. Default 8.
         let sink_http_concurrency = merge!(sink_http_concurrency).unwrap_or(8);
         check_range("sink_http_concurrency", sink_http_concurrency, 1, 1024)?;
+        // Transient-retry budget per segment before it is stranded (left on disk,
+        // re-drained when the sink recovers or on restart). 0 = strand on the
+        // first transient failure. Default 3.
+        let sink_max_retries = merge!(sink_max_retries).unwrap_or(crate::drain::MAX_RETRIES);
+        check_range("sink_max_retries", sink_max_retries, 0, 100)?;
+        let sink_retry_base_delay_ms = merge!(sink_retry_base_delay_ms).unwrap_or(100);
+        check_range("sink_retry_base_delay_ms", sink_retry_base_delay_ms, 1, 60_000)?;
 
         // MySQL sink: identifier validation happens inside MySqlSink::new at
         // startup (strict [A-Za-z_][A-Za-z0-9_]{0,63} rule, single source of
@@ -758,6 +772,8 @@ impl Config {
             sink_max_batch_size,
             sink_send_idempotency_key,
             sink_http_concurrency,
+            sink_max_retries,
+            sink_retry_base_delay_ms,
             #[cfg(feature = "mysql-sink")]
             sink_mysql_table,
             #[cfg(feature = "mysql-sink")]
@@ -942,6 +958,8 @@ mod tests {
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
         assert_eq!(c.sink_http_concurrency, 8);
+        assert_eq!(c.sink_max_retries, 3);
+        assert_eq!(c.sink_retry_base_delay_ms, 100);
         #[cfg(feature = "mysql-sink")]
         assert_eq!(c.sink_mysql_table, "weir_records");
         #[cfg(feature = "mysql-sink")]

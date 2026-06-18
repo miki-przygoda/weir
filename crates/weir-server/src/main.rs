@@ -41,7 +41,7 @@ use std::{
 use tracing::{info, warn};
 
 use config::{Config, SinkType};
-use drain::{DrainConfig, MAX_RETRIES};
+use drain::DrainConfig;
 use models::WorkUnit;
 #[cfg(feature = "clickhouse-sink")]
 use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
@@ -305,8 +305,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wab_dir: config.wab_dir.clone(),
         dead_letter_max_bytes: config.dead_letter_max_bytes,
         dead_letter_check_interval: Duration::from_secs(config.dead_letter_check_interval_secs),
-        base_retry_delay: Duration::from_millis(100),
-        max_retries: MAX_RETRIES,
+        base_retry_delay: Duration::from_millis(config.sink_retry_base_delay_ms),
+        max_retries: config.sink_max_retries,
         // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
         // sink hangs without honouring its internal timeout.
         commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
