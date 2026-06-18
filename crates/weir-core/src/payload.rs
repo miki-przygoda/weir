@@ -101,6 +101,22 @@ impl From<&[u8]> for Payload {
     }
 }
 
+impl From<&str> for Payload {
+    /// Copies the string's UTF-8 bytes into a new payload. Convenience for the
+    /// common case of pushing text records (`Payload::from("hello")`).
+    fn from(s: &str) -> Self {
+        Payload(Bytes::copy_from_slice(s.as_bytes()))
+    }
+}
+
+impl From<String> for Payload {
+    /// Takes ownership of the string's buffer with no copy (`String` → `Vec<u8>`
+    /// → `Bytes` is a move).
+    fn from(s: String) -> Self {
+        Payload(Bytes::from(s.into_bytes()))
+    }
+}
+
 impl PartialEq<[u8]> for Payload {
     fn eq(&self, other: &[u8]) -> bool {
         self.0.as_ref() == other
@@ -150,6 +166,12 @@ mod tests {
         assert_eq!(&p[..], b"hello");
         assert_eq!(p.len(), 5);
         assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn from_str_and_string_carry_utf8_bytes() {
+        assert_eq!(&Payload::from("héllo")[..], "héllo".as_bytes());
+        assert_eq!(&Payload::from(String::from("world"))[..], b"world");
     }
 
     #[test]

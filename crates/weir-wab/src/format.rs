@@ -201,6 +201,8 @@ impl std::fmt::Display for ConfirmedParseError {
     }
 }
 
+impl std::error::Error for ConfirmedParseError {}
+
 /// Parses a `.confirmed` file's byte content.
 /// Returns `Ok(ConfirmedMeta)` only when magic, version, and CRC all pass.
 pub fn parse_confirmed(buf: &[u8]) -> Result<ConfirmedMeta, ConfirmedParseError> {

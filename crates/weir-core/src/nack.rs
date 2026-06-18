@@ -42,6 +42,35 @@ pub enum NackReason {
     ReservedFlagsSet = 0x09,
 }
 
+impl From<NackReason> for u8 {
+    /// The wire byte for this reason. Inverse of [`NackReason::try_from`].
+    fn from(reason: NackReason) -> u8 {
+        reason as u8
+    }
+}
+
+impl std::fmt::Display for NackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            NackReason::BadMagic => "bad frame magic",
+            NackReason::VersionMismatch => "wire protocol version mismatch",
+            NackReason::BadHeaderCrc => "header CRC mismatch",
+            NackReason::PayloadTooLarge => "payload exceeds the daemon's cap",
+            NackReason::BadPayloadCrc => "payload CRC mismatch",
+            NackReason::InternalError => "daemon internal error (transient)",
+            NackReason::EmptyPayload => "empty payload (not representable)",
+            NackReason::UnknownMessage => "unknown message type or durability byte",
+            NackReason::ReservedFlagsSet => "reserved flags byte was non-zero",
+        };
+        write!(f, "{msg}")
+    }
+}
+
+// A Nack reason is a legitimate error a producer can propagate, so it implements
+// the std error trait (Display + Debug are both present). Lets callers do
+// `Box<dyn Error>`/`?` with a `NackReason` directly.
+impl std::error::Error for NackReason {}
+
 /// Error returned when a `u8` does not map to a known `NackReason` variant.
 /// Preserves the raw byte so the client can log or display it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +143,17 @@ mod tests {
             NackReason::try_from(0x09).unwrap(),
             NackReason::ReservedFlagsSet
         );
+    }
+
+    #[test]
+    fn from_for_u8_is_inverse_of_try_from_and_display_is_nonempty() {
+        for byte in 0x01u8..=0x09 {
+            let r = NackReason::try_from(byte).unwrap();
+            assert_eq!(u8::from(r), byte);
+            assert!(!r.to_string().is_empty());
+        }
+        // Usable as a std error.
+        let _: &dyn std::error::Error = &NackReason::BadMagic;
     }
 
     #[test]

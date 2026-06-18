@@ -14,6 +14,24 @@ pub enum Durability {
     Buffered = 0x03,
 }
 
+impl From<Durability> for u8 {
+    /// The wire byte for this tier. Inverse of [`Durability::try_from`].
+    fn from(d: Durability) -> u8 {
+        d as u8
+    }
+}
+
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Durability::Sync => "sync",
+            Durability::Batched => "batched",
+            Durability::Buffered => "buffered",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// Error returned when a `u8` does not map to a known `Durability` variant.
 /// Preserves the raw byte for logging by the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +67,15 @@ mod tests {
         assert_eq!(Durability::try_from(0x01).unwrap(), Durability::Sync);
         assert_eq!(Durability::try_from(0x02).unwrap(), Durability::Batched);
         assert_eq!(Durability::try_from(0x03).unwrap(), Durability::Buffered);
+    }
+
+    #[test]
+    fn from_for_u8_round_trips_and_display() {
+        for d in [Durability::Sync, Durability::Batched, Durability::Buffered] {
+            assert_eq!(Durability::try_from(u8::from(d)).unwrap(), d);
+        }
+        assert_eq!(Durability::Sync.to_string(), "sync");
+        assert_eq!(Durability::Buffered.to_string(), "buffered");
     }
 
     #[test]

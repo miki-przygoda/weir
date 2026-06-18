@@ -127,6 +127,57 @@ pub trait SinkError: Send + Sync + std::error::Error + 'static {
     }
 }
 
+/// [`SinkError`] for a sink whose `commit` can never fail: use
+/// `type Error = std::convert::Infallible` instead of hand-rolling a never-type.
+/// `is_transient` is unreachable (an `Infallible` value cannot exist).
+impl SinkError for std::convert::Infallible {
+    fn is_transient(&self) -> bool {
+        match *self {}
+    }
+}
+
+/// A ready-made [`SinkError`] for sinks that don't need a bespoke error type —
+/// a message plus a transient/permanent classification. Construct it with
+/// [`BasicSinkError::transient`] (the drain retries the segment) or
+/// [`BasicSinkError::permanent`] (the records are dead-lettered).
+#[derive(Debug, Clone)]
+pub struct BasicSinkError {
+    message: String,
+    transient: bool,
+}
+
+impl BasicSinkError {
+    /// A transient failure — the drain retries the whole segment with backoff.
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: true,
+        }
+    }
+
+    /// A permanent failure — the affected records are dead-lettered.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+        }
+    }
+}
+
+impl std::fmt::Display for BasicSinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BasicSinkError {}
+
+impl SinkError for BasicSinkError {
+    fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
 /// The result of a successful [`Sink::commit`].
 ///
 /// Build one with [`CommitResult::new`]. The fields are public for reading, but
@@ -290,6 +341,18 @@ mod tests {
         assert_eq!(&result.dead_lettered[0].0[..], b"reject");
         assert_eq!(sink.committed.load(Ordering::Relaxed), 2);
         assert!(matches!(block_on(sink.health()), SinkHealth::Healthy));
+    }
+
+    #[test]
+    fn basic_sink_error_classifies_and_displays() {
+        let t = BasicSinkError::transient("503 from upstream");
+        assert!(t.is_transient());
+        assert_eq!(t.to_string(), "503 from upstream");
+        let p = BasicSinkError::permanent("400 bad request");
+        assert!(!p.is_transient());
+        // Usable as a SinkError trait object / std error.
+        let _: &dyn SinkError = &p;
+        let _: &dyn std::error::Error = &p;
     }
 
     #[test]
