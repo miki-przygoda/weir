@@ -22,8 +22,10 @@ wab_dir = "/var/lib/weir/wab"
 shard_count = 1
 
 # Number of worker threads (route queue items to per-shard batches). Range: 1-64.
+# Defaults to shard_count (one worker per shard). Do NOT set it higher than
+# shard_count — extra workers just sit idle. Shown here matching shard_count = 1.
 # Env: WEIR_WORKER_COUNT
-worker_count = 2
+worker_count = 1
 
 # Maximum records per flush batch. Range: 1-100000.
 # Default 256 is the sweet spot from docs/benchmarks/batch-tuning.md.
@@ -34,6 +36,13 @@ batch_size = 256
 # Default 1 minimises tail latency; raise for pure-throughput workloads.
 # Env: WEIR_BATCH_DEADLINE_MS
 batch_deadline_ms = 1
+
+# Size at which an active WAB segment is sealed and handed to the drain.
+# Range: 4096 - 4 GiB. Default 256 MiB. NOTE: records only drain once their
+# segment seals (or on graceful shutdown), so low-volume deployments should
+# LOWER this (e.g. a few MiB) for timely delivery instead of waiting to fill
+# 256 MiB. Env: WEIR_WAB_SEGMENT_MAX_BYTES
+wab_segment_max_bytes = 268435456
 
 # Refuse any connection whose peer effective uid does not match the daemon's
 # (SO_PEERCRED / getpeereid). Fail-closed; the application-level access control
@@ -66,6 +75,10 @@ metrics_port = 9185
 # Env: WEIR_METRICS_BIND
 metrics_bind = "127.0.0.1"
 
+# Maximum concurrent connections to the /metrics endpoint. Range: 1-1024.
+# Env: WEIR_METRICS_MAX_CONNECTIONS
+metrics_max_connections = 8
+
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.
 # Set <= the orchestrator's terminationGracePeriodSeconds minus a few seconds.
@@ -87,8 +100,12 @@ dead_letter_check_interval_secs = 30
 # ── Sink selection ────────────────────────────────────────────────────────────
 
 # Which built-in sink to run. One of:
-#   "noop"  — accepts records, forwards nothing (default, useful for soak tests)
-#   "http"  — POSTs each record to sink_url (set sink_url below)
+#   "noop"       — accepts records, forwards nothing (default, useful for soak tests)
+#   "http"       — POSTs records to sink_url               (build feature: http-sink)
+#   "mysql"      — multi-row INSERT into sink_url           (build feature: mysql-sink)
+#   "postgres"   — multi-row INSERT … ON CONFLICT DO NOTHING (build feature: postgres-sink)
+#   "clickhouse" — HTTP INSERT … FORMAT RowBinary           (build feature: clickhouse-sink)
+# A sink type whose feature wasn't compiled in is rejected at startup.
 # Env: WEIR_SINK_TYPE
 sink_type = "noop"
 
@@ -121,6 +138,22 @@ sink_send_idempotency_key = true
 # requires records with no embedded newlines. Env: WEIR_SINK_HTTP_BATCH
 sink_http_batch = "none"
 
+# Max per-record HTTP POSTs kept in flight per commit batch (per-record mode
+# only — inert with sink_http_batch = "ndjson"). Range: 1-1024. Raise for
+# high-RTT endpoints; lower (or 1) for endpoints that rate-limit aggressively.
+# Env: WEIR_SINK_HTTP_CONCURRENCY
+sink_http_concurrency = 8
+
+# Transient-retry budget per segment before it is stranded on disk (then
+# re-drained automatically when the sink recovers, or on restart). Range: 0-100.
+# Env: WEIR_SINK_MAX_RETRIES
+sink_max_retries = 3
+
+# First transient-retry backoff in ms; doubles each retry (capped at 5 min).
+# A downstream Retry-After header overrides it. Range: 1-60000.
+# Env: WEIR_SINK_RETRY_BASE_DELAY_MS
+sink_retry_base_delay_ms = 100
+
 # Bearer token for the HTTP sink. NEVER set this in the config file —
 # it must come from the environment so it doesn't end up in version control,
 # logs, or container image layers.
@@ -128,5 +161,5 @@ sink_http_batch = "none"
 
 # Log level for tracing-subscriber. One of: trace, debug, info, warn, error,
 # or any EnvFilter directive (e.g. "weir_server=debug,info").
-# Env: WEIR_LOG_LEVEL (RUST_LOG also recognised as a fallback)
+# Env: WEIR_LOG_LEVEL
 log_level = "info"

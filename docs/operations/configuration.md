@@ -667,14 +667,21 @@ that legitimately take seconds (some logging ingesters do).
 - **Env**: `WEIR_SINK_MAX_BATCH_SIZE`
 - **TOML**: `sink_max_batch_size`
 
-Maximum records the drain hands to a single `Sink::commit` call. The
-HTTP sink sends one POST per record inside `commit` (up to
-`sink_http_concurrency` in flight), so this also caps the longest run
-of POSTs before the drain re-checks its shutdown signal and
-dead-letter state.
+Maximum records the drain hands to a single `Sink::commit` call. Its effect
+depends on the HTTP framing mode (`sink_http_batch`):
 
-**When to tune**: lower for endpoints that prefer many small calls; the
-default 100 is a balanced point for most deployments.
+- **per-record** (`none`, default): the sink sends one POST per record (up to
+  `sink_http_concurrency` in flight), so this caps the longest run of POSTs
+  before the drain re-checks its shutdown signal and dead-letter state.
+- **ndjson**: this **is** the number of records packed into each single
+  newline-delimited POST. Raise it (toward 1000–10000) for high-throughput
+  log/trace shipping, where larger batches amortise the per-POST overhead.
+
+For the SQL sinks it is the number of rows per multi-row `INSERT`.
+
+**When to tune**: lower for endpoints that prefer many small calls; raise it for
+ndjson/SQL bulk throughput. The default 100 is a balanced point for most
+deployments.
 
 > **Keep this stable for dedup-by-batch sinks (ClickHouse).** The ClickHouse
 > sink's `insert_deduplication_token` is a hash of the **per-`commit` batch**.
@@ -712,6 +719,18 @@ breaking parsers.
 **When to disable**: only if the endpoint can't tolerate the extra
 header (strict CORS, header allow-lists). In that case the endpoint
 must implement its own dedup — usually by hashing the body server-side.
+
+> ⚠ **Content-collision caveat.** The key is `sha256(payload)` — a function of
+> the payload bytes *only*, with no per-record identity. So two **legitimately
+> distinct** records that happen to have byte-identical payloads (heartbeats,
+> repeated `OK`/empty bodies, identical log lines, repeated metric samples)
+> produce the **same** key. An endpoint that dedupes on the key will accept the
+> first and drop the rest — silently collapsing at-least-once into at-most-once
+> for duplicate-payload workloads. This is safe only when payloads are unique or
+> already carry their own dedup id. If your workload has repeating payloads,
+> either set `sink_send_idempotency_key = false` (and let the endpoint dedupe on
+> its own record id), or ensure each record embeds a unique field. (A future
+> per-record dedup token is parked for a WAB-format revision.)
 
 ---
 
@@ -1107,9 +1126,12 @@ SETTINGS non_replicated_deduplication_window = 100;
   `tracing-subscriber::EnvFilter` directive (e.g.
   `"weir_server=debug,info"` to set per-module levels).
 - **CLI**: `--log-level <level>`
-- **Env**: `WEIR_LOG_LEVEL` (also `RUST_LOG`, which `EnvFilter` reads
-  natively as a fallback)
+- **Env**: `WEIR_LOG_LEVEL`
 - **TOML**: `log_level`
+
+> Note: `RUST_LOG` is **not** consulted — the subscriber's `EnvFilter` is built
+> only from the resolved `log_level` (CLI > `WEIR_LOG_LEVEL` > TOML > `info`).
+> Set the level through one of those, not `RUST_LOG`.
 
 The `tracing-subscriber` `EnvFilter` directive used to initialise the
 logging subscriber.

@@ -64,9 +64,11 @@ cargo build --release -p weir-server
 sudo install -m 0755 target/release/weir-server /usr/local/bin/
 ```
 
-Restart the daemon. Updates are not hot — the daemon does not support
-SIGHUP-driven reload. Plan for a graceful restart window (default 30
-s, see `shutdown_timeout_secs`).
+Restart the daemon to pick up a new binary or any config change. The only
+hot-reload is `SIGHUP`, which reloads **TLS cert/key/CA only** (and only on
+builds with the `tls` feature) — see `docs/operations/configuration.md`. Every
+other setting requires a restart, so plan for a graceful restart window (default
+30 s, see `shutdown_timeout_secs`).
 
 ### Building other crates
 

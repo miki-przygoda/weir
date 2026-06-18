@@ -194,8 +194,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 ### Ingest
 | Metric | Type | Meaning |
 |---|---|---|
-| `weir_records_accepted_total{tier}` | counter | Records accepted, by durability tier (`sync`/`batched`/`buffered`). |
-| `weir_records_ack_total` | counter | Records acked durable to the producer. |
+| `weir_records_accepted_total{tier}` | counter | Records admitted for processing, by durability tier (`sync`/`batched`/`buffered`). |
+| `weir_records_ack_total` | counter | Records durably acked to the producer. The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
 | `weir_records_nack_total` | counter | Records Nacked (not durably accepted). Should be ~0. |
 | `weir_accept_latency_seconds` | histogram | Socket-accept → enqueue latency (independent of fsync). |
 | `weir_queue_depth` | gauge | In-flight records between the socket layer and workers. |

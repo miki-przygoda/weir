@@ -16,7 +16,7 @@
 //! [`Payload`] and the payload size cap) and `crc32fast`. It does no async I/O,
 //! pulls in no runtime, and is safe for a slim CLI to depend on.
 //!
-//! See [`format`] for the on-disk byte layout.
+//! See [`mod@format`] for the on-disk byte layout.
 
 pub mod format;
 

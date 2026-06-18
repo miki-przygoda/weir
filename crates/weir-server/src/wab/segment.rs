@@ -193,9 +193,12 @@ impl WabSegment {
 
     /// Calls the platform-appropriate sync operation on the segment file.
     ///
-    /// macOS: `F_BARRIERFSYNC` — writes data to persistent storage with a barrier,
-    /// guaranteeing ordering without waiting for all pending media writes. Faster than
-    /// `F_FULLFSYNC` and sufficient for WAB durability.
+    /// macOS: `F_BARRIERFSYNC` — orders this write ahead of later ones with a
+    /// barrier without waiting for the drive to flush its volatile cache. Faster
+    /// than `F_FULLFSYNC`; it guarantees ordering and survival of a process/OS
+    /// crash, but NOT a guaranteed media flush on sudden power loss (a drive with
+    /// a volatile write cache can still lose the most recent writes). Run
+    /// production data paths on Linux; see the durability note in the README.
     ///
     /// Linux: `fdatasync` — flushes data and critical metadata without waiting for
     /// directory entry updates.
