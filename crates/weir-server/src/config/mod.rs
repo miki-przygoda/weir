@@ -212,6 +212,7 @@ pub(crate) struct PartialConfig {
     pub sink_max_batch_size: Option<usize>,
     pub sink_send_idempotency_key: Option<bool>,
     pub sink_http_concurrency: Option<usize>,
+    pub sink_http_batch: Option<String>,
     pub sink_max_retries: Option<u32>,
     pub sink_retry_base_delay_ms: Option<u64>,
     #[cfg(feature = "mysql-sink")]
@@ -364,6 +365,12 @@ pub struct Config {
     /// Only consumed by the http-sink arm.
     #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
     pub sink_http_concurrency: usize,
+    /// HTTP request framing: `"none"` (per-record POSTs, default) or `"ndjson"`
+    /// (one newline-delimited POST per commit batch). Validated at load to one
+    /// of those two literals; mapped to `HttpBatchMode` in the http-sink arm.
+    /// Only consumed by the http-sink arm.
+    #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
+    pub sink_http_batch: String,
     /// Transient-retry attempts per segment before it is stranded on disk
     /// (left for the recovery rescan / restart to re-drain).
     pub sink_max_retries: u32,
@@ -621,6 +628,19 @@ impl Config {
         // overlap, collapsing a segment's serial RTT cost. Default 8.
         let sink_http_concurrency = merge!(sink_http_concurrency).unwrap_or(8);
         check_range("sink_http_concurrency", sink_http_concurrency, 1, 1024)?;
+        // HTTP request framing: "none" = one POST per record (default), "ndjson"
+        // = one newline-delimited POST per commit batch. Validated here (even when
+        // the http-sink feature is off) so a typo fails fast at load; the http-sink
+        // arm maps the literal to HttpBatchMode.
+        let sink_http_batch = merge!(sink_http_batch).unwrap_or_else(|| "none".to_string());
+        if !matches!(sink_http_batch.as_str(), "none" | "ndjson") {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_http_batch",
+                reason: format!(
+                    "sink_http_batch must be \"none\" or \"ndjson\", got {sink_http_batch:?}"
+                ),
+            });
+        }
         // Transient-retry budget per segment before it is stranded (left on disk,
         // re-drained when the sink recovers or on restart). 0 = strand on the
         // first transient failure. Default 3.
@@ -777,6 +797,7 @@ impl Config {
             sink_max_batch_size,
             sink_send_idempotency_key,
             sink_http_concurrency,
+            sink_http_batch,
             sink_max_retries,
             sink_retry_base_delay_ms,
             #[cfg(feature = "mysql-sink")]
@@ -963,6 +984,7 @@ mod tests {
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
         assert_eq!(c.sink_http_concurrency, 8);
+        assert_eq!(c.sink_http_batch, "none");
         assert_eq!(c.sink_max_retries, 3);
         assert_eq!(c.sink_retry_base_delay_ms, 100);
         #[cfg(feature = "mysql-sink")]
@@ -1348,6 +1370,44 @@ mod tests {
         assert!(msg.contains("http"), "{msg}");
         assert!(msg.contains("mysql"), "{msg}");
         assert!(msg.contains("postgres"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_sink_http_batch_rejected() {
+        // A typo'd framing mode must fail fast at load (validated regardless of
+        // which sink features are compiled in).
+        let dir = tmp_dir("bad_http_batch");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_http_batch: Some("jsonl".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sink_http_batch"), "{msg}");
+        assert!(msg.contains("ndjson"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sink_http_batch_ndjson_accepted() {
+        let dir = tmp_dir("ndjson_http_batch");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_http_batch: Some("ndjson".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.sink_http_batch, "ndjson");
         fs::remove_dir_all(dir).ok();
     }
 

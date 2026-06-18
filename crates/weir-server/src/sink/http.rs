@@ -1,12 +1,13 @@
-//! HTTP sink: POSTs each record as a `application/octet-stream` body to a
-//! configurable URL. Classifies HTTP/network failures into the
-//! transient/permanent buckets the drain expects.
+//! HTTP sink: POSTs records to a configurable URL, either one-per-record
+//! (default) or as one newline-delimited batch (`batch_mode = Ndjson`).
+//! Classifies HTTP/network failures into the transient/permanent buckets
+//! the drain expects.
 //!
-//! # Protocol
+//! # Protocol (default per-record mode)
 //!
 //! - One HTTP POST per record. The body is the raw payload bytes; no
 //!   serialisation, no encoding, no framing — endpoints decide what to do
-//!   with the bytes.
+//!   with the bytes. (See "Batch framing" below for the NDJSON mode.)
 //! - `Content-Type: application/octet-stream`.
 //! - `Idempotency-Key: sha256:<hex>` of the payload, unless explicitly
 //!   disabled via `send_idempotency_key = false`. The drain guarantees
@@ -33,12 +34,20 @@
 //! `SinkError::retry_after()`, which honours it as the next retry delay
 //! (capped at 5 minutes). The HTTP-date form is not parsed in v0.
 //!
-//! # Why one POST per record (for now)
+//! # Batch framing (`batch_mode`)
 //!
-//! Simple endpoint contract: any HTTP server that accepts a POST body
-//! works. No need to agree on a batch format. Tradeoff is N round-trips
-//! per batch; a future iteration could add a batched mode for endpoints
-//! that support it.
+//! - **`PerRecord`** (default): one POST per record. Simple endpoint
+//!   contract — any HTTP server that accepts a single-record POST body
+//!   works, no batch format to agree on, and per-record dead-lettering.
+//!   Tradeoff is N round-trips per batch (mitigated by `concurrency`).
+//! - **`Ndjson`**: the whole commit batch goes in ONE POST as
+//!   newline-delimited bodies (`application/x-ndjson`), with a single
+//!   per-batch `Idempotency-Key`. One round-trip per batch instead of N —
+//!   the framing log/trace ingesters (Loki, ES `_bulk`) expect. The
+//!   endpoint returns one status, so the result is all-or-nothing: a 2xx
+//!   commits the batch, a permanent 4xx dead-letters the whole batch, and
+//!   a transient error retries the whole segment. Records must contain no
+//!   embedded newlines.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +59,20 @@ use weir_core::Payload;
 
 use super::{CommitResult, Sink, SinkError, SinkHealth};
 
+/// How the HTTP sink frames a commit batch into HTTP requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpBatchMode {
+    /// One POST per record (default): per-record `Idempotency-Key`, per-record
+    /// dead-lettering, up to `concurrency` POSTs in flight.
+    #[default]
+    PerRecord,
+    /// One POST per commit batch: newline-delimited (NDJSON) record bodies, a
+    /// single per-batch `Idempotency-Key`, and whole-batch commit/retry/
+    /// dead-letter (the endpoint returns one status, so there is no per-record
+    /// granularity). Records must contain no embedded newlines.
+    Ndjson,
+}
+
 /// Configuration for `HttpSink`.
 ///
 /// `bearer_token` is deliberately omitted from the `Debug` impl so it never
@@ -59,6 +82,8 @@ pub struct HttpSinkConfig {
     pub url: String,
     pub timeout: Duration,
     pub max_batch_size: usize,
+    /// Request framing: per-record POSTs (default) or one NDJSON POST per batch.
+    pub batch_mode: HttpBatchMode,
     /// Optional bearer token. Read from env at startup (`WEIR_SINK_BEARER_TOKEN`);
     /// never sourced from the config file. Wrapped in `Arc` so the value can be
     /// shared without copying.
@@ -83,6 +108,7 @@ impl std::fmt::Debug for HttpSinkConfig {
             .field("url", &crate::sink::redact_url_password(&self.url))
             .field("timeout", &self.timeout)
             .field("max_batch_size", &self.max_batch_size)
+            .field("batch_mode", &self.batch_mode)
             .field(
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
@@ -135,24 +161,47 @@ impl HttpSink {
         Ok(Self { config, client })
     }
 
-    async fn post_record(&self, payload: Payload) -> Result<(), HttpSinkError> {
-        let mut req = self
-            .client
-            .post(&self.config.url)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
-
-        if self.config.send_idempotency_key {
-            req = req.header("Idempotency-Key", payload_idempotency_key(&payload));
-        }
-
+    /// A POST request builder for `sink_url` carrying the bearer token (if any).
+    /// Callers add the Content-Type, Idempotency-Key, and body.
+    fn base_request(&self) -> reqwest::RequestBuilder {
+        let mut req = self.client.post(&self.config.url);
         if let Some(token) = &self.config.bearer_token {
             req = req.bearer_auth(token.as_ref());
         }
+        req
+    }
 
+    /// Per-record POST (the default mode): one record per request, with the
+    /// record's own Idempotency-Key.
+    async fn post_record(&self, payload: Payload) -> Result<(), HttpSinkError> {
+        let mut req = self
+            .base_request()
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+        if self.config.send_idempotency_key {
+            req = req.header("Idempotency-Key", payload_idempotency_key(&payload));
+        }
         // No-copy: reqwest::Body implements From<bytes::Bytes> — the payload's
         // inner Bytes is handed to reqwest without any allocation or memcopy.
-        let req = req.body(payload.into_bytes());
+        self.send_and_classify(req.body(payload.into_bytes())).await
+    }
 
+    /// Single POST of a whole batch as newline-delimited (NDJSON) bodies, with
+    /// one per-batch Idempotency-Key (sha256 of the joined body). The endpoint
+    /// returns one status for the whole batch, so the result is all-or-nothing.
+    async fn post_batch(&self, body: Vec<u8>) -> Result<(), HttpSinkError> {
+        let mut req = self
+            .base_request()
+            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson");
+        if self.config.send_idempotency_key {
+            req = req.header("Idempotency-Key", payload_idempotency_key(&body));
+        }
+        self.send_and_classify(req.body(body)).await
+    }
+
+    /// Sends a prepared request and classifies the response into the
+    /// committed / transient / permanent buckets the drain expects. Shared by
+    /// the per-record and NDJSON-batch paths.
+    async fn send_and_classify(&self, req: reqwest::RequestBuilder) -> Result<(), HttpSinkError> {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -353,16 +402,37 @@ impl Sink for HttpSink {
     type Error = HttpSinkError;
 
     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, HttpSinkError> {
+        match self.config.batch_mode {
+            HttpBatchMode::PerRecord => self.commit_per_record(batch).await,
+            HttpBatchMode::Ndjson => self.commit_ndjson(batch).await,
+        }
+    }
+
+    fn max_batch_size(&self) -> usize {
+        self.config.max_batch_size
+    }
+
+    async fn health(&self) -> SinkHealth {
+        self.probe_health().await
+    }
+}
+
+impl HttpSink {
+    /// Per-record commit: one POST per record, up to `concurrency` in flight.
+    async fn commit_per_record(
+        &self,
+        batch: Vec<Payload>,
+    ) -> Result<CommitResult<Payload>, HttpSinkError> {
         use futures_util::stream::StreamExt;
 
         let concurrency = self.config.concurrency.max(1);
 
-        // One POST per record (unchanged protocol + per-record Idempotency-Key
-        // + per-record dead-lettering), but up to `concurrency` in flight. The
-        // drain thread is single-threaded; these futures are async, so their
-        // network round-trips overlap — a 1000-record segment no longer pays
-        // 1000× the serial RTT. `buffered` (not `buffer_unordered`) keeps the
-        // results in batch order, so `committed` stays in submission order.
+        // One POST per record (per-record Idempotency-Key + per-record
+        // dead-lettering), but up to `concurrency` in flight. The drain thread is
+        // single-threaded; these futures are async, so their network round-trips
+        // overlap — a 1000-record segment no longer pays 1000× the serial RTT.
+        // `buffered` (not `buffer_unordered`) keeps the results in batch order, so
+        // `committed` stays in submission order.
         let stream = futures_util::stream::iter(batch)
             .map(|record| async move {
                 // Clone the Bytes handle (O(1) ref-bump) so we keep the record
@@ -403,11 +473,48 @@ impl Sink for HttpSink {
         Ok(CommitResult::new(committed, dead_lettered))
     }
 
-    fn max_batch_size(&self) -> usize {
-        self.config.max_batch_size
+    /// NDJSON-batch commit: the whole batch goes in ONE POST as newline-delimited
+    /// bodies, with a single per-batch Idempotency-Key. The endpoint returns one
+    /// status, so the result is all-or-nothing: 2xx commits the whole batch, a
+    /// permanent 4xx dead-letters the whole batch, and a transient error retries
+    /// the whole segment. Records must contain no embedded newlines.
+    async fn commit_ndjson(
+        &self,
+        batch: Vec<Payload>,
+    ) -> Result<CommitResult<Payload>, HttpSinkError> {
+        if batch.is_empty() {
+            return Ok(CommitResult::new(vec![], vec![]));
+        }
+        // Join records with '\n' (each record terminated by a newline).
+        let total: usize = batch.iter().map(|r| r.len() + 1).sum();
+        let mut body = Vec::with_capacity(total);
+        for r in &batch {
+            body.extend_from_slice(r.as_ref());
+            body.push(b'\n');
+        }
+
+        match self.post_batch(body).await {
+            Ok(()) => Ok(CommitResult::new(batch, vec![])),
+            Err(HttpSinkError::PermanentStatus {
+                status,
+                body_excerpt,
+            }) => {
+                warn!(
+                    status = %status,
+                    body = %body_excerpt,
+                    count = batch.len(),
+                    "NDJSON batch permanently rejected by HTTP sink; dead-lettering the whole batch"
+                );
+                let reason = format!("http {status} (ndjson batch): {body_excerpt}");
+                let dead = batch.into_iter().map(|r| (r, reason.clone())).collect();
+                Ok(CommitResult::new(vec![], dead))
+            }
+            // Transient (or transport): retry the whole segment.
+            Err(e) => Err(e),
+        }
     }
 
-    async fn health(&self) -> SinkHealth {
+    async fn probe_health(&self) -> SinkHealth {
         // Coarse health probe: HEAD the URL. This probe is UNAUTHENTICATED —
         // the bearer token is attached per-POST in commit(), not as a client
         // default — so a 401/403 here is an expected auth challenge from a
@@ -581,6 +688,7 @@ mod tests {
             url: url.to_string(),
             timeout: Duration::from_secs(5),
             max_batch_size: 100,
+            batch_mode: HttpBatchMode::PerRecord,
             bearer_token: None,
             send_idempotency_key: true,
             concurrency: 8,
@@ -1012,6 +1120,176 @@ mod tests {
             completed.load(Ordering::SeqCst),
             1,
             "stalled in-flight POSTs were not cancelled on the transient error"
+        );
+    }
+
+    // ── NDJSON batch-mode tests ───────────────────────────────────────────
+
+    fn ndjson_cfg(url: &str) -> HttpSinkConfig {
+        let mut c = cfg(url);
+        c.batch_mode = HttpBatchMode::Ndjson;
+        c
+    }
+
+    #[tokio::test]
+    async fn ndjson_commits_whole_batch_in_one_post() {
+        // The whole batch goes in ONE POST; a 2xx commits every record. The
+        // request counter proves it was a single round-trip, not N.
+        let (url, counter) =
+            spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let batch = vec![p(b"alpha"), p(b"beta"), p(b"gamma")];
+        let result = sink.commit(batch.clone()).await.unwrap();
+        assert_eq!(result.committed, batch);
+        assert!(result.dead_lettered.is_empty());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "NDJSON mode must POST the whole batch in a single request"
+        );
+    }
+
+    #[tokio::test]
+    async fn ndjson_dead_letters_whole_batch_on_4xx() {
+        // The endpoint returns one status for the batch; a permanent 4xx
+        // dead-letters every record (no per-record granularity in this mode).
+        let (url, _counter) = spawn_mock_server(vec![
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 8\r\n\r\nbad ndj!",
+        ])
+        .await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let batch = vec![p(b"alpha"), p(b"beta"), p(b"gamma")];
+        let result = sink.commit(batch).await.unwrap();
+        assert!(result.committed.is_empty());
+        assert_eq!(result.dead_lettered.len(), 3);
+        for (_, reason) in &result.dead_lettered {
+            assert!(reason.contains("400"), "reason: {reason}");
+            assert!(reason.contains("ndjson batch"), "reason: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ndjson_5xx_is_transient_for_whole_segment() {
+        // A transient status retries the whole segment — surfaced as Err.
+        let (url, _counter) = spawn_mock_server(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let err = sink
+            .commit(vec![p(b"alpha"), p(b"beta")])
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "503 must be transient: {err}");
+    }
+
+    #[tokio::test]
+    async fn ndjson_sends_newline_framed_body_and_one_idempotency_key() {
+        // Verify the wire format: records joined with '\n' (each terminated by
+        // one), Content-Type application/x-ndjson, and a SINGLE per-batch
+        // Idempotency-Key (sha256 of the joined body).
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let captured_task = Arc::clone(&captured);
+        let bodies_task = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = Arc::clone(&captured_task);
+                let bodies = Arc::clone(&bodies_task);
+                tokio::spawn(async move {
+                    // Read the header block first so we can capture it, then the body.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let header_end = loop {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = find_double_crlf(&buf) {
+                                    break pos;
+                                }
+                            }
+                        }
+                    };
+                    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length = parse_content_length(&header_str).unwrap_or(0);
+                    let mut body = buf[header_end + 4..].to_vec();
+                    while body.len() < content_length {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => body.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    body.truncate(content_length);
+                    captured.lock().unwrap().push(header_str);
+                    bodies.lock().unwrap().push(body);
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        sink.commit(vec![p(b"alpha"), p(b"beta"), p(b"gamma")])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(
+            headers.len(),
+            1,
+            "NDJSON mode must send exactly one request"
+        );
+        assert_eq!(bodies.len(), 1);
+        // Body: each record terminated by '\n'.
+        assert_eq!(bodies[0], b"alpha\nbeta\ngamma\n");
+        // Content-Type advertises NDJSON.
+        assert!(
+            headers[0]
+                .lines()
+                .any(|l| l.to_ascii_lowercase().starts_with("content-type:")
+                    && l.contains("application/x-ndjson")),
+            "missing/incorrect Content-Type:\n{}",
+            headers[0]
+        );
+        // Exactly one Idempotency-Key, computed over the joined body.
+        let expected_key = payload_idempotency_key(b"alpha\nbeta\ngamma\n");
+        let key_lines: Vec<&str> = headers[0]
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("idempotency-key:"))
+            .collect();
+        assert_eq!(key_lines.len(), 1, "expected exactly one Idempotency-Key");
+        assert!(
+            key_lines[0].contains(&expected_key),
+            "Idempotency-Key not over the joined body: {} (want {expected_key})",
+            key_lines[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn ndjson_empty_batch_makes_no_request() {
+        let (url, counter) =
+            spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let result = sink.commit(vec![]).await.unwrap();
+        assert!(result.committed.is_empty());
+        assert!(result.dead_lettered.is_empty());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "an empty batch must not hit the network"
         );
     }
 

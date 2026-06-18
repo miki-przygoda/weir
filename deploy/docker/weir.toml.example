@@ -114,6 +114,13 @@ sink_max_batch_size = 100
 # Env: WEIR_SINK_SEND_IDEMPOTENCY_KEY
 sink_send_idempotency_key = true
 
+# HTTP request framing. "none" (default) sends one POST per record;
+# "ndjson" sends the whole commit batch as one newline-delimited POST
+# (Content-Type application/x-ndjson) — the format Loki / ES _bulk expect.
+# NDJSON is all-or-nothing per batch (one status for the whole POST) and
+# requires records with no embedded newlines. Env: WEIR_SINK_HTTP_BATCH
+sink_http_batch = "none"
+
 # Bearer token for the HTTP sink. NEVER set this in the config file —
 # it must come from the environment so it doesn't end up in version control,
 # logs, or container image layers.

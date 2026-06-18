@@ -46,7 +46,7 @@ use models::WorkUnit;
 #[cfg(feature = "clickhouse-sink")]
 use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
 #[cfg(feature = "http-sink")]
-use sink::http::{HttpSink, HttpSinkConfig};
+use sink::http::{HttpBatchMode, HttpSink, HttpSinkConfig};
 #[cfg(feature = "mysql-sink")]
 use sink::mysql::{MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
@@ -343,6 +343,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .map(Arc::from);
+            // Validated to "none"|"ndjson" at config load; "ndjson" sends the
+            // whole batch as one newline-delimited POST, anything else (i.e.
+            // "none") keeps the per-record default.
+            let batch_mode = if config.sink_http_batch == "ndjson" {
+                HttpBatchMode::Ndjson
+            } else {
+                HttpBatchMode::PerRecord
+            };
             info!(
                 // The URL may carry userinfo (user:password@host); redact the
                 // password so it never reaches a log line (S25).
@@ -351,12 +359,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
                 concurrency = config.sink_http_concurrency,
+                batch = %config.sink_http_batch,
                 "sink: http"
             );
             let http_cfg = HttpSinkConfig {
                 url,
                 timeout: Duration::from_secs(config.sink_timeout_secs),
                 max_batch_size: config.sink_max_batch_size,
+                batch_mode,
                 bearer_token,
                 send_idempotency_key: config.sink_send_idempotency_key,
                 concurrency: config.sink_http_concurrency,

@@ -39,6 +39,8 @@ OPTIONS:
     --sink-send-idempotency-key <bool>       Send Idempotency-Key header (http) [default: true]
     --sink-http-concurrency <n>              Max concurrent POSTs per batch (http, 1-1024)
                                                [default: 8]
+    --sink-http-batch <mode>                 HTTP framing: none (per-record POSTs) or
+                                               ndjson (one POST/batch) [default: none]
     --sink-max-retries <n>                   Transient-retry attempts before a segment is
                                                stranded (0-100) [default: 3]
     --sink-retry-base-delay-ms <ms>          First retry backoff, doubles each retry
@@ -149,6 +151,9 @@ pub(super) fn parse_from(
         sink_send_idempotency_key: opt_bool(&mut pargs, "--sink-send-idempotency-key")?,
         sink_http_concurrency: pargs
             .opt_value_from_str("--sink-http-concurrency")
+            .map_err(pico_err)?,
+        sink_http_batch: pargs
+            .opt_value_from_str("--sink-http-batch")
             .map_err(pico_err)?,
         sink_max_retries: pargs
             .opt_value_from_str("--sink-max-retries")

@@ -33,6 +33,7 @@ struct RawServer {
     sink_max_batch_size: Option<usize>,
     sink_send_idempotency_key: Option<bool>,
     sink_http_concurrency: Option<usize>,
+    sink_http_batch: Option<String>,
     sink_max_retries: Option<u32>,
     sink_retry_base_delay_ms: Option<u64>,
     #[cfg(feature = "mysql-sink")]
@@ -92,6 +93,7 @@ const BASE_SERVER_KEYS: &[&str] = &[
     "sink_max_batch_size",
     "sink_send_idempotency_key",
     "sink_http_concurrency",
+    "sink_http_batch",
     "sink_max_retries",
     "sink_retry_base_delay_ms",
     "dead_letter_max_bytes",
@@ -190,6 +192,7 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             sink_max_batch_size: s.sink_max_batch_size,
             sink_send_idempotency_key: s.sink_send_idempotency_key,
             sink_http_concurrency: s.sink_http_concurrency,
+            sink_http_batch: s.sink_http_batch,
             sink_max_retries: s.sink_max_retries,
             sink_retry_base_delay_ms: s.sink_retry_base_delay_ms,
             #[cfg(feature = "mysql-sink")]

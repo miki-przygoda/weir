@@ -731,6 +731,52 @@ rate-limit aggressively or can't handle concurrent connections.
 
 ---
 
+#### `sink_http_batch`
+
+- **Type**: string (`none` | `ndjson`)
+- **Default**: `none`
+- **CLI**: `--sink-http-batch <mode>`
+- **Env**: `WEIR_SINK_HTTP_BATCH`
+- **TOML**: `sink_http_batch`
+
+How the HTTP sink frames a `commit` batch into HTTP requests.
+
+- **`none`** (default): one POST per record. Per-record `Idempotency-Key`,
+  per-record dead-lettering, up to `sink_http_concurrency` POSTs in flight.
+  Any endpoint that accepts a single-record POST body works — no batch
+  format to agree on.
+- **`ndjson`**: the **whole** `commit` batch (up to `sink_max_batch_size`
+  records) goes in **one** POST, newline-delimited (one record per line,
+  `Content-Type: application/x-ndjson`). This is the framing Loki, the
+  Elasticsearch `_bulk` API, and similar log/trace ingesters expect. One
+  POST per batch instead of N collapses the round-trip cost for sustained
+  high-throughput forwarding.
+
+**Trade-off (NDJSON is all-or-nothing).** The endpoint returns a single
+status for the whole batch, so there is no per-record outcome: a `2xx`
+commits every record in the batch, a permanent `4xx` dead-letters the
+**entire** batch, and a transient error (`408`/`429`/`5xx`/transport)
+retries the whole segment. If you need a single bad record dead-lettered
+without taking its batch-mates with it, use `none`.
+
+**Records must contain no embedded newlines** in `ndjson` mode — a `\n`
+inside a payload would be read by the endpoint as a record boundary.
+weir does not escape or reject them; the framing assumes line-delimited
+records (the normal case for log/event payloads).
+
+**Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
+is sent for the whole batch, computed over the joined body. Because the
+key is a hash of the exact bytes, it inherits the same batch-stability
+caveat as ClickHouse's dedup token — see the note under
+[`sink_max_batch_size`](#sink_max_batch_size): changing
+`sink_max_batch_size` across a restart re-splits a replayed segment into
+different batches with different keys, so an endpoint deduping on the
+batch key would not recognise them as duplicates. Keep
+`sink_max_batch_size` frozen for the life of the deployment if you rely
+on batch-level dedup.
+
+---
+
 #### `sink_max_retries`
 
 - **Type**: u32
