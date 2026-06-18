@@ -460,6 +460,31 @@ fn read_segment_records(path: &Path) -> Result<Vec<Payload>, String> {
     Ok(out)
 }
 
+/// What a `dl requeue` dry run would do: how many records are recoverable and
+/// which segments couldn't be read (and so would be skipped).
+struct DryRunSummary {
+    total_records: u64,
+    unreadable: Vec<String>,
+}
+
+/// Counts the recoverable records across `segs` (reading + CRC-verifying each)
+/// and collects per-segment read errors. Pure over the filesystem inputs, so the
+/// counting logic is unit-testable without a daemon.
+fn dry_run_summary(segs: &[(PathBuf, u64)]) -> DryRunSummary {
+    let mut total_records = 0u64;
+    let mut unreadable = Vec::new();
+    for (p, _sz) in segs {
+        match read_segment_records(p) {
+            Ok(recs) => total_records += recs.len() as u64,
+            Err(e) => unreadable.push(e),
+        }
+    }
+    DryRunSummary {
+        total_records,
+        unreadable,
+    }
+}
+
 fn cmd_dl_requeue(
     wab_dir: &Path,
     socket: &Path,
@@ -476,14 +501,10 @@ fn cmd_dl_requeue(
     // Dry run: count records per segment (reading + CRC-verifying each) and
     // report what WOULD be requeued. Unreadable segments are surfaced here too.
     if !yes {
-        let mut total_records = 0u64;
-        let mut unreadable: Vec<String> = Vec::new();
-        for (p, _sz) in &segs {
-            match read_segment_records(p) {
-                Ok(recs) => total_records += recs.len() as u64,
-                Err(e) => unreadable.push(e),
-            }
-        }
+        let DryRunSummary {
+            total_records,
+            unreadable,
+        } = dry_run_summary(&segs);
         // Report readable-of-total so the segment count reconciles with `dl list`
         // (which counts every segment, readable or not).
         println!(
@@ -842,6 +863,33 @@ mod tests {
 
         let err = read_segment_records(&path).unwrap_err();
         assert!(err.contains("record 0"), "err: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dry_run_summary_counts_readable_and_flags_unreadable() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("weir_ctl_rq_sum_{}", std::process::id()));
+        let dl = dir.join("dead_letter");
+        // One valid segment with 2 records.
+        write_dl_segment(&dl, 1, &[b"r1", b"r2"]);
+        // One corrupt segment (bad CRC) that must be flagged, not counted.
+        let bad = dl.join("dl_00000002.wab.sealed");
+        let mut f = std::fs::File::create(&bad).unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
+            .unwrap();
+        f.write_all(&3u32.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // wrong CRC
+        f.write_all(b"bad").unwrap();
+        f.write_all(&weir_wab::format::build_sentinel()).unwrap();
+        f.sync_all().unwrap();
+
+        let segs = dl_segments(&dl).unwrap();
+        assert_eq!(segs.len(), 2);
+        let summary = dry_run_summary(&segs);
+        assert_eq!(summary.total_records, 2, "only the 2 readable records count");
+        assert_eq!(summary.unreadable.len(), 1, "the corrupt segment is flagged");
+        assert!(summary.unreadable[0].contains("record 0"), "{:?}", summary.unreadable);
         std::fs::remove_dir_all(&dir).ok();
     }
 

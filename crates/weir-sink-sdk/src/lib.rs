@@ -217,6 +217,84 @@ pub trait Sink: Send + Sync + 'static {
 mod tests {
     use super::*;
 
+    /// Minimal std-only executor: drives a future to completion by polling with a
+    /// no-op waker. Enough to test a sink whose `commit`/`health` are immediately
+    /// ready (no real I/O await points), without pulling a runtime into the SDK.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let mut fut = std::pin::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    /// A trivial sink that counts committed records and dead-letters anything
+    /// equal to `b"reject"`. Shows the pattern sink authors use to unit-test a
+    /// `Sink` impl against the stable contract (no daemon, no runtime).
+    #[test]
+    fn a_custom_sink_can_be_driven_and_unit_tested() {
+        use std::cell::Cell;
+
+        #[derive(Debug)]
+        struct Never;
+        impl std::fmt::Display for Never {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "never")
+            }
+        }
+        impl std::error::Error for Never {}
+        impl SinkError for Never {
+            fn is_transient(&self) -> bool {
+                true
+            }
+        }
+
+        struct CountingSink {
+            committed: Cell<usize>,
+        }
+        impl Sink for CountingSink {
+            type Record = Payload;
+            type Error = Never;
+            async fn commit(
+                &self,
+                batch: Vec<Payload>,
+            ) -> Result<CommitResult<Payload>, Never> {
+                let (mut ok, mut dead) = (Vec::new(), Vec::new());
+                for r in batch {
+                    if r.as_ref() == b"reject" {
+                        dead.push((r, "rejected by CountingSink".to_string()));
+                    } else {
+                        ok.push(r);
+                    }
+                }
+                self.committed.set(self.committed.get() + ok.len());
+                Ok(CommitResult::new(ok, dead))
+            }
+            async fn health(&self) -> SinkHealth {
+                SinkHealth::Healthy
+            }
+        }
+
+        let sink = CountingSink {
+            committed: Cell::new(0),
+        };
+        let batch = vec![
+            Payload::copy_from_slice(b"keep-1"),
+            Payload::copy_from_slice(b"reject"),
+            Payload::copy_from_slice(b"keep-2"),
+        ];
+        let result = block_on(sink.commit(batch)).unwrap();
+        assert_eq!(result.committed.len(), 2);
+        assert_eq!(result.dead_lettered.len(), 1);
+        assert_eq!(&result.dead_lettered[0].0[..], b"reject");
+        assert_eq!(sink.committed.get(), 2);
+        assert!(matches!(block_on(sink.health()), SinkHealth::Healthy));
+    }
+
     #[test]
     fn commit_result_new_keeps_both_partitions() {
         let r = CommitResult::new(

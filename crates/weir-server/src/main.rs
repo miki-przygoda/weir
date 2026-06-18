@@ -209,6 +209,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("config: {w}");
     }
 
+    // On macOS the durable-write path uses F_BARRIERFSYNC, which orders writes
+    // and survives a process/OS crash but is NOT a guaranteed media flush on
+    // sudden power loss (a drive with a volatile write cache can still lose the
+    // most recent writes). Surface this once at startup so it isn't a surprise.
+    #[cfg(target_os = "macos")]
+    warn!(
+        "durability note: this is a macOS build — fsync uses F_BARRIERFSYNC, which is \
+         NOT power-loss-durable on drives with a volatile write cache. Run production \
+         data paths on Linux (fdatasync). See the durability section of the README."
+    );
+
     info!(
         socket = %config.socket_path.display(),
         wab_dir = %config.wab_dir.display(),
