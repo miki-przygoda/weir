@@ -142,10 +142,13 @@ outages before stranding. Distinct from `WeirDeadLettered` (*permanent* rejectio
 The sink **permanently** rejected records (e.g. a 4xx). They are written to the
 dead-letter directory for manual handling — not retried.
 **Respond:** inspect the dead-letter files and the sink's rejection reason
-(a schema mismatch, auth failure, malformed payload). Fix the upstream cause;
-`weir-ctl dl` (list/drop) inspects/clears the directory. There is **no built-in
-requeue in 1.0** — reprocessing is manual (extract the records and re-submit them
-through a producer).
+(a schema mismatch, auth failure, malformed payload). Fix the upstream cause,
+then reprocess with `weir-ctl dl requeue` — it re-submits the dead-lettered
+records back through the daemon's socket and deletes each segment once all its
+records are re-accepted. Re-delivery is at-least-once (a record may be delivered
+more than once if a requeue run is interrupted; the HTTP sink's idempotency key
+dedupes identical payloads). `weir-ctl dl` also offers `list` (inspect) and
+`drop` (discard) for when the records aren't worth reprocessing.
 
 ### Ingest / backpressure
 

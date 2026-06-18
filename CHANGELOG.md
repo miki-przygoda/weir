@@ -7,8 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 From v1.0 onward, `weir` follows Semantic Versioning: a breaking change to the
 public Rust API of a published crate (`weir-core`, `weir-client`,
-`weir-sink-sdk`) or to the wire protocol requires a major version bump. Wire
-protocol version changes are tracked separately under **Wire protocol** below.
+`weir-sink-sdk`, `weir-wab`) or to the wire protocol requires a major version
+bump. Wire protocol version changes are tracked separately under **Wire
+protocol** below.
+
+---
+
+## [Unreleased]
+
+Additive operability features from the post-1.0 hands-on usage sweep. All
+backward compatible — no wire, on-disk, or API breaks.
+
+### Added
+
+- **Auto-resume for stranded segments** (drain). When the sink exhausts its
+  transient-retry budget on a segment, the segment is left durably on disk
+  ("stranded"). The drain now re-queues stranded segments automatically when the
+  sink health recovers (a down→up edge at the idle health-poll), instead of
+  waiting for a daemon restart. New `weir_drain_segments_resumed_total` metric.
+- **Configurable sink retry budget** (config). `sink_max_retries` (default 3) and
+  `sink_retry_base_delay_ms` (default 100) are now exposed via CLI/env/TOML; they
+  were previously hardcoded.
+- **HTTP sink NDJSON batch mode** (`sink_http_batch = none | ndjson`, default
+  `none`). `ndjson` sends a whole commit batch as one newline-delimited POST
+  (`application/x-ndjson`) with a single per-batch `Idempotency-Key` — the
+  framing Loki / Elasticsearch `_bulk` ingesters expect — collapsing the
+  per-record round-trip cost for sustained forwarding. The default per-record
+  mode is unchanged.
+- **`weir-ctl dl requeue`** re-submits dead-lettered records back through the
+  daemon's socket and deletes each segment once all its records are re-accepted.
+  Re-delivery is at-least-once (the HTTP sink's idempotency key dedupes identical
+  payloads if a run is interrupted). Defaults to a dry run; `--yes` to apply.
+- **New crate `weir-wab`** — the on-disk WAB segment format and `SegmentReader`,
+  extracted so `weir-ctl` can read dead-letter segments with the *same* parser
+  the daemon uses, without depending on the daemon's async/sink dependency tree.
+  `FORMAT_VERSION = 1` is frozen under the SemVer promise above.
 
 ---
 

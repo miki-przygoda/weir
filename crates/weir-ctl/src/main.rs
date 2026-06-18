@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use weir_client::WeirClient;
-use weir_core::Durability;
+use weir_core::{Durability, Payload};
+use weir_wab::SegmentReader;
 
 /// Default daemon Unix socket. Override with `--socket`.
 const DEFAULT_SOCKET: &str = "/run/weir/weir.sock";
@@ -89,6 +90,25 @@ enum DlCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Re-submit dead-lettered records back through the daemon's socket, then
+    /// delete each segment once all its records are re-accepted. Defaults to a
+    /// dry run. Re-delivery is at-least-once: if interrupted partway through a
+    /// segment, that segment's already-pushed records are re-sent on the next
+    /// run (the sink's idempotency key dedupes identical payloads).
+    Requeue {
+        /// Path to the daemon's WAB directory.
+        #[arg(long)]
+        wab_dir: PathBuf,
+        /// Daemon Unix socket to push the records back through.
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        /// Durability tier for the re-pushed records: sync | batched | buffered.
+        #[arg(long, default_value = "batched", value_parser = parse_durability)]
+        durability: Durability,
+        /// Actually requeue. Without this flag, prints what would be requeued.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn parse_durability(s: &str) -> Result<Durability, String> {
@@ -116,6 +136,12 @@ fn main() -> ExitCode {
         Command::Dl(dl) => match dl {
             DlCommand::List { wab_dir } => cmd_dl_list(&wab_dir),
             DlCommand::Drop { wab_dir, yes } => cmd_dl_drop(&wab_dir, yes),
+            DlCommand::Requeue {
+                wab_dir,
+                socket,
+                durability,
+                yes,
+            } => cmd_dl_requeue(&wab_dir, &socket, durability, yes),
         },
     };
     match result {
@@ -391,6 +417,150 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads every record out of one dead-letter segment, verifying each record's
+/// CRC as it goes (via the shared `SegmentReader`). Returns an error — without
+/// any partial result — if the header is invalid or any record fails to decode,
+/// so a corrupt segment is never partially requeued.
+fn read_segment_records(path: &Path) -> Result<Vec<Payload>, String> {
+    let reader = SegmentReader::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (i, rec) in reader.enumerate() {
+        match rec {
+            Ok(p) => out.push(p),
+            Err(e) => return Err(format!("{}: record {i}: {e}", path.display())),
+        }
+    }
+    Ok(out)
+}
+
+fn cmd_dl_requeue(
+    wab_dir: &Path,
+    socket: &Path,
+    durability: Durability,
+    yes: bool,
+) -> Result<(), String> {
+    let dl_dir = dead_letter_dir(wab_dir);
+    let segs = dl_segments(&dl_dir)?;
+    if segs.is_empty() {
+        println!("dead-letter store is empty; nothing to requeue");
+        return Ok(());
+    }
+
+    // Dry run: count records per segment (reading + CRC-verifying each) and
+    // report what WOULD be requeued. Unreadable segments are surfaced here too.
+    if !yes {
+        let mut total_records = 0u64;
+        let mut unreadable: Vec<String> = Vec::new();
+        for (p, _sz) in &segs {
+            match read_segment_records(p) {
+                Ok(recs) => total_records += recs.len() as u64,
+                Err(e) => unreadable.push(e),
+            }
+        }
+        println!(
+            "would requeue {total_records} record(s) from {} dead-letter segment(s) under {} \
+             through {}",
+            segs.len() - unreadable.len(),
+            dl_dir.display(),
+            socket.display(),
+        );
+        println!(
+            "re-run with --yes to confirm. Re-delivery is at-least-once: a record may be \
+             delivered more than once if the run is interrupted (the sink's idempotency key \
+             dedupes identical payloads)."
+        );
+        if !unreadable.is_empty() {
+            println!(
+                "\n⚠ {} segment(s) could not be read and would be SKIPPED:\n  {}",
+                unreadable.len(),
+                unreadable.join("\n  ")
+            );
+        }
+        return Ok(());
+    }
+
+    // Real run. Connect once, then requeue segment-by-segment. A segment is
+    // deleted only after ALL of its records are re-accepted, so a crash bounds
+    // duplication to at most the in-flight segment.
+    let mut client =
+        WeirClient::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+
+    let mut total_requeued: u64 = 0;
+    let mut segments_cleared: usize = 0;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut delete_failures: Vec<String> = Vec::new();
+
+    for (path, _sz) in &segs {
+        // Read (and CRC-verify) the whole segment before pushing anything, so a
+        // corrupt segment is skipped wholesale rather than partially requeued.
+        let records = match read_segment_records(path) {
+            Ok(r) => r,
+            Err(e) => {
+                skipped.push(e);
+                continue;
+            }
+        };
+
+        for (i, rec) in records.iter().enumerate() {
+            if let Err(e) = client.push(rec.as_ref(), durability) {
+                // A push failure is operational (daemon down / nacking). Abort
+                // the whole run rather than hammering a failing daemon. The
+                // current segment stays on disk; the records pushed from it so
+                // far (i of them) may duplicate on the next run.
+                return Err(format!(
+                    "push failed after requeuing {total_requeued} record(s) from \
+                     {segments_cleared} segment(s); {} left in place \
+                     ({i}/{} of it pushed — those may duplicate on the next run): {e}",
+                    path.display(),
+                    records.len(),
+                ));
+            }
+            total_requeued += 1;
+        }
+
+        // Every record re-accepted (each push is acked only after the daemon
+        // made it durable). Delete the segment. If the delete fails the records
+        // are still safely requeued, but the file will re-requeue (duplicate) on
+        // the next run — surface it loudly rather than silently.
+        match std::fs::remove_file(path) {
+            Ok(()) => segments_cleared += 1,
+            Err(e) => delete_failures.push(format!("{}: {e}", path.display())),
+        }
+    }
+
+    println!(
+        "requeued {total_requeued} record(s) from {segments_cleared} dead-letter segment(s) \
+         through {} ({durability:?})",
+        socket.display(),
+    );
+    println!(
+        "note: requeued records re-enter the pipeline and the drain will attempt delivery \
+         again; if the sink still rejects them they will be dead-lettered anew."
+    );
+    if !skipped.is_empty() {
+        println!(
+            "\n⚠ {} segment(s) were SKIPPED (unreadable) and left in place:\n  {}",
+            skipped.len(),
+            skipped.join("\n  ")
+        );
+    }
+    if !delete_failures.is_empty() {
+        return Err(format!(
+            "{} segment(s) were requeued but could not be deleted (they will requeue again \
+             next run — remove them manually):\n  {}",
+            delete_failures.len(),
+            delete_failures.join("\n  ")
+        ));
+    }
+    if !skipped.is_empty() {
+        return Err(format!(
+            "{} dead-letter segment(s) could not be read",
+            skipped.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Minimal HTTP/1.0 GET of `/metrics` — keeps weir-ctl free of an HTTP client
 /// dependency (the daemon's metrics server speaks plain HTTP/1.0).
 fn scrape(addr: &str) -> Result<String, String> {
@@ -567,6 +737,104 @@ mod tests {
             dl.join("keep.txt").exists(),
             "non-dl file must be left alone"
         );
+        std::fs::remove_dir_all(&wab).ok();
+    }
+
+    // ── Requeue ──────────────────────────────────────────────────────────────
+
+    /// Writes a valid sealed dead-letter segment `dl_<counter>.wab.sealed` that
+    /// `SegmentReader` can read: header + `[len][crc][payload]` per record +
+    /// sentinel. (The reader stops at the sentinel, so the footer is omitted.)
+    fn write_dl_segment(dl_dir: &Path, counter: u64, records: &[&[u8]]) {
+        use std::io::Write;
+        std::fs::create_dir_all(dl_dir).unwrap();
+        let path = dl_dir.join(format!("dl_{counter:08}.wab.sealed"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Shard ID 0xFFFF is the dead-letter marker the daemon uses.
+        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
+            .unwrap();
+        for r in records {
+            f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
+            // Same CRC32 (IEEE) SegmentReader verifies — see weir-wab.
+            f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
+            f.write_all(r).unwrap();
+        }
+        f.write_all(&weir_wab::format::build_sentinel()).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn read_segment_records_reads_all_in_order() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_rq_read_{}", std::process::id()));
+        let dl = dir.join("dead_letter");
+        write_dl_segment(&dl, 1, &[b"alpha", b"beta", b"gamma"]);
+        let path = dl.join("dl_00000001.wab.sealed");
+        let recs = read_segment_records(&path).unwrap();
+        let got: Vec<&[u8]> = recs.iter().map(|p| p.as_ref()).collect();
+        assert_eq!(got, vec![b"alpha".as_ref(), b"beta", b"gamma"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segment_records_errors_on_corrupt_record() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("weir_ctl_rq_crc_{}", std::process::id()));
+        let dl = dir.join("dead_letter");
+        std::fs::create_dir_all(&dl).unwrap();
+        let path = dl.join("dl_00000001.wab.sealed");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
+            .unwrap();
+        let payload = b"corruptme";
+        f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&0xdead_beefu32.to_le_bytes()).unwrap(); // wrong CRC
+        f.write_all(payload).unwrap();
+        f.write_all(&weir_wab::format::build_sentinel()).unwrap();
+        f.sync_all().unwrap();
+
+        let err = read_segment_records(&path).unwrap_err();
+        assert!(err.contains("record 0"), "err: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn requeue_empty_store_is_ok_without_connecting() {
+        // Empty store: returns Ok and never touches the socket (so a bogus
+        // socket path is harmless).
+        let wab = std::env::temp_dir().join(format!("weir_ctl_rq_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&wab).unwrap();
+        let bogus = Path::new("/nonexistent/weir.sock");
+        cmd_dl_requeue(&wab, bogus, Durability::Batched, true).unwrap();
+        std::fs::remove_dir_all(&wab).ok();
+    }
+
+    #[test]
+    fn requeue_dry_run_does_not_connect() {
+        // Dry run (yes = false) must read + count without connecting — a bogus
+        // socket must NOT cause an error.
+        let wab = std::env::temp_dir().join(format!("weir_ctl_rq_dry_{}", std::process::id()));
+        let dl = wab.join("dead_letter");
+        write_dl_segment(&dl, 1, &[b"one", b"two"]);
+        let bogus = Path::new("/nonexistent/weir.sock");
+        cmd_dl_requeue(&wab, bogus, Durability::Batched, false).unwrap();
+        // Dry run leaves the segment in place.
+        assert_eq!(dl_segments(&dl).unwrap().len(), 1);
+        std::fs::remove_dir_all(&wab).ok();
+    }
+
+    #[test]
+    fn requeue_real_run_errors_when_daemon_unreachable() {
+        // With records present and --yes, the real run must attempt to connect;
+        // an unreachable socket surfaces a connect error and leaves the segment
+        // untouched (nothing was requeued).
+        let wab = std::env::temp_dir().join(format!("weir_ctl_rq_conn_{}", std::process::id()));
+        let dl = wab.join("dead_letter");
+        write_dl_segment(&dl, 1, &[b"rec"]);
+        let bogus = Path::new("/nonexistent/weir.sock");
+        let err = cmd_dl_requeue(&wab, bogus, Durability::Batched, true).unwrap_err();
+        assert!(err.contains("connect"), "err: {err}");
+        // The segment is left in place since nothing could be requeued.
+        assert_eq!(dl_segments(&dl).unwrap().len(), 1);
         std::fs::remove_dir_all(&wab).ok();
     }
 }

@@ -43,6 +43,10 @@ path = "src/main.rs"
 
 [dependencies]
 weir-core = { path = "../weir-core", version = "1.0.0" }
+# On-disk WAB segment format + SegmentReader. Extracted into its own crate so
+# weir-ctl can read dead-letter segments (for `dl requeue`) without depending on
+# the daemon's full async/sink dep tree — one parser, shared by both.
+weir-wab = { path = "../weir-wab", version = "1.0.0" }
 # Sink trait + error contract. Extracted into its own published crate so third
 # parties can write sinks without depending on the daemon; the built-in sinks
 # (http/mysql/postgres/clickhouse/noop) implement these traits.

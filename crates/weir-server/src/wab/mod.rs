@@ -1,13 +1,18 @@
 pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
 pub(crate) mod dst;
-pub(crate) mod format;
 pub(crate) mod recovery;
 pub(crate) mod segment;
 
+// The on-disk segment format + reader live in the `weir-wab` crate (shared with
+// weir-ctl, so there is exactly one parser). Re-exported here so the daemon's
+// existing `crate::wab::format::…` and `crate::wab::SegmentReader` paths are
+// unchanged.
+pub(crate) use weir_wab::{SegmentReader, format};
+
 use std::{
-    fs::{self, File},
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    fs,
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -24,10 +29,10 @@ use tracing::{error, info, warn};
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::Batch;
 use clock::{BlockingClock, RealClock};
-use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::{FsSegmentStore, SegmentStore, ShardWriter};
-use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
+use weir_core::Durability;
+use weir_wab::format::{EXT_SEALED, SEGMENT_FOOTER_LEN};
 
 /// Exponential moving average update, fixed-point microseconds.
 /// alpha = 1/4 (new sample weighted 25%). Pure fn so it's unit-testable.
@@ -806,113 +811,15 @@ fn fsync_observed(
     }
 }
 
-/// An iterator over records in a sealed WAB segment file.
-///
-/// Streams records without materialising the whole segment. Applies
-/// `MAX_PAYLOAD_HARD_CAP` before every heap allocation to bound memory usage
-/// during recovery. Stops at the end-of-records sentinel or on the first error.
-pub(crate) struct SegmentReader {
-    reader: BufReader<File>,
-    done: bool,
-}
-
-impl SegmentReader {
-    pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut header = [0u8; SEGMENT_HEADER_LEN];
-        reader.read_exact(&mut header)?;
-
-        if &header[0..4] != b"WEIR" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad segment magic: {:?}", &header[0..4]),
-            ));
-        }
-        if header[4] != FORMAT_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown segment format version: {}", header[4]),
-            ));
-        }
-
-        Ok(SegmentReader {
-            reader,
-            done: false,
-        })
-    }
-}
-
-impl Iterator for SegmentReader {
-    type Item = io::Result<Payload>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        let mut len_buf = [0u8; 4];
-        match self.reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => {
-                self.done = true;
-                return Some(Err(e));
-            }
-        }
-
-        let payload_len = u32::from_le_bytes(len_buf) as usize;
-        if payload_len == 0 {
-            self.done = true;
-            return None; // sentinel
-        }
-
-        // Cap check before allocation — MAX_PAYLOAD_HARD_CAP from weir-core.
-        if payload_len > MAX_PAYLOAD_HARD_CAP {
-            self.done = true;
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "record payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"
-                ),
-            )));
-        }
-
-        let mut crc_buf = [0u8; 4];
-        if let Err(e) = self.reader.read_exact(&mut crc_buf) {
-            self.done = true;
-            return Some(Err(e));
-        }
-        let expected_crc = u32::from_le_bytes(crc_buf);
-
-        let mut payload_buf = vec![0u8; payload_len];
-        if let Err(e) = self.reader.read_exact(&mut payload_buf) {
-            self.done = true;
-            return Some(Err(e));
-        }
-
-        let computed_crc = crc32fast::hash(&payload_buf);
-        if expected_crc != computed_crc {
-            self.done = true;
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "record CRC mismatch: expected {expected_crc:#010x}, computed {computed_crc:#010x}"
-                ),
-            )));
-        }
-
-        // Freeze: O(1) ownership transfer from Vec allocation to Bytes.
-        Some(Ok(Payload::from(payload_buf)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wab::segment::{WabSegment, segment_path};
     use std::fs;
+    // SegmentReader (and the round-trip tests that pair it with WabSegment) live
+    // here even though the reader itself moved to weir-wab — these exercise the
+    // reader against the real writer. Payload + the cap are only used by them.
+    use weir_core::{MAX_PAYLOAD_HARD_CAP, Payload};
 
     fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weir_wab_{label}_{}", std::process::id()));

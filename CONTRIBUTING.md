@@ -86,9 +86,10 @@ cargo +nightly fuzz run envelope_parse
 ## What's frozen at 1.0
 
 weir is 1.0 under [Semantic Versioning](https://semver.org/). The **v1 wire
-protocol** and the **public Rust API** (`weir-core`, `weir-client`,
-`weir-sink-sdk`) are frozen — a breaking change to either is a 2.0 change, not
-a PR. The wire format has a language-neutral conformance suite
+protocol**, the **on-disk WAB segment format** (`weir-wab`, `FORMAT_VERSION = 1`),
+and the **public Rust API** (`weir-core`, `weir-client`, `weir-sink-sdk`,
+`weir-wab`) are frozen — a breaking change to any is a 2.0 change, not a PR. The
+wire format has a language-neutral conformance suite
 ([`docs/conformance.md`](docs/conformance.md)); if you touch the codec, the
 vectors in `docs/conformance/wire_v1_vectors.json` must still pass unchanged.
 
