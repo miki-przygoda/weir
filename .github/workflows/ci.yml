@@ -23,6 +23,19 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
 
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The declared MSRV (workspace.package.rust-version). This job is what makes
+      # the floor real: a dependency or syntax bump that needs a newer compiler
+      # fails here instead of silently raising the requirement (escalation #15).
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features --locked
+
   advisories:
     name: advisories (cargo-deny)
     runs-on: ubuntu-latest
