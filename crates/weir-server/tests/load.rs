@@ -27,6 +27,23 @@
 //! performance-improvement TODO list (end-to-end latency, thundering-herd
 //! queue contention, batching efficiency); future improvements are
 //! catalogued in the CHANGELOG rather than inline here.
+//!
+//! # Coverage caveats (known gaps)
+//!
+//! - **Ingest-only.** Every scenario here measures the producer→daemon→WAB
+//!   ingest path against the **noop** sink; none exercise sink *drain*
+//!   throughput. The HTTP per-record vs NDJSON-batch delivery rate (the thing
+//!   `sink_http_batch = ndjson` was built for) is therefore NOT covered by this
+//!   baseline. A drain-throughput scenario (a localhost mock endpoint,
+//!   parameterised over batch mode / batch size / concurrency) is a worthwhile
+//!   follow-up; until then, treat these numbers as ingest ceilings, not
+//!   end-to-end delivery rates.
+//! - **`thundering_herd_*` is warmup-dominated.** Those scenarios spawn N threads
+//!   that each push a fixed count with no warmup, so connection/thread setup
+//!   dominates short runs and the throughput swings run-to-run (observed up to
+//!   ~8×). Prefer the `ramp_*` scenarios as the stable regression baseline; read
+//!   the herd rows as a smoke test that high fan-out doesn't deadlock, not as a
+//!   precise throughput gate.
 
 #![cfg(unix)]
 

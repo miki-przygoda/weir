@@ -33,6 +33,26 @@ statically-linked-ish executable (links libc and libdl; everything else
 is in the binary). Strip with `strip target/release/weir-server` if
 you care about size (~9.5 MB → ~8.3 MB).
 
+#### Minimal build (smaller dep tree)
+
+The default build enables the `http-sink`, `mysql-sink`, and `postgres-sink`
+features, which pull in the full MySQL and PostgreSQL client stacks (and several
+duplicate-version transitive crates — `cargo tree -d` shows them, largely pinned
+by `mysql_async` / `postgres-protocol`). If you only need one sink, build with
+just that feature for a much smaller dependency tree and faster compile:
+
+```bash
+# HTTP sink only (no SQL client stacks):
+cargo build --release -p weir-server --no-default-features --features http-sink
+# noop only (soak-testing, no sinks compiled in):
+cargo build --release -p weir-server --no-default-features
+```
+
+Available sink features: `http-sink`, `mysql-sink`, `postgres-sink`,
+`clickhouse-sink` (the `noop` sink is always compiled in). Trimming the *default*
+feature set is a breaking change deferred to a future major version, so the full
+set stays the default for now — use `--no-default-features` to opt out today.
+
 ### Install to PATH
 
 ```bash
