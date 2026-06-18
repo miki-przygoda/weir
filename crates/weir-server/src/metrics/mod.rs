@@ -360,14 +360,14 @@ impl Metrics {
             "weir_connection_rejected_peer_uid",
             "Connections refused by the peer-credential check (peer uid != daemon uid, \
              or credential lookup failed). Any non-zero value suggests an attempted \
-             bypass of the socket file's 0o600 mode or a misconfigured producer."
+             bypass of the socket file's 0o600 mode or a misconfigured producer"
         );
         let accept_resource_exhaustion = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_accept_resource_exhaustion",
             "accept(2) failures due to resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM). \
              The accept loop backs off briefly on each. A rising value means the daemon is \
-             out of file descriptors or socket buffers."
+             out of file descriptors or socket buffers"
         );
         let connections_aborted_at_shutdown = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -375,14 +375,14 @@ impl Metrics {
             "Connections force-aborted at shutdown because they didn't drain within \
              shutdown_timeout_secs. Each may correspond to a push whose record was \
              written to the WAB but whose producer never received an ack/nack. \
-             Increase shutdown_timeout_secs if this is non-zero on graceful shutdown."
+             Increase shutdown_timeout_secs if this is non-zero on graceful shutdown"
         );
         let ack_timeout = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_ack_timeout",
             "Pushes nacked because the WAB ack channel did not fire within \
              ACK_TIMEOUT. Indicates a wedged flusher (slow fsync, lock contention) \
-             that hasn't panicked. Investigate alongside weir_wab_fsync_duration_seconds."
+             that hasn't panicked. Investigate alongside weir_wab_fsync_duration_seconds"
         );
         let tls_handshake_failures = reg!(
             Family::<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>::default(),
@@ -415,7 +415,7 @@ impl Metrics {
             "WAB flusher thread panics. A panicked flusher leaves its shard offline \
              (records routed to it receive Nack(InternalError)) until the daemon \
              restarts. Any non-zero value requires operator attention; check logs \
-             for the shard_id and panic payload."
+             for the shard_id and panic payload"
         );
         let drain_panics = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -423,7 +423,7 @@ impl Metrics {
             "weir-drain thread panics caught and respawned by its supervisor. \
              Sustained values indicate a logic bug in the sink/drain path; if the \
              supervisor exhausts its respawn budget, delivery stops and the WAB \
-             accumulates on disk until restart."
+             accumulates on disk until restart"
         );
         let wab_fsync_failures = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -431,7 +431,7 @@ impl Metrics {
             "fsync/fdatasync calls that returned an error. Durability hazard: \
              the kernel buffered the write but couldn't push it to stable storage. \
              Producers whose records were in the failed fsync receive \
-             Nack(InternalError). Check logs for the shard_id and error string."
+             Nack(InternalError). Check logs for the shard_id and error string"
         );
         let sink_commit_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),
@@ -452,7 +452,7 @@ impl Metrics {
             Family::<SinkInfoLabel, Gauge<f64, AtomicU64>>::default(),
             "weir_sink_info",
             "Configured sink type, set to 1 for the active sink. sink_type=\"noop\" means \
-             records are acked then DISCARDED (not forwarded downstream)."
+             records are acked then DISCARDED (not forwarded downstream)"
         );
         let queue_depth = reg!(
             Gauge::<f64, AtomicU64>::default(),
@@ -473,7 +473,7 @@ impl Metrics {
             Counter::<u64, AtomicU64>::default(),
             "weir_wab_unexpected_mode",
             "WAB segment files seen during recovery whose permissions are not 0o600. \
-             Non-zero values indicate tampering or operator error."
+             Non-zero values indicate tampering or operator error"
         );
         let dead_letter_bytes_on_disk = reg!(
             Gauge::<f64, AtomicU64>::default(),
@@ -485,7 +485,7 @@ impl Metrics {
             "weir_dead_letter_full",
             "Number of times the drain entered BlockedDeadLetterFull state. Each increment \
              represents a distinct episode where a permanently-rejected record could not be \
-             dead-lettered due to cap exhaustion. Operator intervention required."
+             dead-lettered due to cap exhaustion. Operator intervention required"
         );
         let drain_segments_stranded = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -495,7 +495,7 @@ impl Metrics {
              the sink health recovers (see weir_drain_segments_resumed) or on daemon restart, \
              so a rising value means delivery has stalled for at least one segment. Investigate \
              the sink (see weir_sink_health). Distinct from weir_dead_letter_full, which counts \
-             PERMANENT rejections; this counts TRANSIENT failures that never succeeded."
+             PERMANENT rejections; this counts TRANSIENT failures that never succeeded"
         );
         let drain_segments_resumed = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -503,45 +503,45 @@ impl Metrics {
             "Stranded WAB segments re-queued for delivery after the sink health recovered \
              (down to up). Convergence with weir_drain_segments_stranded means an outage's \
              backlog has been picked back up; a persistent gap means segments are still \
-             stranded (sink not yet recovered, or recovering then re-failing)."
+             stranded (sink not yet recovered, or recovering then re-failing)"
         );
         let drain_state = reg!(
             Family::<DrainStateLabel, Gauge<f64, AtomicU64>>::default(),
             "weir_drain_state",
             "Current drain state (1 = active, 0 = inactive). Exactly one state label value \
-             is 1 at any time; the others are 0."
+             is 1 at any time; the others are 0"
         );
         let dead_letter_blocked_duration = reg!(
             Gauge::<f64, AtomicU64>::default(),
             "weir_dead_letter_blocked_duration_seconds",
             "Seconds elapsed since the drain entered BlockedDeadLetterFull. Resets to 0 on \
              transition out. Fire an alert if this gauge exceeds your operator-defined \
-             threshold (e.g. 300 s)."
+             threshold (e.g. 300 s)"
         );
 
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_queue_seconds",
-            "Per-record queue + coalesce wait (enqueue → worker flush). bench-trace only."
+            "Per-record queue + coalesce wait (enqueue → worker flush). bench-trace only"
         );
         #[cfg(feature = "bench-trace")]
         let stage_bridge_wait = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_bridge_wait_seconds",
-            "Per-record bridge hop + flusher recv wait (worker flush → flusher dequeue). bench-trace only."
+            "Per-record bridge hop + flusher recv wait (worker flush → flusher dequeue). bench-trace only"
         );
         #[cfg(feature = "bench-trace")]
         let stage_write = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_write_seconds",
-            "Per-record write time (flusher dequeue → write_record done, pre-fsync). bench-trace only."
+            "Per-record write time (flusher dequeue → write_record done, pre-fsync). bench-trace only"
         );
         #[cfg(feature = "bench-trace")]
         let stage_total = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_total_seconds",
-            "Per-record end-to-end server-side latency (enqueue → ack fired). bench-trace only."
+            "Per-record end-to-end server-side latency (enqueue → ack fired). bench-trace only"
         );
 
         let metrics = Self {

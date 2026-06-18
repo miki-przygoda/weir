@@ -125,6 +125,13 @@ data loss), but delivery is stalled.
 transient errors with backoff; sustained `down` means the sink needs attention.
 Records stay safe on disk until it recovers.
 
+#### WeirSinkDegraded
+The sink reports itself **degraded** — reachable but not fully healthy (e.g. the
+HEAD health probe returned a non-404 4xx). Delivery may still work but is
+impaired; the WAB keeps buffering durably. Warning, not critical.
+**Respond:** check the downstream system before it tips to `down`; correlate with
+`WeirSegmentStranded` / `WeirDeadLettered`. Transient flaps below 15m don't fire.
+
 #### WeirSegmentStranded
 The drain exhausted `sink_max_retries` (default 3) of **transient** sink failures
 on a segment and left it on disk ("stranded"). The data is durable (no loss), but
@@ -221,7 +228,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_drain_state{state}` | gauge | One of `draining` / `retrying_transient` / `blocked_dead_letter_full` is 1. |
 | `weir_sink_commit_records_total{outcome}` | counter | `committed` / `retried` / `dead_lettered` per record. |
 | `weir_sink_commit_duration_seconds` | histogram | Sink `commit()` call duration. |
-| `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1`; `degraded` is an early warning. |
+| `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1` (`WeirSinkDown`); `degraded` is an early warning (`WeirSinkDegraded`). |
+| `weir_sink_info{sink_type}` | gauge | The configured sink type, set to 1 for the active one. `sink_type="noop"` means records are acked then **DISCARDED** (not forwarded) — alert/indicate on `weir_sink_info{sink_type="noop"} == 1` in any non-soak-test deployment. |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
 | `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Seconds since the drain entered BlockedDeadLetterFull (resets to 0 on exit); alert when it exceeds your threshold. |

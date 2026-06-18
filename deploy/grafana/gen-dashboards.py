@@ -155,6 +155,9 @@ DRAIN_MAP = [{"type": "value", "options": {
 UP_MAP = [{"type": "value", "options": {
     "1": {"text": "UP", "color": "green", "index": 0},
     "0": {"text": "DOWN", "color": "red", "index": 1}}}]
+NOOP_MAP = [{"type": "value", "options": {
+    "0": {"text": "Forwarding", "color": "green", "index": 0},
+    "1": {"text": "NOOP ⚠", "color": "red", "index": 1}}}]
 TRI_STEPS = [{"color": "green", "value": None}, {"color": "yellow", "value": 1}, {"color": "red", "value": 2}]
 RED_AT = lambda v: [{"color": "green", "value": None}, {"color": "red", "value": v}]
 
@@ -183,6 +186,10 @@ def build_panels(s):
                "Active drain state (one-hot).", mappings=DRAIN_MAP, steps=TRI_STEPS), 3, 4)
     L.add(stat("Queue depth", f"max(weir_queue_depth{{{s}}})",
                "Records waiting in the work queue.", unit="short", color_mode="fixed"), 3, 4)
+    L.add(stat("Sink fwd", f'sum(weir_sink_info{{{s}, sink_type="noop"}})',
+               'Is the configured sink forwarding? 1 = "noop" (records acked then '
+               'DISCARDED, not delivered); 0 = a real sink is forwarding.',
+               mappings=NOOP_MAP, steps=RED_AT(1)), 3, 4)
 
     # ── Latency percentiles ────────────────────────────────────────────────
     L.row("Latency percentiles")
@@ -238,6 +245,14 @@ def build_panels(s):
         target(f"sum(weir_dead_letter_bytes_on_disk{{{s}}})", "dead-letter bytes"),
     ], "Permanently-rejected records awaiting manual handling. Reaching the cap BLOCKS the drain.",
         unit="bytes"), 12, 7)
+    L.add(timeseries("Stranded vs resumed segments/sec", [
+        target(f"sum(rate(weir_drain_segments_stranded_total{{{s}}}[$__rate_interval]))", "stranded"),
+        target(f"sum(rate(weir_drain_segments_resumed_total{{{s}}}[$__rate_interval]))", "resumed"),
+    ], "Segments stranded (transient retries exhausted) vs auto-resumed when the sink recovered (4a). "
+       "Stranded climbing without matching resumed = delivery is stuck; correlate with sink health.",
+        unit="short",
+        overrides=[{"matcher": {"id": "byName", "options": "stranded"},
+                    "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}]), 12, 7)
 
     return L.panels
 

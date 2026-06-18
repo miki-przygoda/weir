@@ -108,6 +108,19 @@ groups:
           description: "The configured sink reports itself unhealthy. The WAB keeps buffering durably (no data loss), but delivery is stalled. Check the downstream system."
           runbook: "docs/monitoring.md#weirsinkdown"
 
+      - alert: WeirSinkDegraded
+        # weir_sink_health one-hot family; match the `degraded` series directly
+        # (same reasoning as WeirSinkDown above). Degraded = reachable but not
+        # fully healthy (e.g. a non-404 4xx on the HEAD probe) — delivery may
+        # still work, so warning, not critical.
+        expr: weir_sink_health{job=~"weir", state="degraded"} == 1
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir sink reporting DEGRADED on {{ $labels.instance }}"
+          description: "The configured sink reports itself degraded (reachable but not fully healthy). The WAB keeps buffering durably, but delivery may be impaired. Check the downstream system; correlate with WeirSegmentStranded / WeirDeadLettered."
+          runbook: "docs/monitoring.md#weirsinkdegraded"
+
       - alert: WeirSegmentStranded
         expr: increase(weir_drain_segments_stranded_total{job=~"weir"}[15m]) > 0
         for: 0m
