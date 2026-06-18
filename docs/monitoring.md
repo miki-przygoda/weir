@@ -193,6 +193,38 @@ reload landed (and `outcome="failed"` that it was rejected).
 
 ---
 
+## Capacity: surviving a sink outage
+
+weir's pitch is "buffer durably while the uplink is down." That's bounded by
+**disk**: while the sink is unreachable, every accepted record stays in the WAB
+(and, for permanent rejections, the dead-letter dir), so the buffer grows at the
+ingest rate until storage fills. Size it deliberately:
+
+> **time-to-WAB-full ≈ free_disk_bytes / (ingest_rate × avg_record_bytes)**
+
+For example, 50 GiB free and 5 MiB/s of accepted data ≈ **~2.9 hours** of outage
+headroom before the disk fills. Once the WAB partition is full, fsync fails and
+producers are Nacked (no false acks — they retry/backpressure), so you lose
+*availability*, not durability.
+
+Wire these so you see it coming, in order of urgency:
+
+1. **WAB disk %** — a node/host alert on the filesystem holding `wab_dir` (weir
+   doesn't measure free disk itself); page well before 100%. Cross-check
+   `weir_wab_bytes_on_disk` for weir's own contribution.
+2. **Dead-letter vs cap** — `weir_dead_letter_bytes_on_disk` approaching
+   `dead_letter_max_bytes`; at the cap the drain blocks (see below).
+3. **Drain blocked** — `weir_drain_state{state="blocked_dead_letter_full"} == 1`
+   (`WeirDrainBlocked`) means all delivery is paused.
+4. **Sink down / segments stranded** — `WeirSinkDown` + `WeirSegmentStranded`
+   are the leading indicators that the buffer has started growing at all.
+
+Mitigations: raise `dead_letter_max_bytes` only if the disk can take it; add disk;
+lower the ingest rate (producer backpressure); or fix the sink. Stranded segments
+re-drain automatically on recovery (watch `weir_drain_segments_resumed_total`).
+
+---
+
 ## Metric reference
 
 All metrics are prefixed `weir_`. Counters carry a `_total` suffix in the

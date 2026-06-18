@@ -37,35 +37,59 @@ chmod 0700 /tmp/weir-quickstart/run
     --socket-path /tmp/weir-quickstart/run/weir.sock
 ```
 
-You should see output like:
+You should see a few `INFO` startup lines ending with the socket and the metrics
+endpoint coming up — the two stable signals that it's ready:
 
 ```
-2026-05-26T15:23:01Z  INFO weir_server: starting weir-server  socket=/tmp/weir-quickstart/run/weir.sock wab_dir=/tmp/weir-quickstart/wab shards=1 workers=1
-2026-05-26T15:23:01Z  INFO weir_server::wab: scanning for unsealed WAB segments
-2026-05-26T15:23:01Z  INFO weir_server::socket: socket listening  path=/tmp/weir-quickstart/run/weir.sock
-2026-05-26T15:23:01Z  INFO weir_server::metrics::server: metrics endpoint bound  addr=127.0.0.1:9185
-2026-05-26T15:23:01Z  INFO weir_server: pipeline assembled; awaiting connections
+INFO weir_server::socket: socket listening  path=/tmp/weir-quickstart/run/weir.sock
+INFO weir_server::metrics::server: metrics endpoint bound  addr=127.0.0.1:9185
 ```
 
-(Exact log wording may vary by version; `workers` defaults to `shard_count`.)
+(Exact wording varies by version. You may also see benign `WARN` lines at
+startup — e.g. a CPU-affinity note, or on macOS a durability note that
+`F_BARRIERFSYNC` is not power-loss-durable; run production on Linux. `workers`
+defaults to `shard_count`.)
 
 That's a fully-functional weir daemon. Leave it running and move on
 to pushing a record.
 
 ## Push your first record
 
-**Fastest path — the bundled example.** From the weir checkout, in a
-second terminal, run the ready-made `push_simple` example against the
-socket from the run above. No project setup, no deps to wire up:
+**Fastest path — `weir-ctl push`.** If you built `weir-ctl` (it's in the
+workspace), one already-compiled command pushes a record and prints the ack —
+nothing to wire up:
+
+```bash
+weir-ctl push --socket /tmp/weir-quickstart/run/weir.sock 'hello, weir!'
+# ack  12 bytes, Batched
+```
+
+**A small load — the bundled example.** From the weir checkout, in a second
+terminal, run the ready-made `push_simple` example against the socket from the
+run above:
 
 ```bash
 cargo run --release -p weir-client --example push_simple -- \
     --socket /tmp/weir-quickstart/run/weir.sock --count 5
 ```
 
+> `push_simple` pushes `--count` records at **each** durability tier (Sync,
+> Batched, Buffered), so `--count 5` sends **15** records in total.
+
 **From your own project.** When you're ready to push from your own code,
 add `weir-client` and `weir-core` as dependencies and write a small
-program against the synchronous client API:
+program against the synchronous client API. weir isn't on crates.io yet (it
+publishes with 1.0), so until then use a git or path dependency:
+
+```toml
+[dependencies]
+# Until the crates.io publish lands with 1.0, depend on the repo directly:
+weir-client = { git = "https://github.com/miki-przygoda/weir" }
+weir-core   = { git = "https://github.com/miki-przygoda/weir" }
+# (or a local path: weir-client = { path = "../weir/crates/weir-client" })
+```
+
+Then write the program against the synchronous client API:
 
 ```rust
 // examples/hello.rs
