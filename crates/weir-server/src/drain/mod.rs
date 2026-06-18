@@ -989,48 +989,12 @@ async fn commit_batch<S: Sink>(
                     .into_iter()
                     .map(|(r, _reason)| r.into_payload())
                     .collect();
-
-                let estimated = estimated_write_bytes(&dead_payloads);
-                if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
-                    if estimated > config.dead_letter_max_bytes {
-                        // This batch alone exceeds the cap, so blocking could never
-                        // clear (even an empty dir won't fit it) — that would wedge
-                        // the drain forever in a block↔retry livelock (F03). The cap
-                        // bounds steady-state growth, not a single oversized
-                        // permanent rejection; write it anyway (overshoot once).
-                        warn!(
-                            estimated,
-                            cap = config.dead_letter_max_bytes,
-                            "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
-                        );
-                    } else {
-                        return BatchResult::Blocked;
-                    }
-                }
-
-                match dead_letter.write_records(&dead_payloads) {
-                    Ok(()) => {
-                        metrics
-                            .sink_commit_records
-                            .get_or_create(&OutcomeLabel {
-                                outcome: Outcome::dead_lettered,
-                            })
-                            .inc_by(dead_payloads.len() as u64);
-                        metrics
-                            .dead_letter_bytes_on_disk
-                            .set(dead_letter.total_bytes() as f64);
-                    }
-                    Err(e) => {
-                        // The records were rejected by the sink AND could not be
-                        // dead-lettered (e.g. ENOSPC on the dead-letter dir — exactly
-                        // when pressure peaks). Falling through to Ok would confirm
-                        // and DELETE the segment with these records neither delivered
-                        // nor dead-lettered: silent data loss. Treat it as transient
-                        // so the segment is preserved and retried (the already-
-                        // committed records re-send under the at-least-once contract).
-                        error!(error = %e, "drain: failed to write dead-letter records; preserving segment for retry");
-                        return BatchResult::Transient { retry_after: None };
-                    }
+                // A failed dead-letter write (or a cap block) must NOT fall through
+                // to Ok: confirming would delete the segment with these records
+                // neither delivered nor dead-lettered — silent data loss (B1/F02).
+                if let Err(failure) = dead_letter_records(&dead_payloads, dead_letter, config, metrics)
+                {
+                    return failure;
                 }
             }
 
@@ -1069,50 +1033,70 @@ async fn commit_batch<S: Sink>(
                 .observe(t.elapsed().as_secs_f64());
             error!(error = %e, "drain: permanent sink error; dead-lettering batch");
 
-            let estimated = estimated_write_bytes(payloads);
-            if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
-                if estimated > config.dead_letter_max_bytes {
-                    // Batch alone exceeds the cap — blocking could never clear, so
-                    // write it anyway rather than livelock the drain (F03). The cap
-                    // bounds steady-state growth, not one oversized permanent batch.
-                    warn!(
-                        estimated,
-                        cap = config.dead_letter_max_bytes,
-                        "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
-                    );
-                } else {
-                    return BatchResult::Blocked;
-                }
-            }
-
-            match dead_letter.write_records(payloads) {
-                Ok(()) => {
-                    metrics
-                        .sink_commit_records
-                        .get_or_create(&OutcomeLabel {
-                            outcome: Outcome::dead_lettered,
-                        })
-                        .inc_by(payloads.len() as u64);
-                    metrics
-                        .dead_letter_bytes_on_disk
-                        .set(dead_letter.total_bytes() as f64);
-                }
-                Err(dl_err) => {
-                    // The batch hit a permanent sink error AND could not be
-                    // dead-lettered. Confirming here would DELETE the segment with
-                    // the records neither delivered nor dead-lettered — silent data
-                    // loss. Preserve the segment by retrying; the dead-letter write
-                    // typically succeeds once disk pressure clears, or the drain
-                    // blocks on the dead-letter cap (would_exceed_cap above).
-                    error!(error = %dl_err, "drain: failed to dead-letter records for permanent error; preserving segment for retry");
-                    return BatchResult::Transient { retry_after: None };
-                }
+            // Same silent-data-loss guard as the partial-rejection path above: a
+            // failed dead-letter write (or a cap block) preserves the segment for
+            // retry instead of confirming + deleting it (B1/F02).
+            if let Err(failure) = dead_letter_records(payloads, dead_letter, config, metrics) {
+                return failure;
             }
 
             // Dead-letter write succeeded: the records are durably re-homed, so the
             // segment can be confirmed. Leaving it unconsumed would replay the same
             // permanent-error records on every restart.
             BatchResult::Ok
+        }
+    }
+}
+
+/// Dead-letters `records` under the `dead_letter_max_bytes` cap, bumping the
+/// `dead_lettered` outcome counter and the `dead_letter_bytes_on_disk` gauge on
+/// success. Single source of truth for the cap pre-check + write + accounting,
+/// shared by the partial-rejection and whole-batch-permanent paths in
+/// `commit_batch` (previously duplicated byte-for-byte).
+///
+/// On failure it returns the `BatchResult` the caller must propagate WITHOUT
+/// confirming the segment:
+/// - `Err(BatchResult::Blocked)` when the write would exceed the cap and the
+///   batch is not itself larger than the whole cap (a one-off oversized batch is
+///   written anyway — overshoot once — to avoid a permanent block↔retry livelock, F03).
+/// - `Err(BatchResult::Transient)` when the dead-letter write itself fails (e.g.
+///   ENOSPC): the segment is preserved and retried rather than confirmed+deleted
+///   with the records neither delivered nor dead-lettered — silent data loss (B1/F02).
+fn dead_letter_records(
+    records: &[Payload],
+    dead_letter: &mut DeadLetterWriter,
+    config: &DrainConfig,
+    metrics: &Metrics,
+) -> Result<(), BatchResult> {
+    let estimated = estimated_write_bytes(records);
+    if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
+        if estimated > config.dead_letter_max_bytes {
+            warn!(
+                estimated,
+                cap = config.dead_letter_max_bytes,
+                "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
+            );
+        } else {
+            return Err(BatchResult::Blocked);
+        }
+    }
+
+    match dead_letter.write_records(records) {
+        Ok(()) => {
+            metrics
+                .sink_commit_records
+                .get_or_create(&OutcomeLabel {
+                    outcome: Outcome::dead_lettered,
+                })
+                .inc_by(records.len() as u64);
+            metrics
+                .dead_letter_bytes_on_disk
+                .set(dead_letter.total_bytes() as f64);
+            Ok(())
+        }
+        Err(e) => {
+            error!(error = %e, "drain: failed to write dead-letter records; preserving segment for retry");
+            Err(BatchResult::Transient { retry_after: None })
         }
     }
 }
