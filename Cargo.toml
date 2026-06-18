@@ -19,6 +19,17 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/miki-przygoda/weir"
+homepage = "https://github.com/miki-przygoda/weir"
+
+# Inter-crate dependency versions centralised here so a workspace version bump is
+# a single edit, not one per dependent crate (the previous hardcoded
+# `version = "1.0.0"` in every Cargo.toml was a next-bump footgun). Each crate
+# refers to these with `weir-core = { workspace = true }`, etc.
+[workspace.dependencies]
+weir-core = { path = "crates/weir-core", version = "1.0.0" }
+weir-wab = { path = "crates/weir-wab", version = "1.0.0" }
+weir-sink-sdk = { path = "crates/weir-sink-sdk", version = "1.0.0" }
+weir-client = { path = "crates/weir-client", version = "1.0.0" }
 
 # Release-profile tuning for production builds and the load suite.
 # - lto = "fat": cross-crate inlining. Build time ~2-3× slower; runtime

@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords = ["weir", "sink", "ingestion", "database", "async"]
 categories = ["database", "asynchronous"]
 
@@ -16,4 +17,4 @@ all-features = true
 # The only dependency: weir-core, for the `Payload` type — a newtype wrapper over
 # `bytes::Bytes` (not a re-export; see the R1 newtype rationale). Sink authors
 # implement these traits without pulling in the daemon.
-weir-core = { path = "../weir-core", version = "1.0.0" }
+weir-core = { workspace = true }

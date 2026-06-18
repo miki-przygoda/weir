@@ -6,9 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords = ["weir", "wal", "durability", "segment", "format"]
 categories = ["encoding", "filesystem"]
 
 [dependencies]
-weir-core = { path = "../weir-core", version = "1.0.0" }
+weir-core = { workspace = true }
 crc32fast = "1.4"

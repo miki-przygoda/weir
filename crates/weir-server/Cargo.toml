@@ -31,6 +31,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords = ["durability", "write-buffer", "wal", "daemon", "ingestion"]
 categories = ["database", "network-programming", "asynchronous"]
 
@@ -42,15 +43,15 @@ name = "weir-server"
 path = "src/main.rs"
 
 [dependencies]
-weir-core = { path = "../weir-core", version = "1.0.0" }
+weir-core = { workspace = true }
 # On-disk WAB segment format + SegmentReader. Extracted into its own crate so
 # weir-ctl can read dead-letter segments (for `dl requeue`) without depending on
 # the daemon's full async/sink dep tree — one parser, shared by both.
-weir-wab = { path = "../weir-wab", version = "1.0.0" }
+weir-wab = { workspace = true }
 # Sink trait + error contract. Extracted into its own published crate so third
 # parties can write sinks without depending on the daemon; the built-in sinks
 # (http/mysql/postgres/clickhouse/noop) implement these traits.
-weir-sink-sdk = { path = "../weir-sink-sdk", version = "1.0.0" }
+weir-sink-sdk = { workspace = true }
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = [
@@ -140,7 +141,7 @@ arc-swap = { version = "1", optional = true }
 [dev-dependencies]
 # `tls` is enabled so the mTLS benchmark (tests/load_tls.rs) can use the client's
 # connect_tls; weir-server's own `tls` feature can't forward to a dev-dependency.
-weir-client = { path = "../weir-client", features = ["tls"] }
+weir-client = { workspace = true, features = ["tls"] }
 weir-testkit = { path = "../weir-testkit" }
 ureq = "2"
 # Generates throwaway CA / server / client certs for the TLS integration tests.

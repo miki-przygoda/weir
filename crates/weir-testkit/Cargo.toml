@@ -6,9 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 publish = false
 
 [dependencies]
-weir-client = { path = "../weir-client" }
+weir-client = { workspace = true }
 libc = "0.2"
 rcgen = "0.13"
