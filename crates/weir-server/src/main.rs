@@ -351,6 +351,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 HttpBatchMode::PerRecord
             };
+            // sink_http_concurrency only applies to per-record POSTs; in ndjson
+            // mode the whole batch is one POST, so report it as inert rather than
+            // logging a misleading "concurrency = 8".
+            let concurrency_display = match batch_mode {
+                HttpBatchMode::Ndjson => "n/a (ndjson)".to_string(),
+                HttpBatchMode::PerRecord => config.sink_http_concurrency.to_string(),
+            };
             info!(
                 // The URL may carry userinfo (user:password@host); redact the
                 // password so it never reaches a log line (S25).
@@ -358,7 +365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bearer = bearer_token.is_some(),
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
-                concurrency = config.sink_http_concurrency,
+                concurrency = %concurrency_display,
                 batch = %config.sink_http_batch,
                 "sink: http"
             );

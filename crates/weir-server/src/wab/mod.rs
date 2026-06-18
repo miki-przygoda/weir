@@ -674,22 +674,19 @@ fn flush_batch(
             };
 
             // write_record returns Some(sealed_path) when the segment rotated.
-            let rotation = match writer.write_record(&unit.payload) {
-                Ok(rotation) => rotation,
-                Err(_) => {
-                    // The active segment was dropped. Records already collected
-                    // for it (pending_acks) are now in an abandoned, un-fsynced
-                    // file — Nack them rather than let the group fsync below
-                    // falsely ack them. Records in already-rotated (sealed +
-                    // fsynced) segments are durable and untouched.
-                    for ack_tx in pending_acks.drain(..) {
-                        let _ = ack_tx.send(false);
-                    }
-                    #[cfg(feature = "bench-trace")]
-                    pending_ts.clear();
-                    let _ = unit.ack_tx.send(false);
-                    continue;
+            let Ok(rotation) = writer.write_record(&unit.payload) else {
+                // The active segment was dropped. Records already collected
+                // for it (pending_acks) are now in an abandoned, un-fsynced
+                // file — Nack them rather than let the group fsync below
+                // falsely ack them. Records in already-rotated (sealed +
+                // fsynced) segments are durable and untouched.
+                for ack_tx in pending_acks.drain(..) {
+                    let _ = ack_tx.send(false);
                 }
+                #[cfg(feature = "bench-trace")]
+                pending_ts.clear();
+                let _ = unit.ack_tx.send(false);
+                continue;
             };
 
             // Observe the write stage (pre-fsync).

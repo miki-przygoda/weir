@@ -179,30 +179,26 @@ fn run_drain_supervised<S: Sink>(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             drain_thread(rx, sink, cfg, m)
         }));
-        match result {
-            // Clean exit: the channel closed (all flushers gone). Done.
-            Ok(()) => break,
-            Err(_) => {
-                attempts += 1;
-                metrics.drain_panics.inc();
-                if attempts >= MAX_DRAIN_RESPAWNS {
-                    error!(
-                        attempts,
-                        "drain thread panicked too many times; giving up — delivery is \
-                         stopped and the WAB will accumulate on disk until restart"
-                    );
-                    break;
-                }
-                error!(
-                    attempts,
-                    max = MAX_DRAIN_RESPAWNS,
-                    "drain thread panicked; respawning"
-                );
-                std::thread::sleep(Duration::from_millis(
-                    100u64.saturating_mul(attempts as u64),
-                ));
-            }
+        // A clean Ok(()) return means the channel closed (all flushers gone) — done.
+        let Err(_) = result else { break };
+        attempts += 1;
+        metrics.drain_panics.inc();
+        if attempts >= MAX_DRAIN_RESPAWNS {
+            error!(
+                attempts,
+                "drain thread panicked too many times; giving up — delivery is \
+                 stopped and the WAB will accumulate on disk until restart"
+            );
+            break;
         }
+        error!(
+            attempts,
+            max = MAX_DRAIN_RESPAWNS,
+            "drain thread panicked; respawning"
+        );
+        std::thread::sleep(Duration::from_millis(
+            100u64.saturating_mul(attempts as u64),
+        ));
     }
     info!("drain supervisor exiting");
 }
@@ -225,42 +221,39 @@ fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
 }
 
 fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
-    let (healthy, degraded, down) = match &health {
-        SinkHealth::Healthy => (1.0, 0.0, 0.0),
+    // Map the health to its one-hot active state (logging the reason on the
+    // off-nominal arms), then drive the gauge family the same way set_drain_state
+    // does: exactly one label set to 1.0, the rest 0.0.
+    let active = match &health {
+        SinkHealth::Healthy => SinkHealthState::healthy,
         SinkHealth::Degraded(reason) => {
             warn!(reason = %reason, "sink health: degraded");
-            (0.0, 1.0, 0.0)
+            SinkHealthState::degraded
         }
         SinkHealth::Down(reason) => {
             error!(reason = %reason, "sink health: down");
-            (0.0, 0.0, 1.0)
+            SinkHealthState::down
         }
         // SinkHealth is #[non_exhaustive] (F48): report an unrecognised future
         // state as degraded so the gauge still moves off "healthy" and operators
         // get a signal rather than a silently-stuck reading.
         _ => {
             warn!("sink health: unrecognised state; reporting as degraded");
-            (0.0, 1.0, 0.0)
+            SinkHealthState::degraded
         }
     };
-    metrics
-        .sink_health
-        .get_or_create(&SinkHealthLabel {
-            state: SinkHealthState::healthy,
-        })
-        .set(healthy);
-    metrics
-        .sink_health
-        .get_or_create(&SinkHealthLabel {
-            state: SinkHealthState::degraded,
-        })
-        .set(degraded);
-    metrics
-        .sink_health
-        .get_or_create(&SinkHealthLabel {
-            state: SinkHealthState::down,
-        })
-        .set(down);
+    let states = [
+        SinkHealthState::healthy,
+        SinkHealthState::degraded,
+        SinkHealthState::down,
+    ];
+    for s in states {
+        let v = if s == active { 1.0 } else { 0.0 };
+        metrics
+            .sink_health
+            .get_or_create(&SinkHealthLabel { state: s })
+            .set(v);
+    }
 }
 
 /// Probes [`Sink::health`] under a timeout backstop and maps a hang to `Down`.
@@ -708,15 +701,10 @@ fn enter_blocked(
     // transient unblock of the same pressure (a flapping cap) — reuse the stored
     // instant so `dead_letter_full` counts distinct episodes and the duration
     // gauge keeps climbing rather than resetting (F09).
-    let blocked_since = match *block_episode {
-        Some(started) => started,
-        None => {
-            let now = Instant::now();
-            metrics.dead_letter_full.inc();
-            *block_episode = Some(now);
-            now
-        }
-    };
+    let blocked_since = *block_episode.get_or_insert_with(|| {
+        metrics.dead_letter_full.inc();
+        Instant::now()
+    });
     set_drain_state(metrics, DrainStateValue::blocked_dead_letter_full);
     DrainState::BlockedDeadLetterFull {
         segment,
@@ -992,7 +980,8 @@ async fn commit_batch<S: Sink>(
                 // A failed dead-letter write (or a cap block) must NOT fall through
                 // to Ok: confirming would delete the segment with these records
                 // neither delivered nor dead-lettered — silent data loss (B1/F02).
-                if let Err(failure) = dead_letter_records(&dead_payloads, dead_letter, config, metrics)
+                if let Err(failure) =
+                    dead_letter_records(&dead_payloads, dead_letter, config, metrics)
                 {
                     return failure;
                 }

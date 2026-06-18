@@ -442,9 +442,11 @@ pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<
     let buf = fs::read(&confirmed_path)?;
     match parse_confirmed(&buf) {
         Ok(_) => Ok(true),
-        Err(e @ ConfirmedParseError::BadMagic)
-        | Err(e @ ConfirmedParseError::CrcMismatch { .. })
-        | Err(e @ ConfirmedParseError::WrongLength { .. }) => {
+        Err(
+            e @ (ConfirmedParseError::BadMagic
+            | ConfirmedParseError::CrcMismatch { .. }
+            | ConfirmedParseError::WrongLength { .. }),
+        ) => {
             let reason = format!("invalid .confirmed file: {e}");
             quarantine(sealed_path, wab_dir, &reason)?;
             quarantine(&confirmed_path, wab_dir, &reason)?;

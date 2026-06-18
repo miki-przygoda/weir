@@ -54,7 +54,7 @@ impl<T> QueueSender<T> {
     /// `weir_queue_depth` metric poll task. This is a cross-partition in-flight
     /// total, not a free-slot count.
     pub fn len(&self) -> usize {
-        self.txs.iter().map(|t| t.len()).sum()
+        self.txs.iter().map(crossbeam_channel::Sender::len).sum()
     }
 
     /// True when every partition is empty (no records in flight). Companion to
@@ -67,7 +67,7 @@ impl<T> QueueSender<T> {
     /// is exercised by the unit tests.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.txs.iter().all(|t| t.is_empty())
+        self.txs.iter().all(crossbeam_channel::Sender::is_empty)
     }
 
     /// Blocking push, test-only. Production code routes through

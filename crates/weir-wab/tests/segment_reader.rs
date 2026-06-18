@@ -48,7 +48,10 @@ fn read_ok(path: &Path) -> Vec<Vec<u8>> {
 fn round_trip_n_records_across_crate_boundary() {
     let path = tmp_path("rt");
     write_segment(&path, &[b"one", b"two", b"three"], b"");
-    assert_eq!(read_ok(&path), vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    assert_eq!(
+        read_ok(&path),
+        vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+    );
     std::fs::remove_file(&path).ok();
 }
 

@@ -168,8 +168,7 @@ fn connect_client(socket: &Path) -> Result<WeirClient, String> {
 }
 
 fn cmd_health(socket: &Path) -> Result<(), String> {
-    let mut client =
-        connect_client(socket)?;
+    let mut client = connect_client(socket)?;
     client
         .health_check()
         .map_err(|e| format!("health check failed: {e}"))?;
@@ -178,8 +177,7 @@ fn cmd_health(socket: &Path) -> Result<(), String> {
 }
 
 fn cmd_push(socket: &Path, payload: &[u8], durability: Durability) -> Result<(), String> {
-    let mut client =
-        connect_client(socket)?;
+    let mut client = connect_client(socket)?;
     client
         .push(payload, durability)
         .map_err(|e| format!("push failed: {e}"))?;
@@ -515,8 +513,7 @@ fn cmd_dl_requeue(
     // Real run. Connect once, then requeue segment-by-segment. A segment is
     // deleted only after ALL of its records are re-accepted, so a crash bounds
     // duplication to at most the in-flight segment.
-    let mut client =
-        connect_client(socket)?;
+    let mut client = connect_client(socket)?;
 
     let mut total_requeued: u64 = 0;
     let mut segments_cleared: usize = 0;
@@ -658,7 +655,10 @@ fn print_summary(body: &str) {
 
     // Labels padded to a single consistent width so the values line up.
     println!("── weir ──────────────────────────────────");
-    println!("{:<10} accepted {accepted}  ack {acked}  nack {nacked}", "ingest");
+    println!(
+        "{:<10} accepted {accepted}  ack {acked}  nack {nacked}",
+        "ingest"
+    );
     println!(
         "{:<10} fsync avg {fsync_avg_ms:.2} ms  wab {} on disk",
         "durability",
@@ -666,7 +666,11 @@ fn print_summary(body: &str) {
     );
     println!("{:<10} depth {queue_depth}", "queue");
     println!("{:<10} type: {sink_type}  health: {sink_health}", "sink");
-    println!("{:<10} {} on disk", "dead-ltr", fmt_bytes(dead_letter_bytes as u64));
+    println!(
+        "{:<10} {} on disk",
+        "dead-ltr",
+        fmt_bytes(dead_letter_bytes as u64)
+    );
 
     // Loud warnings for the durability hazards.
     if sink_type == "noop" {
