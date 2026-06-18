@@ -538,6 +538,28 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ---
 
+#### `health_poll_interval_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `30`
+- **Range**: 1–3600
+- **CLI**: `--health-poll-interval-secs <n>`
+- **Env**: `WEIR_HEALTH_POLL_INTERVAL_SECS`
+- **TOML**: `health_poll_interval_secs`
+
+How often the drain re-probes sink health and rescans for **stranded** segments
+to re-drain. The probe runs on a wall-clock cadence, so it fires even while the
+drain is busy under sustained load (it is **not** gated on the channel going
+idle). This is also the upper bound on how long a stranded segment waits before
+the drain notices the sink recovered.
+
+**When to tune**: lower it (e.g. 5–10 s) for faster stranded-segment recovery on
+a flaky uplink; raise it to probe a rate-sensitive sink less often. The health
+**probe** itself is bounded by a separate short timeout (5 s, or `sink_timeout_secs`
+if shorter), independent of the long `commit` backstop.
+
+---
+
 ### Sink selection
 
 Weir ships with five built-in sinks. The **default build** compiles in `noop`,

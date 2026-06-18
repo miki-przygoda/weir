@@ -97,6 +97,13 @@ dead_letter_max_bytes = 1073741824
 # Env: WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS
 dead_letter_check_interval_secs = 30
 
+# How often (seconds) the drain re-probes sink health and rescans for stranded
+# segments to re-drain (wall-clock cadence — fires under sustained load too).
+# Also the upper bound on stranded-segment recovery latency after a sink
+# recovers. Lower for faster recovery on a flaky uplink. Range: 1-3600.
+# Env: WEIR_HEALTH_POLL_INTERVAL_SECS
+health_poll_interval_secs = 30
+
 # ── Sink selection ────────────────────────────────────────────────────────────
 
 # Which built-in sink to run. One of:

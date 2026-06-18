@@ -80,10 +80,16 @@ pub struct DrainConfig {
     /// timeout). On elapse, the commit is treated as a transient error and the
     /// segment is retried.
     pub commit_timeout: Duration,
-    /// How often the idle drain re-probes sink health (and, on a down→up
-    /// recovery, rescans for stranded segments to re-drain). Default
-    /// [`HEALTH_POLL_INTERVAL`]; shortened in tests.
+    /// How often the drain re-probes sink health and rescans for stranded
+    /// segments to re-drain. Enforced on a wall-clock cadence so it fires even
+    /// under sustained load (not only when the channel goes idle). Default
+    /// [`HEALTH_POLL_INTERVAL`]; operator-tunable via `health_poll_interval_secs`.
     pub health_poll_interval: Duration,
+    /// Timeout for the sink health *probe* (the HEAD/ping in `probe_health`),
+    /// kept separate from — and much shorter than — `commit_timeout`: a probe is
+    /// a liveness check, not a delivery, so it shouldn't inherit the long
+    /// commit backstop. A hung probe past this is treated as `Down`.
+    pub health_probe_timeout: Duration,
 }
 
 // ── Internal state machine types ──────────────────────────────────────────────
@@ -287,7 +293,7 @@ fn probe_and_resume_stranded<S: Sink>(
     pending: &mut VecDeque<PathBuf>,
     prev_health_ok: bool,
 ) -> bool {
-    let health = probe_health(rt, sink, config.commit_timeout);
+    let health = probe_health(rt, sink, config.health_probe_timeout);
     let now_ok = matches!(health, SinkHealth::Healthy);
     set_sink_health(metrics, health);
 
@@ -296,12 +302,18 @@ fn probe_and_resume_stranded<S: Sink>(
         // a startup-replay concern, not a recovery one.
         match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None) {
             Ok(sealed) => {
+                // Dedup against what's already queued via a HashSet membership view
+                // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
+                // matters when a long outage strands many segments (F-rescan).
+                let already: std::collections::HashSet<&PathBuf> = pending.iter().collect();
+                let fresh: Vec<PathBuf> = sealed
+                    .into_iter()
+                    .filter(|seg| !already.contains(seg))
+                    .collect();
                 let mut resumed = 0u64;
-                for seg in sealed {
-                    if !pending.contains(&seg) {
-                        pending.push_back(seg);
-                        resumed += 1;
-                    }
+                for seg in fresh {
+                    pending.push_back(seg);
+                    resumed += 1;
                 }
                 if resumed > 0 {
                     metrics.drain_segments_resumed.inc_by(resumed);
@@ -359,77 +371,90 @@ fn drain_thread<S: Sink>(
     // is not a recovery). Set `false` whenever a segment strands.
     let mut prev_health_ok = true;
 
+    // Wall-clock anchor for the health-poll + stranded-segment rescan. Driving it
+    // off elapsed time (not channel idleness) means recovery fires even under
+    // sustained ingest — a busy drain channel can no longer starve it (the idle
+    // recv_timeout branch alone never fired while segments kept arriving).
+    let mut last_health_poll = Instant::now();
+
     'outer: loop {
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
                 set_drain_state(&metrics, DrainStateValue::draining);
 
-                let segment = if let Some(p) = pending.pop_front() {
-                    p
+                // Wall-clock health poll + stranded-segment rescan. Runs on the
+                // `health_poll_interval` cadence regardless of channel activity, so
+                // a recovered sink re-drains its stranded backlog even while ingest
+                // is saturating the drain channel (the old idle-only poll never
+                // fired under sustained load). `pending` is drained in submission
+                // order, so re-queued stranded segments interleave with new ones.
+                if last_health_poll.elapsed() >= config.health_poll_interval {
+                    prev_health_ok = probe_and_resume_stranded(
+                        &rt,
+                        &*sink,
+                        &config,
+                        &metrics,
+                        &mut pending,
+                        prev_health_ok,
+                    );
+                    // Refresh the dead-letter size gauge too, so an out-of-band
+                    // `weir-ctl dl drop` (an operator deleting files while the
+                    // daemon runs) is reflected without waiting for the blocked
+                    // state or a restart.
+                    if dead_letter.rescan().is_ok() {
+                        metrics
+                            .dead_letter_bytes_on_disk
+                            .set(dead_letter.total_bytes() as f64);
+                    }
+                    last_health_poll = Instant::now();
+                }
+
+                let next_segment = if let Some(p) = pending.pop_front() {
+                    Some(p)
                 } else {
-                    // Wait for a new segment, but wake every
-                    // HEALTH_POLL_INTERVAL to refresh sink health so the
-                    // gauge stays current even on an idle daemon. Channel
-                    // closure (all WAB flushers exited) still ends the loop.
-                    loop {
-                        match drain_rx.recv_timeout(config.health_poll_interval) {
-                            Ok(p) => break p,
-                            Err(RecvTimeoutError::Timeout) => {
-                                // Probe sink health; on a down→up recovery edge
-                                // this re-queues any stranded segments into
-                                // `pending` so a recovered sink drains its backlog
-                                // without a daemon restart.
-                                prev_health_ok = probe_and_resume_stranded(
-                                    &rt,
-                                    &*sink,
-                                    &config,
-                                    &metrics,
-                                    &mut pending,
-                                    prev_health_ok,
-                                );
-                                // Refresh the dead-letter size gauge on the idle
-                                // poll too, so an out-of-band `weir-ctl dl drop`
-                                // (an operator deleting files while the daemon
-                                // runs) is reflected. Without this the gauge only
-                                // re-stats in the blocked state, so on an otherwise
-                                // idle daemon it would read stale until restart.
-                                if dead_letter.rescan().is_ok() {
-                                    metrics
-                                        .dead_letter_bytes_on_disk
-                                        .set(dead_letter.total_bytes() as f64);
-                                }
-                                // A recovery rescan may have re-queued a stranded
-                                // segment — process it now rather than waiting for
-                                // the next channel send.
-                                if let Some(p) = pending.pop_front() {
-                                    break p;
-                                }
-                            }
-                            Err(RecvTimeoutError::Disconnected) => break 'outer,
-                        }
+                    // Idle: wait for a new segment, but no longer than the time
+                    // left until the next health poll, then re-enter Draining so
+                    // the wall-clock poll above runs. Channel closure (all WAB
+                    // flushers exited) still ends the loop.
+                    let until_next_poll = config
+                        .health_poll_interval
+                        .saturating_sub(last_health_poll.elapsed())
+                        .max(Duration::from_millis(1));
+                    match drain_rx.recv_timeout(until_next_poll) {
+                        Ok(p) => Some(p),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => break 'outer,
                     }
                 };
 
-                // Fresh segment → process from the start (skip = 0).
-                let result = rt.block_on(process_segment(
-                    &segment,
-                    &*sink,
-                    &config,
-                    &metrics,
-                    &mut dead_letter,
-                    0,
-                ));
-
-                // Just refresh the health gauge here — the stranded-segment
-                // rescan runs only at the idle poll (below), where `pending` is
-                // empty and no segment is mid-confirm, so it can't re-queue the
-                // segment currently being processed. `prev_health_ok` is managed
-                // by the strand (sets it false) and the idle poll (recovery edge).
-                let health = probe_health(&rt, &*sink, config.commit_timeout);
-                set_sink_health(&metrics, health);
-
-                transition_from_draining(segment, result, &config, &metrics, &mut block_episode)
+                match next_segment {
+                    // Idle timeout with nothing queued: re-enter Draining so the
+                    // wall-clock health poll above runs on schedule.
+                    None => DrainState::Draining,
+                    Some(segment) => {
+                        // Fresh segment → process from the start (skip = 0). The
+                        // health gauge + rescan are refreshed by the wall-clock
+                        // poll above, so we no longer probe the sink after every
+                        // segment (which, under sustained load, meant a HEAD
+                        // request per segment).
+                        let result = rt.block_on(process_segment(
+                            &segment,
+                            &*sink,
+                            &config,
+                            &metrics,
+                            &mut dead_letter,
+                            0,
+                        ));
+                        transition_from_draining(
+                            segment,
+                            result,
+                            &config,
+                            &metrics,
+                            &mut block_episode,
+                        )
+                    }
+                }
             }
 
             // ── RetryingTransient ─────────────────────────────────────────────
@@ -1429,6 +1454,7 @@ mod tests {
             commit_timeout: Duration::from_secs(30),
             // Short so the stranded-segment recovery rescan fires promptly in tests.
             health_poll_interval: Duration::from_millis(50),
+            health_probe_timeout: Duration::from_secs(5),
         }
     }
 

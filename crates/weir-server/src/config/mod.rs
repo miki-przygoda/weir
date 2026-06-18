@@ -235,6 +235,7 @@ pub(crate) struct PartialConfig {
     pub sink_clickhouse_column: Option<String>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
+    pub health_poll_interval_secs: Option<u64>,
     pub log_level: Option<String>,
     pub tcp_bind: Option<String>,
     pub tls_cert_path: Option<PathBuf>,
@@ -396,6 +397,9 @@ pub struct Config {
     pub sink_clickhouse_column: String,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
+    /// How often (seconds) the drain re-probes sink health and rescans for
+    /// stranded segments to re-drain. Wall-clock cadence (fires under load too).
+    pub health_poll_interval_secs: u64,
     pub log_level: String,
     /// TCP listen address for the mTLS listener (e.g. `0.0.0.0:7100`).
     /// `None` ⇒ no TCP listener; Unix-only. When `Some`, the three `tls_*`
@@ -714,6 +718,12 @@ impl Config {
             1,
             3_600,
         )?;
+        // Sink health-poll + stranded-segment rescan cadence (default = the
+        // HEALTH_POLL_INTERVAL const). Lower it for faster stranded-segment
+        // recovery; raise it to probe a flaky sink less often.
+        let health_poll_interval_secs = merge!(health_poll_interval_secs)
+            .unwrap_or_else(|| crate::drain::HEALTH_POLL_INTERVAL.as_secs());
+        check_range("health_poll_interval_secs", health_poll_interval_secs, 1, 3_600)?;
 
         // Treat an empty / whitespace-only value as unset → "info". Otherwise an
         // empty WEIR_LOG_LEVEL="" wins the merge and main's EnvFilter::try_new("")
@@ -820,6 +830,7 @@ impl Config {
             sink_clickhouse_column,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
+            health_poll_interval_secs,
             log_level,
             tcp_bind,
             tls_cert_path,
@@ -998,6 +1009,7 @@ mod tests {
         );
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
+        assert_eq!(c.health_poll_interval_secs, 30);
         assert_eq!(c.log_level, "info");
         fs::remove_dir_all(dir).ok();
     }

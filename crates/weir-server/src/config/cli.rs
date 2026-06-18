@@ -203,6 +203,9 @@ pub(super) fn parse_from(
         dead_letter_check_interval_secs: pargs
             .opt_value_from_str("--dead-letter-check-interval-secs")
             .map_err(pico_err)?,
+        health_poll_interval_secs: pargs
+            .opt_value_from_str("--health-poll-interval-secs")
+            .map_err(pico_err)?,
         log_level: pargs.opt_value_from_str("--log-level").map_err(pico_err)?,
         tcp_bind: pargs.opt_value_from_str("--tcp-bind").map_err(pico_err)?,
         tls_cert_path: pargs.opt_value_from_str("--tls-cert").map_err(pico_err)?,
