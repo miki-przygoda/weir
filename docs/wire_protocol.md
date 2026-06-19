@@ -79,10 +79,14 @@ an unrecognised reason byte should surface it (e.g. log the raw byte) rather
 than assume a specific meaning.
 
 `UnknownMessage` (`0x08`) is sent when a frame's header passes magic / version /
-header-CRC validation but carries a `message_type` or `durability` byte the
-daemon does not recognise — a **permanent** protocol error (typically version
-skew). It is distinct from `InternalError`: the daemon **closes** the connection
-after it, and retrying the identical frame will not succeed.
+header-CRC validation but the daemon will not act on the message: either the
+`message_type` or `durability` byte is unrecognised (typically version skew), **or
+the `message_type` is a valid daemon→client type** (`Ack` `0x02`, `Nack` `0x03`,
+or `HealthCheckResponse` `0x05`) that a client must only ever *receive*, never
+*send*. All of these are **permanent** protocol errors. It is distinct from
+`InternalError`: the daemon **closes** the connection after an `UnknownMessage`,
+and retrying the identical frame will not succeed (so a client must not retry on
+the same connection).
 
 `ReservedFlagsSet` (`0x09`) is sent when a frame's header is otherwise valid but
 sets one or more bits in the reserved `flags` byte (byte 7), which **must be
@@ -199,6 +203,7 @@ fresh connection.
 | Push with a zero-length payload | closed after Nack(EmptyPayload) |
 | Push with bad payload CRC | closed after Nack(BadPayloadCrc) |
 | Push with unknown message_type / durability | closed after Nack(UnknownMessage) |
+| Client sends a daemon→client message type (Ack / Nack / HealthCheckResponse) | closed after Nack(UnknownMessage) |
 | Push with a nonzero reserved `flags` byte | closed after Nack(ReservedFlagsSet) |
 | Idle past `connection_read_timeout_secs` mid-frame | closed silently (slowloris guard); no Nack |
 
@@ -296,10 +301,17 @@ single-byte payload.
 
 ### HealthCheck request and response
 
-A HealthCheck request has a zero-length payload. The `durability`
-field is unused (set to anything; the server doesn't read it). The
-HealthCheckResponse mirrors the shape — zero payload, all-zero
-payload CRC.
+A HealthCheck request has a zero-length payload. The daemon does not
+*act* on the `durability` field for a HealthCheck — but it still **must
+be a valid durability byte** (`0x01` Sync, `0x02` Batched, or `0x03`
+Buffered), because the daemon validates the entire header (including
+durability) before it dispatches on the message type. A HealthCheck
+carrying an out-of-range durability byte (e.g. `0x00`) is rejected with
+`UnknownDurability` → `Nack(UnknownMessage)` and the connection is
+closed, exactly as any other frame with a bad durability byte would be.
+Set it to `0x01` (Sync) by convention; the canonical `healthcheck`
+[conformance vector](conformance.md) does. The HealthCheckResponse
+mirrors the shape — zero payload, all-zero payload CRC.
 
 ## Minimum producer checklist
 
