@@ -19,3 +19,6 @@ book/
 .DS_Store
 PLAN.md
 todos
+
+# Local working docs (plans, scratch notes — not part of the repo)
+.workdocs/
