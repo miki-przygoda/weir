@@ -3,12 +3,25 @@
 
 /// Durability tier requested by the producer for a given record.
 /// Wire values are fixed and must not change without a WIRE_VERSION bump.
+///
+/// `Sync` and `Batched` carry the **same durability guarantee today**: the
+/// record is written and `fdatasync`ed — as part of one batch-boundary group
+/// fsync — *before* the ACK is sent, so an ack means the bytes are on stable
+/// storage and replay after a crash. They remain distinct wire values for
+/// historical and forward-compatibility reasons (originally `Sync` fsynced once
+/// per record and `Batched` once per batch; both now share the batch-boundary
+/// group fsync — see `docs/architecture.md`). `Buffered` trades durability for
+/// latency: it acks before any fsync.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
-    /// fsync before ACK. Producer blocks until the record is on stable storage.
+    /// Durable before ACK: written and `fdatasync`ed (via the batch-boundary
+    /// group fsync) before the ACK — on stable storage, replays after a crash.
     Sync = 0x01,
-    /// Batch fsync. Record is written before ACK but fsync is deferred to the batch boundary.
+    /// Durable before ACK — the same guarantee as [`Durability::Sync`] today:
+    /// written and `fdatasync`ed at the batch boundary before the ACK.
+    /// (Historically `Batched` deferred fsync to the batch boundary while `Sync`
+    /// fsynced per record; both now share the batch-boundary group fsync.)
     Batched = 0x02,
     /// Memory write only. ACK is sent after the record enters the in-memory queue.
     Buffered = 0x03,

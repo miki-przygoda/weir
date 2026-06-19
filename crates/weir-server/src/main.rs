@@ -802,10 +802,14 @@ fn advise_agent_count(shard_count: usize, worker_count: usize) {
             shard_count,
             worker_count,
             recommended_agent_count = recommended,
-            "shard_count/worker_count is well below the recommended value for this core \
-             count. On systems with parallel-fsync-capable storage (NVMe RAID, virtualised \
-             block devices) raising it can unlock additional throughput. This is advisory — \
-             override via config if you've measured your workload."
+            "shard_count/worker_count is below the recommended agent count for this core \
+             count. This is fine and often optimal: shard_count is a parallelism knob, not a \
+             throughput dial. Raising it helps only with many concurrent producers to spread \
+             across shards AND parallel-fsync-capable storage (NVMe RAID, virtualised block \
+             devices); with few connections more shards collapse group-fsync batching and can \
+             REDUCE throughput (the relationship is non-monotonic). The real durable-throughput \
+             lever is connection density into a few shards. Advisory only — see the shard_count \
+             tuning notes in docs/operations/configuration.md."
         );
     }
 }
