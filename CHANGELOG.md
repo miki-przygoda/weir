@@ -13,10 +13,12 @@ protocol** below.
 
 ---
 
-## [Unreleased]
+## [1.1.0] - 2026-06-19
 
-Additive operability features from the post-1.0 hands-on usage sweep. All
-backward compatible — no wire, on-disk, or API breaks.
+Additive operability features, a recovery hardening, and extensive doc truth-ups
+from the post-1.0 hands-on usage sweeps (Tier-4 features plus several rounds of
+"build a real app against the crates" persona sweeps). All backward compatible —
+no wire, on-disk, or API breaks.
 
 ### Added
 
@@ -42,6 +44,55 @@ backward compatible — no wire, on-disk, or API breaks.
   extracted so `weir-ctl` can read dead-letter segments with the *same* parser
   the daemon uses, without depending on the daemon's async/sink dependency tree.
   `FORMAT_VERSION = 1` is frozen under the SemVer promise above.
+- **Client reconnect helpers** — `WeirClient::is_poisoned()` and
+  `ClientError::is_recoverable()` let a long-lived or async-bridged producer
+  decide when to drop and rebuild a connection without matching the
+  `#[non_exhaustive]` `ClientError` enum.
+- **`weir-server --version` / `-V`** (previously only `weir-ctl` had it).
+- **`weir-wab` re-exports `Payload`** so a `weir-wab`-only consumer can name the
+  `SegmentReader` item type without a direct `weir-core` dependency; the
+  bad-segment-magic error is now human-readable (ASCII rendering + expected magic).
+- **systemd deployment artifacts** (`deploy/systemd/`) — a hardened `weir.service`
+  unit, an `EnvironmentFile` secret pattern, and a liveness+readiness probe
+  script, for bare-metal / VM operators (the deploy story was previously
+  Docker-only).
+
+### Reliability
+
+- **Active-segment crash recovery now quarantines a mid-file-corrupt tail**
+  instead of silently truncating it. On a CRC mismatch in the *middle* of a
+  recovered active segment (bit-rot, not a torn trailing write), recovery now
+  copies the whole segment to `quarantine/`, bumps
+  `weir_recovery_segments_quarantined_total`, and logs at ERROR — so acked
+  records sitting after the corruption are preserved and surfaced rather than
+  silently dropped, symmetric with the sealed-segment drain path. The normal
+  torn-tail crash case is unchanged (clean truncate, no quarantine).
+
+### Fixed
+
+- **`docker build` was broken** — the Dockerfile's dependency-stub stage omitted
+  the new `weir-wab` workspace member, failing the build; the `weir-wab` stub is
+  now included.
+- **docker-compose** used a `wget` healthcheck (absent from the
+  `ca-certificates`-only runtime image) and did not set
+  `WEIR_METRICS_BIND=0.0.0.0`, so the mapped metrics port was unscrapeable from
+  the host while the container still reported healthy. Both fixed.
+- **systemd readiness probe** compared gauge values as `"1"` while the daemon
+  emits `1.0`, so the sink-down / drain-blocked not-ready paths never tripped;
+  it also exited 1 silently on a wrong-but-live `/metrics` target. Both fixed.
+
+### Documentation
+
+- Extensive truth-ups from the persona sweeps: an async-producer guide (the
+  blocking-`push()`-starves-the-runtime trap + the recommended dedicated-thread
+  bridge); accurate `Durability` tier rustdoc (Sync and Batched both
+  group-`fdatasync` at the batch boundary before ack); the Windows /
+  cross-platform story (`weir-client`'s client type is Unix-only); a
+  concurrency-aware tuning note (`shard_count` is non-monotonic, not a throughput
+  dial); the transient-strands vs permanent-dead-letters distinction; the
+  `weir_sink_health` HEAD-probe lag; and a quarantined-segment recovery recipe.
+  The startup `shard_count` advisory no longer claims raising it "can unlock
+  additional throughput."
 
 ---
 
@@ -1459,6 +1510,7 @@ The five commits making up this pass:
 
 ---
 
+[1.1.0]: https://github.com/miki-przygoda/weir/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/miki-przygoda/weir/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/miki-przygoda/weir/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/miki-przygoda/weir/compare/v0.4.0...v0.5.0
