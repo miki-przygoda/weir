@@ -22,6 +22,14 @@ services:
       # Override individual config values without editing the TOML file.
       # All WEIR_* variables take precedence over the file.
       WEIR_LOG_LEVEL: info
+      # REQUIRED for the mapped metrics port to be scrapeable from the host.
+      # The daemon defaults metrics_bind=127.0.0.1, which inside the container
+      # is the container's loopback — the "127.0.0.1:9185:9185" mapping above
+      # then refuses host connections (yet the in-container HEALTHCHECK still
+      # passes, so the container looks healthy while Prometheus gets nothing).
+      # 0.0.0.0 is NOT a security boundary; the "127.0.0.1:" host-side of the
+      # port mapping is what keeps the endpoint local.
+      WEIR_METRICS_BIND: 0.0.0.0
 
     # weir-server writes to /var/lib/weir/wab (0o700) and binds the socket.
     # The image already creates a non-root 'weir' user; keep it.

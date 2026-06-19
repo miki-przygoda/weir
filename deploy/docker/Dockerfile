@@ -100,10 +100,14 @@ VOLUME ["/var/lib/weir/wab", "/run/weir"]
 # and waits for in-flight connections to drain (shutdown_timeout_secs).
 STOPSIGNAL SIGTERM
 
-# Lightweight liveness check using bash's /dev/tcp magic (no extra packages
+# Lightweight LIVENESS check using bash's /dev/tcp magic (no extra packages
 # needed). Opens a TCP connection to the metrics port; succeeds iff the
-# daemon is alive and the metrics server has bound. Tunable via
-# --health-* flags at run time.
+# daemon is alive and the metrics server has bound. Adjust the cadence via the
+# HEALTHCHECK --interval/--timeout/--retries options below (there are no weir
+# "--health-*" CLI flags). This is liveness only — it does not check sink
+# health or drain progress; the image ships only weir-server (no curl/awk/
+# weir-ctl), so a readiness gate must be an external probe over /metrics
+# (see deploy/systemd/weir-readiness.sh for the logic).
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
 
