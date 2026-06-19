@@ -77,31 +77,36 @@ cargo run --release -p weir-client --example push_simple -- \
 > Batched, Buffered), so `--count 5` sends **15** records in total.
 
 **From your own project.** When you're ready to push from your own code,
-add `weir-client` and `weir-core` as dependencies and write a small
-program against the synchronous client API. weir isn't on crates.io yet (it
-publishes with 1.0), so until then use a git or path dependency:
+add just `weir-client` and write a small program against the synchronous
+client API. `Durability` is re-exported from `weir-client`, so the basic
+producer path needs **only this one dependency** — pull in `weir-core`
+separately only if you need the lower-level wire types directly. weir isn't
+on crates.io yet (it publishes with 1.0), so until then use a git or path
+dependency:
 
 ```toml
 [dependencies]
 # Until the crates.io publish lands with 1.0, depend on the repo directly:
 weir-client = { git = "https://github.com/miki-przygoda/weir" }
-weir-core   = { git = "https://github.com/miki-przygoda/weir" }
 # (or a local path: weir-client = { path = "../weir/crates/weir-client" })
+# weir-core is only needed for the lower-level wire types, not a basic producer.
 ```
 
 Then write the program against the synchronous client API:
 
 ```rust
 // examples/hello.rs
-use weir_client::WeirClient;
-use weir_core::Durability;
+use weir_client::{Durability, WeirClient}; // Durability is re-exported here
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = WeirClient::connect("/tmp/weir-quickstart/run/weir.sock")?;
 
-    // Push a 12-byte record with Sync durability (fsync before ack).
+    // push() returns Result<(), ClientError>: Ok(()) means the record was
+    // durably acked at the requested tier. There is no ack payload — no
+    // server-assigned offset or id comes back. A dropped/ignored result hides a
+    // failed push, so `push` is #[must_use]; handle it (here via `?`).
     let payload = b"hello, weir!";
-    client.push(payload, Durability::Sync)?;
+    client.push(payload, Durability::Sync)?; // Sync = fsync before ack
     println!("pushed {} bytes", payload.len());
 
     // Verify the daemon is healthy.
@@ -113,8 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The client API is synchronous — one blocking socket round-trip per call,
-no async runtime required. Add `weir-client` and `weir-core` to your
-example/dev deps, then:
+no async runtime required. Add `weir-client` to your example/dev deps, then:
 
 ```bash
 cargo run --release --example hello
@@ -183,14 +187,18 @@ For the full pipeline detail, see
 > a handful of small records the sink isn't touched until you stop the daemon,
 > and with the default `noop` sink nothing is forwarded at all (it's a soak-test
 > sink). Confirm acceptance with `weir_records_ack_total`, not the sink-commit
-> metric; to force a drain in a demo, send `SIGTERM` (graceful shutdown seals
-> the open segment).
+> metric. To make a low-volume deployment drain promptly, set
+> `wab_segment_max_age_secs` (e.g. `2`) so an idle segment seals on a timer
+> instead of waiting to fill 256 MiB; for a one-off demo you can also just send
+> `SIGTERM` (graceful shutdown seals the open segment).
 
 ## Cleaning up
 
 ```bash
-# Stop the daemon (Ctrl-C in its terminal, or):
-pkill weir-server
+# Stop the daemon: Ctrl-C in its terminal, or kill the specific PID you started:
+kill "$(pgrep -f 'weir-server --config /tmp/weir-quickstart')"
+# (Avoid `pkill weir-server` on a shared host — it kills every weir daemon,
+#  not just this quickstart's.)
 
 # Remove the quickstart data.
 rm -rf /tmp/weir-quickstart
@@ -227,6 +235,8 @@ shrink the payload.
 
 ## Next steps
 
+- [Integrating & extending](integrating.md) — use weir's crates without the
+  daemon: produce from your own app, write a custom sink, or read the WAB directly.
 - [Configuration reference](../operations/configuration.md) — every
   option, default, range, and when to tune.
 - [Install options](install.md) — building from source, container
