@@ -50,6 +50,73 @@ pub enum ClientError {
     NoDefaultDurability,
 }
 
+impl ClientError {
+    /// Whether the connection is still usable after this error.
+    ///
+    /// - **Recoverable (`true`)** — the connection is still usable: the error is a
+    ///   *local* or *per-record* rejection that does **not** poison the client.
+    ///   Retry a different payload, or continue, on the **same** client.
+    /// - **Non-recoverable (`false`)** — the connection is dead or in an
+    ///   indeterminate state: the error poisoned the client (set its internal
+    ///   `poisoned`/`closed_after_nack` flag). **Drop this client and reconnect**;
+    ///   every subsequent call on it will fail fast (see [`WeirClient::is_poisoned`]).
+    ///
+    /// This is the stable way to branch on whether to reconnect: [`ClientError`] is
+    /// `#[non_exhaustive]`, so an exhaustive `match` on its variants will not compile
+    /// downstream, and the variant set may grow post-1.0. Calling `is_recoverable`
+    /// (or checking [`WeirClient::is_poisoned`] after a failed call) keeps working
+    /// across additions.
+    ///
+    /// The classification is kept in lock-step with the client's poison logic: a
+    /// variant is recoverable **iff** producing it does not set the client's
+    /// `poisoned` or `closed_after_nack` flag.
+    ///
+    /// | Variant | Recoverable? | Why |
+    /// |---|---|---|
+    /// | [`PayloadTooLarge`][Self::PayloadTooLarge] | yes | local pre-send rejection; no bytes sent, connection untouched |
+    /// | [`NoDefaultDurability`][Self::NoDefaultDurability] | yes | local misconfiguration; returned before any I/O |
+    /// | [`Nack`][Self::Nack]`(`[`InternalError`][NackReason::InternalError]`)` | yes | transient daemon condition; the daemon keeps the connection open |
+    /// | [`Nack`][Self::Nack]`(`any other reason`)` | no | the daemon closes the connection after the Nack |
+    /// | [`VersionMismatch`][Self::VersionMismatch] | no | a Nack reason; the daemon closes the connection |
+    /// | [`UnknownNack`][Self::UnknownNack] | no | a Nack reason; the daemon closes the connection |
+    /// | [`Io`][Self::Io] | no | a socket read/write failure poisons the client |
+    /// | [`Protocol`][Self::Protocol] | no | a malformed/aborted response poisons the client (also the "reconnect" guard error) |
+    ///
+    /// Note: a *server* `Nack(PayloadTooLarge)` (a payload over the daemon's
+    /// configured cap) is **not** recoverable — the daemon Nacks then closes the
+    /// connection — whereas the *local* [`PayloadTooLarge`][Self::PayloadTooLarge]
+    /// error (a payload over the protocol hard cap, rejected before any bytes are
+    /// sent) **is**. They are distinct variants despite the shared name.
+    ///
+    /// New `#[non_exhaustive]` variants default to **non-recoverable** (`false`):
+    /// "drop and reconnect" is the safe assumption for an error this build does not
+    /// yet understand.
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        match self {
+            // Local, pre-I/O rejections: the connection was never touched.
+            Self::PayloadTooLarge { .. } | Self::NoDefaultDurability => true,
+            // The only Nack the daemon keeps the connection open for (transient);
+            // every other Nack reason closes it (see `WeirClient::note_nack`).
+            Self::Nack(NackReason::InternalError) => true,
+            // Every other Nack reason closes the connection.
+            Self::Nack(_) => false,
+            // VersionMismatch / UnknownNack are Nack reasons too — the daemon
+            // closes the connection after them (they route through `note_nack`).
+            Self::VersionMismatch { .. } | Self::UnknownNack(_) => false,
+            // A socket failure poisons the client; a protocol violation either
+            // poisons it (bad response) or IS the "drop and reconnect" guard error.
+            Self::Io(_) | Self::Protocol(_) => false,
+            // `#[non_exhaustive]`: a future variant we don't recognise — assume the
+            // worst (reconnect) rather than risk reusing a poisoned connection.
+            // Unreachable within this crate (all current variants are matched
+            // above), but required so the match stays total if a variant is added.
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+}
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -244,6 +311,41 @@ impl<S: Read + Write> WeirClient<S> {
                 "expected HealthCheckResponse, got {other:?}"
             ))),
         }
+    }
+
+    /// Whether this client's connection has been poisoned and must be rebuilt.
+    ///
+    /// The client poisons itself when a connection-fatal failure leaves the stream
+    /// in an indeterminate or dead state — a response-read failure/timeout, a
+    /// protocol violation in the reply, or a connection-closing Nack (every Nack
+    /// reason except the transient [`InternalError`][NackReason::InternalError]).
+    /// Once poisoned, **every** method fails fast (it will not touch the socket
+    /// again, to avoid mis-reading leftover bytes as a later reply — a false ack);
+    /// the caller must drop this client and open a fresh connection.
+    ///
+    /// A long-lived producer thread (e.g. one driven from an async runtime) should
+    /// check this after a failed call — or, equivalently, branch on
+    /// [`ClientError::is_recoverable`] — and rebuild the connection when it reports
+    /// poisoned / non-recoverable, rather than retrying on the dead client:
+    ///
+    /// ```no_run
+    /// # use weir_client::{WeirClient, ClientError};
+    /// # use weir_core::Durability;
+    /// # fn reconnect() -> WeirClient { unreachable!() }
+    /// # let mut client = reconnect();
+    /// if let Err(e) = client.push(b"record", Durability::Sync) {
+    ///     if !e.is_recoverable() || client.is_poisoned() {
+    ///         client = reconnect(); // drop the dead client, rebuild
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// See [`ClientError::is_recoverable`] for the per-error view of the same
+    /// distinction (recoverable = connection still usable; non-recoverable = drop
+    /// and reconnect).
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Returns the poisoned-connection error if a prior response read failed.
@@ -690,5 +792,92 @@ mod tests {
             ClientError::Protocol(msg) => assert!(msg.contains("poisoned"), "{msg}"),
             other => panic!("expected a poisoned Protocol error, got {other:?}"),
         }
+    }
+
+    // ── is_poisoned / is_recoverable helpers ─────────────────────────────────
+
+    #[test]
+    fn is_poisoned_flips_after_a_read_failure() {
+        // A fresh client is not poisoned; after a response-read failure (here a
+        // timeout) the flag flips, mirroring `client_is_poisoned_after_a_read_failure`.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        assert!(!c.is_poisoned(), "a fresh client must not be poisoned");
+
+        c.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        // Peer never replies → the response read times out → the client poisons.
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        assert!(matches!(err, ClientError::Io(_)), "{err:?}");
+        assert!(
+            c.is_poisoned(),
+            "a read failure must flip is_poisoned() to true"
+        );
+        // And the poisoning error itself is non-recoverable.
+        assert!(!err.is_recoverable(), "an Io failure is not recoverable");
+    }
+
+    #[test]
+    fn is_recoverable_true_for_local_over_cap_rejection() {
+        // The local pre-send PayloadTooLarge rejection does not touch the socket, so
+        // it is recoverable and must not poison the client.
+        let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let oversized = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        let err = c.push(&oversized, Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::PayloadTooLarge { .. }),
+            "expected a local PayloadTooLarge, got {err:?}"
+        );
+        assert!(
+            err.is_recoverable(),
+            "a local over-cap rejection keeps the connection usable"
+        );
+        assert!(!c.is_poisoned(), "a recoverable error must not poison");
+    }
+
+    #[test]
+    fn is_recoverable_true_for_no_default_durability() {
+        // A local misconfiguration returned before any I/O is recoverable.
+        let err = ClientError::NoDefaultDurability;
+        assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_true_for_internal_error_nack() {
+        // InternalError is the one Nack the daemon keeps the connection open for.
+        let err = ClientError::Nack(NackReason::InternalError);
+        assert!(
+            err.is_recoverable(),
+            "a transient InternalError Nack keeps the connection usable"
+        );
+    }
+
+    #[test]
+    fn is_recoverable_false_for_connection_closing_nacks() {
+        // Every Nack reason except InternalError closes the connection, so it is
+        // non-recoverable. VersionMismatch and UnknownNack are Nacks too.
+        for err in [
+            ClientError::Nack(NackReason::EmptyPayload),
+            ClientError::Nack(NackReason::PayloadTooLarge),
+            ClientError::Nack(NackReason::UnknownMessage),
+            ClientError::VersionMismatch { daemon_version: 7 },
+            ClientError::UnknownNack(0xff),
+        ] {
+            assert!(
+                !err.is_recoverable(),
+                "{err:?} closes the connection and must be non-recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn is_recoverable_false_for_io_and_protocol() {
+        // A socket failure poisons; a protocol violation poisons or IS the
+        // reconnect guard — both non-recoverable.
+        let io = ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "pipe"));
+        assert!(!io.is_recoverable());
+        let proto = ClientError::Protocol("connection poisoned".into());
+        assert!(!proto.is_recoverable());
     }
 }

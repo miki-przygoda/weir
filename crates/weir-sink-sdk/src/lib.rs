@@ -191,6 +191,94 @@ impl SinkError for BasicSinkError {
 /// `committed.len() + dead_lettered.len()` does not cover the batch) rather than
 /// by this type, because the record type `R` carries no identity the constructor
 /// could check.
+///
+/// # Reading a `CommitResult`
+///
+/// Both fields are public, so inspect them directly. `committed` is a
+/// `Vec<R>` of the accepted records; `dead_lettered` is a `Vec<(R, String)>`
+/// pairing each permanently-rejected record with its human-readable reason.
+///
+/// ```
+/// use weir_sink_sdk::{CommitResult, Payload};
+///
+/// // The drain hands you back a CommitResult; here we build one to read it.
+/// let result = CommitResult::new(
+///     vec![Payload::from(b"keep-1".as_ref()), Payload::from(b"keep-2".as_ref())],
+///     vec![(Payload::from(b"reject".as_ref()), "400 bad request".to_string())],
+/// );
+///
+/// // `committed`: the records the sink accepted.
+/// assert_eq!(result.committed.len(), 2);
+/// for record in &result.committed {
+///     println!("committed {} bytes", record.len());
+/// }
+///
+/// // `dead_lettered`: each rejected record paired with WHY it was rejected.
+/// assert_eq!(result.dead_lettered.len(), 1);
+/// for (record, reason) in &result.dead_lettered {
+///     println!("dead-lettered {} bytes: {reason}", record.len());
+/// }
+/// let (rejected, reason) = &result.dead_lettered[0];
+/// assert_eq!(&rejected[..], b"reject");
+/// assert_eq!(reason, "400 bad request");
+/// ```
+///
+/// # Driving an async `commit` from a sync test (no runtime)
+///
+/// `Sink::commit` is `async`, but you can unit-test a sink whose commit is
+/// immediately ready (no real I/O await points) without pulling in a runtime,
+/// by polling the future to completion with a no-op waker. This is the same
+/// `block_on` helper the SDK's own tests use — copy it into your sink's tests:
+///
+/// ```
+/// use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth};
+///
+/// /// Minimal std-only executor: drives a future to completion by polling with
+/// /// a no-op waker. Enough for a sink whose `commit`/`health` are immediately
+/// /// ready (no real I/O await points), without pulling a runtime into a test.
+/// fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+///     use std::task::{Context, Poll};
+///     let mut fut = std::pin::pin!(fut);
+///     let waker = std::task::Waker::noop();
+///     let mut cx = Context::from_waker(waker);
+///     loop {
+///         if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+///             return v;
+///         }
+///     }
+/// }
+///
+/// // A sink that dead-letters anything equal to `b"reject"` and commits the rest.
+/// struct MySink;
+/// impl Sink for MySink {
+///     type Record = Payload;
+///     type Error = std::convert::Infallible;
+///     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Self::Error> {
+///         let (mut ok, mut dead) = (Vec::new(), Vec::new());
+///         for r in batch {
+///             if r.as_ref() == b"reject" {
+///                 dead.push((r, "rejected by MySink".to_string()));
+///             } else {
+///                 ok.push(r);
+///             }
+///         }
+///         Ok(CommitResult::new(ok, dead))
+///     }
+///     async fn health(&self) -> SinkHealth {
+///         SinkHealth::Healthy
+///     }
+/// }
+///
+/// let batch = vec![
+///     Payload::from(b"keep".as_ref()),
+///     Payload::from(b"reject".as_ref()),
+/// ];
+/// // Drive the async commit to completion synchronously, then read the result.
+/// let result = block_on(MySink.commit(batch)).unwrap();
+/// assert_eq!(result.committed.len(), 1);
+/// assert_eq!(result.dead_lettered.len(), 1);
+/// assert_eq!(result.dead_lettered[0].1, "rejected by MySink");
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct CommitResult<R> {

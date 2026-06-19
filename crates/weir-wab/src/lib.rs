@@ -24,21 +24,45 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
-use weir_core::{MAX_PAYLOAD_HARD_CAP, Payload};
+use weir_core::MAX_PAYLOAD_HARD_CAP;
 
-use format::{FORMAT_VERSION, SEGMENT_HEADER_LEN};
+use format::{FORMAT_VERSION, SEGMENT_HEADER_LEN, SEGMENT_MAGIC};
 
-/// An iterator over records in a sealed WAB segment file.
+/// Re-export of [`weir_core::Payload`] — the item type of the [`SegmentReader`]
+/// iterator ([`io::Result<Payload>`]). Re-exported so a consumer depending on
+/// only `weir-wab` can name the iterator item type (`weir_wab::Payload`)
+/// without also taking a direct dependency on `weir-core`.
+pub use weir_core::Payload;
+
+/// An iterator over records in a WAB segment file.
 ///
 /// Streams records without materialising the whole segment. Applies
 /// [`MAX_PAYLOAD_HARD_CAP`] before every heap allocation to bound memory usage
-/// while reading. Stops at the end-of-records sentinel or on the first error.
+/// while reading.
 ///
-/// Each record's CRC32 is verified against the stored checksum as it is read; a
-/// mismatch yields an [`io::Error`] of kind [`io::ErrorKind::InvalidData`] and
-/// ends iteration. A truncated trailer (a partial record at EOF with no
-/// sentinel) ends iteration cleanly — sealed segments always end in a sentinel,
-/// so this only arises on a corrupted file.
+/// # Iteration contract
+///
+/// The iterator yields every good record up to the first problem, then stops.
+/// Exactly how it stops depends on *where* the problem is:
+///
+/// - **End-of-records sentinel** (a `payload_len` of `0`): iteration ends
+///   cleanly — the next call returns `None`. This is the normal end of a sealed
+///   segment.
+/// - **Torn trailing write at EOF**: a write interrupted partway through the
+///   4-byte `payload_len` field at the very end of an un-sealed *active* segment
+///   hits [`io::ErrorKind::UnexpectedEof`] on the length read and also ends
+///   cleanly — the next call returns `None`, never an `Err`. Sealed segments
+///   always end in a sentinel, so this only arises mid-write on an active one.
+/// - **Mid-stream corruption**: a CRC32 mismatch (kind
+///   [`io::ErrorKind::InvalidData`]), an oversized `payload_len` past
+///   [`MAX_PAYLOAD_HARD_CAP`] (also `InvalidData`), or a truncation *after* a
+///   valid length field — i.e. a short read of the CRC or payload bytes
+///   (`UnexpectedEof`) — yields a single `Some(Err(..))` and then iteration
+///   stops (every subsequent call returns `None`).
+///
+/// In short: all good records up to the first corruption, then a single clean
+/// `Err` — except a torn `payload_len` at EOF, which is indistinguishable from a
+/// clean end and so returns `None` rather than `Err`.
 #[derive(Debug)]
 pub struct SegmentReader {
     reader: BufReader<File>,
@@ -56,10 +80,18 @@ impl SegmentReader {
         let mut header = [0u8; SEGMENT_HEADER_LEN];
         reader.read_exact(&mut header)?;
 
-        if &header[0..4] != b"WEIR" {
+        if header[0..4] != SEGMENT_MAGIC {
+            let found = &header[0..4];
+            // Lead with the ASCII rendering (each non-printable byte shown as
+            // '.'), keeping the raw bytes for debugging. SEGMENT_MAGIC is the
+            // wire/segment magic b"WEIR".
+            let ascii: String = found
+                .iter()
+                .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
+                .collect();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bad segment magic: {:?}", &header[0..4]),
+                format!("bad segment magic: found {ascii:?} ({found:?}), expected b\"WEIR\""),
             ));
         }
         if header[4] != FORMAT_VERSION {
@@ -202,11 +234,37 @@ mod tests {
         let path = tmp_path("badmagic");
         let mut f = File::create(&path).unwrap();
         let mut header = build_segment_header(0);
-        header[0] = b'X';
+        header[0] = b'X'; // "WEIR" -> "XEIR"
         f.write_all(&header).unwrap();
         f.sync_all().unwrap();
         let err = SegmentReader::open(&path).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Human-readable: leads with the ASCII rendering of the found bytes and
+        // names the expected magic.
+        let msg = err.to_string();
+        assert!(msg.contains("XEIR"), "expected ASCII rendering in: {msg}");
+        assert!(
+            msg.contains("expected b\"WEIR\""),
+            "expected the expected-magic hint in: {msg}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_bad_magic_renders_nonprintable_bytes_as_dots() {
+        let path = tmp_path("badmagic_nonprintable");
+        let mut f = File::create(&path).unwrap();
+        let mut header = build_segment_header(0);
+        // Fully non-printable magic: ASCII rendering should be all dots, but the
+        // raw bytes must still be present for debugging.
+        header[0..4].copy_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+        f.write_all(&header).unwrap();
+        f.sync_all().unwrap();
+        let err = SegmentReader::open(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("\"....\""), "expected dotted ASCII in: {msg}");
+        assert!(msg.contains("expected b\"WEIR\""), "msg: {msg}");
         std::fs::remove_file(&path).ok();
     }
 
