@@ -142,6 +142,15 @@ NSQ), an embedded queryable store (RocksDB, sled, bbolt) or in-JVM low-latency
 queue (Chronicle Queue), or a telemetry pipeline with transforms and many
 destinations (Vector, Fluentd, Fluent Bit, Beats).
 
+**Delivery contract (read before migrating from Kafka/NATS):** delivery is
+**at-least-once** — a crash or retry can redeliver a record, so **your sink must
+dedupe** (e.g. on an `Idempotency-Key` / `ON CONFLICT`). **Ordering holds only
+within a single connection's** sequential pushes — there is **no ordering across
+connections, and no per-key or global order**. And **routing/keys live in your
+payload**: the wire envelope is opaque bytes, with no topic/subject/key field —
+weir does not inspect or route on content. Details in
+[architecture](docs/architecture.md) and [integrating](docs/getting-started/integrating.md).
+
 *No popular project combines all three of weir's defining properties — a local
 microsecond fsync'd ack, N→1 transactional SQL-commit compression, and a
 non-broker single binary. Comparisons reflect public positioning as of June 2026,
@@ -154,7 +163,7 @@ not benchmarks.*
 | `weir-core`     | lib        | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`, `Payload`. Cross-platform.   |
 | `weir-wab`      | lib        | On-disk WAB segment format + `SegmentReader`. Shared by the daemon and `weir-ctl` (one parser) so `dl requeue` can read dead-letter segments without the daemon's dep tree. Cross-platform. |
 | `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
-| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **Client type is Unix-only** — it compiles everywhere but `WeirClient` is `#[cfg(unix)]`; on Windows only the `Durability`/`NackReason` re-exports are usable (produce from non-Unix via the [wire protocol](docs/wire_protocol.md)). |
+| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **Client type is Unix-only** — it compiles everywhere but `WeirClient` is `#[cfg(unix)]`; on Windows only the `Durability`/`NackReason` re-exports are usable (produce from non-Unix via the [wire protocol](docs/wire_protocol.md) — which in practice means the daemon's [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md), since the Unix socket is unreachable cross-host and the Windows server binary is a non-functional stub). |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
 | `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |

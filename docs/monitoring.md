@@ -154,9 +154,13 @@ delivery for that segment is paused.
 Once the sink **recovers**, the drain **automatically re-drains** stranded
 segments on the next health poll — watch `weir_drain_segments_resumed_total`
 converge toward `weir_drain_segments_stranded_total` and the alert clear. A daemon
-restart also replays them. If the gap persists, the sink isn't healthy yet (or is
-recovering then re-failing); `weir-ctl segments` lists the sealed-but-undelivered
-files. Raise `sink_max_retries` / `sink_retry_base_delay_ms` to ride out longer
+restart also replays them. **Note: `stranded − resumed` is not a strict count of
+currently-stuck segments** — both are event counters, and a segment that strands,
+resumes, then re-strands (e.g. a POST-only outage where the HEAD probe stays
+healthy) bumps both, so the difference can over- or under-state the live backlog.
+For the actual stuck files, list them: `weir-ctl segments` shows the
+sealed-but-undelivered files. If the gap persists, the sink isn't healthy yet (or is
+recovering then re-failing). Raise `sink_max_retries` / `sink_retry_base_delay_ms` to ride out longer
 outages before stranding. Distinct from `WeirDeadLettered` (*permanent* rejections).
 
 #### WeirDeadLettered
@@ -279,7 +283,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
 | `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Seconds since the drain entered BlockedDeadLetterFull (resets to 0 on exit); alert when it exceeds your threshold. |
-| `weir_drain_segments_stranded_total` | counter | Segments left on disk after exhausting `sink_max_retries` **transient** sink failures. The data is durable; delivery is paused. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`. They are re-drained automatically when the sink recovers (see below) or on restart. Distinct from `weir_dead_letter_full_total` (permanent rejections). |
+| `weir_drain_segments_stranded_total` | counter | Segments left on disk after exhausting `sink_max_retries` **transient** sink failures. The data is durable; delivery is paused. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`. They are re-drained automatically when the sink recovers (see below) or on restart. This is an **event counter, not a live gauge of distinct stuck segments**: the same segment can strand, auto-resume on the next healthy probe, and re-strand — each strand increments it — so it can exceed the number of distinct stuck segments. That happens notably in a **POST-only outage**: deliveries (`commit`) keep failing while the HEAD health probe stays healthy, so each recovery edge re-queues the segment, it re-fails, and it strands again. Distinct from `weir_dead_letter_full_total` (permanent rejections). |
 | `weir_drain_segments_resumed_total` | counter | Stranded segments re-queued for delivery after a sink health **recovery** (down→up). Convergence with `weir_drain_segments_stranded_total` means an outage's backlog has been picked back up; a persistent gap means segments are still stranded (sink not healthy yet). |
 
 ### System / security

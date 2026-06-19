@@ -155,6 +155,19 @@ fixed at (2, 2) to isolate the batching variables, and the per-machine RPS above
 transfer to other hardware. Treat this section as qualitative direction — measure the
 shard / connection-density trade on your own hardware before committing to a value.
 
+## A related throughput cliff: `wab_segment_max_bytes`
+
+Not a batch knob, but the same throughput conversation: a **small**
+`wab_segment_max_bytes` (frequent segment rotation) is a throughput cliff. Each
+seal does an extra fsync (sentinel+footer durability commit, plus a parent-dir
+fsync to publish the rename), so more rotations = more seal fsyncs = lower RPS —
+a sweep observed sync throughput drop from ~90k to ~26k RPS when the segment cap
+was lowered to 1 MiB (observed on one box; treat the absolute numbers as
+machine-specific). **Durability is unaffected** — every accepted record is
+fsynced before its ack regardless of segment size; the seal fsync only publishes
+the sealed-segment boundary to the drain. Default is 256 MiB (`SEGMENT_MAX_BYTES`);
+see [`wab_segment_max_bytes`](../operations/configuration.md#wab_segment_max_bytes).
+
 ## Out of scope for this sweep
 
 - Larger payloads. 256 B is the load-test default but production records may be

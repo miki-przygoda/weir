@@ -21,12 +21,23 @@ shard_count  = 1
 worker_count = 1
 
 # Balanced batch defaults (the (256, 1ms) sweet spot from batch-tuning.md).
+# NOTE: batch_deadline_ms is the producer-ACK accumulation deadline (how long the
+# flusher waits to fill an fsync batch before acking) — it is NOT a segment-seal
+# trigger and does NOT make records reach the sink. Don't conflate it with
+# wab_segment_max_age_secs below; only sealing (size, age, or shutdown) drains.
 batch_size        = 256
 batch_deadline_ms = 1
 
 # Low-volume / edge box: seal an idle segment after 5s so its records drain
 # promptly instead of waiting to fill wab_segment_max_bytes (256 MiB) or for a
 # restart. Set to 0 on a high-throughput box where segments fill on their own.
+#
+# Why this matters: a low-volume or bursty producer's records sit in the ACTIVE,
+# unsealed segment until it hits wab_segment_max_bytes (256 MiB default) or the
+# daemon stops. Until the segment seals it is durable on disk but INVISIBLE to the
+# sink — the drain never runs, so nothing is delivered (reads as "weir isn't
+# delivering"). A small age here (1-5s) seals an idle segment on a timer so
+# delivery doesn't stall. 0 disables it (size/shutdown sealing only).
 wab_segment_max_age_secs = 5
 
 # Connection + payload caps. Lowering max_payload_bytes bounds worst-case

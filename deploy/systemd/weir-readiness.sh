@@ -16,6 +16,17 @@
 # Verified against crates/weir-server/src/metrics/mod.rs + docs/monitoring.md.
 # weir-ctl subcommands/flags verified against crates/weir-ctl/src/main.rs.
 #
+# NOTE: weir-ctl subcommands DON'T all talk to the live daemon — they split:
+#   - LIVE-daemon: `weir-ctl health` / `weir-ctl push` take `--socket` (Unix
+#     socket round-trip); `weir-ctl metrics` takes `--addr` (the /metrics HTTP
+#     endpoint). Only these reach a running daemon — and only these are used below.
+#   - OFFLINE inspectors: `weir-ctl segments` and the `weir-ctl dl` family
+#     (`dl list` / `dl drop` / `dl requeue`) read on-disk WAB files directly and
+#     take `--wab-dir` (NOT `--socket`); they work whether or not the daemon is
+#     running. (`dl requeue` ALSO takes `--socket` — but to re-PUSH the records,
+#     after reading them off disk.) Don't reach for these as liveness/readiness
+#     probes: a clean `segments` run says nothing about whether the daemon is up.
+#
 # Exit codes:  0 = ready   1 = degraded / not-ready   2 = dead (liveness failed)
 #
 # Usage:

@@ -141,7 +141,15 @@ Operator hardening that **must be applied externally**:
 - **No filesystem read-only constraints.** Apply at runtime:
   `docker run --read-only --tmpfs /tmp` with volume mounts for the WAB
   and socket directories. Weir does not write outside `wab_dir`,
-  `dead_letter_dir`, and the socket parent.
+  `dead_letter_dir`, and the socket parent. Note on testing the
+  restart-recovery guarantee: un-drained records survive a restart on a
+  persistent WAB volume, but that is only **observable** when a segment is
+  genuinely undrained (sink down / stranded). With the `noop` sink or a healthy
+  sink, records drain at/just-before graceful shutdown — the drain writes a
+  `.confirmed` tombstone and deletes the sealed segment — so a naive "restart and
+  list the volume" test sees only `.confirmed` markers, not replayable data. That
+  is correct behaviour (delivered, then removed), not data loss. To observe
+  recovery, strand a segment first (e.g. point at a down sink).
 - **No PID namespace constraints, no user namespace remap, no network
   namespace by default.** These are orchestrator-level settings. The
   daemon listens on a Unix socket only; in most deployments the network

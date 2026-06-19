@@ -137,6 +137,13 @@ fn producer_thread(sock: &str, jobs: std::sync::mpsc::Receiver<Job>) {
 }
 ```
 
+> **Wiring N of these (channel choice matters).** `std::sync::mpsc` is
+> single-consumer: one `Receiver` **cannot** be shared across the pool, so give
+> the pool either **N independent channels** (round-robin dispatch from the async
+> side) or a **shared/MPMC consumer** (e.g. `crossbeam-channel`). And the
+> async-side `send` must never block an executor thread — use a bounded
+> `try_send` to shed load (or offload the blocking send), not a blocking `send`.
+
 > A first-class async producer type is a candidate for a future release; today
 > this bridge is the recommended way to produce from async code.
 

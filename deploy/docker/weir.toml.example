@@ -34,6 +34,10 @@ batch_size = 256
 
 # Maximum time (ms) to accumulate a batch before flushing. Range: 1-60000.
 # Default 1 minimises tail latency; raise for pure-throughput workloads.
+# NOTE: this is the producer-ACK accumulation deadline (how long the flusher
+# waits to fill an fsync batch before acking) — it is NOT a segment-seal trigger
+# and does NOT push records to the sink. Don't conflate it with
+# wab_segment_max_age_secs below; only sealing (size, age, or shutdown) drains.
 # Env: WEIR_BATCH_DEADLINE_MS
 batch_deadline_ms = 1
 
@@ -48,6 +52,12 @@ wab_segment_max_bytes = 268435456
 # records, instead of waiting to fill wab_segment_max_bytes / for shutdown.
 # 0 = disabled (default). Set it (e.g. 5-30) on LOW-VOLUME deployments so a quiet
 # segment's records reach the sink promptly. Range: 0-86400.
+# DEPLOY NOTE: with this at 0, a low-volume or bursty producer's records sit in
+# the ACTIVE, unsealed segment until it hits wab_segment_max_bytes (256 MiB) or
+# the daemon stops — durable on disk but INVISIBLE to the sink, because the drain
+# only runs on sealed segments. The result is a delivery stall that looks like
+# data loss. Set this (e.g. 1-5) on idle/bursty deployments so an idle segment
+# seals on a timer and delivery doesn't stall.
 # Env: WEIR_WAB_SEGMENT_MAX_AGE_SECS
 wab_segment_max_age_secs = 0
 
