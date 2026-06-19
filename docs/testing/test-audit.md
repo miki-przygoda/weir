@@ -1,305 +1,419 @@
-# System Test Suite Audit
+# System test suite overview
 
-File audited: `crates/weir-server/tests/system.rs` (1711 lines, 41 `#[test]` functions).
+File: `crates/weir-server/tests/system.rs` (~2257 lines, 44 `#[test]`
+functions as of this writing).
 
-> **Status:** every verdict has been actioned. DELETE / RENAME / REWRITE in
-> commits `ba69803`, `968afd0`, `8e94cf2`. 9 of 10 STRENGTHEN items in
-> `6f9a5a1`; the 10th plus the prerequisite router fix in `cee9f6f`.
->
-> The Top-finding #1 ("happy-path over-testing") cleanup followed: 2
-> redundant tests deleted and 3 strengthened with metric-count
-> assertions so a silent-drop regression can't pass. See the follow-up
-> commit on this branch.
+> **What this is.** A current snapshot of the system-integration suite —
+> the reference to consult when adding, removing, or renaming a system
+> test. It is organised by test **name** grouped under behavioural
+> categories, deliberately *not* by line number: line numbers rot on the
+> first edit, names do not. Treat the count above as a rough sanity check,
+> not a contract — the source file is the source of truth.
 
-## Executive summary
+Every test spawns the real `weir-server` binary via the `weir_server!`
+macro from `weir-testkit`, waits for the socket, and tears everything
+down on drop. Each test gets its own temp dir, socket path, WAB dir, and
+metrics port, so the suite runs in parallel. The whole file is
+`#![cfg(unix)]` (the daemon only binds Unix sockets). Because each test
+is a real multi-threaded OS process, run with a bounded thread count:
 
-- **Total tests:** 41
-- **Verdicts:** KEEP 25 / STRENGTHEN 10 / DELETE 3 / RENAME 2 / REWRITE 1
-- **Top findings:**
-  1. ~~Recovery is under-tested.~~ **Closed:** `wab_data_preserved_across_crash_restart` now asserts `weir_recovery_records_replayed_total >= acked_count` post-restart (system.rs:757–767), so a recovery pass that silently quarantined every segment would now fail the test.
-  2. ~~`disk_full_returns_nack_not_crash` tests EFBIG, not ENOSPC.~~ **Closed:** the EFBIG test was renamed to `efbig_returns_nack_not_crash` (system.rs:1174) and a real `enospc_returns_nack_not_crash` was added alongside it (system.rs:1232, `#[ignore]`-marked because it needs a pre-mounted tmpfs). The remaining flagged-test items (`metrics_consistent_across_crash_restart`, the `server_restarts_after_sigkill` / `wab_data_integrity_after_crash` overlap, and `stalled_client_does_not_block_other_connections` being the strongest test) still stand as documented.
-  3. Several tests pass even if the feature they "test" is broken: `wab_segment_rotation_creates_multiple_segments` never observes rotation (writes 40 KiB into a 256 MiB segment); `all_durability_tiers_acked` cannot distinguish Sync from Buffered since it never inspects timing or fsync; `health_check_on_separate_connection_from_push` is indistinguishable from two unrelated health checks.
+```sh
+cargo test -p weir-server --test system -- --test-threads=4
+```
+
+## Gating: which tests run by default
+
+Of the 44 tests, **40 run on a plain `cargo test`**. The remaining four
+are gated:
+
+| Test | Gate | Why |
+| --- | --- | --- |
+| `enospc_returns_nack_not_crash` | `#[ignore]` | Needs a small pre-mounted tmpfs at `WEIR_TEST_ENOSPC_DIR` (creating one needs root). |
+| `mysql_sink_end_to_end` | `#[ignore]` | Needs a live MySQL at `WEIR_TEST_MYSQL_URL`. |
+| `postgres_sink_end_to_end` | `#[ignore]` | Needs a live Postgres at `WEIR_TEST_POSTGRES_URL`. |
+| `clickhouse_sink_end_to_end` | `#[ignore]` + `#[cfg(feature = "clickhouse-sink")]` | Needs a live ClickHouse at `WEIR_TEST_CLICKHOUSE_URL` *and* the `clickhouse-sink` feature; otherwise the function isn't even compiled. |
+
+The three sink end-to-end tests are also documented operationally in
+[`sink-integration.md`](sink-integration.md), with the container-startup
+recipes.
 
 ---
 
 ## Basic push / ack
 
-### `smoke_single_push_ack` — system.rs:524
-- **Asserts:** One Sync push round-trips.
-- **Regression prevented:** Catches a totally broken binary (won't start, won't accept, won't ack at all). A canary; every other test would also fail if this did.
-- **Verdict:** KEEP
-- **Notes:** Cheapest possible smoke; useful as the first signal.
+### `smoke_single_push_ack`
+The cheapest canary: a single `Sync` push round-trips with an `Ok`. If
+this fails, the binary is fundamentally broken (won't start, accept, or
+ack) and every other test would fail too.
 
-### `all_durability_tiers_acked` — system.rs:531
-- **Asserts:** One push per tier (Sync/Batched/Buffered) returns Ok.
-- **Regression prevented:** Catches a tier dispatch table that drops or panics for one variant.
-- **Verdict:** STRENGTHEN
-- **Notes:** The name promises that the tiers *behave* like their contract; the test only checks they don't error. A Buffered tier that secretly fsyncs, or a Sync tier that secretly skips fsync, would pass. Either rename to `all_durability_tiers_return_ok` or add a latency/wab-bytes differential check.
+### `all_durability_tiers_behave_per_contract`
+Pushes 10 records per tier and reads
+`weir_wab_fsync_duration_seconds_count` (one increment per fsync syscall)
+as a deterministic differential: **Buffered** moves the fsync counter by
+≤1 (acks before any fsync), **Sync** moves it by ≥N (one fsync per
+record), **Batched** moves it by ≥1 (records are durably flushed, not
+silently skipped). This is the strengthened replacement for the old
+`all_durability_tiers_acked`, which only checked each tier returned `Ok`
+and so couldn't tell a tier that secretly fsynced from one that secretly
+didn't.
 
-### `multiple_sequential_pushes_same_connection` — system.rs:546
-- **Asserts:** 50 sequential Batched pushes on one connection all ack.
-- **Regression prevented:** Catches a per-connection state machine that breaks after the first frame (e.g. forgets to advance read position).
-- **Verdict:** KEEP
+### `multiple_sequential_pushes_same_connection`
+*(Removed — see "Tests no longer present" below.)*
 
 ## Health check
 
-### `health_check_returns_ok` — system.rs:559
-- **Asserts:** HealthCheck request returns Ok.
-- **Regression prevented:** Catches removal/break of the HealthCheck message type.
-- **Verdict:** KEEP
-
-### `health_check_on_separate_connection_from_push` — system.rs:566
-- **Asserts:** A push on connection A and a health check on connection B both succeed.
-- **Regression prevented:** None specific — neither connection observes the other; the test is equivalent to running two unrelated single-frame tests.
-- **Verdict:** DELETE
-- **Notes:** If you want to test that an in-flight push doesn't block health, you'd need to stall the push (use the stall trick from `stalled_client_does_not_block_other_connections`) and time the health check.
+### `health_check_returns_ok`
+A `HealthCheck` request returns `Ok`. Guards the existence of the
+HealthCheck message type and the zero-length-payload path that distinguishes
+a health check from an (rejected) empty push.
 
 ## Concurrent producers
 
-### `concurrent_producers_all_acked` — system.rs:577
-- **Asserts:** 8 threads × 100 Batched pushes all return Ok.
-- **Regression prevented:** A race in the queue or batcher that drops/panics on contention; ack-channel mis-routing across workers.
-- **Verdict:** KEEP
+### `concurrent_producers_all_acked`
+8 threads × 100 Batched pushes. Beyond "no thread panicked", it scrapes
+`weir_records_ack_total{tier="batched"}` and asserts it equals exactly
+800 — a thread that silently dropped half its pushes would land here with
+a short count rather than passing.
 
-### `many_connections_open_simultaneously` — system.rs:610
-- **Asserts:** 20 connections can be opened first, then each does one Buffered push.
-- **Regression prevented:** A semaphore leak or accept-loop bug that fails when many idle connections coexist.
-- **Verdict:** STRENGTHEN
-- **Notes:** 20 is well below any sensible `max_connections` default. The name implies stress-testing the connection cap; either bump the count high enough to actually approach the cap, or rename to `twenty_idle_connections_each_accept_one_push`.
+### `many_connections_open_simultaneously`
+Opens 200 connections *first* (with a retry/back-off loop to ride out the
+listen-backlog cap on macOS), then pushes one Buffered record from each.
+Exercises the semaphore-based connection cap with real headroom under the
+default `max_connections = 256`. (Bumped up from the old count of 20,
+which was too far below the cap to test anything.)
 
 ## WAB on-disk verification
 
-### `records_written_to_wab_on_disk` — system.rs:633
-- **Asserts:** After 20 Sync pushes, at least one `.wab` or `.wab.sealed` file exists.
-- **Regression prevented:** A bug where the WAB writer silently no-ops and acks anyway (e.g. mocked out, wrong path, permissions).
-- **Verdict:** KEEP
+### `records_written_to_wab_on_disk`
+After 20 Sync pushes, at least one `.wab` or `.wab.sealed` file exists.
+Catches a WAB writer that silently no-ops while still acking (mocked
+out, wrong path, permissions).
 
-### `wab_segment_rotation_creates_multiple_segments` — system.rs:656
-- **Asserts:** After 10 × 4 KiB pushes, at least one WAB file exists.
-- **Regression prevented:** None — the assertion is identical to the previous test. 40 KiB cannot trigger rotation in a 256 MiB segment, and the test author admits this in the comment.
-- **Verdict:** DELETE
-- **Notes:** The name actively lies. Either implement rotation testing (override `SEGMENT_MAX_BYTES` via config, then assert ≥2 sealed segments) or remove it; in its current form it adds noise and false confidence.
+### `idle_seal_drains_low_volume_segment_without_shutdown`
+With `wab_segment_max_age_secs = 1`, a single Batched record's segment is
+sealed and drained on idle — without waiting to fill the 256 MiB segment
+or for shutdown. Proven by polling
+`weir_sink_commit_records_total{outcome="committed"}` past the idle
+threshold and asserting it reaches ≥1.
 
-### `wab_writes_nonzero_bytes_to_disk_after_sync_pushes` — system.rs:685
-- **Asserts:** After 20 Sync pushes, total bytes under `wab_dir` > 0.
-- **Regression prevented:** A WAB writer that creates empty files (slightly more than the previous test, which only counts files).
-- **Verdict:** KEEP
-- **Notes:** Subsumed if `records_written_to_wab_on_disk` is strengthened to assert `> 0` bytes; consider merging.
+## Durability tiers and ack contract under load
 
-## Metrics accuracy (registration)
+### `sustained_load_1000_records_single_client`
+1000 sequential Buffered pushes; then asserts both
+`weir_records_accepted_total{tier="buffered"}` and
+`weir_records_ack_total{tier="buffered"}` equal 1000. Catches a slow
+leak or silent drop that surfaces only after sustained load (counters
+fall short while every `push().unwrap()` still passes).
 
-### `metrics_endpoint_responds_with_openmetrics_content` — system.rs:708
-- **Asserts:** `/metrics` returns non-empty body containing `weir_` or `# EOF`.
-- **Regression prevented:** Catches the metrics HTTP server failing to bind or hand back garbage.
-- **Verdict:** KEEP
+### `mixed_durability_under_concurrent_load`
+6 threads round-robin across Sync/Batched/Buffered (50 each). Asserts the
+per-tier ack counter matches the records pushed for that tier, so a
+dispatch table that mis-routes one tier (e.g. counts Buffered as Sync) or
+drops a tier under contention is caught — which the old panic-on-`Err`
+version could not see, since the client only observes Ack/Nack, not the
+server's tier bookkeeping.
 
-### `metrics_all_19_families_registered` — system.rs:720
-- **Asserts:** 19 named metric families appear as `# HELP` lines.
-- **Regression prevented:** A registry refactor that silently drops a family. The most valuable metrics test in the file — these names are public API.
-- **Verdict:** KEEP
+## Payload validation
 
-### `drain_state_shows_draining_and_not_blocked` — system.rs:756
-- **Asserts:** On startup, `weir_drain_state{state="draining"}=1` and the other two states are 0.
-- **Regression prevented:** A bug where the drain state gauge is initialised wrong, or the labels are renamed.
-- **Verdict:** KEEP
+### `empty_payload_is_rejected`
+A zero-length Sync push must be rejected with
+`Nack(NackReason::EmptyPayload)`. An empty payload collides with the WAB
+end-of-records sentinel, so the server refuses it at ingest rather than
+risk truncating a segment. (This *inverts* the old, wrong
+`empty_payload_is_accepted` entry — the current contract is rejection.)
 
-### `sink_health_shows_healthy_via_noop_sink` — system.rs:777
-- **Asserts:** With NoopSink, `weir_sink_health{state="healthy"}=1` and the other two are 0.
-- **Regression prevented:** Sink health enum-to-label mapping breakage.
-- **Verdict:** KEEP
+### `arbitrary_binary_payload_accepted`
+A full `0..=255` byte payload Sync-pushes successfully, confirming no
+text-mode handling strips NULs or high bytes. Renamed from
+`binary_payload_round_trips` — there is no Pop API, so nothing
+"round-trips".
+
+### `payload_size_boundary_enforced`
+Tests the actual `MAX_PAYLOAD_HARD_CAP` (16 MiB) boundary, not a
+mid-range size: a payload exactly at the cap is accepted; a payload one
+byte over is rejected with `Nack(NackReason::PayloadTooLarge)`. The
+over-cap case uses a raw socket that sends only the 16-byte header
+declaring an over-cap length (no body), so the Nack reason can be read
+directly rather than being masked by a BrokenPipe mid-write. Confirms the
+server stays alive afterward. Replaces the weak `large_payload_accepted`
+(a single 1 MiB push).
+
+## Crash-restart durability and recovery
+
+### `server_restarts_after_sigkill`
+Push acks pre-crash; SIGKILL leaves the socket file behind; restart
+succeeds within a 10 s budget; a post-restart push acks. Proves the
+daemon can boot over its own crash debris (stale-socket cleanup, no panic
+on cold start with WAB files present).
+
+### `wab_data_preserved_across_crash_restart`
+WAB bytes are identical before and after SIGKILL, non-zero after restart,
+**and** `weir_recovery_records_replayed_total >= acked_count`. The replay
+assertion is the load-bearing one: a recovery pass that quarantined every
+segment would leave the bytes on disk while losing every record, and the
+byte-count check alone could not catch that.
+
+### `acked_records_delivered_to_sink_and_confirmed_after_crash_restart`
+Extends crash recovery past the replay queue to the *delivery + confirm*
+end state: after SIGKILL + restart, polls
+`weir_sink_commit_records_total{outcome="committed"}` until every acked
+record has been delivered to the (noop) sink and confirmed. Closes the
+full crash → recovery → replay → drain → sink → confirm loop.
+
+### `recovery_replays_records_after_crash`
+Focused replay-metric test: push N Sync records, SIGKILL (active segment
+left without a footer), restart, then assert
+`weir_recovery_records_replayed_total >= N`. Pins that recovery seals and
+replays the crashed active segment.
+
+### `wab_data_integrity_after_crash`
+The byte-level Sync durability contract: every payload that received an
+`Ok` for a Sync push appears verbatim in the raw WAB bytes after SIGKILL.
+If the client got an `Ok`, the fsync happened before the ack — this is
+the guarantee that defines the product. (Note: this test does not restart
+the server; the read-back-after-restart axis is covered by the recovery
+tests above.)
+
+## Metrics
+
+### `metrics_endpoint_responds_with_openmetrics_content`
+`/metrics` returns a non-empty body that looks like OpenMetrics
+(`weir_` or `# EOF`). Catches the metrics HTTP server failing to bind or
+returning garbage.
+
+### `metrics_all_families_registered`
+Asserts every expected metric family appears as a `# HELP weir_…` line
+**and** that the count of distinct `# HELP weir_` lines equals the
+expected-list length — a drift detector that fails loudly if a metric is
+added to `metrics/mod.rs` without updating the list (or vice versa). The
+expected list is **31 families on a default build**; under
+`--all-features` (which turns on `bench-trace`) the four `weir_stage_*`
+per-stage latency histograms register too, for **35 families**, and the
+`#[cfg(feature = "bench-trace")]` branch extends the expected list to
+match. This is the most valuable metrics test — these names are public
+API. (The old doc's "19 families" count was stale.)
+
+### `records_accepted_counter_increments_after_sync_pushes`
+After 10 Sync pushes, the body contains
+`weir_records_accepted_total{tier="sync"} 10`. Catches the accepted
+counter being miswired (wrong tier label, wrong increment site).
+
+### `records_ack_counter_increments_after_sync_pushes`
+After 7 Sync pushes, the body contains
+`weir_records_ack_total{tier="sync"} 7`. The ack-side counterpart.
+
+### `drain_state_shows_draining_and_not_blocked`
+On startup the pre-initialised `weir_drain_state` gauge vector reads
+`draining=1`, `retrying_transient=0`, `blocked_dead_letter_full=0`.
+Guards the gauge's initial value and its label names.
+
+### `sink_health_shows_healthy_via_noop_sink`
+With the NoopSink, `weir_sink_health` reads `healthy=1`, `degraded=0`,
+`down=0`. Guards the sink-health enum-to-label mapping.
+
+### `metrics_internally_consistent_per_session`
+Across 3 rounds (restarting between rounds), within each session
+`records_accepted <= pushes_made` and `records_ack <= records_accepted`.
+A per-session invariant only — the cross-restart reset and the recovery
+counter are tested separately. (This is the honestly-named rewrite of the
+old, misleading `metrics_consistent_across_crash_restart`.)
+
+### `metrics_reset_to_zero_after_restart`
+`records_accepted_total` and `records_ack_total` are in-process atomics:
+after driving both above zero and restarting, they read exactly 0 before
+any new push. Documents the deliberate non-persistence of Prometheus
+counters across a process restart.
 
 ## Graceful shutdown
 
-### `server_shuts_down_cleanly_on_sigterm` — system.rs:799
-- **Asserts:** `ServerHandle::shutdown` (SIGTERM + wait) returns without hanging.
-- **Regression prevented:** A deadlock in shutdown signal handling.
-- **Verdict:** STRENGTHEN
-- **Notes:** No timeout is asserted — if shutdown takes 60 s the test still passes (slowly). Add a wall-clock bound (e.g. `< 5s`) like `graceful_shutdown_under_load` does. The "before-shutdown" push is unused.
+### `server_shuts_down_cleanly_on_sigterm`
+SIGTERM on an idle daemon completes within a 5 s budget. The wall-clock
+bound is the point — without it, a shutdown that hung for any duration
+short of cargo's timeout would still pass.
 
-### `server_exits_and_socket_disappears_after_sigterm` — system.rs:810
-- **Asserts:** Socket file exists before shutdown, does not exist after.
-- **Regression prevented:** Drop/cleanup logic that leaves stale socket files on graceful exit (would force operators into manual cleanup).
-- **Verdict:** KEEP
+### `server_exits_and_socket_disappears_after_sigterm`
+The socket file exists before shutdown and is gone after a clean exit.
+Catches cleanup logic that leaves stale socket files behind on graceful
+exit.
+
+### `graceful_shutdown_under_load`
+8-thread Sync flood + SIGTERM: no thread sees a `Nack` or protocol error
+(only `Ok` or `Io` EOF), shutdown completes in < 8 s, and the WAB has
+bytes. Catches half-ack-then-die, silent drops of in-flight pushes, or a
+hang past `shutdown_timeout_secs`. One of the highest-value tests in the
+file.
 
 ## Reconnect / restart
 
-### `new_connection_accepted_after_previous_client_drops` — system.rs:827
-- **Asserts:** After client A disconnects, client B can connect and push.
-- **Regression prevented:** A semaphore-permit leak where dropping a client doesn't release its connection slot.
-- **Verdict:** STRENGTHEN
-- **Notes:** Only verifies *one* reconnect. A leak that occurs after N drops would not be caught. Loop 100×.
+### `new_connection_accepted_after_previous_client_drops`
+100 connect → push → drop rounds, then a final health check. Cycling well
+past `max_connections` proves the connection-semaphore permit is reliably
+returned on every drop; a leak that only triggers after N drops would be
+invisible to a single-shot test.
 
-## Payload edge cases
+## Connection isolation and fault tolerance
 
-### `empty_payload_is_accepted` — system.rs:843
-- **Asserts:** Zero-length payload Sync push acks.
-- **Regression prevented:** Off-by-one in length validation that rejects len=0.
-- **Verdict:** KEEP
+### `stalled_client_does_not_block_other_connections`
+A raw-socket client sends one Push frame and then never reads the ack,
+holding its connection (and its semaphore permit) open. Meanwhile a
+separate connection completes 50 Sync pushes in < 5 s and the server
+stays healthy. Catches a per-connection task that blocks a shared worker
+(e.g. holding a mutex across `.await`) or a semaphore that tracks "active
+work" rather than "live connection".
 
-### `binary_payload_round_trips` — system.rs:850
-- **Asserts:** A 0..=255 byte payload Sync-pushes successfully.
-- **Regression prevented:** Catches a hypothetical text-mode handler stripping NULs/high bytes.
-- **Verdict:** RENAME
-- **Notes:** "round_trips" implies read-back, which never happens — there's no Pop API. Rename to `arbitrary_binary_payload_accepted`. (If read-back is desired, decode the WAB on disk.)
+### `partial_frame_does_not_corrupt_next_connection`
+A raw socket writes a valid header plus only half the declared payload,
+then closes mid-frame. A fresh connection afterward must work normally —
+the partial frame must not corrupt the per-connection read state or panic
+the server on mid-frame EOF.
 
-### `large_payload_accepted` — system.rs:859
-- **Asserts:** A 1 MiB Batched push acks.
-- **Regression prevented:** Catches a buffer assumption (e.g. read in a single fixed-size chunk) that breaks above some threshold below 1 MiB.
-- **Verdict:** STRENGTHEN
-- **Notes:** Name implies testing the *limit*. Test at `MAX_PAYLOAD_HARD_CAP` (16 MiB) and at `MAX_PAYLOAD_HARD_CAP + 1` to confirm the boundary is enforced; 1 MiB is mid-range and proves little.
+### `fd_limit_exhaustion_does_not_crash_server`
+With `RLIMIT_NOFILE = 128`, flood 200 raw connections, release them, and
+confirm the server still answers a health check and a Sync push. The
+property under test is "doesn't crash or hang under fd pressure"; the
+count of refused connects is logged as diagnostics but not asserted on,
+because the kernel listen backlog absorbs connects on most Linux configs
+even while `accept()` is returning EMFILE.
 
-## Stress
+### `socket_takeover_does_not_corrupt_wab_data`
+A second server B launched at server A's socket path calls `bind_cleanup`
+and takes the socket, but A's WAB files must remain byte-identical with
+all 20 payloads still present. The socket file and the WAB are
+independent resources; this models a misconfigured second-instance
+launch.
 
-### `sustained_load_1000_records_single_client` — system.rs:870
-- **Asserts:** 1000 sequential Buffered pushes ack.
-- **Regression prevented:** Slow leak (memory, fd, queue slot) that surfaces only after sustained load.
-- **Verdict:** KEEP
+## Write-error handling (EFBIG / ENOSPC)
 
-### `mixed_durability_under_concurrent_load` — system.rs:881
-- **Asserts:** 6 threads × 50 pushes (round-robin Sync/Batched/Buffered) all ack.
-- **Regression prevented:** A per-tier code path that breaks when interleaved across workers (e.g. a Sync push poisoning a Batched batch).
-- **Verdict:** KEEP
+### `efbig_returns_nack_not_crash`
+With `RLIMIT_FSIZE = 0` (and SIGXFSZ ignored), every WAB write fails with
+EFBIG; the first Sync push must return `Nack(NackReason::InternalError)`
+and the server must stay healthy. EFBIG is the cheapest write-failure
+mode to simulate without root.
 
-## Crash recovery
+### `enospc_returns_nack_not_crash` *(`#[ignore]`)*
+The production-shaped sibling of the EFBIG test: a real
+filesystem-out-of-space rather than a per-process file-size rlimit.
+Pushes 1 KiB records until one fails with `Nack(InternalError)`, then
+confirms the server is still alive. Requires a small pre-mounted tmpfs at
+`WEIR_TEST_ENOSPC_DIR` (the setup recipe is in the test's docstring), so
+it's `#[ignore]`-marked.
 
-### `server_restarts_after_sigkill` — system.rs:913 *(flagged)*
-- **Asserts:** Pre-crash push acks; socket file survives SIGKILL; restart succeeds; post-restart push acks.
-- **Regression prevented:** A regression in restart-path that fails to clean up the stale socket, or a panic during cold start when WAB files exist.
-- **Verdict:** STRENGTHEN
-- **Notes:** Together with `wab_data_integrity_after_crash` this **is** redundant on the data-survival axis — the integrity test already crashes, restarts implicitly via WAB inspection (well, it inspects WAB *without* restarting actually), and goes further. Keep this one strictly for the "can restart at all" check, but consider folding into `stale_socket_removed_automatically_on_restart` — the two are near-duplicates differing only in whether they push first. My recommendation: keep this, DELETE `stale_socket_removed_automatically_on_restart` (it's a true subset).
-
-### `stale_socket_removed_automatically_on_restart` — system.rs:935
-- **Asserts:** After SIGKILL the socket file is still there; after restart, health_check works.
-- **Regression prevented:** Same as above — `bind_cleanup` regression.
-- **Verdict:** DELETE
-- **Notes:** Strict subset of `server_restarts_after_sigkill` minus the pre-crash push. The "pushed nothing" angle adds no coverage.
-
-### `wab_data_preserved_across_crash_restart` — system.rs:714
-- **Asserts:** WAB bytes equal before/after SIGKILL, `> 0` after restart, **and** `weir_recovery_records_replayed_total >= acked_count` post-restart.
-- **Regression prevented:** A startup-time WAB scrub that wipes good segments, **plus** a recovery pass that silently quarantines every segment (bytes intact, records lost).
-- **Verdict:** KEEP (was STRENGTHEN — the metric-scrape recommendation has since been implemented; see lines 757–767 of the test)
-- **Notes:** Audit's STRENGTHEN recommendation is now implemented. The `weir_recovery_records_replayed_total >= acked` assertion catches the "every segment quarantined" failure mode that the byte-count check alone could not.
-
-## Fault injection
-
-### `readonly_wab_dir_prevents_startup` — system.rs:985
-- **Asserts:** With wab_dir at mode 0o000, server exits non-zero within 5 s.
-- **Regression prevented:** A fail-open startup that runs without WAB writability (would silently lose data).
-- **Verdict:** KEEP
+### `readonly_wab_dir_prevents_startup`
+With `wab_dir` at mode `0o000`, the server must exit non-zero within 5 s
+rather than fail open and run without a writable WAB. When the test
+harness runs as root it drops the child to uid `nobody` so the permission
+bit actually bites.
 
 ## Multi-shard correctness
 
-### `all_pushes_acked_with_multiple_shards` — system.rs:1033
-- **Asserts:** 100 Batched pushes ack with shard_count=4.
-- **Regression prevented:** A shard-routing crash or ack-channel cross-wiring across shards.
-- **Verdict:** KEEP
+### `shard_directories_created_on_disk`
+With `shard_count = 3`, at least three `shard_*` directories exist on
+disk after a push. Catches lazy or missing shard-directory creation.
 
-### `shard_directories_created_on_disk` — system.rs:1044
-- **Asserts:** With shard_count=3, ≥3 `shard_*` directories exist.
-- **Regression prevented:** Lazy/missing shard directory creation.
-- **Verdict:** KEEP
+### `concurrent_producers_all_acked_with_multiple_shards`
+4 threads × 50 Sync pushes with `shard_count = 4`. Beyond "all acked", it
+walks the per-shard directories and asserts data landed in ≥2 of them —
+without that check a buggy router that always picked shard 0 would be
+indistinguishable from the single-shard concurrency test.
 
-### `concurrent_producers_all_acked_with_multiple_shards` — system.rs:1074
-- **Asserts:** 4 threads × 50 Sync pushes with shard_count=4 all ack.
-- **Regression prevented:** A multi-shard concurrency race.
-- **Verdict:** STRENGTHEN
-- **Notes:** Heavy overlap with `concurrent_producers_all_acked`. To justify its existence, assert work landed in *different* shard directories (otherwise a buggy router that always picks shard 0 would still pass).
+## Ordering
 
-## Graceful shutdown under load
+### `per_shard_records_appear_in_submission_order`
+With `shard_count = 1`, payloads `order-00000..order-00029` appear at
+strictly increasing byte offsets in the WAB. The fundamental append-log
+ordering contract — any batching/queue change that reorders within a
+shard is caught.
 
-### `graceful_shutdown_under_load` — system.rs:1109
-- **Asserts:** During 8-thread Sync flood + SIGTERM, no thread sees Nack/Protocol errors; shutdown completes in < 8 s; WAB has bytes.
-- **Regression prevented:** Half-ack-then-die: server returns Nack mid-shutdown, or silently drops in-flight pushes, or hangs past `shutdown_timeout_secs`. One of the most valuable tests in the file.
-- **Verdict:** KEEP
+### `concurrent_producers_to_same_shard_preserve_per_producer_order`
+Single shard, 4 concurrent producers × 50 records each. After all finish,
+*each producer's own* records appear in ascending sequence order in the
+WAB. Pins that the partition queue → worker buffer → flusher channel
+chain stays FIFO per producer even with multiple workers and concurrent
+writers.
 
-## Stalled client isolation
+## Latency bounds
 
-### `stalled_client_does_not_block_other_connections` — system.rs:1206 *(flagged — maintainer thinks good)*
-- **Asserts:** With one client holding a connection open mid-frame (sent, not reading ack), 50 Sync pushes on a separate connection complete in < 5 s; server is still healthy afterward.
-- **Regression prevented:** A regression where the per-connection async task blocks a shared worker (e.g. by accidentally holding a mutex across `.await`), or where the semaphore tracks "active work" rather than "live connection" and starves on a stuck reader. This is a genuine isolation property and the test exercises it the right way: real raw socket, real partial-frame state, real timing assertion.
-- **Verdict:** KEEP — **confirmed good**
-- **Notes:** The maintainer's judgment is right. Minor nit: the 5 s deadline is loose given 50 trivial Sync pushes usually finish in < 1 s; tightening to 2 s would surface degradation earlier. Also consider scaling the stall to N idle connections (say 16) to catch leaks that need multiple stalled clients to trigger.
+### `batch_deadline_timer_keeps_latency_bounded`
+With `batch_deadline_ms = 20`, across 100 Sync samples: every sample is
+within 5× the deadline (100 ms tail ceiling) and the median is within 2×
+(40 ms). The median bound catches batch-timer starvation on the common
+path; the loose tail bound keeps the test from flaking on noisy CI
+runners (the regressions it targets are order-of-magnitude, not 10%
+drift).
 
-## Partial frame injection
+## Sink delivery (end-to-end, gated)
 
-### `partial_frame_does_not_corrupt_next_connection` — system.rs:1276
-- **Asserts:** After writing header + half a payload then closing, a fresh connection works.
-- **Regression prevented:** Per-connection read state that leaks into the *accept* path (it shouldn't — each connection has its own buffer — but the test pins the invariant). Also catches a panic on mid-frame EOF that takes down the whole server.
-- **Verdict:** KEEP
+These exercise a real downstream database and so are `#[ignore]`-marked
+(and, for ClickHouse, feature-gated). See
+[`sink-integration.md`](sink-integration.md) for the runner script and
+schema setup. Each pushes 100 Sync records and asserts the sink committed
+them all (`weir_sink_commit_records_total{outcome="committed"} >= 100`),
+that at least one `commit()` happened, and that the records-per-commit
+ratio is ≥ 10:1 (the IOPS-compression story — many records per
+multi-row INSERT / RowBinary insert).
 
-## Disk full
+### `mysql_sink_end_to_end` *(`#[ignore]`)*
+`sink_type = "mysql"`, URL from `WEIR_TEST_MYSQL_URL`. Verifies delivery
+and IOPS compression against a real MySQL.
 
-### `efbig_returns_nack_not_crash` — system.rs:1174
-- **Asserts:** With `RLIMIT_FSIZE=0`, the first Sync push returns `Nack(InternalError)`; server stays healthy.
-- **Regression prevented:** A WAB write error path that panics or silently acks. That property is real and important.
-- **Verdict:** KEEP (was "RENAME and consider adding ENOSPC variant" — both done)
-- **Notes:** Renamed from the misleading `disk_full_returns_nack_not_crash` (this is EFBIG — write would exceed file-size limit — not ENOSPC). The ENOSPC variant has been added as a sibling test below.
+### `postgres_sink_end_to_end` *(`#[ignore]`)*
+The Postgres counterpart: `sink_type = "postgres"`, URL from
+`WEIR_TEST_POSTGRES_URL`.
 
-### `enospc_returns_nack_not_crash` — system.rs:1232 *(`#[ignore]`, requires setup)*
-- **Asserts:** Same property as `efbig_returns_nack_not_crash` (Nack on first push, server healthy) but exercises the production scenario — a real filesystem-out-of-space rather than a per-process file-size rlimit.
-- **Regression prevented:** A WAB write error path that diverges between EFBIG and ENOSPC. The two can hit at different syscalls (EFBIG in the first over-budget `write`, ENOSPC also in `fallocate`/`fsync`).
-- **Verdict:** KEEP
-- **Notes:** `#[ignore]`-marked because it needs a small pre-mounted tmpfs at `WEIR_TEST_ENOSPC_DIR`; setup recipe is in the test's docstring. Audit closed for the original "add an ENOSPC variant" recommendation.
+### `clickhouse_sink_end_to_end` *(`#[ignore]`, `#[cfg(feature = "clickhouse-sink")]`)*
+`sink_type = "clickhouse"`, URL from `WEIR_TEST_CLICKHOUSE_URL`. Verifies
+the RowBinary HTTP insert path and the IOPS-compression ratio. Only
+compiled when the `clickhouse-sink` feature is on.
 
-## WAB data integrity after crash
+---
 
-### `wab_data_integrity_after_crash` — system.rs:1349 *(flagged)*
-- **Asserts:** Every payload that received an Ack for a Sync push appears verbatim in the raw WAB bytes after SIGKILL.
-- **Regression prevented:** The Sync durability contract being violated: server acks before fsync, or fsync silently no-ops. This is the byte-level guarantee that defines the product. Highest-value test in the suite.
-- **Verdict:** KEEP — **strongest test in the file**
-- **Notes:** Together with `server_restarts_after_sigkill`: not redundant. `server_restarts_after_sigkill` proves the daemon can boot back up over its own crash debris; this one proves the data semantics. They test different invariants and both should stay. The substring search via `windows().any()` is O(N²) but at 50 records × small payloads it's fine. One subtle gap: this test never *restarts* the server after the crash, so it doesn't verify that recovery successfully reads those bytes back — that's the missing test the audit flags above.
+## Maintaining this document
 
-## Socket takeover data safety
+When you add, remove, or rename a system test, update the matching entry
+here by **name** — do not add line numbers. Keep the category grouping;
+add a new category only if a genuinely new behavioural area appears.
 
-### `socket_takeover_does_not_corrupt_wab_data` — system.rs:1396
-- **Asserts:** Spawning a second server B that takes A's socket leaves A's WAB byte-identical, with all 20 payloads still present.
-- **Regression prevented:** A startup path that touches/locks the WAB of a previous-but-still-running instance via the socket path (would be catastrophic for data integrity). Models a misconfigured second-instance launch.
-- **Verdict:** KEEP
+Two related invariants live outside this file and are worth knowing about
+when you touch metrics tests:
 
-## File descriptor limit exhaustion
+- The metric-family count (31 default / 35 with `--all-features`) is
+  enforced by `metrics_all_families_registered` against the expected list
+  in the test and the `reg!(...)` registrations in
+  `crates/weir-server/src/metrics/mod.rs`. Adding a metric means touching
+  both, and the unit tests in `metrics/mod.rs` (`all_metric_names_present_in_output`)
+  as well.
+- The sink end-to-end tests are also documented in
+  [`sink-integration.md`](sink-integration.md); keep the two in sync.
 
-### `fd_limit_exhaustion_does_not_crash_server` — system.rs:1485
-- **Asserts:** With `RLIMIT_NOFILE=128`, flooding 200 raw connections then releasing them leaves the server healthy and able to ack a push.
-- **Regression prevented:** A panic on `accept()` returning `EMFILE` — a real production failure mode.
-- **Verdict:** STRENGTHEN
-- **Notes:** Should additionally assert that at least *some* of the 200 connections were refused (otherwise the test passes if the fd limit is silently ignored). Counting `Err(_)` returns from `RawStream::connect` and asserting `>= 1` would do it.
+## Tests no longer present
 
-## Metrics accuracy (counters)
+The following names appeared in earlier revisions of this audit and are
+**gone** from the current suite — do not look for them:
 
-### `records_accepted_counter_increments_after_sync_pushes` — system.rs:1524
-- **Asserts:** After 10 Sync pushes, body contains `weir_records_accepted_total{tier="sync"} 10`.
-- **Regression prevented:** Accepted counter miswired (wrong tier label, wrong increment site).
-- **Verdict:** KEEP
-
-### `records_ack_counter_increments_after_sync_pushes` — system.rs:1544
-- **Asserts:** After 7 Sync pushes, body contains `weir_records_ack_total{tier="sync"} 7`.
-- **Regression prevented:** Ack counter miswired.
-- **Verdict:** KEEP
-- **Notes:** Near-duplicate of the previous test; the two could be merged into one that checks both counters in one session, but the separation is cheap and the names are honest.
-
-## Per-shard record ordering
-
-### `per_shard_records_appear_in_submission_order` — system.rs:1573
-- **Asserts:** With shard_count=1, payloads `order-00000..order-00029` appear in increasing byte offset in the WAB.
-- **Regression prevented:** A queue or batcher that reorders records within a single shard — would silently break log-replay semantics for downstream consumers.
-- **Verdict:** KEEP
-
-## Batch deadline timer accuracy
-
-### `batch_deadline_timer_keeps_latency_bounded` — system.rs:1621
-- **Asserts:** Across 20 Sync pushes, each is < 100 ms (5×deadline) and the worst < 60 ms (3×deadline).
-- **Regression prevented:** A batch-timer starvation regression (e.g. an accept loop that spins, or a worker that holds a lock past its deadline). Bounds latency in production-meaningful terms.
-- **Verdict:** STRENGTHEN
-- **Notes:** Mostly good. Two concerns: (a) labeling 20 samples' max as "p99" is sloppy — comment that out or run ≥100 samples. (b) On a loaded CI runner one occasional GC-pause-equivalent will flake; consider asserting on median + a separate looser tail.
-
-## Metrics monotonicity under crash-restart
-
-### `metrics_consistent_across_crash_restart` — system.rs:1662 *(flagged)*
-- **Asserts:** In each of 3 rounds (with restarts between), `records_accepted ≤ pushes_made` and `records_ack ≤ records_accepted`.
-- **Regression prevented:** *Within a single session*, only: counter overcount or ack-exceeds-accepted ordering. The cross-restart axis is entirely untested.
-- **Verdict:** REWRITE
-- **Notes:** The name is straight-up misleading. "Across crash-restart" implies a property that spans restarts; the only spanning behaviour the test exercises is "restart, then run the same per-round assertion again." The maintainer's read is correct: rename to `metrics_internally_consistent_per_session` if you keep the current logic, or rewrite to actually test cross-restart properties:
-  - That after restart, `records_accepted_total` resets to 0 (it's a process-local atomic) — documents the deliberate non-persistence.
-  - That `weir_recovery_records_replayed` advances by the number of records that were on disk pre-crash.
-  - That `weir_wab_segments` reflects the on-disk file count after recovery.
-  Without one of those, the test does not earn its name.
+- `multiple_sequential_pushes_same_connection` — removed.
+- `health_check_on_separate_connection_from_push` — removed (it observed
+  no cross-connection interaction).
+- `wab_segment_rotation_creates_multiple_segments` — removed (40 KiB
+  could never rotate a 256 MiB segment; idle-seal behaviour is now
+  covered by `idle_seal_drains_low_volume_segment_without_shutdown`).
+- `wab_writes_nonzero_bytes_to_disk_after_sync_pushes` — removed (folded
+  into the byte-level integrity / durability tests).
+- `stale_socket_removed_automatically_on_restart` — removed (a strict
+  subset of `server_restarts_after_sigkill`).
+- `all_durability_tiers_acked` → renamed/strengthened to
+  `all_durability_tiers_behave_per_contract`.
+- `binary_payload_round_trips` → renamed to
+  `arbitrary_binary_payload_accepted`.
+- `large_payload_accepted` → replaced by `payload_size_boundary_enforced`.
+- `empty_payload_is_accepted` → the behaviour **inverted**; the current
+  test is `empty_payload_is_rejected`.
+- `metrics_all_19_families_registered` → renamed to
+  `metrics_all_families_registered` and the count corrected (31 default /
+  35 all-features, not 19).
+- `disk_full_returns_nack_not_crash` → renamed to
+  `efbig_returns_nack_not_crash`, with `enospc_returns_nack_not_crash`
+  added alongside.
+- `metrics_consistent_across_crash_restart` → rewritten and renamed to
+  `metrics_internally_consistent_per_session`; the cross-restart axis is
+  now covered by `metrics_reset_to_zero_after_restart` and
+  `recovery_replays_records_after_crash`.
