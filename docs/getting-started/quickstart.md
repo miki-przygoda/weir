@@ -117,8 +117,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The client API is synchronous — one blocking socket round-trip per call,
-no async runtime required. Add `weir-client` to your example/dev deps, then:
+The client API is synchronous — one blocking socket round-trip per call, so you
+don't *need* an async runtime to use it. (If you're calling from inside one,
+`push()` blocks the executor thread — see
+[Integrating → Producing from an async runtime](integrating.md#producing-from-an-async-runtime)
+for the bridge pattern.) Add `weir-client` to your example/dev deps, then:
 
 ```bash
 cargo run --release --example hello

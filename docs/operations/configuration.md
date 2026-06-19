@@ -449,30 +449,40 @@ max-size payload at once). On memory-constrained hosts, lower
 
 - **Type**: u16
 - **Default**: `9185`
-- **Range**: 1–65535
+- **Range**: 1–65535 (port `0` is rejected at startup with a clear error)
 - **CLI**: `--metrics-port <n>`
 - **Env**: `WEIR_METRICS_PORT`
 - **TOML**: `metrics_port`
 
-TCP port for the Prometheus `/metrics` HTTP endpoint.
+TCP **port** for the Prometheus `/metrics` HTTP endpoint. This is a distinct
+knob from the bind **host** ([`metrics_bind`](#metrics_bind)); the two combine
+into the listen socket `<metrics_bind>:<metrics_port>` (default
+`127.0.0.1:9185`).
 
 **When to tune**: change if 9185 conflicts with another service, or
 to allow multiple weir instances on one host.
 
 #### `metrics_bind`
 
-- **Type**: IpAddr
+- **Type**: IP address (a bare host `IpAddr` — **not** `host:port`)
 - **Default**: `127.0.0.1` (localhost only)
+- **Validation**: parsed as an `IpAddr` at startup; a value that is not a valid
+  IP address (e.g. a hostname, or a `host:port` pair) is a startup error.
 - **CLI**: `--metrics-bind <addr>`
 - **Env**: `WEIR_METRICS_BIND`
 - **TOML**: `metrics_bind`
 
-Address the metrics server binds to. The default is localhost-only, so
-the endpoint is not exposed off-box without an explicit decision. To
-scrape from another host, sidecar, or container, set `0.0.0.0` (or a
-specific interface) and restrict access via firewall rules or a
-`--publish 127.0.0.1:9185:9185` port mapping in Docker. A `0.0.0.0`
-bind is **not** a security boundary — `/metrics` is unauthenticated.
+The **host address** the metrics server binds to. The **port** is a separate
+knob, [`metrics_port`](#metrics_port) — `metrics_bind` is a host-only address and
+the two combine into the listen socket (`<metrics_bind>:<metrics_port>`, default
+`127.0.0.1:9185`). Set the host here (e.g. `0.0.0.0` or a specific interface) and
+the port in `metrics_port`; do **not** put a port in `metrics_bind`.
+
+The default is localhost-only, so the endpoint is not exposed off-box without an
+explicit decision. To scrape from another host, sidecar, or container, set
+`0.0.0.0` (or a specific interface) and restrict access via firewall rules or a
+`--publish 127.0.0.1:9185:9185` port mapping in Docker. A `0.0.0.0` bind is
+**not** a security boundary — `/metrics` is unauthenticated.
 
 #### `metrics_max_connections`
 
@@ -532,12 +542,40 @@ record is appended to a dead-letter segment under
 > `weir_drain_segments_stranded_total`, not the dead-letter metrics). Only
 > *permanent* rejections land in the dead-letter directory.
 
-**Reprocessing dead-lettered records.** There is **no built-in requeue** in
-1.0: `weir-ctl dl` supports `list` (count + bytes) and `drop` (delete all)
-only. Dead-lettered records are held for manual handling — inspect the segment
-files under `<wab_dir>/dead_letter/`, fix the downstream cause, and re-submit
-them through your producer if needed. An automated requeue path is tracked for
-a post-1.0 release.
+**Reprocessing dead-lettered records.** Use `weir-ctl dl requeue` once you've
+fixed the downstream cause. It reads the dead-letter segments under
+`<wab_dir>/dead_letter/` via the shared `weir-wab` `SegmentReader` (CRC-verifying
+every record) and re-submits each record back through the daemon's Unix socket as
+a normal `Push`, so the records re-enter the pipeline and the drain re-attempts
+delivery. The full `weir-ctl dl` surface is `list` (count + bytes), `drop`
+(delete all), and `requeue` (re-submit then delete).
+
+```bash
+# Dry run (default): report what WOULD be requeued; touches nothing, connects to nothing.
+weir-ctl dl requeue --wab-dir /var/lib/weir/wab
+
+# Real run: re-submit and delete each segment once all its records are re-accepted.
+weir-ctl dl requeue --wab-dir /var/lib/weir/wab --socket /run/weir/weir.sock --yes
+```
+
+- **Defaults to a dry run, like `dl drop`.** Without `--yes` it only counts the
+  recoverable records (and lists any unreadable segments it would skip) and
+  prints what it would do — it does not connect to the daemon or modify any file.
+  `--yes` performs the real run.
+- **Flags**: `--wab-dir` (env `WEIR_WAB_DIR`); `--socket` (alias `--socket-path`,
+  default `/run/weir/weir.sock`) — the daemon socket to push back through;
+  `--durability` (`sync` | `batched` | `buffered`, default `batched`) — the
+  durability tier for the re-pushed records; `--yes` to actually requeue.
+- **At-least-once, segment-atomic.** A segment is deleted only after **all** of
+  its records are re-accepted (each `Push` is acked only once the daemon has made
+  it durable), so an interrupted run bounds duplication to the single in-flight
+  segment, which is re-sent on the next run. Duplicate payloads are absorbed by
+  the sink's idempotency key. A corrupt/unreadable segment is skipped wholesale
+  (never partially requeued) and left in place. Records that are requeued but
+  whose segment can't be deleted are surfaced loudly (they will requeue again
+  next run — remove them manually).
+
+`docs/monitoring.md` references this command in its dead-letter runbook.
 
 #### `dead_letter_max_bytes`
 
