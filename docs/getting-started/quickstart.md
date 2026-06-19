@@ -16,8 +16,10 @@ see [configuration.md](../operations/configuration.md).
 
 - **Rust 1.88+** (edition 2024) — `rustup toolchain install stable` (1.88
   is the declared MSRV, enforced in CI)
-- **Unix host** — Linux or macOS. weir-server does not run on Windows;
-  the `weir-core` and `weir-client` crates are cross-platform.
+- **Unix host** — Linux or macOS. `weir-server` builds on Windows but is a
+  non-functional stub there (no Unix-socket listener), so run the daemon only
+  on Linux or macOS. `weir-core` is genuinely cross-platform; `weir-client`
+  compiles everywhere but its client type is Unix-only.
 - **A writable directory** — for the WAB segments. Anywhere works;
   the examples below use `/tmp/weir-quickstart/wab`.
 
@@ -148,10 +150,10 @@ You'll see weir's Prometheus metric families (the full catalogue is in
 [monitoring.md](../monitoring.md)):
 
 ```
-# HELP weir_records_accepted_total Records accepted from producers
+# HELP weir_records_accepted_total Total records accepted from producers, by durability tier
 # TYPE weir_records_accepted_total counter
 weir_records_accepted_total{tier="sync"} 1
-# HELP weir_records_ack_total Records acknowledged to producers
+# HELP weir_records_ack_total Total records acknowledged to producers, by durability tier
 # TYPE weir_records_ack_total counter
 weir_records_ack_total{tier="sync"} 1
 ...
@@ -199,9 +201,10 @@ For the full pipeline detail, see
 
 ```bash
 # Stop the daemon: Ctrl-C in its terminal, or kill the specific PID you started:
-kill "$(pgrep -f 'weir-server --config /tmp/weir-quickstart')"
-# (Avoid `pkill weir-server` on a shared host — it kills every weir daemon,
-#  not just this quickstart's.)
+kill "$(pgrep -f -- '--wab-dir /tmp/weir-quickstart')"
+# (This matches only the quickstart daemon by its --wab-dir flag. Avoid
+#  `pkill weir-server` on a shared host — it kills every weir daemon, not
+#  just this quickstart's.)
 
 # Remove the quickstart data.
 rm -rf /tmp/weir-quickstart

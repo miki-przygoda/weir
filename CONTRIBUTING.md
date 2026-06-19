@@ -22,8 +22,11 @@ drop a record it has acked?* If you can't rule that out, the change isn't ready.
 
 - **Rust 1.88+** (edition 2024) — the declared MSRV (`rust-version` in
   `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
-- **A Unix host** (Linux or macOS) to build/run `weir-server` — it uses
-  Unix-only socket APIs. `weir-core` and `weir-client` are cross-platform.
+- **A Unix host** (Linux or macOS) to **run** `weir-server` — it uses
+  Unix-only socket APIs. The daemon still *builds* on Windows (CI compiles
+  it there), but it is a non-functional stub: no Unix-socket listener, so it
+  never serves. `weir-core` is genuinely cross-platform; `weir-client`
+  compiles everywhere but its client type is Unix-only.
 - **Docker** (with the `docker compose` plugin) — only for the optional
   sink-integration and monitoring suites below.
 
@@ -52,9 +55,11 @@ cargo test --all-features
 cargo deny check advisories bans licenses sources
 ```
 
-All of the above must pass. CI also builds `weir-server` on Linux (x86_64 +
-aarch64), macOS (x86_64 + aarch64), and `weir-core`/`weir-client` on Windows —
-**cfg-gate any Unix-only code** so the cross-platform crates keep building.
+All of the above must pass. CI builds `weir-server` on all five release targets:
+Linux (x86_64 + aarch64), macOS (x86_64 + aarch64), **and Windows
+(x86_64-pc-windows-msvc)** — so **cfg-gate any Unix-only code** or the Windows
+build breaks. The Windows build is a non-functional stub (no Unix-socket
+listener); the daemon runs only on Linux and macOS.
 
 ## Heavier suites (run when your change touches them)
 

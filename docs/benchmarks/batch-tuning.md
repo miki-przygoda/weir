@@ -69,10 +69,11 @@ fsync → ack), `batched` (request → flush-or-deadline → ack), `buffered`
   amortise per fsync.
 - **(256, 1 ms) is the sweet spot** in this sweep — lowest p50 across sync /
   batched / buffered and tightest p99 tail in batched.
-- The current `config/mod.rs` defaults (`batch_size = 1000`, `batch_deadline_ms
-  = 100`) are out of step with what every shipped config actually uses (the CI
-  load job runs `batch_size = 64`, the bench job and smoke test use
-  `batch_deadline_ms = 1`).
+- The `config/mod.rs` defaults at the time of this sweep (`batch_size = 1000`,
+  `batch_deadline_ms = 100`) were out of step with what every shipped config
+  actually uses (the CI load job runs `batch_size = 64`, the bench job and smoke
+  test use `batch_deadline_ms = 1`). The recommendation below was applied: the
+  current defaults are now `batch_size = 256`, `batch_deadline_ms = 1`.
 
 ## Recommendation
 

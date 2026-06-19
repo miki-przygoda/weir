@@ -42,7 +42,7 @@ static host, GitHub Pages) and serve it as-is, or open it directly with
 `file://`. To embed it in an existing page, drop it in an `<iframe>`:
 
 ```html
-<iframe src="weir-demo.html" width="100%" height="1200" style="border:0"></iframe>
+<iframe src="index.html" width="100%" height="1200" style="border:0"></iframe>
 ```
 
 All styles and scripts are inline, so there are no asset paths to fix up.

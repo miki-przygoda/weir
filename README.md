@@ -26,7 +26,7 @@ naive insert-per-record baseline. No build step — open `demo/index.html` in an
 browser. *(Hosted version coming with the public launch.)*
 
 > **Status — 1.0.** The v1 wire protocol and public Rust API (`weir-core`,
-> `weir-client`, `weir-sink-sdk`) are frozen under
+> `weir-client`, `weir-sink-sdk`, `weir-wab`) are frozen under
 > [Semantic Versioning](https://semver.org/), with a
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
 > format for non-Rust implementers. The WAB on-disk format is stable and
@@ -184,7 +184,11 @@ listener is available behind the `tls` feature for cross-host producers.
   reasons, and each rejection case — run your own codec against them
   ([docs/conformance.md](docs/conformance.md)).
 - **Cross-platform CI:** `fmt` + `clippy` across the feature matrix + `cargo-deny`
-  + the full test suites + a monitoring-stack end-to-end smoke test, on every push.
+  + the full test suites + a monitoring-stack end-to-end smoke test, on every
+  push. The build matrix compiles `weir-server` on all five release targets,
+  including `x86_64-pc-windows-msvc` — though the Windows binary is a
+  non-functional stub (no Unix-socket listener); the daemon runs only on
+  Linux and macOS.
 
 ## Contributing
 

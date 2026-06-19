@@ -127,8 +127,11 @@ Records stay safe on disk until it recovers.
 
 #### WeirSinkDegraded
 The sink reports itself **degraded** — reachable but not fully healthy (e.g. the
-HEAD health probe returned a non-404 4xx). Delivery may still work but is
-impaired; the WAB keeps buffering durably. Warning, not critical.
+HEAD health probe returned a 4xx other than 401/403/405; 404 is not special and
+falls here too). 401/403/405/501 are treated as Healthy, since they mean the
+endpoint is reachable but just rejects the unauthenticated HEAD probe (the real
+authenticated POST path still works). Delivery may still work but is impaired;
+the WAB keeps buffering durably. Warning, not critical.
 **Respond:** check the downstream system before it tips to `down`; correlate with
 `WeirSegmentStranded` / `WeirDeadLettered`. Transient flaps below 15m don't fire.
 

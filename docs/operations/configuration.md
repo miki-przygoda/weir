@@ -718,16 +718,18 @@ For HTTP, the body is the raw payload bytes; `Content-Type` is
 - **2xx** for accepted records → committed
 - **4xx (except 408, 429)** for rejected records → dead-lettered
 - **408, 429, 5xx** for retryable failures → drain retries the whole
-  segment with exponential backoff (up to `MAX_RETRIES`)
+  segment with exponential backoff (up to `sink_max_retries`)
 
 Network-layer failures (connect refused, DNS failure, timeout) are
 treated as transient.
 
-**`MAX_RETRIES` is a fixed `3`** (100 ms base delay, doubling) — it is **not**
-currently configurable via flag/env/TOML. Once a segment exhausts its retries it
-is left on disk ("stranded"), increments `weir_drain_segments_stranded_total`,
-and is re-attempted **only on daemon restart** — not automatically when the sink
-recovers. See [monitoring.md](../monitoring.md#weirsegmentstranded).
+**The retry budget is configurable** via `sink_max_retries` (default `3`,
+range 0–100) and `sink_retry_base_delay_ms` (default `100`, doubling on each
+retry) — see their sections below. Once a segment exhausts its retries it is
+left on disk ("stranded"), increments `weir_drain_segments_stranded_total`, and
+is re-drained **automatically on the next health poll after the sink recovers**
+(within `health_poll_interval_secs`), or on the next daemon restart.
+See [monitoring.md](../monitoring.md#weirsegmentstranded).
 
 **Health probe (`HEAD`).** weir periodically sends an HTTP `HEAD` to `sink_url`
 to populate `weir_sink_health`. A reachable endpoint that doesn't implement HEAD

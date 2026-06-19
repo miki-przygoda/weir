@@ -6,9 +6,12 @@
 > container image (`docker compose -f deploy/docker/docker-compose.yml up`).
 > `cargo install weir-server` lands with the 1.0 crates.io release (see below).
 
-Three supported install paths are covered below. All install paths
-produce the same `weir-server` daemon; the choice is purely about how
-you want to build, deploy, and update it.
+Several install paths are covered below — from source, container image,
+`cargo install`, or a pre-built release binary. They all produce the same
+`weir-server` daemon; the choice is purely about how you want to build,
+deploy, and update it. (The systemd section below is for *running* an
+already-installed binary as a bare-metal service, not a separate install
+method.)
 
 ## From source (Cargo)
 
@@ -16,8 +19,12 @@ you want to build, deploy, and update it.
 
 - **Rust 1.88+** (edition 2024) — the declared MSRV (`rust-version` in
   `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
-- A Unix host (Linux or macOS). weir-server does not build on Windows
-  due to Unix-only socket APIs; `weir-core` and `weir-client` do.
+- A Unix host (Linux or macOS) to **run** the daemon. `weir-server`
+  *builds* on Windows (CI and the release workflow produce a
+  `weir-server.exe`), but it is a non-functional stub there — there is no
+  Unix-socket listener, so the daemon never serves. `weir-core` is
+  genuinely cross-platform; `weir-client` compiles everywhere but its
+  client type (`WeirClient`) is Unix-only, so Windows has no usable client.
 - ~500 MB free disk (build artifacts).
 
 ### Build
@@ -121,6 +128,11 @@ for the security review.
 docker build -f deploy/docker/Dockerfile -t weir:latest .
 ```
 
+(This is a manual build tagged `weir:latest`. Note that `docker compose`
+builds and tags its own image `weir-server:local` — a different tag — so
+the two don't collide and `docker rmi weir:latest` won't remove the
+compose image.)
+
 The build uses BuildKit's cache mounts where available. First build
 takes ~3–5 minutes; subsequent builds with unchanged dependencies are
 ~30 seconds.
@@ -131,8 +143,9 @@ takes ~3–5 minutes; subsequent builds with unchanged dependencies are
 docker compose -f deploy/docker/docker-compose.yml up
 ```
 
-This mounts `./data/wab` for the WAB and exposes the metrics port on
-`127.0.0.1:9185`. Configuration goes in
+This stores the WAB in a named Docker volume (`wab_data`, mounted at
+`/var/lib/weir/wab`) and exposes the metrics port on `127.0.0.1:9185`.
+Configuration goes in
 `deploy/docker/weir.toml.example` — copy to your own path and
 bind-mount.
 
@@ -206,12 +219,14 @@ public API are frozen at 1.0 under Semantic Versioning.
 
 ## Pre-built release binaries
 
-The `release.yml` GitHub Actions workflow builds and attaches binaries
-for `x86_64-linux`, `aarch64-linux`, `x86_64-macos`, `aarch64-macos`,
-and `x86_64-windows` (for `weir-core` only) to each version tag's
-[GitHub Release](https://github.com/miki-przygoda/weir/releases).
-Download the archive for your platform, or use the from-source or
-container paths above.
+The `release.yml` GitHub Actions workflow builds and attaches `weir-server`
+binaries for `x86_64-linux`, `aarch64-linux`, `x86_64-macos`, `aarch64-macos`,
+and `x86_64-windows` to each version tag's
+[GitHub Release](https://github.com/miki-przygoda/weir/releases). The
+`x86_64-windows` artifact is a `weir-server.exe`, but it is a non-functional
+stub: there is no Unix-socket listener on Windows, so the daemon does not
+serve — run the daemon only on Linux or macOS. Download the archive for your
+platform, or use the from-source or container paths above.
 
 ## Verifying the install
 
@@ -264,7 +279,9 @@ cargo uninstall weir-server
 
 ```bash
 docker compose -f deploy/docker/docker-compose.yml down
-docker rmi weir:latest
+# Compose tags its image weir-server:local; remove that one:
+docker rmi weir-server:local
+# (If you ran the manual `docker build -t weir:latest .` above, also: docker rmi weir:latest)
 ```
 
 ### Data

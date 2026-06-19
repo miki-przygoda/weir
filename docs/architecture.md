@@ -63,7 +63,7 @@ Three-layer configuration: `CLI > env > TOML file > defaults`.
 
 The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exist on Windows; `weir-core` remains cross-platform.
 
-- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, `chmod 0o600` after bind).
+- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, then a tightened umask of `0o177` so `bind(2)` creates the socket inode at mode `0o600` directly — no post-bind `chmod`, which was the exact TOCTOU window the design removed). See [security/socket-bind.md](security/socket-bind.md).
 - Accepts connections up to `max_connections` (Semaphore-gated; over-cap streams are dropped immediately).
 - Assigns each accepted connection a `shard_id` round-robin (`accept_counter % shard_count`). Every WorkUnit pushed on that connection inherits the same shard_id, so a connection is pinned to one WAB flusher for its lifetime — no per-record routing decision on the hot path.
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
@@ -81,7 +81,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 
 ### Worker pool (`src/worker.rs`, `src/models.rs`)
 
-- `WorkUnit { shard_id: u32, payload: Payload, ack_tx: oneshot::Sender<bool> }` — the ack channel travels intact through the worker and batch to the WAB drain, which resolves it after the durable write. Workers do not ack.
+- `WorkUnit { shard_id: u32, payload: Payload, durability: Durability, ack_tx: oneshot::Sender<bool> }` — the ack channel travels intact through the worker and batch to the WAB drain, which resolves it after the durable write. Workers do not ack.
 - `Batch { shard_id: u32, records: Vec<WorkUnit> }` — per-shard buffer flushed on batch-full or `batch_deadline`.
 - Flush uses `std::mem::replace` to swap in a fresh pre-allocated buffer; zero allocation on the hot path.
 - `on_disconnect` is `#[cold] #[inline(never)]` to keep it off the hot path and bias the branch predictor toward the `Ok(unit)` arm.
