@@ -1,0 +1,123 @@
+# weir.service — production systemd unit for the weir write-ahead-buffer daemon.
+#
+# Install path: /etc/systemd/system/weir.service
+# See README.md in this directory for the full install walkthrough; the short
+# version is:
+#
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin weir
+#   sudo install -m0755 weir-server /usr/local/bin/weir-server
+#   sudo install -m0644 weir.service /etc/systemd/system/weir.service
+#   sudo install -d -m0755 /etc/weir
+#   sudo install -m0640 -o root -g weir weir.toml /etc/weir/weir.toml
+#   sudo install -m0640 -o root -g weir weir.env.example /etc/weir/weir.env  # then edit secrets
+#   sudo systemctl daemon-reload && sudo systemctl enable --now weir
+#
+# RuntimeDirectory= (/run/weir) is recreated on every boot, and ExecStartPre
+# below creates the wab/ subdir, so a fresh host comes up with no manual dir
+# setup beyond installing the binary, config, and this unit.
+
+[Unit]
+Description=weir durable write-ahead-buffer daemon
+Documentation=https://github.com/miki-przygoda/weir
+# The HTTP/SQL sinks dial out to a downstream; wait for the network to be up.
+# (Harmless for the default noop sink, which makes no outbound connections.)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=weir
+Group=weir
+
+# /run/weir is the socket's PARENT directory. systemd creates and chowns it to
+# weir:weir on every start; the 0700 mode is load-bearing for weir's bind
+# security model (see docs/security/socket-bind.md) — DO NOT loosen it.
+RuntimeDirectory=weir
+RuntimeDirectoryMode=0700
+
+# /var/lib/weir is the persistent WAB store. StateDirectory creates and chowns
+# it, but NOT the wab/ subdir the daemon's wab_dir points at (see ExecStartPre).
+StateDirectory=weir
+StateDirectoryMode=0700
+
+# Secrets (WEIR_SINK_BEARER_TOKEN, and a credential-bearing WEIR_SINK_URL) come
+# from an env file, NOT the TOML — the config file has no on-disk redaction, and
+# WEIR_SINK_BEARER_TOKEN is env-only by design (never read from TOML or a flag).
+# Leading '-' makes it optional, so a default noop-sink box without secrets still
+# starts. Keep this file 0640 root:weir (see weir.env.example).
+EnvironmentFile=-/etc/weir/weir.env
+
+# The daemon validates wab_dir with canonicalize() at startup and REFUSES to
+# start if it does not exist ("cannot canonicalize '/var/lib/weir/wab': No such
+# file or directory" — see validate_path in crates/weir-server/src/config/mod.rs;
+# weir follows the Postgres model and never creates its own data dir).
+# StateDirectory= creates /var/lib/weir but not the wab/ subdir, so create it at
+# 0700 here. This also self-heals a wiped StateDirectory on the next start.
+ExecStartPre=/usr/bin/install -d -m0700 /var/lib/weir/wab
+
+# Real flags only (verified against crates/weir-server/src/config/cli.rs).
+# All other knobs live in the TOML / WEIR_* env; --config selects the file
+# (this IS the default path, but spell it out for clarity).
+ExecStart=/usr/local/bin/weir-server --config /etc/weir/weir.toml
+
+# Graceful shutdown: weir traps SIGTERM, seals the open WAB segment, drains
+# in-flight connections, then exits — bounded by its own shutdown_timeout_secs
+# (default 30s). Keep TimeoutStopSec a few seconds ABOVE shutdown_timeout_secs so
+# systemd lets the daemon finish its own drain instead of SIGKILLing mid-flush.
+# If you raise shutdown_timeout_secs in weir.toml, raise this to match (+5s).
+KillSignal=SIGTERM
+TimeoutStopSec=35
+
+Restart=on-failure
+RestartSec=5
+
+# ── Resource limits ──────────────────────────────────────────────────────────
+# weir uses one spawn_blocking slot per producer connection; max_connections
+# caps at 512 and the metrics endpoint adds a handful. 4096 fds is generous
+# headroom over the worst case (512 conns + per-shard WAB segment fds + outbound
+# sink HTTP sockets).
+LimitNOFILE=4096
+# Worst-case transient receive memory is max_connections x max_payload_bytes
+# (with defaults, 256 x 16 MiB ~= 4 GiB). The shipped weir.toml lowers
+# max_payload_bytes to 1 MiB (256 MiB worst case), so 1G leaves headroom. RAISE
+# this if you run the default 16 MiB payload cap or a higher max_connections.
+MemoryMax=1G
+TasksMax=512
+
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+# Hardening tuned to weir's actual needs: it writes only its WAB and runtime
+# socket dir, and opens AF_UNIX (always) + AF_INET/AF_INET6 (metrics endpoint
+# and the HTTP/SQL sinks). Everything else is locked down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# The ONLY writable paths weir needs. RuntimeDirectory/StateDirectory already
+# grant these; listing them keeps the intent explicit under ProtectSystem=strict.
+ReadWritePaths=/var/lib/weir /run/weir
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# weir never JITs or maps W+X pages.
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_UNIX for the producer socket; AF_INET/AF_INET6 for /metrics and outbound
+# sinks. Drops AF_NETLINK, AF_PACKET, etc. that weir never uses.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# weir logs to stderr via tracing-subscriber; journald captures it. Tag for
+# filtering: `journalctl -u weir -t weir`. NOTE: weir reads its level from
+# log_level / WEIR_LOG_LEVEL only — RUST_LOG is NOT consulted.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=weir
+
+[Install]
+WantedBy=multi-user.target

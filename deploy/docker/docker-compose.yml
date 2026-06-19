@@ -28,11 +28,19 @@ services:
     user: weir
 
     healthcheck:
-      # The metrics endpoint doubles as a liveness probe —
-      # it only comes up after the socket is bound and the pipeline is running.
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9185/metrics > /dev/null"]
+      # The metrics endpoint doubles as a liveness probe — it only binds after
+      # the socket is bound and the pipeline is running.
+      #
+      # The runtime image (debian:bookworm-slim) ships ONLY ca-certificates —
+      # there is NO wget or curl — so an HTTP-client probe would always fail with
+      # "wget: not found", marking a healthy container unhealthy and (under
+      # restart: unless-stopped) triggering a restart loop. Mirror the
+      # Dockerfile's HEALTHCHECK instead: bash's /dev/tcp opens a TCP connection
+      # to the metrics port (9185) with no extra packages. Succeeds iff the
+      # daemon is alive and the metrics server has bound.
+      test: ["CMD", "/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
       interval: 10s
-      timeout: 5s
+      timeout: 3s
       retries: 3
       start_period: 5s
 
