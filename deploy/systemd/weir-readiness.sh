@@ -55,20 +55,39 @@ fi
 METRICS="$(curl -fsS --max-time 3 "http://${ADDR}/metrics" 2>/dev/null)" \
   || fail_dead "/metrics not reachable at http://${ADDR}/metrics"
 
+# 3. The response must actually be weir's exposition. A wrong-but-live HTTP
+#    target (another service, a reverse proxy, a stray `python3 -m http.server`)
+#    answers 200 so curl -fsS succeeds, but exposes no `weir_*` metrics. Without
+#    this guard every metric grep below finds nothing, so none of the not-ready
+#    conditions trip and the script falls through to the summary line — which
+#    then exits 1 with no output under `set -euo pipefail`. Treat "reachable but
+#    not weir" as DEAD (wrong target), not as a silent not-ready. weir always
+#    emits many `weir_*` HELP/TYPE/data lines regardless of runtime state, so a
+#    single `weir_` token is a reliable fingerprint.
+if ! grep -q 'weir_' <<<"$METRICS"; then
+  fail_dead "/metrics reachable at http://${ADDR}/metrics but returned no weir_* metrics — wrong target?"
+fi
+
 # helper: read a single-series gauge/counter value by exact line prefix.
 mval() { awk -v k="$1" '$1==k {print $2; exit}' <<<"$METRICS"; }
+
+# helper: true when a metric value is numerically >= 1. Gauges are exposed in
+# float form (`1.0`, `0.0`), so a literal `== "1"` test never matches a live
+# daemon — strip any fractional part and compare as an integer. Empty / absent
+# values (the series hasn't been emitted yet) are treated as "not set" → false.
+is_set() { local v="${1:-}"; [[ -n "$v" && "${v%.*}" =~ ^[0-9]+$ && "${v%.*}" -ge 1 ]]; }
 
 # ── READINESS ───────────────────────────────────────────────────────────────
 problems=()
 
 # Sink-health one-hot family: state="down" == 1 means delivery stalled
 # (records still buffer durably in the WAB, but nothing reaches the sink).
-if [[ "$(mval 'weir_sink_health{state="down"}')" == "1" ]]; then
+if is_set "$(mval 'weir_sink_health{state="down"}')"; then
   problems+=("sink health=DOWN (delivery stalled; WAB still buffering)")
 fi
 
 # Drain blocked on a full dead-letter dir == ALL delivery paused.
-if [[ "$(mval 'weir_drain_state{state="blocked_dead_letter_full"}')" == "1" ]]; then
+if is_set "$(mval 'weir_drain_state{state="blocked_dead_letter_full"}')"; then
   problems+=("drain BLOCKED: dead-letter dir full (free space or raise dead_letter_max_bytes)")
 fi
 
@@ -99,7 +118,14 @@ if [[ ${#problems[@]} -gt 0 ]]; then
 fi
 
 # Healthy summary line (handy in journald / probe logs).
+# Both extractions can legitimately find nothing (the records_accepted series
+# is absent until the first push; the sink_info line could be a sink_type this
+# regex doesn't cover). Append `|| true` / default with `${var:-…}` so a missing
+# match never trips `set -e` into a silent non-zero exit — we reached READY and
+# must print it. (The DEAD/no-weir-metrics guard above already rules out the
+# wrong-target case that this line previously masked.)
 accepted="$(mval 'weir_records_accepted_total{tier="batched"}')"
-sink_type="$(grep -oE 'weir_sink_info\{sink_type="[a-z]+"\} 1' <<<"$METRICS" | sed -E 's/.*sink_type="([a-z]+)".*/\1/')"
+sink_type="$(grep -oE 'weir_sink_info\{sink_type="[a-z]+"\} 1' <<<"$METRICS" \
+  | sed -E 's/.*sink_type="([a-z]+)".*/\1/' || true)"
 echo "READY: socket ok, /metrics ok, sink=${sink_type:-?} healthy, accepted=${accepted:-0}"
 exit 0

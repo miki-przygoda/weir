@@ -90,6 +90,11 @@ filled-in copy. See `weir.env.example`.
 on a full dead-letter dir, zero fsync failures / flusher panics, and a loud WARN
 if the sink is `noop`). Exit codes: `0` ready, `1` degraded, `2` dead.
 
+A `/metrics` endpoint that answers `200` but exposes no `weir_*` metrics (a
+misrouted `--addr` pointing at some other live service) is treated as `2` dead
+("wrong target?"), not as a degraded `1` — so a misconfigured probe surfaces
+loudly instead of looking like a transient not-ready.
+
 ```bash
 sudo install -m0755 weir-readiness.sh /usr/local/bin/weir-readiness.sh
 weir-readiness.sh --socket /run/weir/weir.sock --addr 127.0.0.1:9185

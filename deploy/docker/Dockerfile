@@ -11,6 +11,7 @@ WORKDIR /build
 # Copy manifests first so this layer is only invalidated when deps change.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/weir-core/Cargo.toml     crates/weir-core/Cargo.toml
+COPY crates/weir-wab/Cargo.toml      crates/weir-wab/Cargo.toml
 COPY crates/weir-server/Cargo.toml   crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml   crates/weir-client/Cargo.toml
 # weir-sink-sdk is a real dependency of weir-server (the Sink trait contract);
@@ -25,6 +26,7 @@ COPY crates/weir-testkit/Cargo.toml  crates/weir-testkit/Cargo.toml
 # Stub sources so Cargo can resolve the workspace and compile dependencies.
 RUN mkdir -p \
         crates/weir-core/src \
+        crates/weir-wab/src \
         crates/weir-server/src \
         crates/weir-client/src \
         crates/weir-sink-sdk/src \
@@ -34,6 +36,7 @@ RUN mkdir -p \
     echo 'fn main(){}' > crates/weir-ctl/src/main.rs && \
     touch \
         crates/weir-core/src/lib.rs \
+        crates/weir-wab/src/lib.rs \
         crates/weir-client/src/lib.rs \
         crates/weir-sink-sdk/src/lib.rs \
         crates/weir-testkit/src/lib.rs
