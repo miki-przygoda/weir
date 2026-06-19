@@ -408,7 +408,10 @@ impl Metrics {
         let wab_bytes_on_disk = reg!(
             Gauge::<f64, AtomicU64>::default(),
             "weir_wab_bytes_on_disk",
-            "Current total bytes used by WAB segment files on disk"
+            "Current bytes used by live WAB shard segments on disk: the open active \
+             segment (.wab) plus sealed segments awaiting drain (.wab.sealed). Excludes \
+             drained-marker segments (.wab.confirmed) and the dead_letter/ and quarantine/ \
+             subdirs (which have their own accounting)"
         );
         let wab_fsync_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),

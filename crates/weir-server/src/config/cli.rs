@@ -71,6 +71,7 @@ OPTIONS:
     --tls-client-ca <path>                   Path to the client CA certificate for mTLS (PEM)
     --tls-handshake-timeout-secs <n>         TLS handshake timeout in seconds [default: 10]
     -h, --help                               Print this help and exit
+    -V, --version                            Print version and exit
 
 ENVIRONMENT:
     Every option above can be set via WEIR_<UPPER_SNAKE_NAME>.
@@ -96,6 +97,13 @@ pub(super) fn parse_from(
 ) -> Result<(PartialConfig, PathBuf), ConfigError> {
     if pargs.contains(["-h", "--help"]) {
         print!("{HELP}");
+        std::process::exit(0);
+    }
+
+    // Mirror --help: short-circuit before any config load/validation. Matches the
+    // format clap gives weir-ctl (`<bin> <version>`), so the two CLIs agree.
+    if pargs.contains(["-V", "--version"]) {
+        println!("weir-server {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
 
