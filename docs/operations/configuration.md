@@ -28,6 +28,32 @@ Weir merges four layers in this precedence order (first match wins):
 The merge happens once at startup. Config is not reloaded on SIGHUP
 (see [Limitations](#limitations) below).
 
+### How to read this reference (knob philosophy)
+
+The list below is long, but **you can ignore most of it.** Every option has a
+production-ready default; a real deployment typically sets only a handful —
+`wab_dir`, `sink_type` + `sink_url`, maybe `shard_count` and a durability-related
+dial. The rest are **operability levers**: timeouts, retry budgets, poll
+intervals, and safety caps that you don't touch day to day but want available for
+the incident where the default is wrong for *your* environment and a recompile
+isn't an option (a slow downstream, a flaky uplink, an unusually large host).
+
+This is a deliberate design stance, not configuration sprawl:
+
+- A knob you never change still earns its place if it's the difference between a
+  three-line config edit and a fork-and-rebuild at 3am. The value of a safety/
+  tuning dial is realised exactly once, when you need it.
+- Defaults are the single source of truth — they're tuned constants in the code
+  (`drain::MAX_RETRIES`, `drain::HEALTH_POLL_INTERVAL`, …) that the knobs fall
+  back to, so "the default" and "what the tests exercise" can't drift apart.
+- Adding a knob is a backward-compatible change; removing one is breaking. So new
+  knobs are added sparingly — only when a real deployment would plausibly need to
+  change the value, never "just in case."
+
+Practical takeaway: start from the defaults, set the four or five knobs your
+deployment actually needs, and treat the rest as documented escape hatches you'll
+reach for if and when an operational problem points you at one.
+
 ### TOML file structure
 
 All options live under `[server]`:

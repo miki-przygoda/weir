@@ -151,6 +151,13 @@ not benchmarks.*
 | `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
 
+These are deliberately separate so you can compose the pieces you need without
+the daemon — produce with `weir-client`, forward with a custom `weir-sink-sdk`
+sink, or read the buffer with `weir-wab`, and only depend on `weir-server` if you
+run it. See [Integrating & extending](docs/getting-started/integrating.md) for
+how, and [Architecture → Workspace & crate boundaries](docs/architecture.md#workspace--crate-boundaries)
+for why.
+
 ## Non-goals (v1)
 
 - **Not embedded** — weir is a daemon; producers talk to it over a socket.

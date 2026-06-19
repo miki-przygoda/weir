@@ -215,3 +215,55 @@ Throughput and latency measurements for single-threaded, thundering-herd, connec
 | Torn write in crash recovery               | Per-record CRC32 checked; replay truncates at the first corrupt entry                                                                                                                                                            |
 | Blocked socket semaphore (dead workers)    | `push_timeout` (5 s) returns `InternalError` Nack rather than blocking indefinitely                                                                                                                                              |
 | WAB integrity on shared/network storage    | **Out of scope.** CRC32 detects accidental corruption; it does not detect malicious modification. The WAB directory must be local storage accessible only to the daemon (`0o700`). Network filesystems break the security model. |
+
+---
+
+## Workspace & crate boundaries
+
+weir ships as several crates rather than one, and the split is deliberate: each
+piece is usable **without** pulling in the daemon, so you can compose the parts
+you want instead of taking the whole thing. The boundaries are enforced by the
+dependency graph, not just convention — verify with `cargo tree`.
+
+| Crate | Depends on (normal) | Standalone use without the daemon |
+|-------|---------------------|-----------------------------------|
+| `weir-core` | — (just `bytes`, `crc32fast`) | The wire types + `Payload`. Build a producer or a non-Rust client against the frozen v1 wire protocol. |
+| `weir-wab` | `weir-core`, `crc32fast` | Read/inspect/recover on-disk WAB segments. No async runtime, no daemon. `SegmentReader::open(path)` streams CRC-verified records straight off disk — useful for a recovery tool, an offline inspector, or a custom reader. |
+| `weir-sink-sdk` | `weir-core` | Implement **and unit-test** a custom `Sink` against the stable trait — no `weir-server`, no tokio required (the crate's own tests drive `commit`/`health` with a tiny `block_on`). `BasicSinkError` / `Infallible` cover quick error types. |
+| `weir-client` | `weir-core` | The synchronous producer client. Push records over the socket from your own app. |
+| `weir-ctl` | `weir-core`, `weir-client`, `weir-wab` | The admin CLI. Notably does **not** depend on `weir-server` — it's a thin tool over the wire client + the segment reader, so it (and the WAB-reading capability it's built on) work independently of the daemon binary. |
+| `weir-server` | the above + tokio/sink stacks | The daemon itself. |
+
+**What this enables.** You can build your own system on the pieces — e.g. read
+the WAB with `weir-wab`, run operations with `weir-ctl`, and forward to your own
+destination by implementing a `Sink` with `weir-sink-sdk` — and only depend on
+the daemon if you actually run it. (Today, *running* a custom sink inside the
+shipped daemon still means compiling it into the sink-selection path; the SDK's
+present, delivered value is authoring + testing a sink against a frozen contract.
+A first-class plugin/entry-point is a candidate for a future minor release.)
+
+The cost of the split is real but small — more `Cargo.toml`s and a published
+surface to keep stable — and it buys genuine composability, not speculative
+modularity: the boundaries have present consumers (`weir-ctl` uses `weir-wab`;
+the built-in sinks implement `weir-sink-sdk`).
+
+## Design notes
+
+A couple of deliberate choices a contributor should know:
+
+- **Config knobs are operability levers, not speculation.** The configuration
+  surface is broad, but each knob is a tuning or safety dial with a
+  production-ready default — you rarely set them, but they're there for the
+  incident where the default is wrong for *your* deployment and a recompile isn't
+  an option. Defaults are defined once as named constants (e.g.
+  `drain::MAX_RETRIES`, `drain::HEALTH_POLL_INTERVAL`) and the knobs fall back to
+  them, so the default and the tested behaviour can't drift. Adding a knob is
+  SemVer-additive; removing one is breaking — so the bar to *add* is "a real
+  deployment would plausibly need to change this," not "someone might." See the
+  [Configuration reference](operations/configuration.md).
+- **`Sink::Record` / `SinkRecord` is a known over-generalisation.** The drain is
+  generic over a record type, but the only implementation is the identity on
+  `Payload`, and every built-in sink uses `type Record = Payload`. It's wired but
+  effectively a no-op everywhere. It's part of the **frozen 1.0** `Sink` trait, so
+  it can't be removed without a major version; flagged here as a deliberate
+  candidate to drop in a hypothetical 2.0, not a bug.
