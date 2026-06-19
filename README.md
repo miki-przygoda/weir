@@ -63,6 +63,14 @@ mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
 > (`http`/`mysql`/`postgres`/`clickhouse`) + `--sink-url` to actually deliver.
 > Records also only drain once a WAB segment seals, so a few small records won't
 > reach the sink until shutdown — see the quickstart.
+>
+> **Two more producer gotchas:** `push()` is **blocking** — never call it directly
+> from an `async fn` (it starves the runtime; use the
+> [async bridge](docs/getting-started/integrating.md#producing-from-an-async-runtime)).
+> And `Buffered` acks *before* fsync, so it survives a process crash but **not**
+> power loss — use `Sync`/`Batched` for data you can't lose. The
+> [quickstart](docs/getting-started/quickstart.md#push-your-first-record) has the
+> full rundown.
 
 Full walk-through, including pushing your first record: [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md).
 

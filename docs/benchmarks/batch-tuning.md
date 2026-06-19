@@ -13,6 +13,17 @@ Results below were collected on a single shared-VM sandbox in a single session.
 Absolute numbers are noisy and will not match production hardware; **relative
 ordering between configs is the takeaway**.
 
+**The latency tables are single-producer.** The three latency scenarios
+(`sync` / `batched` / `buffered`) and the single-thread throughput table below time
+**one** producer pushing serially, so a batch fills by reaching `batch_deadline_ms`,
+not the `batch_size` cap. That is why the deadline appears to dominate latency here —
+it is the single-threaded regime talking. Under **concurrent** producers the picture
+changes (see [Tuning under concurrency](#tuning-under-concurrency)): batches fill by the
+deadline regardless of the size cap, so `batch_size` does little, and the per-deadline
+latency figures in these tables do **not** carry over to concurrent throughput. Read
+the deadline-dominates-latency numbers as a single-threaded result, not a tuning guide
+for loaded deployments.
+
 ## Methodology
 
 For each (`batch_size`, `batch_deadline_ms`) point:
@@ -116,6 +127,33 @@ scenario, 256 B payload). Median RPS across the 3 trials per scenario.
 (256, 1ms) leads or ties on every scenario; (1000, 10ms) is 3-6× worse on
 every concurrency level. The throughput data agrees with the latency data:
 no axis on which the (1000, 10ms) default beats (256, 1ms).
+
+## Tuning under concurrency
+
+The two knobs a tuner reaches for first — `batch_size` and `batch_deadline_ms` — are
+**largely inert under concurrent producers, and the wrong place to start.** The flusher
+flushes when it reaches `batch_size` records **or** `batch_deadline_ms` elapses,
+whichever comes first. With many concurrent producers a batch hits the deadline long
+before it hits the size cap, so `batch_size` does little and the flush cadence is set by
+the deadline. The deadline-dominates-latency figures in the [Results](#results) tables
+are **single-producer** measurements (see [Caveat](#caveat)); they are not a guide to
+concurrent throughput. Keep the defaults `(256, 1ms)`.
+
+The lever that actually moves concurrent Sync throughput is **group-fsync batching** —
+how many concurrent producers' records ride a single `fsync` — and that is governed by
+**connection density into few shards**, not by the batch knobs. Each connection is
+pinned to one shard, and a shard's flusher group-fsyncs every record in its active
+segment at once, so more concurrent producers per shard means more records amortised per
+`fsync`. Spreading the same connections across more shards thins that batching and can
+push Sync throughput *below* a single shard — `shard_count` is non-monotonic, not a
+throughput dial. See the `shard_count` caveat in
+[operations/configuration.md](../operations/configuration.md#shard_count) for the full
+mechanism and the connections-per-shard guidance.
+
+This sweep does **not** quantify that lever: `shard_count` / `worker_count` were held
+fixed at (2, 2) to isolate the batching variables, and the per-machine RPS above will not
+transfer to other hardware. Treat this section as qualitative direction — measure the
+shard / connection-density trade on your own hardware before committing to a value.
 
 ## Out of scope for this sweep
 

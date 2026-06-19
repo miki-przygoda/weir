@@ -78,6 +78,24 @@ cargo run --release -p weir-client --example push_simple -- \
 > `push_simple` pushes `--count` records at **each** durability tier (Sync,
 > Batched, Buffered), so `--count 5` sends **15** records in total.
 
+> **Before you build a producer — three gotchas that compile and pass a smoke
+> test, then bite under load:**
+> 1. **`push()` is blocking — never call it directly from an `async fn`.** It
+>    blocks the executor thread and starves the runtime (a multi-thread runtime
+>    masks it; a single-threaded one freezes). Use the bridge in
+>    [Integrating → Producing from an async runtime](integrating.md#producing-from-an-async-runtime).
+> 2. **Ack ≠ delivered.** A successful `push` means *durably buffered*, not
+>    delivered to your sink. Nothing reaches the sink until a WAB segment seals,
+>    and the **default `noop` sink discards everything**. For low volume, set
+>    [`wab_segment_max_age_secs`](../operations/configuration.md#wab_segment_max_age_secs)
+>    so idle segments seal on a timer; configure a real
+>    [`sink_type`](../operations/configuration.md#sink_type) to actually deliver.
+>    Details in the [Ack ≠ delivered](#what-just-happened) note below.
+> 3. **`Buffered` is not power-loss durable.** It acks *before* fsync. A process
+>    crash survives (page cache), but power loss / OS crash is a loss window — use
+>    `Sync`/`Batched` for data you can't lose. (macOS is not power-safe at any
+>    tier; see [How it earns the "durable" claim](../../README.md#how-it-earns-the-durable-claim).)
+
 **From your own project.** When you're ready to push from your own code,
 add just `weir-client` and write a small program against the synchronous
 client API. `Durability` is re-exported from `weir-client`, so the basic

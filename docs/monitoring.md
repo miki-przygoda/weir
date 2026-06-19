@@ -124,6 +124,17 @@ data loss), but delivery is stalled.
 **Respond:** check the downstream system (the HTTP/SQL endpoint). weir retries
 transient errors with backoff; sustained `down` means the sink needs attention.
 Records stay safe on disk until it recovers.
+**Detection lag — alert on more than this one signal.** `weir_sink_health{state}`
+is driven *only* by the periodic HEAD health probe (`probe_health`), not by commit
+failures, and that probe runs on the `health_poll_interval_secs` cadence *from the
+`Draining` state*. During an active outage the drain spends its time in
+`RetryingTransient` (backing off between commit retries), where the probe does not
+run — so `sink_health{down}` can lag the actual outage by a full poll interval or
+more, while `weir_drain_state{state="retrying_transient"}` flips on the *first*
+failed commit. For prompt detection, alert on the faster signals **in addition to**
+`WeirSinkDown`: `weir_drain_state{state="retrying_transient"} == 1` (immediate on
+the first transient failure) and `increase(weir_drain_segments_stranded_total[15m])
+> 0` (`WeirSegmentStranded`, fires once retries are exhausted) — see those entries.
 
 #### WeirSinkDegraded
 The sink reports itself **degraded** — reachable but not fully healthy (e.g. the
@@ -250,7 +261,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_wab_flusher_panics_total` | counter | Flusher thread panics. **Must be 0.** |
 | `weir_drain_panics_total` | counter | weir-drain thread panics caught and respawned by its supervisor. **Must be 0**; sustained values indicate a sink/drain logic bug, and exhausting the respawn budget stops delivery. |
 | `weir_wab_segments_total{state}` | counter | Lifecycle: `open` → `sealed` → `confirmed`; `quarantined` on corruption. |
-| `weir_wab_bytes_on_disk` | gauge | Un-drained segment bytes. |
+| `weir_wab_bytes_on_disk` | gauge | Bytes used by **live** WAB shard segments: the open active segment (`.wab`) **plus** sealed segments awaiting drain (`.wab.sealed`). It scans on a 5 s cadence, so it trails real-time by up to that interval. It is **not** a total-disk-usage gauge: it excludes drained-marker files (`.wab.confirmed`) and the `dead_letter/` (own gauge: `weir_dead_letter_bytes_on_disk`) and `quarantine/` subdirs, and it doesn't measure the filesystem's free space — for the "disk filling up" signal use a node/host filesystem alert on the partition holding `wab_dir` (see *Capacity*). |
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
 | `weir_recovery_records_replayed_total` | counter | Records replayed from sealed-but-unconfirmed segments on startup. |
 | `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during recovery. |
@@ -263,7 +274,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_drain_state{state}` | gauge | One of `draining` / `retrying_transient` / `blocked_dead_letter_full` is 1. |
 | `weir_sink_commit_records_total{outcome}` | counter | `committed` / `retried` / `dead_lettered` per record. |
 | `weir_sink_commit_duration_seconds` | histogram | Sink `commit()` call duration. |
-| `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1` (`WeirSinkDown`); `degraded` is an early warning (`WeirSinkDegraded`). |
+| `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1` (`WeirSinkDown`); `degraded` is an early warning (`WeirSinkDegraded`). **This gauge is driven solely by the periodic HEAD health probe, not by commit failures** — see the lag note below. |
 | `weir_sink_info{sink_type}` | gauge | The configured sink type, set to 1 for the active one. `sink_type="noop"` means records are acked then **DISCARDED** (not forwarded) — alert/indicate on `weir_sink_info{sink_type="noop"} == 1` in any non-soak-test deployment. |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
 | `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |

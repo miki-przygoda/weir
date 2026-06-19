@@ -313,6 +313,15 @@ Set it to `0x01` (Sync) by convention; the canonical `healthcheck`
 [conformance vector](conformance.md) does. The HealthCheckResponse
 mirrors the shape — zero payload, all-zero payload CRC.
 
+The canonical HealthCheck carries a **zero-length** payload. The daemon is
+currently **lenient** on this point: a HealthCheck frame that declares a
+non-empty payload (with a matching, CRC-valid `payload_crc32`) is still answered
+with a HealthCheckResponse rather than rejected — the daemon reads and CRC-checks
+the payload bytes, then dispatches on the message type and ignores the payload
+contents (the zero-length empty-payload guard applies only to `Push`). Do not
+rely on this: send a zero-length payload, and treat the non-empty case as
+unspecified — a future version may reject it.
+
 ## Minimum producer checklist
 
 A non-Rust client that satisfies the following is wire-compatible:

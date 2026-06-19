@@ -201,11 +201,31 @@ do not increase fsync throughput — they fight for the same disk queue.
 On NVMe with high parallel write depth, 2–4 shards may improve aggregate
 throughput. Default `1` is correct for most deployments.
 
+> **`shard_count` is not a throughput dial — and it is non-monotonic under
+> concurrency.** Each connection is pinned to one shard for its lifetime, round-robin
+> at accept time (`counter % shard_count`, `socket/mod.rs`). The Sync-tier throughput
+> lever is **group-fsync batching**: a shard's flusher rides every record currently in
+> its active segment on a single `fsync` (`wab/mod.rs` `flush_batch` — "one group fsync
+> covers every record still in the active segment"), so the more concurrent producers
+> land on a shard, the more records amortise each `fsync`. Spreading the *same* set of
+> connections across more shards does the opposite — it thins connections-per-shard, so
+> each group fsync covers fewer records, while adding one more contending flusher thread
+> per shard. Past the point where that trade turns over, more shards can drop Sync
+> throughput *below* a single shard. "Match your cores" is therefore a trap for this
+> knob: the optimum is governed by **connections-per-shard**, not core count. If you are
+> chasing Sync throughput, prefer concentrating concurrent producers into **few** shards
+> over fanning out into many. (This is qualitative — the turn-over point is workload- and
+> hardware-specific; measure your own.)
+
 The daemon emits a startup advisory if `shard_count` / `worker_count`
 looks unusual for the host's core count. See
 [Agent count vs cores](../benchmarks/agent-count-tuning.md) for the
 empirical sweep and the heuristic the advisory is based on; the rule
-of thumb is `max(2, cores - 2) / 2`.
+of thumb is `max(2, cores - 2) / 2`. Treat that advisory as a thread-budget
+sanity check (don't run far more agent threads than cores), **not** a
+throughput recommendation: as the caveat above explains, the Sync-throughput
+optimum follows connections-per-shard, not cores, so the cores-based heuristic
+does not predict the best `shard_count` for throughput.
 
 ---
 
@@ -243,6 +263,18 @@ the right knob.
 The batch tuning data is in [batch-tuning.md](../benchmarks/batch-tuning.md);
 an operator-facing tuning **guide** is planned for Phase 2. Defaults below
 are the sweet spot found by the empirical sweep.
+
+> **These two knobs are largely inert under concurrency — keep the defaults.**
+> The flusher flushes when it reaches `batch_size` records **or** `batch_deadline_ms`
+> elapses, whichever comes first (`worker.rs` / `wab/mod.rs`). With many concurrent
+> producers a batch fills by reaching the deadline long before it reaches the size cap,
+> so `batch_size` does little and `batch_deadline_ms` is what actually governs the
+> flush cadence. The dramatic per-deadline figures in
+> [batch-tuning.md](../benchmarks/batch-tuning.md) (e.g. "a 5 ms deadline pushes p50 to
+> ~6 ms") come from its **single-producer latency** sweep; they are not a guide to
+> throughput under concurrent load. The defaults `(256, 1ms)` are a good starting point
+> at any concurrency — reach for [`shard_count`](#shard_count) and connection density
+> (see its caveat) before these two when tuning concurrent Sync throughput.
 
 #### `batch_size`
 
@@ -576,6 +608,14 @@ weir-ctl dl requeue --wab-dir /var/lib/weir/wab --socket /run/weir/weir.sock --y
   next run — remove them manually).
 
 `docs/monitoring.md` references this command in its dead-letter runbook.
+
+> **`weir-ctl segments`, `dl list`, and `dl drop` read the WAB directory on disk
+> (`--wab-dir` / `WEIR_WAB_DIR`), not the daemon socket** — they inspect the on-disk
+> segments directly and never connect to a running daemon (unlike `health` / `push`,
+> which use `--socket`, and `metrics`, which scrapes `--addr`). `dl requeue` is the
+> exception that uses both: it reads the dead-letter segments from `--wab-dir` and then
+> re-pushes them through `--socket`. Point `--wab-dir` at the daemon's configured
+> [`wab_dir`](#wab_dir).
 
 #### `dead_letter_max_bytes`
 
