@@ -19,6 +19,8 @@ OPTIONS:
     --batch-deadline-ms <n>                  Batch accumulation time ms (1-60000) [default: 1]
     --wab-segment-max-bytes <n>              WAB segment rotation threshold (4096-4294967296)
                                                [default: 268435456 (256 MiB)]
+    --wab-segment-max-age-secs <n>           Idle-seal threshold secs, 0=disabled (0-86400)
+                                               [default: 0]
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
@@ -58,6 +60,8 @@ OPTIONS:
     --sink-clickhouse-column <name>          ClickHouse target column [default: payload]
     --dead-letter-max-bytes <n>              Dead-letter dir size cap [default: 1073741824]
     --dead-letter-check-interval-secs <n>    Blocked-state wake interval (1-3600) [default: 30]
+    --health-poll-interval-secs <n>          Sink health + stranded-segment rescan cadence
+                                               secs (1-3600) [default: 30]
     --log-level <level>                      Log level (trace/debug/info/warn/error) [default: info]
     --tcp-bind <addr>                        TCP listen address for the mTLS listener
                                                (e.g. '0.0.0.0:7100'). Requires --features tls
