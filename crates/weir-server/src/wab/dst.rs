@@ -543,6 +543,15 @@ pub enum Scenario {
     /// Drive the panic supervisor under [`SimClock`]; assert it caps out in
     /// virtual (instantly-advanced) time.
     PanicSupervisor,
+    /// Write `records` to an un-sealed `.wab`, flip one byte inside record
+    /// `corrupt_index`'s payload (so its CRC fails while records after it stay
+    /// fully written), then run recovery. Asserts the valid prefix is delivered
+    /// AND the corrupt-and-after bytes are preserved in quarantine (not silently
+    /// dropped) — the mid-file bit-rot durability fix.
+    MidFileCorruption {
+        records: usize,
+        corrupt_index: usize,
+    },
 }
 
 /// A fully specified, reproducible run. Serialises to a `tests/dst_seeds/*.json`
@@ -575,6 +584,10 @@ impl SimSpec {
                 records_per_batch,
             } => run_interleaved_flush(self.seed, &self.faults, *batches, *records_per_batch),
             Scenario::PanicSupervisor => run_panic_supervisor(self.seed),
+            Scenario::MidFileCorruption {
+                records,
+                corrupt_index,
+            } => run_mid_file_corruption(self.seed, *records, *corrupt_index),
         }
     }
 }
@@ -636,6 +649,9 @@ pub struct SimReport {
     pub virtual_elapsed: Duration,
     /// `PanicSupervisor`: real wall-clock spent (should be ~0, proving collapse).
     pub real_elapsed: Duration,
+    /// `MidFileCorruption`: count of segments quarantined during recovery (the
+    /// preserved-corrupt-tail metric).
+    pub quarantined: u64,
 }
 
 // ── Invariant oracle ────────────────────────────────────────────────────────
@@ -1050,6 +1066,104 @@ fn run_panic_supervisor(seed: u64) -> SimReport {
     }
 }
 
+/// Scenario — mid-file bit-rot during crash recovery of an un-sealed segment.
+///
+/// Writes `records` real records to an active `.wab`, drops the writer (flushing
+/// the segment), then flips ONE byte inside record `corrupt_index`'s payload so
+/// its CRC fails while records `corrupt_index+1..records` remain fully written on
+/// disk. Runs the real `recover_segment` and asserts the durability fix:
+///
+///   * the valid prefix (records `0..corrupt_index`) is recovered + sealed and
+///     replays exactly (delivered), AND
+///   * the corrupt-and-after bytes were PRESERVED (a quarantine copy of the full
+///     original-corrupt segment exists, the quarantine metric was bumped) — i.e.
+///     the loss is surfaced, never silent.
+///
+/// The companion `i_torn_tail_*` invariant in the sweep stays unchanged: this is
+/// genuine mid-file corruption, not a torn tail, so the two paths are distinct.
+fn run_mid_file_corruption(seed: u64, records: usize, corrupt_index: usize) -> SimReport {
+    use super::segment::{WabSegment, sealed_path_for, segment_path};
+    assert!(corrupt_index < records, "corrupt_index must be in range");
+
+    let env = SimEnv::new("midfile_corruption");
+    let shard_dir = env.shard_dir(0);
+    let path = segment_path(&shard_dir, 1);
+
+    // Write real records to an un-sealed segment via the production writer.
+    let mut rng = SplitMix64::new(seed);
+    let mut written: Vec<Vec<u8>> = Vec::with_capacity(records);
+    {
+        let mut seg = WabSegment::create(&path, 0).expect("create segment");
+        for i in 0..records {
+            let payload = rng.unique_payload(i as u64);
+            seg.write_record(&payload).expect("write_record");
+            written.push(payload);
+        }
+        // Drop flushes/closes the segment, leaving an active `.wab` on disk.
+    }
+
+    // Locate record `corrupt_index`'s payload by walking the on-disk layout:
+    // header(24) then per record [4 len][4 crc][len payload]. Flip a payload byte
+    // so length + crc read fine but the CRC check fails, with later records still
+    // fully present.
+    let original = std::fs::read(&path).expect("read segment");
+    let mut off = super::format::SEGMENT_HEADER_LEN;
+    let mut payload_off = None;
+    for i in 0..records {
+        let len = u32::from_le_bytes(original[off..off + 4].try_into().unwrap()) as usize;
+        let p_start = off + 8;
+        if i == corrupt_index {
+            payload_off = Some(p_start);
+            break;
+        }
+        off = p_start + len;
+    }
+    let payload_off = payload_off.expect("found corrupt record offset");
+    let mut corrupt = original.clone();
+    corrupt[payload_off] ^= 0xFF;
+    std::fs::write(&path, &corrupt).expect("write corrupt segment");
+
+    // Run the real recovery.
+    let sealed = super::recovery::recover_segment(&path, &env.wab_dir, &env.metrics)
+        .expect("recover_segment");
+    assert_eq!(sealed, sealed_path_for(&path));
+
+    let recovered = read_sealed_payloads(&shard_dir);
+    let quarantined = env.metrics.recovery_segments_quarantined.get();
+
+    // I — the valid prefix is delivered exactly (records 0..corrupt_index).
+    assert_invariant(
+        seed,
+        "i_midfile_valid_prefix_delivered",
+        recovered == written[..corrupt_index],
+    );
+
+    // I — the corrupt tail is PRESERVED, not silently dropped: a quarantine copy
+    // exists holding the full original-corrupt bytes (incl. records after the
+    // corrupt one), and the quarantine metric was bumped exactly once.
+    let q_dir = env.wab_dir.join("quarantine");
+    let preserved_ok = std::fs::read_dir(&q_dir)
+        .ok()
+        .and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find_map(|p| std::fs::read(&p).ok())
+        })
+        .map(|bytes| bytes == corrupt)
+        .unwrap_or(false);
+    assert_invariant(seed, "i_midfile_corrupt_tail_preserved", preserved_ok);
+    assert_invariant(seed, "i_midfile_quarantine_counted", quarantined == 1);
+
+    env.cleanup();
+    SimReport {
+        seed,
+        written,
+        recovered,
+        quarantined,
+        ..Default::default()
+    }
+}
+
 /// Scenario (Phase 3) — a producer and the real flusher run as two cooperatively
 /// scheduled threads ([`SimScheduler`]), so the seed deterministically chooses
 /// how the producer's sends interleave with the flusher's receives (i.e. how
@@ -1214,6 +1328,33 @@ mod tests {
         assert_eq!(
             report.recovered, report.written,
             "recovery must return exactly the synced records"
+        );
+    }
+
+    /// Mid-file bit-rot in an un-sealed segment: a CRC mismatch on a fully-read
+    /// record (with valid records after it) must recover+deliver the valid prefix
+    /// AND preserve the corrupt-and-after bytes in quarantine — never silently
+    /// drop them. Mirrors the unit test, but through the DST harness so it serves
+    /// as a pinned, seed-reproducible durability regression.
+    #[test]
+    fn midfile_corruption_delivers_prefix_and_preserves_corrupt_tail() {
+        let report = Sim::new(0x5EED_0009)
+            .scenario(Scenario::MidFileCorruption {
+                records: 6,
+                corrupt_index: 3,
+            })
+            .run();
+        // The driver's invariant oracle already asserts prefix-delivered +
+        // tail-preserved + quarantine-counted; re-assert at the test boundary so a
+        // failure reads clearly here too.
+        assert_eq!(
+            report.recovered,
+            report.written[..3],
+            "only records 0..3 (the valid prefix) are delivered"
+        );
+        assert_eq!(
+            report.quarantined, 1,
+            "the corrupt segment must be quarantined exactly once"
         );
     }
 

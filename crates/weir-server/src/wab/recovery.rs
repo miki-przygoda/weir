@@ -232,6 +232,33 @@ pub(crate) fn recover_segment(
     // here if the next read is corrupt or incomplete.
     let mut valid_end_offset = SEGMENT_HEADER_LEN as u64;
 
+    // EOF-truncate vs corruption-quarantine distinction (durability-critical).
+    //
+    // The record loop stops for one of two fundamentally different reasons, and
+    // they must be handled differently:
+    //
+    //   * TORN TAIL (clean EOF): an `UnexpectedEof` while reading a length, CRC,
+    //     or payload field means the file simply ended part-way through a record.
+    //     That trailing partial write was never made durable (the writer fsyncs
+    //     whole records), so nothing meaningful exists after `valid_end_offset`.
+    //     We truncate at the last valid boundary and seal — the canonical, lossless
+    //     crash-recovery path that DST and the kill-9 tests exercise. Leave
+    //     `quarantine_reason` as None for these.
+    //
+    //   * MID-FILE CORRUPTION (bytes remain after the truncation point): a CRC
+    //     mismatch on a record whose length+CRC+payload were ALL fully read, or an
+    //     oversized `payload_len` field with more data behind it. Here the bytes
+    //     past `valid_end_offset` were fully written and may include
+    //     individually-valid, acked-durable records that happen to sit after the
+    //     corrupt one. Silently truncating them away is invisible data loss. So we
+    //     still recover+seal the valid prefix (unchanged), but FIRST preserve the
+    //     whole original segment in quarantine for manual recovery, bump the
+    //     quarantine metrics, and log at ERROR — mirroring the sealed-segment drain
+    //     path (drain::process_segment), which quarantines on the analogous
+    //     mid-segment read error rather than confirming+deleting the tail. Set
+    //     `quarantine_reason` to Some(reason) at those break points.
+    let mut quarantine_reason: Option<String> = None;
+
     loop {
         let mut len_buf = [0u8; 4];
         match reader.read_exact(&mut len_buf) {
@@ -259,6 +286,14 @@ pub(crate) fn recover_segment(
         }
 
         if payload_len > MAX_PAYLOAD_HARD_CAP {
+            // Oversized length field — corruption. If anything follows the
+            // truncation point (i.e. more bytes than just this 4-byte field were
+            // already on disk), those bytes were fully written and might hold
+            // individually-valid records after the corrupt one; preserve the
+            // segment for manual recovery rather than dropping them silently.
+            // (When the oversized field is the very last 4 bytes of the file —
+            // e.g. a torn final length write — nothing follows, so this is a
+            // clean truncate, no quarantine.)
             warn!(
                 path = %path.display(),
                 payload_len,
@@ -266,6 +301,14 @@ pub(crate) fn recover_segment(
                 records = record_count,
                 "oversized payload_len field — likely corruption; truncating at last valid record"
             );
+            let field_start = valid_end_offset; // this length field began here
+            let file_len = reader.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len > field_start + 4 {
+                quarantine_reason = Some(format!(
+                    "oversized payload_len {payload_len} (cap {MAX_PAYLOAD_HARD_CAP}) mid-file with {} trailing byte(s)",
+                    file_len - (field_start + 4)
+                ));
+            }
             break;
         }
 
@@ -292,6 +335,16 @@ pub(crate) fn recover_segment(
 
         let computed_crc = crc32fast::hash(&payload);
         if expected_crc != computed_crc {
+            // Mid-file bit-rot: this record's length, CRC, and payload were ALL
+            // fully read (no EOF), so it was a complete, durable on-disk record
+            // whose content was later corrupted. Everything from here to the end
+            // of the file was fully written too and may include valid,
+            // acked-durable records sitting after the corrupt one. Truncating them
+            // away silently (the old behaviour) is invisible data loss; instead we
+            // recover+seal the valid prefix AND preserve the original segment in
+            // quarantine. NOTE: warn! is kept here for the original wording, but
+            // the authoritative operator-visible message is the ERROR logged at
+            // the quarantine step below.
             warn!(
                 path = %path.display(),
                 records = record_count,
@@ -299,6 +352,9 @@ pub(crate) fn recover_segment(
                 computed = format!("{computed_crc:#010x}"),
                 "CRC mismatch on record — truncating at last valid record"
             );
+            quarantine_reason = Some(format!(
+                "CRC mismatch on record {record_count}: expected {expected_crc:#010x}, computed {computed_crc:#010x}"
+            ));
             break;
         }
 
@@ -314,6 +370,47 @@ pub(crate) fn recover_segment(
         valid_end_offset = valid_end_offset
             .checked_add(8 + payload_len as u64)
             .expect("valid_end_offset overflow");
+    }
+
+    // ── Preserve a mid-file-corrupt tail before we truncate it away ──────────
+    // The loop set `quarantine_reason` only when the bytes past `valid_end_offset`
+    // were fully written (mid-file CRC bit-rot, or an oversized length with data
+    // behind it) — NOT for the clean torn-tail/EOF cases. Copy (not move: we still
+    // need to truncate+seal the valid prefix in place) the WHOLE original segment
+    // into quarantine, giving manual recovery full context, then bump the same
+    // quarantine metrics the header-validation sites use and log at ERROR so the
+    // discarded tail is surfaced, not silently dropped.
+    if let Some(reason) = &quarantine_reason {
+        // Surface the loss before we mutate the file. If the copy fails we keep
+        // going (the valid prefix must still be recovered + delivered) but log it.
+        match copy_to_quarantine(path, wab_dir, reason) {
+            Ok(dest) => {
+                metrics.recovery_segments_quarantined.inc();
+                metrics
+                    .wab_segments
+                    .get_or_create(&SegmentStateLabel {
+                        state: SegmentState::quarantined,
+                    })
+                    .inc();
+                error!(
+                    path = %path.display(),
+                    quarantine = %dest.display(),
+                    recovered_records = record_count,
+                    reason = %reason,
+                    "mid-file WAB corruption: recovered + sealed the valid prefix of {record_count} record(s) for delivery; \
+                     the corrupt record and all bytes after it were PRESERVED in quarantine for manual recovery"
+                );
+            }
+            Err(qe) => {
+                error!(
+                    path = %path.display(),
+                    error = %qe,
+                    reason = %reason,
+                    "mid-file WAB corruption detected but quarantine copy FAILED; recovering the valid prefix anyway — \
+                     the corrupt tail will be truncated away (manual recovery is no longer possible from quarantine)"
+                );
+            }
+        }
     }
 
     // ── Rebuild: truncate + write sentinel + footer + rename ─────────────────
@@ -395,6 +492,41 @@ pub(crate) fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Resul
         "quarantining WAB segment"
     );
     fs::rename(path, &dest)
+}
+
+/// Like [`quarantine`], but COPIES the segment into `<wab_dir>/quarantine/`
+/// instead of moving it, so the caller can still truncate+seal the valid prefix
+/// in place. Used by active-segment recovery when mid-file corruption (a CRC
+/// mismatch on a fully-read record, or an oversized length with data behind it)
+/// would otherwise silently discard fully-written bytes that may include
+/// acked-durable records sitting after the corrupt one. The whole original
+/// segment is copied (not just the tail) so manual recovery has full context.
+///
+/// Reuses the exact quarantine dir + shard-prefixed, non-clobbering naming scheme
+/// as [`quarantine`]; only the final filesystem op differs (copy vs rename), so
+/// the preserved artifact lands next to (and is named like) move-quarantined ones.
+/// Returns the destination path on success.
+fn copy_to_quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<PathBuf> {
+    let quarantine_dir = wab_dir.join("quarantine");
+    super::create_dir_private(quarantine_dir.clone())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let shard_name = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown_shard".to_string());
+    let base = format!("{shard_name}__{}", file_name.to_string_lossy());
+    let dest = non_clobbering_dest(&quarantine_dir, &base)?;
+    error!(
+        path = %path.display(),
+        dest = %dest.display(),
+        reason,
+        "preserving mid-file-corrupt WAB segment in quarantine (copy)"
+    );
+    fs::copy(path, &dest)?;
+    Ok(dest)
 }
 
 /// Returns a path inside `dir` based on `base` that does not yet exist, so the
@@ -545,19 +677,23 @@ mod tests {
 
     #[test]
     fn recovery_truncates_at_crc_mismatch_keeping_valid_prefix() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
         let dir = tmp_dir("crc_mismatch");
         let path = make_segment(&dir, 0, &[b"recordA", b"recordB"]);
         // Flip a byte inside record B's PAYLOAD, leaving its length + CRC fields
         // intact: the reader reads the 7-byte payload fully but the computed CRC no
-        // longer matches the stored one, so recovery must truncate at the last
-        // valid record (A) — the silent-bit-rot detection branch (S33). Layout:
+        // longer matches the stored one, so recovery must (a) truncate at the last
+        // valid record (A) for delivery AND (b) PRESERVE the original segment in
+        // quarantine — the mid-file bit-rot branch (S33), now non-silent. Layout:
         // header 24 + record [4 len + 4 crc + 7 payload = 15]; record B's payload
         // begins at 24 + 15 + 8 = 47.
-        let mut bytes = fs::read(&path).unwrap();
+        let original_bytes = fs::read(&path).unwrap();
+        let mut bytes = original_bytes.clone();
         bytes[47] ^= 0xff;
         fs::write(&path, &bytes).unwrap();
 
-        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
         let records: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -568,6 +704,196 @@ mod tests {
             "a CRC mismatch in record B must truncate to the valid prefix (A)"
         );
         assert_eq!(records[0], b"recordA" as &[u8]);
+
+        // The corrupt tail is preserved (not silently dropped): a quarantine copy
+        // exists, the counter + gauge were bumped, and the copy holds the FULL
+        // original (corrupted) bytes including record B.
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "mid-file CRC corruption must bump recovery_segments_quarantined"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "mid-file CRC corruption must bump wab_segments{{quarantined}}"
+        );
+        let q_dir = dir.join("quarantine");
+        let q_entry = fs::read_dir(&q_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .next()
+            .expect("a quarantine copy must exist");
+        let preserved = fs::read(&q_entry).unwrap();
+        assert_eq!(
+            preserved, bytes,
+            "the quarantined copy must hold the full corrupt segment (incl. record B), not just the prefix"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Headline durability regression (mid-file bit-rot in the MIDDLE of a run):
+    /// K valid records, flip one byte in record i's payload so its CRC fails, then
+    /// records i+1..K follow it on disk. Before the fix, recovery silently dropped
+    /// record i AND every following (individually-valid, acked-durable) record with
+    /// only a WARN. Now it must: (a) recover+seal records 0..i for delivery, (b)
+    /// quarantine a COPY whose bytes still contain records i..K, (c) bump
+    /// recovery_segments_quarantined, (d) lose nothing silently.
+    #[test]
+    fn recovery_mid_file_corruption_preserves_corrupt_and_following_records() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        use crate::wab::segment::segment_path;
+        let dir = tmp_dir("mid_file_corruption");
+        let path = segment_path(&dir, 1);
+        // Five equal-length records so the byte offsets are easy to reason about.
+        // Each record on disk is [4 len + 4 crc + 7 payload = 15] bytes after the
+        // 24-byte header. Records: 0..5 at payload offsets 24 + i*15 + 8.
+        let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
+        {
+            use crate::wab::segment::WabSegment;
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            for p in payloads {
+                seg.write_record(p).unwrap();
+            }
+        }
+        let original = fs::read(&path).unwrap();
+        let original_len = original.len();
+
+        // Corrupt record i=2's payload (offset 24 + 2*15 + 8 = 62), leaving its
+        // length + CRC fields intact so the payload reads fully and the CRC check
+        // fires — with records 3 and 4 fully written AFTER it.
+        let corrupt_index = 2usize;
+        let payload_off = 24 + corrupt_index * 15 + 8;
+        let mut corrupt = original.clone();
+        corrupt[payload_off] ^= 0xff;
+        fs::write(&path, &corrupt).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        // (a) records 0..i recovered + sealed (delivered).
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            corrupt_index,
+            "only the valid prefix (records 0..i) is delivered"
+        );
+        for (k, rec) in recovered.iter().enumerate() {
+            assert_eq!(rec.as_ref(), payloads[k], "prefix record {k} must survive");
+        }
+
+        // (b) + (d) a quarantine copy exists and holds the FULL corrupt segment —
+        // including the corrupt record AND every record after it (records i..K) —
+        // so nothing was silently lost.
+        let q_dir = dir.join("quarantine");
+        let q_entry = fs::read_dir(&q_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .next()
+            .expect("a quarantine copy must exist after mid-file corruption");
+        let preserved = fs::read(&q_entry).unwrap();
+        assert_eq!(
+            preserved.len(),
+            original_len,
+            "quarantine must preserve the whole segment, not just the readable prefix"
+        );
+        assert_eq!(
+            preserved, corrupt,
+            "quarantined bytes must equal the on-disk corrupt segment (records i..K preserved)"
+        );
+        // Sanity: the post-corruption records (3, 4) are byte-present in the copy.
+        for k in (corrupt_index + 1)..payloads.len() {
+            let off = 24 + k * 15 + 8;
+            assert_eq!(
+                &preserved[off..off + payloads[k].len()],
+                payloads[k],
+                "record {k} (after the corrupt one) must be preserved verbatim in quarantine"
+            );
+        }
+
+        // (c) metrics bumped.
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1
+        );
+
+        // The active segment was sealed (renamed away) — the valid prefix is live.
+        assert!(!path.exists());
+        assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Counterpart to the headline test: the TORN-TAIL (clean EOF) crash-recovery
+    /// path must stay byte-for-byte unchanged — truncate cleanly, NO quarantine,
+    /// NO metric bump. A partial trailing write was never durable, so there is
+    /// nothing to preserve. This guards against the corruption-quarantine logic
+    /// leaking into the normal kill-9 / DST path.
+    #[test]
+    fn recovery_torn_tail_truncates_without_quarantine() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        let dir = tmp_dir("torn_tail_no_quarantine");
+        let path = make_segment(&dir, 0, &[b"record1", b"record2", b"record3"]);
+
+        // Truncate mid-CRC of record3: header(24)+rec1(15)+rec2(15)+4 = 58.
+        let truncate_at = 24 + 15 + 15 + 4;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(truncate_at)
+            .unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            2,
+            "torn tail recovers the whole-record prefix"
+        );
+
+        // The crux: a clean EOF truncation must NOT quarantine.
+        assert!(
+            !dir.join("quarantine").exists(),
+            "a torn-tail (EOF) truncation must NOT create a quarantine entry"
+        );
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            0,
+            "a torn-tail truncation must NOT bump recovery_segments_quarantined"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            0,
+            "a torn-tail truncation must NOT bump wab_segments{{quarantined}}"
+        );
 
         fs::remove_dir_all(dir).ok();
     }
@@ -863,7 +1189,8 @@ mod tests {
         let oversized = (MAX_PAYLOAD_HARD_CAP as u32 + 1).to_le_bytes();
         append_raw(&path, &oversized);
 
-        let sealed = recover_segment(&path, &dir, &noop_metrics()).unwrap();
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
 
         let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
             .unwrap()
@@ -875,6 +1202,78 @@ mod tests {
             "recovery must truncate at the last valid record, keeping only it"
         );
         assert_eq!(recovered[0], b"keep-me" as &[u8]);
+        // The oversized field is the file's LAST 4 bytes (nothing follows it), so
+        // it is treated as a clean torn-tail truncation: NO quarantine.
+        assert!(
+            !dir.join("quarantine").exists(),
+            "an oversized len as the trailing 4 bytes must NOT quarantine (nothing follows)"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Companion to the trailing-oversized case: an oversized `payload_len` field
+    /// with MORE bytes behind it is mid-file corruption — those trailing bytes
+    /// were fully written and may hold valid records, so recovery must preserve
+    /// the whole segment in quarantine (and count it), not silently drop the tail.
+    #[test]
+    fn recovery_oversized_payload_len_midfile_quarantines() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("recover_oversized_midfile");
+        let path = segment_path(&dir, 1);
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            seg.write_record(b"keep-me").unwrap();
+        }
+        // Splice an oversized length field, THEN trailing bytes after it so the
+        // corruption is mid-file (file_len > field_start + 4).
+        let oversized = (MAX_PAYLOAD_HARD_CAP as u32 + 1).to_le_bytes();
+        append_raw(&path, &oversized);
+        append_raw(&path, b"trailing-data-after-the-bad-length");
+        let on_disk = fs::read(&path).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "valid prefix still recovered + delivered"
+        );
+        assert_eq!(recovered[0], b"keep-me" as &[u8]);
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "an oversized len with trailing bytes must bump recovery_segments_quarantined"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1
+        );
+        let q_dir = dir.join("quarantine");
+        let q_entry = fs::read_dir(&q_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .next()
+            .expect("a quarantine copy must exist");
+        assert_eq!(
+            fs::read(&q_entry).unwrap(),
+            on_disk,
+            "the quarantined copy must hold the full segment incl. the trailing bytes"
+        );
 
         fs::remove_dir_all(dir).ok();
     }
