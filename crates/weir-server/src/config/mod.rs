@@ -1290,6 +1290,71 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    // ── Bounded scalar knobs: every check_range-guarded field ──────────────────
+
+    /// Sets one knob to an out-of-range value on an otherwise-default config and
+    /// asserts `from_layers` rejects it, naming the field in the error.
+    fn assert_knob_rejected(label: &str, field: &str, mutate: impl FnOnce(&mut PartialConfig)) {
+        let dir = tmp_dir(label);
+        let mut p = PartialConfig {
+            wab_dir: Some(dir.clone()),
+            ..PartialConfig::empty()
+        };
+        mutate(&mut p);
+        let err =
+            Config::from_layers(p, PartialConfig::empty(), PartialConfig::empty()).unwrap_err();
+        assert!(
+            err.to_string().contains(field),
+            "{field}: out-of-range value must be rejected and name the field, got: {err}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Pins the range guard on every bounded scalar knob that the dedicated
+    /// shard_count / wab_segment_max_bytes / dead_letter_* tests above don't
+    /// already cover. They share the `check_range` helper (range tested there),
+    /// but each call wires a distinct field+bounds — this catches a future edit
+    /// that drops or mis-wires one knob's guard. Each case sets exactly one knob
+    /// just past a bound; all others default to in-range, so only the target
+    /// field's check fires.
+    #[test]
+    fn bounded_scalar_knobs_reject_out_of_range() {
+        assert_knob_rejected("rng_batch_size", "batch_size", |p| p.batch_size = Some(0));
+        assert_knob_rejected("rng_batch_deadline", "batch_deadline_ms", |p| {
+            p.batch_deadline_ms = Some(0)
+        });
+        assert_knob_rejected("rng_seg_age", "wab_segment_max_age_secs", |p| {
+            p.wab_segment_max_age_secs = Some(86_401)
+        });
+        assert_knob_rejected("rng_max_conn", "max_connections", |p| {
+            p.max_connections = Some(0)
+        });
+        assert_knob_rejected("rng_metrics_conn", "metrics_max_connections", |p| {
+            p.metrics_max_connections = Some(0)
+        });
+        assert_knob_rejected("rng_read_to", "connection_read_timeout_secs", |p| {
+            p.connection_read_timeout_secs = Some(0)
+        });
+        assert_knob_rejected("rng_sink_to", "sink_timeout_secs", |p| {
+            p.sink_timeout_secs = Some(0)
+        });
+        assert_knob_rejected("rng_sink_batch", "sink_max_batch_size", |p| {
+            p.sink_max_batch_size = Some(0)
+        });
+        assert_knob_rejected("rng_sink_conc", "sink_http_concurrency", |p| {
+            p.sink_http_concurrency = Some(0)
+        });
+        assert_knob_rejected("rng_sink_retries", "sink_max_retries", |p| {
+            p.sink_max_retries = Some(101)
+        });
+        assert_knob_rejected("rng_retry_delay", "sink_retry_base_delay_ms", |p| {
+            p.sink_retry_base_delay_ms = Some(0)
+        });
+        assert_knob_rejected("rng_health_poll", "health_poll_interval_secs", |p| {
+            p.health_poll_interval_secs = Some(3_601)
+        });
+    }
+
     // ── Sink: MySQL ───────────────────────────────────────────────────────────
 
     #[cfg(feature = "mysql-sink")]
