@@ -302,12 +302,34 @@ pub(crate) fn recover_segment(
                 "oversized payload_len field — likely corruption; truncating at last valid record"
             );
             let field_start = valid_end_offset; // this length field began here
-            let file_len = reader.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
-            if file_len > field_start + 4 {
-                quarantine_reason = Some(format!(
-                    "oversized payload_len {payload_len} (cap {MAX_PAYLOAD_HARD_CAP}) mid-file with {} trailing byte(s)",
-                    file_len - (field_start + 4)
-                ));
+            // Determining whether bytes follow this oversized field requires the
+            // file length. If `metadata()` fails we must NOT coerce file_len to 0:
+            // that would make the `file_len > field_start + 4` guard false and
+            // silently downgrade a possible mid-file corruption (tail still on
+            // disk) into a clean truncate, dropping that tail with no quarantine.
+            // On a stat error take the CONSERVATIVE branch — assume data may follow
+            // and preserve the segment — surfacing the stat error rather than
+            // swallowing it.
+            match reader.get_ref().metadata() {
+                Ok(m) => {
+                    let file_len = m.len();
+                    if file_len > field_start + 4 {
+                        quarantine_reason = Some(format!(
+                            "oversized payload_len {payload_len} (cap {MAX_PAYLOAD_HARD_CAP}) mid-file with {} trailing byte(s)",
+                            file_len - (field_start + 4)
+                        ));
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not stat segment after oversized payload_len; conservatively preserving the segment in quarantine rather than risk silently dropping a trailing tail"
+                    );
+                    quarantine_reason = Some(format!(
+                        "oversized payload_len {payload_len} (cap {MAX_PAYLOAD_HARD_CAP}) and metadata() failed ({e}); cannot rule out a trailing tail — preserving conservatively"
+                    ));
+                }
             }
             break;
         }
@@ -526,6 +548,17 @@ fn copy_to_quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<P
         "preserving mid-file-corrupt WAB segment in quarantine (copy)"
     );
     fs::copy(path, &dest)?;
+    // Make the quarantine artifact crash-durable BEFORE the caller truncates the
+    // original in place. `fs::copy` only writes into the page cache; without these
+    // fsyncs a crash after the (durable) truncate+seal but before the copy's data
+    // and dirent reach disk would lose the ONLY copy of the corrupt tail — the
+    // exact opposite of the "PRESERVED in quarantine" guarantee the caller logs.
+    // Order: copy → fsync the copied file's data → fsync the quarantine dir so the
+    // new dirent survives a crash. `fsync_parent_dir(&dest)` fsyncs dest's parent,
+    // i.e. the quarantine dir, and is a no-op on non-Unix. The caller only truncates
+    // after we return Ok, so durability is established first.
+    fs::File::open(&dest)?.sync_all()?;
+    super::segment::fsync_parent_dir(&dest)?;
     Ok(dest)
 }
 
