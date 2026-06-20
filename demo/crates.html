@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — the crates</title>
+<meta name="description" content="weir is a set of composable Rust crates — produce, forward to a custom sink, read the on-disk buffer, or operate a running daemon, each without pulling in the daemon. Take only what you need." />
+<link rel="stylesheet" href="weir.css" />
+</head>
+<body>
+
+<div class="statusbar top">
+  <span>weir 1.1.0</span>
+  <span class="sb-dim">the crates · composable building blocks</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">take only what you need</span>
+</div>
+
+<nav class="nav">
+  <a href="index.html">Demo</a>
+  <a href="crates.html" class="active">Crates</a>
+  <a href="examples.html">Examples</a>
+  <span class="nav-ext">
+    <a href="https://github.com/miki-przygoda/weir" target="_blank" rel="noopener">GitHub ↗</a>
+    <a href="https://miki-przygoda.github.io/weir" target="_blank" rel="noopener">Docs ↗</a>
+  </span>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>The crates</h1>
+    <p class="tag">weir isn't only a daemon you run — it's a workspace of crates you can compose. Each piece is usable <em>without</em> the daemon, so you take just the parts you need.</p>
+  </div>
+
+  <!-- WHICH CRATE -->
+  <div class="sec-head"><span class="label">Which crate do I need?</span><span class="rule"></span></div>
+  <table class="tui-table">
+    <thead>
+      <tr><th>You want to…</th><th>Use</th><th>Pulls in the daemon?</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Run the buffer as a service</td><td><code class="inline">weir-server</code></td><td>it <em>is</em> the daemon</td></tr>
+      <tr><td>Push records from your own app</td><td><code class="inline">weir-client</code></td><td>no</td></tr>
+      <tr><td>Forward records to a custom destination</td><td><code class="inline">weir-sink-sdk</code></td><td>no</td></tr>
+      <tr><td>Read / recover / inspect WAB segments off disk</td><td><code class="inline">weir-wab</code></td><td>no</td></tr>
+      <tr><td>Operate a running daemon from the shell</td><td><code class="inline">weir-ctl</code></td><td>no</td></tr>
+      <tr><td>Build a producer in another language</td><td>the <a href="https://miki-przygoda.github.io/weir/wire_protocol.html">wire protocol</a></td><td>no — zero Rust deps</td></tr>
+    </tbody>
+  </table>
+
+  <!-- DEP GRAPH -->
+  <div class="sec-head"><span class="label">How they compose</span><span class="rule"></span></div>
+  <div class="panel"><div class="panel-body">
+    <div class="depgraph">
+      <div class="layer">
+        <span class="node bin">weir-server</span>
+        <span class="node bin">weir-ctl</span>
+      </div>
+      <div class="arrow">▲ depend on ▲</div>
+      <div class="layer">
+        <span class="node">weir-wab</span>
+        <span class="node">weir-sink-sdk</span>
+        <span class="node">weir-client</span>
+      </div>
+      <div class="arrow">▲ all build on ▲</div>
+      <div class="layer">
+        <span class="node base">weir-core &nbsp;— wire types, frozen</span>
+      </div>
+    </div>
+    <p class="card-sub" style="text-align:center; margin:10px 0 0">The boundaries are real — enforced by the dependency graph, not convention. <code class="inline">weir-core</code> is the only shared base; the libs above it never pull the daemon.</p>
+  </div></div>
+
+  <!-- CRATE CARDS -->
+  <div class="sec-head"><span class="label">The crates</span><span class="rule"></span></div>
+  <div class="grid cols-2">
+
+    <div class="card">
+      <h3>weir-client</h3>
+      <div class="chips"><span class="chip">lib</span><span class="chip dim">Unix-only client</span><span class="chip dim">no async runtime</span></div>
+      <p class="card-sub">Synchronous producer client. One blocking socket round-trip per <code class="inline">push()</code>; <code class="inline">Durability</code>/<code class="inline">NackReason</code> re-exported so a basic producer needs only this one crate.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you produce records from your own app. <code class="inline">is_poisoned()</code> / <code class="inline">is_recoverable()</code> drive reconnect from a long-lived or async-bridged producer. The client type is <code class="inline">#[cfg(unix)]</code>; on Windows only the re-exports are available.</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/getting-started/integrating.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-sink-sdk</h3>
+      <div class="chips"><span class="chip">lib</span><span class="chip">deps: weir-core only</span><span class="chip dim">no daemon</span></div>
+      <p class="card-sub">The <code class="inline">Sink</code> trait plus its <code class="inline">SinkError</code> / <code class="inline">CommitResult</code> / <code class="inline">SinkHealth</code> contract — the stable, frozen interface for forwarding records downstream.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you forward to a custom destination. You can <b>author and fully unit-test</b> a sink with no daemon and no async runtime (a no-op-waker <code class="inline">block_on</code> drives <code class="inline">commit</code>). Running it in the shipped daemon is a small fork today — a first-class entry point is a future minor.</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/getting-started/integrating.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-wab</h3>
+      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip">deps: weir-core + crc32fast</span></div>
+      <p class="card-sub">Standalone, runtime-free reader of the on-disk WAB segment format. Point <code class="inline">SegmentReader</code> at any segment file and it streams each record, verifying its CRC32. <code class="inline">FORMAT_VERSION = 1</code> is frozen.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you build an offline recovery / export / inspection tool. This is the same parser the daemon and <code class="inline">weir-ctl</code> use — one implementation, no drift.</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/wab_format.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-core</h3>
+      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip">frozen API</span></div>
+      <p class="card-sub">The wire-protocol types every other crate shares: <code class="inline">Envelope</code>, <code class="inline">Header</code>, <code class="inline">Durability</code>, <code class="inline">NackReason</code>, <code class="inline">Payload</code>, <code class="inline">MAX_PAYLOAD_HARD_CAP</code>. Tiny dep tree (<code class="inline">bytes</code> + <code class="inline">crc32fast</code>).</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you need the low-level wire types directly — most consumers get them transitively via <code class="inline">weir-client</code> / <code class="inline">weir-wab</code>.</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/wire_protocol.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-server</h3>
+      <div class="chips"><span class="chip">bin + lib</span><span class="chip dim">Unix only</span></div>
+      <p class="card-sub">The daemon: socket layer, WAB, bounded queue, worker pool, drain, metrics, config. Built-in sinks: <code class="inline">noop</code>, <code class="inline">http</code>, <code class="inline">mysql</code>, <code class="inline">postgres</code>, and <code class="inline">clickhouse</code> (opt-in feature). TCP + mutual TLS behind the <code class="inline">tls</code> feature.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you run the buffer as a service. Depend on it <em>only</em> when you actually run the daemon — everything else is in the smaller crates.</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/operations/configuration.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-ctl</h3>
+      <div class="chips"><span class="chip">bin</span><span class="chip dim">no weir-server dep</span></div>
+      <p class="card-sub">Admin &amp; inspection CLI: <code class="inline">health</code>, <code class="inline">push</code>, <code class="inline">metrics</code>, <code class="inline">segments</code> (per-shard WAB inspect), and <code class="inline">dl</code> (dead-letter <code class="inline">list</code> / <code class="inline">drop</code> / <code class="inline">requeue</code>). A thin tool over the socket + the WAB reader.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you operate a running daemon. Installing it doesn't drag in the daemon's dependencies. (Live commands use <code class="inline">--socket</code>/<code class="inline">--addr</code>; <code class="inline">segments</code>/<code class="inline">dl</code> read the WAB on disk via <code class="inline">--wab-dir</code>.)</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/monitoring.html">→ docs</a></p>
+    </div>
+
+  </div>
+
+  <p class="card-sub" style="margin-top:14px"><code class="inline">weir-testkit</code> is an internal test harness (<code class="inline">publish = false</code>) — not part of the public API and not for downstream use.</p>
+
+  <p style="margin-top:18px"><a href="examples.html">See these crates in action — example projects by crate-ratio →</a></p>
+
+  <p class="foot">Full crate reference lives in the <a href="https://miki-przygoda.github.io/weir">docs site</a>.
+     This is the pitch layer — the canonical, versioned docs are authoritative.</p>
+</div>
+
+<div class="statusbar bottom">
+  <span class="sb-dim">[1]</span><a href="index.html" style="color:#003333">Demo</a>
+  <span class="sb-dim">[2]</span><span>Crates</span>
+  <span class="sb-dim">[3]</span><a href="examples.html" style="color:#003333">Examples</a>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">guest@weir:~$ ls crates/ ▮</span>
+</div>
+
+</body>
+</html>

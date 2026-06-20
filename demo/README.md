@@ -1,48 +1,58 @@
-# weir interactive demo
+# weir demo bundle
 
-`index.html` is a single, self-contained, browser-only demo of weir. No build
-step, no dependencies, no network — open it and it runs.
+A small, dependency-free static site for weir — a sell landing page built around
+a live simulation, plus subpages for the crates and example projects. No build
+step, no framework, no network beyond a web font: serve the `demo/` folder (or
+open the files with `file://`) and it runs.
 
-## What it shows
+Styled to a **CGA / terminal-TUI aesthetic** (black + cyan/yellow/green,
+JetBrains Mono) to sit natively inside the host personal site.
 
-A live, animated simulation of weir's pipeline side by side with a naive
-"synchronous insert per record" baseline:
+## Pages
 
-- **Push records** (one, ten, or a continuous stream) and watch tokens flow
+| File | What it is |
+|------|------------|
+| `index.html` | **Landing + live simulation.** The pitch, the interactive Naive-vs-weir pipeline sim, "why weir", and a crate strip. |
+| `crates.html` | **The crates.** Which-crate-do-I-need table, a dependency diagram, and a card per crate (when to reach for it, deps, platform). |
+| `examples.html` | **Example projects by crate-ratio.** A crate-usage matrix + curated recipes spanning one crate → the full pipeline → a zero-Rust-dep wire client. |
+| `weir.css` | Shared theme (palette, components) used by all three pages. |
+
+The subpages are a **pitch / onboarding layer** — they link out to the canonical,
+versioned [docs site](https://miki-przygoda.github.io/weir) rather than
+duplicating it.
+
+## The simulation (index.html)
+
+A live, animated model of weir's pipeline beside a naive "synchronous insert per
+record" baseline:
+
+- **Push records** (one, ten, or a stream) and watch tokens flow
   Producer → Socket → WAB → fsync → Ack, then drain in **batches** to the sink.
 - **Toggle the durability tier** (Sync / Batched / Buffered) and see the effect
   on ack latency and on what survives a crash.
-- **Crash the daemon** mid-flight and **Restart** it to watch unconfirmed WAB
+- **Crash the daemon** mid-flight and **Restart** to watch unconfirmed WAB
   segments replay — the visual proof of *"an ack is never a false ack."*
 - **Live metric cards** compare producer-facing ack latency, downstream DB
-  commits (the N→1 compression), and records lost on crash, naive vs weir.
+  commits (the N→1 compression), and records lost on crash.
 
-## Faithfulness
+It's a *simulation*, not the daemon (no Unix-socket daemon in a browser), but the
+model follows weir's real semantics. Latency figures are rounded from the
+project's CI benchmarks (Sync/Batched ≈ 0.39 ms ack, Buffered ≈ 0.07 ms); the
+naive baseline models a synchronous insert + commit round-trip (~8 ms), one
+commit per record.
 
-It is a *simulation*, not the real daemon (you can't run a Unix-socket daemon
-in a browser), but the model follows weir's real semantics:
+## Hosting / integration
 
-- **Sync** — fsync before the ack; durable before the producer is told "ok".
-- **Batched** — written before the ack, one group fsync per batch; durable
-  before the ack, fewer fsyncs (the throughput sweet spot).
-- **Buffered** — ack after the in-memory enqueue only; fastest, but the demo
-  honestly shows the not-yet-fsynced window as lost on crash.
-- **Drain** commits a whole sealed segment in one statement (the SQL sinks do
-  N rows → 1 `INSERT`); segments are reclaimed only after the sink confirms.
-- **Recovery** replays sealed-but-unconfirmed segments on restart.
+The bundle is self-contained — relative links between the three pages, one shared
+stylesheet, all JS inline. Drop the whole `demo/` folder onto any static host.
 
-Latency figures are rounded from the project's CI benchmarks (Sync/Batched
-≈ 0.39 ms ack, Buffered ≈ 0.07 ms); the naive baseline models a synchronous
-insert + commit + network round-trip (~8 ms), one commit per record.
-
-## Hosting / embedding
-
-The file is fully standalone — copy `index.html` anywhere (a personal site, a
-static host, GitHub Pages) and serve it as-is, or open it directly with
-`file://`. To embed it in an existing page, drop it in an `<iframe>`:
+For the **Next.js personal site**, follow the existing static-demo precedent
+(`public/demo/<project>/`): copy this folder to `public/demo/weir/`, then link it
+from the weir project page (or embed the simulation via an `<iframe>`):
 
 ```html
-<iframe src="index.html" width="100%" height="1200" style="border:0"></iframe>
+<iframe src="/demo/weir/index.html" width="100%" height="1400" style="border:0"></iframe>
 ```
 
-All styles and scripts are inline, so there are no asset paths to fix up.
+There are no absolute asset paths to fix up; only the cross-page links
+(`crates.html`, `examples.html`) and `weir.css`, all relative.
