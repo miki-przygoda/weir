@@ -542,19 +542,73 @@ fn new_connection_accepted_after_previous_client_drops() {
 // ── Payload edge cases ────────────────────────────────────────────────────────
 
 #[test]
-fn empty_payload_is_rejected() {
-    // An empty Push payload collides with the WAB end-of-records sentinel
-    // (a zero-length prefix), so the server rejects it at ingest with
-    // Nack(EmptyPayload) rather than risk truncating a segment. HealthCheck
-    // frames also carry a zero-length payload but are unaffected — see
-    // `health_check_returns_ok`.
-    use weir_core::NackReason;
-    let srv = weir_server!("empty_payload").start();
+fn empty_payload_rejected_locally_by_client() {
+    // An empty Push payload collides with the WAB end-of-records sentinel (a
+    // zero-length prefix). weir-client rejects it LOCALLY, before any bytes are
+    // sent, with a recoverable ClientError::EmptyPayload — so the connection is
+    // never drawn into the daemon's connection-closing Nack(EmptyPayload), and
+    // the client stays usable. The DAEMON-side guard (for non-weir-client
+    // producers) is covered by `empty_payload_rejected_by_daemon_for_raw_frame`
+    // below and by connection::tests::empty_payload_rejected_at_ingest.
+    let srv = weir_server!("empty_payload_client").start();
     let mut client = srv.client();
     let err = client.push(b"", Durability::Sync).unwrap_err();
     assert!(
-        matches!(err, ClientError::Nack(NackReason::EmptyPayload)),
-        "expected Nack(EmptyPayload), got {err:?}"
+        matches!(err, ClientError::EmptyPayload),
+        "expected local ClientError::EmptyPayload, got {err:?}"
+    );
+    assert!(
+        !client.is_poisoned(),
+        "a local empty-payload reject must keep the client usable"
+    );
+}
+
+#[test]
+fn empty_payload_rejected_by_daemon_for_raw_frame() {
+    // A producer that is NOT weir-client (e.g. a polyglot wire client) and does
+    // not implement the local guard can still put an empty Push on the wire. The
+    // daemon must reject it at ingest with Nack(EmptyPayload) rather than risk
+    // truncating a segment. Bypass weir-client's local guard with a raw socket to
+    // prove the end-to-end daemon behavior. HealthCheck frames also carry a
+    // zero-length payload but are unaffected — see `health_check_returns_ok`.
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream as RawStream,
+    };
+    use weir_core::{Envelope, HEADER_LEN, Header, MessageType, NackReason};
+
+    let srv = weir_server!("empty_payload_raw").start();
+    let mut stream = RawStream::connect(&srv.socket_path).expect("raw connect");
+    // A Push whose Envelope-derived payload_len is 0. The daemon rejects on the
+    // zero length right after the header, before reading any body — so writing
+    // just the 16-byte header is enough to draw the Nack.
+    let frame = Envelope::new(
+        Header::new(MessageType::Push, Durability::Sync, 0),
+        Vec::new(),
+    )
+    .encode();
+    stream
+        .write_all(&frame[..HEADER_LEN])
+        .expect("write empty push header");
+
+    let mut resp_header_buf = [0u8; HEADER_LEN];
+    stream
+        .read_exact(&mut resp_header_buf)
+        .expect("read response header");
+    let resp_header = Header::decode(&resp_header_buf).expect("decode response header");
+    assert_eq!(
+        resp_header.message_type(),
+        MessageType::Nack,
+        "expected a Nack for a raw empty Push"
+    );
+    let mut payload = vec![0u8; resp_header.payload_len() as usize];
+    stream.read_exact(&mut payload).expect("read nack payload");
+    let mut crc = [0u8; 4];
+    stream.read_exact(&mut crc).expect("read response crc");
+    assert_eq!(
+        payload.first().copied(),
+        Some(NackReason::EmptyPayload as u8),
+        "daemon must Nack a raw empty Push with EmptyPayload"
     );
 }
 

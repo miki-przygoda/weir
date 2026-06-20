@@ -48,6 +48,12 @@ pub enum ClientError {
     Protocol(String),
     /// `push_default` was called but no default durability was set.
     NoDefaultDurability,
+    /// `push` was called with an empty payload, rejected locally before any bytes
+    /// are sent. An empty payload IS the WAB end-of-records sentinel, so the daemon
+    /// Nacks it ([`NackReason::EmptyPayload`]) and closes the connection; rejecting
+    /// up front keeps the connection usable, mirroring the local
+    /// [`PayloadTooLarge`][Self::PayloadTooLarge] reject.
+    EmptyPayload,
 }
 
 impl ClientError {
@@ -74,6 +80,7 @@ impl ClientError {
     /// | Variant | Recoverable? | Why |
     /// |---|---|---|
     /// | [`PayloadTooLarge`][Self::PayloadTooLarge] | yes | local pre-send rejection; no bytes sent, connection untouched |
+    /// | [`EmptyPayload`][Self::EmptyPayload] | yes | local pre-send rejection; no bytes sent, connection untouched |
     /// | [`NoDefaultDurability`][Self::NoDefaultDurability] | yes | local misconfiguration; returned before any I/O |
     /// | [`Nack`][Self::Nack]`(`[`InternalError`][NackReason::InternalError]`)` | yes | transient daemon condition; the daemon keeps the connection open |
     /// | [`Nack`][Self::Nack]`(`any other reason`)` | no | the daemon closes the connection after the Nack |
@@ -95,7 +102,7 @@ impl ClientError {
     pub fn is_recoverable(&self) -> bool {
         match self {
             // Local, pre-I/O rejections: the connection was never touched.
-            Self::PayloadTooLarge { .. } | Self::NoDefaultDurability => true,
+            Self::PayloadTooLarge { .. } | Self::NoDefaultDurability | Self::EmptyPayload => true,
             // The only Nack the daemon keeps the connection open for (transient);
             // every other Nack reason closes it (see `WeirClient::note_nack`).
             Self::Nack(NackReason::InternalError) => true,
@@ -136,6 +143,10 @@ impl std::fmt::Display for ClientError {
             Self::NoDefaultDurability => {
                 write!(f, "push_default called but no default durability was set")
             }
+            Self::EmptyPayload => write!(
+                f,
+                "payload is empty; rejected locally (an empty payload is the WAB end-of-records sentinel)"
+            ),
         }
     }
 }
@@ -237,6 +248,14 @@ impl<S: Read + Write> WeirClient<S> {
     ) -> Result<(), ClientError> {
         self.ensure_usable()?;
         let bytes = payload.as_ref();
+        // Local guard against an empty payload. An empty payload IS the WAB
+        // end-of-records sentinel, so the daemon Nacks it (NackReason::EmptyPayload)
+        // and closes the connection — which would poison this client. Reject it up
+        // front, before any bytes are sent, so the connection stays usable
+        // (recoverable), mirroring the hard-cap guard below.
+        if bytes.is_empty() {
+            return Err(ClientError::EmptyPayload);
+        }
         // Local guard against the protocol hard cap. The daemon always rejects a
         // payload this large, and for a big frame it Nacks then closes the
         // connection before we finish streaming — so the Nack races our write and
@@ -972,6 +991,26 @@ mod tests {
         assert!(
             err.is_recoverable(),
             "a local over-cap rejection keeps the connection usable"
+        );
+        assert!(!c.is_poisoned(), "a recoverable error must not poison");
+    }
+
+    #[test]
+    fn push_rejects_empty_payload_locally_without_poisoning() {
+        // An empty payload is the WAB end-of-records sentinel; the daemon would
+        // Nack+close it. The local guard rejects it before any bytes are sent, so
+        // the connection stays usable (recoverable, not poisoned) — mirroring the
+        // over-cap guard.
+        let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let err = c.push(b"", Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::EmptyPayload),
+            "expected a local EmptyPayload, got {err:?}"
+        );
+        assert!(
+            err.is_recoverable(),
+            "a local empty-payload rejection keeps the connection usable"
         );
         assert!(!c.is_poisoned(), "a recoverable error must not poison");
     }
