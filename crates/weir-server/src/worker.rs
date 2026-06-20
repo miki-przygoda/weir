@@ -9,11 +9,22 @@ use std::{
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tracing::warn;
+use weir_core::Durability;
 
 use crate::{
     models::{Batch, WorkUnit},
     queue::QueueReceiver,
 };
+
+/// Whether a record's tier rides the batch-boundary group fdatasync (and so
+/// benefits from coalescing more records under one fsync). `Buffered` acks
+/// immediately after the in-memory write and never fsyncs, so it is excluded —
+/// a batch with no fsync-tier record gets no amortisation from the coalesce
+/// window. Kept in lockstep with the ack path in `wab::flush_*`.
+#[inline]
+fn is_fsync_tier(durability: Durability) -> bool {
+    matches!(durability, Durability::Sync | Durability::Batched)
+}
 
 /// Workers are pinned starting at this logical core index, leaving cores 0–1
 /// free for the OS scheduler and network interrupt handlers.
@@ -94,6 +105,18 @@ impl Worker {
                             .clamp(COALESCE_MIN_US, COALESCE_MAX_US),
                     );
 
+                    // Track whether this batch contains any fsync-tier
+                    // (Sync/Batched) record. The Phase-2 coalesce window only
+                    // pays off by amortising a group fdatasync across more
+                    // records — but Buffered acks immediately after the
+                    // in-memory write (wab/mod.rs: it never rides the
+                    // batch-boundary group fsync). A batch that is entirely
+                    // Buffered has no fsync to amortise, so coalescing it adds
+                    // pure latency. When 2+ connections co-locate on one shard
+                    // this collapses single-shard Buffered throughput ~8–12×
+                    // (sweep #6). Compute the tier composition from the units
+                    // actually pulled and gate the window on it below.
+                    let mut has_fsync_tier = is_fsync_tier(unit.durability);
                     let shard = (unit.shard_id as usize) % self.buffers.len();
                     self.buffers[shard].push(unit);
                     if self.buffers[shard].len() >= self.batch_size {
@@ -108,6 +131,7 @@ impl Worker {
                     // empty.
                     while let Ok(unit) = work_rx.try_recv() {
                         total_drained += 1;
+                        has_fsync_tier |= is_fsync_tier(unit.durability);
                         let shard = (unit.shard_id as usize) % self.buffers.len();
                         self.buffers[shard].push(unit);
                         if self.buffers[shard].len() >= self.batch_size {
@@ -115,11 +139,12 @@ impl Worker {
                         }
                     }
                     // Phase 2: coalesce only when the PREVIOUS batch told us
-                    // to expect more. This catches the multi-producer case
-                    // even when "we got here first" — the first record's
-                    // arrival hits this branch because the previous batch
-                    // (large) set the flag.
-                    if expect_concurrent {
+                    // to expect more AND this batch carries an fsync-tier
+                    // record whose group fdatasync the window can amortise.
+                    // An entirely-Buffered batch is flushed promptly — it
+                    // would pay the window for no IOPS benefit (see
+                    // has_fsync_tier above).
+                    if expect_concurrent && has_fsync_tier {
                         total_drained += self.coalesce_window(&work_rx, window);
                     }
                     // Self-correcting: if we mispredict, the next batch's
@@ -402,12 +427,20 @@ mod tests {
     use tokio::sync::oneshot;
 
     fn make_unit(shard_id: u32, payload: &[u8]) -> (WorkUnit, oneshot::Receiver<bool>) {
+        make_unit_tier(shard_id, payload, weir_core::Durability::Buffered)
+    }
+
+    fn make_unit_tier(
+        shard_id: u32,
+        payload: &[u8],
+        durability: weir_core::Durability,
+    ) -> (WorkUnit, oneshot::Receiver<bool>) {
         let (tx, rx) = oneshot::channel();
         (
             WorkUnit {
                 shard_id,
                 payload: weir_core::Payload::copy_from_slice(payload),
-                durability: weir_core::Durability::Buffered,
+                durability,
                 ack_tx: tx,
                 #[cfg(feature = "bench-trace")]
                 enqueued_at: std::time::Instant::now(),
@@ -432,6 +465,103 @@ mod tests {
 
     fn default_hint() -> Arc<AtomicU64> {
         Arc::new(AtomicU64::new(200))
+    }
+
+    /// A high coalesce hint so the window is large enough to time
+    /// unambiguously: 2000 µs is the clamp ceiling (COALESCE_MAX_US), giving a
+    /// 2 ms window — comfortably above thread-scheduling jitter for the
+    /// "promptly vs. coalesced" distinction the tier-aware test relies on.
+    fn max_window_hint() -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(COALESCE_MAX_US))
+    }
+
+    /// Tier-aware coalesce (sweep #6 perf cliff): a batch that is entirely
+    /// `Buffered` must NOT pay the Phase-2 coalesce window — Buffered acks
+    /// immediately after the in-memory write and never rides the batch-boundary
+    /// group fdatasync, so coalescing it is pure added latency. A batch with an
+    /// fsync-tier (`Sync`/`Batched`) record still coalesces, because the window
+    /// amortises that record's group fsync.
+    ///
+    /// Both halves run the SAME sequence — a 2-record priming burst (to set the
+    /// worker's `expect_concurrent` flag) followed, after that batch lands, by a
+    /// single record of the tier under test — and time how long the single
+    /// record takes to flush. The only difference is the single record's tier.
+    /// Buffered must flush well under the window; Sync must wait out (most of)
+    /// the window.
+    fn time_single_record_flush(durability: weir_core::Durability) -> Duration {
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let (shard_txs, batch_rxs) = make_shard_channels(1);
+        // Large batch_size so nothing flushes on fullness; large deadline so
+        // nothing flushes on the idle timeout — the coalesce window (or its
+        // absence) is the only thing that can delay the single record.
+        let handles = spawn_workers(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            10_000,
+            Duration::from_secs(60),
+            max_window_hint(),
+        );
+
+        // Prime `expect_concurrent = true` with a 2-record burst, then wait for
+        // its batch so the next record is handled in a fresh outer-loop
+        // iteration with the flag already set.
+        let (a, _ack_a) = make_unit_tier(0, b"prime", durability);
+        let (b, _ack_b) = make_unit_tier(0, b"prime", durability);
+        queue_tx.push(0, a);
+        queue_tx.push(0, b);
+        let primed = batch_rxs[0]
+            .recv_timeout(Duration::from_secs(2))
+            .expect("priming batch should flush");
+        assert_eq!(primed.records.len(), 2, "priming burst should batch as one");
+
+        // Now the single record under test. Time arrival of its batch.
+        let (unit, _ack) = make_unit_tier(0, b"solo", durability);
+        let start = Instant::now();
+        queue_tx.push(0, unit);
+        let batch = batch_rxs[0]
+            .recv_timeout(Duration::from_secs(2))
+            .expect("single record should flush");
+        let elapsed = start.elapsed();
+        assert_eq!(batch.records.len(), 1);
+
+        drop(queue_tx);
+        for h in handles {
+            h.join().unwrap();
+        }
+        elapsed
+    }
+
+    #[test]
+    fn buffered_only_batch_skips_coalesce_window_but_fsync_tier_coalesces() {
+        let window = Duration::from_micros(COALESCE_MAX_US);
+
+        let buffered = time_single_record_flush(weir_core::Durability::Buffered);
+        let sync = time_single_record_flush(weir_core::Durability::Sync);
+
+        // Sync enters the window and waits out most of it before flushing. This is
+        // a real sleep, so it's a robust LOWER bound (scheduling jitter only makes
+        // it longer): 60% of the window stays clear of timer-granularity slop.
+        assert!(
+            sync >= window * 6 / 10,
+            "Sync batch did NOT coalesce: solo record flushed in {sync:?}, \
+             expected to wait out most of the {window:?} window",
+        );
+
+        // Buffered skips the window, so it flushes at least ~half a window SOONER
+        // than Sync. A RELATIVE bound (both timed on the same machine) — Sync has a
+        // deterministic full-window sleep that Buffered lacks, so `sync - buffered`
+        // ≈ one window regardless of absolute load; an absolute `buffered < window/2`
+        // bound is flaky under a contended gate, a relative one is not. If the
+        // tier-gating regressed and Buffered also paid the window, buffered ≈ sync
+        // and this assertion fails — so it still catches a real bug.
+        assert!(
+            buffered + window / 2 <= sync,
+            "Buffered-only batch did not skip the coalesce window: buffered {buffered:?} \
+             vs sync {sync:?} (window {window:?}) — expected buffered to flush ≥ half a \
+             window sooner",
+        );
     }
 
     #[test]
