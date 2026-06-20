@@ -8,29 +8,18 @@
 //! [`Sink`] (and [`SinkError`] for your error type); the drain retries transient
 //! failures with backoff and dead-letters permanent ones.
 //!
+//! A sink whose `commit` can never fail picks `type Error = std::convert::Infallible`
+//! — no error type to hand-roll, no `is_transient` to write:
+//!
 //! ```
-//! use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth};
+//! use weir_sink_sdk::{CommitResult, Payload, Sink, SinkHealth};
 //!
 //! struct StdoutSink;
 //!
-//! #[derive(Debug)]
-//! struct Never;
-//! impl std::fmt::Display for Never {
-//!     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//!         write!(f, "unreachable")
-//!     }
-//! }
-//! impl std::error::Error for Never {}
-//! impl SinkError for Never {
-//!     fn is_transient(&self) -> bool {
-//!         true
-//!     }
-//! }
-//!
 //! impl Sink for StdoutSink {
 //!     type Record = Payload;
-//!     type Error = Never;
-//!     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Never> {
+//!     type Error = std::convert::Infallible; // this commit never returns Err
+//!     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Self::Error> {
 //!         for r in &batch {
 //!             println!("{} bytes", r.len());
 //!         }
@@ -41,6 +30,10 @@
 //!     }
 //! }
 //! ```
+//!
+//! A sink that *can* fail returns a [`SinkError`] that classifies the failure as
+//! transient (retried) or permanent (dead-lettered). Reach for the ready-made
+//! [`BasicSinkError`] before writing your own error type.
 //!
 //! # Idempotency contract
 //!
@@ -263,12 +256,27 @@ impl SinkError for BasicSinkError {
 /// by polling the future to completion with a no-op waker. This is the same
 /// `block_on` helper the SDK's own tests use — copy it into your sink's tests:
 ///
+/// <div class="warning">
+///
+/// **Only for sinks with no real I/O await points.** This `block_on` busy-polls
+/// with a *no-op* waker — it never sleeps and never wakes. If the future ever
+/// returns `Poll::Pending` (any real `await` that yields: a socket read, a timer,
+/// `tokio::fs`, `sqlx`, `reqwest`), this loop spins the CPU at 100% forever and
+/// **never makes progress** — the no-op waker can't reschedule it. It is fine
+/// only when `commit`/`health` complete synchronously (in-memory work, a `Vec`
+/// push, no yield point). For a sink that does real I/O, use a real runtime —
+/// write a `#[tokio::test]` and `.await` the commit directly (see
+/// `docs/getting-started/integrating.md` → "Unit-testing a real-I/O sink").
+///
+/// </div>
+///
 /// ```
 /// use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth};
 ///
 /// /// Minimal std-only executor: drives a future to completion by polling with
-/// /// a no-op waker. Enough for a sink whose `commit`/`health` are immediately
-/// /// ready (no real I/O await points), without pulling a runtime into a test.
+/// /// a no-op waker. ONLY for a sink whose `commit`/`health` are immediately
+/// /// ready (no real I/O await points) — it busy-spins forever on any future
+/// /// that returns `Poll::Pending`. For real I/O use a `#[tokio::test]` instead.
 /// fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 ///     use std::task::{Context, Poll};
 ///     let mut fut = std::pin::pin!(fut);

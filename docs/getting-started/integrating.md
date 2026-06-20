@@ -105,10 +105,25 @@ over the daemon's configured `max_payload_bytes`, which the daemon Nacks then
 closes). After a push error, if `client.is_poisoned()` (equivalently
 `!err.is_recoverable()`), drop and rebuild the client before the next job.
 
+**Set a read timeout (and re-apply it on reconnect).** By default every `push`
+blocks **forever** waiting for the daemon's ack. A wedged daemon (hung flusher,
+`SIGSTOP`, half-open socket) would freeze the producer thread indefinitely; with
+no thread draining the bounded channel, it fills and the back-pressure becomes a
+permanent stall instead of a recoverable hiccup. Call
+[`set_read_timeout`](https://docs.rs/weir-client/latest/weir_client/struct.WeirClient.html#method.set_read_timeout)
+(and [`set_write_timeout`](https://docs.rs/weir-client/latest/weir_client/struct.WeirClient.html#method.set_write_timeout)
+to bound a stalled request write) right after `connect`, so a stalled reply
+surfaces as a `ClientError::Io` timeout the thread can act on. The timeout lives
+on the **socket**, so a fresh connection starts with none — you **must re-apply
+it after every reconnect**, not just at startup. Pick a value comfortably above
+the daemon's Sync ack latency (its own `ACK_TIMEOUT` is 30 s, so e.g. 45–60 s lets
+a legitimate Nack win rather than racing it).
+
 A sketch of one producer thread (the async-side glue — channel wiring and the
 spawn of N of these — is left out for brevity):
 
 ```rust
+use std::time::Duration;
 use tokio::sync::oneshot;
 use weir_client::{ClientError, Durability, WeirClient};
 
@@ -119,17 +134,36 @@ struct Job {
     reply: oneshot::Sender<Result<(), ClientError>>,
 }
 
+// Open a connection and apply the timeouts. Called at startup AND on every
+// reconnect — the timeouts live on the socket, so a fresh connection has none.
+fn connect(sock: &str) -> WeirClient {
+    let client = WeirClient::connect(sock).expect("connect");
+    // Bound the ack wait so a wedged daemon can't freeze this thread forever.
+    client.set_read_timeout(Some(Duration::from_secs(60))).expect("set read timeout");
+    client.set_write_timeout(Some(Duration::from_secs(60))).expect("set write timeout");
+    client
+}
+
 // Runs on a dedicated std::thread; owns ONE persistent connection.
 fn producer_thread(sock: &str, jobs: std::sync::mpsc::Receiver<Job>) {
-    let mut client = WeirClient::connect(sock).expect("initial connect");
+    let mut client = connect(sock);
     for job in jobs {                       // blocks until the next job; ends on channel close
         let result = client.push(&job.payload, job.durability);
         if let Err(e) = &result {
+            // Surface WHY the push failed, not just THAT it did: Display gives the
+            // human reason, is_recoverable() / is_poisoned() give the next action.
+            tracing::warn!(
+                error = %e,                          // ClientError Display
+                recoverable = e.is_recoverable(),    // false → drop & reconnect
+                poisoned = client.is_poisoned(),     // true  → client must be rebuilt
+                "push failed"
+            );
             // Drop the dead client and reconnect; a poisoned client fails every
             // later call. Recoverable errors (local rejects, InternalError Nack)
-            // leave the connection usable, so we keep it.
+            // leave the connection usable, so we keep it. `connect` re-applies the
+            // timeouts the fresh socket would otherwise lack.
             if !e.is_recoverable() || client.is_poisoned() {
-                client = WeirClient::connect(sock).expect("reconnect");
+                client = connect(sock);
             }
         }
         let _ = job.reply.send(result);     // async caller .await's this for the durable ack
@@ -206,11 +240,140 @@ for (record, reason) in &result.dead_lettered {
 }
 ```
 
-You can **unit-test** the sink against the contract with no runtime — the test in
-the `weir-sink-sdk` crate (`a_custom_sink_can_be_driven_and_unit_tested`) shows a
-tiny `block_on` helper that polls a ready future to completion, then asserts on
-`result.committed` / `result.dead_lettered`. See also
+You can **unit-test** a sink that does no real I/O against the contract with no
+runtime — the test in the `weir-sink-sdk` crate
+(`a_custom_sink_can_be_driven_and_unit_tested`) shows a tiny `block_on` helper
+that polls a ready future to completion, then asserts on `result.committed` /
+`result.dead_lettered`. See also
 [Testing → Sink integration](../testing/sink-integration.md).
+
+> **The `block_on` helper is for ready futures only.** It busy-polls with a
+> *no-op* waker, so it only works when `commit`/`health` finish synchronously (an
+> in-memory `Vec` push, no yield point). Point it at a sink that does a real
+> `await` that yields — a socket read, a timer, `tokio::fs`, `sqlx`, `reqwest` —
+> and the loop spins the CPU forever and never makes progress, because the no-op
+> waker can never reschedule a `Poll::Pending` future. **For a sink that does real
+> async I/O, use a `#[tokio::test]` and `.await` the commit directly** — see the
+> next section.
+
+### Unit-testing a real-I/O sink
+
+A sink that touches a real async resource (a file, a socket, a DB connection)
+returns `Poll::Pending` at its `await` points, so the no-op-waker `block_on`
+above will not drive it. Use a real runtime: a `#[tokio::test]` lets you
+`.await` the commit directly, and a tempfile/tempdir gives the sink a real I/O
+target with no external service. Assert on the returned `CommitResult` —
+`committed` for what landed, `dead_lettered` for what was permanently rejected:
+
+```rust
+// dev-dependencies: tokio = { version = "1", features = ["macros", "rt", "fs"] }
+//                   tempfile = "3"
+use weir_sink_sdk::{CommitResult, Payload, Sink, SinkHealth};
+
+#[tokio::test]
+async fn commits_good_records_and_dead_letters_bad_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = FileSink::new(dir.path().join("out.log")); // your real-I/O sink
+
+    let batch = vec![
+        Payload::from(&b"good"[..]),
+        Payload::from(&b""[..]),       // your sink rejects empty records
+        Payload::from(&b"also-good"[..]),
+    ];
+    let result: CommitResult<Payload> = sink.commit(batch).await.unwrap();
+
+    assert_eq!(result.committed.len(), 2);
+    assert_eq!(result.dead_lettered.len(), 1);
+    assert_eq!(&result.dead_lettered[0].0[..], b"");
+    // The two good records are now on disk in the tempfile; the dir is removed
+    // when `dir` drops at end of test.
+}
+```
+
+> **`weir-testkit` is not a sink unit-test surface.** It is `publish = false` and
+> spawns the *whole daemon* as a child process for `weir-server`'s integration
+> tests — useful for end-to-end coverage, not for exercising a `Sink` impl in
+> isolation. Unit-test your sink directly as above (call `commit` and assert on
+> the `CommitResult`); reach for a real daemon only for end-to-end tests.
+
+### A typed record that rejects malformed input
+
+If your sink parses each payload into a struct, give it
+`type Record = MyRecord` and implement [`SinkRecord`](https://docs.rs/weir-sink-sdk)
+(`from_payload` / `into_payload`). Note that **`from_payload` returns `Self`, not
+`Result`** — it *cannot* reject bad bytes, because the drain has already committed
+to handing you every payload in the segment. So parse **leniently** and keep the
+raw `Payload` alongside the parsed fields; then dead-letter the records that
+failed to parse from inside `commit`, pairing each with a reason:
+
+```rust
+use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth, SinkRecord};
+
+struct MyRecord {
+    raw: Payload,             // ALWAYS keep the original bytes…
+    parsed: Option<Parsed>,   // …None means "arrived malformed"
+}
+
+impl SinkRecord for MyRecord {
+    fn from_payload(payload: Payload) -> Self {
+        // Lenient: parsing can't fail here (returns Self, not Result). Stash the
+        // failure as `None` and carry the raw bytes so we can dead-letter later.
+        let parsed = Parsed::try_from(payload.as_ref()).ok();
+        MyRecord { raw: payload, parsed }
+    }
+    fn into_payload(self) -> Payload {
+        // Byte-preserving round-trip: hand back exactly what we received, so the
+        // per-record dead-letter bytes match the whole-batch-Err bytes.
+        self.raw
+    }
+}
+
+impl Sink for MySink {
+    type Record = MyRecord;
+    type Error = MySinkError;
+    async fn commit(&self, batch: Vec<MyRecord>)
+        -> Result<CommitResult<MyRecord>, MySinkError>
+    {
+        let mut committed = Vec::new();
+        let mut dead_lettered = Vec::new();
+        for record in batch {
+            match &record.parsed {
+                // Malformed on arrival: dead-letter it (permanent — retrying
+                // won't make unparseable bytes parse). The drain recovers the
+                // bytes via `into_payload`, i.e. the raw payload we kept.
+                None => dead_lettered.push((record, "unparseable payload".to_string())),
+                Some(_parsed) => { /* deliver `_parsed` … */ committed.push(record); }
+            }
+        }
+        Ok(CommitResult::new(committed, dead_lettered))
+    }
+    async fn health(&self) -> SinkHealth { SinkHealth::Healthy }
+}
+```
+
+Keeping `raw` and returning it from `into_payload` makes the round-trip
+byte-identical, so the per-record dead-letter path (which calls `into_payload`)
+writes the same bytes the whole-batch-`Err` path would — see the `SinkRecord`
+`# Footgun` in the crate docs.
+
+### Wrapping a non-`Sync` handle
+
+`Sink` requires `Send + Sync`, but some client handles are `Send` and **not**
+`Sync` (e.g. `rusqlite::Connection`, which holds an SQLite handle behind a
+`RefCell`). Wrap such a handle in a `std::sync::Mutex` (or `tokio::sync::Mutex`
+if you hold it across an `.await`) to recover `Sync`:
+
+```rust
+struct SqliteSink {
+    conn: std::sync::Mutex<rusqlite::Connection>, // Connection: Send + !Sync → Mutex makes it Sync
+}
+```
+
+The lock looks like a serialisation point but costs nothing in practice: **the
+drain is single-threaded** and calls `commit` on one segment at a time, so
+commits are already serialised — the `Mutex` is never actually contended. It is
+there only to satisfy the `Sink: Send + Sync` bound, not to arbitrate concurrent
+callers.
 
 > **Running it inside the shipped daemon** today means building a `weir-server`
 > with your sink wired into the sink-selection path (effectively a small fork) —

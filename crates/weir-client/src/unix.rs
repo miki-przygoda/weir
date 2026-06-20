@@ -217,6 +217,17 @@ impl<S: Read + Write> WeirClient<S> {
     /// An `Ack` means the record is durably **buffered** at the requested tier —
     /// **not** that it has reached the downstream sink yet (the daemon drains in
     /// batches once a segment seals). See the crate-level "Ack vs. delivery" note.
+    ///
+    /// The ack is **per record, not a liveness probe for the next one.** If the
+    /// daemon dies (or the socket is severed) between two pushes, the *first*
+    /// push after the failure can still return `Ok` — its frame was written and
+    /// acked, or the breakage isn't observed until the next read/write — and only
+    /// the *following* push surfaces the broken pipe. So a single `Ok` does not
+    /// guarantee the connection is healthy for subsequent pushes. After any push
+    /// error, branch on [`ClientError::is_recoverable`] /
+    /// [`is_poisoned`][Self::is_poisoned] to decide whether to keep using this
+    /// client or drop and reconnect, rather than assuming a prior `Ok` proved the
+    /// connection good.
     #[must_use = "a dropped push result hides whether the record was acked; an \
                   unhandled Nack also closes the connection"]
     pub fn push(
