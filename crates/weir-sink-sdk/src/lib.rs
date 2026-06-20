@@ -47,9 +47,13 @@
 //! The drain guarantees **at-least-once delivery per segment**, not per record.
 //! If the daemon crashes after a partial commit but before recording the segment
 //! as confirmed, `commit` is called again with the full segment — including
-//! records already committed. Implementations **must** handle duplicates
-//! gracefully (upsert, `INSERT IGNORE`, a content-derived dedup key, etc.). This
-//! is the explicit durability trade-off, not a protocol weakness.
+//! records already committed. The same whole-segment replay also occurs when a
+//! segment is *stranded* (its transient-retry budget is exhausted while the sink
+//! is unavailable) and later auto-resumed once the sink recovers: the resume
+//! reprocesses from the start, not from the last durably-committed sub-batch.
+//! Implementations **must** handle duplicates gracefully (upsert, `INSERT IGNORE`,
+//! a content-derived dedup key, etc.). This is the explicit durability trade-off,
+//! not a protocol weakness.
 //!
 //! # Running your sink in the daemon
 //!
