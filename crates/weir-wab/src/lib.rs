@@ -16,6 +16,22 @@
 //! [`Payload`] and the payload size cap) and `crc32fast`. It does no async I/O,
 //! pulls in no runtime, and is safe for a slim CLI to depend on.
 //!
+//! # Trust model
+//!
+//! [`SegmentReader`] validates structural integrity only — magic, format version,
+//! and a CRC32 per record. CRC32 detects *accidental* corruption, **not** a
+//! deliberately forged segment with a valid CRC; see the Security model in
+//! [`mod@format`] for the full statement. The reader does **not** check file
+//! ownership or permissions: the access boundary is the filesystem (`0700` WAB
+//! directory, `0600` segment files), and both consumers are assumed to run as the
+//! daemon's UID. This is already the case for `weir-ctl dl requeue` — it must run
+//! as that UID both to read the `0700` dead-letter directory *and* to pass the
+//! daemon's default-on socket `peer_uid_check`. A different-UID caller cannot
+//! reach the segments at all, so `dl requeue` opens no new forged-segment vector
+//! beyond the "compromised process running as the daemon UID" case, which the
+//! threat model places out of scope. If the WAB lives on a shared/network
+//! filesystem these guarantees do not hold (also an explicit `format` assumption).
+//!
 //! See [`mod@format`] for the on-disk byte layout.
 
 pub mod format;
