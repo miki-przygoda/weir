@@ -46,8 +46,9 @@
 //!   the framing log/trace ingesters (Loki, ES `_bulk`) expect. The
 //!   endpoint returns one status, so the result is all-or-nothing: a 2xx
 //!   commits the batch, a permanent 4xx dead-letters the whole batch, and
-//!   a transient error retries the whole segment. Records must contain no
-//!   embedded newlines.
+//!   a transient error retries the whole segment. Records containing embedded
+//!   newlines are dead-lettered rather than NDJSON-framed (use per-record mode
+//!   for newline-bearing payloads).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,7 +70,9 @@ pub enum HttpBatchMode {
     /// One POST per commit batch: newline-delimited (NDJSON) record bodies, a
     /// single per-batch `Idempotency-Key`, and whole-batch commit/retry/
     /// dead-letter (the endpoint returns one status, so there is no per-record
-    /// granularity). Records must contain no embedded newlines.
+    /// granularity). Records containing embedded newlines are dead-lettered
+    /// rather than NDJSON-framed (use per-record mode for newline-bearing
+    /// payloads).
     Ndjson,
 }
 
@@ -237,12 +240,19 @@ impl HttpSink {
         // configured sink URL should point straight at the ingest endpoint, not a
         // redirector. Reported with the Location so the operator can repoint it.
         if status.is_redirection() {
-            let location = resp
+            let raw_location = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("<no Location header>")
-                .to_string();
+                .unwrap_or("<no Location header>");
+            // The Location header is downstream-controlled and is interpolated into
+            // the log line and the dead-letter reason, so sanitize + bound it the
+            // same way as the permanent-body excerpt below (S29 log-forging defense).
+            // reqwest already rejects CR/LF in header values, so this is defense in
+            // depth plus capping an otherwise-unbounded header value at 256.
+            let location = crate::sink::sanitize_log_excerpt(
+                &raw_location.chars().take(256).collect::<String>(),
+            );
             return Err(HttpSinkError::PermanentStatus {
                 status,
                 body_excerpt: format!(

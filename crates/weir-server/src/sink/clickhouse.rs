@@ -356,12 +356,19 @@ impl Sink for ClickHouseSink {
             // Surfaces only because redirect-following is disabled (G01). An
             // INSERT endpoint that redirects is a misconfiguration; dead-letter
             // (permanent), never commit — the rows were not inserted here.
-            let location = resp
+            let raw_location = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("<no Location header>")
-                .to_string();
+                .unwrap_or("<no Location header>");
+            // The Location header is downstream-controlled and is logged / stored
+            // in the dead-letter reason, so sanitize + bound it the same way as the
+            // permanent-body detail below (S29 log-forging defense). reqwest already
+            // rejects CR/LF in header values, so this is defense in depth plus
+            // capping an otherwise-unbounded header value.
+            let location = crate::sink::sanitize_log_excerpt(
+                &raw_location.chars().take(500).collect::<String>(),
+            );
             Err(sql_common::SqlSinkError::permanent(
                 "clickhouse",
                 format!(
