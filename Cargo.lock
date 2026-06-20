@@ -2687,6 +2687,7 @@ version = "1.1.0"
 dependencies = [
  "clap",
  "crc32fast",
+ "serde_json",
  "weir-client",
  "weir-core",
  "weir-wab",

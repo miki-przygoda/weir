@@ -25,6 +25,10 @@ weir-wab = { workspace = true }
 # fallback on --wab-dir. The proc-macro build cost is already paid elsewhere in
 # the workspace (serde derive, etc.).
 clap = { version = "4", features = ["derive", "env"] }
+# Machine-readable `--json` output for the read/inspect subcommands. weir-ctl is
+# a binary (no public API), so the runtime dep cost is fine; serde_json is
+# already in the workspace lock tree as a transitive dep.
+serde_json = "1"
 
 [dev-dependencies]
 # Test-only: the requeue tests hand-build dead-letter segment fixtures and need

@@ -29,6 +29,12 @@ const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9185";
     about = "Admin and inspection CLI for the weir daemon"
 )]
 struct Cli {
+    /// Emit machine-readable JSON instead of the human table, for the
+    /// read/inspect subcommands (health, metrics, segments, dl list). The human
+    /// output stays the default. Mutating commands (push, dl drop/requeue) emit
+    /// a small JSON result object under --json.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -129,24 +135,25 @@ fn parse_durability(s: &str) -> Result<Durability, String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     let result = match cli.command {
-        Command::Health { socket } => cmd_health(&socket),
+        Command::Health { socket } => cmd_health(&socket, json),
         Command::Push {
             payload,
             durability,
             socket,
-        } => cmd_push(&socket, payload.as_bytes(), durability),
-        Command::Metrics { addr, raw } => cmd_metrics(&addr, raw),
-        Command::Segments { wab_dir } => cmd_segments(&wab_dir),
+        } => cmd_push(&socket, payload.as_bytes(), durability, json),
+        Command::Metrics { addr, raw } => cmd_metrics(&addr, raw, json),
+        Command::Segments { wab_dir } => cmd_segments(&wab_dir, json),
         Command::Dl(dl) => match dl {
-            DlCommand::List { wab_dir } => cmd_dl_list(&wab_dir),
-            DlCommand::Drop { wab_dir, yes } => cmd_dl_drop(&wab_dir, yes),
+            DlCommand::List { wab_dir } => cmd_dl_list(&wab_dir, json),
+            DlCommand::Drop { wab_dir, yes } => cmd_dl_drop(&wab_dir, yes, json),
             DlCommand::Requeue {
                 wab_dir,
                 socket,
                 durability,
                 yes,
-            } => cmd_dl_requeue(&wab_dir, &socket, durability, yes),
+            } => cmd_dl_requeue(&wab_dir, &socket, durability, yes, json),
         },
     };
     match result {
@@ -172,28 +179,69 @@ fn connect_client(socket: &Path) -> Result<WeirClient, String> {
     })
 }
 
-fn cmd_health(socket: &Path) -> Result<(), String> {
+/// Prints a `serde_json::Value` as a pretty, machine-readable block on stdout.
+/// Centralised so every `--json` path emits the same shape of output.
+fn print_json(value: &serde_json::Value) {
+    // `to_string_pretty` cannot fail for a Value built in-process; if it somehow
+    // did, fall back to the compact form rather than panicking.
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => println!("{s}"),
+        Err(_) => println!("{value}"),
+    }
+}
+
+/// The machine-readable form of a successful `health` check. (The command only
+/// reaches the print path once the health check has succeeded, so `healthy` is
+/// always `true` here; a failed check returns an Err that `main` prints to
+/// stderr with a non-zero exit.)
+fn health_json(socket: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "healthy": true,
+        "socket": socket.display().to_string(),
+    })
+}
+
+fn cmd_health(socket: &Path, json: bool) -> Result<(), String> {
     let mut client = connect_client(socket)?;
     client
         .health_check()
         .map_err(|e| format!("health check failed: {e}"))?;
-    println!("OK  daemon healthy at {}", socket.display());
+    if json {
+        print_json(&health_json(socket));
+    } else {
+        println!("OK  daemon healthy at {}", socket.display());
+    }
     Ok(())
 }
 
-fn cmd_push(socket: &Path, payload: &[u8], durability: Durability) -> Result<(), String> {
+fn cmd_push(
+    socket: &Path,
+    payload: &[u8],
+    durability: Durability,
+    json: bool,
+) -> Result<(), String> {
     let mut client = connect_client(socket)?;
     client
         .push(payload, durability)
         .map_err(|e| format!("push failed: {e}"))?;
-    println!("ack  {} bytes, {durability:?}", payload.len());
+    if json {
+        print_json(&serde_json::json!({
+            "acked": true,
+            "bytes": payload.len(),
+            "durability": format!("{durability:?}"),
+        }));
+    } else {
+        println!("ack  {} bytes, {durability:?}", payload.len());
+    }
     Ok(())
 }
 
-fn cmd_metrics(addr: &str, raw: bool) -> Result<(), String> {
+fn cmd_metrics(addr: &str, raw: bool, json: bool) -> Result<(), String> {
     let body = scrape(addr)?;
     if raw {
-        // --raw dumps whatever the endpoint returned, unchanged.
+        // --raw dumps whatever the endpoint returned, unchanged. It takes
+        // precedence over --json: --raw is the escape hatch for the verbatim
+        // Prometheus exposition, which is not JSON.
         print!("{body}");
         return Ok(());
     }
@@ -206,7 +254,11 @@ fn cmd_metrics(addr: &str, raw: bool) -> Result<(), String> {
              and is --addr correct? (default {DEFAULT_METRICS_ADDR})"
         ));
     }
-    print_summary(&body);
+    if json {
+        print_json(&summary_json(&body));
+    } else {
+        print_summary(&body);
+    }
     Ok(())
 }
 
@@ -225,7 +277,7 @@ struct ShardStat {
     bytes: u64,
 }
 
-fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
+fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
     let entries =
         std::fs::read_dir(wab_dir).map_err(|e| format!("read {}: {e}", wab_dir.display()))?;
 
@@ -287,6 +339,13 @@ fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
         shards.push(st);
     }
 
+    shards.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if json {
+        print_json(&segments_json(wab_dir, &shards, dl_files, dl_bytes));
+        return Ok(());
+    }
+
     if shards.is_empty() {
         if dl_files == 0 {
             println!("no shard directories under {}", wab_dir.display());
@@ -303,7 +362,6 @@ fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    shards.sort_by(|a, b| a.name.cmp(&b.name));
     println!(
         "{:<8} {:>7} {:>7} {:>10} {:>12}",
         "shard", "active", "sealed", "confirmed", "bytes"
@@ -340,6 +398,48 @@ fn cmd_segments(wab_dir: &Path) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The machine-readable form of the segments view: per-shard objects, a totals
+/// object, and the dead-letter rollup. Field names mirror the human table
+/// headers; bytes are raw integers so a consumer can do arithmetic on them.
+fn segments_json(
+    wab_dir: &Path,
+    shards: &[ShardStat],
+    dl_files: u64,
+    dl_bytes: u64,
+) -> serde_json::Value {
+    let (mut ta, mut ts, mut tc, mut tb) = (0u64, 0u64, 0u64, 0u64);
+    let shard_json: Vec<serde_json::Value> = shards
+        .iter()
+        .map(|s| {
+            ta += s.active;
+            ts += s.sealed;
+            tc += s.confirmed;
+            tb += s.bytes;
+            serde_json::json!({
+                "shard": s.name,
+                "active": s.active,
+                "sealed": s.sealed,
+                "confirmed": s.confirmed,
+                "bytes": s.bytes,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "wab_dir": wab_dir.display().to_string(),
+        "shards": shard_json,
+        "total": {
+            "active": ta,
+            "sealed": ts,
+            "confirmed": tc,
+            "bytes": tb,
+        },
+        "dead_letter": {
+            "files": dl_files,
+            "bytes": dl_bytes,
+        },
+    })
 }
 
 fn fmt_bytes(b: u64) -> String {
@@ -454,10 +554,36 @@ fn dl_sealed_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     dl_segments_filtered(dl_dir, false)
 }
 
-fn cmd_dl_list(wab_dir: &Path) -> Result<(), String> {
+/// The machine-readable form of `dl list`: one object per segment plus a
+/// count/total rollup. An empty store is a valid result (empty array, zero
+/// totals), not a special-cased message — a consumer always gets the same shape.
+fn dl_list_json(dl_dir: &Path, segs: &[(PathBuf, u64)]) -> serde_json::Value {
+    let total: u64 = segs.iter().map(|(_, s)| *s).sum();
+    let segments: Vec<serde_json::Value> = segs
+        .iter()
+        .map(|(p, sz)| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            serde_json::json!({ "segment": name, "bytes": sz })
+        })
+        .collect();
+    serde_json::json!({
+        "dead_letter_dir": dl_dir.display().to_string(),
+        "count": segs.len(),
+        "total_bytes": total,
+        "segments": segments,
+    })
+}
+
+fn cmd_dl_list(wab_dir: &Path, json: bool) -> Result<(), String> {
     ensure_wab_dir(wab_dir)?;
     let dl_dir = dead_letter_dir(wab_dir);
     let segs = dl_segments(&dl_dir)?;
+
+    if json {
+        print_json(&dl_list_json(&dl_dir, &segs));
+        return Ok(());
+    }
+
     if segs.is_empty() {
         println!("dead-letter store is empty ({})", dl_dir.display());
         return Ok(());
@@ -477,25 +603,44 @@ fn cmd_dl_list(wab_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
+fn cmd_dl_drop(wab_dir: &Path, yes: bool, json: bool) -> Result<(), String> {
     ensure_wab_dir(wab_dir)?;
     let dl_dir = dead_letter_dir(wab_dir);
     // DESTRUCTIVE: read-then-delete, so match ONLY immutable `.wab.sealed`. The
     // bare active `dl_*.wab` is off-limits (a live daemon may be sealing it).
     let segs = dl_sealed_segments(&dl_dir)?;
     if segs.is_empty() {
-        println!("dead-letter store is empty; nothing to drop");
+        if json {
+            print_json(&serde_json::json!({
+                "dry_run": !yes,
+                "candidates": 0,
+                "dropped": 0,
+                "dropped_bytes": 0,
+            }));
+        } else {
+            println!("dead-letter store is empty; nothing to drop");
+        }
         return Ok(());
     }
     let total: u64 = segs.iter().map(|(_, s)| *s).sum();
     if !yes {
-        println!(
-            "would delete {} dead-letter segment(s) ({}) under {}",
-            segs.len(),
-            fmt_bytes(total),
-            dl_dir.display()
-        );
-        println!("re-run with --yes to confirm — this is irreversible.");
+        if json {
+            print_json(&serde_json::json!({
+                "dry_run": true,
+                "candidates": segs.len(),
+                "candidate_bytes": total,
+                "dropped": 0,
+                "dropped_bytes": 0,
+            }));
+        } else {
+            println!(
+                "would delete {} dead-letter segment(s) ({}) under {}",
+                segs.len(),
+                fmt_bytes(total),
+                dl_dir.display()
+            );
+            println!("re-run with --yes to confirm — this is irreversible.");
+        }
         return Ok(());
     }
     // Deletion is irreversible, so don't bail on the first failure and leave a
@@ -513,15 +658,25 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
             Err(e) => failures.push(format!("{}: {e}", p.display())),
         }
     }
-    println!(
-        "dropped {dropped} of {} dead-letter segment(s) ({})",
-        segs.len(),
-        fmt_bytes(dropped_bytes)
-    );
-    println!(
-        "note: a running daemon refreshes its dead-letter accounting \
-         (weir_dead_letter_bytes_on_disk) on its next health-poll cycle — no restart needed."
-    );
+    if json {
+        print_json(&serde_json::json!({
+            "dry_run": false,
+            "candidates": segs.len(),
+            "dropped": dropped,
+            "dropped_bytes": dropped_bytes,
+            "failures": failures.len(),
+        }));
+    } else {
+        println!(
+            "dropped {dropped} of {} dead-letter segment(s) ({})",
+            segs.len(),
+            fmt_bytes(dropped_bytes)
+        );
+        println!(
+            "note: a running daemon refreshes its dead-letter accounting \
+             (weir_dead_letter_bytes_on_disk) on its next health-poll cycle — no restart needed."
+        );
+    }
     if !failures.is_empty() {
         return Err(format!(
             "{} dead-letter segment(s) could not be removed:\n  {}",
@@ -578,6 +733,7 @@ fn cmd_dl_requeue(
     socket: &Path,
     durability: Durability,
     yes: bool,
+    json: bool,
 ) -> Result<(), String> {
     ensure_wab_dir(wab_dir)?;
     let dl_dir = dead_letter_dir(wab_dir);
@@ -587,7 +743,16 @@ fn cmd_dl_requeue(
     // requeue a torn-tail subset before deleting it (see `is_active_dl_wab`).
     let segs = dl_sealed_segments(&dl_dir)?;
     if segs.is_empty() {
-        println!("dead-letter store is empty; nothing to requeue");
+        if json {
+            print_json(&serde_json::json!({
+                "dry_run": !yes,
+                "segments": 0,
+                "requeued_records": 0,
+                "segments_cleared": 0,
+            }));
+        } else {
+            println!("dead-letter store is empty; nothing to requeue");
+        }
         return Ok(());
     }
 
@@ -598,6 +763,16 @@ fn cmd_dl_requeue(
             total_records,
             unreadable,
         } = dry_run_summary(&segs);
+        if json {
+            print_json(&serde_json::json!({
+                "dry_run": true,
+                "segments": segs.len(),
+                "readable_segments": segs.len() - unreadable.len(),
+                "unreadable_segments": unreadable.len(),
+                "requeuable_records": total_records,
+            }));
+            return Ok(());
+        }
         // Report readable-of-total so the segment count reconciles with `dl list`
         // (which counts every segment, readable or not).
         println!(
@@ -673,21 +848,33 @@ fn cmd_dl_requeue(
         }
     }
 
-    println!(
-        "requeued {total_requeued} record(s) from {segments_cleared} dead-letter segment(s) \
-         through {} ({durability:?})",
-        socket.display(),
-    );
-    println!(
-        "note: requeued records re-enter the pipeline and the drain will attempt delivery \
-         again; if the sink still rejects them they will be dead-lettered anew."
-    );
-    if !skipped.is_empty() {
+    if json {
+        print_json(&serde_json::json!({
+            "dry_run": false,
+            "segments": segs.len(),
+            "requeued_records": total_requeued,
+            "segments_cleared": segments_cleared,
+            "skipped_segments": skipped.len(),
+            "delete_failures": delete_failures.len(),
+            "durability": format!("{durability:?}"),
+        }));
+    } else {
         println!(
-            "\n⚠ {} segment(s) were SKIPPED (unreadable) and left in place:\n  {}",
-            skipped.len(),
-            skipped.join("\n  ")
+            "requeued {total_requeued} record(s) from {segments_cleared} dead-letter segment(s) \
+             through {} ({durability:?})",
+            socket.display(),
         );
+        println!(
+            "note: requeued records re-enter the pipeline and the drain will attempt delivery \
+             again; if the sink still rejects them they will be dead-lettered anew."
+        );
+        if !skipped.is_empty() {
+            println!(
+                "\n⚠ {} segment(s) were SKIPPED (unreadable) and left in place:\n  {}",
+                skipped.len(),
+                skipped.join("\n  ")
+            );
+        }
     }
     // Aggregate BOTH failure conditions into one error so the stderr summary
     // reflects everything that went wrong — previously a delete failure masked
@@ -752,12 +939,25 @@ fn get_metric(body: &str, name: &str) -> Option<f64> {
         .and_then(|v| v.parse::<f64>().ok())
 }
 
-fn print_summary(body: &str) {
-    // Counters are non-negative integers; render them as such (avoids `-0`).
-    let accepted = sum_metric(body, "weir_records_accepted_total") as u64;
-    let acked = sum_metric(body, "weir_records_ack_total") as u64;
-    let nacked = sum_metric(body, "weir_records_nack_total") as u64;
+/// The parsed metrics summary, shared by the human (`print_summary`) and JSON
+/// (`summary_json`) renderers so both views report identically-derived numbers.
+struct MetricsSummary {
+    accepted: u64,
+    acked: u64,
+    nacked: u64,
+    fsync_avg_ms: f64,
+    queue_depth: u64,
+    panics: u64,
+    fsync_failures: u64,
+    dead_letter_bytes: u64,
+    wab_bytes: u64,
+    sink_health: String,
+    sink_type: String,
+}
 
+/// Parses the metric values `print_summary` and `summary_json` both need from a
+/// Prometheus exposition body.
+fn parse_summary(body: &str) -> MetricsSummary {
     let fsync_sum = get_metric(body, "weir_wab_fsync_duration_seconds_sum").unwrap_or(0.0);
     let fsync_count = get_metric(body, "weir_wab_fsync_duration_seconds_count").unwrap_or(0.0);
     let fsync_avg_ms = if fsync_count > 0.0 {
@@ -766,15 +966,57 @@ fn print_summary(body: &str) {
         0.0
     };
 
-    let queue_depth = get_metric(body, "weir_queue_depth").unwrap_or(0.0) as u64;
-    let panics = get_metric(body, "weir_wab_flusher_panics_total").unwrap_or(0.0) as u64;
-    let fsync_failures = get_metric(body, "weir_wab_fsync_failures_total").unwrap_or(0.0) as u64;
-    let dead_letter_bytes = get_metric(body, "weir_dead_letter_bytes_on_disk").unwrap_or(0.0);
-    let wab_bytes = get_metric(body, "weir_wab_bytes_on_disk").unwrap_or(0.0);
+    MetricsSummary {
+        // Counters are non-negative integers; render them as such (avoids `-0`).
+        accepted: sum_metric(body, "weir_records_accepted_total") as u64,
+        acked: sum_metric(body, "weir_records_ack_total") as u64,
+        nacked: sum_metric(body, "weir_records_nack_total") as u64,
+        fsync_avg_ms,
+        queue_depth: get_metric(body, "weir_queue_depth").unwrap_or(0.0) as u64,
+        panics: get_metric(body, "weir_wab_flusher_panics_total").unwrap_or(0.0) as u64,
+        fsync_failures: get_metric(body, "weir_wab_fsync_failures_total").unwrap_or(0.0) as u64,
+        dead_letter_bytes: get_metric(body, "weir_dead_letter_bytes_on_disk").unwrap_or(0.0) as u64,
+        wab_bytes: get_metric(body, "weir_wab_bytes_on_disk").unwrap_or(0.0) as u64,
+        // Health flags worth surfacing loudly.
+        sink_health: active_label(body, "weir_sink_health", "state").unwrap_or_else(|| "?".into()),
+        sink_type: active_label(body, "weir_sink_info", "sink_type").unwrap_or_else(|| "?".into()),
+    }
+}
 
-    // Health flags worth surfacing loudly.
-    let sink_health = active_label(body, "weir_sink_health", "state").unwrap_or_else(|| "?".into());
-    let sink_type = active_label(body, "weir_sink_info", "sink_type").unwrap_or_else(|| "?".into());
+/// The machine-readable form of the metrics summary. Field names mirror the
+/// human labels; byte gauges are raw integers (not pretty `fmt_bytes` strings)
+/// so a consumer can do arithmetic on them.
+fn summary_json(body: &str) -> serde_json::Value {
+    let s = parse_summary(body);
+    serde_json::json!({
+        "accepted": s.accepted,
+        "ack": s.acked,
+        "nack": s.nacked,
+        "fsync_avg_ms": s.fsync_avg_ms,
+        "queue_depth": s.queue_depth,
+        "wab_bytes_on_disk": s.wab_bytes,
+        "dead_letter_bytes_on_disk": s.dead_letter_bytes,
+        "sink_type": s.sink_type,
+        "sink_health": s.sink_health,
+        "flusher_panics": s.panics,
+        "fsync_failures": s.fsync_failures,
+    })
+}
+
+fn print_summary(body: &str) {
+    let MetricsSummary {
+        accepted,
+        acked,
+        nacked,
+        fsync_avg_ms,
+        queue_depth,
+        panics,
+        fsync_failures,
+        dead_letter_bytes,
+        wab_bytes,
+        sink_health,
+        sink_type,
+    } = parse_summary(body);
 
     // Labels padded to a single consistent width so the values line up.
     println!("── weir ──────────────────────────────────");
@@ -785,14 +1027,14 @@ fn print_summary(body: &str) {
     println!(
         "{:<10} fsync avg {fsync_avg_ms:.2} ms  wab {} on disk",
         "durability",
-        fmt_bytes(wab_bytes as u64)
+        fmt_bytes(wab_bytes)
     );
     println!("{:<10} depth {queue_depth}", "queue");
     println!("{:<10} type: {sink_type}  health: {sink_health}", "sink");
     println!(
         "{:<10} {} on disk",
         "dead-ltr",
-        fmt_bytes(dead_letter_bytes as u64)
+        fmt_bytes(dead_letter_bytes)
     );
 
     // Loud warnings for the durability hazards.
@@ -909,11 +1151,11 @@ mod tests {
             std::env::temp_dir().join(format!("weir_ctl_missing_wab_{}_xyzzy", std::process::id()));
         std::fs::remove_dir_all(&missing).ok();
         assert!(
-            cmd_dl_list(&missing).is_err(),
+            cmd_dl_list(&missing, false).is_err(),
             "dl list on a missing wab dir must error, not report empty"
         );
         assert!(
-            cmd_dl_drop(&missing, false).is_err(),
+            cmd_dl_drop(&missing, false, false).is_err(),
             "dl drop on a missing wab dir must error, not report empty"
         );
 
@@ -921,8 +1163,9 @@ mod tests {
         let present =
             std::env::temp_dir().join(format!("weir_ctl_present_wab_{}", std::process::id()));
         std::fs::create_dir_all(&present).unwrap();
-        cmd_dl_list(&present).expect("dl list on an empty wab dir must report empty cleanly");
-        cmd_dl_drop(&present, false)
+        cmd_dl_list(&present, false)
+            .expect("dl list on an empty wab dir must report empty cleanly");
+        cmd_dl_drop(&present, false, false)
             .expect("dl drop on an empty wab dir must report empty cleanly");
         std::fs::remove_dir_all(&present).ok();
     }
@@ -946,7 +1189,7 @@ mod tests {
         std::fs::write(&active, b"in-flight").unwrap();
         std::fs::write(dl.join("keep.txt"), b"not-a-dl-file").unwrap();
 
-        cmd_dl_drop(&wab, true).unwrap();
+        cmd_dl_drop(&wab, true, false).unwrap();
 
         // The sealed segments are gone; the active `.wab` and the non-dl file are
         // untouched.
@@ -1067,7 +1310,7 @@ mod tests {
         let wab = std::env::temp_dir().join(format!("weir_ctl_rq_empty_{}", std::process::id()));
         std::fs::create_dir_all(&wab).unwrap();
         let bogus = Path::new("/nonexistent/weir.sock");
-        cmd_dl_requeue(&wab, bogus, Durability::Batched, true).unwrap();
+        cmd_dl_requeue(&wab, bogus, Durability::Batched, true, false).unwrap();
         std::fs::remove_dir_all(&wab).ok();
     }
 
@@ -1079,7 +1322,7 @@ mod tests {
         let dl = wab.join("dead_letter");
         write_dl_segment(&dl, 1, &[b"one", b"two"]);
         let bogus = Path::new("/nonexistent/weir.sock");
-        cmd_dl_requeue(&wab, bogus, Durability::Batched, false).unwrap();
+        cmd_dl_requeue(&wab, bogus, Durability::Batched, false, false).unwrap();
         // Dry run leaves the segment in place.
         assert_eq!(dl_segments(&dl).unwrap().len(), 1);
         std::fs::remove_dir_all(&wab).ok();
@@ -1094,7 +1337,7 @@ mod tests {
         let dl = wab.join("dead_letter");
         write_dl_segment(&dl, 1, &[b"rec"]);
         let bogus = Path::new("/nonexistent/weir.sock");
-        let err = cmd_dl_requeue(&wab, bogus, Durability::Batched, true).unwrap_err();
+        let err = cmd_dl_requeue(&wab, bogus, Durability::Batched, true, false).unwrap_err();
         assert!(err.contains("connect"), "err: {err}");
         // The segment is left in place since nothing could be requeued.
         assert_eq!(dl_segments(&dl).unwrap().len(), 1);
@@ -1229,7 +1472,8 @@ mod tests {
         std::fs::remove_file(&socket).ok();
         let daemon = FakeDaemon::start(socket.clone());
 
-        cmd_dl_requeue(&wab, &socket, Durability::Batched, true).expect("requeue should succeed");
+        cmd_dl_requeue(&wab, &socket, Durability::Batched, true, false)
+            .expect("requeue should succeed");
 
         let received = daemon.into_received();
 
@@ -1263,5 +1507,133 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    // ── `--json` machine-readable output (sweep #6) ──────────────────────────
+    //
+    // Each read/inspect subcommand's `--json` shape is built by a pure helper
+    // (`health_json` / `summary_json` / `segments_json` / `dl_list_json`) that
+    // the command function calls. The tests exercise those helpers directly:
+    // they assert the emitted text is valid JSON (round-trips through
+    // serde_json) and carries the expected top-level keys, deterministically and
+    // without stdout capture or a live daemon.
+
+    /// Parses a `serde_json::Value` through its serialized form, the same way an
+    /// external consumer of `--json` output would — proving the rendered text is
+    /// valid JSON, not just that the in-memory `Value` exists.
+    fn round_trip(value: &serde_json::Value) -> serde_json::Value {
+        let rendered = serde_json::to_string_pretty(value).expect("must serialize");
+        serde_json::from_str(&rendered).expect("--json output must be valid JSON")
+    }
+
+    #[test]
+    fn health_json_has_expected_keys() {
+        let v = round_trip(&health_json(Path::new("/run/weir/weir.sock")));
+        assert_eq!(v["healthy"], serde_json::json!(true));
+        assert_eq!(v["socket"], serde_json::json!("/run/weir/weir.sock"));
+    }
+
+    #[test]
+    fn metrics_summary_json_has_expected_keys() {
+        // A representative exposition with the series print_summary reads.
+        let body = "\
+weir_records_accepted_total{tier=\"sync\"} 5
+weir_records_ack_total{tier=\"sync\"} 4
+weir_records_nack_total{reason=\"bad_payload_crc\"} 1
+weir_wab_fsync_duration_seconds_sum 0.5
+weir_wab_fsync_duration_seconds_count 10
+weir_queue_depth 7
+weir_wab_flusher_panics_total 0
+weir_wab_fsync_failures_total 0
+weir_dead_letter_bytes_on_disk 2048
+weir_wab_bytes_on_disk 4096
+weir_sink_health{state=\"healthy\"} 1
+weir_sink_info{sink_type=\"http\"} 1
+";
+        let v = round_trip(&summary_json(body));
+        // Top-level keys exist and carry the parsed values.
+        assert_eq!(v["accepted"], serde_json::json!(5));
+        assert_eq!(v["ack"], serde_json::json!(4));
+        assert_eq!(v["nack"], serde_json::json!(1));
+        assert_eq!(v["queue_depth"], serde_json::json!(7));
+        assert_eq!(v["wab_bytes_on_disk"], serde_json::json!(4096));
+        assert_eq!(v["dead_letter_bytes_on_disk"], serde_json::json!(2048));
+        assert_eq!(v["sink_type"], serde_json::json!("http"));
+        assert_eq!(v["sink_health"], serde_json::json!("healthy"));
+        assert_eq!(v["flusher_panics"], serde_json::json!(0));
+        assert_eq!(v["fsync_failures"], serde_json::json!(0));
+        // fsync avg = sum/count*1000 = 0.5/10*1000 = 50 ms.
+        assert_eq!(v["fsync_avg_ms"], serde_json::json!(50.0));
+    }
+
+    #[test]
+    fn segments_json_has_expected_keys_and_totals() {
+        let shards = vec![
+            ShardStat {
+                name: "shard-0".into(),
+                active: 1,
+                sealed: 2,
+                confirmed: 3,
+                bytes: 100,
+            },
+            ShardStat {
+                name: "shard-1".into(),
+                active: 0,
+                sealed: 1,
+                confirmed: 0,
+                bytes: 50,
+            },
+        ];
+        let v = round_trip(&segments_json(Path::new("/var/lib/weir"), &shards, 4, 200));
+        assert_eq!(v["wab_dir"], serde_json::json!("/var/lib/weir"));
+        // Per-shard array preserved.
+        assert!(v["shards"].is_array());
+        assert_eq!(v["shards"].as_array().unwrap().len(), 2);
+        assert_eq!(v["shards"][0]["shard"], serde_json::json!("shard-0"));
+        assert_eq!(v["shards"][0]["bytes"], serde_json::json!(100));
+        // Totals are summed across shards.
+        assert_eq!(v["total"]["active"], serde_json::json!(1));
+        assert_eq!(v["total"]["sealed"], serde_json::json!(3));
+        assert_eq!(v["total"]["confirmed"], serde_json::json!(3));
+        assert_eq!(v["total"]["bytes"], serde_json::json!(150));
+        // Dead-letter rollup.
+        assert_eq!(v["dead_letter"]["files"], serde_json::json!(4));
+        assert_eq!(v["dead_letter"]["bytes"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn dl_list_json_has_expected_keys_from_tmp_wab() {
+        // Build a real tmp dead-letter dir and feed its actual listing through
+        // the JSON helper, exercising the same `dl_segments` path the command
+        // uses end-to-end.
+        let wab = std::env::temp_dir().join(format!("weir_ctl_dljson_{}", std::process::id()));
+        let dl = wab.join("dead_letter");
+        write_dl_segment(&dl, 1, &[b"x"]);
+        write_dl_segment(&dl, 2, &[b"y", b"z"]);
+        let segs = dl_segments(&dl).unwrap();
+
+        let v = round_trip(&dl_list_json(&dl, &segs));
+        assert_eq!(v["count"], serde_json::json!(2));
+        assert!(v["total_bytes"].is_u64());
+        assert!(v["segments"].is_array());
+        assert_eq!(v["segments"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v["segments"][0]["segment"],
+            serde_json::json!("dl_00000001.wab.sealed")
+        );
+        assert!(v["dead_letter_dir"].is_string());
+
+        std::fs::remove_dir_all(&wab).ok();
+    }
+
+    #[test]
+    fn dl_list_json_empty_store_is_stable_shape() {
+        // An empty store still yields the same shape (zero count, empty array) —
+        // not a special-cased message — so a consumer can parse unconditionally.
+        let dir = std::env::temp_dir().join("weir_ctl_dljson_empty_xyzzy");
+        let v = round_trip(&dl_list_json(&dir, &[]));
+        assert_eq!(v["count"], serde_json::json!(0));
+        assert_eq!(v["total_bytes"], serde_json::json!(0));
+        assert_eq!(v["segments"], serde_json::json!([]));
     }
 }
