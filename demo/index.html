@@ -10,8 +10,7 @@
 <body>
 
 <div class="statusbar top">
-  <span>weir 1.1.0</span>
-  <span class="sb-dim">durable write-ahead buffer · Rust</span>
+  <span>weir 1.1.0 · durable write-ahead buffer · Rust</span>
   <span class="sb-spacer"></span>
   <span class="sb-dim">an ack is never a false ack</span>
 </div>
@@ -30,12 +29,13 @@
 
   <div class="hero">
     <h1>weir <span class="accent">// live demo</span></h1>
+    <p class="role">durable write buffer · interactive simulation</p>
     <p class="tag">A durable write buffer — as fast as a direct insert at the producer, but crash-safe and N→1 on the database.</p>
     <div class="metrics">
-      <span><b>~69 µs</b> Buffered ack p50</span>
-      <span><b>~364 µs</b> durable Sync ack p50</span>
-      <span><b>N→1</b> commit compression</span>
-      <span><b>0</b> false acks across crash</span>
+      <span><span class="mk">Buffered ack p50</span><b>~69 µs</b></span>
+      <span><span class="mk">durable Sync ack p50</span><b>~364 µs</b></span>
+      <span><span class="mk">commit compression</span><b>N→1</b></span>
+      <span><span class="mk">false acks across crash</span><b>0</b></span>
     </div>
     <div class="cta">
       <a href="#sim" class="primary">▶ Run the simulation</a>
@@ -51,11 +51,11 @@
       producer until it commits. weir instead takes the record over a local socket, writes it to a
       CRC-checked <b>Write-Ahead Buffer</b>, fsyncs per the durability tier, and <b>acks</b> the
       producer — then drains <b>batches</b> downstream, collapsing N commits into one. You get two
-      things the direct path can't: <span style="color:var(--green)">an ack is never a false ack</span>
+      things the direct path can't: <span style="color:var(--n-green)">an ack is never a false ack</span>
       (an acked record is durable and replays across a crash) and far fewer database commits — at a
       producer-facing latency as fast or faster than the direct insert. The honest tradeoff: a record
       lands in the database a beat <em>later</em>, via the batched drain.</p>
-      <p style="margin-bottom:0; color:var(--fg-dim)">Push records below and compare the two stacks.
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Push records below and compare the two stacks.
       <em>Browser simulation; latencies are modeled on weir's benchmarks, with per-record jitter.</em></p>
     </div>
   </div>
@@ -218,8 +218,8 @@
 
 <div class="statusbar bottom">
   <span class="sb-dim">[1]</span><span>Demo</span>
-  <span class="sb-dim">[2]</span><a href="crates.html" style="color:#003333">Crates</a>
-  <span class="sb-dim">[3]</span><a href="examples.html" style="color:#003333">Examples</a>
+  <span class="sb-dim">[2]</span><a href="crates.html">Crates</a>
+  <span class="sb-dim">[3]</span><a href="examples.html">Examples</a>
   <span class="sb-spacer"></span>
   <span class="sb-dim">guest@weir:~$ ▮</span>
 </div>
@@ -230,12 +230,12 @@
   // ---- modeled real latencies (µs) ----
   const WEIR_ACK_US = { Sync:390, Batched:390, Buffered:70 };  // local durable-write cost
   const NAIVE_COMMIT_US = 8000;                                 // remote insert+commit round trip
-  const TIER_COLOR = { Sync:"#55ffff", Batched:"#ff55ff", Buffered:"#55ff55" };  // CGA tier palette
+  const TIER_COLOR = { Sync:"#38bdf8", Batched:"#a78bfa", Buffered:"#4ade80" };  // hr2 tier palette
 
-  // ---- CGA/terminal canvas palette ----
-  const C_NODE_FILL="#0a0a0a", C_NODE_STROKE="#00aaaa", C_NODE_DOWN="#aa0000",
-        C_NODE_TEXT="#aaaaaa", C_LINK="#006666", C_LOSS="#ff5555", C_DRAIN="#ff55ff",
-        C_BUFFERED="#ffff55", C_DIM="#555555";
+  // ---- hr2 canvas palette ----
+  const C_NODE_FILL="#1c1c1c", C_NODE_STROKE="#3a3a3a", C_NODE_DOWN="#f87171",
+        C_NODE_TEXT="#c0c0c0", C_LINK="#2a2a2a", C_LOSS="#f87171", C_DRAIN="#a78bfa",
+        C_BUFFERED="#4ade80", C_DIM="#4e4e4e";
 
   const BATCH_SIZE = 8;
   const BATCH_DEADLINE = 1400;     // anim ms before a partial batch seals
@@ -478,7 +478,7 @@
       if(r.lane!=="naive") continue;
       const pos=naivePos(r); let col=r.color, a=1;
       if(r.lost){ col=C_LOSS; a=Math.max(0.15,1-(tNow-(r.lostAt||tNow))/1400); }
-      else if(r.acked) col="#55ff55";
+      else if(r.acked) col="#4ade80";
       token(ctx,pos.x,pos.y,col,a);
     }
   }
@@ -498,7 +498,7 @@
       token(ctx, segNode.x-28+c*11, yD-3-r2*9, wab[i].durable?wab[i].color:C_BUFFERED, 0.9, 4); }
     if(down){
       const rx=ING_X-58;
-      ctx.save(); ctx.fillStyle="rgba(170,0,0,0.12)"; ctx.fillRect(rx,0,cvW.width-rx,cvW.height);
+      ctx.save(); ctx.fillStyle="rgba(248,113,113,0.10)"; ctx.fillRect(rx,0,cvW.width-rx,cvW.height);
       ctx.fillStyle=C_LOSS; ctx.font="700 13px 'JetBrains Mono',monospace"; ctx.textAlign="center";
       ctx.fillText("daemon DOWN — durable segments held; Restart to replay", (rx+cvW.width)/2, 30); ctx.restore();
     }
@@ -506,7 +506,7 @@
       if(r.lane!=="weir") continue;
       const pos=weirPos(r); let col=r.color, a=1;
       if(r.lost){ col=C_LOSS; a=Math.max(0.15,1-(tNow-(r.lostAt||tNow))/1400); }
-      else if(r.stage==="ack"||r.stage==="acked-rest") col="#55ff55";
+      else if(r.stage==="ack"||r.stage==="acked-rest") col="#4ade80";
       token(ctx,pos.x,pos.y,col,a);
     }
     for(const b of drainQueue){
