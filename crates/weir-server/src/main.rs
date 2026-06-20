@@ -360,6 +360,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .map(Arc::from);
+            // One-shot startup hint: with no token set the sink POSTs
+            // unauthenticated, and the first symptom is otherwise a flood of 401
+            // dead-letters at drain time. Gated to the http arm, so it only fires
+            // when the http sink is actually selected.
+            if bearer_token.is_none() {
+                warn!(
+                    "sink: http — WEIR_SINK_BEARER_TOKEN is unset; requests will be sent \
+                     UNAUTHENTICATED (no Authorization header). If the endpoint requires auth, \
+                     set WEIR_SINK_BEARER_TOKEN or expect 401s to dead-letter at drain time."
+                );
+            }
             // Validated to "none"|"ndjson" at config load; "ndjson" sends the
             // whole batch as one newline-delimited POST, anything else (i.e.
             // "none") keeps the per-record default.

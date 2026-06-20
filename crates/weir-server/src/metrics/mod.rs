@@ -518,7 +518,10 @@ impl Metrics {
             Family::<DrainStateLabel, Gauge<f64, AtomicU64>>::default(),
             "weir_drain_state",
             "Current drain state (1 = active, 0 = inactive). Exactly one state label value \
-             is 1 at any time; the others are 0"
+             is 1 at any time; the others are 0. NOTE: state=\"draining\" does NOT imply \
+             delivery progress — a segment stranded waiting on a fully-down sink still reads \
+             draining. Watch weir_sink_health{state=\"down\"} and weir_drain_segments_stranded \
+             for that case, not this gauge alone"
         );
         let dead_letter_blocked_duration = reg!(
             Gauge::<f64, AtomicU64>::default(),
@@ -634,6 +637,34 @@ impl Metrics {
                 state: SinkHealthState::down,
             })
             .set(0.0);
+
+        // Pre-initialise the labeled nack counter family so the series exist at 0
+        // on the first scrape — without this a scraper can't baseline them until
+        // the first nack actually happens (unlike the pre-initialised gauges and
+        // the unlabeled weir_ack_timeout counter, which exist at 0 from boot).
+        // The decode-error reject path attributes its nack to tier=sync (the
+        // durability tier isn't known until the header parses), so touching every
+        // reason at tier=sync covers the always-reachable label combinations; the
+        // per-tier payload_too_large/internal_error/empty_payload series still
+        // appear on first occurrence as before.
+        for reason in [
+            NackReason::bad_magic,
+            NackReason::version_mismatch,
+            NackReason::bad_header_crc,
+            NackReason::payload_too_large,
+            NackReason::bad_payload_crc,
+            NackReason::internal_error,
+            NackReason::empty_payload,
+            NackReason::unknown_message,
+            NackReason::reserved_flags_set,
+        ] {
+            // get_or_create returns a guard; binding it to `_` is enough — the
+            // series is registered at 0 by the lookup itself.
+            let _ = metrics.records_nack.get_or_create(&NackLabel {
+                tier: TierValue::sync,
+                reason,
+            });
+        }
 
         (metrics, reg)
     }

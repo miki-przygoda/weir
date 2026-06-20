@@ -10,7 +10,9 @@ USAGE:
 
 OPTIONS:
     --config <path>                          Config file path [default: /etc/weir/weir.toml]
-    --socket-path <path>                     Unix socket path [env: WEIR_SOCKET_PATH]
+    --socket-path <path>                     Unix socket path; must be ABSOLUTE
+                                               (no '..' components)
+                                               [env: WEIR_SOCKET_PATH]
     --wab-dir <path>                         WAB directory [env: WEIR_WAB_DIR]
     --shard-count <n>                        Number of WAB shards (1-256) [default: 1]
     --worker-count <n>                       Worker thread count (1-64)
