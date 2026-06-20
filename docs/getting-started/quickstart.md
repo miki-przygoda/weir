@@ -34,10 +34,28 @@ mkdir -p /tmp/weir-quickstart/wab /tmp/weir-quickstart/run
 chmod 0700 /tmp/weir-quickstart/run
 
 # 3. Run.
+#    --wab-segment-max-age-secs 2 is the low-volume default you almost
+#    certainly want (see the note right below): with the stock 256 MiB
+#    segment cap and no idle-seal, a handful of small records are acked but
+#    never sealed — so the sink (and any downstream you wire up) sees NOTHING
+#    until you stop the daemon. A 2-second idle seal drains quiet segments
+#    promptly. Drop the flag on a high-volume deployment where segments fill
+#    on their own.
 ./target/release/weir-server \
     --wab-dir /tmp/weir-quickstart/wab \
-    --socket-path /tmp/weir-quickstart/run/weir.sock
+    --socket-path /tmp/weir-quickstart/run/weir.sock \
+    --wab-segment-max-age-secs 2
 ```
+
+> **Why the idle-seal flag is here.** Idle seal (`wab_segment_max_age_secs`,
+> CLI `--wab-segment-max-age-secs`) defaults to `0` (**disabled**): a segment
+> seals only when it reaches `wab_segment_max_bytes` (default 256 MiB) or the
+> daemon shuts down. A low-volume producer that writes a few small records and
+> goes quiet gets **acked** but never seals — so the drain never forwards them
+> and the sink receives nothing until shutdown. Setting it to a couple seconds
+> (here `2`) makes a quiet segment seal on a timer and drain promptly. This is a
+> first-class knob for any low-throughput deployment; details in
+> [configuration.md](../operations/configuration.md#wab_segment_max_age_secs).
 
 You should see a few `INFO` startup lines ending with the socket and the metrics
 endpoint coming up — the two stable signals that it's ready:

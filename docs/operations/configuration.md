@@ -217,6 +217,19 @@ throughput. Default `1` is correct for most deployments.
 > over fanning out into many. (This is qualitative — the turn-over point is workload- and
 > hardware-specific; measure your own.)
 
+> **The "few shards" advice is for the fsync tiers only — it inverts for `Buffered`.**
+> The amortization above exists because Sync/Batched records share a single group
+> `fsync`. `Buffered` **never fsyncs** — its records ack the moment they hit memory
+> (`wab/mod.rs`, `Durability::Buffered` acks immediately, with no group fsync), so
+> there is nothing to amortize and no benefit to piling connections onto one shard.
+> What concentration *does* do there is funnel every concurrent producer through a
+> single shard's flusher thread and active segment, serialising work that could run in
+> parallel — in our runs this collapsed aggregate `Buffered` throughput by roughly
+> **8–12×** versus spreading the same connections across shards. So for a `Buffered`
+> workload, **spread connections across shards** (and scale `shard_count` toward your
+> parallel-write capacity); reserve the few-shards guidance for the `Sync`/`Batched`
+> tiers where the group fsync actually rewards density.
+
 The daemon emits a startup advisory if `shard_count` / `worker_count`
 looks unusual for the host's core count. See
 [Agent count vs cores](../benchmarks/agent-count-tuning.md) for the
@@ -339,6 +352,16 @@ The size threshold at which the WAB flusher seals the active segment
 and opens a fresh one. The sealed segment is forwarded to the drain
 for sink commit; until a segment seals, its records are durable on
 disk but invisible to the sink.
+
+> **Low-volume trap: with idle-seal off (the default), a quiet producer
+> delivers nothing.** With this 256 MiB cap and the default
+> [`wab_segment_max_age_secs`](#wab_segment_max_age_secs) `= 0`, a low-volume
+> deployment that writes a handful of small records and goes quiet gets every
+> record **acked** but the segment never reaches 256 MiB, so it never seals and
+> the sink receives **nothing** until shutdown. If your throughput won't fill a
+> segment promptly, set `wab_segment_max_age_secs` (e.g. `2`–`30`) so idle
+> segments seal on a timer — or lower this cap. This is the single most common
+> "weir accepts records but my sink is empty" surprise.
 
 **Effect**: smaller values trigger more frequent drain → sink activity
 and faster failure isolation (a corrupt segment only affects records
@@ -1135,6 +1158,18 @@ The `UNIQUE (payload_sha256)` constraint pairs with the default
 `sink_postgres_insert_mode = "on_conflict_do_nothing"` so crash-recovery
 retries are idempotent: duplicate inserts are silently dropped by the
 server, no consumer-side dedup required.
+
+> **The generated `payload_sha256` column is a dedup key, not at-rest
+> tamper-evidence.** It is `GENERATED ALWAYS … STORED`, so Postgres
+> **recomputes** it on every `UPDATE` — an attacker (or a buggy migration) that
+> rewrites `payload` also rewrites the hash, leaving the row internally
+> consistent. It anchors the bytes only at *insert* time, against accidental
+> duplication; it does **not** detect a later mutation. Real at-rest
+> tamper-evidence needs an **append-only** table (revoke `UPDATE`/`DELETE`) or an
+> application-maintained **hash chain** (each row's hash folds in the previous
+> row's), neither of which weir provides — see the
+> [threat model](../security/threat-model.md) ("Signed audit log": records are
+> written verbatim, with no hash chain beyond the per-record wire CRC).
 
 #### `sink_postgres_table`
 

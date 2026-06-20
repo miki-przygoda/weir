@@ -252,10 +252,21 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | Metric | Type | Meaning |
 |---|---|---|
 | `weir_records_accepted_total{tier}` | counter | Records admitted for processing, by durability tier (`sync`/`batched`/`buffered`). |
-| `weir_records_ack_total` | counter | Records durably acked to the producer. The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
-| `weir_records_nack_total` | counter | Records Nacked (not durably accepted). Should be ~0. |
+| `weir_records_ack_total{tier}` | counter | Records durably acked to the producer, by durability tier (`sync`/`batched`/`buffered`). The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
+| `weir_records_nack_total{tier,reason}` | counter | Records Nacked (not durably accepted), by durability tier and `reason`. Should be ~0. `reason` is one of `bad_magic`, `version_mismatch`, `bad_header_crc`, `payload_too_large`, `bad_payload_crc`, `internal_error`, `empty_payload`, `unknown_message`, `reserved_flags_set` (the wire `NackReason` variant names, lowercased). `internal_error` is the only *transient* reason (queue saturation / ack timeout / write-fsync error — connection stays open, producer retries); the rest are permanent protocol/payload errors that close the connection. |
 | `weir_accept_latency_seconds` | histogram | Socket-accept → enqueue latency (independent of fsync). |
 | `weir_queue_depth` | gauge | In-flight records between the socket layer and workers. |
+
+> **These counters are per-process and reset to 0 on every restart** (they are
+> in-memory atomics, not persisted). After a crash/restart, `accepted − ack` is
+> *not* a lifetime loss figure: records that were durably written before the
+> restart but not yet drained are **replayed from the WAB on startup and counted
+> under `weir_recovery_records_replayed_total`** (Durability section), not
+> re-counted under `accepted`/`ack`. So a fresh process legitimately shows
+> `accepted ≈ ack` near zero while the recovery counter carries the
+> pre-restart backlog. Use `rate(...)`/`increase(...)` over a window (which
+> tolerate counter resets) rather than raw cumulative differences across a
+> restart boundary.
 
 ### Durability (WAB)
 | Metric | Type | Meaning |
@@ -278,7 +289,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_drain_state{state}` | gauge | One of `draining` / `retrying_transient` / `blocked_dead_letter_full` is 1. |
 | `weir_sink_commit_records_total{outcome}` | counter | `committed` / `retried` / `dead_lettered` per record. |
 | `weir_sink_commit_duration_seconds` | histogram | Sink `commit()` call duration. |
-| `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1` (`WeirSinkDown`); `degraded` is an early warning (`WeirSinkDegraded`). **This gauge is driven solely by the periodic HEAD health probe, not by commit failures** — see the lag note below. |
+| `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1` (`WeirSinkDown`); `degraded` is an early warning (`WeirSinkDegraded`). **This gauge is driven solely by the periodic HEAD health probe, not by commit failures** — see the lag note below. **It is not a delivery-success signal.** A sink that answers `HEAD` with 2xx (or with 401/403/405/501, which read as healthy) but then 4xx-es every `POST` reads `healthy` here while **dead-lettering all traffic** — the only metric that rises is `weir_sink_commit_records_total{outcome="dead_lettered"}`. **Alert on the dead-lettered outcome rate** (`rate(weir_sink_commit_records_total{outcome="dead_lettered"}[5m]) > 0`, the shipped `WeirDeadLettered` rule) in addition to `weir_sink_health` — health alone will not catch a HEAD-healthy / POST-rejecting endpoint. |
 | `weir_sink_info{sink_type}` | gauge | The configured sink type, set to 1 for the active one. `sink_type="noop"` means records are acked then **DISCARDED** (not forwarded) — alert/indicate on `weir_sink_info{sink_type="noop"} == 1` in any non-soak-test deployment. |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
 | `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |

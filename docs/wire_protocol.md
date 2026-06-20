@@ -133,6 +133,15 @@ implementation that reads from a stream must therefore frame the bytes itself
 single decode call. This keeps a desynced or concatenated stream from silently
 losing records (G18).
 
+`TruncatedFrame` (and `TrailingBytes`) are therefore **decoder-only verdicts** —
+they describe the reference codec's *exactly-one-frame* contract. A streaming
+reader never observes them: a short read is just "read more bytes" (or, past
+`connection_read_timeout_secs`, a timeout), and an over-long buffer never arises
+because the reader takes exactly `payload_len + 4` bytes. The daemon itself reads
+the header and payload separately and so never produces `TruncatedFrame` or
+`TrailingBytes` on the wire — there is no Nack reason for either (see the
+[decoder-tag → wire-Nack mapping](conformance.md#decoder-tag--wire-nack-byte)).
+
 ---
 
 ## CRC32 algorithm
@@ -333,13 +342,30 @@ A non-Rust client that satisfies the following is wire-compatible:
 - [ ] Writes 4-byte payload CRC32 (same algorithm) after the payload.
 - [ ] Reads 16-byte response header, then `header.payload_len`
       response-payload bytes, then 4 response-CRC bytes.
+- [ ] **Caps the response `payload_len` at a few bytes before allocating.**
+      Every weir response payload is **≤ 2 bytes** (`Ack`/`HealthCheckResponse`
+      = 0; `Nack` = 1, except `VersionMismatch` = 2). A larger declared length
+      on a *response* is a desync or a non-weir peer — treat it as a protocol
+      error and close the connection rather than allocating an attacker-chosen
+      buffer. (This mirrors the send-path cap below; the daemon never sends a
+      large response.)
 - [ ] Verifies the response header magic, version, and CRC before
       consuming the payload.
 - [ ] Treats response `message_type == Nack` as failure; decodes the
       first byte of the response payload as `NackReason`.
-- [ ] Caps `payload_len` at the daemon's `MAX_PAYLOAD_HARD_CAP`
-      (16 MiB) — sending larger frames is wasted I/O; the daemon
-      closes the connection after the Nack.
+- [ ] Sends a **non-empty** payload on every `Push`: a zero-length `Push`
+      is rejected with `Nack(EmptyPayload 0x07)` and the connection is closed.
+      To probe liveness without a payload, send a `HealthCheck` (the correct
+      no-payload frame) — **not** an empty `Push`.
+- [ ] Caps its **send** `payload_len` at the **effective** cap —
+      `min(configured max_payload_bytes, MAX_PAYLOAD_HARD_CAP)` — not just at
+      the 16 MiB hard cap. The daemon's `max_payload_bytes` (default 16 MiB,
+      but lower in many deployments) may be **below** the hard cap, so the
+      effective boundary is the smaller of the two and a client cannot know it
+      a priori. Treat a `Nack(PayloadTooLarge 0x04)` as **authoritative**: the
+      frame exceeded the daemon's effective cap regardless of the client's own
+      estimate. Sending larger frames is wasted I/O; the daemon closes the
+      connection after the Nack without reading the payload.
 - [ ] Handles connection close mid-stream as "in-flight requests had
       unknown outcomes; retry on a fresh connection."
 

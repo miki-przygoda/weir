@@ -60,6 +60,34 @@ before the frame-length check) are documented in
 [`wire_protocol.md`](wire_protocol.md#frame-decode-order-server-side); the vectors
 encode the observable result, not the internal order.
 
+### Decoder tag → wire Nack byte
+
+The rejection tags above are *decoder* names (they describe what the codec
+detected). They are **not** the same vocabulary as the wire `NackReason` bytes
+the daemon sends back — several decoder tags collapse to one Nack byte, and two
+are decode-only with no Nack at all. When a Push fails decoding, the daemon maps
+the decoder verdict to a wire Nack as follows:
+
+| Decoder tag          | Wire `NackReason`        | Byte   | Notes                                                            |
+|----------------------|--------------------------|--------|------------------------------------------------------------------|
+| `BadMagic`           | `BadMagic`               | `0x01` |                                                                  |
+| `VersionMismatch`    | `VersionMismatch`        | `0x02` | Nack carries a second byte = daemon `WIRE_VERSION`.              |
+| `HeaderCrcMismatch`  | `BadHeaderCrc`           | `0x03` | Decoder/wire names differ; same condition.                       |
+| `PayloadTooLarge`    | `PayloadTooLarge`        | `0x04` | Boundary is `min(max_payload_bytes, 16 MiB hard cap)` on the wire.|
+| `PayloadCrcMismatch` | `BadPayloadCrc`          | `0x05` | Decoder/wire names differ; same condition.                       |
+| `UnknownMessageType` | `UnknownMessage`         | `0x08` | **Both `UnknownMessageType` and `UnknownDurability` map here.**  |
+| `UnknownDurability`  | `UnknownMessage`         | `0x08` | Same wire byte as `UnknownMessageType` — distinct decoder tags.  |
+| `ReservedFlagsSet`   | `ReservedFlagsSet`       | `0x09` |                                                                  |
+| `TruncatedFrame`     | *(none — local decode)*  | —      | A streaming reader frames bytes itself; a short read is read-more/timeout, never an on-wire Nack. |
+| `TrailingBytes`      | *(none — local decode)*  | —      | A reference-codec verdict for an over-long buffer (G18); the daemon reads exactly one frame, so it never emits this. |
+
+`EmptyPayload` (`0x07`) and `InternalError` (`0x06`) are wire Nacks with **no
+decoder tag**: an empty Push is a daemon admission-policy rejection (the codec
+accepts a zero-length payload), and `InternalError` is a runtime/transient
+condition, not a decode verdict. The full byte table is in
+[`wire_protocol.md`](wire_protocol.md#nack-payload-format); the source of truth
+for this mapping is `nack_for_decode_error` in `crates/weir-server/src/socket/connection.rs`.
+
 ## Coverage
 
 The suite covers every message type, **all nine** Nack reason bytes
