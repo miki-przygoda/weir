@@ -38,7 +38,7 @@ enum Command {
     /// Check that the daemon is alive and answering on its socket.
     Health {
         /// Path to the daemon's Unix socket.
-        #[arg(long, alias = "socket-path", default_value = DEFAULT_SOCKET)]
+        #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
     /// Push a single record (debugging / smoke testing).
@@ -49,7 +49,7 @@ enum Command {
         #[arg(long, default_value = "batched", value_parser = parse_durability)]
         durability: Durability,
         /// Path to the daemon's Unix socket.
-        #[arg(long, alias = "socket-path", default_value = DEFAULT_SOCKET)]
+        #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
     },
     /// Scrape the daemon's Prometheus endpoint and print a health summary.
@@ -95,12 +95,17 @@ enum DlCommand {
     /// dry run. Re-delivery is at-least-once: if interrupted partway through a
     /// segment, that segment's already-pushed records are re-sent on the next
     /// run (the sink's idempotency key dedupes identical payloads).
+    ///
+    /// Skip semantics: a sealed segment with ANY unreadable/corrupt record is
+    /// skipped WHOLESALE (left in place, nothing from it requeued) so a corrupt
+    /// segment is never partially re-delivered. Recovering the readable prefix
+    /// of such a segment is a manual step.
     Requeue {
         /// Path to the daemon's WAB directory.
         #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
         /// Daemon Unix socket to push the records back through.
-        #[arg(long, alias = "socket-path", default_value = DEFAULT_SOCKET)]
+        #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
         /// Durability tier for the re-pushed records: sync | batched | buffered.
         #[arg(long, default_value = "batched", value_parser = parse_durability)]
@@ -357,6 +362,20 @@ fn dead_letter_dir(wab_dir: &Path) -> PathBuf {
     wab_dir.join("dead_letter")
 }
 
+/// Validates that the WAB directory exists and is readable, mirroring how
+/// `cmd_segments` opens it (`std::fs::read_dir`). The dead-letter commands
+/// otherwise treat a missing `dead_letter/` SUBDIR as an empty store
+/// (NotFound → empty), which would silently swallow a missing or mistyped
+/// `--wab-dir` into an empty-Ok and mask the misconfiguration. Checking the
+/// PARENT dir here makes a bad `--wab-dir` error (non-zero exit) like
+/// `segments` does, while a valid wab_dir with no dead-letters yet still
+/// reports empty cleanly.
+fn ensure_wab_dir(wab_dir: &Path) -> Result<(), String> {
+    std::fs::read_dir(wab_dir)
+        .map(|_| ())
+        .map_err(|e| format!("read {}: {e}", wab_dir.display()))
+}
+
 /// The bare active dead-letter file the daemon is currently writing.
 ///
 /// `DeadLetterWriter::write_records` (server `drain/dead_letter.rs`) creates a
@@ -436,6 +455,7 @@ fn dl_sealed_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
 }
 
 fn cmd_dl_list(wab_dir: &Path) -> Result<(), String> {
+    ensure_wab_dir(wab_dir)?;
     let dl_dir = dead_letter_dir(wab_dir);
     let segs = dl_segments(&dl_dir)?;
     if segs.is_empty() {
@@ -458,6 +478,7 @@ fn cmd_dl_list(wab_dir: &Path) -> Result<(), String> {
 }
 
 fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
+    ensure_wab_dir(wab_dir)?;
     let dl_dir = dead_letter_dir(wab_dir);
     // DESTRUCTIVE: read-then-delete, so match ONLY immutable `.wab.sealed`. The
     // bare active `dl_*.wab` is off-limits (a live daemon may be sealing it).
@@ -558,6 +579,7 @@ fn cmd_dl_requeue(
     durability: Durability,
     yes: bool,
 ) -> Result<(), String> {
+    ensure_wab_dir(wab_dir)?;
     let dl_dir = dead_letter_dir(wab_dir);
     // DESTRUCTIVE: each segment is read then `remove_file`d after its records are
     // acked, so match ONLY immutable `.wab.sealed`. The bare active `dl_*.wab` is
@@ -873,6 +895,36 @@ mod tests {
     fn dl_segments_missing_dir_is_empty() {
         let dir = std::env::temp_dir().join("weir_ctl_dl_nonexistent_xyzzy");
         assert!(dl_segments(&dir).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dl_list_and_drop_error_on_missing_wab_dir_but_empty_without_subdir() {
+        // A missing/typo'd `--wab-dir` must error (non-zero exit), like
+        // `segments` does — not be swallowed into an empty-Ok via the
+        // dead_letter/ subdir's NotFound→empty path. But a VALID wab_dir that
+        // simply has no dead_letter/ subdir yet must still report empty cleanly.
+
+        // (1) Missing wab dir → error.
+        let missing =
+            std::env::temp_dir().join(format!("weir_ctl_missing_wab_{}_xyzzy", std::process::id()));
+        std::fs::remove_dir_all(&missing).ok();
+        assert!(
+            cmd_dl_list(&missing).is_err(),
+            "dl list on a missing wab dir must error, not report empty"
+        );
+        assert!(
+            cmd_dl_drop(&missing, false).is_err(),
+            "dl drop on a missing wab dir must error, not report empty"
+        );
+
+        // (2) Existing wab dir with no dead_letter/ subdir → empty/Ok.
+        let present =
+            std::env::temp_dir().join(format!("weir_ctl_present_wab_{}", std::process::id()));
+        std::fs::create_dir_all(&present).unwrap();
+        cmd_dl_list(&present).expect("dl list on an empty wab dir must report empty cleanly");
+        cmd_dl_drop(&present, false)
+            .expect("dl drop on an empty wab dir must report empty cleanly");
+        std::fs::remove_dir_all(&present).ok();
     }
 
     #[test]
