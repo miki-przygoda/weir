@@ -73,8 +73,9 @@ pub use weir_core::Payload;
 ///   [`io::ErrorKind::InvalidData`]), an oversized `payload_len` past
 ///   [`MAX_PAYLOAD_HARD_CAP`] (also `InvalidData`), or a truncation *after* a
 ///   valid length field — i.e. a short read of the CRC or payload bytes
-///   (`UnexpectedEof`) — yields a single `Some(Err(..))` and then iteration
-///   stops (every subsequent call returns `None`).
+///   (`UnexpectedEof`, wrapped with a "segment truncated mid-record" context but
+///   keeping the `UnexpectedEof` kind) — yields a single `Some(Err(..))` and then
+///   iteration stops (every subsequent call returns `None`).
 ///
 /// In short: all good records up to the first corruption, then a single clean
 /// `Err` — except a torn `payload_len` at EOF, which is indistinguishable from a
@@ -139,6 +140,27 @@ impl SegmentReader {
     }
 }
 
+/// Adds a "segment truncated mid-record" context to a short-read error hit
+/// *after* a valid `payload_len` field, so the mid-stream truncation case reads
+/// like the contextful open-time messages instead of the bare stdlib "failed to
+/// fill whole buffer". Only an [`io::ErrorKind::UnexpectedEof`] (a genuine short
+/// read of the CRC or payload bytes) is wrapped — and the wrapped error
+/// *preserves* `UnexpectedEof`, because the documented iteration contract (and
+/// callers, e.g. the recovery path's truncation test) switch on that kind. Any
+/// other read error (e.g. a real I/O failure) propagates unchanged.
+fn truncate_context(e: io::Error, payload_len: usize, what: &str) -> io::Error {
+    if e.kind() != io::ErrorKind::UnexpectedEof {
+        return e;
+    }
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!(
+            "segment truncated mid-record: short read of the {what} for a record \
+             declaring {payload_len} payload bytes ({e})"
+        ),
+    )
+}
+
 impl Iterator for SegmentReader {
     type Item = io::Result<Payload>;
 
@@ -184,14 +206,14 @@ impl Iterator for SegmentReader {
         let mut crc_buf = [0u8; 4];
         if let Err(e) = self.reader.read_exact(&mut crc_buf) {
             self.done = true;
-            return Some(Err(e));
+            return Some(Err(truncate_context(e, payload_len, "CRC field")));
         }
         let expected_crc = u32::from_le_bytes(crc_buf);
 
         let mut payload_buf = vec![0u8; payload_len];
         if let Err(e) = self.reader.read_exact(&mut payload_buf) {
             self.done = true;
-            return Some(Err(e));
+            return Some(Err(truncate_context(e, payload_len, "payload bytes")));
         }
 
         let computed_crc = crc32fast::hash(&payload_buf);
