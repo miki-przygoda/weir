@@ -357,15 +357,48 @@ fn dead_letter_dir(wab_dir: &Path) -> PathBuf {
     wab_dir.join("dead_letter")
 }
 
-/// Returns `(path, size)` for every dead-letter segment in the dead-letter dir,
+/// The bare active dead-letter file the daemon is currently writing.
+///
+/// `DeadLetterWriter::write_records` (server `drain/dead_letter.rs`) creates a
+/// bare `dl_<counter>.wab`, appends to it, then renames it to
+/// `dl_<counter>.wab.sealed`. So a bare `dl_*.wab` is EITHER the segment a live
+/// daemon is creating/writing/sealing RIGHT NOW, or an orphaned partial left by
+/// a failed write. The CLI cannot tell those apart from the outside, so the
+/// destructive paths (`dl requeue`, `dl drop`) treat every bare `.wab` as
+/// off-limits: reading+deleting one could race the daemon's `seal()` and lose or
+/// duplicate dead-letter records (a torn tail reads as a clean `None`, so a
+/// subset would be requeued and the file then removed under the daemon's feet).
+/// Informational commands (`dl list`, `segments`) may still COUNT the bare file.
+fn is_active_dl_wab(name: &str) -> bool {
+    name.starts_with("dl_") && name.ends_with(".wab")
+}
+
+/// An immutable, fully-sealed dead-letter segment (`dl_<counter>.wab.sealed`).
+/// Once sealed the daemon never reopens or renames it, so it is safe for the CLI
+/// to read and delete even against a live daemon.
+fn is_sealed_dl_wab(name: &str) -> bool {
+    name.starts_with("dl_") && name.ends_with(".wab.sealed")
+}
+
+/// Returns `(path, size)` for dead-letter segments in the dead-letter dir,
 /// sorted by name. A missing dead-letter directory is treated as empty.
 ///
-/// Dead-letter records are written and then SEALED, so the on-disk files are
-/// `dl_NNNNNNNN.wab.sealed` — the previous `ends_with(".wab")` filter never
-/// matched them, so `dl list`/`dl drop` always reported an empty store (F40). We
-/// match the sealed files plus any orphaned `dl_*.wab` partial left by a failed
-/// write, so `drop` cleans those up too.
-fn dl_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
+/// `include_active` controls whether the daemon's bare active `dl_*.wab` files
+/// are included:
+///
+/// - INFORMATIONAL callers (`dl list`, `segments`) pass `true`: dead-letter
+///   records are written then SEALED, so on disk they are `dl_NNNNNNNN.wab.sealed`
+///   — the original `ends_with(".wab")` filter never matched them and the store
+///   looked empty (F40). Counting the bare `.wab` too lets these views also
+///   surface an orphaned/in-flight partial.
+/// - DESTRUCTIVE callers (`dl requeue`, `dl drop`) pass `false`: they read then
+///   `remove_file`, so they must match ONLY immutable `.wab.sealed` and never the
+///   bare active file (see [`is_active_dl_wab`] — a TOCTOU against the daemon's
+///   `seal()` would silently lose/duplicate dead-letter records).
+fn dl_segments_filtered(
+    dl_dir: &Path,
+    include_active: bool,
+) -> Result<Vec<(PathBuf, u64)>, String> {
     let entries = match std::fs::read_dir(dl_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -374,16 +407,32 @@ fn dl_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     let mut out = Vec::new();
     for f in entries.flatten() {
         let p = f.path();
-        let is_dl = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            n.starts_with("dl_") && (n.ends_with(".wab.sealed") || n.ends_with(".wab"))
+        let is_match = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            // Order matters: a sealed file ends in BOTH ".wab.sealed" and (via the
+            // bare check below) would never match ".wab", so test sealed first.
+            is_sealed_dl_wab(n) || (include_active && is_active_dl_wab(n))
         });
-        if p.is_file() && is_dl {
+        if p.is_file() && is_match {
             let sz = f.metadata().map(|m| m.len()).unwrap_or(0);
             out.push((p, sz));
         }
     }
     out.sort();
     Ok(out)
+}
+
+/// Informational listing: counts sealed segments AND the daemon's bare active
+/// `dl_*.wab`. Used by `dl list` and `segments` — never for delete/requeue.
+fn dl_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
+    dl_segments_filtered(dl_dir, true)
+}
+
+/// Destructive listing: matches ONLY immutable `dl_*.wab.sealed`. The bare active
+/// `dl_*.wab` is deliberately excluded so `dl requeue` / `dl drop` can never
+/// read-then-delete the file a live daemon is writing/sealing (see
+/// [`is_active_dl_wab`]).
+fn dl_sealed_segments(dl_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
+    dl_segments_filtered(dl_dir, false)
 }
 
 fn cmd_dl_list(wab_dir: &Path) -> Result<(), String> {
@@ -410,7 +459,9 @@ fn cmd_dl_list(wab_dir: &Path) -> Result<(), String> {
 
 fn cmd_dl_drop(wab_dir: &Path, yes: bool) -> Result<(), String> {
     let dl_dir = dead_letter_dir(wab_dir);
-    let segs = dl_segments(&dl_dir)?;
+    // DESTRUCTIVE: read-then-delete, so match ONLY immutable `.wab.sealed`. The
+    // bare active `dl_*.wab` is off-limits (a live daemon may be sealing it).
+    let segs = dl_sealed_segments(&dl_dir)?;
     if segs.is_empty() {
         println!("dead-letter store is empty; nothing to drop");
         return Ok(());
@@ -508,7 +559,11 @@ fn cmd_dl_requeue(
     yes: bool,
 ) -> Result<(), String> {
     let dl_dir = dead_letter_dir(wab_dir);
-    let segs = dl_segments(&dl_dir)?;
+    // DESTRUCTIVE: each segment is read then `remove_file`d after its records are
+    // acked, so match ONLY immutable `.wab.sealed`. The bare active `dl_*.wab` is
+    // off-limits — snapshotting it would race the live daemon's `seal()` and could
+    // requeue a torn-tail subset before deleting it (see `is_active_dl_wab`).
+    let segs = dl_sealed_segments(&dl_dir)?;
     if segs.is_empty() {
         println!("dead-letter store is empty; nothing to requeue");
         return Ok(());
@@ -585,10 +640,11 @@ fn cmd_dl_requeue(
             total_requeued += 1;
         }
 
-        // Every record re-accepted (each push is acked only after the daemon
-        // made it durable). Delete the segment. If the delete fails the records
-        // are still safely requeued, but the file will re-requeue (duplicate) on
-        // the next run — surface it loudly rather than silently.
+        // Every record re-accepted (each push is acked per its durability tier:
+        // after fsync for sync/batched; after in-memory enqueue for buffered).
+        // Delete the segment. If the delete fails the records are still safely
+        // requeued, but the file will re-requeue (duplicate) on the next run —
+        // surface it loudly rather than silently.
         match std::fs::remove_file(path) {
             Ok(()) => segments_cleared += 1,
             Err(e) => delete_failures.push(format!("{}: {e}", path.display())),
@@ -611,8 +667,13 @@ fn cmd_dl_requeue(
             skipped.join("\n  ")
         );
     }
+    // Aggregate BOTH failure conditions into one error so the stderr summary
+    // reflects everything that went wrong — previously a delete failure masked
+    // the skip count (both were printed above, but only the delete failure was
+    // returned). Exit code is non-zero if either occurred.
+    let mut problems: Vec<String> = Vec::new();
     if !delete_failures.is_empty() {
-        return Err(format!(
+        problems.push(format!(
             "{} segment(s) were requeued but could not be deleted (they will requeue again \
              next run — remove them manually):\n  {}",
             delete_failures.len(),
@@ -620,10 +681,13 @@ fn cmd_dl_requeue(
         ));
     }
     if !skipped.is_empty() {
-        return Err(format!(
+        problems.push(format!(
             "{} dead-letter segment(s) could not be read",
             skipped.len()
         ));
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("\n"));
     }
     Ok(())
 }
@@ -812,24 +876,35 @@ mod tests {
     }
 
     #[test]
-    fn dl_drop_removes_every_matched_segment() {
+    fn dl_drop_removes_sealed_segments_only_not_active_wab() {
         // G05: --yes drops all matched dl segments. (The accumulation loop also
         // continues past per-file failures and reports them, but an unremovable
         // file can't be created portably — root bypasses perms — so this covers
         // the all-succeed path.)
+        //
+        // TOCTOU fix: `drop` reads-then-deletes, so it must touch ONLY immutable
+        // `.wab.sealed`. A bare `dl_*.wab` is the daemon's active/in-flight file
+        // and must be left in place.
         let wab = std::env::temp_dir().join(format!("weir_ctl_drop_{}", std::process::id()));
         let dl = wab.join("dead_letter");
         std::fs::create_dir_all(&dl).unwrap();
         std::fs::write(dl.join("dl_00000001.wab.sealed"), b"a").unwrap();
-        std::fs::write(dl.join("dl_00000002.wab"), b"b").unwrap();
+        std::fs::write(dl.join("dl_00000002.wab.sealed"), b"b").unwrap();
+        let active = dl.join("dl_00000003.wab"); // daemon's active file
+        std::fs::write(&active, b"in-flight").unwrap();
         std::fs::write(dl.join("keep.txt"), b"not-a-dl-file").unwrap();
 
         cmd_dl_drop(&wab, true).unwrap();
 
-        // The two dl segments are gone; the non-dl file is untouched.
+        // The sealed segments are gone; the active `.wab` and the non-dl file are
+        // untouched.
         assert!(
-            dl_segments(&dl).unwrap().is_empty(),
-            "all dl segments dropped"
+            dl_sealed_segments(&dl).unwrap().is_empty(),
+            "all sealed dl segments dropped"
+        );
+        assert!(
+            active.exists(),
+            "the daemon's active dl_*.wab must NOT be deleted by drop"
         );
         assert!(
             dl.join("keep.txt").exists(),
@@ -972,5 +1047,169 @@ mod tests {
         // The segment is left in place since nothing could be requeued.
         assert_eq!(dl_segments(&dl).unwrap().len(), 1);
         std::fs::remove_dir_all(&wab).ok();
+    }
+
+    // ── TOCTOU: destructive paths touch only `.wab.sealed`, never active `.wab` ──
+
+    #[test]
+    fn destructive_listing_excludes_active_wab() {
+        // Minimum-bar guard for the TOCTOU fix: the destructive segment listing
+        // (`dl_sealed_segments`, used by requeue/drop) must match ONLY immutable
+        // `.wab.sealed` and exclude the daemon's bare active `dl_*.wab`. The
+        // informational listing (`dl_segments`) still counts the bare file.
+        let dir = std::env::temp_dir().join(format!("weir_ctl_destr_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dl_00000001.wab.sealed"), b"sealed").unwrap();
+        std::fs::write(dir.join("dl_00000002.wab"), b"active").unwrap(); // daemon's active file
+        std::fs::write(dir.join("not_a_dl_file.txt"), b"ignore").unwrap();
+
+        let names = |segs: Vec<(PathBuf, u64)>| -> Vec<String> {
+            segs.iter()
+                .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+
+        // Destructive: sealed only.
+        assert_eq!(
+            names(dl_sealed_segments(&dir).unwrap()),
+            vec!["dl_00000001.wab.sealed"],
+            "destructive listing must exclude the bare active .wab"
+        );
+        // Informational: sealed + bare active (unchanged behavior).
+        assert_eq!(
+            names(dl_segments(&dir).unwrap()),
+            vec!["dl_00000001.wab.sealed", "dl_00000002.wab"],
+            "informational listing still counts the active .wab"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An in-process fake daemon that speaks the Push/Ack wire protocol over a
+    /// Unix socket: it accepts ONE connection, then reads Push frames and replies
+    /// with an Ack for each, recording every payload it received. Used to assert
+    /// the delete-only-after-ack contract without standing up the real daemon.
+    struct FakeDaemon {
+        socket: PathBuf,
+        handle: Option<std::thread::JoinHandle<Vec<Vec<u8>>>>,
+    }
+
+    impl FakeDaemon {
+        fn start(socket: PathBuf) -> Self {
+            use std::os::unix::net::UnixListener;
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon socket");
+            let handle = std::thread::spawn(move || {
+                let mut received: Vec<Vec<u8>> = Vec::new();
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(_) => return received,
+                };
+                // Read frames until the client disconnects (EOF on the header read).
+                loop {
+                    let mut header_buf = [0u8; weir_core::HEADER_LEN];
+                    if std::io::Read::read_exact(&mut stream, &mut header_buf).is_err() {
+                        break; // clean EOF / disconnect
+                    }
+                    let header = weir_core::Header::decode(&header_buf).expect("decode header");
+                    let payload_len = header.payload_len() as usize;
+                    let mut payload = vec![0u8; payload_len];
+                    if payload_len > 0 {
+                        std::io::Read::read_exact(&mut stream, &mut payload).expect("read payload");
+                    }
+                    // Consume the trailing CRC word (4 bytes) of the request frame.
+                    let mut crc = [0u8; 4];
+                    std::io::Read::read_exact(&mut stream, &mut crc).expect("read req crc");
+                    received.push(payload);
+
+                    // Reply with a well-formed Ack frame (empty payload).
+                    let ack = weir_core::Envelope::new(
+                        weir_core::Header::new(
+                            weir_core::MessageType::Ack,
+                            weir_core::Durability::Sync,
+                            0,
+                        ),
+                        Vec::new(),
+                    )
+                    .encode();
+                    std::io::Write::write_all(&mut stream, &ack).expect("write ack");
+                }
+                received
+            });
+            FakeDaemon {
+                socket,
+                handle: Some(handle),
+            }
+        }
+
+        /// Joins the daemon thread and returns the payloads it received. The
+        /// client drops at the end of the requeue call, so the daemon sees EOF
+        /// and the loop exits.
+        fn into_received(mut self) -> Vec<Vec<u8>> {
+            self.handle.take().unwrap().join().expect("daemon thread")
+        }
+    }
+
+    impl Drop for FakeDaemon {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.socket).ok();
+        }
+    }
+
+    #[test]
+    fn requeue_deletes_sealed_segments_only_after_acks() {
+        // The core sev-9 contract: against a daemon that acks every push, a real
+        // `dl requeue --yes` (a) re-delivers EVERY record, and (b) deletes the
+        // `.wab.sealed` segments — but only AFTER the acks. (c) A bare active
+        // `dl_*.wab` is never read or deleted.
+        let base = std::env::temp_dir().join(format!("weir_ctl_rq_ack_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let wab = base.join("wab");
+        let dl = wab.join("dead_letter");
+
+        // Two sealed segments to be requeued, plus the daemon's active file.
+        write_dl_segment(&dl, 1, &[b"a1", b"a2"]);
+        write_dl_segment(&dl, 2, &[b"b1", b"b2", b"b3"]);
+        let active = dl.join("dl_00000003.wab");
+        std::fs::write(&active, b"in-flight-do-not-touch").unwrap();
+        let active_before = std::fs::read(&active).unwrap();
+
+        // Short socket path (Unix socket paths are length-limited).
+        let socket = std::env::temp_dir().join(format!("wctl_rq_{}.sock", std::process::id()));
+        std::fs::remove_file(&socket).ok();
+        let daemon = FakeDaemon::start(socket.clone());
+
+        cmd_dl_requeue(&wab, &socket, Durability::Batched, true).expect("requeue should succeed");
+
+        let received = daemon.into_received();
+
+        // (a) Every record from BOTH sealed segments reached the daemon, in order.
+        assert_eq!(
+            received,
+            vec![
+                b"a1".to_vec(),
+                b"a2".to_vec(),
+                b"b1".to_vec(),
+                b"b2".to_vec(),
+                b"b3".to_vec(),
+            ],
+            "daemon must receive every requeued record in segment+record order"
+        );
+
+        // (b) Both sealed segments are deleted (after the acks — the requeue call
+        // only returned Ok once every push was acked, then removed the files).
+        assert!(
+            dl_sealed_segments(&dl).unwrap().is_empty(),
+            "sealed segments must be deleted after their records are acked"
+        );
+
+        // (c) The bare active `.wab` was never read or deleted — still present and
+        // byte-for-byte unchanged.
+        assert!(active.exists(), "active dl_*.wab must not be deleted");
+        assert_eq!(
+            std::fs::read(&active).unwrap(),
+            active_before,
+            "active dl_*.wab must not be modified"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
