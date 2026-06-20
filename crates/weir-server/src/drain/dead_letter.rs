@@ -91,8 +91,13 @@ impl DeadLetterWriter {
         // create_new's AlreadyExists on that partial, and then fail EVERY
         // subsequent dead-letter for the rest of the run (commit_batch retries
         // dead-letter failures transiently, so the poison is permanent). The
-        // cost of reserving is at most a skipped counter on failure; recovery
-        // re-seals the orphaned partial on the next start.
+        // cost of reserving is at most a skipped counter on failure. Crash
+        // recovery does NOT re-seal the orphaned partial: it skips the
+        // dead_letter/ dir entirely (F16, scan_unconfirmed_sealed). The orphan
+        // is instead accounted for by the next DeadLetterWriter::open — scan_dir
+        // advances next_counter past the partial's counter, so the orphan is
+        // never reused and never poisons a future write (it just lingers on disk
+        // until an operator clears it via weir-ctl dl).
         self.next_counter += 1;
 
         let active_path = self.dir.join(format!("dl_{counter:08}.wab"));

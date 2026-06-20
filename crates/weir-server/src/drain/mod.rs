@@ -323,10 +323,22 @@ fn probe_and_resume_stranded<S: Sink>(
                     );
                 }
             }
-            Err(e) => warn!(
-                error = %e,
-                "drain: sink recovered but the stranded-segment rescan failed; will retry on the next recovery edge"
-            ),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "drain: sink recovered but the stranded-segment rescan failed; will retry on the next recovery edge"
+                );
+                // Keep the recovery edge LIVE: return the caller's previous
+                // health-ok state (still `false` here, since we only reach this
+                // arm on a down→up edge) rather than `now_ok`. If we returned
+                // `now_ok` (true), `prev_health_ok` would flip true and the
+                // `now_ok && !prev_health_ok` edge would never fire again, so a
+                // transient rescan failure would strand segments until restart —
+                // contradicting the "will retry on the next recovery edge"
+                // promise (H1). The gauge above already reflects the healthy
+                // probe; only the edge-tracking state is held back.
+                return prev_health_ok;
+            }
         }
     }
     now_ok
@@ -581,7 +593,7 @@ fn drain_thread<S: Sink>(
                 // while we were waiting on dead-letter headroom; without
                 // this poll the gauge would be stuck at whatever value the
                 // last segment commit produced.
-                let health = probe_health(&rt, &*sink, config.commit_timeout);
+                let health = probe_health(&rt, &*sink, config.health_probe_timeout);
                 set_sink_health(&metrics, health);
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
                     // Headroom available — retry the preserved segment, RESUMING
@@ -1242,6 +1254,12 @@ mod tests {
         /// reason string. Tests use this to verify dead-letter *contents*,
         /// not just the dead-letter file count.
         dead_lettered_records: Mutex<Vec<(Payload, String)>>,
+        /// Scripted health responses, popped one per `health()` call. Once
+        /// exhausted (or if empty), `health()` falls back to `Healthy` — so
+        /// sinks built without a script behave exactly as before. Used by the
+        /// stranded-segment recovery-edge tests to drive a Down→Healthy
+        /// transition deterministically.
+        health_script: Mutex<VecDeque<SinkHealth>>,
     }
 
     impl MockSink {
@@ -1255,6 +1273,18 @@ mod tests {
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
                 dead_lettered_records: Mutex::new(Vec::new()),
+                health_script: Mutex::new(VecDeque::new()),
+            }
+        }
+
+        /// A sink whose `health()` returns `script` in order (one per call),
+        /// then falls back to `Healthy` once exhausted. Drives the down→up
+        /// recovery-edge logic in `probe_and_resume_stranded`. `commit()`
+        /// behaves like `with_responses([])` (commits whatever it is given).
+        fn with_health_script(script: impl IntoIterator<Item = SinkHealth>) -> Self {
+            Self {
+                health_script: Mutex::new(script.into_iter().collect()),
+                ..Self::with_responses([])
             }
         }
 
@@ -1271,6 +1301,7 @@ mod tests {
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
                 dead_lettered_records: Mutex::new(Vec::new()),
+                health_script: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -1366,7 +1397,13 @@ mod tests {
         }
 
         async fn health(&self) -> SinkHealth {
-            SinkHealth::Healthy
+            // Pop the next scripted health, else fall back to Healthy so sinks
+            // built without a script behave exactly as before.
+            self.health_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(SinkHealth::Healthy)
         }
     }
 
@@ -2086,6 +2123,164 @@ mod tests {
             get_confirmed_path(&sealed).exists(),
             "resumed segment must be confirmed after delivery"
         );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── probe_and_resume_stranded: recovery-edge contract (H1) ─────────────────
+
+    /// Reads the one-hot `weir_sink_health` gauge value for a single state.
+    fn sink_health_gauge(m: &Metrics, state: crate::metrics::SinkHealthState) -> f64 {
+        m.sink_health
+            .get_or_create(&crate::metrics::SinkHealthLabel { state })
+            .get()
+    }
+
+    /// The recovery edge (`now_ok && !prev_health_ok`) must fire EXACTLY once on
+    /// the down→up transition, re-queueing the stranded segment, and must NOT
+    /// fire again on subsequent steady-Healthy polls (no double re-queue).
+    #[test]
+    fn probe_and_resume_stranded_edge_fires_once() {
+        use crate::metrics::SinkHealthState;
+
+        let dir = tmp_dir("edge_once");
+        // A real sealed-but-unconfirmed segment on disk for the rescan to find.
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let mut pending: VecDeque<PathBuf> = VecDeque::new();
+
+        // Script: Down (no edge — sink still down) → Healthy (down→up edge) →
+        // Healthy (steady, must NOT re-fire).
+        let sink = MockSink::with_health_script([
+            SinkHealth::Down("offline".into()),
+            SinkHealth::Healthy,
+            SinkHealth::Healthy,
+        ]);
+
+        // Poll 1: Down. prev was true (startup), now false. No edge → no resume.
+        let after1 = probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, true);
+        assert!(!after1, "Down probe must return now_ok = false");
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            0,
+            "no resume while the sink is down"
+        );
+        assert!(pending.is_empty(), "no segment queued while down");
+        // Gauge reflects the (down) probe.
+        assert_eq!(sink_health_gauge(&metrics, SinkHealthState::down), 1.0);
+
+        // Poll 2: Healthy. down→up edge fires → exactly one segment re-queued.
+        let after2 = probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, after1);
+        assert!(after2, "Healthy probe must return now_ok = true");
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            1,
+            "the down→up edge must re-queue the stranded segment exactly once"
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "exactly one segment re-queued on the edge"
+        );
+        assert_eq!(
+            pending[0], sealed,
+            "the re-queued segment is the stranded one"
+        );
+        // Healthy probe drives the gauge to healthy.
+        assert_eq!(sink_health_gauge(&metrics, SinkHealthState::healthy), 1.0);
+
+        // Poll 3: Healthy again, prev now true → NO edge → NO further resume and
+        // no second copy enqueued (dedup against `pending` also guards this).
+        let after3 = probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, after2);
+        assert!(after3, "steady Healthy probe stays now_ok = true");
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            1,
+            "steady-Healthy polls must NOT re-fire the recovery edge"
+        );
+        assert_eq!(pending.len(), 1, "no duplicate enqueue on steady Healthy");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// H1 regression: when the WAB rescan returns `Err` on the recovery edge,
+    /// `probe_and_resume_stranded` must return the caller's `prev_health_ok`
+    /// (kept `false`) rather than `now_ok` (`true`), so the edge stays live and a
+    /// later poll retries the rescan and resumes — instead of stranding the
+    /// segment until restart. Faults the rescan by deleting `wab_dir` so the
+    /// `fs::read_dir` inside `scan_unconfirmed_sealed` returns `Err`, then
+    /// restores it and re-polls.
+    #[test]
+    fn probe_and_resume_stranded_err_path_keeps_edge_live() {
+        let dir = tmp_dir("edge_err");
+        // Start from a clean slate so the directory truly does not exist.
+        std::fs::remove_dir_all(&dir).ok();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let mut pending: VecDeque<PathBuf> = VecDeque::new();
+
+        // Every probe is Healthy; the recovery edge is driven by the caller's
+        // prev_health_ok = false (as the drain sets it when a segment strands).
+        let sink = MockSink::with_health_script([SinkHealth::Healthy, SinkHealth::Healthy]);
+
+        // Poll on the edge while wab_dir is MISSING → scan_unconfirmed_sealed
+        // returns Err. The contract: return the passed-in prev_health_ok (false),
+        // NOT now_ok (true), and resume nothing.
+        assert!(
+            !dir.exists(),
+            "precondition: wab_dir must be absent so the rescan faults"
+        );
+        let after_err =
+            probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, false);
+        assert!(
+            !after_err,
+            "H1: on rescan Err the function must return the passed-in prev_health_ok (false), \
+             not now_ok (true) — otherwise the recovery edge dies and segments strand until restart"
+        );
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            0,
+            "nothing resumes when the rescan failed"
+        );
+        assert!(pending.is_empty(), "no segment queued on rescan failure");
+        // The gauge still reflects the healthy probe (FIX 1 leaves set_sink_health
+        // as-is; only the edge-tracking return value is held back).
+        assert_eq!(
+            sink_health_gauge(&metrics, crate::metrics::SinkHealthState::healthy),
+            1.0,
+            "the health gauge must still show healthy even when the rescan failed"
+        );
+
+        // Now restore wab_dir with a stranded segment. Because after_err is still
+        // false, the NEXT poll is again a down→up edge → the rescan retries,
+        // succeeds, and resumes the segment. (If H1 returned now_ok=true, prev
+        // would be true here and the edge would never fire again.)
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+        let after_retry =
+            probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, after_err);
+        assert!(after_retry, "the retry poll is Healthy → now_ok = true");
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            1,
+            "H1: the live edge lets a later poll retry the rescan and resume the segment"
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "the stranded segment is re-queued on retry"
+        );
+        assert_eq!(pending[0], sealed);
 
         std::fs::remove_dir_all(dir).ok();
     }
