@@ -263,10 +263,19 @@ impl<S: Read + Write> WeirClient<S> {
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::Ack => Ok(()),
-            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
-            other => Err(ClientError::Protocol(format!(
-                "expected Ack or Nack, got {other:?}"
-            ))),
+            // A Nack may carry an empty payload, which `nack_error` reports as a
+            // `Protocol` desync; poison in that case (see `surface_nack`).
+            MessageType::Nack => Err(self.surface_nack(resp.payload())),
+            // Any other frame type is a stream desync: the daemon sent something we
+            // never expect here, so leftover/unexpected bytes could be mis-read as a
+            // later reply (a false ack). Poison the connection (Protocol → not
+            // recoverable, matching `ensure_usable`).
+            other => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(format!(
+                    "expected Ack or Nack, got {other:?}"
+                )))
+            }
         }
     }
 
@@ -279,6 +288,24 @@ impl<S: Read + Write> WeirClient<S> {
             self.closed_after_nack = true;
         }
         err
+    }
+
+    /// Decodes a Nack frame's payload and records its connection effect.
+    ///
+    /// `nack_error` maps a well-formed Nack to a `Nack`/`VersionMismatch`/`UnknownNack`
+    /// error (routed through [`note_nack`][Self::note_nack] to mark a closing Nack),
+    /// but an **empty** Nack payload is a stream desync that it reports as
+    /// [`ClientError::Protocol`]. A desync means leftover/unexpected bytes could be
+    /// mis-read as a later reply (a false ack), so we poison the connection in that
+    /// case — keeping `Protocol` non-recoverable and `is_poisoned()` in agreement.
+    fn surface_nack(&mut self, payload: &[u8]) -> ClientError {
+        match nack_error(payload) {
+            ClientError::Protocol(msg) => {
+                self.poisoned = true;
+                ClientError::Protocol(msg)
+            }
+            other => self.note_nack(other),
+        }
     }
 
     /// Pushes at the connection's default durability tier.
@@ -306,22 +333,38 @@ impl<S: Read + Write> WeirClient<S> {
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::HealthCheckResponse => Ok(()),
-            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
-            other => Err(ClientError::Protocol(format!(
-                "expected HealthCheckResponse, got {other:?}"
-            ))),
+            // An empty Nack payload is a desync `nack_error` reports as `Protocol`;
+            // poison in that case (see `surface_nack`).
+            MessageType::Nack => Err(self.surface_nack(resp.payload())),
+            // Any other frame type is a stream desync: poison the connection so a
+            // later call can't mis-read a stale frame as its reply (Protocol → not
+            // recoverable, matching `ensure_usable`).
+            other => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(format!(
+                    "expected HealthCheckResponse, got {other:?}"
+                )))
+            }
         }
     }
 
-    /// Whether this client's connection has been poisoned and must be rebuilt.
+    /// Whether this client's connection is dead and must be rebuilt.
     ///
-    /// The client poisons itself when a connection-fatal failure leaves the stream
-    /// in an indeterminate or dead state — a response-read failure/timeout, a
-    /// protocol violation in the reply, or a connection-closing Nack (every Nack
-    /// reason except the transient [`InternalError`][NackReason::InternalError]).
-    /// Once poisoned, **every** method fails fast (it will not touch the socket
-    /// again, to avoid mis-reading leftover bytes as a later reply — a false ack);
-    /// the caller must drop this client and open a fresh connection.
+    /// Reports the union of the two ways a connection becomes unusable, so it is the
+    /// exact complement of [`is_recoverable`][ClientError::is_recoverable] for the
+    /// error that caused it:
+    ///
+    /// - an **indeterminate stream** (the internal `poisoned` flag) — a
+    ///   response-read failure/timeout, a protocol violation in the reply, or any
+    ///   stream desync (an unexpected daemon message type, an empty-payload Nack);
+    ///   leftover/unexpected bytes could be mis-read as a later reply (a false ack);
+    /// - a **connection-closing Nack** (the internal `closed_after_nack` flag) —
+    ///   every Nack reason except the transient
+    ///   [`InternalError`][NackReason::InternalError], after which the daemon closes
+    ///   the connection.
+    ///
+    /// In either state **every** method fails fast (it will not touch the socket
+    /// again); the caller must drop this client and open a fresh connection.
     ///
     /// A long-lived producer thread (e.g. one driven from an async runtime) should
     /// check this after a failed call — or, equivalently, branch on
@@ -342,10 +385,11 @@ impl<S: Read + Write> WeirClient<S> {
     ///
     /// See [`ClientError::is_recoverable`] for the per-error view of the same
     /// distinction (recoverable = connection still usable; non-recoverable = drop
-    /// and reconnect).
+    /// and reconnect). The two are kept equivalent: `is_poisoned()` is true after a
+    /// failed call exactly when that call's error is non-recoverable.
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned || self.closed_after_nack
     }
 
     /// Returns the poisoned-connection error if a prior response read failed.
@@ -815,6 +859,91 @@ mod tests {
         );
         // And the poisoning error itself is non-recoverable.
         assert!(!err.is_recoverable(), "an Io failure is not recoverable");
+    }
+
+    #[test]
+    fn is_poisoned_after_a_connection_closing_nack() {
+        // A connection-closing Nack (every reason except InternalError) leaves the
+        // connection dead. `is_poisoned()` must report that — it reflects
+        // `closed_after_nack`, not just `poisoned` — and the connection must be
+        // refused by `ensure_usable` on the next call. (Models the closing-nack
+        // test `closing_nack_makes_next_call_fail_with_a_clear_reconnect_error`.)
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        assert!(!c.is_poisoned(), "a fresh client must not be poisoned");
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            server_end
+                .write_all(&nack_frame(NackReason::EmptyPayload))
+                .unwrap();
+            // drop server_end → connection closes, as the daemon does after a Nack.
+        });
+        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(first, ClientError::Nack(NackReason::EmptyPayload)),
+            "expected the real Nack reason, got {first:?}"
+        );
+        // The closing Nack is non-recoverable, and the client reports poisoned.
+        assert!(
+            !first.is_recoverable(),
+            "a connection-closing Nack is non-recoverable"
+        );
+        assert!(
+            c.is_poisoned(),
+            "a connection-closing Nack must flip is_poisoned() to true"
+        );
+        // And the connection is refused fast on the next attempt.
+        assert!(
+            matches!(c.ensure_usable(), Err(ClientError::Protocol(_))),
+            "ensure_usable must reject a closed-after-nack connection"
+        );
+    }
+
+    #[test]
+    fn is_poisoned_and_is_recoverable_agree_after_a_desync() {
+        // A stream desync — the daemon sends an unexpected message type where an
+        // Ack/Nack was expected — poisons the connection: leftover/unexpected bytes
+        // could be mis-read as a later reply (a false ack). `is_poisoned()` must be
+        // true AND the returned error must be non-recoverable, i.e. the two agree.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        assert!(!c.is_poisoned(), "a fresh client must not be poisoned");
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // A HealthCheck frame is a valid frame, but it is NOT a reply push expects
+            // (push expects Ack or Nack) — a genuine stream desync.
+            let bogus = weir_core::Envelope::new(
+                weir_core::Header::new(
+                    weir_core::MessageType::HealthCheck,
+                    weir_core::Durability::Sync,
+                    0,
+                ),
+                vec![],
+            )
+            .encode();
+            server_end.write_all(&bogus).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        // The error is a Protocol desync, which is non-recoverable...
+        assert!(
+            matches!(err, ClientError::Protocol(_)),
+            "expected a Protocol desync error, got {err:?}"
+        );
+        assert!(!err.is_recoverable(), "a stream desync is non-recoverable");
+        // ...and is_poisoned() agrees (the two must never disagree).
+        assert!(
+            c.is_poisoned(),
+            "a stream desync must flip is_poisoned() to true"
+        );
+        assert_eq!(
+            c.is_poisoned(),
+            !err.is_recoverable(),
+            "is_poisoned() and !is_recoverable() must agree"
+        );
     }
 
     #[test]
