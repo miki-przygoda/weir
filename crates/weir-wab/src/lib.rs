@@ -38,11 +38,15 @@ pub mod format;
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
-use format::{FORMAT_VERSION, SEGMENT_HEADER_LEN, SEGMENT_MAGIC};
+use format::{
+    EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
+    SEGMENT_MAGIC, SegmentFooterMeta, SegmentHeaderMeta, SegmentHeaderParseError,
+    parse_segment_footer, parse_segment_header,
+};
 
 /// Re-export of [`weir_core::Payload`] — the item type of the [`SegmentReader`]
 /// iterator ([`io::Result<Payload>`]). Re-exported so a consumer depending on
@@ -84,12 +88,20 @@ pub use weir_core::Payload;
 pub struct SegmentReader {
     reader: BufReader<File>,
     done: bool,
+    header: SegmentHeaderMeta,
+    /// Set in `next`'s terminal branches: `Some(true)` once a `payload_len == 0`
+    /// sentinel is consumed, `Some(false)` if a torn `payload_len` EOF ended
+    /// iteration, `None` while iteration has not yet ended. See
+    /// [`SegmentReader::terminated_cleanly`].
+    terminated_cleanly: Option<bool>,
 }
 
 impl SegmentReader {
     /// Opens a segment file and validates its header (magic + format version)
     /// before any records are read. Fails with [`io::ErrorKind::InvalidData`]
     /// for a bad magic or an unknown format version.
+    ///
+    /// The parsed header is retained and exposed via [`SegmentReader::header`].
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
@@ -133,10 +145,63 @@ impl SegmentReader {
             ));
         }
 
+        // Magic and version are already validated above (with richer, path-aware
+        // messages). Re-parse the same bytes to capture shard_id + created_at;
+        // the structural checks cannot fail here, but map any error rather than
+        // unwrap, so a future format change can never panic.
+        let header = parse_segment_header(&header).map_err(|e| match e {
+            SegmentHeaderParseError::WrongLength { .. } => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("segment header is not {SEGMENT_HEADER_LEN} bytes"),
+            ),
+            other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+        })?;
+
         Ok(SegmentReader {
             reader,
             done: false,
+            header,
+            terminated_cleanly: None,
         })
+    }
+
+    /// The parsed segment header (shard id, format version, creation time),
+    /// captured at [`open`](SegmentReader::open).
+    pub fn header(&self) -> &SegmentHeaderMeta {
+        &self.header
+    }
+
+    /// Consumes the reader and returns the underlying [`BufReader<File>`],
+    /// positioned wherever iteration left it. Resume-after-error escape hatch:
+    /// a forensics tool that hits an [`Err`] item can take ownership of the
+    /// reader to seek past the damage and continue inspecting the file.
+    pub fn into_inner(self) -> BufReader<File> {
+        self.reader
+    }
+
+    /// Borrows the underlying [`BufReader<File>`] without consuming the reader.
+    /// Like [`into_inner`](SegmentReader::into_inner) but non-destructive — for
+    /// peeking at the current file position after an error.
+    pub fn get_ref(&self) -> &BufReader<File> {
+        &self.reader
+    }
+
+    /// How iteration ended, or `None` if it has not yet ended.
+    ///
+    /// - `None` — iteration is still in progress (no terminal branch reached).
+    /// - `Some(true)` — a `payload_len == 0` end-of-records sentinel was
+    ///   consumed: a clean termination, the normal end of a sealed segment.
+    /// - `Some(false)` — a torn `payload_len` field hit EOF: an active segment
+    ///   that ended mid-write with no sentinel. Iteration still ended cleanly
+    ///   (with `None`, never `Err`), but the absence of the sentinel is the
+    ///   forensic signal that the file was never sealed.
+    ///
+    /// Note this distinguishes only the two clean terminal branches. A mid-stream
+    /// error (CRC mismatch, oversized length, truncation after a valid length)
+    /// surfaces as an `Err` *item* and leaves this `None`; the caller already
+    /// observes that failure directly.
+    pub fn terminated_cleanly(&self) -> Option<bool> {
+        self.terminated_cleanly
     }
 }
 
@@ -178,6 +243,7 @@ impl Iterator for SegmentReader {
                 // branch so the fused guarantee holds without relying on
                 // BufReader<File> happening to keep returning EOF.
                 self.done = true;
+                self.terminated_cleanly = Some(false);
                 return None;
             }
             Err(e) => {
@@ -189,6 +255,7 @@ impl Iterator for SegmentReader {
         let payload_len = u32::from_le_bytes(len_buf) as usize;
         if payload_len == 0 {
             self.done = true;
+            self.terminated_cleanly = Some(true);
             return None; // sentinel
         }
 
@@ -238,6 +305,247 @@ impl Iterator for SegmentReader {
 // Once the iterator yields `None` it therefore yields `None` forever, so the
 // fused guarantee is exact — make it explicit (and free) for callers.
 impl std::iter::FusedIterator for SegmentReader {}
+
+/// A sealed segment that passed [`verify_sealed_segment`]: its header parsed, its
+/// record framing walked to the sentinel, its footer present, and the footer's
+/// `file_crc32` matched a fresh CRC32 over every pre-sentinel byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentVerification {
+    /// The parsed segment header.
+    pub header: SegmentHeaderMeta,
+    /// The parsed segment footer (record count, data bytes, CRC, seal time).
+    pub footer: SegmentFooterMeta,
+}
+
+/// Why [`verify_sealed_segment`] rejected a file. Structured like the format
+/// module's parse errors (`Display` + [`std::error::Error`], with a
+/// [`From<io::Error>`](From) so the streaming reads can use `?`).
+#[derive(Debug)]
+pub enum SegmentVerifyError {
+    /// An underlying I/O error while reading the file.
+    Io(io::Error),
+    /// The fixed-size header failed to parse.
+    Header(SegmentHeaderParseError),
+    /// The file is too short to hold even a header.
+    TooShort,
+    /// A record's `payload_len` past [`MAX_PAYLOAD_HARD_CAP`], or a CRC mismatch,
+    /// or any other structural fault hit while walking record framing.
+    BadRecord(io::Error),
+    /// Reached EOF while walking records without ever seeing the end-of-records
+    /// sentinel — the file is not a cleanly sealed segment.
+    NoSentinel,
+    /// The sentinel was found but the trailing [`SEGMENT_FOOTER_LEN`]-byte footer
+    /// is absent or truncated.
+    MissingFooter,
+    /// The footer's `file_crc32` did not match a fresh CRC32 over all bytes
+    /// before the sentinel — the canonical accidental-corruption signal.
+    CrcMismatch { expected: u32, computed: u32 },
+}
+
+impl std::fmt::Display for SegmentVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error verifying segment: {e}"),
+            Self::Header(e) => write!(f, "segment header invalid: {e}"),
+            Self::TooShort => write!(f, "file too short to contain a segment header"),
+            Self::BadRecord(e) => write!(f, "corrupt record framing: {e}"),
+            Self::NoSentinel => write!(
+                f,
+                "reached EOF without an end-of-records sentinel: not a sealed segment"
+            ),
+            Self::MissingFooter => write!(
+                f,
+                "end-of-records sentinel found but the {SEGMENT_FOOTER_LEN}-byte footer is missing or truncated"
+            ),
+            Self::CrcMismatch { expected, computed } => write!(
+                f,
+                "whole-file CRC mismatch: footer recorded {expected:#010x}, computed {computed:#010x}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SegmentVerifyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) | Self::BadRecord(e) => Some(e),
+            Self::Header(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for SegmentVerifyError {
+    fn from(e: io::Error) -> Self {
+        SegmentVerifyError::Io(e)
+    }
+}
+
+/// Whole-file integrity check for a *sealed* segment — the forensics primitive.
+///
+/// Validates the header, walks the record framing (`len` / `crc` / payload) up to
+/// the end-of-records sentinel, reads the trailing footer, then recomputes a
+/// CRC32 over **every byte from offset 0 up to but not including the 4-byte
+/// sentinel** and compares it to the footer's `file_crc32`.
+///
+/// The walk is *streamed* with a [`crc32fast::Hasher`] and fixed-size reads — it
+/// never slurps the whole file, so it is safe on a full-size segment (up to
+/// [`format::SEGMENT_MAX_BYTES`], 256 MiB).
+///
+/// Returns the parsed header + footer on success, or a structured
+/// [`SegmentVerifyError`] describing the first fault found. An active/unsealed
+/// segment has no sentinel + footer, so it surfaces as
+/// [`SegmentVerifyError::NoSentinel`].
+pub fn verify_sealed_segment(
+    path: impl AsRef<Path>,
+) -> Result<SegmentVerification, SegmentVerifyError> {
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    let mut hasher = crc32fast::Hasher::new();
+
+    // --- Header: read, hash, parse. ---
+    let mut header_buf = [0u8; SEGMENT_HEADER_LEN];
+    match reader.read_exact(&mut header_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(SegmentVerifyError::TooShort);
+        }
+        Err(e) => return Err(SegmentVerifyError::Io(e)),
+    }
+    hasher.update(&header_buf);
+    let header = parse_segment_header(&header_buf).map_err(SegmentVerifyError::Header)?;
+
+    // --- Records: walk framing to the sentinel, hashing every pre-sentinel byte. ---
+    loop {
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // EOF where a length (or sentinel) was expected: never sealed.
+                return Err(SegmentVerifyError::NoSentinel);
+            }
+            Err(e) => return Err(SegmentVerifyError::Io(e)),
+        }
+
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        if payload_len == 0 {
+            // Sentinel reached. Do NOT hash these 4 bytes — the footer CRC
+            // covers only the pre-sentinel bytes. Break to read the footer.
+            break;
+        }
+        // A real record header → hash the length field.
+        hasher.update(&len_buf);
+
+        if payload_len > MAX_PAYLOAD_HARD_CAP {
+            return Err(SegmentVerifyError::BadRecord(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "record payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"
+                ),
+            )));
+        }
+
+        let mut crc_buf = [0u8; 4];
+        reader.read_exact(&mut crc_buf).map_err(|e| {
+            SegmentVerifyError::BadRecord(truncate_context(e, payload_len, "CRC field"))
+        })?;
+        hasher.update(&crc_buf);
+        let expected_crc = u32::from_le_bytes(crc_buf);
+
+        // Stream the payload through the file hasher *and* a per-record hasher in
+        // bounded chunks, so a 256 MiB record never lands in one allocation.
+        let mut record_hasher = crc32fast::Hasher::new();
+        let mut remaining = payload_len;
+        let mut chunk = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            reader.read_exact(&mut chunk[..want]).map_err(|e| {
+                SegmentVerifyError::BadRecord(truncate_context(e, payload_len, "payload bytes"))
+            })?;
+            hasher.update(&chunk[..want]);
+            record_hasher.update(&chunk[..want]);
+            remaining -= want;
+        }
+        let computed_crc = record_hasher.finalize();
+        if expected_crc != computed_crc {
+            return Err(SegmentVerifyError::BadRecord(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "record CRC mismatch: expected {expected_crc:#010x}, computed {computed_crc:#010x}"
+                ),
+            )));
+        }
+    }
+
+    // --- Footer: read the trailing fixed-size block. ---
+    let mut footer_buf = [0u8; SEGMENT_FOOTER_LEN];
+    match reader.read_exact(&mut footer_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(SegmentVerifyError::MissingFooter);
+        }
+        Err(e) => return Err(SegmentVerifyError::Io(e)),
+    }
+    // parse_segment_footer's only failure is a wrong length, which a fixed-size
+    // [u8; SEGMENT_FOOTER_LEN] cannot trigger — but map it rather than unwrap.
+    let footer =
+        parse_segment_footer(&footer_buf).map_err(|_| SegmentVerifyError::MissingFooter)?;
+
+    let computed = hasher.finalize();
+    if footer.file_crc32 != computed {
+        return Err(SegmentVerifyError::CrcMismatch {
+            expected: footer.file_crc32,
+            computed,
+        });
+    }
+
+    Ok(SegmentVerification { header, footer })
+}
+
+/// The on-disk lifecycle state of a segment file, inferred from its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentState {
+    /// `.wab` — an active, unsealed segment still being written.
+    Active,
+    /// `.wab.sealed` — a sealed segment awaiting drain.
+    Sealed,
+    /// `.wab.confirmed` — the drain-confirmation sidecar for a sealed segment.
+    Confirmed,
+}
+
+/// Lists segment-related files in `dir`, each tagged with its [`SegmentState`].
+///
+/// Classifies by extension ([`EXT_CONFIRMED`](format::EXT_CONFIRMED),
+/// [`EXT_SEALED`](format::EXT_SEALED), [`EXT_ACTIVE`](format::EXT_ACTIVE)),
+/// checked most-specific-first so `.wab.sealed` / `.wab.confirmed` are not
+/// mis-classified as `.wab`. Files matching none of the three are ignored. The
+/// result is sorted deterministically by path.
+pub fn list_segment_files(dir: &Path) -> io::Result<Vec<(PathBuf, SegmentState)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Most-specific suffix first: `.wab.confirmed` and `.wab.sealed` both end
+        // in something containing `.wab`, so the order of these checks matters.
+        let state = if name.ends_with(EXT_CONFIRMED) {
+            SegmentState::Confirmed
+        } else if name.ends_with(EXT_SEALED) {
+            SegmentState::Sealed
+        } else if name.ends_with(EXT_ACTIVE) {
+            SegmentState::Active
+        } else {
+            continue;
+        };
+        out.push((path, state));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -452,5 +760,241 @@ mod tests {
         let err = reader.next().unwrap().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- Forensics read surface (sweep #6) ----
+
+    use format::build_segment_footer;
+
+    /// Builds a fully sealed segment to a `Vec<u8>`: header, records, sentinel,
+    /// and a footer carrying a correct whole-file CRC over the pre-sentinel
+    /// bytes. The single source of truth for the verify tests; returns the exact
+    /// byte boundaries the tests need to corrupt or truncate.
+    struct SealedBytes {
+        bytes: Vec<u8>,
+        /// Offset of the sentinel (== length of all pre-sentinel bytes).
+        sentinel_off: usize,
+        /// Offset of the first payload byte of the first record (for flipping).
+        first_payload_off: usize,
+    }
+
+    fn build_sealed_segment(shard: u16, records: &[&[u8]]) -> SealedBytes {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&build_segment_header(shard));
+        let mut data_bytes = 0u64;
+        let mut first_payload_off = 0usize;
+        for (i, r) in records.iter().enumerate() {
+            bytes.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
+            if i == 0 {
+                first_payload_off = bytes.len();
+            }
+            bytes.extend_from_slice(r);
+            data_bytes += r.len() as u64;
+        }
+        let sentinel_off = bytes.len();
+        let file_crc = crc32fast::hash(&bytes); // CRC over all pre-sentinel bytes
+        bytes.extend_from_slice(&SENTINEL);
+        bytes.extend_from_slice(&build_segment_footer(
+            records.len() as u64,
+            data_bytes,
+            file_crc,
+            1_700_000_000_000_000_000i64,
+        ));
+        SealedBytes {
+            bytes,
+            sentinel_off,
+            first_payload_off,
+        }
+    }
+
+    fn write_bytes(label: &str, bytes: &[u8]) -> PathBuf {
+        let path = tmp_path(label);
+        let mut f = File::create(&path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+        path
+    }
+
+    #[test]
+    fn open_parses_and_exposes_header() {
+        let path = tmp_path("hdr_smoke");
+        write_segment(&path, &[b"x"]);
+        let reader = SegmentReader::open(&path).unwrap();
+        let h = reader.header();
+        assert_eq!(h.shard_id, 0xFFFF); // write_segment uses 0xFFFF
+        assert_eq!(h.format_version, format::FORMAT_VERSION);
+        assert!(h.created_at > 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn into_inner_returns_underlying_reader() {
+        let path = tmp_path("into_inner");
+        write_segment(&path, &[b"only"]);
+        let mut reader = SegmentReader::open(&path).unwrap();
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            Payload::from_static(b"only")
+        );
+        // get_ref borrows non-destructively; into_inner takes ownership.
+        let _ = reader.get_ref();
+        let inner = reader.into_inner();
+        // The escape hatch yields a usable BufReader<File>.
+        let _: BufReader<File> = inner;
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn terminated_cleanly_true_on_sealed_segment() {
+        let path = tmp_path("term_clean");
+        write_segment(&path, &[b"a", b"b"]); // ends in a sentinel
+        let mut reader = SegmentReader::open(&path).unwrap();
+        assert_eq!(reader.terminated_cleanly(), None); // not yet ended
+        while reader.next().is_some() {}
+        assert_eq!(reader.terminated_cleanly(), Some(true));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn terminated_cleanly_false_on_torn_active_tail() {
+        // Active segment that ends right after a complete record, no sentinel.
+        let path = tmp_path("term_torn");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&build_segment_header(0)).unwrap();
+        let r = b"rec";
+        f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
+        f.write_all(r).unwrap();
+        f.sync_all().unwrap();
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        while reader.next().is_some() {}
+        assert_eq!(reader.terminated_cleanly(), Some(false));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_ok_with_correct_metas() {
+        let sealed = build_sealed_segment(7, &[b"alpha", b"beta", b"gamma"]);
+        let path = write_bytes("verify_ok", &sealed.bytes);
+        let v = verify_sealed_segment(&path).unwrap();
+        assert_eq!(v.header.shard_id, 7);
+        assert_eq!(v.footer.record_count, 3);
+        assert_eq!(v.footer.data_bytes, (5 + 4 + 5) as u64);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_empty_is_ok() {
+        let sealed = build_sealed_segment(0, &[]);
+        let path = write_bytes("verify_empty", &sealed.bytes);
+        let v = verify_sealed_segment(&path).unwrap();
+        assert_eq!(v.footer.record_count, 0);
+        assert_eq!(v.footer.data_bytes, 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_detects_flipped_payload_byte() {
+        let mut sealed = build_sealed_segment(1, &[b"corruptme"]);
+        // Flip a payload byte: the record CRC catches it first (BadRecord), and
+        // even were that to pass, the whole-file CRC would not match.
+        sealed.bytes[sealed.first_payload_off] ^= 0xff;
+        let path = write_bytes("verify_flip", &sealed.bytes);
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::BadRecord(_)) => {}
+            other => panic!("expected BadRecord on flipped payload, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_detects_file_crc_mismatch() {
+        // Corrupt the footer's file_crc32 directly: framing + record CRCs all
+        // pass, only the whole-file CRC check fails. file_crc32 is at footer
+        // bytes [16..20]; the footer starts at sentinel_off + 4.
+        let mut sealed = build_sealed_segment(2, &[b"hello", b"world"]);
+        let footer_off = sealed.sentinel_off + SENTINEL.len();
+        sealed.bytes[footer_off + 16] ^= 0xff;
+        let path = write_bytes("verify_crc", &sealed.bytes);
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::CrcMismatch { .. }) => {}
+            other => panic!("expected CrcMismatch, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_truncated_before_footer_errors() {
+        // Keep the sentinel but drop the footer entirely.
+        let sealed = build_sealed_segment(3, &[b"data"]);
+        let truncated = &sealed.bytes[..sealed.sentinel_off + SENTINEL.len()];
+        let path = write_bytes("verify_nofoot", truncated);
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::MissingFooter) => {}
+            other => panic!("expected MissingFooter, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_no_sentinel_is_rejected() {
+        // Active segment (header + a record, no sentinel/footer): NoSentinel.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&build_segment_header(0));
+        let r = b"rec";
+        bytes.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
+        bytes.extend_from_slice(r);
+        let path = write_bytes("verify_nosent", &bytes);
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::NoSentinel) => {}
+            other => panic!("expected NoSentinel, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_too_short_for_header() {
+        let path = write_bytes("verify_short", b"WEI");
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::TooShort) => {}
+            other => panic!("expected TooShort, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn list_segment_files_classifies_and_sorts() {
+        let dir = std::env::temp_dir().join(format!("weir_wab_list_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create one of each + an unrelated file that must be ignored.
+        for name in [
+            "seg_00000002.wab",
+            "seg_00000000.wab.sealed",
+            "seg_00000001.wab.confirmed",
+            "notes.txt",
+        ] {
+            File::create(dir.join(name)).unwrap();
+        }
+        let listed = list_segment_files(&dir).unwrap();
+        // notes.txt ignored; the other three present, sorted by path.
+        let names: Vec<(String, SegmentState)> = listed
+            .iter()
+            .map(|(p, s)| (p.file_name().unwrap().to_string_lossy().into_owned(), *s))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("seg_00000000.wab.sealed".to_string(), SegmentState::Sealed),
+                (
+                    "seg_00000001.wab.confirmed".to_string(),
+                    SegmentState::Confirmed
+                ),
+                ("seg_00000002.wab".to_string(), SegmentState::Active),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

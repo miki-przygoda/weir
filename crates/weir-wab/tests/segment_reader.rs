@@ -156,3 +156,97 @@ fn segment_reader_is_a_fused_iterator() {
     assert!(reader.next().is_none(), "stays None (2)");
     std::fs::remove_file(&path).ok();
 }
+
+// ---- Forensics read surface (sweep #6), exercised across the crate boundary ----
+
+use weir_wab::format::build_segment_footer;
+use weir_wab::{SegmentState, SegmentVerifyError, list_segment_files, verify_sealed_segment};
+
+/// Writes a fully sealed segment (header + records + sentinel + footer with a
+/// correct whole-file CRC). Returns `(path, sentinel_offset, first_payload_off)`.
+fn write_sealed_segment(label: &str, shard: u16, records: &[&[u8]]) -> (PathBuf, usize, usize) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&build_segment_header(shard));
+    let mut data_bytes = 0u64;
+    let mut first_payload_off = 0usize;
+    for (i, r) in records.iter().enumerate() {
+        bytes.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
+        if i == 0 {
+            first_payload_off = bytes.len();
+        }
+        bytes.extend_from_slice(r);
+        data_bytes += r.len() as u64;
+    }
+    let sentinel_off = bytes.len();
+    let file_crc = crc32fast::hash(&bytes);
+    bytes.extend_from_slice(&SENTINEL);
+    bytes.extend_from_slice(&build_segment_footer(
+        records.len() as u64,
+        data_bytes,
+        file_crc,
+        1,
+    ));
+
+    let path = tmp_path(label);
+    let mut f = File::create(&path).unwrap();
+    f.write_all(&bytes).unwrap();
+    f.sync_all().unwrap();
+    (path, sentinel_off, first_payload_off)
+}
+
+#[test]
+fn verify_sealed_segment_round_trips_metas() {
+    let (path, _, _) = write_sealed_segment("verify_ok", 9, &[b"one", b"two"]);
+    let v = verify_sealed_segment(&path).unwrap();
+    assert_eq!(v.header.shard_id, 9);
+    assert_eq!(v.footer.record_count, 2);
+    assert_eq!(v.footer.data_bytes, (3 + 3) as u64);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn verify_sealed_segment_flipped_payload_is_rejected() {
+    let (path, _, first_payload_off) = write_sealed_segment("verify_flip", 1, &[b"payload"]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[first_payload_off] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+    match verify_sealed_segment(&path) {
+        Err(SegmentVerifyError::BadRecord(_)) => {}
+        other => panic!("expected BadRecord, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn verify_sealed_segment_truncated_before_footer_errors() {
+    let (path, sentinel_off, _) = write_sealed_segment("verify_trunc", 0, &[b"data"]);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..sentinel_off + SENTINEL.len()]).unwrap();
+    match verify_sealed_segment(&path) {
+        Err(SegmentVerifyError::MissingFooter) => {}
+        other => panic!("expected MissingFooter, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn list_segment_files_classifies_by_extension() {
+    let dir = std::env::temp_dir().join(format!("weir_wab_it_list_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in [
+        "seg_00000005.wab",
+        "seg_00000003.wab.sealed",
+        "seg_00000004.wab.confirmed",
+        "README.md",
+    ] {
+        File::create(dir.join(name)).unwrap();
+    }
+    let listed = list_segment_files(&dir).unwrap();
+    assert_eq!(listed.len(), 3, "README.md must be ignored");
+    // Sorted by path: ...003.sealed < ...004.confirmed < ...005.wab.
+    assert_eq!(listed[0].1, SegmentState::Sealed);
+    assert_eq!(listed[1].1, SegmentState::Confirmed);
+    assert_eq!(listed[2].1, SegmentState::Active);
+    std::fs::remove_dir_all(&dir).ok();
+}
