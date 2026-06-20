@@ -114,10 +114,45 @@ fn truncated_mid_record_is_an_error_not_a_silent_short_read() {
 
 #[test]
 fn truncated_header_is_rejected_at_open() {
-    // A file shorter than the fixed header can't be opened as a segment.
+    // A file shorter than the fixed header can't be opened as a segment. The
+    // bare read_exact EOF is wrapped into an InvalidData error with context.
     let path = tmp_path("shorthdr");
     File::create(&path).unwrap().write_all(b"WEI").unwrap();
     let err = SegmentReader::open(&path).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let msg = err.to_string();
+    assert!(msg.contains("too short"), "expected 'too short' in: {msg}");
+    assert!(msg.contains("header"), "expected 'header' in: {msg}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn empty_file_is_rejected_at_open_with_context() {
+    // A 0-byte file likewise can't carry a header.
+    let path = tmp_path("emptyhdr");
+    File::create(&path).unwrap();
+    let err = SegmentReader::open(&path).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let msg = err.to_string();
+    assert!(msg.contains("too short"), "expected 'too short' in: {msg}");
+    assert!(msg.contains("header"), "expected 'header' in: {msg}");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn segment_reader_is_a_fused_iterator() {
+    // Generic bound: this only compiles if SegmentReader: FusedIterator.
+    fn assert_fused<I: std::iter::FusedIterator>(_it: &I) {}
+
+    let path = tmp_path("fused");
+    write_segment(&path, &[b"only"], b"");
+    let mut reader = SegmentReader::open(&path).unwrap();
+    assert_fused(&reader);
+
+    // Drain, then confirm it stays None across repeated calls past the end.
+    assert_eq!(reader.next().unwrap().unwrap().as_ref(), b"only");
+    assert!(reader.next().is_none(), "sentinel ends iteration");
+    assert!(reader.next().is_none(), "stays None (1)");
+    assert!(reader.next().is_none(), "stays None (2)");
     std::fs::remove_file(&path).ok();
 }

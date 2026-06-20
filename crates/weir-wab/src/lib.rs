@@ -74,11 +74,26 @@ impl SegmentReader {
     /// before any records are read. Fails with [`io::ErrorKind::InvalidData`]
     /// for a bad magic or an unknown format version.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
         let mut header = [0u8; SEGMENT_HEADER_LEN];
-        reader.read_exact(&mut header)?;
+        if let Err(e) = reader.read_exact(&mut header) {
+            // A file shorter than the fixed header can't carry one. Give the
+            // bare "failed to fill whole buffer" a human-readable context (like
+            // bad-magic/bad-version do); other read errors propagate as-is.
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "segment file too short: need a {SEGMENT_HEADER_LEN}-byte header, file is truncated/empty: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            return Err(e);
+        }
 
         if header[0..4] != SEGMENT_MAGIC {
             let found = &header[0..4];
@@ -119,7 +134,14 @@ impl Iterator for SegmentReader {
         let mut len_buf = [0u8; 4];
         match self.reader.read_exact(&mut len_buf) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Torn trailing write at EOF (or a clean end with no sentinel):
+                // ends iteration cleanly. Set `done` like every other terminal
+                // branch so the fused guarantee holds without relying on
+                // BufReader<File> happening to keep returning EOF.
+                self.done = true;
+                return None;
+            }
             Err(e) => {
                 self.done = true;
                 return Some(Err(e));
@@ -171,6 +193,13 @@ impl Iterator for SegmentReader {
         Some(Ok(Payload::from(payload_buf)))
     }
 }
+
+// Every terminal branch of `next` sets `self.done = true` before returning
+// (the EOF-on-`payload_len`, sentinel, oversized-len, CRC-mismatch, short-read,
+// and other-read-error branches), and `done` short-circuits to `None` on entry.
+// Once the iterator yields `None` it therefore yields `None` forever, so the
+// fused guarantee is exact — make it explicit (and free) for callers.
+impl std::iter::FusedIterator for SegmentReader {}
 
 #[cfg(test)]
 mod tests {
@@ -300,6 +329,72 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // Iteration ends after the error.
         assert!(reader.next().is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn iterating_past_end_stays_none_and_is_fused() {
+        // FusedIterator is a compile-time bound here; the runtime check is that
+        // repeated next() after exhaustion keeps returning None.
+        fn assert_fused<I: std::iter::FusedIterator>(_it: &I) {}
+
+        let path = tmp_path("fused_unit");
+        write_segment(&path, &[b"x", b"y"]);
+        let mut reader = SegmentReader::open(&path).unwrap();
+        assert_fused(&reader);
+        assert_eq!(reader.next().unwrap().unwrap(), Payload::from_static(b"x"));
+        assert_eq!(reader.next().unwrap().unwrap(), Payload::from_static(b"y"));
+        assert!(reader.next().is_none()); // sentinel
+        assert!(reader.next().is_none());
+        assert!(reader.next().is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn torn_len_at_eof_ends_cleanly_and_sets_done() {
+        // An *active* (un-sealed) segment that ends right after a complete
+        // record — no sentinel — hits UnexpectedEof on the next payload_len
+        // read. That must end cleanly (None, never Err) and stay fused.
+        let path = tmp_path("torn_len");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&build_segment_header(0)).unwrap();
+        let r = b"rec";
+        f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
+        f.write_all(r).unwrap(); // ends here: no sentinel, no next len
+        f.sync_all().unwrap();
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            Payload::from_static(b"rec")
+        );
+        assert!(reader.next().is_none(), "torn len at EOF ends cleanly");
+        assert!(reader.next().is_none(), "stays None after end");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_on_short_file_reports_too_short() {
+        let path = tmp_path("short");
+        File::create(&path).unwrap().write_all(b"WEI").unwrap(); // 3 bytes
+        let err = SegmentReader::open(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("too short"), "expected 'too short' in: {msg}");
+        assert!(msg.contains("header"), "expected 'header' in: {msg}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn open_on_empty_file_reports_too_short() {
+        let path = tmp_path("zero");
+        File::create(&path).unwrap(); // 0 bytes
+        let err = SegmentReader::open(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("too short"), "expected 'too short' in: {msg}");
+        assert!(msg.contains("header"), "expected 'header' in: {msg}");
         std::fs::remove_file(&path).ok();
     }
 
