@@ -79,6 +79,29 @@ pub use weir_core::Payload;
 ///
 /// The simplest implementation is `type Record = Payload` (opaque bytes). Richer
 /// sinks can define a concrete record type that deserialises the payload.
+///
+/// # Footgun
+///
+/// The two dead-letter paths recover bytes differently, and a custom record type
+/// can make them disagree:
+///
+/// - **Per-record** (a successful `commit` that returns records in
+///   [`CommitResult::dead_lettered`]): the drain calls [`into_payload`] on each
+///   rejected record to recover the bytes it writes to the dead-letter store.
+/// - **Whole-batch `Err`** (`commit` returns a permanent error): the typed
+///   records were moved into `commit` and are gone, so the drain dead-letters the
+///   **original** raw segment payload bytes — the same bytes it passed to
+///   [`from_payload`] — and never calls [`into_payload`] at all.
+///
+/// **Rule:** if `into_payload(from_payload(x))` is not byte-identical to `x`,
+/// your dead-letter bytes differ between the per-record path (uses
+/// [`into_payload`]) and the whole-batch-`Err` path (uses the original payload) —
+/// make the round-trip byte-preserving, or carry the raw payload inside your
+/// record. For the identity [`Payload`] record the round-trip is exact, so the
+/// two paths always agree.
+///
+/// [`into_payload`]: SinkRecord::into_payload
+/// [`from_payload`]: SinkRecord::from_payload
 pub trait SinkRecord: Send + 'static {
     /// Build the record from the raw payload bytes handed over by the drain.
     fn from_payload(payload: Payload) -> Self;
@@ -86,15 +109,12 @@ pub trait SinkRecord: Send + 'static {
     /// Recover the raw payload bytes for a record the sink returned in
     /// [`CommitResult::dead_lettered`].
     ///
-    /// This is the **per-record** dead-letter path: when a `commit` call succeeds
-    /// but reports some records as permanently rejected, the drain calls
+    /// Called on the **per-record** dead-letter path only: when a `commit` call
+    /// succeeds but reports some records as permanently rejected, the drain calls
     /// `into_payload` on each to recover the bytes it writes to the dead-letter
-    /// store. It is **not** used when `commit` returns `Err`: a whole-batch
-    /// permanent error dead-letters the original segment's raw payload bytes
-    /// directly (the typed records were moved into `commit` and are gone on the
-    /// error path). For the identity [`Payload`] record the two are the same
-    /// bytes; a custom record type only sees `into_payload` on the per-record
-    /// path, so it must not rely on it being called for whole-batch errors.
+    /// store. It is **not** called when `commit` returns `Err` — see the
+    /// [`SinkRecord`] type-level `# Footgun` for the whole-batch-`Err` divergence
+    /// and the byte-preserving round-trip rule.
     fn into_payload(self) -> Payload;
 }
 
@@ -185,12 +205,21 @@ impl SinkError for BasicSinkError {
 /// constructor variant) without a breaking change — construct it through `new`
 /// rather than a struct literal.
 ///
-/// Every record handed to [`Sink::commit`] must appear in exactly one of
-/// `committed` or `dead_lettered`. This partition invariant is enforced by the
-/// drain at runtime (it refuses to confirm a segment whose
-/// `committed.len() + dead_lettered.len()` does not cover the batch) rather than
-/// by this type, because the record type `R` carries no identity the constructor
-/// could check.
+/// Conceptually, every record handed to [`Sink::commit`] should appear in
+/// exactly one of `committed` or `dead_lettered`. **Nothing enforces that set
+/// partition.** This type does not (the record type `R` carries no identity the
+/// constructor could check), and the drain only validates total **count**
+/// coverage: it refuses to confirm a segment unless
+/// `committed.len() + dead_lettered.len()` equals the batch length. That count
+/// check catches a sink that simply drops a record, but it does **not** catch a
+/// sink that emits the same record in *both* vectors while dropping a different
+/// one — the counts still add up, so the segment is confirmed and the dropped
+/// record is silently false-acked (never delivered, never dead-lettered).
+///
+/// **Author warning:** do not emit a record in both partitions, and do not drop
+/// or duplicate records — a count-correct but identity-incorrect partition can
+/// still cause a lost record. Built-in sinks always partition cleanly; the
+/// burden is on custom sinks.
 ///
 /// # Reading a `CommitResult`
 ///
@@ -292,8 +321,9 @@ impl<R> CommitResult<R> {
     /// Builds a commit result from the accepted and permanently-rejected records.
     ///
     /// Every record passed to [`Sink::commit`] should appear in exactly one of the
-    /// two lists; see the type-level note for how the partition invariant is
-    /// enforced.
+    /// two lists. Neither this constructor nor the drain enforces that partition
+    /// by identity (only total count coverage is checked) — see the type-level
+    /// note for the failure mode and the author warning.
     #[must_use]
     pub fn new(committed: Vec<R>, dead_lettered: Vec<(R, String)>) -> Self {
         Self {
