@@ -93,7 +93,9 @@ API rather than matching the `#[non_exhaustive]` error enum:
   client and reconnect**.
 
 Recoverable (connection untouched, keep using it): the *local* pre-send
-`ClientError::PayloadTooLarge` rejection, `ClientError::NoDefaultDurability`, and
+`ClientError::PayloadTooLarge` rejection, the *local* pre-send
+`ClientError::EmptyPayload` rejection (a zero-length payload rejected before any
+bytes are sent), `ClientError::NoDefaultDurability`, and
 `ClientError::Nack(NackReason::InternalError)` (the one transient Nack the daemon
 keeps the connection open for). Everything else is non-recoverable and the daemon
 has closed (or the socket is dead): all *other* server Nacks, plus
@@ -427,6 +429,17 @@ daemon wrote. The [WAB on-disk format](../wab_format.md) documents the byte
 layout. (`weir-ctl dl requeue` is built on exactly this — it reads dead-letter
 segments with `weir-wab` and re-submits them through the daemon's socket.)
 
+Beyond streaming records, `weir-wab` exposes a small read/inspect surface for
+forensics and recovery tools: `verify_sealed_segment` walks a sealed segment
+end-to-end and returns a `SegmentVerification` (header + footer) or a structured
+`SegmentVerifyError` on the first fault; `list_segment_files` enumerates a
+directory's segment files each tagged with its `SegmentState` (`Active` /
+`Sealed` / `Confirmed`); and `SegmentReader` carries accessors —
+`header()` for the parsed header, `terminated_cleanly()` to tell a clean
+end-of-records sentinel from an unsealed active tail, and `into_inner()` /
+`get_ref()` to take or borrow the underlying `BufReader<File>` (e.g. to seek past
+damage and resume after an `Err` item).
+
 ## Operate a running daemon
 
 `weir-ctl` is a thin admin tool over the socket + the WAB reader; it does **not**
@@ -434,6 +447,12 @@ depend on `weir-server`, so installing it doesn't drag in the daemon's
 dependencies. It covers `health`, `push`, `metrics`, `segments` (per-shard WAB
 inspect), and `dl` (dead-letter `list` / `drop` / `requeue`). See
 [Monitoring](../monitoring.md) and the `dl requeue` notes there.
+
+Pass the global `--json` flag for machine-readable output: the read/inspect
+commands (`health`, `metrics`, `segments`, `dl list`) emit a structured JSON
+object instead of the human table, and the mutating commands (`push`, `dl drop`,
+`dl requeue`) emit a small JSON result object — handy for scripting or piping
+into `jq`. The human output stays the default.
 
 ---
 

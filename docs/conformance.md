@@ -101,7 +101,9 @@ bytes after a complete frame).
 Both CRC fields are **IEEE / ISO-3309 CRC-32** — the zlib/PNG/Ethernet variant,
 *not* CRC-32C (Castagnoli). The vectors are generated with Python's
 `zlib.crc32` and verified against the Rust `crc32fast` crate, so a passing
-vector means two independent CRC implementations agree on the bytes. See
+vector means two independent CRC implementations agree on the bytes. The same
+variant is exposed by Go's `hash/crc32.IEEETable`, Java's `java.util.zip.CRC32`,
+and Node's `node:zlib.crc32` (Node >= 22.2). See
 [`wire_protocol.md`](wire_protocol.md#crc32-algorithm) for the full parameter
 table.
 

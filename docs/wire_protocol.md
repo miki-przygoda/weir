@@ -45,11 +45,21 @@ Total frame size: `16 + payload_len + 4` bytes.
 
 ## Durability tiers
 
-| Byte | Name      | Guarantee                                              |
-|------|-----------|--------------------------------------------------------|
-| 0x01 | Sync      | fdatasync before Ack — record on stable storage        |
-| 0x02 | Batched   | Group fdatasync at batch boundary before Ack           |
-| 0x03 | Buffered  | Ack after memory write; fsync is deferred              |
+| Byte | Name      | Guarantee                                                       |
+|------|-----------|-----------------------------------------------------------------|
+| 0x01 | Sync      | Group fdatasync at the batch boundary before Ack — on stable storage |
+| 0x02 | Batched   | Group fdatasync at the batch boundary before Ack — on stable storage |
+| 0x03 | Buffered  | Ack after memory write; fsync is deferred                       |
+
+> **Sync and Batched share the same durability guarantee.** Both fdatasync at the
+> batch boundary before acking every record in the batch — one group fsync at the
+> end of the batch covers every record written during it, so there is no
+> durability or speed distinction between the two tiers. The historical
+> "Sync = one fdatasync per record, Batched = one fdatasync per batch" distinction
+> **no longer applies** (a single-producer serial workload sees no difference
+> because the batch holds one record anyway; under concurrent producers, Sync
+> amortises into the group fsync just like Batched). See
+> [architecture.md → durability tiers](architecture.md).
 
 ---
 
@@ -160,7 +170,8 @@ algorithm as zlib, PNG, and Ethernet. Concretely:
 
 This is the algorithm exposed by the Rust [`crc32fast`](https://crates.io/crates/crc32fast)
 crate (`crc32fast::hash(bytes) -> u32`), Python's `zlib.crc32`,
-Go's `hash/crc32.IEEETable`, and Java's `java.util.zip.CRC32`. It is
+Go's `hash/crc32.IEEETable`, Java's `java.util.zip.CRC32`, and Node's
+`node:zlib.crc32` (Node >= 22.2). It is
 **not** CRC-32C (Castagnoli, polynomial `0x1EDC6F41`) — using
 CRC-32C will produce frames the daemon rejects with
 `BadHeaderCrc` or `BadPayloadCrc`.
@@ -192,6 +203,15 @@ in-flight Pushes (those without a matching Ack/Nack received yet) as
 **unknown outcomes** — they may or may not have been durably written
 depending on where in the pipeline the close happened. Retry on a
 fresh connection.
+
+**Cap the response `payload_len` at ≤ 2 bytes before allocating.** Every weir
+response payload is **≤ 2 bytes** (`Ack`/`HealthCheckResponse` = 0; `Nack` = 1,
+except `VersionMismatch` = 2). When reading a *response* header, reject (and close
+the connection) any declared `payload_len` larger than that *before* allocating a
+buffer — a larger length on a response is a desync or a non-weir peer, and the
+daemon never sends a large response, so honouring an attacker-chosen length would
+allocate an arbitrary buffer. This is the read-side mirror of the send-path cap
+and is also enumerated in the [producer checklist](#minimum-producer-checklist).
 
 ### When the server keeps the connection open
 
@@ -228,6 +248,11 @@ bytes on the same connection.
   uid can connect. Producers must run as the same uid (or root).
 - The parent directory must exist before the daemon starts; the
   daemon does not create it.
+- **`sun_path` length cap (non-Rust producers).** A `sockaddr_un.sun_path` is a
+  fixed-size buffer — roughly **104 bytes on macOS/BSD and 108 bytes on Linux,
+  including the NUL terminator**. A socket path at or over that length fails with
+  `ENAMETOOLONG` at `connect()` (or `bind()` on the daemon side). Keep the socket
+  path comfortably short, or `chdir` near it and connect via a relative path.
 - There is no in-band handshake. Producers connect and immediately
   send a Push (or HealthCheck) frame.
 

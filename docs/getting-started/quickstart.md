@@ -186,14 +186,19 @@ You'll see weir's Prometheus metric families (the full catalogue is in
 [monitoring.md](../monitoring.md)):
 
 ```
-# HELP weir_records_accepted_total Total records accepted from producers, by durability tier
-# TYPE weir_records_accepted_total counter
+# HELP weir_records_accepted Total records accepted from producers, by durability tier
+# TYPE weir_records_accepted counter
 weir_records_accepted_total{tier="sync"} 1
-# HELP weir_records_ack_total Total records acknowledged to producers, by durability tier
-# TYPE weir_records_ack_total counter
+# HELP weir_records_ack Total records acknowledged to producers, by durability tier
+# TYPE weir_records_ack counter
 weir_records_ack_total{tier="sync"} 1
 ...
 ```
+
+The exporter (`prometheus-client`) appends the `_total` suffix only to the
+counter **data** rows — the `# HELP`/`# TYPE` rows carry the base name. A labeled
+counter series is also absent until the first matching event initialises it, so a
+family with no traffic yet shows only its `# HELP`/`# TYPE` lines and no data row.
 
 The full metrics catalogue — every family, its labels, and the alerts
 that matter — lives in [monitoring.md](../monitoring.md).
