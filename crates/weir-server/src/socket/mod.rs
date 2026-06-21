@@ -144,6 +144,12 @@ pub async fn run(
                 let accept_start = Instant::now();
                 match res {
                     Ok((stream, _addr)) => {
+                        // Reap handlers that have already finished so the JoinSet
+                        // doesn't grow one node per lifetime connection — it is
+                        // otherwise only drained at shutdown, an unbounded leak
+                        // under the documented many-short-connections model.
+                        // Non-blocking: returns None once nothing is ready (F1).
+                        while join_set.try_join_next().is_some() {}
                         // Peer-credential check: refuse mismatched uids before
                         // any further work. See peer.rs for the platform impls.
                         if config.peer_uid_check {
