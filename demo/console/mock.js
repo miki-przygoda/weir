@@ -5,7 +5,7 @@
   // ── Explorer: WAB inventory (incl. one CrcMismatch segment) ──
   const SEGMENTS = {
     wab_dir: "/var/lib/weir/wab  (demo · sample data)",
-    totals: { segments: 4, sealed: 3, active: 1, confirmed: 1, dead_letter: 6, total_bytes: 14080 },
+    totals: { segments: 6, sealed: 5, active: 1, confirmed: 2, dead_letter: 6, total_bytes: 26240 },
     segments: [
       {
         shard: "00", file: "shard_00/seg_00000001.wab.sealed", state: "sealed", size_bytes: 4096,
@@ -29,6 +29,19 @@
       {
         shard: "00", file: "shard_00/seg_00000003.wab", state: "active", size_bytes: 512,
         header: { format_version: 1, shard_id: 0, created_at: 1782000005000000000 },
+      },
+      {
+        shard: "01", file: "shard_01/seg_00000005.wab.sealed", state: "sealed", size_bytes: 6144,
+        header: { format_version: 1, shard_id: 1, created_at: 1782000006500000000 },
+        footer: { record_count: 3, data_bytes: 60, file_crc32: "0x77c1e0a2", sealed_at: 1782000007000000000 },
+        integrity: { ok: true },
+      },
+      {
+        shard: "01", file: "shard_01/seg_00000006.wab.sealed", state: "sealed", size_bytes: 6144,
+        header: { format_version: 1, shard_id: 1, created_at: 1782000008000000000 },
+        footer: { record_count: 3, data_bytes: 60, file_crc32: "0x3fa9b1c4", sealed_at: 1782000009000000000 },
+        integrity: { ok: true },
+        confirmed: { sealed_at: 1782000009000000000, record_count: 3, drained_at: 1782000010000000000 },
       },
     ],
   };
@@ -109,18 +122,18 @@
   const dlBytes = () => dlStore.reduce((a, s) => a + s.bytes, 0);
   const dlRecords = () => dlStore.reduce((a, s) => a + s.records, 0);
 
-  // ── Live: counters that increment so the animation/sparklines have motion ──
-  let accepted = 12840, ack = 12835;
-  const nack = 7;
+  // ── Live: counters climb like a busy producer so the pipeline + sparklines move ──
+  let accepted = 1_284_000, ack = 1_283_950;
+  const nack = 12;
   function opsStatus() {
-    accepted += 9 + Math.floor(Math.random() * 24); // strictly increasing
-    ack = accepted - Math.floor(Math.random() * 4);
+    accepted += 1800 + Math.floor(Math.random() * 2400); // ~1.2k–2.8k/s over a ~1.5s poll
+    ack = accepted - Math.floor(Math.random() * 40);
     return {
       daemon: "up", metrics_addr: "127.0.0.1:9185  (demo)",
       summary: {
         accepted, ack, nack,
-        fsync_avg_ms: 0.42, queue_depth: 2 + Math.floor(Math.random() * 6),
-        wab_bytes_on_disk: 8192, dead_letter_bytes_on_disk: dlBytes(),
+        fsync_avg_ms: 0.38, queue_depth: 3 + Math.floor(Math.random() * 11),
+        wab_bytes_on_disk: 41_943_040, dead_letter_bytes_on_disk: dlBytes(),
         sink_type: "http", sink_health: "healthy", flusher_panics: 0, fsync_failures: 0,
       },
     };

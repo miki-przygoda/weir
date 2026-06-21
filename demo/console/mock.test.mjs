@@ -16,7 +16,7 @@ async function j(f, url, opts) {
 test("explorer routes return real-shaped JSON incl. a corrupt segment", async () => {
   const f = loadMock();
   const segs = await j(f, "/api/wab/segments");
-  assert.equal(segs.totals.sealed, 3);
+  assert.equal(segs.totals.sealed, 5);
   assert.ok(segs.segments.some((s) => s.integrity && s.integrity.kind === "CrcMismatch"));
   assert.ok(segs.segments.some((s) => s.integrity && s.integrity.kind === "MissingFooter"));
   const rec = await j(f, "/api/wab/segment?path=shard_00/seg_00000001.wab.sealed&limit=200");

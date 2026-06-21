@@ -127,6 +127,87 @@ em { color: var(--n-accent); font-style: normal; }
 .pagenav .pn-right { margin-left: auto; color: var(--n-fg-dim); }
 .pagenav .pn-right:hover { color: var(--n-accent); }
 
+/* ── weir-console demo (Explorer / Ops / Live views) ───────────────────────
+   Styles the markup the (verbatim) view scripts emit — wc-seg / wc-chip /
+   wc-rec / #ops-status / #live-counters / #cv — into a dashboard-grade look. */
+.wc-grid { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+@media (max-width: 720px) { .wc-grid { grid-template-columns: 1fr; } }
+
+.wc-tree {
+  border: 1px solid var(--n-border); border-radius: 10px;
+  background: rgba(255, 255, 255, .015);
+  padding: 8px; overflow: auto; max-height: 62vh;
+}
+.wc-tree .label {
+  display: block; font-family: var(--mono); font-size: .58rem;
+  letter-spacing: .14em; text-transform: uppercase;
+  color: var(--n-fg-dim); margin: 12px 6px 5px;
+}
+.wc-tree .label:first-child { margin-top: 2px; }
+.wc-seg {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 6px 9px; margin: 1px 0; border-radius: 7px;
+  font-family: var(--mono); font-size: 12px; color: var(--n-fg-mid);
+  cursor: pointer; transition: background .1s, box-shadow .1s, color .1s;
+}
+.wc-seg:hover { background: var(--n-accent-dim); box-shadow: inset 2px 0 0 var(--n-accent); color: var(--n-fg-bright); }
+
+/* state + integrity badges */
+.wc-chip {
+  display: inline-flex; align-items: center;
+  font-family: var(--mono); font-size: 9.5px; line-height: 1.4;
+  padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--n-border-lt); color: var(--n-fg-dim); letter-spacing: .04em;
+}
+.wc-chip.wc-ok  { color: var(--n-green); border-color: rgba(74, 222, 128, .45); background: rgba(74, 222, 128, .08); }
+.wc-chip.wc-bad { color: var(--n-rose);  border-color: rgba(248, 113, 113, .5); background: rgba(248, 113, 113, .10); }
+.wc-ok  { color: var(--n-green); }
+.wc-bad { color: var(--n-rose); }
+
+/* record rows (center detail / dead-letter list) */
+.wc-rec {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  padding: 6px 10px; border-bottom: 1px solid var(--n-border-lt);
+  white-space: pre-wrap; word-break: break-all; color: var(--n-fg-mid);
+}
+.wc-rec:hover { background: rgba(255, 255, 255, .02); }
+.wc-rec.wc-bad {
+  background: rgba(248, 113, 113, .08); border-left: 2px solid var(--n-rose);
+  padding-left: 8px; color: var(--n-rose);
+}
+
+/* status strip — Ops #ops-status + Live #live-counters (a designed metrics bar) */
+#ops-status, #live-counters {
+  font-family: var(--mono); font-size: 12px; line-height: 2.1; letter-spacing: .02em;
+  color: var(--n-fg-mid); padding: 11px 14px; margin-bottom: 14px;
+  border: 1px solid var(--n-border); border-radius: 10px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, .025), rgba(255, 255, 255, .006));
+}
+
+.wc-actions button { margin-left: 8px; }
+
+/* Live pipeline canvas + sparklines */
+#cv {
+  width: 100%; display: block;
+  border: 1px solid var(--n-border); border-radius: 10px;
+  background: rgba(255, 255, 255, .012);
+}
+.wc-sparks { margin-top: 12px; display: flex; gap: 24px; flex-wrap: wrap; }
+.wc-spark { font-family: var(--mono); font-size: .72rem; color: var(--n-fg-dim); letter-spacing: .04em; }
+.wc-spark span { font-size: 15px; color: var(--n-accent); letter-spacing: 0; }
+
+/* Ops requeue/drop modal */
+#modal {
+  display: none; position: fixed; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, .66); align-items: center; justify-content: center;
+}
+.wc-modal-box {
+  background: var(--n-bg); border: 1px solid var(--n-border); border-radius: 12px;
+  padding: 18px 20px; max-width: 520px; width: 90%;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .5);
+}
+.wc-modal-box select, .wc-modal-box input { font-family: var(--mono); }
+
 /* sticky nav needs a real wrapper backdrop; give the bar a full-bleed band */
 .nav::before {
   content: "";

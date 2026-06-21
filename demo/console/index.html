@@ -7,15 +7,6 @@
 <meta name="description" content="The weir-console Explorer: read-only forensics over a write-ahead-buffer directory — segment states, integrity/CRC, and recoverable records, even against a stopped daemon." />
 <link rel="stylesheet" href="../weir.css" />
 <script src="../version.js"></script>
-<style>
-  .wc-grid { display: grid; grid-template-columns: 320px 1fr; gap: 16px; }
-  .wc-tree { border: 1px solid var(--n-border); padding: 8px; overflow:auto; max-height: 60vh; }
-  .wc-seg { padding: 4px 6px; cursor: pointer; font-size: 12px; }
-  .wc-seg:hover { background: var(--n-bg-row); }
-  .wc-chip { font-size: 10px; padding: 1px 6px; border: 1px solid var(--n-border); margin-left: 6px; }
-  .wc-ok { color: var(--n-green); } .wc-bad { color: var(--n-rose); }
-  .wc-rec { font-family: 'JetBrains Mono', monospace; font-size: 11px; border-bottom: 1px solid var(--n-border-lt); padding: 4px 0; white-space: pre-wrap; word-break: break-all; }
-</style>
 </head>
 <body>
 <div class="statusbar top">
@@ -46,7 +37,7 @@
     <div class="panel-title">The scenario</div>
     <div class="panel-body">
       <p>weir is a durable buffer: producers get a fast <em>ack</em> the moment a record is fsynced to a local WAB segment, and an async drain later forwards sealed segments downstream. After an unclean shutdown, the WAB directory holds the ground truth of what was accepted. This view is how you read it — no daemon required, nothing written back.</p>
-      <p style="margin-bottom:0">The tree below is loaded with a <strong>sample</strong> post-crash directory: a clean drained segment, a byte-flipped one, a half-sealed one, and a segment still being written.</p>
+      <p style="margin-bottom:0">The tree below is a <strong>sample</strong> post-crash WAB — two shards, six segments. Most are healthy (sealed or already drained), but two casualties sit right beside the good ones: a byte-flipped segment and a half-sealed torn tail.</p>
     </div>
   </div>
 
