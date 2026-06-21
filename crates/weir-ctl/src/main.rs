@@ -729,13 +729,26 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool, json: bool) -> Result<(), String> {
 /// any partial result — if the header is invalid or any record fails to decode,
 /// so a corrupt segment is never partially requeued.
 fn read_segment_records(path: &Path) -> Result<Vec<Payload>, String> {
-    let reader = SegmentReader::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut reader =
+        SegmentReader::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut out = Vec::new();
-    for (i, rec) in reader.enumerate() {
+    for (i, rec) in reader.by_ref().enumerate() {
         match rec {
             Ok(p) => out.push(p),
             Err(e) => return Err(format!("{}: record {i}: {e}", path.display())),
         }
+    }
+    // A torn/unsealed tail (no clean-end sentinel) means the segment was not
+    // fully sealed — e.g. a `.wab.sealed` truncated by disk damage (the
+    // MissingFooter case the Explorer surfaces). Requeue must NOT push the
+    // readable prefix and then delete the file: that silently drops a damaged
+    // segment the daemon's own recovery would QUARANTINE for inspection. Skip it
+    // wholesale (left in place + flagged), mirroring the corrupt-record path.
+    if reader.terminated_cleanly() != Some(true) {
+        return Err(format!(
+            "{}: torn/unsealed tail (no clean-end sentinel) — left in place for inspection",
+            path.display()
+        ));
     }
     Ok(out)
 }
@@ -1341,6 +1354,35 @@ mod tests {
 
         let err = read_segment_records(&path).unwrap_err();
         assert!(err.contains("record 0"), "err: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_segment_records_skips_torn_tail_without_sentinel() {
+        use std::io::Write;
+        // A `.wab.sealed` whose records are all CRC-valid but which has NO
+        // clean-end sentinel (truncated tail / never fully sealed). requeue must
+        // SKIP it (return Err -> left in place + flagged) rather than push the
+        // readable prefix and delete the file — that would silently drop a torn
+        // segment the daemon would quarantine (F2).
+        let dir = std::env::temp_dir().join(format!("weir_ctl_rq_torn_{}", std::process::id()));
+        let dl = dir.join("dead_letter");
+        std::fs::create_dir_all(&dl).unwrap();
+        let path = dl.join("dl_00000001.wab.sealed");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
+            .unwrap();
+        let payload = b"survivor";
+        f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&weir_wab::format::crc32(payload).to_le_bytes())
+            .unwrap();
+        f.write_all(payload).unwrap();
+        f.sync_all().unwrap(); // NO sentinel/footer — torn tail
+        let err = read_segment_records(&path).unwrap_err();
+        assert!(
+            err.contains("torn") || err.contains("sentinel"),
+            "torn-tail segment must be skipped, got: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
