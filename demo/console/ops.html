@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir-console · Ops</title>
+<link rel="stylesheet" href="../weir.css" />
+<script src="../version.js"></script>
+<style>
+  .wc-chip { font-size: 10px; padding: 1px 6px; border: 1px solid var(--n-border); margin-left: 4px; }
+  .wc-ok { color: var(--n-green); } .wc-bad { color: var(--n-rose); }
+  .wc-rec { font-family: 'JetBrains Mono', monospace; font-size: 11px; border-bottom: 1px solid var(--n-border-lt); padding: 4px 0; }
+  .wc-actions button { margin-right: 8px; }
+  #ops-status { font-size: 12px; padding: 8px; border: 1px solid var(--n-border); margin-bottom: 12px; }
+  #modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); align-items: center; justify-content: center; }
+  .wc-modal-box { background: var(--n-bg); border: 1px solid var(--n-border); padding: 16px; max-width: 520px; width: 90%; }
+</style>
+</head>
+<body>
+<div class="statusbar top">
+  <span>weir-console · Ops · <span data-weir-version></span></span>
+  <span class="sb-spacer"></span>
+  <a class="sb-dim" href="../index.html">← weir demo</a> · <span class="sb-dim">sample data · no backend</span>
+</div>
+<nav class="nav">
+  <a href="index.html">Explorer</a>
+  <a href="ops.html" class="active">Ops</a>
+  <a href="live.html">Live</a>
+</nav>
+<div class="wrap">
+  <div id="ops-status">loading status…</div>
+  <div class="panel">
+    <div class="panel-title">Dead-letter store
+      <span class="pt-right wc-actions">
+        <button id="act-requeue">Requeue all</button>
+        <button id="act-drop">Drop all</button>
+      </span>
+    </div>
+    <div class="panel-body" id="dl-body">loading…</div>
+  </div>
+</div>
+<div id="modal"></div>
+<script src="mock.js"></script>
+<script src="ops.js"></script>
+</body>
+</html>
