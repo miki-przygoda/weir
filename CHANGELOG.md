@@ -13,6 +13,62 @@ protocol** below.
 
 ---
 
+## [1.2.0] - 2026-06-21
+
+Additive operability + ecosystem release from the post-1.1 finalization sweeps: a
+public `weir-wab` forensics read surface, machine-readable `weir-ctl --json`, a
+Prometheus-label accessor on `NackReason`, a recoverable client-side empty-payload
+guard, a Buffered-throughput fix, and a 5-language polyglot demo showcase. All
+backward compatible — no wire, on-disk-format, or existing-API breaks (a clean
+minor). The new `weir-wab` error enums are `#[non_exhaustive]` so future variants
+stay additive.
+
+### Added
+
+- **weir-wab — public forensics read surface.** `verify_sealed_segment` (streamed
+  whole-file CRC check) returning `SegmentVerification` / `SegmentVerifyError`;
+  `list_segment_files` → `SegmentState` (Active/Sealed/Confirmed); `parse_segment_header`
+  / `parse_segment_footer` / `crc32` with `SegmentHeaderMeta` / `SegmentFooterMeta`;
+  and `SegmentReader::header()` / `into_inner()` / `get_ref()` / `terminated_cleanly()`.
+- **weir-ctl — opt-in `--json`** global flag for machine-readable output on
+  `health` / `metrics` / `segments` / `push` / `dl` (human tables stay the default).
+- **weir-core — `NackReason::as_metric_label()` / `from_metric_label()`** mapping wire
+  reasons to the Prometheus `reason=` labels (the wire byte `0x07` is unchanged).
+- **weir-client — `ClientError::EmptyPayload`**, a recoverable local pre-send guard in
+  `WeirClient::push` (an empty payload is rejected before any bytes are sent, leaving
+  the connection usable, mirroring the oversized-payload guard).
+- **demos/ — 5-language polyglot wire clients** (C, Java, TypeScript, Python, Go) built
+  from the spec + conformance vectors with no weir-crate dependency, each passing all
+  28 conformance vectors, plus per-client subpages in the demo bundle.
+
+### Changed
+
+- **Tier-aware coalesce.** A Buffered-only batch no longer pays the worker's Phase-2
+  coalesce window (it has no group-fsync to amortise), restoring single-shard Buffered
+  throughput (~8–12× when connections co-locate); per-shard FIFO and durability are
+  unchanged.
+- **Drain stranded-segment auto-resume** now runs from the `BlockedDeadLetterFull` and
+  `RetryingTransient` states as well as `Draining`; a strand→resume reprocesses the
+  whole segment (documented whole-segment at-least-once — sinks already dedupe).
+- **Demo bundle restyled** to the personal-site "hr2" palette (dark neutral + sky/violet/
+  green, Inter + JetBrains Mono).
+- **Docs** — protocol/ops/monitoring truth-ups, decoder-tag→Nack-byte table, consumer
+  rustdoc + integrating guide, conformance/sink-integration; **publish order corrected to
+  `weir-core → weir-wab → weir-sink-sdk → weir-client / weir-server / weir-ctl`**
+  (`weir-testkit` is `publish = false`).
+
+### Fixed
+
+- WAB mid-record truncation now surfaces a contextual error (preserving the
+  `UnexpectedEof` kind); `verify_sealed_segment` rejects trailing bytes after the footer.
+- weir-ctl: a missing wab dir now errors (instead of an empty-OK), `dl requeue`
+  skip-semantics documented, `--socket-path` alias made visible, `--json` failures emit a
+  JSON error object.
+- weir-server: a one-shot warning when the HTTP sink runs unauthenticated, absolute
+  socket-path help text, `weir_drain_state` / nack-counter metric truth-ups (nack series
+  pre-initialised at 0).
+- config: range guards asserted on every bounded scalar knob.
+
 ## [1.1.0] - 2026-06-19
 
 Additive operability features, a recovery hardening, and extensive doc truth-ups
@@ -1510,6 +1566,7 @@ The five commits making up this pass:
 
 ---
 
+[1.2.0]: https://github.com/miki-przygoda/weir/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/miki-przygoda/weir/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/miki-przygoda/weir/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/miki-przygoda/weir/compare/v0.5.0...v0.9.0
