@@ -8,6 +8,17 @@
 /// "daemon is on wire protocol v1; this client is built against v2 — upgrade the daemon or downgrade the client."
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Reason bytes 0x0A-0xFF are reserved for future use within wire v1 (see
+// wire_protocol.md): a new reason can be added in a minor release without a
+// WIRE_VERSION bump. #[non_exhaustive] makes that growth non-breaking for
+// downstream matchers (they must already carry a wildcard arm), matching the
+// rationale on its decode-side twin DecodeError. Adding it later would itself be
+// breaking, so it lands before 1.x ships. The wire stays forward-compatible
+// regardless: an unknown byte surfaces as ClientError::UnknownNack(u8), not a
+// new variant. MessageType/Durability are deliberately left exhaustive because
+// changing them requires a WIRE_VERSION bump (a major event); that does not
+// apply here.
+#[non_exhaustive]
 pub enum NackReason {
     /// Frame did not start with the `b"WEIR"` magic.
     BadMagic = 0x01,
