@@ -15,7 +15,7 @@ import java.nio.file.Path;
  * A synchronous weir producer over an {@code AF_UNIX SOCK_STREAM} socket.
  *
  * <p>Uses {@link java.net.UnixDomainSocketAddress} + {@link SocketChannel}
- * (JDK 16+) — pure stdlib, no JNI, no third-party dependency. The wire framing
+ * (JDK 21+) — pure stdlib, no JNI, no third-party dependency. The wire framing
  * is implemented directly from {@code docs/wire_protocol.md}; there is no
  * dependency on any weir crate.
  *

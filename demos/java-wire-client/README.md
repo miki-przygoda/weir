@@ -67,7 +67,7 @@ conformance vector name string.
 ### Connection lifecycle & errors
 
 `WeirClient.connect(socketPath)` opens a `java.net.UnixDomainSocketAddress` +
-`java.nio.channels.SocketChannel` (`AF_UNIX SOCK_STREAM`, JDK 16+, pure stdlib,
+`java.nio.channels.SocketChannel` (`AF_UNIX SOCK_STREAM`, JDK 21+, pure stdlib,
 no JNI) — no in-band handshake. `readResponse()` frames the reply by hand: read
 16 header bytes, validate magic/version before trusting `payload_len`, **cap the
 response `payload_len` at `MAX_RESPONSE_PAYLOAD` (2 bytes)** before allocating,
@@ -113,7 +113,7 @@ guard). `AuditEventProducer`'s event-count arg is optional (defaults to 5).
 ## Requirements
 
 JDK standard library only (`UnixDomainSocketAddress`, `java.util.zip.CRC32`,
-`ByteBuffer`). **Requires JDK 16+** (for the `AF_UNIX` domain-socket API)
+`ByteBuffer`). **Requires JDK 21+** (current LTS)
 **· tested on OpenJDK 25.** The codec alone (`Frame` / `Wire` / `Hex` /
 `MiniJson`) is plain Java with no version-specific APIs.
 

@@ -46,7 +46,7 @@ the source of truth. Override the path with the `WEIR_CONFORMANCE_VECTORS` env v
 | [`py-wire-client/`](py-wire-client/) | Python (stdlib) | From-scratch producer + codec; runnable `examples/produce.py` + `scripts/run_daemon.sh`. | `python3 tests/test_conformance.py` |
 | [`go-wire-client/`](go-wire-client/) | Go (stdlib) | Producer + codec + a 15-case adversarial live harness (every Nack reason + connection-close). | `go test ./...` |
 | [`c-wire-client/`](c-wire-client/) | C (C11, POSIX) | Zero-dep, warning-clean (`-Wall -Wextra -Wpedantic -Wconversion`); embedded/systems angle. | `make check` |
-| [`java-wire-client/`](java-wire-client/) | Java (JDK 16+) | Stdlib-only (`UnixDomainSocketAddress` + `CRC32`); enterprise/JVM angle. | `javac -d out $(find src -name '*.java') && java -cp out dev.weir.client.ConformanceRunner` |
+| [`java-wire-client/`](java-wire-client/) | Java (JDK 21+) | Stdlib-only (`UnixDomainSocketAddress` + `CRC32`); enterprise/JVM angle. | `javac -d out $(find src -name '*.java') && java -cp out dev.weir.client.ConformanceRunner` |
 | [`ts-wire-client/`](ts-wire-client/) | TypeScript/Node | Zero runtime deps; runs `.ts` on stock Node; end-to-end HTTP→wire→WAB example. | `node src/conformance.ts` |
 
 Run instructions are in each project's own README. The offline conformance suites

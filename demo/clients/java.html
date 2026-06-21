@@ -42,7 +42,7 @@
   <div class="panel">
     <div class="panel-title">What it is</div>
     <div class="panel-body">
-      <p>A clean polyglot Java implementation of the wire, written straight from <code class="inline">docs/wire_protocol.md</code> with no dependency on any weir crate — exactly what a skeptical enterprise team would write to integrate a JVM service with weir without pulling in a Rust toolchain. It uses <code class="inline">UnixDomainSocketAddress</code> + <code class="inline">SocketChannel</code> (JDK 16+) for the transport and <code class="inline">java.util.zip.CRC32</code> for the CRC.</p>
+      <p>A clean polyglot Java implementation of the wire, written straight from <code class="inline">docs/wire_protocol.md</code> with no dependency on any weir crate — exactly what a skeptical enterprise team would write to integrate a JVM service with weir without pulling in a Rust toolchain. It uses <code class="inline">UnixDomainSocketAddress</code> + <code class="inline">SocketChannel</code> (JDK 21+) for the transport and <code class="inline">java.util.zip.CRC32</code> for the CRC.</p>
       <p style="margin-bottom:0">The domain is enterprise event logging: <code class="inline">AuditEventProducer</code> streams structured JSON audit events to weir at <em>Sync</em> durability — so an <code class="inline">Ack</code> means "on stable storage", the guarantee a compliance auditor cares about.</p>
     </div>
   </div>
@@ -55,7 +55,7 @@
 <pre class="code">javac -d out $(find src -name '*.java')
 java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
 <span class="c"># -> 28/28 vectors passed (4 encode round-trips verified)</span></pre>
-      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: JDK stdlib only (<code class="inline">UnixDomainSocketAddress</code>, <code class="inline">java.util.zip.CRC32</code>, <code class="inline">ByteBuffer</code>) · requires JDK 16+ for the <code class="inline">AF_UNIX</code> API · tested on OpenJDK 25.</p>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: JDK stdlib only (<code class="inline">UnixDomainSocketAddress</code>, <code class="inline">java.util.zip.CRC32</code>, <code class="inline">ByteBuffer</code>) · requires JDK 21+ (current LTS) · tested on OpenJDK 25.</p>
     </div>
   </div>
 
@@ -91,7 +91,7 @@ java -cp out dev.weir.client.AuditEventProducer "$SOCK" 7 <span class="c"># 7/7 
     buf.<span class="f">putInt</span>((<span class="t">int</span>) <span class="f">crc32</span>(payload, <span class="t">0</span>, payload.length));
     <span class="k">return</span> buf.<span class="f">array</span>();
 }</pre>
-      <p style="margin-bottom:0; color:var(--n-fg-dim)">CRC is <code class="inline">java.util.zip.CRC32</code> (IEEE / ISO-3309), <em>not</em> CRC-32C. Built and verified on OpenJDK 25; requires JDK 16+ for the Unix domain socket API.</p>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">CRC is <code class="inline">java.util.zip.CRC32</code> (IEEE / ISO-3309), <em>not</em> CRC-32C. Built and verified on OpenJDK 25; requires JDK 21+ (current LTS).</p>
     </div>
   </div>
 
