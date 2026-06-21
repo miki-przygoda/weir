@@ -284,6 +284,13 @@ pub(crate) struct Metrics {
     /// Increments per stranded segment re-queued when the sink health recovers
     /// (down→up). Pairs with `drain_segments_stranded`: convergence of the two
     /// means the backlog from an outage has been picked back up for delivery.
+    ///
+    /// May transiently OVER-COUNT at a recovery-edge rescan: a segment still
+    /// sitting in the drain channel can be re-queued and counted again, so
+    /// convergence with `stranded` is approximate / eventually-consistent rather
+    /// than exact. Deduplicating in code is impractical — crossbeam channels are
+    /// not enumerable, so the resume path cannot cheaply check whether a segment
+    /// is already in flight.
     pub drain_segments_resumed: Counter<u64, AtomicU64>,
     /// Gauge vector: exactly one state label value is 1 at any time; the others are 0.
     pub drain_state: Family<DrainStateLabel, Gauge<f64, AtomicU64>>,

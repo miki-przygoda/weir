@@ -539,6 +539,7 @@ mod tests {
 
         let buffered = time_single_record_flush(weir_core::Durability::Buffered);
         let sync = time_single_record_flush(weir_core::Durability::Sync);
+        let batched = time_single_record_flush(weir_core::Durability::Batched);
 
         // Sync enters the window and waits out most of it before flushing. This is
         // a real sleep, so it's a robust LOWER bound (scheduling jitter only makes
@@ -547,6 +548,16 @@ mod tests {
             sync >= window * 6 / 10,
             "Sync batch did NOT coalesce: solo record flushed in {sync:?}, \
              expected to wait out most of the {window:?} window",
+        );
+
+        // Batched is an fsync tier too: its group fdatasync rides the batch
+        // boundary, so the coalesce window amortises a real cost and Batched must
+        // coalesce just like Sync (not skip the window like Buffered). Same robust
+        // 60%-of-window lower bound.
+        assert!(
+            batched >= window * 6 / 10,
+            "Batched batch did NOT coalesce: solo record flushed in {batched:?}, \
+             expected to wait out most of the {window:?} window like Sync",
         );
 
         // Buffered skips the window, so it flushes at least ~half a window SOONER
