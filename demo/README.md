@@ -18,7 +18,6 @@ natively inside the host personal site.
 | `crates.html` | **The crates.** Which-crate-do-I-need table, a dependency diagram, and a card per crate (when to reach for it, deps, platform). |
 | `examples.html` | **Example projects by crate-ratio.** A crate-usage matrix + curated recipes spanning one crate → the full pipeline → a zero-Rust-dep wire client. |
 | `clients/<lang>.html` | **Polyglot wire-client subpages** — one per language (`py`, `go`, `c`, `java`, `ts`). Each is a from-scratch, stdlib-only producer built from the wire spec + conformance vectors. Linked from `examples.html`. |
-| `console/{index,ops,live}.html` | **Interactive `weir-console` demo** — the Explorer / Ops / Live views running on canned data via `mock.js` (no backend). Linked from the nav + the `examples.html` admin row. See below. |
 | `weir.css` | Shared theme (palette, components) loaded by every page above. |
 
 The subpages are a **pitch / onboarding layer** — they link out to the canonical,
@@ -62,14 +61,3 @@ from the weir project page (or embed the simulation via an `<iframe>`):
 There are no absolute asset paths to fix up; only the cross-page links
 (`crates.html`, `examples.html`, the `clients/<lang>.html` subpages) and
 `weir.css`, all relative.
-
-## console/
-
-`console/` is an **interactive, no-backend mock** of `weir-console` (the local tool under
-`tools/weir-console/`): the three real views — **Explorer**, **Ops**, **Live** — running
-on canned sample data via `mock.js` (a `fetch` shim). The `*.js` view files are committed
-copies of `tools/weir-console/static/*.js`; `mock.js` serves JSON in the real `/api/*`
-shapes — including a deliberately-corrupt segment (so the Explorer shows its integrity
-badge + an error row), a mutable dead-letter store (so Ops Drop/Requeue visibly empty it),
-and an incrementing counter (so the Live pipeline animates and the sparklines fill). For
-the real tool, run `cargo run --manifest-path tools/weir-console/Cargo.toml -- --wab-dir <dir>`.

@@ -8,7 +8,6 @@ members = [
     "crates/weir-ctl",
     "crates/weir-testkit",
 ]
-exclude = ["tools/weir-console"]
 resolver = "2"
 
 [workspace.package]
