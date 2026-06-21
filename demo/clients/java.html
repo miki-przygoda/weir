@@ -30,7 +30,7 @@
   <div class="hero">
     <p class="role"><a href="../examples.html">← Example projects</a></p>
     <h1>Java <span class="accent">· weir wire client</span></h1>
-    <p class="tag">A self-contained JDK producer that speaks the weir v1 wire protocol over a Unix domain socket — built from the spec, <em>zero weir-crate deps</em>, only the JDK standard library. No Maven, no Gradle, no third-party jars.</p>
+    <p class="tag"><strong>An enterprise audit-event logger.</strong> A self-contained JDK producer that speaks the weir v1 wire protocol over a Unix domain socket — built from the spec, <em>zero weir-crate deps</em>, only the JDK standard library (no Maven, no Gradle, no third-party jars) — writing each audit event at <code class="inline">Sync</code> durability, so the producer only proceeds once the record is fsynced.</p>
     <div class="chips" style="gap:8px">
       <span class="chip wire">28/28 conformance vectors</span>
       <span class="chip wire">byte-exact</span>

@@ -30,7 +30,7 @@
   <div class="hero">
     <p class="role"><a href="../examples.html">← Example projects</a></p>
     <h1>Python <span class="accent">· weir wire client</span></h1>
-    <p class="tag">A pure-Python producer that speaks the weir v1 wire protocol straight to the daemon socket — built from the spec, <em>zero weir-crate deps</em>, stdlib only (<code class="inline">socket</code>, <code class="inline">struct</code>, <code class="inline">zlib</code>).</p>
+    <p class="tag"><strong>The reference from-spec client.</strong> A pure-Python producer that speaks the weir v1 wire protocol straight to the daemon socket — built <em>only</em> from the spec + conformance vectors (never the Rust source), <em>zero weir-crate deps</em>, stdlib only (<code class="inline">socket</code>, <code class="inline">struct</code>, <code class="inline">zlib</code>). The proof that the protocol alone is enough: a working client fell out in one pass.</p>
     <div class="chips" style="gap:8px">
       <span class="chip wire">28/28 conformance vectors</span>
       <span class="chip wire">byte-exact</span>
