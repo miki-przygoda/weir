@@ -1,3 +1,2 @@
-fn main() {
-    println!("weir-console (scaffold)");
-}
+mod wab;
+fn main() {}
