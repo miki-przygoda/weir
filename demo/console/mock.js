@@ -5,7 +5,7 @@
   // ── Explorer: WAB inventory (incl. one CrcMismatch segment) ──
   const SEGMENTS = {
     wab_dir: "/var/lib/weir/wab  (demo · sample data)",
-    totals: { segments: 3, sealed: 2, active: 1, confirmed: 1, dead_letter: 2, total_bytes: 8192 },
+    totals: { segments: 4, sealed: 3, active: 1, confirmed: 1, dead_letter: 6, total_bytes: 14080 },
     segments: [
       {
         shard: "00", file: "shard_00/seg_00000001.wab.sealed", state: "sealed", size_bytes: 4096,
@@ -19,6 +19,12 @@
         header: { format_version: 1, shard_id: 0, created_at: 1782000003000000000 },
         footer: { record_count: 2, data_bytes: 40, file_crc32: "0xdeadbeef", sealed_at: 1782000004000000000 },
         integrity: { ok: false, kind: "CrcMismatch", expected: "0xdeadbeef", computed: "0x0badf00d" },
+      },
+      {
+        shard: "00", file: "shard_00/seg_00000004.wab.sealed", state: "sealed", size_bytes: 5376,
+        header: { format_version: 1, shard_id: 0, created_at: 1782000006000000000 },
+        // a torn tail: the daemon was killed mid-seal, so the footer never landed.
+        integrity: { ok: false, kind: "MissingFooter" },
       },
       {
         shard: "00", file: "shard_00/seg_00000003.wab", state: "active", size_bytes: 512,
@@ -39,9 +45,20 @@
         terminated_cleanly: false,
       };
     }
-    if (path.indexOf("seg_00000003") !== -1) {
+    if (path.indexOf("seg_00000004") !== -1) {
+      // truncated/torn segment: a few good records, then the tail is gone (no sentinel).
       return {
         file: path, header: SEGMENTS.segments[2].header,
+        records: [
+          { index: 0, len: 7, crc_ok: true, hex_preview: "6f 72 64 65 72 2d 34", utf8_preview: "order-4" },
+          { index: 1, len: 7, crc_ok: true, hex_preview: "6f 72 64 65 72 2d 35", utf8_preview: "order-5" },
+        ],
+        terminated_cleanly: false, // torn tail — no clean-end sentinel
+      };
+    }
+    if (path.indexOf("seg_00000003") !== -1) {
+      return {
+        file: path, header: SEGMENTS.segments[3].header,
         records: [{ index: 0, len: 7, crc_ok: true, hex_preview: "6f 72 64 65 72 2d 39", utf8_preview: "order-9" }],
         terminated_cleanly: null,
       };
@@ -61,6 +78,9 @@
     if (path.indexOf("seg_00000002") !== -1) {
       return { ok: false, kind: "CrcMismatch", expected: "0xdeadbeef", computed: "0x0badf00d" };
     }
+    if (path.indexOf("seg_00000004") !== -1) {
+      return { ok: false, kind: "MissingFooter" };
+    }
     return { ok: true };
   }
 
@@ -76,14 +96,18 @@
     ],
   };
 
-  // ── Ops: mutable dead-letter store ──
+  // ── Ops: mutable dead-letter store (a backlog that piled up during a sink outage) ──
   let dlStore = [
-    { segment: "dl_00000001.wab.sealed", bytes: 512 },
-    { segment: "dl_00000002.wab.sealed", bytes: 490 },
+    { segment: "dl_00000001.wab.sealed", bytes: 6144, records: 80 },
+    { segment: "dl_00000002.wab.sealed", bytes: 4992, records: 64 },
+    { segment: "dl_00000003.wab.sealed", bytes: 5520, records: 72 },
+    { segment: "dl_00000004.wab.sealed", bytes: 3120, records: 40 },
+    { segment: "dl_00000005.wab.sealed", bytes: 4368, records: 56 },
+    { segment: "dl_00000006.wab.sealed", bytes: 2184, records: 28 },
   ];
   const dlCount = () => dlStore.length;
   const dlBytes = () => dlStore.reduce((a, s) => a + s.bytes, 0);
-  const dlRecords = () => dlStore.length * 2;
+  const dlRecords = () => dlStore.reduce((a, s) => a + s.records, 0);
 
   // ── Live: counters that increment so the animation/sparklines have motion ──
   let accepted = 12840, ack = 12835;

@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>weir-console · Live</title>
+<title>weir-console · Live — watching a busy producer</title>
+<meta name="description" content="The weir-console Live view: a real-time pipeline animation of a running weir daemon, driven by polled metric rates — watch your durable log breathe." />
 <link rel="stylesheet" href="../weir.css" />
 <script src="../version.js"></script>
 <style>
@@ -27,13 +28,68 @@
   <a href="live.html" class="active">Live</a>
 </nav>
 <div class="wrap">
+
+  <div class="hero">
+    <p class="role">weir-console · view 3 of 3</p>
+    <h1>Live <span class="accent">· watching a busy producer</span></h1>
+    <p class="tag">A high-rate producer is feeding weir right now. Watch the durable pipeline keep up: records flow Producer → Socket → WAB → fsync → Ack → Drain → Sink at the <strong>real measured rate</strong>, acks stay microsecond-fast, and the queue stays shallow.</p>
+    <div class="chips" style="gap:8px">
+      <span class="chip wire">polled rates, live</span>
+      <span class="chip dim">pipeline-shaped, not panels</span>
+      <span class="chip dim">honest: no per-record stream</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">The scenario</div>
+    <div class="panel-body">
+      <p>The whole point of weir is to sit between a fast producer and a slower/flakier sink without ever blocking the producer or losing an acked record. This view is the proof you can <em>see</em>: the front of the pipeline (accept → fsync → ack) running at the producer's rate, and the back (drain → sink) keeping the backlog shallow.</p>
+      <p style="margin-bottom:0">The animation below is driven by a <strong>sample</strong> metrics feed whose counters climb like a real busy daemon's — so the dots flow and the sparklines fill.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Live — the pipeline at the real rate</span><span class="rule"></span></div>
+
   <div id="live-counters">connecting…</div>
   <canvas id="cv" width="1040" height="180"></canvas>
   <div class="wc-sparks">
     <span class="wc-spark">acc/s <span id="spark-acc"></span></span>
     <span class="wc-spark">queue <span id="spark-queue"></span></span>
   </div>
-  <p class="sb-dim">Live rates are polled from the daemon's /metrics every ~1.5s (no per-record stream exists). The drain→sink stage reflects queue depth + sink health, not a per-second drain rate.</p>
+
+  <div class="panel" style="margin-top:16px">
+    <div class="panel-title">What you're looking at</div>
+    <div class="panel-body">
+      <p><strong>Counter cards</strong> (top) — accepted / ack / nack <em>per second</em> (computed from the deltas between polls), queue depth (drain backlog), average fsync ms, sink health + type, dead-letter bytes, and an alarms chip.</p>
+      <p><strong>The pipeline canvas</strong> — dots spawn at the producer at the real <code class="inline">accepted/sec</code> and flow left-to-right; the <strong>Drain</strong> stage shows the queue backlog and the <strong>Sink</strong> is tinted by sink health. An idle daemon (0/s) shows no dots — honestly still.</p>
+      <p style="margin-bottom:0"><strong>Sparklines</strong> — a short rolling history of accepted/sec and queue depth, so you can see a burst or a stall at a glance.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Honest scope</div>
+    <div class="panel-body">
+      <p style="margin-bottom:0">The daemon exposes only a pull <code class="inline">/metrics</code> endpoint — no per-record event stream — so Live shows <strong>polled rates</strong> (sampled ~1.5s, deltas → rates), not individual records, and the drain→sink stage reflects queue depth + sink health rather than a per-second drain rate. A counter reset (daemon restart) re-baselines instead of showing a negative rate; with no daemon, it shows a clean "waiting…" state and resumes automatically.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Why it matters</div>
+    <div class="panel-body">
+      <p style="margin-bottom:0">It's a live, <em>pipeline-shaped</em> view of a real daemon — "watch your durable log breathe." weir also speaks Prometheus, so Grafana owns the time-series dashboards; Live is the complementary narrative view that makes the flow legible at a glance.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">The real tool</span><span class="rule"></span></div>
+  <p style="margin-top:0">This page is a sample-data mock (no backend). Live polls a running daemon's metrics:</p>
+<pre class="code">cargo run --manifest-path tools/weir-console/Cargo.toml -- \
+  --wab-dir <span class="t">&lt;dir&gt;</span> --metrics-addr 127.0.0.1:9185
+<span class="c"># open the Live tab; it polls /metrics and animates the pipeline at the real rate</span></pre>
+  <p style="margin-top:0.6rem"><a href="https://github.com/miki-przygoda/weir/tree/main/tools/weir-console" target="_blank" rel="noopener">→ tools/weir-console on GitHub</a> · <a href="ops.html">← Ops</a> · <a href="index.html">← Explorer</a></p>
+
+  <p class="foot">weir-console — one local tool, three views (Explorer · Ops · Live).
+     Live reads the same metrics summary the CLI's <code class="inline">weir-ctl metrics</code> prints.
+     Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
 </div>
 <script src="mock.js"></script>
 <script src="live.js"></script>
