@@ -159,7 +159,14 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("weir-ctl: {e}");
+            if json {
+                // Under --json, emit a structured error object to stderr so a
+                // consumer can parse failures the same way it parses successes.
+                // Still goes to stderr (not stdout) and keeps the non-zero exit.
+                eprintln!("{}", error_json(&e));
+            } else {
+                eprintln!("weir-ctl: {e}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -190,6 +197,13 @@ fn print_json(value: &serde_json::Value) {
     }
 }
 
+/// The machine-readable form of any command failure: a single `error` string.
+/// Emitted to stderr under `--json` (the success payload goes to stdout), so a
+/// consumer can parse failures the same way it parses successes.
+fn error_json(msg: &str) -> serde_json::Value {
+    serde_json::json!({ "error": msg })
+}
+
 /// The machine-readable form of a successful `health` check. (The command only
 /// reaches the print path once the health check has succeeded, so `healthy` is
 /// always `true` here; a failed check returns an Err that `main` prints to
@@ -214,6 +228,16 @@ fn cmd_health(socket: &Path, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The machine-readable form of a successful `push`. (Only reached after the
+/// push is acked, so `acked` is always `true` here.)
+fn push_json(bytes: usize, durability: Durability) -> serde_json::Value {
+    serde_json::json!({
+        "acked": true,
+        "bytes": bytes,
+        "durability": format!("{durability:?}"),
+    })
+}
+
 fn cmd_push(
     socket: &Path,
     payload: &[u8],
@@ -225,11 +249,7 @@ fn cmd_push(
         .push(payload, durability)
         .map_err(|e| format!("push failed: {e}"))?;
     if json {
-        print_json(&serde_json::json!({
-            "acked": true,
-            "bytes": payload.len(),
-            "durability": format!("{durability:?}"),
-        }));
+        print_json(&push_json(payload.len(), durability));
     } else {
         println!("ack  {} bytes, {durability:?}", payload.len());
     }
@@ -603,6 +623,33 @@ fn cmd_dl_list(wab_dir: &Path, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The machine-readable form of `dl drop`. Covers all three outcomes — an empty
+/// store, a dry run, and a real run — by including only the keys relevant to
+/// each: `candidate_bytes` is present only on a dry run, `failures` only on a
+/// real run. `dry_run == true` ⇒ nothing was deleted (`dropped`/`dropped_bytes`
+/// are zero).
+fn dl_drop_json(
+    dry_run: bool,
+    candidates: usize,
+    candidate_bytes: Option<u64>,
+    dropped: usize,
+    dropped_bytes: u64,
+    failures: Option<usize>,
+) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("dry_run".into(), serde_json::json!(dry_run));
+    obj.insert("candidates".into(), serde_json::json!(candidates));
+    if let Some(cb) = candidate_bytes {
+        obj.insert("candidate_bytes".into(), serde_json::json!(cb));
+    }
+    obj.insert("dropped".into(), serde_json::json!(dropped));
+    obj.insert("dropped_bytes".into(), serde_json::json!(dropped_bytes));
+    if let Some(f) = failures {
+        obj.insert("failures".into(), serde_json::json!(f));
+    }
+    serde_json::Value::Object(obj)
+}
+
 fn cmd_dl_drop(wab_dir: &Path, yes: bool, json: bool) -> Result<(), String> {
     ensure_wab_dir(wab_dir)?;
     let dl_dir = dead_letter_dir(wab_dir);
@@ -611,12 +658,7 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool, json: bool) -> Result<(), String> {
     let segs = dl_sealed_segments(&dl_dir)?;
     if segs.is_empty() {
         if json {
-            print_json(&serde_json::json!({
-                "dry_run": !yes,
-                "candidates": 0,
-                "dropped": 0,
-                "dropped_bytes": 0,
-            }));
+            print_json(&dl_drop_json(!yes, 0, None, 0, 0, None));
         } else {
             println!("dead-letter store is empty; nothing to drop");
         }
@@ -625,13 +667,7 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool, json: bool) -> Result<(), String> {
     let total: u64 = segs.iter().map(|(_, s)| *s).sum();
     if !yes {
         if json {
-            print_json(&serde_json::json!({
-                "dry_run": true,
-                "candidates": segs.len(),
-                "candidate_bytes": total,
-                "dropped": 0,
-                "dropped_bytes": 0,
-            }));
+            print_json(&dl_drop_json(true, segs.len(), Some(total), 0, 0, None));
         } else {
             println!(
                 "would delete {} dead-letter segment(s) ({}) under {}",
@@ -659,13 +695,14 @@ fn cmd_dl_drop(wab_dir: &Path, yes: bool, json: bool) -> Result<(), String> {
         }
     }
     if json {
-        print_json(&serde_json::json!({
-            "dry_run": false,
-            "candidates": segs.len(),
-            "dropped": dropped,
-            "dropped_bytes": dropped_bytes,
-            "failures": failures.len(),
-        }));
+        print_json(&dl_drop_json(
+            false,
+            segs.len(),
+            None,
+            dropped,
+            dropped_bytes,
+            Some(failures.len()),
+        ));
     } else {
         println!(
             "dropped {dropped} of {} dead-letter segment(s) ({})",
@@ -728,6 +765,56 @@ fn dry_run_summary(segs: &[(PathBuf, u64)]) -> DryRunSummary {
     }
 }
 
+/// The machine-readable form of `dl requeue`. The three outcomes report
+/// different counters, so each is its own constructor:
+/// [`DlRequeueJson::empty`] (empty store), [`DlRequeueJson::dry_run`] (what a
+/// real run would do), and [`DlRequeueJson::done`] (a completed real run).
+enum DlRequeueJson {}
+
+impl DlRequeueJson {
+    /// Empty dead-letter store: nothing to requeue.
+    fn empty(dry_run: bool) -> serde_json::Value {
+        serde_json::json!({
+            "dry_run": dry_run,
+            "segments": 0,
+            "requeued_records": 0,
+            "segments_cleared": 0,
+        })
+    }
+
+    /// Dry-run preview: how many records/segments WOULD be requeued, and how
+    /// many segments are unreadable (and so would be skipped).
+    fn dry_run(segments: usize, unreadable: usize, requeuable_records: u64) -> serde_json::Value {
+        serde_json::json!({
+            "dry_run": true,
+            "segments": segments,
+            "readable_segments": segments - unreadable,
+            "unreadable_segments": unreadable,
+            "requeuable_records": requeuable_records,
+        })
+    }
+
+    /// A completed real run.
+    fn done(
+        segments: usize,
+        requeued_records: u64,
+        segments_cleared: usize,
+        skipped: usize,
+        delete_failures: usize,
+        durability: Durability,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "dry_run": false,
+            "segments": segments,
+            "requeued_records": requeued_records,
+            "segments_cleared": segments_cleared,
+            "skipped_segments": skipped,
+            "delete_failures": delete_failures,
+            "durability": format!("{durability:?}"),
+        })
+    }
+}
+
 fn cmd_dl_requeue(
     wab_dir: &Path,
     socket: &Path,
@@ -744,12 +831,7 @@ fn cmd_dl_requeue(
     let segs = dl_sealed_segments(&dl_dir)?;
     if segs.is_empty() {
         if json {
-            print_json(&serde_json::json!({
-                "dry_run": !yes,
-                "segments": 0,
-                "requeued_records": 0,
-                "segments_cleared": 0,
-            }));
+            print_json(&DlRequeueJson::empty(!yes));
         } else {
             println!("dead-letter store is empty; nothing to requeue");
         }
@@ -764,13 +846,11 @@ fn cmd_dl_requeue(
             unreadable,
         } = dry_run_summary(&segs);
         if json {
-            print_json(&serde_json::json!({
-                "dry_run": true,
-                "segments": segs.len(),
-                "readable_segments": segs.len() - unreadable.len(),
-                "unreadable_segments": unreadable.len(),
-                "requeuable_records": total_records,
-            }));
+            print_json(&DlRequeueJson::dry_run(
+                segs.len(),
+                unreadable.len(),
+                total_records,
+            ));
             return Ok(());
         }
         // Report readable-of-total so the segment count reconciles with `dl list`
@@ -849,15 +929,14 @@ fn cmd_dl_requeue(
     }
 
     if json {
-        print_json(&serde_json::json!({
-            "dry_run": false,
-            "segments": segs.len(),
-            "requeued_records": total_requeued,
-            "segments_cleared": segments_cleared,
-            "skipped_segments": skipped.len(),
-            "delete_failures": delete_failures.len(),
-            "durability": format!("{durability:?}"),
-        }));
+        print_json(&DlRequeueJson::done(
+            segs.len(),
+            total_requeued,
+            segments_cleared,
+            skipped.len(),
+            delete_failures.len(),
+            durability,
+        ));
     } else {
         println!(
             "requeued {total_requeued} record(s) from {segments_cleared} dead-letter segment(s) \
@@ -1635,5 +1714,82 @@ weir_sink_info{sink_type=\"http\"} 1
         assert_eq!(v["count"], serde_json::json!(0));
         assert_eq!(v["total_bytes"], serde_json::json!(0));
         assert_eq!(v["segments"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn push_json_has_expected_keys() {
+        let v = round_trip(&push_json(128, Durability::Sync));
+        assert_eq!(v["acked"], serde_json::json!(true));
+        assert_eq!(v["bytes"], serde_json::json!(128));
+        assert_eq!(v["durability"], serde_json::json!("Sync"));
+    }
+
+    #[test]
+    fn dl_drop_json_has_expected_keys_per_outcome() {
+        // Empty store: no candidate_bytes / failures keys.
+        let empty = round_trip(&dl_drop_json(true, 0, None, 0, 0, None));
+        assert_eq!(empty["dry_run"], serde_json::json!(true));
+        assert_eq!(empty["candidates"], serde_json::json!(0));
+        assert_eq!(empty["dropped"], serde_json::json!(0));
+        assert!(empty.get("candidate_bytes").is_none());
+        assert!(empty.get("failures").is_none());
+
+        // Dry run: candidate_bytes present, failures absent.
+        let dry = round_trip(&dl_drop_json(true, 3, Some(900), 0, 0, None));
+        assert_eq!(dry["candidates"], serde_json::json!(3));
+        assert_eq!(dry["candidate_bytes"], serde_json::json!(900));
+        assert_eq!(dry["dropped"], serde_json::json!(0));
+        assert!(dry.get("failures").is_none());
+
+        // Real run: failures present, candidate_bytes absent.
+        let done = round_trip(&dl_drop_json(false, 3, None, 2, 500, Some(1)));
+        assert_eq!(done["dry_run"], serde_json::json!(false));
+        assert_eq!(done["dropped"], serde_json::json!(2));
+        assert_eq!(done["dropped_bytes"], serde_json::json!(500));
+        assert_eq!(done["failures"], serde_json::json!(1));
+        assert!(done.get("candidate_bytes").is_none());
+    }
+
+    #[test]
+    fn dl_requeue_json_has_expected_keys_per_outcome() {
+        let empty = round_trip(&DlRequeueJson::empty(true));
+        assert_eq!(empty["dry_run"], serde_json::json!(true));
+        assert_eq!(empty["segments"], serde_json::json!(0));
+        assert_eq!(empty["requeued_records"], serde_json::json!(0));
+        assert_eq!(empty["segments_cleared"], serde_json::json!(0));
+
+        let dry = round_trip(&DlRequeueJson::dry_run(5, 2, 40));
+        assert_eq!(dry["dry_run"], serde_json::json!(true));
+        assert_eq!(dry["segments"], serde_json::json!(5));
+        assert_eq!(dry["readable_segments"], serde_json::json!(3));
+        assert_eq!(dry["unreadable_segments"], serde_json::json!(2));
+        assert_eq!(dry["requeuable_records"], serde_json::json!(40));
+
+        let done = round_trip(&DlRequeueJson::done(5, 40, 4, 1, 0, Durability::Batched));
+        assert_eq!(done["dry_run"], serde_json::json!(false));
+        assert_eq!(done["segments"], serde_json::json!(5));
+        assert_eq!(done["requeued_records"], serde_json::json!(40));
+        assert_eq!(done["segments_cleared"], serde_json::json!(4));
+        assert_eq!(done["skipped_segments"], serde_json::json!(1));
+        assert_eq!(done["delete_failures"], serde_json::json!(0));
+        assert_eq!(done["durability"], serde_json::json!("Batched"));
+    }
+
+    #[test]
+    fn json_error_path_emits_parseable_json() {
+        // Drive a guaranteed-failure path: connecting to a socket that cannot
+        // exist yields an Err, which `main` renders under --json via
+        // `error_json`. The rendered object must round-trip as valid JSON and
+        // carry the error message in an `error` string field.
+        let bogus =
+            std::env::temp_dir().join(format!("weir_ctl_no_such_sock_{}.sock", std::process::id()));
+        let err = connect_client(&bogus).expect_err("connecting to a missing socket must fail");
+        let v = round_trip(&error_json(&err));
+        assert!(
+            v["error"].is_string(),
+            "expected an `error` string field, got: {v}"
+        );
+        // The error text is preserved verbatim (operator hint included).
+        assert_eq!(v["error"].as_str().unwrap(), err);
     }
 }
