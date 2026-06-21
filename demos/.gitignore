@@ -1,0 +1,10 @@
+# Build artifacts from the demo projects (source-only is committed; build locally)
+node_modules/
+target/
+out/
+*.class
+*.o
+# C client binaries (built via `make`)
+/c-wire-client/conformance
+/c-wire-client/telemetry
+/c-wire-client/negative

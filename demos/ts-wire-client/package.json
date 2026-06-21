@@ -1,0 +1,19 @@
+{
+  "name": "weir-ts-wire-client",
+  "version": "0.1.0",
+  "description": "Dependency-free TypeScript/Node weir v1 wire producer (Push/Ack + CRC32), built from the wire spec + conformance vectors. stdlib only (node:net, node:zlib).",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "conformance": "node src/conformance.ts",
+    "smoke": "node examples/live-smoke.ts",
+    "logger": "node examples/request-logger.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}
