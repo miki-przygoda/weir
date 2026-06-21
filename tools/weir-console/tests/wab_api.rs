@@ -8,7 +8,9 @@ fn inventory_reports_state_meta_and_integrity() {
     let root = fixtures::build_fixtures(dir.path());
     let inv = wab::inventory(&root).unwrap();
 
-    assert_eq!(inv.totals.segments, 4);          // 1 clean-sealed + 1 active + 1 corrupt-sealed + 1 truncated-sealed (confirmed sidecars are not counted as segments)
+    // 1 clean-sealed + 1 active + 1 footer-CRC-corrupt + 1 truncated + 1 record-CRC-corrupt
+    // = 5 segments; the confirmed sidecar is metadata, not counted as a segment.
+    assert_eq!(inv.totals.segments, 5);
     assert_eq!(inv.totals.active, 1);
     assert_eq!(inv.totals.dead_letter, 1);
 
@@ -22,6 +24,10 @@ fn inventory_reports_state_meta_and_integrity() {
     let integ = corrupt.integrity.as_ref().unwrap();
     assert!(!integ.ok);
     assert_eq!(integ.kind.as_deref(), Some("CrcMismatch"));
+
+    // The record-CRC-corrupt segment fails the per-record check first -> BadRecord.
+    let rec_corrupt = inv.segments.iter().find(|s| s.file.ends_with("seg_00000005.wab.sealed")).unwrap();
+    assert_eq!(rec_corrupt.integrity.as_ref().unwrap().kind.as_deref(), Some("BadRecord"));
 
     let active = inv.segments.iter().find(|s| s.file.ends_with("seg_00000002.wab")).unwrap();
     assert_eq!(active.state, "active");

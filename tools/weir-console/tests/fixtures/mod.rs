@@ -61,6 +61,15 @@ pub fn build_fixtures(root: &Path) -> PathBuf {
     truncated.truncate(truncated.len() - 10);
     fs::write(shard.join("seg_00000004.wab.sealed"), truncated).unwrap();
 
+    // A record-CRC-corrupt sealed segment: flip a PAYLOAD byte after building, so the
+    // stored per-record CRC no longer matches. verify_sealed_segment checks the
+    // per-record CRC *before* the file CRC, so this surfaces as `BadRecord`, and
+    // reading the records yields an error row at that record — distinct from seg_3's
+    // file-level `CrcMismatch`.
+    let mut rec_corrupt = segment_bytes(0, &[b"badrecord"], true);
+    rec_corrupt[weir_wab::format::SEGMENT_HEADER_LEN + 8] ^= 0xff; // first payload byte
+    fs::write(shard.join("seg_00000005.wab.sealed"), rec_corrupt).unwrap();
+
     // Dead-letter store: dead_letter/dl_00000001.wab.sealed (2 rejected payloads)
     let dl = root.join("dead_letter");
     fs::create_dir_all(&dl).unwrap();
