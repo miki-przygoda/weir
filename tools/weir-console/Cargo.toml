@@ -27,3 +27,4 @@ weir-wab = { path = "../../crates/weir-wab" }
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot for axum tests
+http-body-util = "0.1"

@@ -121,3 +121,86 @@ async fn read_only_blocks_mutations_without_spawning() {
     // The stub must never have run.
     assert!(ops_support::read_args(&log).is_empty(), "read-only must not spawn weir-ctl");
 }
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+
+fn ops_router(weir_ctl: PathBuf, dir: PathBuf, read_only: bool) -> axum::Router {
+    let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
+    let ops = OpsConfig {
+        weir_ctl,
+        wab_dir: dir.clone(),
+        metrics_addr: "127.0.0.1:9185".into(),
+        socket: PathBuf::from("/run/weir/weir.sock"),
+        read_only,
+    };
+    weir_console::server::router_with_ops(dir, static_dir, ops)
+}
+
+async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn http_status_and_dead_letter_ok() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let app = ops_router(stub.bin, dir.path().to_path_buf(), false);
+
+    let resp = app.clone().oneshot(Request::get("/api/ops/status").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["daemon"], "up");
+
+    let resp = app.oneshot(Request::get("/api/ops/dead-letter").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn http_requeue_preview_no_yes_commit_yes() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let log = stub.args_log.clone();
+    let app = ops_router(stub.bin, dir.path().to_path_buf(), false);
+
+    let resp = app.clone().oneshot(
+        Request::post("/api/ops/requeue/preview?durability=sync").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.oneshot(
+        Request::post("/api/ops/requeue?durability=sync").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let args = ops_support::read_args(&log);
+    // exactly one of the two requeue calls carried --yes (the commit, not the preview)
+    let yes_lines = args.lines().filter(|l| l.contains("requeue") && l.contains("--yes")).count();
+    let no_yes_lines = args.lines().filter(|l| l.contains("requeue") && !l.contains("--yes")).count();
+    assert_eq!(yes_lines, 1, "{args}");
+    assert_eq!(no_yes_lines, 1, "{args}");
+}
+
+#[tokio::test]
+async fn http_requeue_bad_durability_is_400() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let app = ops_router(stub.bin, dir.path().to_path_buf(), false);
+    let resp = app.oneshot(
+        Request::post("/api/ops/requeue?durability=bogus").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_read_only_mutations_are_403() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let app = ops_router(stub.bin, dir.path().to_path_buf(), true);
+    for path in ["/api/ops/requeue", "/api/ops/requeue/preview", "/api/ops/drop", "/api/ops/drop/preview"] {
+        let resp = app.clone().oneshot(Request::post(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
