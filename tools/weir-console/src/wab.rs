@@ -188,3 +188,55 @@ pub fn inventory(wab_dir: &Path) -> Result<SegmentsResponse, WabError> {
     totals.total_bytes = segments.iter().map(|s| s.size_bytes).sum();
     Ok(SegmentsResponse { wab_dir: wab_dir.to_string_lossy().into_owned(), totals, segments })
 }
+
+#[derive(Serialize)]
+pub struct RecordJson {
+    pub index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")] pub len: Option<usize>,
+    pub crc_ok: bool,                              // false when error is Some
+    #[serde(skip_serializing_if = "Option::is_none")] pub hex_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub utf8_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub error: Option<String>,
+}
+#[derive(Serialize)]
+pub struct RecordsResponse {
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub header: Option<HeaderJson>,
+    pub records: Vec<RecordJson>,
+    pub terminated_cleanly: Option<bool>,
+}
+
+fn hex_preview(bytes: &[u8]) -> String {
+    bytes.iter().take(PREVIEW_BYTES).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+pub fn records(wab_dir: &Path, rel: &str, offset: usize, limit: usize) -> Result<RecordsResponse, WabError> {
+    let path = safe_join(wab_dir, rel)?;
+    let limit = limit.clamp(1, 1000);
+    let mut reader = SegmentReader::open(&path)?;
+    let header = Some(HeaderJson::from(reader.header()));
+    let mut records = Vec::new();
+    let mut index = 0usize;
+    while let Some(item) = reader.next() {
+        if index < offset { index += 1; continue; }
+        if records.len() >= limit { break; }
+        match item {
+            Ok(payload) => {
+                let bytes: &[u8] = &payload;
+                records.push(RecordJson {
+                    index, len: Some(bytes.len()), crc_ok: true,
+                    hex_preview: Some(hex_preview(bytes)),
+                    utf8_preview: Some(String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_BYTES)]).into_owned()),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                records.push(RecordJson { index, len: None, crc_ok: false, hex_preview: None, utf8_preview: None, error: Some(e.to_string()) });
+                index += 1;
+                break; // reader is fused after an Err; stop
+            }
+        }
+        index += 1;
+    }
+    Ok(RecordsResponse { file: rel.to_string(), header, records, terminated_cleanly: reader.terminated_cleanly() })
+}

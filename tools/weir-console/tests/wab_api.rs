@@ -34,3 +34,22 @@ fn inventory_reports_state_meta_and_integrity() {
     assert!(active.footer.is_none()); // unsealed: no footer/integrity
     assert!(active.header.is_some());
 }
+
+#[test]
+fn records_reads_payloads_with_crc_and_termination() {
+    let dir = tempdir().unwrap();
+    let root = fixtures::build_fixtures(dir.path());
+
+    let ok = wab::records(&root, "shard_00/seg_00000001.wab.sealed", 0, 100).unwrap();
+    assert_eq!(ok.records.len(), 2);
+    assert!(ok.records[0].crc_ok && ok.records[1].crc_ok);
+    assert_eq!(ok.records[0].utf8_preview.as_deref(), Some("alpha"));
+    assert_eq!(ok.terminated_cleanly, Some(true)); // sentinel present
+
+    // The CRC-corrupt segment yields an error row for the bad record.
+    let bad = wab::records(&root, "shard_00/seg_00000005.wab.sealed", 0, 100).unwrap();
+    assert!(bad.records.iter().any(|r| r.error.is_some()));
+
+    // Path escape is rejected.
+    assert!(matches!(wab::records(&root, "../etc/passwd", 0, 10), Err(wab::WabError::BadPath(_))));
+}
