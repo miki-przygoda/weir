@@ -94,8 +94,8 @@ pub fn write_ok_stub(dir: &Path) -> Stub {
 printf '%s\n' "$*" >> "{log}"
 case "$*" in
   *metrics*) printf '%s' '{{"accepted":5,"ack":4,"nack":1,"fsync_avg_ms":50.0,"queue_depth":7,"wab_bytes_on_disk":4096,"dead_letter_bytes_on_disk":2048,"sink_type":"http","sink_health":"healthy","flusher_panics":0,"fsync_failures":0}}' ;;
-  *requeue*) case "$*" in *--yes*) printf '%s' '{{"requeued_records":5,"requeued_segments":2}}';; *) printf '%s' '{{"would_requeue_records":5,"would_requeue_segments":2,"unreadable":0}}';; esac ;;
-  *drop*) case "$*" in *--yes*) printf '%s' '{{"dropped":2,"dropped_bytes":1024}}';; *) printf '%s' '{{"dry_run":true,"candidate_segments":2,"candidate_records":5,"candidate_bytes":1024}}';; esac ;;
+  *requeue*) case "$*" in *--yes*) printf '%s' '{{"dry_run":false,"segments":2,"requeued_records":5,"segments_cleared":2,"skipped_segments":0,"delete_failures":0,"durability":"Batched"}}';; *) printf '%s' '{{"dry_run":true,"segments":2,"readable_segments":2,"unreadable_segments":0,"requeuable_records":5}}';; esac ;;
+  *drop*) case "$*" in *--yes*) printf '%s' '{{"dry_run":false,"candidates":2,"dropped":2,"dropped_bytes":1024,"failures":0}}';; *) printf '%s' '{{"dry_run":true,"candidates":2,"candidate_bytes":1024,"dropped":0,"dropped_bytes":0}}';; esac ;;
   *list*) printf '%s' '{{"dead_letter_dir":"/x/dead_letter","count":2,"total_bytes":1024,"segments":[{{"segment":"dl_00000001.wab.sealed","bytes":512}},{{"segment":"dl_00000002.wab.sealed","bytes":512}}]}}' ;;
   *) printf '%s' '{{}}' ;;
 esac
@@ -386,7 +386,7 @@ async fn requeue_preview_omits_yes_and_passes_durability() {
     let log = stub.args_log.clone();
     let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
     let v = ops::requeue(&cfg, Durability::Sync, false).await.unwrap();
-    assert_eq!(v["would_requeue_records"], 5);
+    assert_eq!(v["requeuable_records"], 5);
     let args = ops_support::read_args(&log);
     assert!(args.contains("requeue"), "{args}");
     assert!(args.contains("--durability sync"), "{args}");
@@ -412,7 +412,7 @@ async fn drop_preview_omits_yes_commit_passes_yes() {
     let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
 
     let prev = ops::drop_dl(&cfg, false).await.unwrap();
-    assert_eq!(prev["candidate_segments"], 2);
+    assert_eq!(prev["candidates"], 2);
     assert!(!ops_support::read_args(&log).contains("--yes"));
 
     let done = ops::drop_dl(&cfg, true).await.unwrap();
@@ -1006,9 +1006,11 @@ function statusLine(s) {
 function dlSummary(dl) { return `${dl.count || 0} dead-letter segment(s) · ${dl.total_bytes || 0} bytes`; }
 function dropConfirmMatches(typed, count) { return String(typed).trim() === String(count); }
 function requeuePreviewText(p) {
-  const recs = p.would_requeue_records ?? p.requeued_records ?? 0;
-  const segs = p.would_requeue_segments ?? p.requeued_segments ?? 0;
-  const skipped = p.unreadable ?? 0;
+  // weir-ctl dl requeue --json: dry-run -> {segments, readable_segments, unreadable_segments, requeuable_records};
+  // empty store -> {segments:0, requeued_records:0}; commit -> {segments, requeued_records, skipped_segments}.
+  const recs = p.requeuable_records ?? p.requeued_records ?? 0;
+  const segs = p.readable_segments ?? p.segments ?? 0;
+  const skipped = p.unreadable_segments ?? p.skipped_segments ?? 0;
   return `would requeue ${recs} record(s) from ${segs} segment(s)` +
     (skipped ? ` · ${skipped} corrupt segment(s) skipped` : "");
 }
@@ -1079,10 +1081,11 @@ async function dropFlow() {
   let preview;
   try { preview = await getJSON("/api/ops/drop/preview", { method: "POST" }); }
   catch (e) { openModal(`<p class="wc-bad">preview failed: ${e.message}</p><button id="x-close">close</button>`); $("#x-close").onclick = closeModal; return; }
-  const count = preview.candidate_segments ?? 0;
+  // weir-ctl dl drop --json dry-run -> {candidates, candidate_bytes} (whole-segment; no record count).
+  const count = preview.candidates ?? 0;
   openModal(
     `<div class="panel-title">Drop all dead-letter segments</div>
-     <p class="wc-bad">IRREVERSIBLE — would delete ${count} segment(s) / ${preview.candidate_records ?? 0} record(s) / ${preview.candidate_bytes ?? 0} bytes.</p>
+     <p class="wc-bad">IRREVERSIBLE — would delete ${count} segment(s) / ${preview.candidate_bytes ?? 0} bytes.</p>
      <label>Type the segment count (<b>${count}</b>) to confirm: <input id="dr-count" /></label>
      ${liveWarn()}
      <div class="wc-actions"><button id="dr-go" disabled>Drop</button><button id="dr-cancel">Cancel</button></div>
@@ -1232,7 +1235,7 @@ test("pure helpers format status / dl / previews / drop gate", () => {
   assert.equal(app.dlSummary(DL), "2 dead-letter segment(s) · 1024 bytes");
   assert.ok(app.dropConfirmMatches("2", 2));
   assert.ok(!app.dropConfirmMatches("1", 2));
-  assert.match(app.requeuePreviewText({ would_requeue_records: 5, would_requeue_segments: 2, unreadable: 0 }), /would requeue 5 record\(s\) from 2 segment\(s\)/);
+  assert.match(app.requeuePreviewText({ segments: 2, readable_segments: 2, unreadable_segments: 0, requeuable_records: 5 }), /would requeue 5 record\(s\) from 2 segment\(s\)/);
 });
 
 test("status header + dead-letter panel render from mock JSON", async () => {
@@ -1250,7 +1253,7 @@ test("drop flow: confirm button stays disabled until the typed count matches", a
   const dom = makeDom();
   const { fetchStub } = makeFetch({
     "/api/ops/status": { daemon: "down" },
-    "/api/ops/drop/preview": { dry_run: true, candidate_segments: 2, candidate_records: 5, candidate_bytes: 1024 },
+    "/api/ops/drop/preview": { dry_run: true, candidates: 2, candidate_bytes: 1024, dropped: 0, dropped_bytes: 0 },
   });
   const app = loadOps(dom.document, fetchStub);
   await app.refreshStatus(); // daemonLive = false
@@ -1267,8 +1270,8 @@ test("requeue flow: confirm calls the commit endpoint", async () => {
   const dom = makeDom();
   const { fetchStub, calls } = makeFetch({
     "/api/ops/status": { daemon: "down" },
-    "/api/ops/requeue/preview": { would_requeue_records: 5, would_requeue_segments: 2, unreadable: 0 },
-    "/api/ops/requeue": { requeued_records: 5, requeued_segments: 2 },
+    "/api/ops/requeue/preview": { dry_run: true, segments: 2, readable_segments: 2, unreadable_segments: 0, requeuable_records: 5 },
+    "/api/ops/requeue": { dry_run: false, segments: 2, requeued_records: 5, segments_cleared: 2, skipped_segments: 0, delete_failures: 0, durability: "batched" },
     "/api/ops/dead-letter": DL,
   });
   const app = loadOps(dom.document, fetchStub);
@@ -1286,7 +1289,7 @@ test("live daemon gates the action until the box is checked", async () => {
   const dom = makeDom();
   const { fetchStub, calls } = makeFetch({
     "/api/ops/status": UP, // daemon live
-    "/api/ops/drop/preview": { dry_run: true, candidate_segments: 2, candidate_records: 5, candidate_bytes: 1024 },
+    "/api/ops/drop/preview": { dry_run: true, candidates: 2, candidate_bytes: 1024, dropped: 0, dropped_bytes: 0 },
     "/api/ops/drop": { dropped: 2 },
   });
   const app = loadOps(dom.document, fetchStub);
@@ -1392,4 +1395,4 @@ git commit -m "docs(weir-console): README for the Ops Control Panel + fmt/clippy
 
 **Placeholder scan:** no TBD/TODO; every code step has complete code and exact commands with expected output.
 
-**Type consistency:** `OpsConfig { weir_ctl, wab_dir, metrics_addr, socket, read_only }`, `OpsError { NotFound, CtlFailed, BadOutput, ReadOnly }`, `Durability { Sync, Batched, Buffered }::{parse, as_str}`, and `ops::{status, dead_letter, requeue, drop_dl}` are used identically across the module, the server routes, `main`, and the tests. Frontend field reads (`s.daemon`, `s.summary.*`, `dl.count/segments[].segment/bytes`, `p.would_requeue_*`/`candidate_*`, `r.requeued_records`/`dropped`) match the verified `weir-ctl --json` shapes and the stub. The server keeps `router`/`router_with_static` working (delegating to `router_with_ops`) so the existing Explorer tests are unaffected.
+**Type consistency:** `OpsConfig { weir_ctl, wab_dir, metrics_addr, socket, read_only }`, `OpsError { NotFound, CtlFailed, BadOutput, ReadOnly }`, `Durability { Sync, Batched, Buffered }::{parse, as_str}`, and `ops::{status, dead_letter, requeue, drop_dl}` are used identically across the module, the server routes, `main`, and the tests. Frontend field reads match the REAL `weir-ctl --json` shapes (verified against the actual binary): `s.daemon`, `s.summary.{accepted,ack,nack,fsync_avg_ms,queue_depth,wab_bytes_on_disk,dead_letter_bytes_on_disk,sink_type,sink_health,flusher_panics,fsync_failures}`, `dl.{count,total_bytes,segments[].segment/bytes}`, requeue preview `{segments,readable_segments,unreadable_segments,requeuable_records}` + commit `{requeued_records,segments_cleared,skipped_segments}`, drop preview `{candidates,candidate_bytes}` + commit `{dropped,dropped_bytes,failures}` — and the stub emits these same names. The server keeps `router`/`router_with_static` working (delegating to `router_with_ops`) so the existing Explorer tests are unaffected.
