@@ -1,0 +1,25 @@
+[package]
+name = "weir-console"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Local tool: inspect a live/at-rest weir (WAB Explorer view)."
+
+[[bin]]
+name = "weir-console"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tower-http = { version = "0.6", features = ["fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+weir-core = { path = "../../crates/weir-core" }
+weir-wab = { path = "../../crates/weir-wab" }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }   # ServiceExt::oneshot for axum tests
