@@ -34,6 +34,8 @@
 //!
 //! See [`mod@format`] for the on-disk byte layout.
 
+#![deny(missing_docs)]
+
 pub mod format;
 
 use std::fs::File;
@@ -321,6 +323,7 @@ pub struct SegmentVerification {
 /// module's parse errors (`Display` + [`std::error::Error`], with a
 /// [`From<io::Error>`](From) so the streaming reads can use `?`).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SegmentVerifyError {
     /// An underlying I/O error while reading the file.
     Io(io::Error),
@@ -339,7 +342,16 @@ pub enum SegmentVerifyError {
     MissingFooter,
     /// The footer's `file_crc32` did not match a fresh CRC32 over all bytes
     /// before the sentinel — the canonical accidental-corruption signal.
-    CrcMismatch { expected: u32, computed: u32 },
+    CrcMismatch {
+        /// The `file_crc32` recorded in the footer.
+        expected: u32,
+        /// The CRC32 freshly computed over every pre-sentinel byte.
+        computed: u32,
+    },
+    /// The header, records, sentinel, and footer all parsed, but there are
+    /// extra bytes after the footer — a sealed segment ends at the footer, so a
+    /// trailing byte signals appended garbage or a concatenated second segment.
+    TrailingBytes,
 }
 
 impl std::fmt::Display for SegmentVerifyError {
@@ -360,6 +372,10 @@ impl std::fmt::Display for SegmentVerifyError {
             Self::CrcMismatch { expected, computed } => write!(
                 f,
                 "whole-file CRC mismatch: footer recorded {expected:#010x}, computed {computed:#010x}"
+            ),
+            Self::TrailingBytes => write!(
+                f,
+                "extra bytes after the footer: a sealed segment must end at its footer"
             ),
         }
     }
@@ -501,6 +517,16 @@ pub fn verify_sealed_segment(
         });
     }
 
+    // A sealed segment ends exactly at its footer. Any byte beyond it is
+    // appended garbage or a concatenated second segment — reject rather than
+    // silently accept a file whose tail we never validated.
+    let mut extra = [0u8; 1];
+    match reader.read(&mut extra) {
+        Ok(0) => {} // clean EOF: nothing trails the footer.
+        Ok(_) => return Err(SegmentVerifyError::TrailingBytes),
+        Err(e) => return Err(SegmentVerifyError::Io(e)),
+    }
+
     Ok(SegmentVerification { header, footer })
 }
 
@@ -522,7 +548,8 @@ pub enum SegmentState {
 /// checked most-specific-first so `.wab.sealed` / `.wab.confirmed` are not
 /// mis-classified as `.wab`. Files matching none of the three are ignored. The
 /// result is sorted deterministically by path.
-pub fn list_segment_files(dir: &Path) -> io::Result<Vec<(PathBuf, SegmentState)>> {
+pub fn list_segment_files(dir: impl AsRef<Path>) -> io::Result<Vec<(PathBuf, SegmentState)>> {
+    let dir = dir.as_ref();
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
@@ -675,6 +702,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // Iteration ends after the error.
         assert!(reader.next().is_none());
+        // A mid-stream error surfaces as an `Err` item, not a clean terminal
+        // branch — so neither `terminated_cleanly` flag is set.
+        assert_eq!(reader.terminated_cleanly(), None);
         std::fs::remove_file(&path).ok();
     }
 
@@ -961,6 +991,55 @@ mod tests {
         match verify_sealed_segment(&path) {
             Err(SegmentVerifyError::TooShort) => {}
             other => panic!("expected TooShort, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_rejects_trailing_bytes() {
+        // A valid sealed segment with one stray byte appended after the footer.
+        // Everything parses + CRCs match, but the file does not end at the
+        // footer, so the trailing-byte check rejects it.
+        let mut sealed = build_sealed_segment(4, &[b"alpha", b"beta"]);
+        sealed.bytes.push(0xAB);
+        let path = write_bytes("verify_trailing", &sealed.bytes);
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::TrailingBytes) => {}
+            other => panic!("expected TrailingBytes, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_rejects_bad_header() {
+        // Corrupt the header magic on an otherwise valid sealed segment: the
+        // header parse fails before any records are walked.
+        let mut sealed = build_sealed_segment(5, &[b"data"]);
+        sealed.bytes[0] = b'X'; // "WEIR" -> "XEIR"
+        let path = write_bytes("verify_bad_header", &sealed.bytes);
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::Header(_)) => {}
+            other => panic!("expected Header(..), got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_rejects_oversized_record() {
+        // Hand-build a segment whose first record declares a payload_len past
+        // MAX_PAYLOAD_HARD_CAP. The verifier rejects on the length check
+        // (BadRecord) before attempting to read/hash the bogus payload.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&build_segment_header(6));
+        let bogus_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
+        bytes.extend_from_slice(&bogus_len.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+        let path = write_bytes("verify_oversize", &bytes);
+        match verify_sealed_segment(&path) {
+            Err(SegmentVerifyError::BadRecord(e)) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            }
+            other => panic!("expected BadRecord on oversized record, got {other:?}"),
         }
         std::fs::remove_file(&path).ok();
     }

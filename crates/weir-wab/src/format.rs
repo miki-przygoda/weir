@@ -63,6 +63,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// but the FORMAT_VERSION byte distinguishes segment files from wire frames.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"WEIR";
 
+/// On-disk segment format version, byte `[4]` of the header. A reader rejects
+/// any header whose version byte is not this value.
 pub const FORMAT_VERSION: u8 = 1;
 
 /// Segment header size in bytes. Fixed for the lifetime of FORMAT_VERSION = 1.
@@ -77,7 +79,12 @@ pub const SENTINEL: [u8; 4] = [0u8; 4];
 /// Rotate the active segment when it reaches this size (including header).
 pub const SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Magic for a `.confirmed` sidecar file, bytes `[0..4]`. Distinct from
+/// [`SEGMENT_MAGIC`] so a misplaced segment file cannot be parsed as a
+/// confirmation file (`b"WCON"`).
 pub const CONFIRMED_MAGIC: [u8; 4] = *b"WCON";
+/// On-disk `.confirmed` file format version, byte `[4]`. A parse rejects any
+/// other value (quarantines rather than risk a double-drain).
 pub const CONFIRMED_VERSION: u8 = 1;
 /// Total byte length of a `.confirmed` file.
 pub const CONFIRMED_LEN: usize = 36;
@@ -147,8 +154,11 @@ pub fn build_segment_footer(
 /// Parsed confirmation file contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedMeta {
+    /// Seal timestamp copied from the segment footer, bytes `[8..16]` LE — unix nanoseconds.
     pub sealed_at: i64,
+    /// Number of records drained from the segment, bytes `[16..24]` LE.
     pub record_count: u64,
+    /// Timestamp when the drain completed, bytes `[24..32]` LE — unix nanoseconds.
     pub drained_at: i64,
 }
 
@@ -167,17 +177,28 @@ pub fn build_confirmed(sealed_at: i64, record_count: u64, drained_at: i64) -> [u
     buf
 }
 
+/// Why a [`parse_confirmed`] call failed. Carries `Display` +
+/// [`std::error::Error`] so callers can render or wrap it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConfirmedParseError {
     /// Not 36 bytes.
-    WrongLength { got: usize },
+    WrongLength {
+        /// The actual buffer length received.
+        got: usize,
+    },
     /// First four bytes are not `b"WCON"`.
     BadMagic,
     /// Version byte is not 1. Quarantine instead of treating as unconfirmed to
     /// avoid potential double-drain on unknown format.
     UnknownVersion(u8),
     /// CRC32 of bytes [0..32] does not match bytes [32..36].
-    CrcMismatch { expected: u32, computed: u32 },
+    CrcMismatch {
+        /// CRC32 read from the file's trailing 4 bytes.
+        expected: u32,
+        /// CRC32 freshly computed over bytes `[0..32]`.
+        computed: u32,
+    },
 }
 
 impl std::fmt::Display for ConfirmedParseError {
@@ -246,9 +267,13 @@ pub struct SegmentHeaderMeta {
 /// Why a [`parse_segment_header`] call failed. Mirrors the structured style of
 /// [`ConfirmedParseError`] (`Display` + [`std::error::Error`]).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SegmentHeaderParseError {
     /// Buffer length is not exactly [`SEGMENT_HEADER_LEN`].
-    WrongLength { got: usize },
+    WrongLength {
+        /// The actual buffer length received.
+        got: usize,
+    },
     /// First four bytes are not [`SEGMENT_MAGIC`] (`b"WEIR"`).
     BadMagic,
     /// Version byte is not [`FORMAT_VERSION`].
@@ -310,9 +335,13 @@ pub struct SegmentFooterMeta {
 /// no magic — it is located by file offset, immediately after the sentinel), so
 /// the only structural check is its length.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SegmentFooterParseError {
     /// Buffer length is not exactly [`SEGMENT_FOOTER_LEN`].
-    WrongLength { got: usize },
+    WrongLength {
+        /// The actual buffer length received.
+        got: usize,
+    },
 }
 
 impl std::fmt::Display for SegmentFooterParseError {

@@ -623,6 +623,15 @@ pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<
             quarantine(&confirmed_path, wab_dir, &reason)?;
             Err(io::Error::new(io::ErrorKind::InvalidData, reason))
         }
+        // `ConfirmedParseError` is `#[non_exhaustive]`; any future parse failure
+        // is also "cannot trust this .confirmed file", so quarantine and skip —
+        // the same conservative path as a bad CRC, never a silent accept.
+        Err(e) => {
+            let reason = format!("unparseable .confirmed file: {e}");
+            quarantine(sealed_path, wab_dir, &reason)?;
+            quarantine(&confirmed_path, wab_dir, &reason)?;
+            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+        }
     }
 }
 
