@@ -165,7 +165,7 @@
     },
     {
       "name": "ack_nonsync_durability_filler",
-      "notes": "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must ignore the durability field on responses.",
+      "notes": "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must not interpret the durability field on responses, but it stays a valid Durability value (0x01-0x03) that the decoder range-checks.",
       "hex": "574549520102030000000000c2e6837700000000",
       "decode": "ok",
       "message_type": "Ack",

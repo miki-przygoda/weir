@@ -7,9 +7,12 @@ use bytes::Bytes;
 /// Opaque payload bytes — a newtype over ref-counted [`bytes::Bytes`] so clones
 /// through the drain / sink path are O(1) instead of heap copies.
 ///
-/// `Payload` *wraps* `Bytes` rather than aliasing it so weir's 1.0 public API
-/// does not leak the `bytes` crate's semver: a future `bytes 2.0` would
-/// otherwise be a breaking change to weir's own 1.0. It derefs to `[u8]`, so
+/// `Payload` *wraps* `Bytes` rather than aliasing it, so the common path of
+/// weir's public API (slicing, `&[u8]` / `Vec<u8>` / `&str` interop) never names
+/// the `bytes` crate and is insulated from its semver. The zero-copy `Bytes`
+/// conversions (`From<Bytes>`, `From<Payload> for Bytes`, `into_bytes`) do
+/// expose `Bytes` deliberately, so a future `bytes 2.0` is a *contained* breaking
+/// surface there — not across the whole API. It derefs to `[u8]`, so
 /// slicing, indexing, iteration, `len()`, and `&payload` → `&[u8]` coercion all
 /// work transparently. `Debug` prints only the length — never the bytes — so a
 /// stray `debug!(?payload)` cannot leak (possibly sensitive) record contents.

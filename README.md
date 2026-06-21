@@ -25,7 +25,7 @@ daemon mid-flight, and watch unconfirmed segments replay, side by side with a
 naive insert-per-record baseline. No build step — open `demo/index.html` in any
 browser. *(Hosted version coming with the public launch.)*
 
-> **Status — 1.0.** The v1 wire protocol and public Rust API (`weir-core`,
+> **Status — 1.x (stable).** The v1 wire protocol and public Rust API (`weir-core`,
 > `weir-client`, `weir-sink-sdk`, `weir-wab`) are frozen under
 > [Semantic Versioning](https://semver.org/), with a
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
@@ -34,7 +34,7 @@ browser. *(Hosted version coming with the public launch.)*
 > `mysql`, `postgres` in the default build, plus `clickhouse` behind the opt-in
 > `clickhouse-sink` Cargo feature (see [Crates](#crates) and the
 > [configuration reference](docs/operations/configuration.md)). WAB flusher and
-> drain threads are panic-supervised. Publishing to crates.io with the 1.0 release.
+> drain threads are panic-supervised. Publishing to crates.io with the public release.
 
 ## How it works
 
