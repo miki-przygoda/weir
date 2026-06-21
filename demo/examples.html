@@ -32,6 +32,48 @@
     <p class="tag">Real shapes you can build — and exactly which crates each one pulls in. weir scales from a single-crate producer to a zero-dependency polyglot client to a full self-hosted pipeline.</p>
   </div>
 
+  <!-- POLYGLOT WIRE CLIENTS -->
+  <div class="sec-head"><span class="label">Polyglot wire clients</span><span class="rule"></span></div>
+  <p class="tag" style="margin-bottom:1.1rem">One wire, five languages, from the spec. Each is a from-scratch producer built only from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors — <b>zero weir-crate deps</b>, stdlib only — and each re-encodes all 28 canonical vectors byte-exact.</p>
+  <div class="grid cols-3">
+    <div class="card">
+      <h3>Python</h3>
+      <div class="chips"><span class="chip wire">28/28</span><span class="chip dim">stdlib only</span></div>
+      <p class="card-sub">Pure-Python producer over the Unix socket — <code class="inline">socket</code> · <code class="inline">struct</code> · <code class="inline">zlib</code>. Built in one pass from the spec.</p>
+      <p style="margin:0"><a href="clients/py.html">→ Python client</a></p>
+    </div>
+    <div class="card">
+      <h3>Go</h3>
+      <div class="chips"><span class="chip wire">28/28</span><span class="chip dim">+ 15-case live harness</span></div>
+      <p class="card-sub">Pure-Go producer plus an adversarial live harness that exercises every Nack reason against a running daemon.</p>
+      <p style="margin:0"><a href="clients/go.html">→ Go client</a></p>
+    </div>
+    <div class="card">
+      <h3>C</h3>
+      <div class="chips"><span class="chip wire">28/28</span><span class="chip dim">+ 109 checks</span></div>
+      <p class="card-sub">Dependency-free C telemetry producer — C stdlib + POSIX sockets. Built for embedded sensor nodes pushing fixed-width records.</p>
+      <p style="margin:0"><a href="clients/c.html">→ C client</a></p>
+    </div>
+    <div class="card">
+      <h3>Java</h3>
+      <div class="chips"><span class="chip wire">28/28</span><span class="chip dim">JDK stdlib only</span></div>
+      <p class="card-sub">JDK-only producer over a Unix domain socket — no Maven, no jars. An enterprise audit-event logger at Sync durability.</p>
+      <p style="margin:0"><a href="clients/java.html">→ Java client</a></p>
+    </div>
+    <div class="card">
+      <h3>TypeScript</h3>
+      <div class="chips"><span class="chip wire">28/28</span><span class="chip dim">Node stdlib only</span></div>
+      <p class="card-sub">Dependency-free Node producer — <code class="inline">node:net</code> · <code class="inline">node:zlib</code>. An async HTTP backend that durably logs each request.</p>
+      <p style="margin:0"><a href="clients/ts.html">→ TypeScript client</a></p>
+    </div>
+    <div class="card">
+      <h3>One wire spec</h3>
+      <div class="chips"><span class="chip wire">wire protocol only</span></div>
+      <p class="card-sub">All five speak the same 16-byte-header frame + payload + CRC32. The spec and vectors pin every byte — prove compatibility in any language.</p>
+      <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/conformance.html">→ conformance vectors</a></p>
+    </div>
+  </div>
+
   <!-- MATRIX -->
   <div class="sec-head"><span class="label">Crate-usage matrix</span><span class="rule"></span></div>
   <table class="tui-table">

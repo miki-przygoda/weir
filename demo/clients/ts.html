@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — TypeScript / Node wire client</title>
+<meta name="description" content="A dependency-free TypeScript/Node weir v1 wire-protocol producer for an async HTTP backend — built from the spec, zero weir-crate deps, 28/28 conformance vectors byte-exact." />
+<link rel="stylesheet" href="../weir.css" />
+</head>
+<body>
+
+<div class="statusbar top">
+  <span>weir 1.1.0 · polyglot wire client · TypeScript / Node</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">one wire, five languages, from the spec</span>
+</div>
+
+<nav class="nav">
+  <a href="../index.html">Demo</a>
+  <a href="../crates.html">Crates</a>
+  <a href="../examples.html" class="active">Examples</a>
+  <span class="nav-ext">
+    <a href="https://github.com/miki-przygoda/weir" target="_blank" rel="noopener">GitHub ↗</a>
+    <a href="https://miki-przygoda.github.io/weir" target="_blank" rel="noopener">Docs ↗</a>
+  </span>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <p class="role"><a href="../examples.html">← Example projects</a></p>
+    <h1>TypeScript <span class="accent">· weir wire client</span></h1>
+    <p class="tag">A dependency-free TypeScript/Node producer that speaks the weir v1 wire protocol over a Unix socket — built from the spec, <em>zero weir-crate deps</em>, no npm runtime deps. Node stdlib only (<code class="inline">node:net</code>, <code class="inline">node:zlib</code>).</p>
+    <div class="chips" style="gap:8px">
+      <span class="chip wire">28/28 conformance vectors</span>
+      <span class="chip wire">byte-exact</span>
+      <span class="chip dim">Node stdlib only</span>
+      <span class="chip dim">zero Rust deps</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">What it is</div>
+    <div class="panel-body">
+      <p>A dependency-free TypeScript producer built purely from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors — no weir crate, no npm runtime deps. A reference codec (<code class="inline">wire.ts</code>) and an async <code class="inline">WeirClient</code> (<code class="inline">client.ts</code>) doing serial request/response over one connection.</p>
+      <p style="margin-bottom:0">It demonstrates a realistic async-integrator use case: a Node <code class="inline">http</code> web backend that durably logs every request to weir from its handler. Runs <code class="inline">.ts</code> directly on stock Node — no build step.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Run it</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
+    <div class="panel-body">
+<pre class="code">node src/conformance.ts
+<span class="c"># -> conformance: 28/28 passed</span></pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requires Node &gt;= 22.6 for native TypeScript (runs <code class="inline">.ts</code> directly, no build step). Verified on Node v26.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Live <span class="pt-right">smoke test + HTTP request-logger demo</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="c"># start a daemon (unique socket / wab / metrics port):</span>
+weir-server --socket-path "$PWD/weir.sock" --wab-dir "$PWD/wab" \
+            --metrics-port 19100 --sink-type noop
+
+node examples/live-smoke.ts "$PWD/weir.sock" 19100   <span class="c"># -> all PASS, SMOKE OK</span>
+
+<span class="c"># request logger — each HTTP request becomes a durable record:</span>
+node examples/request-logger.ts "$PWD/weir.sock" 8787 &amp;
+curl -s localhost:8787/api/users</pre>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">The codec</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">src/wire.ts <span class="pt-right">frame encode — 16-byte header + payload + CRC32</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="c">// Encode a frame. Defaults to a Push at Sync durability.</span>
+<span class="k">export function</span> <span class="f">encodeFrame</span>(payload: <span class="t">Buffer</span>, opts: <span class="t">EncodeOpts</span> = {}): <span class="t">Buffer</span> {
+  <span class="k">const</span> messageType = opts.messageType ?? MessageType.Push;
+  <span class="k">const</span> durability = opts.durability ?? Durability.Sync;
+  <span class="k">const</span> flags = opts.flags ?? <span class="t">0</span>;
+
+  <span class="k">const</span> frame = <span class="t">Buffer</span>.<span class="f">allocUnsafe</span>(HEADER_LEN + payload.length + <span class="t">4</span>);
+  MAGIC.<span class="f">copy</span>(frame, <span class="t">0</span>);                          <span class="c">// "WEIR"</span>
+  frame.<span class="f">writeUInt8</span>(WIRE_VERSION, <span class="t">4</span>);
+  frame.<span class="f">writeUInt8</span>(messageType, <span class="t">5</span>);
+  frame.<span class="f">writeUInt8</span>(durability, <span class="t">6</span>);
+  frame.<span class="f">writeUInt8</span>(flags, <span class="t">7</span>);                    <span class="c">// reserved, must be 0</span>
+  frame.<span class="f">writeUInt32LE</span>(payload.length, <span class="t">8</span>);
+  frame.<span class="f">writeUInt32LE</span>(<span class="f">crc</span>(frame.<span class="f">subarray</span>(<span class="t">0</span>, <span class="t">12</span>)), <span class="t">12</span>); <span class="c">// header CRC</span>
+  payload.<span class="f">copy</span>(frame, HEADER_LEN);
+  frame.<span class="f">writeUInt32LE</span>(<span class="f">crc</span>(payload), HEADER_LEN + payload.length);
+  <span class="k">return</span> frame;
+}</pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">CRC is <code class="inline">node:zlib.crc32</code> (IEEE / ISO-3309), <em>not</em> CRC-32C — it matched every worked-example CRC on the first try.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Source</span><span class="rule"></span></div>
+  <p style="margin-top:0"><a href="https://github.com/miki-przygoda/weir/tree/main/demos/ts-wire-client" target="_blank" rel="noopener">→ demos/ts-wire-client on GitHub</a></p>
+  <p style="margin-top:0.4rem"><a href="../examples.html">← back to example projects</a></p>
+
+  <p class="foot">One of five from-spec polyglot wire clients shipped with
+     <a href="https://github.com/miki-przygoda/weir">weir</a> —
+     each speaks the same 16-byte-header wire protocol with zero weir-crate deps.
+     Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
+</div>
+
+</body>
+</html>

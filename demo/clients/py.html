@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — Python wire client</title>
+<meta name="description" content="A pure-Python, stdlib-only weir v1 wire-protocol producer — built from the spec, zero weir-crate deps, 28/28 conformance vectors byte-exact." />
+<link rel="stylesheet" href="../weir.css" />
+</head>
+<body>
+
+<div class="statusbar top">
+  <span>weir 1.1.0 · polyglot wire client · Python</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">one wire, five languages, from the spec</span>
+</div>
+
+<nav class="nav">
+  <a href="../index.html">Demo</a>
+  <a href="../crates.html">Crates</a>
+  <a href="../examples.html" class="active">Examples</a>
+  <span class="nav-ext">
+    <a href="https://github.com/miki-przygoda/weir" target="_blank" rel="noopener">GitHub ↗</a>
+    <a href="https://miki-przygoda.github.io/weir" target="_blank" rel="noopener">Docs ↗</a>
+  </span>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <p class="role"><a href="../examples.html">← Example projects</a></p>
+    <h1>Python <span class="accent">· weir wire client</span></h1>
+    <p class="tag">A pure-Python producer that speaks the weir v1 wire protocol straight to the daemon socket — built from the spec, <em>zero weir-crate deps</em>, stdlib only (<code class="inline">socket</code>, <code class="inline">struct</code>, <code class="inline">zlib</code>).</p>
+    <div class="chips" style="gap:8px">
+      <span class="chip wire">28/28 conformance vectors</span>
+      <span class="chip wire">byte-exact</span>
+      <span class="chip dim">stdlib only</span>
+      <span class="chip dim">zero Rust deps</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">What it is</div>
+    <div class="panel-body">
+      <p>A from-scratch, stdlib-only Python implementation of the weir v1 wire protocol — no Rust, no weir crates imported. It talks to the daemon over its <code class="inline">AF_UNIX</code> socket using the framing defined in <code class="inline">docs/wire_protocol.md</code>: a frame codec (<code class="inline">codec.py</code>) and a synchronous <code class="inline">WeirClient</code> with <code class="inline">push()</code> and <code class="inline">health_check()</code>.</p>
+      <p style="margin-bottom:0">It was built the way a polyglot developer would — working <em>only</em> from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors, never looking at the Rust source or the shipped reference codec. A working client fell out in one pass.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Run it</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
+    <div class="panel-body">
+<pre class="code">python3 tests/test_conformance.py        <span class="c"># -> "28/28 vectors passed"</span></pre>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Live <span class="pt-right">against a running weir-server</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="c"># 1. start a daemon (isolated socket / wab / metrics)</span>
+bash scripts/run_daemon.sh
+
+<span class="c"># 2. live validation against the running daemon</span>
+python3 tests/test_live.py weir.sock      <span class="c"># -> "11/11 live tests passed"</span>
+
+<span class="c"># 3. demo</span>
+python3 examples/produce.py weir.sock</pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">11/11 live tests pass against a real <code class="inline">weir-server</code>: health check, Push at all three durability tiers, 50 pipelined Pushes, and every server-enforced rejection.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">The codec</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">src/weir_wire/codec.py <span class="pt-right">frame encode — 16-byte header + payload + CRC32</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="k">def</span> <span class="f">encode_frame</span>(message_type, durability, payload, flags=<span class="t">0</span>):
+    <span class="s">"""Encode exactly one frame. Mirrors the wire layout table."""</span>
+    header = <span class="f">bytearray</span>(HEADER_LEN)
+    header[<span class="t">0</span>:<span class="t">4</span>] = MAGIC                <span class="c"># b"WEIR"</span>
+    header[<span class="t">4</span>] = WIRE_VERSION             <span class="c"># 1</span>
+    header[<span class="t">5</span>] = <span class="f">int</span>(message_type)
+    header[<span class="t">6</span>] = <span class="f">int</span>(durability)
+    header[<span class="t">7</span>] = flags                   <span class="c"># reserved, must be 0</span>
+    struct.<span class="f">pack_into</span>(<span class="s">"&lt;I"</span>, header, <span class="t">8</span>, <span class="f">len</span>(payload))
+    struct.<span class="f">pack_into</span>(<span class="s">"&lt;I"</span>, header, <span class="t">12</span>, <span class="f">_crc32</span>(<span class="f">bytes</span>(header[:<span class="t">12</span>])))
+    <span class="k">return</span> <span class="f">bytes</span>(header) + payload + struct.<span class="f">pack</span>(<span class="s">"&lt;I"</span>, <span class="f">_crc32</span>(payload))</pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">CRC is IEEE / ISO-3309 CRC-32 (Python's <code class="inline">zlib.crc32</code>), <em>not</em> CRC-32C. The encoder reproduces the spec's worked examples byte-for-byte.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Source</span><span class="rule"></span></div>
+  <p style="margin-top:0"><a href="https://github.com/miki-przygoda/weir/tree/main/demos/py-wire-client" target="_blank" rel="noopener">→ demos/py-wire-client on GitHub</a></p>
+  <p style="margin-top:0.4rem"><a href="../examples.html">← back to example projects</a></p>
+
+  <p class="foot">One of five from-spec polyglot wire clients shipped with
+     <a href="https://github.com/miki-przygoda/weir">weir</a> —
+     each speaks the same 16-byte-header wire protocol with zero weir-crate deps.
+     Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
+</div>
+
+</body>
+</html>
