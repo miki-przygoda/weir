@@ -74,7 +74,7 @@ async fn requeue_preview_omits_yes_and_passes_durability() {
     let log = stub.args_log.clone();
     let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
     let v = ops::requeue(&cfg, Durability::Sync, false).await.unwrap();
-    assert_eq!(v["would_requeue_records"], 5);
+    assert_eq!(v["requeuable_records"], 5);
     let args = ops_support::read_args(&log);
     assert!(args.contains("requeue"), "{args}");
     assert!(args.contains("--durability sync"), "{args}");
@@ -100,7 +100,7 @@ async fn drop_preview_omits_yes_commit_passes_yes() {
     let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
 
     let prev = ops::drop_dl(&cfg, false).await.unwrap();
-    assert_eq!(prev["candidate_segments"], 2);
+    assert_eq!(prev["candidates"], 2);
     assert!(!ops_support::read_args(&log).contains("--yes"));
 
     let done = ops::drop_dl(&cfg, true).await.unwrap();

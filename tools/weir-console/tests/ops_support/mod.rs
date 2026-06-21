@@ -21,8 +21,8 @@ pub fn write_ok_stub(dir: &Path) -> Stub {
 printf '%s\n' "$*" >> "{log}"
 case "$*" in
   *metrics*) printf '%s' '{{"accepted":5,"ack":4,"nack":1,"fsync_avg_ms":50.0,"queue_depth":7,"wab_bytes_on_disk":4096,"dead_letter_bytes_on_disk":2048,"sink_type":"http","sink_health":"healthy","flusher_panics":0,"fsync_failures":0}}' ;;
-  *requeue*) case "$*" in *--yes*) printf '%s' '{{"requeued_records":5,"requeued_segments":2}}';; *) printf '%s' '{{"would_requeue_records":5,"would_requeue_segments":2,"unreadable":0}}';; esac ;;
-  *drop*) case "$*" in *--yes*) printf '%s' '{{"dropped":2,"dropped_bytes":1024}}';; *) printf '%s' '{{"dry_run":true,"candidate_segments":2,"candidate_records":5,"candidate_bytes":1024}}';; esac ;;
+  *requeue*) case "$*" in *--yes*) printf '%s' '{{"dry_run":false,"segments":2,"requeued_records":5,"segments_cleared":2,"skipped_segments":0,"delete_failures":0,"durability":"Batched"}}';; *) printf '%s' '{{"dry_run":true,"segments":2,"readable_segments":2,"unreadable_segments":0,"requeuable_records":5}}';; esac ;;
+  *drop*) case "$*" in *--yes*) printf '%s' '{{"dry_run":false,"candidates":2,"dropped":2,"dropped_bytes":1024,"failures":0}}';; *) printf '%s' '{{"dry_run":true,"candidates":2,"candidate_bytes":1024,"dropped":0,"dropped_bytes":0}}';; esac ;;
   *list*) printf '%s' '{{"dead_letter_dir":"/x/dead_letter","count":2,"total_bytes":1024,"segments":[{{"segment":"dl_00000001.wab.sealed","bytes":512}},{{"segment":"dl_00000002.wab.sealed","bytes":512}}]}}' ;;
   *) printf '%s' '{{}}' ;;
 esac
