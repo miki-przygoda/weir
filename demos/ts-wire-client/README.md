@@ -79,8 +79,8 @@ optional per-request timeout destroys the socket on expiry.
 
 ## Conformance
 
-`src/conformance.ts` runs the codec against all **28 canonical vectors** (17
-valid frames + 11 rejection cases). For each it checks the decode outcome and —
+`src/conformance.ts` runs the codec against all **29 canonical vectors** (17
+valid frames + 12 rejection cases). For each it checks the decode outcome and —
 for `"ok"` frames — the decoded `message_type`, `durability`, `flags`, and
 payload, plus a **byte-exact re-encode** round-trip back to the vector `hex`. It
 reads the cap and vectors from `docs/conformance/wire_v1_vectors.json` (resolved
@@ -94,7 +94,7 @@ mismatch.
 cd demos/ts-wire-client
 
 # Offline codec conformance — no daemon needed
-node src/conformance.ts                 # -> conformance: 28/28 passed
+node src/conformance.ts                 # -> conformance: 29/29 passed
 #   (or via npm: npm run conformance)
 
 # Live: start a daemon with a unique socket/wab/metrics port
@@ -138,7 +138,7 @@ native `.ts` type-stripping sets the 22.6 floor — hence `"engines": {"node":
 |------|---------------|
 | `src/wire.ts`     | The wire codec: `encodeFrame` / `decodeFrame`, constants, the `as const` `MessageType` / `Durability` / `NackReason` maps, name helpers, `crc()` (`node:zlib`), and `DecodeError` / `DecodeErrorTag`. |
 | `src/client.ts`   | Async Unix-socket producer (`WeirClient`) over `node:net`: serial Push/HealthCheck → Ack/Nack with response framing, a 2-byte response cap, timeouts, and `WireError` / `NackError`. |
-| `src/conformance.ts` | Self-executing harness running the 28 vectors through the codec (decode + fields + byte-exact re-encode for valid frames, tag-match for rejections). |
+| `src/conformance.ts` | Self-executing harness running the 29 vectors through the codec (decode + fields + byte-exact re-encode for valid frames, tag-match for rejections). |
 | `examples/request-logger.ts` | The demo: a `node:http` backend that fire-and-forget Pushes a JSON access-log event per request at Buffered durability. |
 | `examples/live-smoke.ts` | End-to-end test against a running daemon: 3 durability tiers, empty-Push rejection, and a Prometheus metrics cross-check. |
 | `package.json`    | ESM, `private`, zero runtime deps, TypeScript-only devDep, `engines.node >=22.6`; scripts run `.ts` directly via `node`. |

@@ -39,7 +39,7 @@ stay additive.
   the connection usable, mirroring the oversized-payload guard).
 - **demos/ — 5-language polyglot wire clients** (C, Java, TypeScript, Python, Go) built
   from the spec + conformance vectors with no weir-crate dependency, each passing all
-  28 conformance vectors, plus per-client subpages in the demo bundle.
+  29 conformance vectors, plus per-client subpages in the demo bundle.
 
 ### Changed
 

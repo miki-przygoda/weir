@@ -125,7 +125,7 @@ It includes a small reference codec that passes all vectors, so it doubles as a
 worked non-Rust implementation:
 
 ```bash
-python3 docs/conformance/run_vectors.py   # "28/28 vectors passed"; non-zero exit on mismatch
+python3 docs/conformance/run_vectors.py   # "29/29 vectors passed"; non-zero exit on mismatch
 ```
 
 To validate **your own** client, replace its `decode_frame()` / `encode_frame()`

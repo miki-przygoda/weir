@@ -131,6 +131,16 @@ raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data"))
 raw[0:4] = b"XXXX"
 err("reject_bad_magic", "First four bytes are not \"WEIR\".", bytes(raw), "BadMagic")
 
+# partial-magic short buffer: length is checked BEFORE magic, so any buffer
+# shorter than the 16-byte header is TruncatedFrame regardless of its leading
+# bytes — even one whose first byte (0x57 = 'W') matches the magic. This pins
+# length-before-magic precedence (see wire_protocol.md step 1) so all reference
+# decoders agree; a magic-first decoder would wrongly return BadMagic here.
+err("reject_partial_magic_short",
+    "2-byte buffer 0x57 0x99 (first byte matches magic 'W', but shorter than the "
+    "16-byte header): TruncatedFrame, not BadMagic — length is checked first.",
+    bytes([0x57, 0x99]), "TruncatedFrame")
+
 # version mismatch (future version, CRC recomputed so version path fires, not CRC)
 raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data"))
 raw[4] = WIRE_VERSION + 1

@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>weir — Java wire client</title>
-<meta name="description" content="A stdlib-only JDK weir v1 wire-protocol producer for enterprise audit logging — built from the spec, zero weir-crate deps, 28/28 conformance vectors byte-exact." />
+<meta name="description" content="A stdlib-only JDK weir v1 wire-protocol producer for enterprise audit logging — built from the spec, zero weir-crate deps, 29/29 conformance vectors byte-exact." />
 <link rel="stylesheet" href="../weir.css" />
 </head>
 <body>
@@ -32,7 +32,7 @@
     <h1>Java <span class="accent">· weir wire client</span></h1>
     <p class="tag"><strong>An enterprise audit-event logger.</strong> A self-contained JDK producer that speaks the weir v1 wire protocol over a Unix domain socket — built from the spec, <em>zero weir-crate deps</em>, only the JDK standard library (no Maven, no Gradle, no third-party jars) — writing each audit event at <code class="inline">Sync</code> durability, so the producer only proceeds once the record is fsynced.</p>
     <div class="chips" style="gap:8px">
-      <span class="chip wire">28/28 conformance vectors</span>
+      <span class="chip wire">29/29 conformance vectors</span>
       <span class="chip wire">byte-exact</span>
       <span class="chip dim">JDK stdlib only</span>
       <span class="chip dim">zero Rust deps</span>
@@ -54,7 +54,7 @@
     <div class="panel-body">
 <pre class="code">javac -d out $(find src -name '*.java')
 java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
-<span class="c"># -> 28/28 vectors passed (4 encode round-trips verified)</span></pre>
+<span class="c"># -> 29/29 vectors passed (4 encode round-trips verified)</span></pre>
       <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: JDK stdlib only (<code class="inline">UnixDomainSocketAddress</code>, <code class="inline">java.util.zip.CRC32</code>, <code class="inline">ByteBuffer</code>) · requires JDK 21+ (current LTS) · tested on OpenJDK 25.</p>
     </div>
   </div>

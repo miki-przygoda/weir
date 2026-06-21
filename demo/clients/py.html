@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>weir — Python wire client</title>
-<meta name="description" content="A pure-Python, stdlib-only weir v1 wire-protocol producer — built from the spec, zero weir-crate deps, 28/28 conformance vectors byte-exact." />
+<meta name="description" content="A pure-Python, stdlib-only weir v1 wire-protocol producer — built from the spec, zero weir-crate deps, 29/29 conformance vectors byte-exact." />
 <link rel="stylesheet" href="../weir.css" />
 </head>
 <body>
@@ -32,7 +32,7 @@
     <h1>Python <span class="accent">· weir wire client</span></h1>
     <p class="tag"><strong>The reference from-spec client.</strong> A pure-Python producer that speaks the weir v1 wire protocol straight to the daemon socket — built <em>only</em> from the spec + conformance vectors (never the Rust source), <em>zero weir-crate deps</em>, stdlib only (<code class="inline">socket</code>, <code class="inline">struct</code>, <code class="inline">zlib</code>). The proof that the protocol alone is enough: a working client fell out in one pass.</p>
     <div class="chips" style="gap:8px">
-      <span class="chip wire">28/28 conformance vectors</span>
+      <span class="chip wire">29/29 conformance vectors</span>
       <span class="chip wire">byte-exact</span>
       <span class="chip dim">stdlib only</span>
       <span class="chip dim">zero Rust deps</span>
@@ -52,7 +52,7 @@
   <div class="panel">
     <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
     <div class="panel-body">
-<pre class="code">python3 tests/test_conformance.py        <span class="c"># -> "28/28 vectors passed"</span></pre>
+<pre class="code">python3 tests/test_conformance.py        <span class="c"># -> "29/29 vectors passed"</span></pre>
       <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: stdlib only (<code class="inline">socket</code>, <code class="inline">zlib</code>, <code class="inline">struct</code>) · requires Python 3.8+ · tested on 3.14.4.</p>
     </div>
   </div>

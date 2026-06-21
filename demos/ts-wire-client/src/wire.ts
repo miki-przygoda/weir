@@ -188,14 +188,14 @@ export function decodeFrame(
   buf: Buffer,
   maxPayload = MAX_PAYLOAD_HARD_CAP,
 ): DecodedFrame {
-  // A buffer that starts with valid magic but is shorter than the 16-byte
-  // header is TruncatedFrame, not BadMagic — a full header is required before
-  // any field is interpreted.
-  const magicLen = Math.min(4, buf.length);
-  if (!buf.subarray(0, magicLen).equals(MAGIC.subarray(0, magicLen))) {
+  // A buffer shorter than the 16-byte header is TruncatedFrame regardless of its
+  // leading bytes — magic is only interpreted once a complete header is present
+  // (length-before-magic, matching weir-core's Envelope::decode). So a 1–15 byte
+  // buffer never returns BadMagic even if its bytes differ from "WEIR".
+  if (buf.length < HEADER_LEN) throw new DecodeError("TruncatedFrame");
+  if (!buf.subarray(0, 4).equals(MAGIC)) {
     throw new DecodeError("BadMagic");
   }
-  if (buf.length < HEADER_LEN) throw new DecodeError("TruncatedFrame");
 
   // 2. version (before header CRC, so v2 -> VersionMismatch not HeaderCrcMismatch)
   const version = buf.readUInt8(4);

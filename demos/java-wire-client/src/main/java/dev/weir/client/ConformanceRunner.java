@@ -7,7 +7,7 @@ import java.util.Map;
 
 /**
  * Validates this Java codec against the canonical wire conformance vectors
- * ({@code docs/conformance/wire_v1_vectors.json}, 28 vectors).
+ * ({@code docs/conformance/wire_v1_vectors.json}, 29 vectors).
  *
  * <p>For each vector:
  * <ul>

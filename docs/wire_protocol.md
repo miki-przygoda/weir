@@ -115,7 +115,7 @@ The `VersionMismatch` second byte lets a client produce a specific error:
 
 The server decodes in this order to minimise DoS surface. **This order is mandatory and must not be changed.**
 
-1. **Magic** — cheapest check; eliminates non-weir traffic before any further work. Magic is validated against whatever leading bytes are present; a buffer that *starts* with valid magic but is shorter than the 16-byte header is `TruncatedFrame`, **not** `BadMagic` — a complete header is required before any field is interpreted.
+1. **Length, then magic** — a buffer shorter than the 16-byte header is `TruncatedFrame` **regardless of its leading bytes**; magic is only interpreted once a complete header is present. So a 1–15 byte buffer is *always* `TruncatedFrame` — never `BadMagic`, even if its bytes differ from `WEIR`. Once a full header is present, magic is the cheapest check and eliminates non-weir traffic before any further work. (Length-before-magic is the reference `Envelope::decode` order in `weir-core`; conformance vector `reject_partial_magic_short` pins it.)
 2. **Version** — checked before header CRC so a v2 client gets `VersionMismatch` (actionable) rather than `HeaderCrcMismatch` (confusing) when the frame layout has shifted between versions.
 3. **Header CRC** — validates the remaining header bytes are uncorrupted.
 4. **Header field parsing** — only after the header CRC passes are the `message_type`, `durability`, and reserved `flags` bytes interpreted. An unknown `message_type` (or `durability`) yields `UnknownMessage`; a nonzero reserved `flags` byte yields `ReservedFlagsSet`. Both close the connection. (Steps 1–4 are `Header::decode` in `weir-core`.)

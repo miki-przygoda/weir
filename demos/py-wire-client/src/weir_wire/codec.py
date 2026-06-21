@@ -111,12 +111,13 @@ def decode_frame(buf: bytes, max_payload_bytes: int = MAX_PAYLOAD_HARD_CAP) -> F
     Raises DecodeError(tag) on rejection, where `tag` is one of the
     conformance rejection tags (BadMagic, VersionMismatch, ...).
     """
-    # 1. Magic. A short buffer that *starts* with valid magic is TruncatedFrame.
-    n = min(len(buf), 4)
-    if buf[:n] != MAGIC[:n]:
-        raise DecodeError("BadMagic")
+    # 1. Length, then magic. A buffer shorter than the 16-byte header is
+    #    TruncatedFrame regardless of its leading bytes; magic is only interpreted
+    #    once a full header is present (length-before-magic, matching weir-core).
     if len(buf) < HEADER_LEN:
         raise DecodeError("TruncatedFrame")
+    if buf[:4] != MAGIC:
+        raise DecodeError("BadMagic")
 
     # 2. Version, before the header CRC.
     if buf[4] != WIRE_VERSION:

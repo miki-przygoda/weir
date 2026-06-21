@@ -78,8 +78,8 @@ permanent errors, verifies the daemon actually closes the connection.
 
 ## Conformance
 
-`conformance_test.go` runs the codec against all **28 canonical vectors** (17
-valid frames + 11 rejection cases). It first asserts the file's `wire_version`
+`conformance_test.go` runs the codec against all **29 canonical vectors** (17
+valid frames + 12 rejection cases). It first asserts the file's `wire_version`
 and `max_payload_hard_cap` match the client's constants, then for each vector
 checks the decode outcome and — for valid frames — the decoded `message_type`,
 `durability`, `flags`, and payload, plus a **byte-exact re-encode** back to the
@@ -93,7 +93,7 @@ vector `hex`. Vectors are read from `docs/conformance/wire_v1_vectors.json`
 ```bash
 # Offline codec conformance — no daemon needed (run from the demo dir)
 cd demos/go-wire-client
-go test ./...                              # 28/28 conformance vectors
+go test ./...                              # 29/29 conformance vectors
 
 # Live: start the daemon yourself with a unique socket/wab/port
 weir-server --socket-path ./weir.sock --wab-dir ./wab --metrics-port 19009 &

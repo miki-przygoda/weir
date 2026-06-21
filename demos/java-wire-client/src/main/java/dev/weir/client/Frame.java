@@ -93,19 +93,12 @@ public final class Frame {
      * @throws ProtocolException with a {@link DecodeError} tag on any violation
      */
     public static Frame decode(byte[] data) {
-        // 1. Magic. A buffer shorter than the full header that *starts* with
-        //    valid magic is TruncatedFrame, not BadMagic — so check length first.
+        // 1. Length, then magic. A buffer shorter than the 16-byte header is
+        //    TruncatedFrame regardless of its leading bytes; magic is only
+        //    interpreted once a full header is present (length-before-magic,
+        //    matching weir-core's Envelope::decode). So a 1-15 byte buffer is
+        //    never BadMagic, even if its bytes differ from "WEIR".
         if (data.length < Wire.HEADER_LEN) {
-            // Distinguish "not even a header" from "bad magic": if the leading
-            // bytes that ARE present diverge from MAGIC, it's BadMagic; otherwise
-            // it's a truncated header. The spec: "a complete header is required
-            // before any field is interpreted" => short-but-magic-prefix is truncation.
-            int cmp = Math.min(data.length, Wire.MAGIC.length);
-            for (int i = 0; i < cmp; i++) {
-                if (data[i] != Wire.MAGIC[i]) {
-                    throw new ProtocolException(DecodeError.BAD_MAGIC, "bad magic prefix");
-                }
-            }
             throw new ProtocolException(DecodeError.TRUNCATED_FRAME,
                 "buffer shorter than 16-byte header (" + data.length + " bytes)");
         }

@@ -180,6 +180,12 @@
       "decode": "BadMagic"
     },
     {
+      "name": "reject_partial_magic_short",
+      "notes": "2-byte buffer 0x57 0x99 (first byte matches magic 'W', but shorter than the 16-byte header): TruncatedFrame, not BadMagic \u2014 length is checked first.",
+      "hex": "5799",
+      "decode": "TruncatedFrame"
+    },
+    {
       "name": "reject_version_mismatch",
       "notes": "Version byte 0x02 with a valid CRC.",
       "hex": "574549520201010004000000e0cd4e0a6461746163f3f3ad",
