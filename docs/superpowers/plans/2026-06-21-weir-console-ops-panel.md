@@ -888,7 +888,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 Run: `cargo build --manifest-path tools/weir-console/Cargo.toml`
 Expected: `Finished`.
 Run: `cargo test --manifest-path tools/weir-console/Cargo.toml`
-Expected: all pass (5 wab + 14 ops).
+Expected: all pass (5 wab + 13 ops).
 
 - [ ] **Step 3: Curl smoke (Ops endpoints, no real daemon)**
 
@@ -1371,7 +1371,7 @@ Expected: clean. Fix any warning at the source (no `#[allow]`).
 - [ ] **Step 3: Full tool test + workspace-untouched check**
 
 Run: `cargo test --manifest-path tools/weir-console/Cargo.toml`
-Expected: all pass (5 wab + 14 ops integration).
+Expected: all pass (5 wab + 13 ops integration).
 Run: `node --test tools/weir-console/static/ops.test.mjs && node --test tools/weir-console/static/explorer.test.mjs`
 Expected: ops 5/5, explorer 3/3.
 Run: `cargo build --workspace && git status --short Cargo.lock`
