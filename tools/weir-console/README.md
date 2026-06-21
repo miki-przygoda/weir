@@ -1,15 +1,16 @@
 # weir-console
 
 A small local web tool for looking **inside** and **operating** a weir
-write-ahead-buffer (WAB) directory. Two views so far:
+write-ahead-buffer (WAB) directory. Three views:
 
 - **WAB Explorer** — a read-only forensics UI over the segments on disk: their
   lifecycle state, header/footer metadata, the records within (with CRC flags and
   payload previews), integrity/CRC verification, and the dead-letter store.
 - **Ops Control Panel** — dead-letter management (requeue / drop, with
   preview → confirm → execute) plus a live status header.
-
-A **Live** view is planned (nav placeholder for now).
+- **Live** — a real-time pipeline animation of a running daemon: polled metric
+  rates animate Producer→Socket→WAB→fsync→Ack→Drain→Sink, with live counters and
+  sparklines.
 
 This crate is **excluded from the root workspace** so its web dependencies
 never touch the published crates' lockfile or the main CI. It depends on
@@ -85,6 +86,27 @@ tested behavior rather than re-implementing it.
 > The console is unauthenticated and localhost-only by default; it both reveals record
 > contents and can mutate the dead-letter store. Do not expose it. Use `--read-only` for
 > shared/demo instances.
+
+## Live view
+
+The **Live** tab animates the weir pipeline at a **running daemon's** measured
+throughput. It polls the existing `/api/ops/status` (which shells out to
+`weir-ctl metrics --json`) every ~1.5s, computes per-second rates from the counter
+deltas, and renders:
+
+- **Counter cards** — accepted/ack/nack per second, queue depth, avg fsync ms, sink
+  health + type, dead-letter bytes, and a panic/fsync-failure alarm chip.
+- **A canvas pipeline** — dots spawn at the real accepted/sec and flow
+  Producer→…→Sink; the Drain stage shows the queue backlog and the Sink is tinted by
+  sink health.
+- **Sparklines** — a short rolling history of accepted/sec and queue depth.
+
+Honest scope: the daemon exposes only pull `/metrics` (no event stream), so Live shows
+**polled rates**, not per-record events; and the drain→sink stage reflects queue depth +
+sink health, not a per-second drain rate. With no daemon running, Live shows a clean
+"waiting for daemon…" state and resumes automatically. Live needs `--metrics-addr` to
+point at the daemon's `/metrics` (default `127.0.0.1:9185`) and `weir-ctl` to be
+resolvable (see the Ops flags).
 
 ## Theme
 
