@@ -22,6 +22,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      # The demo banners show the weir version via demo/version.js (single source,
+      # generated from [workspace.package] in Cargo.toml). Fail if it drifts — after
+      # a version bump, run scripts/sync-demo-version.sh and commit demo/version.js.
+      - run: ./scripts/sync-demo-version.sh && git diff --exit-code demo/version.js
 
   msrv:
     name: msrv (1.88)
