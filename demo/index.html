@@ -10,7 +10,7 @@
 <body>
 
 <div class="statusbar top">
-  <span>weir 1.1.0 · durable write-ahead buffer · Rust</span>
+  <span>weir 1.2.0 · durable write-ahead buffer · Rust</span>
   <span class="sb-spacer"></span>
   <span class="sb-dim">an ack is never a false ack</span>
 </div>
@@ -228,7 +228,7 @@
 "use strict";
 (function(){
   // ---- modeled real latencies (µs) ----
-  const WEIR_ACK_US = { Sync:390, Batched:390, Buffered:70 };  // local durable-write cost
+  const WEIR_ACK_US = { Sync:364, Batched:364, Buffered:69 };  // local durable-write cost
   const NAIVE_COMMIT_US = 8000;                                 // remote insert+commit round trip
   const TIER_COLOR = { Sync:"#38bdf8", Batched:"#a78bfa", Buffered:"#4ade80" };  // hr2 tier palette
 

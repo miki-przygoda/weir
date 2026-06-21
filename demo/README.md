@@ -5,8 +5,10 @@ a live simulation, plus subpages for the crates and example projects. No build
 step, no framework, no network beyond a web font: serve the `demo/` folder (or
 open the files with `file://`) and it runs.
 
-Styled to a **CGA / terminal-TUI aesthetic** (black + cyan/yellow/green,
-JetBrains Mono) to sit natively inside the host personal site.
+Styled to the shared **"hr2" palette** (dark neutral `#141414` background with
+sky `#38bdf8`, violet `#a78bfa`, green `#4ade80`, and rose `#f87171` accents;
+**Inter** body text with **JetBrains Mono** for labels/mono accents) to sit
+natively inside the host personal site.
 
 ## Pages
 
@@ -15,7 +17,8 @@ JetBrains Mono) to sit natively inside the host personal site.
 | `index.html` | **Landing + live simulation.** The pitch, the interactive Naive-vs-weir pipeline sim, "why weir", and a crate strip. |
 | `crates.html` | **The crates.** Which-crate-do-I-need table, a dependency diagram, and a card per crate (when to reach for it, deps, platform). |
 | `examples.html` | **Example projects by crate-ratio.** A crate-usage matrix + curated recipes spanning one crate → the full pipeline → a zero-Rust-dep wire client. |
-| `weir.css` | Shared theme (palette, components) used by all three pages. |
+| `clients/<lang>.html` | **Polyglot wire-client subpages** — one per language (`py`, `go`, `c`, `java`, `ts`). Each is a from-scratch, stdlib-only producer built from the wire spec + conformance vectors. Linked from `examples.html`. |
+| `weir.css` | Shared theme (palette, components) loaded by every page above. |
 
 The subpages are a **pitch / onboarding layer** — they link out to the canonical,
 versioned [docs site](https://miki-przygoda.github.io/weir) rather than
@@ -37,14 +40,15 @@ record" baseline:
 
 It's a *simulation*, not the daemon (no Unix-socket daemon in a browser), but the
 model follows weir's real semantics. Latency figures are rounded from the
-project's CI benchmarks (Sync/Batched ≈ 0.39 ms ack, Buffered ≈ 0.07 ms); the
+project's CI benchmarks (Sync/Batched ≈ 0.36 ms ack, Buffered ≈ 0.07 ms); the
 naive baseline models a synchronous insert + commit round-trip (~8 ms), one
 commit per record.
 
 ## Hosting / integration
 
-The bundle is self-contained — relative links between the three pages, one shared
-stylesheet, all JS inline. Drop the whole `demo/` folder onto any static host.
+The bundle is self-contained — relative links between the pages (including the
+`clients/<lang>.html` subpages), one shared stylesheet, all JS inline. Drop the
+whole `demo/` folder onto any static host.
 
 For the **Next.js personal site**, follow the existing static-demo precedent
 (`public/demo/<project>/`): copy this folder to `public/demo/weir/`, then link it
@@ -55,4 +59,5 @@ from the weir project page (or embed the simulation via an `<iframe>`):
 ```
 
 There are no absolute asset paths to fix up; only the cross-page links
-(`crates.html`, `examples.html`) and `weir.css`, all relative.
+(`crates.html`, `examples.html`, the `clients/<lang>.html` subpages) and
+`weir.css`, all relative.

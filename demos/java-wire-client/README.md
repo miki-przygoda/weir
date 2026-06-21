@@ -45,7 +45,7 @@ javac -d out $(find src -name '*.java')
 ## Run the conformance suite (no daemon needed)
 
 ```sh
-java -cp out dev.weir.client.ConformanceRunner resources/wire_v1_vectors.json
+java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
 # -> 28/28 vectors passed (4 encode round-trips verified)
 ```
 
