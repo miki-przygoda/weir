@@ -340,7 +340,9 @@ pub(crate) fn scan_unconfirmed_sealed(
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
-    shard_dirs.sort();
+    // Numeric shard order (not lexicographic): `shard_{id:02}` is a minimum
+    // width, so a plain sort would mis-order shard_100 before shard_20 (P2-F3).
+    shard_dirs.sort_by_key(|p| segment::shard_id_from_path(p));
 
     let mut unconfirmed = Vec::new();
     for sdir in shard_dirs {
@@ -377,7 +379,12 @@ pub(crate) fn scan_unconfirmed_sealed(
             .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
             .collect();
-        sealed_segments.sort(); // ascending counter order
+        // Ascending numeric counter order. A plain PathBuf sort is lexicographic,
+        // which tracks counter order only while every name shares the :08 digit
+        // width; past 99_999_999 segments the pad grows a 9th digit and
+        // "seg_100000000" would sort before "seg_99999999" (P2-F3). Parsing the
+        // counter keeps the order numerically correct and the claim honest.
+        sealed_segments.sort_by_key(|p| segment::segment_counter_from_path(p));
 
         for sealed in sealed_segments {
             match check_confirmed(&sealed, wab_dir) {

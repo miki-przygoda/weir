@@ -11,7 +11,7 @@ use super::format::{
     ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN,
     SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed, unix_nanos_now,
 };
-use super::segment::sealed_path_for;
+use super::segment::{sealed_path_for, segment_counter_from_path, shard_id_from_path};
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
@@ -19,18 +19,20 @@ use weir_core::MAX_PAYLOAD_HARD_CAP;
 /// unsealed `.wab` files found. Sealed files are left untouched by this function;
 /// the replay pass (in `spawn`) handles those.
 ///
-/// Shard directories are processed in sorted (name) order rather than
+/// Shard directories are processed in ascending numeric shard order rather than
 /// `read_dir`'s OS-arbitrary order. The recovery outcome is order-independent —
 /// each shard is recovered in isolation — but a deterministic order keeps the
 /// recovery logs reproducible and removes a latent `read_dir`-order dependence
 /// from the durability path.
 pub(crate) fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
     // Collect first (propagating any dirent error, as the streaming `?` did)
-    // so we can sort before processing.
+    // so we can sort before processing. Numeric shard order, not lexicographic:
+    // `shard_{id:02}` is a minimum width, so a plain sort would mis-order
+    // shard_100 before shard_20 once shard_count exceeds 100 (P2-F3).
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
-    shard_dirs.sort();
+    shard_dirs.sort_by_key(|p| shard_id_from_path(p));
 
     for shard_dir in shard_dirs {
         if !shard_dir.is_dir() {
@@ -99,10 +101,12 @@ fn audit_segment_modes(shard_dir: &Path, metrics: &Arc<Metrics>) {
 fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -> io::Result<()> {
     // Collect the unsealed `.wab` segments (propagating any dirent error, as the
     // streaming `?` did) and sort so recovery seals them in a deterministic
-    // counter order rather than read_dir's OS-arbitrary order. Each segment is
-    // sealed in isolation, so the outcome is order-independent; the sort is for
-    // reproducible logs and to keep the durability path free of read_dir-order
-    // dependence.
+    // ascending counter order rather than read_dir's OS-arbitrary order. Each
+    // segment is sealed in isolation, so the outcome is order-independent; the
+    // sort is for reproducible logs and to keep the durability path free of
+    // read_dir-order dependence. Sort by the parsed numeric counter, not a
+    // lexicographic PathBuf sort, which would mis-order past the :08 pad's 8th
+    // digit (P2-F3).
     let mut active: Vec<PathBuf> = fs::read_dir(shard_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?
@@ -112,7 +116,7 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
                 && path.to_string_lossy().ends_with(EXT_ACTIVE)
         })
         .collect();
-    active.sort();
+    active.sort_by_key(|p| segment_counter_from_path(p));
 
     for path in active {
         info!(path = %path.display(), "recovering unsealed WAB segment");

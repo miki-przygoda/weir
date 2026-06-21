@@ -324,6 +324,24 @@ pub(crate) fn segment_counter_from_path(path: &Path) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// Derives the shard index from a shard directory path — `shard_00` yields `0`,
+/// `shard_07` yields `7`, `shard_128` yields `128`. Shard directories are named
+/// `shard_{id:02}` (a *minimum* width, segment_path's sibling at mod.rs), so a
+/// lexicographic path sort only tracks numeric order while every id has the same
+/// digit count; past `shard_99` the names grow a third digit and `"shard_100"`
+/// would sort before `"shard_20"`. Parsing the id keeps shard ordering
+/// numerically correct — used only for reproducible recovery logs; recovery
+/// itself is per-shard-isolated and order-independent. Returns `None` for the
+/// daemon's reserved `quarantine/` and `dead_letter/` subdirs, which then sort
+/// first and are skipped by the recovery scans.
+pub(crate) fn shard_id_from_path(path: &Path) -> Option<usize> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("shard_")?
+        .parse()
+        .ok()
+}
+
 /// Formats a segment file name for a given shard directory and counter.
 pub(crate) fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
     shard_dir.join(format!("seg_{counter:08}{EXT_ACTIVE}"))
