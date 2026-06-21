@@ -72,3 +72,20 @@ fn verify_returns_ok_and_structured_error() {
     let bad = wab::verify(&root, "shard_00/seg_00000003.wab.sealed").unwrap();
     assert!(!bad.ok && bad.kind.as_deref() == Some("CrcMismatch"));
 }
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn http_segments_ok_and_bad_path_400() {
+    let dir = tempdir().unwrap();
+    let root = fixtures::build_fixtures(dir.path());
+    let app = weir_console::server::router(root.clone());
+
+    let resp = app.clone().oneshot(Request::get("/api/wab/segments").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app.oneshot(Request::get("/api/wab/segment?path=../x&offset=0&limit=10").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
