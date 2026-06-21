@@ -15,7 +15,7 @@ commits into 1. **An ack is never a false ack:** an acked record is on disk and
 replays after a crash.
 
 `~69 µs` Buffered (non-durable) ack p50 · `~364 µs` durable Sync ack p50 ·
-`~2,550` Sync RPS · `~58,600` RPS at the 48-connection cap
+`~2,550` Sync RPS · `~58,600` RPS at saturation (Buffered, ~64 threads)
 *(indicative — single box, sandboxed CI runners; reproduce on your own hardware, see [benchmarks](docs/benchmarks.md))* ·
 5 built-in sinks (4 in a default build; `clickhouse` opt-in) · v1 wire + Rust API frozen under SemVer
 
