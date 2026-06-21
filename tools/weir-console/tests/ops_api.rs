@@ -34,3 +34,33 @@ async fn run_ctl_nonzero_exit_surfaces_error_message() {
         other => panic!("expected CtlFailed, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn status_up_carries_metrics_summary() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
+    let v = ops::status(&cfg).await.unwrap();
+    assert_eq!(v["daemon"], "up");
+    assert_eq!(v["summary"]["sink_health"], "healthy");
+    assert_eq!(v["summary"]["queue_depth"], 7);
+}
+
+#[tokio::test]
+async fn status_down_when_ctl_fails() {
+    let dir = tempdir().unwrap();
+    let fail = ops_support::write_fail_stub(dir.path());
+    let cfg = cfg_with(fail, dir.path().to_path_buf());
+    let v = ops::status(&cfg).await.unwrap(); // a down daemon is not an error
+    assert_eq!(v["daemon"], "down");
+}
+
+#[tokio::test]
+async fn dead_letter_parses_list() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
+    let v = ops::dead_letter(&cfg).await.unwrap();
+    assert_eq!(v["count"], 2);
+    assert_eq!(v["segments"][0]["segment"], "dl_00000001.wab.sealed");
+}
