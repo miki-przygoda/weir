@@ -55,6 +55,7 @@
 <pre class="code">javac -d out $(find src -name '*.java')
 java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
 <span class="c"># -> 28/28 vectors passed (4 encode round-trips verified)</span></pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: JDK stdlib only (<code class="inline">UnixDomainSocketAddress</code>, <code class="inline">java.util.zip.CRC32</code>, <code class="inline">ByteBuffer</code>) · requires JDK 16+ for the <code class="inline">AF_UNIX</code> API · tested on OpenJDK 25.</p>
     </div>
   </div>
 

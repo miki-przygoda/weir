@@ -55,7 +55,8 @@
     <div class="panel-body">
 <pre class="code">make            <span class="c"># builds: conformance, telemetry, negative</span>
 ./conformance /path/to/weir/docs/conformance/wire_v1_vectors.json</pre>
-      <p style="margin-bottom:0; color:var(--n-fg-dim)">Expected: <code class="inline">vectors scanned: 28&nbsp;&nbsp;&nbsp;checks passed: 109&nbsp;&nbsp;&nbsp;failed: 0</code> → <em>C codec is wire-compatible with weir v1.</em> The strongest check is byte-exact re-encoding.</p>
+      <p style="color:var(--n-fg-dim)">Expected: <code class="inline">vectors scanned: 28&nbsp;&nbsp;&nbsp;checks passed: 109&nbsp;&nbsp;&nbsp;failed: 0</code> → <em>C codec is wire-compatible with weir v1.</em> The strongest check is byte-exact re-encoding.</p>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: C11 + POSIX sockets, no deps · requires a C11 compiler (<code class="inline">-std=c11</code>) · tested with clang 21.</p>
     </div>
   </div>
 
