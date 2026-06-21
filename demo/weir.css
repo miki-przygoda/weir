@@ -113,6 +113,19 @@ em { color: var(--n-accent); font-style: normal; }
 .nav .nav-ext { margin-left: auto; display: flex; gap: 1.2rem; }
 .nav .nav-ext a { color: var(--n-fg-dim); }
 .nav .nav-ext a:hover { color: var(--n-accent); }
+/* a clearly-visible "back" affordance in a nav bar (accent, not dimmed) */
+.nav a.nav-back { color: var(--n-accent); font-weight: 600; margin-right: 0.4rem; }
+
+/* a clean, spaced footer nav row — replaces cramped "·"-separated link lists */
+.pagenav {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 22px;
+  margin: 22px 0 6px; padding-top: 14px; border-top: 1px solid var(--n-border);
+  font-family: var(--mono); font-size: 0.82rem;
+}
+.pagenav a { color: var(--n-accent); }
+.pagenav .pn-back { font-weight: 600; }
+.pagenav .pn-right { margin-left: auto; color: var(--n-fg-dim); }
+.pagenav .pn-right:hover { color: var(--n-accent); }
 
 /* sticky nav needs a real wrapper backdrop; give the bar a full-bleed band */
 .nav::before {

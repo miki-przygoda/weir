@@ -21,9 +21,10 @@
 <div class="statusbar top">
   <span>weir-console · Explorer · <span data-weir-version></span></span>
   <span class="sb-spacer"></span>
-  <a class="sb-dim" href="../index.html">← weir demo</a> · <span class="sb-dim">sample data · no backend</span>
+  <span class="sb-dim">sample data · no backend</span>
 </div>
 <nav class="nav">
+  <a href="../index.html" class="nav-back">↩ weir demo</a>
   <a href="index.html" class="active">Explorer</a>
   <a href="ops.html">Ops</a>
   <a href="live.html">Live</a>
@@ -77,11 +78,17 @@
   <p style="margin-top:0">This page is a sample-data mock (no backend). Run the real thing against your own WAB directory:</p>
 <pre class="code">cargo run --manifest-path tools/weir-console/Cargo.toml -- --wab-dir <span class="t">&lt;dir&gt;</span>
 <span class="c"># opens the Explorer at http://127.0.0.1:8787 — read-only, localhost only</span></pre>
-  <p style="margin-top:0.6rem"><a href="https://github.com/miki-przygoda/weir/tree/main/tools/weir-console" target="_blank" rel="noopener">→ tools/weir-console on GitHub</a> · <a href="ops.html">next: Ops →</a></p>
-
   <p class="foot">weir-console — one local tool, three views (Explorer · Ops · Live).
      The Explorer is strictly read-only; Ops and Live act on a running daemon.
      Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
+
+  <div class="pagenav">
+    <a class="pn-back" href="../index.html">↩ weir demo</a>
+    <a href="index.html">Explorer</a>
+    <a href="ops.html">Ops</a>
+    <a href="live.html">Live</a>
+    <a class="pn-right" href="https://github.com/miki-przygoda/weir/tree/main/tools/weir-console" target="_blank" rel="noopener">tools/weir-console on GitHub ↗</a>
+  </div>
 </div>
 <script src="mock.js"></script>
 <script src="explorer.js"></script>

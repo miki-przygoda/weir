@@ -21,9 +21,10 @@
 <div class="statusbar top">
   <span>weir-console · Ops · <span data-weir-version></span></span>
   <span class="sb-spacer"></span>
-  <a class="sb-dim" href="../index.html">← weir demo</a> · <span class="sb-dim">sample data · no backend</span>
+  <span class="sb-dim">sample data · no backend</span>
 </div>
 <nav class="nav">
+  <a href="../index.html" class="nav-back">↩ weir demo</a>
   <a href="index.html">Explorer</a>
   <a href="ops.html" class="active">Ops</a>
   <a href="live.html">Live</a>
@@ -84,11 +85,17 @@
 <pre class="code">cargo run --manifest-path tools/weir-console/Cargo.toml -- \
   --wab-dir <span class="t">&lt;dir&gt;</span> --metrics-addr 127.0.0.1:9185 --socket /run/weir/weir.sock
 <span class="c"># open the Ops tab; --read-only disables requeue/drop for shared instances</span></pre>
-  <p style="margin-top:0.6rem"><a href="https://github.com/miki-przygoda/weir/tree/main/tools/weir-console" target="_blank" rel="noopener">→ tools/weir-console on GitHub</a> · <a href="index.html">← Explorer</a> · <a href="live.html">next: Live →</a></p>
-
   <p class="foot">weir-console — one local tool, three views (Explorer · Ops · Live).
      Ops mutations reuse <code class="inline">weir-ctl</code>; nothing here re-implements the durability-critical paths.
      Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
+
+  <div class="pagenav">
+    <a class="pn-back" href="../index.html">↩ weir demo</a>
+    <a href="index.html">Explorer</a>
+    <a href="ops.html">Ops</a>
+    <a href="live.html">Live</a>
+    <a class="pn-right" href="https://github.com/miki-przygoda/weir/tree/main/tools/weir-console" target="_blank" rel="noopener">tools/weir-console on GitHub ↗</a>
+  </div>
 </div>
 <div id="modal"></div>
 <script src="mock.js"></script>
