@@ -240,3 +240,26 @@ pub fn records(wab_dir: &Path, rel: &str, offset: usize, limit: usize) -> Result
     }
     Ok(RecordsResponse { file: rel.to_string(), header, records, terminated_cleanly: reader.terminated_cleanly() })
 }
+
+#[derive(Serialize)]
+pub struct DeadLetterSegmentJson { pub file: String, pub records: Vec<RecordJson>, pub terminated_cleanly: Option<bool> }
+#[derive(Serialize)]
+pub struct DeadLetterResponse { pub dead_letter_dir: String, pub segments: Vec<DeadLetterSegmentJson> }
+
+pub fn dead_letter(wab_dir: &Path) -> Result<DeadLetterResponse, WabError> {
+    let dl_dir = wab_dir.join("dead_letter");
+    let mut segments = Vec::new();
+    if dl_dir.is_dir() {
+        for (path, _state) in list_segment_files(&dl_dir)? {
+            let rel = format!("dead_letter/{}", path.file_name().unwrap().to_string_lossy());
+            let r = records(wab_dir, &rel, 0, 1000)?;
+            segments.push(DeadLetterSegmentJson { file: rel, records: r.records, terminated_cleanly: r.terminated_cleanly });
+        }
+    }
+    Ok(DeadLetterResponse { dead_letter_dir: dl_dir.to_string_lossy().into_owned(), segments })
+}
+
+pub fn verify(wab_dir: &Path, rel: &str) -> Result<IntegrityJson, WabError> {
+    let path = safe_join(wab_dir, rel)?;
+    Ok(match verify_sealed_segment(&path) { Ok(_) => IntegrityJson::ok(), Err(e) => IntegrityJson::from_err(&e) })
+}

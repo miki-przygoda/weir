@@ -53,3 +53,22 @@ fn records_reads_payloads_with_crc_and_termination() {
     // Path escape is rejected.
     assert!(matches!(wab::records(&root, "../etc/passwd", 0, 10), Err(wab::WabError::BadPath(_))));
 }
+
+#[test]
+fn dead_letter_lists_payload_records() {
+    let dir = tempdir().unwrap();
+    let root = fixtures::build_fixtures(dir.path());
+    let dl = wab::dead_letter(&root).unwrap();
+    assert_eq!(dl.segments.len(), 1);
+    assert_eq!(dl.segments[0].records.len(), 2);
+    assert_eq!(dl.segments[0].records[0].utf8_preview.as_deref(), Some("rejected-1"));
+}
+
+#[test]
+fn verify_returns_ok_and_structured_error() {
+    let dir = tempdir().unwrap();
+    let root = fixtures::build_fixtures(dir.path());
+    assert!(wab::verify(&root, "shard_00/seg_00000001.wab.sealed").unwrap().ok);
+    let bad = wab::verify(&root, "shard_00/seg_00000003.wab.sealed").unwrap();
+    assert!(!bad.ok && bad.kind.as_deref() == Some("CrcMismatch"));
+}
