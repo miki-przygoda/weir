@@ -1,11 +1,15 @@
 # weir-console
 
-A small local web tool for looking **inside** a weir write-ahead-buffer (WAB)
-directory. The first (and currently only) view is the **WAB Explorer**: a
-read-only forensics UI over the segments on disk — their lifecycle state,
-header/footer metadata, the records within (with CRC flags and payload
-previews), integrity/CRC verification, and the dead-letter store. An **Ops**
-and a **Live** view are planned (nav placeholders for now).
+A small local web tool for looking **inside** and **operating** a weir
+write-ahead-buffer (WAB) directory. Two views so far:
+
+- **WAB Explorer** — a read-only forensics UI over the segments on disk: their
+  lifecycle state, header/footer metadata, the records within (with CRC flags and
+  payload previews), integrity/CRC verification, and the dead-letter store.
+- **Ops Control Panel** — dead-letter management (requeue / drop, with
+  preview → confirm → execute) plus a live status header.
+
+A **Live** view is planned (nav placeholder for now).
 
 This crate is **excluded from the root workspace** so its web dependencies
 never touch the published crates' lockfile or the main CI. It depends on
@@ -46,6 +50,41 @@ All endpoints are rooted at the configured `--wab-dir` and return JSON:
   disk).
 - `GET /api/wab/verify?path=<rel>` — run full sealed-segment verification for
   one segment; returns the structured result or the structured error.
+
+## Ops Control Panel
+
+The **Ops** tab manages the **dead-letter store** and shows a live status header. It
+**shells out to `weir-ctl`** for every operation (`--json`), so it reuses the CLI's
+tested behavior rather than re-implementing it.
+
+- **Status header** — `weir-ctl metrics --json`: daemon up/down, sink health, accepted/
+  ack/nack, queue depth, avg fsync ms, WAB + dead-letter bytes, and panic/fsync-failure
+  alarms. A down daemon is shown plainly, not as an error.
+- **Requeue all** — re-submits every dead-lettered record through the daemon's socket
+  (at-least-once; the sink's idempotency key dedupes identical payloads). Shows a dry-run
+  preview, a durability selector, then executes.
+- **Drop all** — permanently deletes the dead-letter segments. Shows a dry-run preview
+  and requires typing the segment count to confirm.
+- When the daemon **appears live**, both actions require an extra confirmation.
+
+### Ops flags
+
+- `--metrics-addr <host:port>` — daemon `/metrics` for the status header (default
+  `127.0.0.1:9185`).
+- `--socket <path>` — daemon Unix socket used by requeue (default `/run/weir/weir.sock`).
+- `--weir-ctl <path>` — the `weir-ctl` binary (default: next to this exe, then `PATH`).
+- `--read-only` — disable all Ops mutations (requeue/drop + previews); status + listing
+  remain.
+
+### Ops HTTP API
+
+- `GET /api/ops/status`, `GET /api/ops/dead-letter`
+- `POST /api/ops/requeue/preview`, `POST /api/ops/requeue?durability=<sync|batched|buffered>`
+- `POST /api/ops/drop/preview`, `POST /api/ops/drop`
+
+> The console is unauthenticated and localhost-only by default; it both reveals record
+> contents and can mutate the dead-letter store. Do not expose it. Use `--read-only` for
+> shared/demo instances.
 
 ## Theme
 

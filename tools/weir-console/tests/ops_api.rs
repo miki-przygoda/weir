@@ -1,8 +1,8 @@
 #![cfg(unix)]
 mod ops_support;
+use std::path::PathBuf;
 use tempfile::tempdir;
 use weir_console::ops::{self, OpsConfig, OpsError};
-use std::path::PathBuf;
 
 fn cfg_with(weir_ctl: PathBuf, dir: PathBuf) -> OpsConfig {
     OpsConfig {
@@ -78,7 +78,10 @@ async fn requeue_preview_omits_yes_and_passes_durability() {
     let args = ops_support::read_args(&log);
     assert!(args.contains("requeue"), "{args}");
     assert!(args.contains("--durability sync"), "{args}");
-    assert!(!args.contains("--yes"), "preview must NOT pass --yes: {args}");
+    assert!(
+        !args.contains("--yes"),
+        "preview must NOT pass --yes: {args}"
+    );
 }
 
 #[tokio::test]
@@ -115,11 +118,23 @@ async fn read_only_blocks_mutations_without_spawning() {
     let log = stub.args_log.clone();
     let mut cfg = cfg_with(stub.bin, dir.path().to_path_buf());
     cfg.read_only = true;
-    assert!(matches!(ops::requeue(&cfg, Durability::Sync, true).await, Err(OpsError::ReadOnly)));
-    assert!(matches!(ops::drop_dl(&cfg, true).await, Err(OpsError::ReadOnly)));
-    assert!(matches!(ops::requeue(&cfg, Durability::Sync, false).await, Err(OpsError::ReadOnly)));
+    assert!(matches!(
+        ops::requeue(&cfg, Durability::Sync, true).await,
+        Err(OpsError::ReadOnly)
+    ));
+    assert!(matches!(
+        ops::drop_dl(&cfg, true).await,
+        Err(OpsError::ReadOnly)
+    ));
+    assert!(matches!(
+        ops::requeue(&cfg, Durability::Sync, false).await,
+        Err(OpsError::ReadOnly)
+    ));
     // The stub must never have run.
-    assert!(ops_support::read_args(&log).is_empty(), "read-only must not spawn weir-ctl");
+    assert!(
+        ops_support::read_args(&log).is_empty(),
+        "read-only must not spawn weir-ctl"
+    );
 }
 
 use axum::body::Body;
@@ -150,11 +165,22 @@ async fn http_status_and_dead_letter_ok() {
     let stub = ops_support::write_ok_stub(dir.path());
     let app = ops_router(stub.bin, dir.path().to_path_buf(), false);
 
-    let resp = app.clone().oneshot(Request::get("/api/ops/status").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/ops/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["daemon"], "up");
 
-    let resp = app.oneshot(Request::get("/api/ops/dead-letter").body(Body::empty()).unwrap()).await.unwrap();
+    let resp = app
+        .oneshot(
+            Request::get("/api/ops/dead-letter")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -165,20 +191,37 @@ async fn http_requeue_preview_no_yes_commit_yes() {
     let log = stub.args_log.clone();
     let app = ops_router(stub.bin, dir.path().to_path_buf(), false);
 
-    let resp = app.clone().oneshot(
-        Request::post("/api/ops/requeue/preview?durability=sync").body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/ops/requeue/preview?durability=sync")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = app.oneshot(
-        Request::post("/api/ops/requeue?durability=sync").body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let resp = app
+        .oneshot(
+            Request::post("/api/ops/requeue?durability=sync")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let args = ops_support::read_args(&log);
     // exactly one of the two requeue calls carried --yes (the commit, not the preview)
-    let yes_lines = args.lines().filter(|l| l.contains("requeue") && l.contains("--yes")).count();
-    let no_yes_lines = args.lines().filter(|l| l.contains("requeue") && !l.contains("--yes")).count();
+    let yes_lines = args
+        .lines()
+        .filter(|l| l.contains("requeue") && l.contains("--yes"))
+        .count();
+    let no_yes_lines = args
+        .lines()
+        .filter(|l| l.contains("requeue") && !l.contains("--yes"))
+        .count();
     assert_eq!(yes_lines, 1, "{args}");
     assert_eq!(no_yes_lines, 1, "{args}");
 }
@@ -188,9 +231,14 @@ async fn http_requeue_bad_durability_is_400() {
     let dir = tempdir().unwrap();
     let stub = ops_support::write_ok_stub(dir.path());
     let app = ops_router(stub.bin, dir.path().to_path_buf(), false);
-    let resp = app.oneshot(
-        Request::post("/api/ops/requeue?durability=bogus").body(Body::empty()).unwrap()
-    ).await.unwrap();
+    let resp = app
+        .oneshot(
+            Request::post("/api/ops/requeue?durability=bogus")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -199,8 +247,17 @@ async fn http_read_only_mutations_are_403() {
     let dir = tempdir().unwrap();
     let stub = ops_support::write_ok_stub(dir.path());
     let app = ops_router(stub.bin, dir.path().to_path_buf(), true);
-    for path in ["/api/ops/requeue", "/api/ops/requeue/preview", "/api/ops/drop", "/api/ops/drop/preview"] {
-        let resp = app.clone().oneshot(Request::post(path).body(Body::empty()).unwrap()).await.unwrap();
+    for path in [
+        "/api/ops/requeue",
+        "/api/ops/requeue/preview",
+        "/api/ops/drop",
+        "/api/ops/drop/preview",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(Request::post(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
     }
 }

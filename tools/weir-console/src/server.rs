@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
@@ -32,7 +32,9 @@ fn ops_err_response(e: ops::OpsError) -> Response {
     let code = match e {
         ops::OpsError::ReadOnly => StatusCode::FORBIDDEN,
         ops::OpsError::CtlFailed(_) => StatusCode::BAD_GATEWAY,
-        ops::OpsError::NotFound(_) | ops::OpsError::BadOutput(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ops::OpsError::NotFound(_) | ops::OpsError::BadOutput(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     };
     (code, Json(json!({ "error": e.to_string() }))).into_response()
 }
@@ -90,10 +92,10 @@ pub fn router_with_static(wab_dir: PathBuf, static_dir: PathBuf) -> Router {
 
 /// A default ops config (weir-ctl on PATH, weir-ctl/daemon defaults). Used by the
 /// Explorer-only constructors; `main`/tests inject a real one via `router_with_ops`.
-fn default_ops(wab_dir: &PathBuf) -> OpsConfig {
+fn default_ops(wab_dir: &Path) -> OpsConfig {
     OpsConfig {
         weir_ctl: PathBuf::from("weir-ctl"),
-        wab_dir: wab_dir.clone(),
+        wab_dir: wab_dir.to_path_buf(),
         metrics_addr: "127.0.0.1:9185".to_string(),
         socket: PathBuf::from("/run/weir/weir.sock"),
         read_only: false,

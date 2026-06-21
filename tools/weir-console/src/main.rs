@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use weir_console::ops::OpsConfig;
 
 #[derive(Parser)]
-#[command(name = "weir-console", about = "Inspect and operate a weir wab directory.")]
+#[command(
+    name = "weir-console",
+    about = "Inspect and operate a weir wab directory."
+)]
 struct Args {
     /// The weir wab directory to inspect (read-only Explorer + dead-letter target).
     #[arg(long)]
@@ -31,12 +34,12 @@ fn resolve_weir_ctl(explicit: Option<PathBuf>) -> PathBuf {
     if let Some(p) = explicit {
         return p;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("weir-ctl");
-            if cand.is_file() {
-                return cand;
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cand = dir.join("weir-ctl");
+        if cand.is_file() {
+            return cand;
         }
     }
     PathBuf::from("weir-ctl")
@@ -46,14 +49,20 @@ fn resolve_weir_ctl(explicit: Option<PathBuf>) -> PathBuf {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if !args.wab_dir.is_dir() {
-        eprintln!("weir-console: --wab-dir {:?} is not a directory", args.wab_dir);
+        eprintln!(
+            "weir-console: --wab-dir {:?} is not a directory",
+            args.wab_dir
+        );
         std::process::exit(2);
     }
 
     let weir_ctl = resolve_weir_ctl(args.weir_ctl);
     // Probe once so a misconfigured weir-ctl is a clear warning at startup, not a
     // surprise on the first Ops action. The Explorer works without it.
-    match std::process::Command::new(&weir_ctl).arg("--version").output() {
+    match std::process::Command::new(&weir_ctl)
+        .arg("--version")
+        .output()
+    {
         Ok(o) if o.status.success() => {}
         _ => eprintln!(
             "weir-console: warning — could not run weir-ctl at {:?}; Ops actions will error \

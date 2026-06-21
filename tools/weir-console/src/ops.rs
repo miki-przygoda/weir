@@ -2,9 +2,9 @@
 //! `--json` for every operation (status, dead-letter list, requeue, drop). Nothing
 //! here opens the daemon socket or parses /metrics directly — `weir-ctl` is the single
 //! tested execution path, so the console can't drift from the CLI's behavior.
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use serde_json::{Value, json};
 use tokio::process::Command;
 
 /// Where to find `weir-ctl` and which daemon/wab to target. Cloned into `AppState`.
@@ -96,9 +96,18 @@ async fn run_ctl(weir_ctl: &Path, args: &[&str]) -> Result<Value, OpsError> {
 /// (daemon down or wrong addr) is reported as `{"daemon":"down"}`, NOT an error — only a
 /// missing binary / bad output is a real error.
 pub async fn status(cfg: &OpsConfig) -> Result<Value, OpsError> {
-    match run_ctl(&cfg.weir_ctl, &["--json", "metrics", "--addr", cfg.metrics_addr.as_str()]).await {
-        Ok(summary) => Ok(json!({ "daemon": "up", "metrics_addr": cfg.metrics_addr, "summary": summary })),
-        Err(OpsError::CtlFailed(_)) => Ok(json!({ "daemon": "down", "metrics_addr": cfg.metrics_addr })),
+    match run_ctl(
+        &cfg.weir_ctl,
+        &["--json", "metrics", "--addr", cfg.metrics_addr.as_str()],
+    )
+    .await
+    {
+        Ok(summary) => {
+            Ok(json!({ "daemon": "up", "metrics_addr": cfg.metrics_addr, "summary": summary }))
+        }
+        Err(OpsError::CtlFailed(_)) => {
+            Ok(json!({ "daemon": "down", "metrics_addr": cfg.metrics_addr }))
+        }
         Err(other) => Err(other),
     }
 }
@@ -106,22 +115,35 @@ pub async fn status(cfg: &OpsConfig) -> Result<Value, OpsError> {
 /// The actionable dead-letter list (`weir-ctl dl list --json`).
 pub async fn dead_letter(cfg: &OpsConfig) -> Result<Value, OpsError> {
     let wab = cfg.wab_dir.to_string_lossy();
-    run_ctl(&cfg.weir_ctl, &["--json", "dl", "list", "--wab-dir", wab.as_ref()]).await
+    run_ctl(
+        &cfg.weir_ctl,
+        &["--json", "dl", "list", "--wab-dir", wab.as_ref()],
+    )
+    .await
 }
 
 /// Requeue ALL dead-letter records through the daemon (`weir-ctl dl requeue`).
 /// `commit = false` is a dry-run preview (no `--yes`); `commit = true` executes.
-pub async fn requeue(cfg: &OpsConfig, durability: Durability, commit: bool) -> Result<Value, OpsError> {
+pub async fn requeue(
+    cfg: &OpsConfig,
+    durability: Durability,
+    commit: bool,
+) -> Result<Value, OpsError> {
     if cfg.read_only {
         return Err(OpsError::ReadOnly);
     }
     let wab = cfg.wab_dir.to_string_lossy();
     let sock = cfg.socket.to_string_lossy();
     let mut args: Vec<&str> = vec![
-        "--json", "dl", "requeue",
-        "--wab-dir", wab.as_ref(),
-        "--socket", sock.as_ref(),
-        "--durability", durability.as_str(),
+        "--json",
+        "dl",
+        "requeue",
+        "--wab-dir",
+        wab.as_ref(),
+        "--socket",
+        sock.as_ref(),
+        "--durability",
+        durability.as_str(),
     ];
     if commit {
         args.push("--yes");
