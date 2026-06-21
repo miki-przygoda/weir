@@ -6,6 +6,10 @@ rust-version = "1.88"
 publish = false
 description = "Local tool: inspect a live/at-rest weir (WAB Explorer view)."
 
+[lib]
+name = "weir_console"
+path = "src/lib.rs"
+
 [[bin]]
 name = "weir-console"
 path = "src/main.rs"

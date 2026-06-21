@@ -45,9 +45,15 @@ pub fn build_fixtures(root: &Path) -> PathBuf {
     fs::write(shard.join("seg_00000001.wab.confirmed"),
         build_confirmed(1_700_000_000_000_000_000, 2, 1_700_000_001_000_000_000)).unwrap();
 
-    // A CRC-corrupt sealed segment: flip a payload byte AFTER building (footer CRC now mismatches)
+    // A CRC-corrupt sealed segment: flip a byte of the stored footer `file_crc32`
+    // (footer bytes [16..20]) so the recomputed file CRC no longer matches.
+    // NB: corrupting a *payload* byte instead would trip the per-record CRC check,
+    // which `verify_sealed_segment` performs *before* the file-level CRC, surfacing
+    // as `BadRecord` rather than `CrcMismatch`. Corrupting the stored file_crc32
+    // leaves every record CRC valid and isolates the file-level `CrcMismatch` path.
     let mut corrupt = segment_bytes(0, &[b"corruptme"], true);
-    corrupt[weir_wab::format::SEGMENT_HEADER_LEN + 8] ^= 0xff; // first payload byte
+    let footer_crc_off = corrupt.len() - weir_wab::format::SEGMENT_FOOTER_LEN + 16;
+    corrupt[footer_crc_off] ^= 0xff;
     fs::write(shard.join("seg_00000003.wab.sealed"), corrupt).unwrap();
 
     // A truncated sealed segment: drop the trailing footer bytes -> MissingFooter/NoSentinel
