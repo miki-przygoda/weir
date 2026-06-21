@@ -64,3 +64,60 @@ async fn dead_letter_parses_list() {
     assert_eq!(v["count"], 2);
     assert_eq!(v["segments"][0]["segment"], "dl_00000001.wab.sealed");
 }
+
+use ops::Durability;
+
+#[tokio::test]
+async fn requeue_preview_omits_yes_and_passes_durability() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let log = stub.args_log.clone();
+    let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
+    let v = ops::requeue(&cfg, Durability::Sync, false).await.unwrap();
+    assert_eq!(v["would_requeue_records"], 5);
+    let args = ops_support::read_args(&log);
+    assert!(args.contains("requeue"), "{args}");
+    assert!(args.contains("--durability sync"), "{args}");
+    assert!(!args.contains("--yes"), "preview must NOT pass --yes: {args}");
+}
+
+#[tokio::test]
+async fn requeue_commit_passes_yes() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let log = stub.args_log.clone();
+    let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
+    let v = ops::requeue(&cfg, Durability::Batched, true).await.unwrap();
+    assert_eq!(v["requeued_records"], 5);
+    assert!(ops_support::read_args(&log).contains("--yes"));
+}
+
+#[tokio::test]
+async fn drop_preview_omits_yes_commit_passes_yes() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let log = stub.args_log.clone();
+    let cfg = cfg_with(stub.bin, dir.path().to_path_buf());
+
+    let prev = ops::drop_dl(&cfg, false).await.unwrap();
+    assert_eq!(prev["candidate_segments"], 2);
+    assert!(!ops_support::read_args(&log).contains("--yes"));
+
+    let done = ops::drop_dl(&cfg, true).await.unwrap();
+    assert_eq!(done["dropped"], 2);
+    assert!(ops_support::read_args(&log).contains("--yes"));
+}
+
+#[tokio::test]
+async fn read_only_blocks_mutations_without_spawning() {
+    let dir = tempdir().unwrap();
+    let stub = ops_support::write_ok_stub(dir.path());
+    let log = stub.args_log.clone();
+    let mut cfg = cfg_with(stub.bin, dir.path().to_path_buf());
+    cfg.read_only = true;
+    assert!(matches!(ops::requeue(&cfg, Durability::Sync, true).await, Err(OpsError::ReadOnly)));
+    assert!(matches!(ops::drop_dl(&cfg, true).await, Err(OpsError::ReadOnly)));
+    assert!(matches!(ops::requeue(&cfg, Durability::Sync, false).await, Err(OpsError::ReadOnly)));
+    // The stub must never have run.
+    assert!(ops_support::read_args(&log).is_empty(), "read-only must not spawn weir-ctl");
+}

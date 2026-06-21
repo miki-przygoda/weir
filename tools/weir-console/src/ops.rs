@@ -108,3 +108,37 @@ pub async fn dead_letter(cfg: &OpsConfig) -> Result<Value, OpsError> {
     let wab = cfg.wab_dir.to_string_lossy();
     run_ctl(&cfg.weir_ctl, &["--json", "dl", "list", "--wab-dir", wab.as_ref()]).await
 }
+
+/// Requeue ALL dead-letter records through the daemon (`weir-ctl dl requeue`).
+/// `commit = false` is a dry-run preview (no `--yes`); `commit = true` executes.
+pub async fn requeue(cfg: &OpsConfig, durability: Durability, commit: bool) -> Result<Value, OpsError> {
+    if cfg.read_only {
+        return Err(OpsError::ReadOnly);
+    }
+    let wab = cfg.wab_dir.to_string_lossy();
+    let sock = cfg.socket.to_string_lossy();
+    let mut args: Vec<&str> = vec![
+        "--json", "dl", "requeue",
+        "--wab-dir", wab.as_ref(),
+        "--socket", sock.as_ref(),
+        "--durability", durability.as_str(),
+    ];
+    if commit {
+        args.push("--yes");
+    }
+    run_ctl(&cfg.weir_ctl, &args).await
+}
+
+/// Drop ALL dead-letter segments (`weir-ctl dl drop`). `commit = false` is a dry-run
+/// preview (no `--yes`); `commit = true` deletes.
+pub async fn drop_dl(cfg: &OpsConfig, commit: bool) -> Result<Value, OpsError> {
+    if cfg.read_only {
+        return Err(OpsError::ReadOnly);
+    }
+    let wab = cfg.wab_dir.to_string_lossy();
+    let mut args: Vec<&str> = vec!["--json", "dl", "drop", "--wab-dir", wab.as_ref()];
+    if commit {
+        args.push("--yes");
+    }
+    run_ctl(&cfg.weir_ctl, &args).await
+}
