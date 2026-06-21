@@ -116,11 +116,14 @@ without it) but logs a clear warning, and every `/api/ops/*` call returns a stru
 
 `ops.html` + `ops.js`, hr2-styled by reusing `weir.css` and the console shell. Layout:
 
-- **Live-status header** — polls `GET /api/ops/status` every few seconds (the existing
-  page-visibility-friendly cadence): a daemon **up/down** dot, a one-line shard summary,
-  drain lag / stranded count, dead-letter count + bytes, **sink health**, and fsync
-  p50/p99 — taken from the `weir-ctl metrics --json` summary. If the daemon is down the
-  header shows it clearly and is not an error.
+- **Live-status header** — polls `GET /api/ops/status` every few seconds: a daemon
+  **up/down** indicator, **sink health** + type, accepted/ack/nack counters, **queue
+  depth** (drain backlog), average fsync ms, WAB + dead-letter bytes on disk, and
+  **flusher-panic / fsync-failure** alarms (highlighted when non-zero) — exactly the
+  fields `weir-ctl metrics --json` exposes (`accepted`, `ack`, `nack`, `fsync_avg_ms`,
+  `queue_depth`, `wab_bytes_on_disk`, `dead_letter_bytes_on_disk`, `sink_type`,
+  `sink_health`, `flusher_panics`, `fsync_failures`). It is system-wide totals, not
+  per-shard. If the daemon is down the header shows it clearly and is not an error.
 - **Dead-letter panel** — the `dl list` view (segments, records, bytes) plus two actions:
   - **Requeue all** → calls the requeue *preview* → a modal shows "would requeue R
     records from M segments (X corrupt segment(s) skipped)", a **durability selector**
