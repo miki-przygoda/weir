@@ -1533,7 +1533,7 @@ mod tests {
         );
     }
 
-    /// Random-seed sweep across the two fault scenarios. Every run checks its
+    /// Random-seed sweep across the five fault scenarios. Every run checks its
     /// invariants in-harness, so any seed that breaks one fails here with a
     /// pin-able repro. The count is `WEIR_DST_SWEEP` (small by default so PR
     /// runs stay fast; the CI `dst` job cranks it up).

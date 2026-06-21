@@ -75,7 +75,7 @@ jobs:
       # Builds the WAB deterministic-simulation harness with the `dst` feature
       # ON (compile-checks the non-test path too), replays every pinned
       # regression seed in tests/dst_seeds/, and runs a deeper random-seed
-      # sweep than the default `cargo test` (300 seeds × 2 fault scenarios).
+      # sweep than the default `cargo test` (300 seeds × 5 fault scenarios).
       # A violated durability invariant fails here with a WEIR_DST_SEED repro.
       - name: DST scenarios + regression seeds + sweep
         env:

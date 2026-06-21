@@ -195,7 +195,7 @@ listener is available behind the `tls` feature for cross-host producers.
   platform; run production on Linux.)
 - **Deterministic simulation (DST):** the WAB durability invariants are checked
   under injected crash/fault schedules with **replayable seeds**, on every CI run
-  (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md).
+  (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md#testing-infrastructure).
 - **Language-neutral conformance vectors:** canonical hex frames plus the result
   a conformant decoder must produce for every message type, all nine Nack
   reasons, and each rejection case — run your own codec against them
