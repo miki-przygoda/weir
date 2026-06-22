@@ -1834,4 +1834,48 @@ weir_sink_info{sink_type=\"http\"} 1
         // The error text is preserved verbatim (operator hint included).
         assert_eq!(v["error"].as_str().unwrap(), err);
     }
+
+    #[test]
+    fn parse_durability_is_case_insensitive_and_rejects_unknown() {
+        assert_eq!(parse_durability("SYNC").unwrap(), Durability::Sync);
+        assert_eq!(parse_durability("batched").unwrap(), Durability::Batched);
+        assert_eq!(parse_durability("BuFfErEd").unwrap(), Durability::Buffered);
+        let err = parse_durability("fast").unwrap_err();
+        assert!(
+            err.contains("sync") && err.contains("batched") && err.contains("buffered"),
+            "the error must name the three valid values, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // clap's own structural self-check (catches conflicting flags, bad
+        // value_parsers, duplicate names) — a compile-adjacent guard on the CLI.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn metric_primitives_sum_get_and_active_label() {
+        let body = "\
+weir_records_accepted_total{tier=\"sync\"} 3
+weir_records_accepted_total{tier=\"buffered\"} 4
+weir_records_accepted_total 99
+weir_queue_depth 7
+weir_sink_health{state=\"healthy\"} 1
+weir_sink_health{state=\"degraded\"} 0
+";
+        // sum_metric sums every line sharing the prefix (label series + bare).
+        assert_eq!(sum_metric(body, "weir_records_accepted_total"), 3.0 + 4.0 + 99.0);
+        // get_metric matches the EXACT bare metric (a space after the name), not a
+        // labelled sibling and not a longer-named metric.
+        assert_eq!(get_metric(body, "weir_queue_depth"), Some(7.0));
+        assert_eq!(get_metric(body, "weir_records_accepted_total"), Some(99.0));
+        assert_eq!(get_metric(body, "weir_sink_health"), None); // only labelled series
+        // active_label returns the label of the series whose value == 1.0.
+        assert_eq!(
+            active_label(body, "weir_sink_health", "state").as_deref(),
+            Some("healthy")
+        );
+    }
 }
