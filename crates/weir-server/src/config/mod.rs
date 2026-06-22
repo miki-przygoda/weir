@@ -1015,6 +1015,12 @@ mod tests {
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
+        // Secure-by-design: /metrics binds localhost by default, never 0.0.0.0 —
+        // catches a regression that would expose the unauthenticated endpoint.
+        assert_eq!(
+            c.metrics_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
         assert_eq!(c.shutdown_timeout_secs, 30);
         assert_eq!(c.connection_read_timeout_secs, 30);
         assert_eq!(c.sink_type, SinkType::Noop);
@@ -1361,6 +1367,19 @@ mod tests {
         });
         assert_knob_rejected("rng_health_poll", "health_poll_interval_secs", |p| {
             p.health_poll_interval_secs = Some(3_601)
+        });
+        // Bespoke `== 0` guards (not check_range, but the same "a 0 must not boot a
+        // broken daemon" contract): a zero payload cap, metrics port, or shutdown
+        // timeout is a foreseeable fat-finger that would break ingest / metrics /
+        // graceful drain.
+        assert_knob_rejected("rng_max_payload", "max_payload_bytes", |p| {
+            p.max_payload_bytes = Some(0)
+        });
+        assert_knob_rejected("rng_metrics_port", "metrics_port", |p| {
+            p.metrics_port = Some(0)
+        });
+        assert_knob_rejected("rng_shutdown_to", "shutdown_timeout_secs", |p| {
+            p.shutdown_timeout_secs = Some(0)
         });
     }
 
