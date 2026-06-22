@@ -583,6 +583,24 @@ mod tests {
         assert_eq!(env, decoded);
     }
 
+    /// F49: Envelope::new makes the payload authoritative for the header's
+    /// payload_len. The >4 GiB saturation arm is intentionally untestable without
+    /// a multi-GiB allocation, but pinning the equality across the realistic
+    /// in-cap range proves no `as`-truncation snuck in (a declared len that
+    /// disagreed with the payload would be a desync the crown invariant relies on
+    /// never happening).
+    #[test]
+    fn envelope_new_payload_len_equals_payload_length() {
+        for len in [0usize, 1, 7, 256, 65_536, 1_000_000] {
+            let env = Envelope::new(push_header(), vec![0xAB; len]);
+            assert_eq!(
+                env.header().payload_len() as usize,
+                len,
+                "payload_len must equal the actual payload length for len={len}"
+            );
+        }
+    }
+
     #[test]
     fn envelope_decode_rejects_truncated_header() {
         let env = Envelope::new(push_header(), b"data".to_vec());
