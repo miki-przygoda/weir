@@ -13,6 +13,79 @@ protocol** below.
 
 ---
 
+## [1.3.0] - 2026-06-22
+
+Hardening + test-completeness release from four pre-publication sweeps (three
+adversarial bug-hunts plus a per-logic-layer action audit covering all 204
+actions on two axes: behavioural test coverage and "the operator cannot
+accidentally break their own system"). Two operator-foolproofing guardrails, a
+few additive APIs, and ~30 new tests. No wire, on-disk-format, or existing-API
+breaks — a clean minor.
+
+### Added
+
+- **weir-core — `From<MessageType> for u8`**, completing the symmetric
+  `TryFrom<u8>` ⇄ `From<Self>` pair the other frozen wire enums (`Durability`,
+  `NackReason`) already expose.
+- **weir-wab — `SegmentVerifyError::FooterMismatch`** (the enum is
+  `#[non_exhaustive]`): `verify_sealed_segment` now cross-checks the footer's
+  `record_count` / `data_bytes` against the records actually walked — the one
+  segment region the whole-file CRC does not cover.
+- **`weir_recovery_quarantine_copy_failed_total`** metric — an alertable signal
+  that recovery is stuck on a corrupt segment it cannot preserve (see Reliability).
+- **weir-core — `NackReason` is now `#[non_exhaustive]`** so promoting a reserved
+  reason byte (`0x0A`–`0xFF`) is an additive, not breaking, change.
+
+### Reliability
+
+- **Recovery fails closed on an un-preservable corrupt tail.** When a mid-file
+  corrupt segment's quarantine *copy* fails (disk full / read-only mount / inode
+  exhaustion), recovery no longer truncates the valid prefix — that discarded any
+  acked-durable records sitting after the corruption. It now leaves the segment
+  untouched, returns an error (left for manual inspection), and bumps
+  `weir_recovery_quarantine_copy_failed_total`, so the crown invariant (an acked
+  record is never lost) holds even when preservation is impossible.
+- **`tls_handshake_timeout_secs` is range-validated `[1, 300]`.** A `0` (a
+  plausible fat-finger) previously made every TLS handshake time out instantly,
+  silently rejecting all TCP/mTLS clients while the daemon looked healthy.
+- **WAB segment + shard-directory ordering is numeric, not lexicographic** — the
+  documented "ascending counter order" held only while every name shared the same
+  zero-pad width.
+- **weir-ctl `dl requeue` skips a torn / unsealed `.wab.sealed` tail** instead of
+  pushing its readable prefix and then deleting the file (which silently dropped
+  the torn remainder).
+- **Accept loop reaps finished connection handlers** each iteration (the `JoinSet`
+  was only drained at shutdown, growing unbounded under many short connections).
+
+### Wire protocol & conformance
+
+- **Canonical decode order is length-before-magic** across the Rust reference and
+  all five polyglot demo decoders; the Java decoder's field-parse order was fixed
+  to match (`message_type` → `durability` → reserved flags). The conformance suite
+  grew to **30 vectors** (`reject_partial_magic_short`,
+  `reject_flags_and_unknown_durability`) to pin both precedences. No wire-format
+  change — only which rejection tag a malformed frame carries.
+
+### Tests
+
+- **Per-layer action audit** added ~30 tests across all 11 layers, closing the
+  coverage + secure-by-design gaps it surfaced: the client mTLS `connect_tls`
+  trust boundary (previously zero-coverage), DST mid-batch rotation ack-fate +
+  seal-error-during-rotation, client refuse-and-poison on hostile daemon
+  responses, sink bearer / basic-auth delivery on the wire, the drain
+  commit-timeout-resumes-past-cursor + supervisor give-up paths, recovery
+  symlink / format-version trust boundaries, and the config range / zero guards.
+
+### Docs
+
+- Truth-ups: the architecture durability-tier claim (Buffered does **not** uphold
+  "ack ⇒ durable"), the README throughput headline, the README→architecture DST
+  cross-reference plus a "Deterministic Simulation Testing" section, version-
+  agnostic crates.io-publish framing, and the conformance-vector counts across the
+  demos.
+
+---
+
 ## [1.2.0] - 2026-06-21
 
 Additive operability + ecosystem release from the post-1.1 finalization sweeps: a
@@ -1566,6 +1639,7 @@ The five commits making up this pass:
 
 ---
 
+[1.3.0]: https://github.com/miki-przygoda/weir/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/miki-przygoda/weir/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/miki-przygoda/weir/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/miki-przygoda/weir/compare/v0.9.0...v1.0.0
