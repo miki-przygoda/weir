@@ -387,6 +387,7 @@ fn metrics_all_families_registered() {
         // Recovery
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
+        "weir_recovery_quarantine_copy_failed",
         "weir_wab_unexpected_mode",
         // Dead letter
         "weir_dead_letter_bytes_on_disk",
