@@ -74,6 +74,13 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
+impl From<MessageType> for u8 {
+    /// The wire byte for this message type. Inverse of [`MessageType::try_from`].
+    fn from(m: MessageType) -> u8 {
+        m as u8
+    }
+}
+
 /// Decoded wire header. `magic` and `header_crc32` are not stored: magic is always
 /// `b"WEIR"` after a successful decode (storing it invites confusion about validity),
 /// and CRC is computed on encode rather than held as state.
@@ -149,8 +156,8 @@ impl Header {
         let mut buf = [0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(&MAGIC);
         buf[4] = self.version;
-        buf[5] = self.message_type as u8;
-        buf[6] = self.durability as u8;
+        buf[5] = u8::from(self.message_type);
+        buf[6] = u8::from(self.durability);
         buf[7] = self.flags;
         buf[8..12].copy_from_slice(&self.payload_len.to_le_bytes());
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
@@ -500,6 +507,21 @@ mod tests {
         assert!(MessageType::try_from(0x00).is_err());
         assert!(MessageType::try_from(0x06).is_err());
         assert!(MessageType::try_from(0xff).is_err());
+    }
+
+    #[test]
+    fn message_type_from_u8_round_trips() {
+        // From<MessageType> for u8 is the inverse of TryFrom<u8>, matching the
+        // symmetric pair Durability and NackReason already expose (P3-F3).
+        for mt in [
+            MessageType::Push,
+            MessageType::Ack,
+            MessageType::Nack,
+            MessageType::HealthCheck,
+            MessageType::HealthCheckResponse,
+        ] {
+            assert_eq!(MessageType::try_from(u8::from(mt)).unwrap(), mt);
+        }
     }
 
     #[test]
