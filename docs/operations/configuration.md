@@ -912,7 +912,7 @@ must implement its own dedup — usually by hashing the body server-side.
 > per-record dedup token — `sha256(segment_id ‖ offset ‖ payload)`, stable across
 > retries but distinct per record — is parked for an on-disk WAB-format revision;
 > see "Generalized dedup token → WAB format v2" in
-> [`docs/explorations/parked-future-directions.md`](../explorations/parked-future-directions.md).
+> `docs/explorations/parked-future-directions.md`.
 > It can't be done without a format change because the sink today receives no
 > per-record identity, only the payload bytes.)
 

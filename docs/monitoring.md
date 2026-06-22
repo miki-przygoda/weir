@@ -133,8 +133,8 @@ run — so `sink_health{down}` can lag the actual outage by a full poll interval
 more, while `weir_drain_state{state="retrying_transient"}` flips on the *first*
 failed commit. For prompt detection, alert on the faster signals **in addition to**
 `WeirSinkDown`: `weir_drain_state{state="retrying_transient"} == 1` (immediate on
-the first transient failure) and `increase(weir_drain_segments_stranded_total[15m])
-> 0` (`WeirSegmentStranded`, fires once retries are exhausted) — see those entries.
+the first transient failure) and `increase(weir_drain_segments_stranded_total[15m]) > 0`
+(`WeirSegmentStranded`, fires once retries are exhausted) — see those entries.
 
 #### WeirSinkDegraded
 The sink reports itself **degraded** — reachable but not fully healthy (e.g. the
