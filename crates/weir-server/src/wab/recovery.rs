@@ -407,8 +407,12 @@ pub(crate) fn recover_segment(
     // quarantine metrics the header-validation sites use and log at ERROR so the
     // discarded tail is surfaced, not silently dropped.
     if let Some(reason) = &quarantine_reason {
-        // Surface the loss before we mutate the file. If the copy fails we keep
-        // going (the valid prefix must still be recovered + delivered) but log it.
+        // Preserve the corrupt tail before we truncate it away. The bytes past
+        // `valid_end_offset` were fully written and MAY hold individually-valid,
+        // acked-durable records sitting after the corrupt one — truncating them
+        // would lose acked records, violating the crown invariant. Copy (not
+        // move: the valid prefix must still be sealed in place) the whole segment
+        // into quarantine first.
         match copy_to_quarantine(path, wab_dir, reason) {
             Ok(dest) => {
                 metrics.recovery_segments_quarantined.inc();
@@ -428,13 +432,28 @@ pub(crate) fn recover_segment(
                 );
             }
             Err(qe) => {
+                // FAIL CLOSED. If we cannot preserve the tail (disk full /
+                // read-only mount / inode exhaustion), we must NOT truncate it —
+                // doing so would silently discard any acked-durable records after
+                // the corruption. Leave the segment untouched on disk and return
+                // Err: the caller logs "left for manual inspection", the daemon
+                // still starts, and the next recovery pass retries once the
+                // operator clears the failure. No acked record is ever destroyed.
+                metrics.recovery_quarantine_copy_failed.inc();
                 error!(
                     path = %path.display(),
                     error = %qe,
                     reason = %reason,
-                    "mid-file WAB corruption detected but quarantine copy FAILED; recovering the valid prefix anyway — \
-                     the corrupt tail will be truncated away (manual recovery is no longer possible from quarantine)"
+                    "mid-file WAB corruption detected but the quarantine copy FAILED \
+                     (disk full / read-only / inode exhaustion?); refusing to truncate \
+                     the valid prefix because the corrupt tail may hold acked-durable \
+                     records — segment left UNTOUCHED for retry. Clear the failure and restart."
                 );
+                return Err(io::Error::other(format!(
+                    "quarantine copy of mid-file-corrupt segment {} failed ({qe}); \
+                     refusing to truncate to avoid losing acked-durable tail records",
+                    path.display()
+                )));
             }
         }
     }
@@ -883,6 +902,71 @@ mod tests {
         // The active segment was sealed (renamed away) — the valid prefix is live.
         assert!(!path.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// FAIL-CLOSED: when a mid-file-corrupt segment cannot be preserved (the
+    /// quarantine copy fails — disk full / read-only mount / inode exhaustion),
+    /// recovery must REFUSE to truncate the valid prefix, because the corrupt
+    /// tail may hold acked-durable records whose loss would violate the crown
+    /// invariant. The segment is left byte-for-byte UNTOUCHED for a retry, the
+    /// caller leaves it for manual inspection, and the failure is alertable via
+    /// `recovery_quarantine_copy_failed`. (Regression guard for the prior
+    /// fail-OPEN behaviour that truncated the tail away on copy failure.)
+    #[test]
+    fn recovery_mid_file_corruption_fails_closed_when_quarantine_copy_fails() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("mid_file_quarantine_copy_fails");
+        let path = segment_path(&dir, 1);
+        let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
+        {
+            let mut seg = WabSegment::create(&path, 0).unwrap();
+            for p in payloads {
+                seg.write_record(p).unwrap();
+            }
+        }
+        // Corrupt record 2's payload (records 3,4 fully written after it) so the
+        // CRC check fires mid-file and recovery tries to quarantine the tail.
+        let mut bytes = fs::read(&path).unwrap();
+        let payload_off = 24 + 2 * 15 + 8;
+        bytes[payload_off] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        // Force copy_to_quarantine to fail: occupy `wab_dir/quarantine` with a
+        // regular FILE so the dir cannot be created. (Stands in for ENOSPC /
+        // read-only mount — any copy-stage failure takes the same Err arm.)
+        fs::write(dir.join("quarantine"), b"not a dir").unwrap();
+
+        let metrics = noop_metrics();
+        let err = recover_segment(&path, &dir, &metrics)
+            .expect_err("recovery must FAIL when the corrupt tail can't be quarantined");
+        assert!(
+            err.to_string().contains("refusing to truncate"),
+            "error must explain the fail-closed refusal, got: {err}"
+        );
+
+        // The segment is left UNTOUCHED (not truncated, not sealed): the
+        // acked-durable tail is preserved for a retry.
+        assert!(path.exists(), "the corrupt segment must be left in place");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "the segment must be byte-for-byte unchanged — no truncation"
+        );
+        assert!(
+            !path.with_extension("wab.sealed").exists()
+                && fs::read_dir(&dir)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .all(|e| !e.path().to_string_lossy().ends_with(".wab.sealed")),
+            "no sealed segment must be produced"
+        );
+
+        // The event is alertable, and the normal quarantine metric did NOT fire
+        // (nothing was successfully quarantined).
+        assert_eq!(metrics.recovery_quarantine_copy_failed.get(), 1);
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
 
         fs::remove_dir_all(dir).ok();
     }

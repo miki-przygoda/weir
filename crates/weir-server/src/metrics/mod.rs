@@ -251,6 +251,13 @@ pub(crate) struct Metrics {
     // ── Recovery ──────────────────────────────────────────────────────────────
     pub recovery_records_replayed: Counter<u64, AtomicU64>,
     pub recovery_segments_quarantined: Counter<u64, AtomicU64>,
+    /// Counts mid-file-corrupt WAB segments whose quarantine COPY failed during
+    /// recovery (disk full / read-only mount / inode exhaustion). On this event
+    /// recovery refuses to truncate the valid prefix — it leaves the segment in
+    /// place to preserve any acked-durable records sitting after the corruption,
+    /// rather than fail open and lose them. Alertable so the stuck-on-full-disk
+    /// state is visible instead of silent.
+    pub recovery_quarantine_copy_failed: Counter<u64, AtomicU64>,
     /// Counts WAB segment files seen during recovery whose permissions are
     /// not 0o600. Defense-in-depth signal for tampering or operator error.
     pub wab_unexpected_mode: Counter<u64, AtomicU64>,
@@ -485,6 +492,14 @@ impl Metrics {
             "weir_recovery_segments_quarantined",
             "WAB segments quarantined due to corruption detected during crash recovery"
         );
+        let recovery_quarantine_copy_failed = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_recovery_quarantine_copy_failed",
+            "Mid-file-corrupt WAB segments whose quarantine copy failed during \
+             recovery; the valid prefix was left un-truncated to preserve any \
+             acked-durable tail records (recovery is stuck until the operator clears \
+             disk space / read-only state)"
+        );
         let wab_unexpected_mode = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_wab_unexpected_mode",
@@ -588,6 +603,7 @@ impl Metrics {
             queue_depth,
             recovery_records_replayed,
             recovery_segments_quarantined,
+            recovery_quarantine_copy_failed,
             wab_unexpected_mode,
             dead_letter_bytes_on_disk,
             dead_letter_full,

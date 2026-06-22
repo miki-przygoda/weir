@@ -280,6 +280,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
 | `weir_recovery_records_replayed_total` | counter | Records replayed from sealed-but-unconfirmed segments on startup. |
 | `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during recovery. |
+| `weir_recovery_quarantine_copy_failed_total` | counter | Mid-file-corrupt segments whose quarantine copy failed (disk full / read-only / inode exhaustion); recovery left the segment un-truncated to preserve acked-durable tail records and will retry. **Non-zero means recovery is stuck on that segment — clear the disk/read-only state and restart.** |
 | `weir_ack_timeout_total` | counter | Acks that never fired within the timeout (wedged flusher). |
 | `weir_stage_{queue,bridge_wait,write,total}_seconds` | histogram | Per-stage latency decomposition (`bench-trace` builds only — diagnostic). |
 
