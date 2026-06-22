@@ -806,6 +806,172 @@ mod tests {
         server.join().unwrap();
     }
 
+    // ── Hostile / malformed daemon responses: refuse + poison, never false-ack ──
+
+    /// F44: a daemon-declared response payload_len above the hard cap must be
+    /// refused BEFORE allocating ~4 GiB, and poison the connection.
+    #[test]
+    fn response_oversized_payload_len_refuses_to_allocate_and_poisons() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // A valid 16-byte header whose payload_len is CAP+1, with a recomputed
+            // header CRC; then EOF (no payload) — the client must refuse before it
+            // would try to read/allocate the declared payload.
+            let mut hdr =
+                Header::new(MessageType::Ack, Durability::Sync, 0).encode();
+            let big = (MAX_PAYLOAD_HARD_CAP as u32).wrapping_add(1);
+            hdr[8..12].copy_from_slice(&big.to_le_bytes());
+            let crc = crc32fast::hash(&hdr[0..12]);
+            hdr[12..16].copy_from_slice(&crc.to_le_bytes());
+            server_end.write_all(&hdr).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        match err {
+            ClientError::Protocol(msg) => assert!(
+                msg.contains("refusing to allocate"),
+                "expected the cap refusal, got: {msg}"
+            ),
+            other => panic!("expected a Protocol cap refusal, got {other:?}"),
+        }
+        assert!(c.is_poisoned(), "an oversized response must poison the client");
+    }
+
+    /// An empty Nack payload is a stream desync: `nack_error` reports `Protocol`,
+    /// and the connection must be poisoned so a stale frame can't be mis-read as a
+    /// later ack (a false ack).
+    #[test]
+    fn empty_nack_payload_is_protocol_desync_and_poisons() {
+        // (1) the helper maps an empty payload to a Protocol error.
+        match nack_error(&[]) {
+            ClientError::Protocol(msg) => assert!(msg.contains("empty payload"), "{msg}"),
+            other => panic!("expected Protocol for empty Nack, got {other:?}"),
+        }
+        // (2) end-to-end: an empty-payload Nack poisons + is not recoverable.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            let frame = Envelope::new(
+                Header::new(MessageType::Nack, Durability::Sync, 0),
+                vec![],
+            )
+            .encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(err, ClientError::Protocol(_)), "got {err:?}");
+        assert!(!err.is_recoverable(), "a desync Protocol error is not recoverable");
+        assert!(c.is_poisoned(), "an empty-Nack desync must poison the client");
+    }
+
+    /// A corrupted response payload CRC is a protocol violation: surface it and
+    /// poison (the stream tail is now untrustworthy).
+    #[test]
+    fn response_payload_crc_mismatch_poisons() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // A Nack frame with a flipped trailing CRC byte.
+            let mut frame = nack_frame(NackReason::InternalError);
+            *frame.last_mut().unwrap() ^= 0xff;
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        match err {
+            ClientError::Protocol(msg) => assert!(msg.contains("CRC mismatch"), "{msg}"),
+            other => panic!("expected a CRC-mismatch Protocol error, got {other:?}"),
+        }
+        assert!(c.is_poisoned(), "a CRC-mismatched response must poison the client");
+    }
+
+    /// An unrecognised Nack reason byte (reserved range) surfaces as
+    /// `UnknownNack(byte)` and closes the connection.
+    #[test]
+    fn unknown_nack_reason_byte_surfaces_unknown_nack() {
+        assert!(matches!(nack_error(&[0x0A]), ClientError::UnknownNack(0x0A)));
+
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            let frame = Envelope::new(
+                Header::new(MessageType::Nack, Durability::Sync, 0),
+                vec![0x0A],
+            )
+            .encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(err, ClientError::UnknownNack(0x0A)), "got {err:?}");
+        assert!(c.is_poisoned(), "an unknown closing Nack must mark the client unusable");
+    }
+
+    /// A VersionMismatch Nack surfaces the daemon's version through push() and is
+    /// non-recoverable + connection-closing.
+    #[test]
+    fn version_mismatch_surfaces_through_push() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            let frame = Envelope::new(
+                Header::new(MessageType::Nack, Durability::Sync, 0),
+                vec![NackReason::VersionMismatch as u8, 9],
+            )
+            .encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(err, ClientError::VersionMismatch { daemon_version: 9 }),
+            "got {err:?}"
+        );
+        assert!(!err.is_recoverable());
+        assert!(c.is_poisoned());
+    }
+
+    /// health_check() against a daemon that replies with the wrong frame type is a
+    /// desync: Protocol error + poison + non-recoverable.
+    #[test]
+    fn health_check_unexpected_frame_type_poisons() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // Reply to a HealthCheck with an Ack — never expected here.
+            let frame = Envelope::new(
+                Header::new(MessageType::Ack, Durability::Sync, 0),
+                vec![],
+            )
+            .encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.health_check().unwrap_err();
+        server.join().unwrap();
+        match &err {
+            ClientError::Protocol(msg) => {
+                assert!(msg.contains("expected HealthCheckResponse"), "{msg}")
+            }
+            other => panic!("expected a Protocol desync, got {other:?}"),
+        }
+        assert!(!err.is_recoverable());
+        assert!(c.is_poisoned());
+    }
+
     // ── F43: opt-in socket timeouts ───────────────────────────────────────────
 
     #[test]
