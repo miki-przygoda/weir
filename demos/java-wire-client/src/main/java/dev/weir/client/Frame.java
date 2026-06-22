@@ -127,12 +127,12 @@ public final class Frame {
                     computedHeaderCrc, storedHeaderCrc));
         }
 
-        // 4. Header field parsing (only after header CRC passes).
-        int flags = data[7] & 0xFF;
-        if (flags != 0) {
-            throw new ProtocolException(DecodeError.RESERVED_FLAGS_SET,
-                "reserved flags byte is 0x" + Integer.toHexString(flags));
-        }
+        // 4. Header field parsing (only after header CRC passes). The order is
+        //    load-bearing and matches weir-core's Header::decode: message_type,
+        //    then durability, THEN the reserved-flags check — so a doubly-
+        //    malformed header (unknown durability AND nonzero flags) surfaces
+        //    UnknownDurability, not ReservedFlagsSet (conformance vector
+        //    reject_flags_and_unknown_durability pins this).
         Wire.MessageType mt = Wire.MessageType.fromByte(data[5]);
         if (mt == null) {
             throw new ProtocolException(DecodeError.UNKNOWN_MESSAGE_TYPE,
@@ -142,6 +142,11 @@ public final class Frame {
         if (dur == null) {
             throw new ProtocolException(DecodeError.UNKNOWN_DURABILITY,
                 "unknown durability 0x" + Integer.toHexString(data[6] & 0xFF));
+        }
+        int flags = data[7] & 0xFF;
+        if (flags != 0) {
+            throw new ProtocolException(DecodeError.RESERVED_FLAGS_SET,
+                "reserved flags byte is 0x" + Integer.toHexString(flags));
         }
 
         // 5. Payload length cap (checked before any allocation, before frame-length check).

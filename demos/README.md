@@ -12,7 +12,7 @@ runnable reference integrations.
 
 These five demos implement the **weir v1 wire protocol from the spec alone** —
 each in a different language, with **no dependency on any weir crate** — and every
-one reproduces all **29 conformance vectors byte-exact**. Together they're the
+one reproduces all **30 conformance vectors byte-exact**. Together they're the
 proof that weir's wire is a complete, language-neutral contract: you can talk to a
 weir daemon from anything that can open a socket and compute a CRC32.
 

@@ -34,35 +34,35 @@
 
   <!-- POLYGLOT WIRE CLIENTS -->
   <div class="sec-head"><span class="label">Polyglot wire clients</span><span class="rule"></span></div>
-  <p class="tag" style="margin-bottom:1.1rem">One wire, five languages, from the spec. Each is a from-scratch producer built only from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors — <b>zero weir-crate deps</b>, stdlib only — and each validates all 29 canonical vectors (decode outcome + fields) and re-encodes the encodable (ok) vectors byte-exact.</p>
+  <p class="tag" style="margin-bottom:1.1rem">One wire, five languages, from the spec. Each is a from-scratch producer built only from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors — <b>zero weir-crate deps</b>, stdlib only — and each validates all 30 canonical vectors (decode outcome + fields) and re-encodes the encodable (ok) vectors byte-exact.</p>
   <div class="grid cols-3">
     <div class="card">
       <h3>Python</h3>
-      <div class="chips"><span class="chip wire">29/29</span><span class="chip dim">stdlib only</span></div>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">stdlib only</span></div>
       <p class="card-sub">Pure-Python producer over the Unix socket — <code class="inline">socket</code> · <code class="inline">struct</code> · <code class="inline">zlib</code>. Built in one pass from the spec.</p>
       <p style="margin:0"><a href="clients/py.html">→ Python client</a></p>
     </div>
     <div class="card">
       <h3>Go</h3>
-      <div class="chips"><span class="chip wire">29/29</span><span class="chip dim">+ 15-case live harness</span></div>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">+ 15-case live harness</span></div>
       <p class="card-sub">Pure-Go producer plus an adversarial live harness that exercises every Nack reason against a running daemon.</p>
       <p style="margin:0"><a href="clients/go.html">→ Go client</a></p>
     </div>
     <div class="card">
       <h3>C</h3>
-      <div class="chips"><span class="chip wire">29/29</span><span class="chip dim">+ 109 checks</span></div>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">+ 112 checks</span></div>
       <p class="card-sub">Dependency-free C telemetry producer — C stdlib + POSIX sockets. Built for embedded sensor nodes pushing fixed-width records.</p>
       <p style="margin:0"><a href="clients/c.html">→ C client</a></p>
     </div>
     <div class="card">
       <h3>Java</h3>
-      <div class="chips"><span class="chip wire">29/29</span><span class="chip dim">JDK stdlib only</span></div>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">JDK stdlib only</span></div>
       <p class="card-sub">JDK-only producer over a Unix domain socket — no Maven, no jars. An enterprise audit-event logger at Sync durability.</p>
       <p style="margin:0"><a href="clients/java.html">→ Java client</a></p>
     </div>
     <div class="card">
       <h3>TypeScript</h3>
-      <div class="chips"><span class="chip wire">29/29</span><span class="chip dim">Node stdlib only</span></div>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">Node stdlib only</span></div>
       <p class="card-sub">Dependency-free Node producer — <code class="inline">node:net</code> · <code class="inline">node:zlib</code>. An async HTTP backend that durably logs each request.</p>
       <p style="margin:0"><a href="clients/ts.html">→ TypeScript client</a></p>
     </div>
@@ -195,8 +195,8 @@ std::thread::<span class="f">spawn</span>(<span class="k">move</span> || {
 <span class="c">#   magic "WEIR" · version · msg_type(Push) · durability · flags</span>
 <span class="c">#   · payload_len (u32 LE) · header-CRC32   →   payload bytes   →   payload-CRC32</span>
 
-docs/conformance/wire_v1_vectors.json     <span class="c"># 29 canonical vectors</span>
-python docs/conformance/run_vectors.py    <span class="c"># reference runner — 29/29</span>
+docs/conformance/wire_v1_vectors.json     <span class="c"># 30 canonical vectors</span>
+python docs/conformance/run_vectors.py    <span class="c"># reference runner — 30/30</span>
 </pre>
     <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/conformance.html">→ conformance vectors</a></p>
   </div>

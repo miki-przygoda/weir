@@ -77,8 +77,8 @@ retry on a fresh connection").
 
 ## Conformance
 
-`tests/test_conformance.py` runs the codec against all **29 canonical vectors**
-(17 valid frames + 12 rejection cases). For every vector it checks the decode
+`tests/test_conformance.py` runs the codec against all **30 canonical vectors**
+(17 valid frames + 13 rejection cases). For every vector it checks the decode
 outcome and — for `"ok"` frames — the decoded `message_type`, `durability`,
 `flags`, and payload; for the valid frames it also re-encodes and asserts the
 bytes round-trip **byte-for-byte** to the vector's `hex`. The vectors are read
@@ -91,7 +91,7 @@ mismatch.
 
 ```bash
 # Offline codec conformance — no daemon needed (run from the repo root)
-python3 demos/py-wire-client/tests/test_conformance.py     # -> "29/29 vectors passed"
+python3 demos/py-wire-client/tests/test_conformance.py     # -> "30/30 vectors passed"
 
 # Live: start an isolated daemon, then validate against it
 bash demos/py-wire-client/scripts/run_daemon.sh            # writes daemon.pid; socket = weir.sock
@@ -120,7 +120,7 @@ Stdlib only (`socket`, `zlib`, `struct`, `enum`, `dataclasses`) — no
 | `src/weir_wire/client.py`     | `WeirClient`: AF_UNIX producer with `push()` (Push→Ack) and `health_check()`; surfaces rejections as `NackError` / `ConnectionClosed`. |
 | `src/weir_wire/__init__.py`   | Package facade re-exporting the public API. |
 | `examples/produce.py`         | End-to-end demo: health-check, then push five JSON `signup` events; takes an optional socket-path arg. |
-| `tests/test_conformance.py`   | Runs the codec against the 29 canonical vectors (decode + fields for all, byte-exact re-encode for valid frames); plain script. |
+| `tests/test_conformance.py`   | Runs the codec against the 30 canonical vectors (decode + fields for all, byte-exact re-encode for valid frames); plain script. |
 | `tests/test_live.py`          | Validates the client against a running daemon: happy path, pipelining, and every rejection path. |
 | `scripts/run_daemon.sh`       | Launches an isolated `weir-server` (socket `weir.sock`, `wab/` dir, metrics port), writes `daemon.pid`. |
 </content>

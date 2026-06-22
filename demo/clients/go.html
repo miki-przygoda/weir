@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>weir — Go wire client</title>
-<meta name="description" content="A pure-Go weir v1 wire-protocol producer — built from the spec, zero weir-crate deps, 29/29 conformance vectors plus a 15-case adversarial live harness." />
+<meta name="description" content="A pure-Go weir v1 wire-protocol producer — built from the spec, zero weir-crate deps, 30/30 conformance vectors plus a 15-case adversarial live harness." />
 <link rel="stylesheet" href="../weir.css" />
 </head>
 <body>
@@ -32,7 +32,7 @@
     <h1>Go <span class="accent">· weir wire client</span></h1>
     <p class="tag"><strong>The adversarial conformance harness.</strong> A pure-Go producer that speaks the weir v1 wire protocol straight to the daemon socket — built from the spec, <em>zero weir-crate deps</em>, stdlib only (<code class="inline">hash/crc32</code>, <code class="inline">encoding/binary</code>, <code class="inline">net</code>) — paired with a 15-case live harness that deliberately fires <em>every</em> rejection (Nack) reason at a running daemon and checks it gets the right one back.</p>
     <div class="chips" style="gap:8px">
-      <span class="chip wire">29/29 conformance vectors</span>
+      <span class="chip wire">30/30 conformance vectors</span>
       <span class="chip wire">byte-exact</span>
       <span class="chip wire">+ 15-case adversarial live harness</span>
       <span class="chip dim">stdlib only</span>
@@ -53,7 +53,7 @@
   <div class="panel">
     <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
     <div class="panel-body">
-<pre class="code">go test ./...                         <span class="c"># offline: 29/29 conformance vectors</span></pre>
+<pre class="code">go test ./...                         <span class="c"># offline: 30/30 conformance vectors</span></pre>
       <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: stdlib only (<code class="inline">net</code>, <code class="inline">encoding/binary</code>, <code class="inline">hash/crc32</code>, <code class="inline">encoding/json</code>), zero external deps · tested on go 1.26.3 (the <code class="inline">go</code> directive in <code class="inline">go.mod</code>).</p>
     </div>
   </div>

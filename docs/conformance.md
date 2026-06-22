@@ -91,10 +91,12 @@ for this mapping is `nack_for_decode_error` in `crates/weir-server/src/socket/co
 ## Coverage
 
 The suite covers every message type, **all nine** Nack reason bytes
-(`0x01`–`0x09`) as decodable Nack frames, and one rejection vector per
+(`0x01`–`0x09`) as decodable Nack frames, and at least one rejection vector per
 `DecodeError` variant, including the boundary cases (empty payloads, the
-payload-cap boundary, a truncated header vs. a truncated payload, and trailing
-bytes after a complete frame).
+payload-cap boundary, a truncated header vs. a truncated payload, trailing
+bytes after a complete frame, and a doubly-malformed header that pins the
+field-parse precedence — unknown durability *and* a nonzero flags byte resolves
+to `UnknownDurability`, since durability is parsed before the flags check).
 
 ## CRC algorithm
 
@@ -125,7 +127,7 @@ It includes a small reference codec that passes all vectors, so it doubles as a
 worked non-Rust implementation:
 
 ```bash
-python3 docs/conformance/run_vectors.py   # "29/29 vectors passed"; non-zero exit on mismatch
+python3 docs/conformance/run_vectors.py   # "30/30 vectors passed"; non-zero exit on mismatch
 ```
 
 To validate **your own** client, replace its `decode_frame()` / `encode_frame()`

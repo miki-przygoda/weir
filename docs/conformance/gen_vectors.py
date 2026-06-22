@@ -174,6 +174,20 @@ err("reject_reserved_flags_set",
     "flags byte 0x01 (reserved; must be zero in v1).", bytes(raw),
     "ReservedFlagsSet")
 
+# doubly-malformed header: durability 0xFF AND flags 0x01, valid CRC. Locks the
+# field-parse precedence: message_type, then durability, THEN the reserved-flags
+# check (envelope.rs Header::decode order). A decoder that checks flags first
+# would wrongly return ReservedFlagsSet; the conformant result is
+# UnknownDurability (P3-F1).
+raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data", flags=0x01))
+raw[6] = 0xFF
+raw[12:16] = crc32(bytes(raw[0:12])).to_bytes(4, "little")
+err("reject_flags_and_unknown_durability",
+    "durability 0xFF AND flags 0x01, valid CRC: durability is parsed before "
+    "the reserved-flags check, so the result is UnknownDurability, not "
+    "ReservedFlagsSet (locks type/durability-before-flags precedence).",
+    bytes(raw), "UnknownDurability")
+
 # payload too large: 16-byte header only, payload_len = cap + 1, valid CRC
 oversize = MAX_PAYLOAD_HARD_CAP + 1
 raw = bytearray(header_bytes(MT["Push"], DUR["Sync"], 0, oversize))

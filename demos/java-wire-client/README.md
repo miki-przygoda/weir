@@ -78,8 +78,8 @@ close throws an `IOException` noting the in-flight outcome is unknown.
 
 ## Conformance
 
-`ConformanceRunner` runs the codec against all **29 canonical vectors** (17 valid
-frames + 12 rejection cases). For each it checks the decode outcome and — for
+`ConformanceRunner` runs the codec against all **30 canonical vectors** (17 valid
+frames + 13 rejection cases). For each it checks the decode outcome and — for
 `"ok"` frames — the decoded `message_type`, `durability`, `flags`, and payload;
 for the **4 client-emittable** valid frames (the 3 Pushes + the HealthCheck) it
 also re-encodes and asserts the bytes round-trip **byte-for-byte** (daemon→client
@@ -96,7 +96,7 @@ javac -d out $(find src -name '*.java')
 
 # Offline codec conformance — no daemon needed
 java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
-# -> 29/29 vectors passed (4 encode round-trips verified)
+# -> 30/30 vectors passed (4 encode round-trips verified)
 
 # Live: start a daemon with a unique socket/wab/port
 SOCK=$PWD/weir.sock
@@ -125,7 +125,7 @@ JDK standard library only (`UnixDomainSocketAddress`, `java.util.zip.CRC32`,
 | `Frame.java`            | Single-frame `encode()` / `decode(byte[])` (CRC32 IEEE, little-endian `ByteBuffer`) plus the `DecodeError` verdict enum with vector-name strings. |
 | `WeirClient.java`       | Synchronous `AutoCloseable` producer over an `AF_UNIX` `SocketChannel`: `connect` / `push` / `healthCheck`; does its own stream framing and caps response payloads at 2 bytes. |
 | `AuditEventProducer.java` | The demo: streams JSON audit events at Sync durability. CLI: `<socket> [event-count]`. |
-| `ConformanceRunner.java`| Offline validator running the codec against the 29 vectors (decode + fields for all, byte-exact re-encode for the 4 client-emittable frames). |
+| `ConformanceRunner.java`| Offline validator running the codec against the 30 vectors (decode + fields for all, byte-exact re-encode for the 4 client-emittable frames). |
 | `LiveSmokeTest.java`    | Live happy + rejection paths against a running daemon. CLI: `<socket>`. |
 | `ProtocolException.java`| Unchecked wire exception carrying the `DecodeError` / `NackReason` / raw byte, with `isRetryable()`. |
 | `Hex.java`, `MiniJson.java` | Tiny stdlib-only hex codec and JSON reader for the vector runner. |

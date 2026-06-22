@@ -96,7 +96,7 @@ cd demos/c-wire-client
 make                                # builds: conformance, telemetry, negative
 
 # Offline codec conformance — no daemon needed
-make check                          # -> "vectors scanned: 28 ... RESULT: PASS"
+make check                          # -> "vectors scanned: 30 ... RESULT: PASS"
 #   (override the path: make check VECTORS=/abs/path/to/wire_v1_vectors.json)
 
 # Live: start a daemon with a private socket

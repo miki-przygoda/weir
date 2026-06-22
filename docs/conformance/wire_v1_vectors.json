@@ -216,6 +216,12 @@
       "decode": "ReservedFlagsSet"
     },
     {
+      "name": "reject_flags_and_unknown_durability",
+      "notes": "durability 0xFF AND flags 0x01, valid CRC: durability is parsed before the reserved-flags check, so the result is UnknownDurability, not ReservedFlagsSet (locks type/durability-before-flags precedence).",
+      "hex": "574549520101ff0104000000da9b39966461746163f3f3ad",
+      "decode": "UnknownDurability"
+    },
+    {
       "name": "reject_payload_too_large",
       "notes": "Header alone declares payload_len = MAX_PAYLOAD_HARD_CAP + 1; rejected before any allocation, before the frame-length check.",
       "hex": "574549520101010001000001a70a18c4",
