@@ -831,6 +831,48 @@ mod tests {
         let mut reader = SegmentReader::open(&path).unwrap();
         let err = reader.next().unwrap().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // A structural error is NOT a clean termination (mirrors the CRC path).
+        assert_eq!(reader.terminated_cleanly(), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// After an iteration error the reader stays recoverable: `get_ref` and
+    /// `into_inner` hand back the underlying reader rather than panicking, so a
+    /// forensics consumer can inspect the raw bytes around a corruption.
+    #[test]
+    fn into_inner_after_error_yields_usable_reader() {
+        use std::io::Read;
+        let path = tmp_path("into_inner_after_err");
+        let mut bytes = build_segment_header(0).to_vec();
+        // record 0: valid.
+        let r0 = b"hello";
+        bytes.extend_from_slice(&(r0.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(r0).to_le_bytes());
+        bytes.extend_from_slice(r0);
+        // record 1: a CRC that does not match the payload → iteration Err.
+        let r1 = b"world";
+        bytes.extend_from_slice(&(r1.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        bytes.extend_from_slice(r1);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = SegmentReader::open(&path).unwrap();
+        assert_eq!(
+            reader.next().unwrap().unwrap(),
+            Payload::from_static(b"hello")
+        );
+        assert!(
+            reader.next().unwrap().is_err(),
+            "record 1's bad CRC must error"
+        );
+        // get_ref is callable post-error; into_inner recovers the reader and it is
+        // still usable for raw reads (no panic / no poisoning of the file handle).
+        let _ = reader.get_ref();
+        let mut inner = reader.into_inner();
+        let mut rest = Vec::new();
+        inner
+            .read_to_end(&mut rest)
+            .expect("reader usable after an iteration error");
         std::fs::remove_file(&path).ok();
     }
 
