@@ -758,6 +758,12 @@ impl Config {
         let tls_key_path = merge!(tls_key_path);
         let tls_client_ca_path = merge!(tls_client_ca_path);
         let tls_handshake_timeout_secs = merge!(tls_handshake_timeout_secs).unwrap_or(10);
+        // Floor at 1s like every other timeout knob: a 0 here (a plausible
+        // fat-finger or a "disable the timeout" misunderstanding) makes
+        // tokio::time::timeout fire IMMEDIATELY on every handshake, silently
+        // rejecting 100% of TLS clients while the daemon looks healthy. Reject
+        // it (and absurdly large values) at startup with a named error.
+        check_range("tls_handshake_timeout_secs", tls_handshake_timeout_secs, 1, 300)?;
 
         let tcp_bind = match tcp_bind_str {
             None => None,
@@ -1334,6 +1340,9 @@ mod tests {
         });
         assert_knob_rejected("rng_read_to", "connection_read_timeout_secs", |p| {
             p.connection_read_timeout_secs = Some(0)
+        });
+        assert_knob_rejected("rng_hs_to", "tls_handshake_timeout_secs", |p| {
+            p.tls_handshake_timeout_secs = Some(0)
         });
         assert_knob_rejected("rng_sink_to", "sink_timeout_secs", |p| {
             p.sink_timeout_secs = Some(0)
