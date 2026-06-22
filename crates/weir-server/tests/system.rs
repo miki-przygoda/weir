@@ -1236,6 +1236,48 @@ fn graceful_shutdown_under_load() {
     );
 }
 
+/// `--version` and `--help` short-circuit before any config load (no
+/// `--config`, no socket, no wab dir needed) and exit 0. `--version` prints
+/// `weir-server <version>`, matching the format `weir-ctl` uses. This can only
+/// be an integration test: the handler calls `process::exit(0)`, so it must run
+/// the real binary, not the in-process parser.
+#[test]
+fn version_and_help_flags_short_circuit_and_exit_zero() {
+    use std::process::Command;
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+
+    let out = Command::new(binary)
+        .arg("--version")
+        .output()
+        .expect("spawn weir-server --version");
+    assert!(
+        out.status.success(),
+        "--version must exit 0, got {:?}",
+        out.status
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("weir-server "),
+        "--version stdout must start with 'weir-server ', got: {stdout:?}"
+    );
+    assert!(
+        stdout.trim().ends_with(env!("CARGO_PKG_VERSION")),
+        "--version must print the crate version {}, got: {stdout:?}",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let help = Command::new(binary)
+        .arg("--help")
+        .output()
+        .expect("spawn weir-server --help");
+    assert!(
+        help.status.success(),
+        "--help must exit 0, got {:?}",
+        help.status
+    );
+    assert!(!help.stdout.is_empty(), "--help must print usage to stdout");
+}
+
 // ── Stalled client isolation ──────────────────────────────────────────────────
 
 /// A client that connects, sends one Push frame, and then never reads the Ack
