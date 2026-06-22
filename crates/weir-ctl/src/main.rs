@@ -297,7 +297,15 @@ struct ShardStat {
     bytes: u64,
 }
 
-fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
+/// Walks `wab_dir`, classifying each shard directory's segment files by suffix
+/// (`.wab.confirmed` > `.wab.sealed` > `.wab`, longest-suffix first so the bare
+/// `.wab` test can't shadow the others) and rolling up the dead-letter sibling
+/// through the same `dl_segments` filter the `dl` commands use. Returns the
+/// shards (sorted by name) plus the dead-letter `(file_count, bytes)`. Factored
+/// out of `cmd_segments` so this load-bearing accounting is unit-testable
+/// without capturing stdout. Note: `confirmed` markers contribute 0 bytes (only
+/// active + sealed segments hold live data).
+fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
     let entries =
         std::fs::read_dir(wab_dir).map_err(|e| format!("read {}: {e}", wab_dir.display()))?;
 
@@ -360,6 +368,11 @@ fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
     }
 
     shards.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((shards, dl_files, dl_bytes))
+}
+
+fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
+    let (shards, dl_files, dl_bytes) = scan_segments(wab_dir)?;
 
     if json {
         print_json(&segments_json(wab_dir, &shards, dl_files, dl_bytes));
@@ -1095,64 +1108,69 @@ fn summary_json(body: &str) -> serde_json::Value {
     })
 }
 
+/// The durability-hazard / info warnings for a metrics summary, as printable
+/// lines (in priority order). Pure — no I/O — so this decision logic, the CLI's
+/// primary operator-foolproofing against silent data loss, is unit-testable
+/// without capturing stdout: noop ⇒ acked-then-DISCARDED, flusher panics ⇒ shard
+/// offline, fsync failures ⇒ DURABILITY HAZARD, plus a nacked-records info line.
+fn summary_warnings(s: &MetricsSummary) -> Vec<String> {
+    let mut out = Vec::new();
+    if s.sink_type == "noop" {
+        out.push(
+            "\n⚠ sink: noop — records are acked then DISCARDED, not delivered downstream. \
+             Set --sink-type (http/mysql/postgres/clickhouse) to forward records."
+                .to_string(),
+        );
+    }
+    if s.panics > 0 {
+        out.push(format!(
+            "\n⚠ flusher {} — a shard is offline until restart",
+            plural(s.panics, "panic", "panics")
+        ));
+    }
+    if s.fsync_failures > 0 {
+        out.push(format!(
+            "⚠ {} — DURABILITY HAZARD (data may not be on stable storage)",
+            plural(s.fsync_failures, "fsync failure", "fsync failures")
+        ));
+    }
+    if s.nacked > 0 {
+        out.push(format!(
+            "ℹ {} nacked — check producer behaviour / capacity",
+            plural(s.nacked, "record", "records")
+        ));
+    }
+    out
+}
+
 fn print_summary(body: &str) {
-    let MetricsSummary {
-        accepted,
-        acked,
-        nacked,
-        fsync_avg_ms,
-        queue_depth,
-        panics,
-        fsync_failures,
-        dead_letter_bytes,
-        wab_bytes,
-        sink_health,
-        sink_type,
-    } = parse_summary(body);
+    let s = parse_summary(body);
 
     // Labels padded to a single consistent width so the values line up.
     println!("── weir ──────────────────────────────────");
     println!(
-        "{:<10} accepted {accepted}  ack {acked}  nack {nacked}",
-        "ingest"
+        "{:<10} accepted {}  ack {}  nack {}",
+        "ingest", s.accepted, s.acked, s.nacked
     );
     println!(
-        "{:<10} fsync avg {fsync_avg_ms:.2} ms  wab {} on disk",
+        "{:<10} fsync avg {:.2} ms  wab {} on disk",
         "durability",
-        fmt_bytes(wab_bytes)
+        s.fsync_avg_ms,
+        fmt_bytes(s.wab_bytes)
     );
-    println!("{:<10} depth {queue_depth}", "queue");
-    println!("{:<10} type: {sink_type}  health: {sink_health}", "sink");
+    println!("{:<10} depth {}", "queue", s.queue_depth);
+    println!(
+        "{:<10} type: {}  health: {}",
+        "sink", s.sink_type, s.sink_health
+    );
     println!(
         "{:<10} {} on disk",
         "dead-ltr",
-        fmt_bytes(dead_letter_bytes)
+        fmt_bytes(s.dead_letter_bytes)
     );
 
-    // Loud warnings for the durability hazards.
-    if sink_type == "noop" {
-        println!(
-            "\n⚠ sink: noop — records are acked then DISCARDED, not delivered downstream. \
-             Set --sink-type (http/mysql/postgres/clickhouse) to forward records."
-        );
-    }
-    if panics > 0 {
-        println!(
-            "\n⚠ flusher {} — a shard is offline until restart",
-            plural(panics, "panic", "panics")
-        );
-    }
-    if fsync_failures > 0 {
-        println!(
-            "⚠ {} — DURABILITY HAZARD (data may not be on stable storage)",
-            plural(fsync_failures, "fsync failure", "fsync failures")
-        );
-    }
-    if nacked > 0 {
-        println!(
-            "ℹ {} nacked — check producer behaviour / capacity",
-            plural(nacked, "record", "records")
-        );
+    for warning in summary_warnings(&s) {
+        println!("{warning}");
     }
 }
 
@@ -1853,6 +1871,86 @@ weir_sink_info{sink_type=\"http\"} 1
         // value_parsers, duplicate names) — a compile-adjacent guard on the CLI.
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    fn summary_with(
+        sink_type: &str,
+        nacked: u64,
+        panics: u64,
+        fsync_failures: u64,
+    ) -> MetricsSummary {
+        MetricsSummary {
+            accepted: 0,
+            acked: 0,
+            nacked,
+            fsync_avg_ms: 0.0,
+            queue_depth: 0,
+            panics,
+            fsync_failures,
+            dead_letter_bytes: 0,
+            wab_bytes: 0,
+            sink_health: "healthy".into(),
+            sink_type: sink_type.into(),
+        }
+    }
+
+    #[test]
+    fn summary_warnings_flag_the_durability_hazards() {
+        // A clean summary on a real sink → no warnings.
+        assert!(summary_warnings(&summary_with("http", 0, 0, 0)).is_empty());
+
+        // noop → the acked-then-DISCARDED warning (the loudest data-loss signal).
+        let noop = summary_warnings(&summary_with("noop", 0, 0, 0));
+        assert!(
+            noop.iter().any(|w| w.contains("DISCARDED")),
+            "noop sink must warn about discarded records, got {noop:?}"
+        );
+
+        // flusher panics → shard-offline; fsync failures → DURABILITY HAZARD.
+        let panicked = summary_warnings(&summary_with("http", 0, 2, 0));
+        assert!(
+            panicked.iter().any(|w| w.contains("offline")),
+            "{panicked:?}"
+        );
+        let hazard = summary_warnings(&summary_with("http", 0, 0, 1));
+        assert!(
+            hazard.iter().any(|w| w.contains("DURABILITY HAZARD")),
+            "{hazard:?}"
+        );
+
+        // nacked records → the info line.
+        let nacked = summary_warnings(&summary_with("http", 5, 0, 0));
+        assert!(nacked.iter().any(|w| w.contains("nacked")), "{nacked:?}");
+    }
+
+    #[test]
+    fn scan_segments_classifies_suffixes_and_rolls_up_dead_letter() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_00");
+        std::fs::create_dir_all(&shard).unwrap();
+        // One of each lifecycle extension. confirmed must add 0 bytes; active +
+        // sealed contribute their on-disk size.
+        std::fs::write(shard.join("seg_00000003.wab"), vec![0u8; 100]).unwrap();
+        std::fs::write(shard.join("seg_00000002.wab.sealed"), vec![0u8; 200]).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.confirmed"), vec![0u8; 9999]).unwrap();
+        // A dead-letter sibling with one dl_*.wab segment.
+        let dl = dir.join("dead_letter");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::write(dl.join("dl_00000001.wab"), vec![0u8; 50]).unwrap();
+
+        let (shards, dl_files, dl_bytes) = scan_segments(&dir).unwrap();
+        assert_eq!(shards.len(), 1);
+        let s = &shards[0];
+        assert_eq!((s.active, s.sealed, s.confirmed), (1, 1, 1));
+        assert_eq!(
+            s.bytes, 300,
+            "only active(100) + sealed(200) count; confirmed adds 0 bytes"
+        );
+        assert_eq!(dl_files, 1);
+        assert_eq!(dl_bytes, 50);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
