@@ -321,6 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dead_letter_check_interval: Duration::from_secs(config.dead_letter_check_interval_secs),
         base_retry_delay: Duration::from_millis(config.sink_retry_base_delay_ms),
         max_retries: config.sink_max_retries,
+        max_respawns: drain::MAX_DRAIN_RESPAWNS,
         // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
         // sink hangs without honouring its internal timeout.
         commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),

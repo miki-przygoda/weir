@@ -74,6 +74,11 @@ pub struct DrainConfig {
     /// Maximum number of retry attempts per segment before the segment is left
     /// on disk and the drain advances to the next segment.
     pub max_retries: u32,
+    /// Maximum times the panic supervisor respawns the drain thread before
+    /// giving up (delivery stops; the WAB accumulates until restart). Defaults to
+    /// [`MAX_DRAIN_RESPAWNS`]; carried in config so the give-up path is testable
+    /// without the real ~4.5 s of inter-respawn backoff.
+    pub max_respawns: u32,
     /// Hard upper bound on a single `Sink::commit` call. A backstop against a
     /// sink that hangs without honouring its own internal timeout (notably
     /// third-party sinks built on `weir-sink-sdk`, which carry no built-in
@@ -161,7 +166,7 @@ pub fn spawn<S: Sink + 'static>(
 /// Maximum times the drain is respawned after a panic before giving up — past
 /// this, delivery stops and the WAB accumulates on disk until restart (the same
 /// policy as the WAB flusher supervisor).
-const MAX_DRAIN_RESPAWNS: u32 = 10;
+pub(crate) const MAX_DRAIN_RESPAWNS: u32 = 10;
 
 /// Runs [`drain_thread`] under panic supervision. A panic in the drain (a sink
 /// impl, `process_segment`, `confirm_and_delete`, …) is caught and the drain is
@@ -189,7 +194,7 @@ fn run_drain_supervised<S: Sink>(
         let Err(_) = result else { break };
         attempts += 1;
         metrics.drain_panics.inc();
-        if attempts >= MAX_DRAIN_RESPAWNS {
+        if attempts >= config.max_respawns {
             error!(
                 attempts,
                 "drain thread panicked too many times; giving up — delivery is \
@@ -199,7 +204,7 @@ fn run_drain_supervised<S: Sink>(
         }
         error!(
             attempts,
-            max = MAX_DRAIN_RESPAWNS,
+            max = config.max_respawns,
             "drain thread panicked; respawning"
         );
         std::thread::sleep(Duration::from_millis(
@@ -1298,6 +1303,11 @@ mod tests {
         /// `pending()`), modelling a sink with no internal timeout. The drain's
         /// backstop `commit_timeout` must cancel these.
         hang_calls: u64,
+        /// A single 1-based `commit()` call that hangs forever (in addition to
+        /// `hang_calls`), so a test can hang a *later* sub-batch — e.g. succeed on
+        /// the first sub-batch, then time out on the second — to exercise the
+        /// commit-timeout-resumes-past-the-cursor path.
+        hang_on_call: Option<u64>,
         /// Number of initial `commit()` calls that panic, to drive the drain's
         /// panic supervisor.
         panic_calls: u64,
@@ -1330,6 +1340,7 @@ mod tests {
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
                 panic_calls: 0,
+                hang_on_call: None,
                 max_batch: 1000,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -1358,6 +1369,7 @@ mod tests {
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
                 panic_calls: 0,
+                hang_on_call: None,
                 max_batch,
                 call_timestamps: Mutex::new(Vec::new()),
                 committed_records: Mutex::new(Vec::new()),
@@ -1408,6 +1420,13 @@ mod tests {
             self.dead_lettered_records.lock().unwrap().clone()
         }
 
+        /// Hang the `nth` (1-based) `commit()` call forever — for hanging a
+        /// *later* sub-batch (the first N succeed, then call N+1 times out).
+        fn hanging_on_call(mut self, nth: u64) -> Self {
+            self.hang_on_call = Some(nth);
+            self
+        }
+
         fn ok(batch: Vec<Payload>) -> MockResult {
             Ok(CommitResult::new(batch, vec![]))
         }
@@ -1430,7 +1449,7 @@ mod tests {
             if nth <= self.panic_calls {
                 panic!("mock sink: induced panic on commit #{nth}");
             }
-            if nth <= self.hang_calls {
+            if nth <= self.hang_calls || self.hang_on_call == Some(nth) {
                 // Hang forever; the drain's backstop timeout cancels this future.
                 std::future::pending::<()>().await;
             }
@@ -1549,6 +1568,7 @@ mod tests {
             dead_letter_check_interval: Duration::from_millis(10),
             base_retry_delay: Duration::from_millis(1),
             max_retries: MAX_RETRIES,
+            max_respawns: MAX_DRAIN_RESPAWNS,
             commit_timeout: Duration::from_secs(30),
             // Short so the stranded-segment recovery rescan fires promptly in tests.
             health_poll_interval: Duration::from_millis(50),
@@ -1716,6 +1736,56 @@ mod tests {
         );
         assert!(!sealed.exists(), "sealed segment deleted after confirm");
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The commit-timeout backstop interacting with the F05 sub-batch cursor:
+    /// when the timeout fires on a LATER sub-batch (not the first), the retry must
+    /// resume PAST the already-committed prefix, not re-commit it. max_batch=1 so
+    /// each record is its own sub-batch: commit([A]) ok (cursor=1); commit([B])
+    /// hangs → backstop timeout → Transient{processed=1}; the retry resumes at B.
+    /// (hung_sink_commit_times_out covers the timeout on the *first* sub-batch;
+    /// retry_resumes_past_already_processed_sub_batches covers the cursor under a
+    /// permanent/transient response — this pins their intersection.)
+    #[test]
+    fn commit_timeout_on_a_later_sub_batch_resumes_past_the_committed_prefix() {
+        let dir = tmp_dir("timeout_later_subbatch");
+        let sealed = make_sealed_segment(&dir, 0, &[b"A", b"B"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        // call 1 → commit([A]) ok; call 2 → commit([B]) HANGS (timeout); after the
+        // transient retry, call 3 → commit([B]) ok. The hang on call 2 consumes no
+        // response, so the queue is [A-ok, B-ok].
+        let sink = Arc::new(
+            MockSink::with_batch_size(
+                1,
+                [
+                    MockSink::ok(vec![Payload::from(b"A".as_ref())]),
+                    MockSink::ok(vec![Payload::from(b"B".as_ref())]),
+                ],
+            )
+            .hanging_on_call(2),
+        );
+        let metrics = noop_metrics();
+        let mut config = fast_config(dir.clone());
+        config.commit_timeout = Duration::from_millis(50);
+        run_drain(rx, tx, Arc::clone(&sink), config, metrics.clone());
+
+        assert_eq!(
+            sink.call_count(),
+            3,
+            "A, B(timeout), B = 3 commits — the retry resumed at B, not restarted at A (4)"
+        );
+        assert_eq!(
+            records_committed(&metrics),
+            2,
+            "A and B each committed once"
+        );
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "segment confirmed after the commit-timeout retry resumed past the cursor"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -1941,6 +2011,50 @@ mod tests {
         assert!(
             get_confirmed_path(&seg_b).exists(),
             "the drain must survive the panic and confirm the following segment"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The terminal end of B7: if the drain keeps panicking, the supervisor gives
+    /// up after `max_respawns` rather than respawning forever — delivery stops and
+    /// the WAB accumulates until restart. Driven with `max_respawns = 2` so the
+    /// give-up fires after a single ~100 ms backoff instead of the real ~4.5 s
+    /// 10-respawn ladder.
+    #[test]
+    fn drain_supervisor_gives_up_after_max_respawns() {
+        let dir = tmp_dir("drain_giveup");
+        // Two segments (distinct counters) so each respawn has a fresh segment to
+        // panic on.
+        let shard_dir = dir.join("shard_00");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+        let mk = |counter: u64, payload: &[u8]| {
+            let p = segment_path(&shard_dir, counter);
+            let mut s = WabSegment::create(&p, 0).unwrap();
+            s.write_record(payload).unwrap();
+            s.seal().unwrap()
+        };
+        let sa = mk(1, b"a");
+        let sb = mk(2, b"b");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sa.clone()).unwrap();
+        tx.send(sb.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_panic(5, [])); // panics on every commit
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            max_respawns: 2,
+            ..fast_config(dir.clone())
+        };
+        run_drain(rx, tx, sink, config, metrics.clone());
+
+        assert_eq!(
+            drain_panics(&metrics),
+            2,
+            "the supervisor counts one panic per respawn attempt, then gives up at the cap"
+        );
+        assert!(
+            !get_confirmed_path(&sa).exists() && !get_confirmed_path(&sb).exists(),
+            "after giving up, delivery stops — no segment is confirmed"
         );
         std::fs::remove_dir_all(dir).ok();
     }
