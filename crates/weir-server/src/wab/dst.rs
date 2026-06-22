@@ -1316,6 +1316,141 @@ mod tests {
         assert!(report.acks.iter().all(|&ok| ok), "acks: {:?}", report.acks);
     }
 
+    /// Drives the REAL [`super::flusher_thread`] over one Sync batch of
+    /// fixed-size payloads with a small `segment_max_bytes`, so rotation fires
+    /// MID-batch. Fixed-size payloads keep the rotation split deterministic
+    /// (`drive_sync_flusher` uses variable-size payloads, so no flusher-driving
+    /// scenario ever rotated — these branches were untested). Returns each
+    /// record's ack, the durability ledger, and the sealed paths forwarded to the
+    /// drain (proof a rotation occurred).
+    fn drive_rotating_batch(
+        faults: &[Fault],
+        payloads: Vec<Vec<u8>>,
+        segment_max_bytes: u64,
+    ) -> (Vec<bool>, Ledger, Vec<PathBuf>, SimEnv) {
+        let env = SimEnv::new("rotation");
+        let sim_faults = SimFaults::from_faults(faults);
+        let ledger = Ledger::default();
+        let store: Arc<dyn SegmentStore> =
+            Arc::new(SimSegmentStore::new(Arc::clone(&sim_faults), ledger.clone()));
+        let clock = SimClock::new();
+
+        let n = payloads.len();
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(n.max(1) * 4);
+        let (drain_tx, drain_rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let coalesce_hint = Arc::new(AtomicU64::new(200));
+
+        let mut ack_rxs = Vec::with_capacity(n);
+        let mut units = Vec::with_capacity(n);
+        for p in &payloads {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            ack_rxs.push(ack_rx);
+            units.push(make_unit(p.clone(), Durability::Sync, ack_tx));
+        }
+        work_tx.send(make_batch(units)).expect("send batch");
+        drop(work_tx);
+
+        let shard_dir = env.shard_dir(0);
+        let metrics = Arc::clone(&env.metrics);
+        let handle = std::thread::spawn(move || {
+            crate::wab::flusher_thread(
+                0,
+                shard_dir,
+                work_rx,
+                drain_tx,
+                n.max(1),
+                Duration::from_millis(5),
+                segment_max_bytes,
+                None,
+                None,
+                metrics,
+                coalesce_hint,
+                &clock,
+                store,
+            );
+        });
+        handle.join().expect("flusher join");
+
+        // A dropped ack sender (a record whose batch was aborted) reads as Nack.
+        let acks: Vec<bool> = ack_rxs
+            .into_iter()
+            .map(|mut rx| rx.try_recv().unwrap_or(false))
+            .collect();
+        let drain_paths: Vec<PathBuf> = drain_rx.try_iter().collect();
+        (acks, ledger, drain_paths, env)
+    }
+
+    /// Rotation ack-fate (the `durable_acks` branch of `flush_batch`): records in
+    /// a segment that ROTATED (sealed + fsynced) mid-batch ack `true` and stay
+    /// durable EVEN IF the next active segment's group fsync then fails. Three
+    /// 50-byte payloads over `segment_max_bytes = 100` (≈58 B/record on disk + a
+    /// 24 B header): rec0→A (no rotate), rec1→A hits the threshold and ROTATES
+    /// (seals A=[0,1]), rec2→fresh B. The batch's lone counted group fsync lands
+    /// on B (the seal's own fsync is not counted), so `FsyncReturns { nth: 1 }`
+    /// fails B: rec2 is Nacked while the sealed records 0,1 stay durable + acked
+    /// true. Pins "a rotated record is durable even if the next fsync fails".
+    #[test]
+    fn rotation_sealed_records_ack_true_even_when_next_fsync_fails() {
+        let payloads: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 50]).collect();
+        let (acks, ledger, drain_paths, env) =
+            drive_rotating_batch(&[Fault::FsyncReturns { nth: 1 }], payloads.clone(), 100);
+
+        assert_eq!(
+            acks,
+            vec![true, true, false],
+            "sealed (rotated) records ack true; the active record whose fsync failed is Nacked"
+        );
+        // I1 (crown invariant): every acked-TRUE record is genuinely durable. (The
+        // Nacked rec2 may still become durable later via the flusher's shutdown
+        // seal of the active segment — that's harmless at-least-once, NOT a false
+        // ack, so we only check the acked-true direction.)
+        for (p, &ok) in payloads.iter().zip(&acks) {
+            if ok {
+                assert!(
+                    ledger.is_durable(p),
+                    "acked-true record {p:?} must be durable (no false ack)"
+                );
+            }
+        }
+        assert!(
+            !drain_paths.is_empty(),
+            "rotation must have sealed + forwarded a segment to the drain"
+        );
+        env.cleanup();
+    }
+
+    /// Seal error DURING rotation: when the rotation seal itself fails (ENOSPC),
+    /// the records in that un-fsynced segment are Nacked — never false-acked —
+    /// while a record that lands in a subsequently-opened, group-fsynced segment
+    /// is correctly acked true and durable. Same layout as above but with
+    /// `Fault::SealFails`: rec1's rotation seal fails, so flush_batch Nacks the
+    /// pending rec0 + the triggering rec1; rec2 opens a fresh segment that the
+    /// batch's group fsync makes durable. No false ack, no acked record lost.
+    #[test]
+    fn rotation_seal_error_nacks_unsynced_records_without_false_ack() {
+        let payloads: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 50]).collect();
+        let (acks, ledger, _drain, env) =
+            drive_rotating_batch(&[Fault::SealFails], payloads.clone(), 100);
+
+        assert_eq!(
+            acks,
+            vec![false, false, true],
+            "the failed-seal segment's records are Nacked; the fresh group-fsynced record is acked"
+        );
+        // Crown invariant: no acked-true record is non-durable.
+        for (p, &ok) in payloads.iter().zip(&acks) {
+            if ok {
+                assert!(ledger.is_durable(p), "acked-true record {p:?} must be durable");
+            } else {
+                assert!(
+                    !ledger.is_durable(p),
+                    "Nacked record {p:?} from the failed-seal segment must not be durable"
+                );
+            }
+        }
+        env.cleanup();
+    }
+
     /// Scenario 2: a crash between sync_all and rename leaves a fully-formed
     /// `.wab`; recovery must replay every synced record, intact and in order.
     #[test]
