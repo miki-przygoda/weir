@@ -1480,7 +1480,10 @@ mod tests {
             "got: {err}"
         );
         assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
-        assert!(!path.exists(), "the bad-version segment must be quarantined");
+        assert!(
+            !path.exists(),
+            "the bad-version segment must be quarantined"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

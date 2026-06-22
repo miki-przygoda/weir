@@ -1866,7 +1866,10 @@ weir_sink_health{state=\"healthy\"} 1
 weir_sink_health{state=\"degraded\"} 0
 ";
         // sum_metric sums every line sharing the prefix (label series + bare).
-        assert_eq!(sum_metric(body, "weir_records_accepted_total"), 3.0 + 4.0 + 99.0);
+        assert_eq!(
+            sum_metric(body, "weir_records_accepted_total"),
+            3.0 + 4.0 + 99.0
+        );
         // get_metric matches the EXACT bare metric (a space after the name), not a
         // labelled sibling and not a longer-named metric.
         assert_eq!(get_metric(body, "weir_queue_depth"), Some(7.0));

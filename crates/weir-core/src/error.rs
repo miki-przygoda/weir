@@ -227,7 +227,10 @@ mod tests {
         for (e, needle) in cases {
             let s = e.to_string();
             assert!(!s.is_empty(), "{e:?}: Display must be non-empty");
-            assert!(s.contains(needle), "{e:?}: Display {s:?} must contain {needle:?}");
+            assert!(
+                s.contains(needle),
+                "{e:?}: Display {s:?} must contain {needle:?}"
+            );
         }
     }
 

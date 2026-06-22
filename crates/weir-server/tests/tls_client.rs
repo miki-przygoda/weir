@@ -52,7 +52,10 @@ fn connect_tls_with_valid_cert_pushes_and_acks() {
             .push(format!("rec-{i}").as_bytes(), Durability::Sync)
             .unwrap_or_else(|e| panic!("push {i} through connect_tls failed: {e}"));
     }
-    assert!(!client.is_poisoned(), "a healthy mTLS client must not be poisoned");
+    assert!(
+        !client.is_poisoned(),
+        "a healthy mTLS client must not be poisoned"
+    );
 
     srv.shutdown();
 }

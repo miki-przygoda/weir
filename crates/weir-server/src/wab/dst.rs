@@ -1331,8 +1331,10 @@ mod tests {
         let env = SimEnv::new("rotation");
         let sim_faults = SimFaults::from_faults(faults);
         let ledger = Ledger::default();
-        let store: Arc<dyn SegmentStore> =
-            Arc::new(SimSegmentStore::new(Arc::clone(&sim_faults), ledger.clone()));
+        let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(
+            Arc::clone(&sim_faults),
+            ledger.clone(),
+        ));
         let clock = SimClock::new();
 
         let n = payloads.len();
@@ -1440,7 +1442,10 @@ mod tests {
         // Crown invariant: no acked-true record is non-durable.
         for (p, &ok) in payloads.iter().zip(&acks) {
             if ok {
-                assert!(ledger.is_durable(p), "acked-true record {p:?} must be durable");
+                assert!(
+                    ledger.is_durable(p),
+                    "acked-true record {p:?} must be durable"
+                );
             } else {
                 assert!(
                     !ledger.is_durable(p),

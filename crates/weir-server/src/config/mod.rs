@@ -763,7 +763,12 @@ impl Config {
         // tokio::time::timeout fire IMMEDIATELY on every handshake, silently
         // rejecting 100% of TLS clients while the daemon looks healthy. Reject
         // it (and absurdly large values) at startup with a named error.
-        check_range("tls_handshake_timeout_secs", tls_handshake_timeout_secs, 1, 300)?;
+        check_range(
+            "tls_handshake_timeout_secs",
+            tls_handshake_timeout_secs,
+            1,
+            300,
+        )?;
 
         let tcp_bind = match tcp_bind_str {
             None => None,
