@@ -115,11 +115,14 @@ ok("nack_reserved_reason",
    "Nack with a reserved reason byte (0x0A): decodes as a Nack frame; the reason's "
    "meaning is forward-compatible and clients surface the raw byte.",
    frame(MT["Nack"], DUR["Sync"], bytes([0x0A])), "Nack", "Sync", 0, bytes([0x0A]))
-# Responses carry a durability *filler* byte that clients must ignore. Pin that a
-# non-Sync filler still decodes (here an Ack with Buffered, 0x03).
+# Responses carry a durability *filler* byte: clients must not INTERPRET it (it
+# carries no meaning on a response), but it is still a valid Durability
+# discriminant (0x01-0x03) that the reference decoder range-checks like any other
+# header byte. Pin that a non-Sync filler value still decodes (Ack with Buffered).
 ok("ack_nonsync_durability_filler",
    "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must "
-   "ignore the durability field on responses.",
+   "not interpret the durability field on responses, but it stays a valid "
+   "Durability value (0x01-0x03) that the decoder range-checks.",
    frame(MT["Ack"], DUR["Buffered"], b""), "Ack", "Buffered", 0, b"")
 
 # ── Rejection vectors (decode must error with the named variant) ──────────────
@@ -127,6 +130,16 @@ ok("ack_nonsync_durability_filler",
 raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data"))
 raw[0:4] = b"XXXX"
 err("reject_bad_magic", "First four bytes are not \"WEIR\".", bytes(raw), "BadMagic")
+
+# partial-magic short buffer: length is checked BEFORE magic, so any buffer
+# shorter than the 16-byte header is TruncatedFrame regardless of its leading
+# bytes — even one whose first byte (0x57 = 'W') matches the magic. This pins
+# length-before-magic precedence (see wire_protocol.md step 1) so all reference
+# decoders agree; a magic-first decoder would wrongly return BadMagic here.
+err("reject_partial_magic_short",
+    "2-byte buffer 0x57 0x99 (first byte matches magic 'W', but shorter than the "
+    "16-byte header): TruncatedFrame, not BadMagic — length is checked first.",
+    bytes([0x57, 0x99]), "TruncatedFrame")
 
 # version mismatch (future version, CRC recomputed so version path fires, not CRC)
 raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data"))
@@ -160,6 +173,20 @@ raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data", flags=0x01))
 err("reject_reserved_flags_set",
     "flags byte 0x01 (reserved; must be zero in v1).", bytes(raw),
     "ReservedFlagsSet")
+
+# doubly-malformed header: durability 0xFF AND flags 0x01, valid CRC. Locks the
+# field-parse precedence: message_type, then durability, THEN the reserved-flags
+# check (envelope.rs Header::decode order). A decoder that checks flags first
+# would wrongly return ReservedFlagsSet; the conformant result is
+# UnknownDurability (P3-F1).
+raw = bytearray(frame(MT["Push"], DUR["Sync"], b"data", flags=0x01))
+raw[6] = 0xFF
+raw[12:16] = crc32(bytes(raw[0:12])).to_bytes(4, "little")
+err("reject_flags_and_unknown_durability",
+    "durability 0xFF AND flags 0x01, valid CRC: durability is parsed before "
+    "the reserved-flags check, so the result is UnknownDurability, not "
+    "ReservedFlagsSet (locks type/durability-before-flags precedence).",
+    bytes(raw), "UnknownDurability")
 
 # payload too large: 16-byte header only, payload_len = cap + 1, valid CRC
 oversize = MAX_PAYLOAD_HARD_CAP + 1

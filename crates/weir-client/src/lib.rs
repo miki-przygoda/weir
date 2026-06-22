@@ -5,6 +5,20 @@
 //! issues one request and reads one response — no pipelining. For concurrent
 //! producers, create one [`WeirClient`] per thread.
 //!
+//! # Throughput: one record per round-trip
+//!
+//! [`push`](WeirClient::push) is synchronous: it sends one frame and blocks for
+//! the ack before returning. So a **single** client's throughput is bounded by
+//! the round-trip time — roughly `1 / RTT` records/sec on one connection
+//! (e.g. a ~50 µs Unix-socket RTT caps a single client near ~20k rec/s; a
+//! `Sync`-tier push also waits on the daemon's fsync). To go faster, **fan out
+//! across connections**: create one `WeirClient` per producer thread (they're
+//! independent and the daemon handles many concurrently). Ordering is only
+//! guaranteed within a single connection's sequential pushes, not across
+//! connections. A built-in batched-push frame and a pooled client are a possible
+//! future (2.0) wire-protocol addition; today, parallel connections are the way
+//! to scale a producer.
+//!
 //! # Example
 //!
 //! ```no_run

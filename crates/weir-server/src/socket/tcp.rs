@@ -141,6 +141,10 @@ pub async fn run(
                 let accept_start = Instant::now();
                 match res {
                     Ok((stream, peer_addr)) => {
+                        // Reap handlers that have already finished so the JoinSet
+                        // doesn't grow one node per lifetime connection — it is
+                        // otherwise only drained at shutdown. Non-blocking (F1).
+                        while join_set.try_join_next().is_some() {}
                         // Acquire a permit from the shared semaphore. This is the
                         // same Arc<Semaphore> as the Unix listener — the combined
                         // cap across both transports is config.max_connections.

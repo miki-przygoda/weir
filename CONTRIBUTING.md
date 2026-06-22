@@ -22,8 +22,11 @@ drop a record it has acked?* If you can't rule that out, the change isn't ready.
 
 - **Rust 1.88+** (edition 2024) — the declared MSRV (`rust-version` in
   `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
-- **A Unix host** (Linux or macOS) to build/run `weir-server` — it uses
-  Unix-only socket APIs. `weir-core` and `weir-client` are cross-platform.
+- **A Unix host** (Linux or macOS) to **run** `weir-server` — it uses
+  Unix-only socket APIs. The daemon still *builds* on Windows (CI compiles
+  it there), but it is a non-functional stub: no Unix-socket listener, so it
+  never serves. `weir-core` is genuinely cross-platform; `weir-client`
+  compiles everywhere but its client type is Unix-only.
 - **Docker** (with the `docker compose` plugin) — only for the optional
   sink-integration and monitoring suites below.
 
@@ -52,9 +55,11 @@ cargo test --all-features
 cargo deny check advisories bans licenses sources
 ```
 
-All of the above must pass. CI also builds `weir-server` on Linux (x86_64 +
-aarch64), macOS (x86_64 + aarch64), and `weir-core`/`weir-client` on Windows —
-**cfg-gate any Unix-only code** so the cross-platform crates keep building.
+All of the above must pass. CI builds `weir-server` on all five release targets:
+Linux (x86_64 + aarch64), macOS (x86_64 + aarch64), **and Windows
+(x86_64-pc-windows-msvc)** — so **cfg-gate any Unix-only code** or the Windows
+build breaks. The Windows build is a non-functional stub (no Unix-socket
+listener); the daemon runs only on Linux and macOS.
 
 ## Heavier suites (run when your change touches them)
 
@@ -86,11 +91,23 @@ cargo +nightly fuzz run envelope_parse
 ## What's frozen at 1.0
 
 weir is 1.0 under [Semantic Versioning](https://semver.org/). The **v1 wire
-protocol** and the **public Rust API** (`weir-core`, `weir-client`,
-`weir-sink-sdk`) are frozen — a breaking change to either is a 2.0 change, not
-a PR. The wire format has a language-neutral conformance suite
+protocol**, the **on-disk WAB segment format** (`weir-wab`, `FORMAT_VERSION = 1`),
+and the **public Rust API** (`weir-core`, `weir-client`, `weir-sink-sdk`,
+`weir-wab`) are frozen — a breaking change to any is a 2.0 change, not a PR. The
+wire format has a language-neutral conformance suite
 ([`docs/conformance.md`](docs/conformance.md)); if you touch the codec, the
 vectors in `docs/conformance/wire_v1_vectors.json` must still pass unchanged.
+
+**Known 2.0 cleanup (frozen for now):** `Sink::Record` / the `SinkRecord` trait in
+`weir-sink-sdk` is an over-generalisation — the only implementation is the identity
+on `Payload`, and every built-in sink uses `type Record = Payload`, so the drain's
+generic conversion is a no-op everywhere. It's part of the frozen `Sink` trait, so
+it can't be removed without a major version; it's a deliberate candidate to drop in
+a hypothetical 2.0, not a bug to "fix" in a 1.x PR. (Rationale in
+[`docs/architecture.md`](docs/architecture.md#design-notes).)
+
+For the design rationale behind the crate split and the configuration surface, see
+the [Architecture doc](docs/architecture.md#workspace--crate-boundaries).
 
 ## Tests and commits
 

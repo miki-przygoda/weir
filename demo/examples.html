@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — example projects</title>
+<meta name="description" content="Real shapes you can build on weir, and exactly which crates each needs — from a one-crate producer to a zero-Rust-dep polyglot wire client to a full self-hosted pipeline." />
+<link rel="stylesheet" href="weir.css" />
+</head>
+<body>
+
+<div class="statusbar top">
+  <span>weir <span data-weir-version></span> · example projects · by crate-ratio</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">from one crate to the whole daemon</span>
+</div>
+
+<nav class="nav">
+  <a href="index.html">Demo</a>
+  <a href="crates.html">Crates</a>
+  <a href="examples.html" class="active">Examples</a>
+  <span class="nav-ext">
+    <a href="https://github.com/miki-przygoda/weir" target="_blank" rel="noopener">GitHub ↗</a>
+    <a href="https://miki-przygoda.github.io/weir" target="_blank" rel="noopener">Docs ↗</a>
+  </span>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>Example projects</h1>
+    <p class="tag">Real shapes you can build — and exactly which crates each one pulls in. weir scales from a single-crate producer to a zero-dependency polyglot client to a full self-hosted pipeline.</p>
+  </div>
+
+  <!-- POLYGLOT WIRE CLIENTS -->
+  <div class="sec-head"><span class="label">Polyglot wire clients</span><span class="rule"></span></div>
+  <p class="tag" style="margin-bottom:1.1rem">One wire, five languages, from the spec. Each is a from-scratch producer built only from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors — <b>zero weir-crate deps</b>, stdlib only — and each validates all 30 canonical vectors (decode outcome + fields) and re-encodes the encodable (ok) vectors byte-exact.</p>
+  <div class="grid cols-3">
+    <div class="card">
+      <h3>Python</h3>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">stdlib only</span></div>
+      <p class="card-sub">Pure-Python producer over the Unix socket — <code class="inline">socket</code> · <code class="inline">struct</code> · <code class="inline">zlib</code>. Built in one pass from the spec.</p>
+      <p style="margin:0"><a href="clients/py.html">→ Python client</a></p>
+    </div>
+    <div class="card">
+      <h3>Go</h3>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">+ 15-case live harness</span></div>
+      <p class="card-sub">Pure-Go producer plus an adversarial live harness that exercises every Nack reason against a running daemon.</p>
+      <p style="margin:0"><a href="clients/go.html">→ Go client</a></p>
+    </div>
+    <div class="card">
+      <h3>C</h3>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">+ 112 checks</span></div>
+      <p class="card-sub">Dependency-free C telemetry producer — C stdlib + POSIX sockets. Built for embedded sensor nodes pushing fixed-width records.</p>
+      <p style="margin:0"><a href="clients/c.html">→ C client</a></p>
+    </div>
+    <div class="card">
+      <h3>Java</h3>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">JDK stdlib only</span></div>
+      <p class="card-sub">JDK-only producer over a Unix domain socket — no Maven, no jars. An enterprise audit-event logger at Sync durability.</p>
+      <p style="margin:0"><a href="clients/java.html">→ Java client</a></p>
+    </div>
+    <div class="card">
+      <h3>TypeScript</h3>
+      <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">Node stdlib only</span></div>
+      <p class="card-sub">Dependency-free Node producer — <code class="inline">node:net</code> · <code class="inline">node:zlib</code>. An async HTTP backend that durably logs each request.</p>
+      <p style="margin:0"><a href="clients/ts.html">→ TypeScript client</a></p>
+    </div>
+    <div class="card">
+      <h3>One wire spec</h3>
+      <div class="chips"><span class="chip wire">wire protocol only</span></div>
+      <p class="card-sub">All five speak the same 16-byte-header frame + payload + CRC32. The spec and vectors pin every byte — prove compatibility in any language.</p>
+      <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/conformance.html">→ conformance vectors</a></p>
+    </div>
+  </div>
+
+  <!-- MATRIX -->
+  <div class="sec-head"><span class="label">Crate-usage matrix</span><span class="rule"></span></div>
+  <table class="tui-table">
+    <thead>
+      <tr>
+        <th>Pattern</th>
+        <th style="text-align:center">core</th>
+        <th style="text-align:center">wab</th>
+        <th style="text-align:center">sink-sdk</th>
+        <th style="text-align:center">client</th>
+        <th style="text-align:center">server</th>
+        <th style="text-align:center">ctl</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td><a href="#minimal">Minimal producer</a></td><td class="dot off">○</td><td class="dot off"></td><td class="dot off"></td><td class="dot">●</td><td class="dot off"></td><td class="dot off"></td></tr>
+      <tr><td><a href="#async">Producer in an async runtime</a></td><td class="dot off">○</td><td class="dot off"></td><td class="dot off"></td><td class="dot">●</td><td class="dot off"></td><td class="dot off"></td></tr>
+      <tr><td><a href="#sink">Custom sink</a></td><td class="dot">●</td><td class="dot off"></td><td class="dot">●</td><td class="dot off"></td><td class="dot off"></td><td class="dot off"></td></tr>
+      <tr><td><a href="#recovery">Offline recovery / export tool</a></td><td class="dot off">○</td><td class="dot">●</td><td class="dot off"></td><td class="dot off"></td><td class="dot off"></td><td class="dot off"></td></tr>
+      <tr><td><a href="#admin">Admin &amp; inspection</a></td><td class="dot off"></td><td class="dot off"></td><td class="dot off"></td><td class="dot off"></td><td class="dot off"></td><td class="dot">●</td></tr>
+      <tr><td><a href="#polyglot">Polyglot / non-Rust client</a></td><td colspan="6" style="text-align:center; color:var(--n-green)">— wire protocol only · zero Rust deps —</td></tr>
+      <tr><td><a href="#pipeline">Full self-hosted pipeline</a></td><td class="dot off">○</td><td class="dot off">○</td><td class="dot off">○</td><td class="dot">●</td><td class="dot">●</td><td class="dot off"></td></tr>
+    </tbody>
+  </table>
+  <p class="card-sub"><span style="color:var(--n-green)">●</span> reached for directly &nbsp;·&nbsp; <span style="color:var(--n-fg-dim)">○</span> pulled transitively &nbsp;·&nbsp; bins (<code class="inline">server</code>/<code class="inline">ctl</code>) bundle the lib crates they need.</p>
+
+  <!-- RECIPES -->
+  <div class="sec-head"><span class="label">The recipes</span><span class="rule"></span></div>
+
+  <div class="card" id="minimal">
+    <h3>Minimal producer</h3>
+    <div class="chips"><span class="chip">weir-client</span></div>
+    <p class="card-sub">The smallest useful thing: connect to the socket and push a durable record. One crate, no async runtime, one blocking round-trip — the call returns only once the record is durable.</p>
+<pre class="code"><span class="k">use</span> weir_client::{<span class="t">WeirClient</span>, <span class="t">Durability</span>};
+
+<span class="k">let mut</span> client = <span class="t">WeirClient</span>::<span class="f">connect</span>(<span class="s">"/run/weir/weir.sock"</span>)?;
+client.<span class="f">push</span>(<span class="s">b"hello, weir!"</span>, <span class="t">Durability</span>::Sync)?;  <span class="c">// durable before this returns</span>
+</pre>
+    <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/getting-started/quickstart.html">→ quickstart</a></p>
+  </div>
+
+  <div class="card" id="async">
+    <h3>Producer in an async runtime</h3>
+    <div class="chips"><span class="chip">weir-client</span><span class="chip dim">+ your runtime</span></div>
+    <p class="card-sub"><code class="inline">push()</code> is blocking — calling it in an <code class="inline">async fn</code> starves the executor. The bridge: a pool of dedicated threads, each owning one persistent client, fed by a bounded channel; the async side awaits a reply. Reconnect on poison via the client API (no matching the <code class="inline">#[non_exhaustive]</code> error enum).</p>
+<pre class="code"><span class="c">// one std::thread owns a persistent client; the async side awaits a oneshot</span>
+<span class="k">let</span> (tx, rx) = std::sync::mpsc::<span class="f">sync_channel</span>::&lt;<span class="t">Job</span>&gt;(<span class="t">1024</span>);
+std::thread::<span class="f">spawn</span>(<span class="k">move</span> || {
+    <span class="k">let mut</span> client = <span class="t">WeirClient</span>::<span class="f">connect</span>(&amp;sock).<span class="f">unwrap</span>();
+    <span class="k">for</span> job <span class="k">in</span> rx {                              <span class="c">// Job { payload, durability, reply }</span>
+        <span class="k">let</span> r = client.<span class="f">push</span>(&amp;job.payload, job.durability);
+        <span class="k">if</span> client.<span class="f">is_poisoned</span>() { client = <span class="f">reconnect</span>(&amp;sock); }
+        <span class="k">let</span> _ = job.reply.<span class="f">send</span>(r);                   <span class="c">// tokio oneshot back to the caller</span>
+    }
+});
+</pre>
+    <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/getting-started/integrating.html#producing-from-an-async-runtime">→ async producer guide</a></p>
+  </div>
+
+  <div class="card" id="sink">
+    <h3>Custom sink</h3>
+    <div class="chips"><span class="chip">weir-sink-sdk</span><span class="chip">weir-core</span></div>
+    <p class="card-sub">Forward records to your own destination. Implement <code class="inline">Sink</code> against a frozen contract — and unit-test it with <b>no daemon and no runtime</b>. Each record ends up <em>committed</em> or <em>dead-lettered</em> (permanent rejection); a transient failure returns <code class="inline">Err</code> and the whole segment is retried.</p>
+<pre class="code"><span class="k">use</span> weir_sink_sdk::{<span class="t">Sink</span>, <span class="t">CommitResult</span>, <span class="t">Payload</span>, <span class="t">BasicSinkError</span>, <span class="t">SinkHealth</span>};
+
+<span class="k">impl</span> <span class="t">Sink</span> <span class="k">for</span> <span class="t">MySink</span> {
+    <span class="k">type</span> <span class="t">Record</span> = <span class="t">Payload</span>;
+    <span class="k">type</span> <span class="t">Error</span>  = <span class="t">BasicSinkError</span>;
+    <span class="k">async fn</span> <span class="f">commit</span>(&amp;<span class="k">self</span>, batch: <span class="t">Vec</span>&lt;<span class="t">Payload</span>&gt;)
+        -&gt; <span class="t">Result</span>&lt;<span class="t">CommitResult</span>&lt;<span class="t">Payload</span>&gt;, <span class="t">BasicSinkError</span>&gt; {
+        <span class="k">let mut</span> committed = <span class="t">Vec</span>::<span class="f">new</span>();
+        <span class="k">let mut</span> dead = <span class="t">Vec</span>::<span class="f">new</span>();
+        <span class="k">for</span> rec <span class="k">in</span> batch {
+            <span class="k">match</span> <span class="f">deliver</span>(rec.<span class="f">as_ref</span>()) {
+                <span class="t">Ok</span>(()) =&gt; committed.<span class="f">push</span>(rec),
+                <span class="t">Err</span>(why) =&gt; dead.<span class="f">push</span>((rec, why)),   <span class="c">// permanent → dead-letter</span>
+            }
+        }
+        <span class="t">Ok</span>(<span class="t">CommitResult</span>::<span class="f">new</span>(committed, dead))
+    }
+    <span class="k">async fn</span> <span class="f">health</span>(&amp;<span class="k">self</span>) -&gt; <span class="t">SinkHealth</span> { <span class="t">SinkHealth</span>::Healthy }
+}
+</pre>
+    <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/getting-started/integrating.html#write-a-custom-sink">→ custom sink guide</a></p>
+  </div>
+
+  <div class="card" id="recovery">
+    <h3>Offline recovery / export tool</h3>
+    <div class="chips"><span class="chip">weir-wab</span></div>
+    <p class="card-sub">Read the on-disk buffer directly — for disaster recovery, export, or inspection — with a runtime-free reader and a tiny dep tree. <code class="inline">SegmentReader</code> streams each record and verifies its CRC32, stopping at the first corruption with a clean error.</p>
+<pre class="code"><span class="k">use</span> weir_wab::{<span class="t">SegmentReader</span>, <span class="t">Payload</span>};   <span class="c">// Payload re-exported — no weir-core dep needed</span>
+
+<span class="k">for</span> rec <span class="k">in</span> <span class="t">SegmentReader</span>::<span class="f">open</span>(<span class="s">"/var/lib/weir/wab/shard_00/seg_00000001.wab"</span>)? {
+    <span class="k">let</span> payload: <span class="t">Payload</span> = rec?;       <span class="c">// io::Error on a CRC mismatch / truncation</span>
+    <span class="c">// … inspect, re-emit as NDJSON, or recover …</span>
+}
+</pre>
+    <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/wab_format.html">→ WAB format</a></p>
+  </div>
+
+  <div class="card" id="admin">
+    <h3>Admin &amp; inspection</h3>
+    <div class="chips"><span class="chip">weir-ctl</span></div>
+    <p class="card-sub">Operate a running daemon from the shell — no code, no daemon dependency tree. Live commands hit the socket / metrics endpoint; <code class="inline">segments</code> and <code class="inline">dl</code> read the WAB on disk. <code class="inline">dl drop</code>/<code class="inline">requeue</code> default to a dry run.</p>
+<pre class="code"><span class="f">weir-ctl</span> health   --socket /run/weir/weir.sock
+<span class="f">weir-ctl</span> metrics  --addr 127.0.0.1:9185
+<span class="f">weir-ctl</span> segments --wab-dir /var/lib/weir/wab        <span class="c"># per-shard WAB inspect</span>
+<span class="f">weir-ctl</span> dl list  --wab-dir /var/lib/weir/wab        <span class="c"># dead-letter queue</span>
+<span class="f">weir-ctl</span> dl requeue --wab-dir /var/lib/weir/wab --yes <span class="c"># re-submit (dry-run without --yes)</span>
+</pre>
+    <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/monitoring.html">→ monitoring &amp; ops</a></p>
+  </div>
+
+  <div class="card" id="polyglot">
+    <h3>Polyglot / non-Rust client</h3>
+    <div class="chips"><span class="chip wire">wire protocol only</span><span class="chip dim">zero Rust deps</span></div>
+    <p class="card-sub">Produce from <em>any</em> language by speaking the wire protocol directly — a 16-byte header + payload + CRC32 over a Unix socket (or TCP + mutual TLS). Language-neutral conformance vectors pin every byte, so you can prove byte-compatibility.</p>
+<pre class="code"><span class="c"># 16-byte header, then payload, then payload CRC32 (IEEE/zlib):</span>
+<span class="c">#   magic "WEIR" · version · msg_type(Push) · durability · flags</span>
+<span class="c">#   · payload_len (u32 LE) · header-CRC32   →   payload bytes   →   payload-CRC32</span>
+
+docs/conformance/wire_v1_vectors.json     <span class="c"># 30 canonical vectors</span>
+python docs/conformance/run_vectors.py    <span class="c"># reference runner — 30/30</span>
+</pre>
+    <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/conformance.html">→ conformance vectors</a></p>
+  </div>
+
+  <div class="card" id="pipeline">
+    <h3>Full self-hosted pipeline</h3>
+    <div class="chips"><span class="chip">weir-server</span><span class="chip">weir-client</span><span class="chip dim">+ a sink</span></div>
+    <p class="card-sub">The whole thing: run the daemon with a real sink, point producers at the socket, and let the drain compress N records into one downstream commit. Crash-safe by construction — unconfirmed segments replay on restart.</p>
+<pre class="code"><span class="f">weir-server</span> --wab-dir /var/lib/weir/wab \
+            --socket-path /run/weir/weir.sock \
+            --sink-type http --sink-url https://ingest.example/bulk
+
+<span class="c"># producers push via weir-client over the socket;</span>
+<span class="c"># the drain batches and forwards N records → 1 commit to the sink.</span>
+</pre>
+    <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/getting-started/install.html">→ install &amp; run</a></p>
+  </div>
+
+  <p class="foot">Snippets are idealized for clarity — the canonical, compile-checked examples live in the
+     <a href="https://miki-przygoda.github.io/weir">docs site</a> and the repo.</p>
+</div>
+
+<div class="statusbar bottom">
+  <span class="sb-dim">[1]</span><a href="index.html">Demo</a>
+  <span class="sb-dim">[2]</span><a href="crates.html">Crates</a>
+  <span class="sb-dim">[3]</span><span>Examples</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">guest@weir:~$ cat examples/*.rs ▮</span>
+</div>
+
+<script src="version.js"></script>
+</body>
+</html>

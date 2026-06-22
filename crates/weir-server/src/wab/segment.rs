@@ -193,9 +193,12 @@ impl WabSegment {
 
     /// Calls the platform-appropriate sync operation on the segment file.
     ///
-    /// macOS: `F_BARRIERFSYNC` — writes data to persistent storage with a barrier,
-    /// guaranteeing ordering without waiting for all pending media writes. Faster than
-    /// `F_FULLFSYNC` and sufficient for WAB durability.
+    /// macOS: `F_BARRIERFSYNC` — orders this write ahead of later ones with a
+    /// barrier without waiting for the drive to flush its volatile cache. Faster
+    /// than `F_FULLFSYNC`; it guarantees ordering and survival of a process/OS
+    /// crash, but NOT a guaranteed media flush on sudden power loss (a drive with
+    /// a volatile write cache can still lose the most recent writes). Run
+    /// production data paths on Linux; see the durability note in the README.
     ///
     /// Linux: `fdatasync` — flushes data and critical metadata without waiting for
     /// directory entry updates.
@@ -319,6 +322,24 @@ pub(crate) fn segment_counter_from_path(path: &Path) -> Option<u64> {
         return None;
     }
     rest[..end].parse().ok()
+}
+
+/// Derives the shard index from a shard directory path — `shard_00` yields `0`,
+/// `shard_07` yields `7`, `shard_128` yields `128`. Shard directories are named
+/// `shard_{id:02}` (a *minimum* width, segment_path's sibling at mod.rs), so a
+/// lexicographic path sort only tracks numeric order while every id has the same
+/// digit count; past `shard_99` the names grow a third digit and `"shard_100"`
+/// would sort before `"shard_20"`. Parsing the id keeps shard ordering
+/// numerically correct — used only for reproducible recovery logs; recovery
+/// itself is per-shard-isolated and order-independent. Returns `None` for the
+/// daemon's reserved `quarantine/` and `dead_letter/` subdirs, which then sort
+/// first and are skipped by the recovery scans.
+pub(crate) fn shard_id_from_path(path: &Path) -> Option<usize> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("shard_")?
+        .parse()
+        .ok()
 }
 
 /// Formats a segment file name for a given shard directory and counter.
@@ -514,6 +535,15 @@ impl ShardWriter {
         }
     }
 
+    /// Whether an active (unsealed) segment is currently open. Because a segment
+    /// is opened lazily on the first `write_record`, an open segment always holds
+    /// at least one record — so this doubles as "are there unsealed records?",
+    /// which the idle/age-based seal uses to decide whether sealing now would
+    /// hand a non-empty segment to the drain.
+    pub(crate) fn has_active_segment(&self) -> bool {
+        self.active.is_some()
+    }
+
     fn ensure_open(&mut self) -> io::Result<()> {
         if self.active.is_none() {
             let path = segment_path(&self.shard_dir, self.next_counter);
@@ -598,6 +628,52 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weir_seg_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// WabSegment::create is the daemon's segment-creation trust boundary:
+    /// O_EXCL (never clobber an existing file), O_NOFOLLOW (never follow a
+    /// symlink), and mode 0o600 (private to the daemon). Pins all three.
+    #[test]
+    fn wab_segment_create_is_exclusive_nofollow_and_private() {
+        let dir = tmp_dir("create_guards");
+
+        // O_EXCL: creating over an existing file fails with AlreadyExists and
+        // leaves the existing bytes untouched.
+        let existing = dir.join("seg_00000001.wab");
+        fs::write(&existing, b"pre-existing").unwrap();
+        let err = match WabSegment::create(&existing, 0) {
+            Ok(_) => panic!("create over an existing file must fail (O_EXCL)"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&existing).unwrap(), b"pre-existing");
+
+        // Fresh create: mode is exactly 0o600 (no group/other access).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fresh = dir.join("seg_00000002.wab");
+            let _seg = WabSegment::create(&fresh, 0).unwrap();
+            let mode = fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "segment files must be private (0o600)");
+        }
+
+        // O_NOFOLLOW: creating at a path that is a symlink fails rather than
+        // following it (create_new on a symlink errors regardless, but this pins
+        // the no-follow intent).
+        #[cfg(unix)]
+        {
+            let target = dir.join("nofollow_target.bin");
+            let link = dir.join("seg_00000003.wab");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(
+                WabSegment::create(&link, 0).is_err(),
+                "create must refuse a symlinked target path"
+            );
+            assert!(!target.exists(), "the symlink target must not be created");
+        }
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

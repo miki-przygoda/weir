@@ -28,6 +28,32 @@ Weir merges four layers in this precedence order (first match wins):
 The merge happens once at startup. Config is not reloaded on SIGHUP
 (see [Limitations](#limitations) below).
 
+### How to read this reference (knob philosophy)
+
+The list below is long, but **you can ignore most of it.** Every option has a
+production-ready default; a real deployment typically sets only a handful —
+`wab_dir`, `sink_type` + `sink_url`, maybe `shard_count` and a durability-related
+dial. The rest are **operability levers**: timeouts, retry budgets, poll
+intervals, and safety caps that you don't touch day to day but want available for
+the incident where the default is wrong for *your* environment and a recompile
+isn't an option (a slow downstream, a flaky uplink, an unusually large host).
+
+This is a deliberate design stance, not configuration sprawl:
+
+- A knob you never change still earns its place if it's the difference between a
+  three-line config edit and a fork-and-rebuild at 3am. The value of a safety/
+  tuning dial is realised exactly once, when you need it.
+- Defaults are the single source of truth — they're tuned constants in the code
+  (`drain::MAX_RETRIES`, `drain::HEALTH_POLL_INTERVAL`, …) that the knobs fall
+  back to, so "the default" and "what the tests exercise" can't drift apart.
+- Adding a knob is a backward-compatible change; removing one is breaking. So new
+  knobs are added sparingly — only when a real deployment would plausibly need to
+  change the value, never "just in case."
+
+Practical takeaway: start from the defaults, set the four or five knobs your
+deployment actually needs, and treat the rest as documented escape hatches you'll
+reach for if and when an operational problem points you at one.
+
 ### TOML file structure
 
 All options live under `[server]`:
@@ -175,11 +201,44 @@ do not increase fsync throughput — they fight for the same disk queue.
 On NVMe with high parallel write depth, 2–4 shards may improve aggregate
 throughput. Default `1` is correct for most deployments.
 
+> **`shard_count` is not a throughput dial — and it is non-monotonic under
+> concurrency.** Each connection is pinned to one shard for its lifetime, round-robin
+> at accept time (`counter % shard_count`, `socket/mod.rs`). The Sync-tier throughput
+> lever is **group-fsync batching**: a shard's flusher rides every record currently in
+> its active segment on a single `fsync` (`wab/mod.rs` `flush_batch` — "one group fsync
+> covers every record still in the active segment"), so the more concurrent producers
+> land on a shard, the more records amortise each `fsync`. Spreading the *same* set of
+> connections across more shards does the opposite — it thins connections-per-shard, so
+> each group fsync covers fewer records, while adding one more contending flusher thread
+> per shard. Past the point where that trade turns over, more shards can drop Sync
+> throughput *below* a single shard. "Match your cores" is therefore a trap for this
+> knob: the optimum is governed by **connections-per-shard**, not core count. If you are
+> chasing Sync throughput, prefer concentrating concurrent producers into **few** shards
+> over fanning out into many. (This is qualitative — the turn-over point is workload- and
+> hardware-specific; measure your own.)
+
+> **The "few shards" advice is for the fsync tiers only — it inverts for `Buffered`.**
+> The amortization above exists because Sync/Batched records share a single group
+> `fsync`. `Buffered` **never fsyncs** — its records ack the moment they hit memory
+> (`wab/mod.rs`, `Durability::Buffered` acks immediately, with no group fsync), so
+> there is nothing to amortize and no benefit to piling connections onto one shard.
+> What concentration *does* do there is funnel every concurrent producer through a
+> single shard's flusher thread and active segment, serialising work that could run in
+> parallel — in our runs this collapsed aggregate `Buffered` throughput by roughly
+> **8–12×** versus spreading the same connections across shards. So for a `Buffered`
+> workload, **spread connections across shards** (and scale `shard_count` toward your
+> parallel-write capacity); reserve the few-shards guidance for the `Sync`/`Batched`
+> tiers where the group fsync actually rewards density.
+
 The daemon emits a startup advisory if `shard_count` / `worker_count`
 looks unusual for the host's core count. See
 [Agent count vs cores](../benchmarks/agent-count-tuning.md) for the
 empirical sweep and the heuristic the advisory is based on; the rule
-of thumb is `max(2, cores - 2) / 2`.
+of thumb is `max(2, cores - 2) / 2`. Treat that advisory as a thread-budget
+sanity check (don't run far more agent threads than cores), **not** a
+throughput recommendation: as the caveat above explains, the Sync-throughput
+optimum follows connections-per-shard, not cores, so the cores-based heuristic
+does not predict the best `shard_count` for throughput.
 
 ---
 
@@ -217,6 +276,18 @@ the right knob.
 The batch tuning data is in [batch-tuning.md](../benchmarks/batch-tuning.md);
 an operator-facing tuning **guide** is planned for Phase 2. Defaults below
 are the sweet spot found by the empirical sweep.
+
+> **These two knobs are largely inert under concurrency — keep the defaults.**
+> The flusher flushes when it reaches `batch_size` records **or** `batch_deadline_ms`
+> elapses, whichever comes first (`worker.rs` / `wab/mod.rs`). With many concurrent
+> producers a batch fills by reaching the deadline long before it reaches the size cap,
+> so `batch_size` does little and `batch_deadline_ms` is what actually governs the
+> flush cadence. The dramatic per-deadline figures in
+> [batch-tuning.md](../benchmarks/batch-tuning.md) (e.g. "a 5 ms deadline pushes p50 to
+> ~6 ms") come from its **single-producer latency** sweep; they are not a guide to
+> throughput under concurrent load. The defaults `(256, 1ms)` are a good starting point
+> at any concurrency — reach for [`shard_count`](#shard_count) and connection density
+> (see its caveat) before these two when tuning concurrent Sync throughput.
 
 #### `batch_size`
 
@@ -282,6 +353,16 @@ and opens a fresh one. The sealed segment is forwarded to the drain
 for sink commit; until a segment seals, its records are durable on
 disk but invisible to the sink.
 
+> **Low-volume trap: with idle-seal off (the default), a quiet producer
+> delivers nothing.** With this 256 MiB cap and the default
+> [`wab_segment_max_age_secs`](#wab_segment_max_age_secs) `= 0`, a low-volume
+> deployment that writes a handful of small records and goes quiet gets every
+> record **acked** but the segment never reaches 256 MiB, so it never seals and
+> the sink receives **nothing** until shutdown. If your throughput won't fill a
+> segment promptly, set `wab_segment_max_age_secs` (e.g. `2`–`30`) so idle
+> segments seal on a timer — or lower this cap. This is the single most common
+> "weir accepts records but my sink is empty" surprise.
+
 **Effect**: smaller values trigger more frequent drain → sink activity
 and faster failure isolation (a corrupt segment only affects records
 in that window); larger values reduce the per-rotation overhead and
@@ -293,6 +374,34 @@ embedded boxes with ≤ 1 GiB available for WAB), or in tests that
 need to demonstrate sink-side behaviour without pushing 256 MiB of
 data. Higher if you have spare disk and want to amortise the seal
 cost over more records.
+
+---
+
+#### `wab_segment_max_age_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `0` (disabled)
+- **Range**: 0 – 86400
+- **CLI**: `--wab-segment-max-age-secs <n>`
+- **Env**: `WEIR_WAB_SEGMENT_MAX_AGE_SECS`
+- **TOML**: `wab_segment_max_age_secs`
+
+Opt-in **idle seal**: when > 0, the WAB flusher seals the active segment (handing
+it to the drain) after it has gone this many seconds with no new records, instead
+of waiting to reach `wab_segment_max_bytes` or for shutdown. `0` (default)
+preserves the historical behaviour — a segment seals only on the size threshold
+or shutdown.
+
+**Why it exists**: a **low-volume** deployment can write a handful of small
+records and then go quiet; with size-only sealing those records stay durable on
+disk but never reach the sink until 256 MiB accumulates or the daemon restarts —
+which reads as "weir isn't delivering." Set this (e.g. `5`–`30`) so a quiet
+segment drains promptly. On-disk format is unchanged; this only affects *when* a
+normal seal happens.
+
+**When to tune**: set it on edge/low-throughput deployments where timely delivery
+matters more than maximal per-segment batching; leave it `0` on high-throughput
+deployments where segments fill quickly on their own.
 
 ---
 
@@ -395,30 +504,40 @@ max-size payload at once). On memory-constrained hosts, lower
 
 - **Type**: u16
 - **Default**: `9185`
-- **Range**: 1–65535
+- **Range**: 1–65535 (port `0` is rejected at startup with a clear error)
 - **CLI**: `--metrics-port <n>`
 - **Env**: `WEIR_METRICS_PORT`
 - **TOML**: `metrics_port`
 
-TCP port for the Prometheus `/metrics` HTTP endpoint.
+TCP **port** for the Prometheus `/metrics` HTTP endpoint. This is a distinct
+knob from the bind **host** ([`metrics_bind`](#metrics_bind)); the two combine
+into the listen socket `<metrics_bind>:<metrics_port>` (default
+`127.0.0.1:9185`).
 
 **When to tune**: change if 9185 conflicts with another service, or
 to allow multiple weir instances on one host.
 
 #### `metrics_bind`
 
-- **Type**: IpAddr
+- **Type**: IP address (a bare host `IpAddr` — **not** `host:port`)
 - **Default**: `127.0.0.1` (localhost only)
+- **Validation**: parsed as an `IpAddr` at startup; a value that is not a valid
+  IP address (e.g. a hostname, or a `host:port` pair) is a startup error.
 - **CLI**: `--metrics-bind <addr>`
 - **Env**: `WEIR_METRICS_BIND`
 - **TOML**: `metrics_bind`
 
-Address the metrics server binds to. The default is localhost-only, so
-the endpoint is not exposed off-box without an explicit decision. To
-scrape from another host, sidecar, or container, set `0.0.0.0` (or a
-specific interface) and restrict access via firewall rules or a
-`--publish 127.0.0.1:9185:9185` port mapping in Docker. A `0.0.0.0`
-bind is **not** a security boundary — `/metrics` is unauthenticated.
+The **host address** the metrics server binds to. The **port** is a separate
+knob, [`metrics_port`](#metrics_port) — `metrics_bind` is a host-only address and
+the two combine into the listen socket (`<metrics_bind>:<metrics_port>`, default
+`127.0.0.1:9185`). Set the host here (e.g. `0.0.0.0` or a specific interface) and
+the port in `metrics_port`; do **not** put a port in `metrics_bind`.
+
+The default is localhost-only, so the endpoint is not exposed off-box without an
+explicit decision. To scrape from another host, sidecar, or container, set
+`0.0.0.0` (or a specific interface) and restrict access via firewall rules or a
+`--publish 127.0.0.1:9185:9185` port mapping in Docker. A `0.0.0.0` bind is
+**not** a security boundary — `/metrics` is unauthenticated.
 
 #### `metrics_max_connections`
 
@@ -478,12 +597,48 @@ record is appended to a dead-letter segment under
 > `weir_drain_segments_stranded_total`, not the dead-letter metrics). Only
 > *permanent* rejections land in the dead-letter directory.
 
-**Reprocessing dead-lettered records.** There is **no built-in requeue** in
-1.0: `weir-ctl dl` supports `list` (count + bytes) and `drop` (delete all)
-only. Dead-lettered records are held for manual handling — inspect the segment
-files under `<wab_dir>/dead_letter/`, fix the downstream cause, and re-submit
-them through your producer if needed. An automated requeue path is tracked for
-a post-1.0 release.
+**Reprocessing dead-lettered records.** Use `weir-ctl dl requeue` once you've
+fixed the downstream cause. It reads the dead-letter segments under
+`<wab_dir>/dead_letter/` via the shared `weir-wab` `SegmentReader` (CRC-verifying
+every record) and re-submits each record back through the daemon's Unix socket as
+a normal `Push`, so the records re-enter the pipeline and the drain re-attempts
+delivery. The full `weir-ctl dl` surface is `list` (count + bytes), `drop`
+(delete all), and `requeue` (re-submit then delete).
+
+```bash
+# Dry run (default): report what WOULD be requeued; touches nothing, connects to nothing.
+weir-ctl dl requeue --wab-dir /var/lib/weir/wab
+
+# Real run: re-submit and delete each segment once all its records are re-accepted.
+weir-ctl dl requeue --wab-dir /var/lib/weir/wab --socket /run/weir/weir.sock --yes
+```
+
+- **Defaults to a dry run, like `dl drop`.** Without `--yes` it only counts the
+  recoverable records (and lists any unreadable segments it would skip) and
+  prints what it would do — it does not connect to the daemon or modify any file.
+  `--yes` performs the real run.
+- **Flags**: `--wab-dir` (env `WEIR_WAB_DIR`); `--socket` (alias `--socket-path`,
+  default `/run/weir/weir.sock`) — the daemon socket to push back through;
+  `--durability` (`sync` | `batched` | `buffered`, default `batched`) — the
+  durability tier for the re-pushed records; `--yes` to actually requeue.
+- **At-least-once, segment-atomic.** A segment is deleted only after **all** of
+  its records are re-accepted (each `Push` is acked only once the daemon has made
+  it durable), so an interrupted run bounds duplication to the single in-flight
+  segment, which is re-sent on the next run. Duplicate payloads are absorbed by
+  the sink's idempotency key. A corrupt/unreadable segment is skipped wholesale
+  (never partially requeued) and left in place. Records that are requeued but
+  whose segment can't be deleted are surfaced loudly (they will requeue again
+  next run — remove them manually).
+
+`docs/monitoring.md` references this command in its dead-letter runbook.
+
+> **`weir-ctl segments`, `dl list`, and `dl drop` read the WAB directory on disk
+> (`--wab-dir` / `WEIR_WAB_DIR`), not the daemon socket** — they inspect the on-disk
+> segments directly and never connect to a running daemon (unlike `health` / `push`,
+> which use `--socket`, and `metrics`, which scrapes `--addr`). `dl requeue` is the
+> exception that uses both: it reads the dead-letter segments from `--wab-dir` and then
+> re-pushes them through `--socket`. Point `--wab-dir` at the daemon's configured
+> [`wab_dir`](#wab_dir).
 
 #### `dead_letter_max_bytes`
 
@@ -538,6 +693,28 @@ and rescans are expensive (each rescan is a `readdir` + per-file
 
 ---
 
+#### `health_poll_interval_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `30`
+- **Range**: 1–3600
+- **CLI**: `--health-poll-interval-secs <n>`
+- **Env**: `WEIR_HEALTH_POLL_INTERVAL_SECS`
+- **TOML**: `health_poll_interval_secs`
+
+How often the drain re-probes sink health and rescans for **stranded** segments
+to re-drain. The probe runs on a wall-clock cadence, so it fires even while the
+drain is busy under sustained load (it is **not** gated on the channel going
+idle). This is also the upper bound on how long a stranded segment waits before
+the drain notices the sink recovered.
+
+**When to tune**: lower it (e.g. 5–10 s) for faster stranded-segment recovery on
+a flaky uplink; raise it to probe a rate-sensitive sink less often. The health
+**probe** itself is bounded by a separate short timeout (5 s, or `sink_timeout_secs`
+if shorter), independent of the long `commit` backstop.
+
+---
+
 ### Sink selection
 
 Weir ships with five built-in sinks. The **default build** compiles in `noop`,
@@ -588,8 +765,15 @@ Mind the other exposure surfaces: passing `--sink-url` on the **command line**
 puts the credential in the process argv, visible via `ps aux` to any same-uid
 process; and even `WEIR_SINK_URL` is readable via `/proc/<pid>/environ` or
 `ps eww`. The env var is the best of the three (off disk, out of `ps aux`);
-restrict who can read the daemon's `/proc` entry. The password is always
-redacted in weir's own logs and the config-debug line regardless of source.
+restrict who can read the daemon's `/proc` entry. weir redacts credentials in
+its own logs and the config-debug line: both the URL **userinfo** password
+(`scheme://user:<redacted>@host`) and the values of known **credential query
+parameters** (`?password=`, `?token=`, `?access_token=`, `?secret=`,
+`?api_key=`/`?apikey=`, `?sig=`/`?signature=`, `?passwd=`/`?pwd=`) are scrubbed
+wherever a sink URL is logged, including inside transport-error strings on every
+retry. This is a defence-in-depth denylist, not a guarantee for arbitrary custom
+credential parameters — prefer a bearer token (`WEIR_SINK_BEARER_TOKEN`) or the
+userinfo form, and treat the `/proc`/`ps` surfaces above as the real boundary.
 
 For HTTP, the body is the raw payload bytes; `Content-Type` is
 `application/octet-stream`. The endpoint is expected to return:
@@ -597,16 +781,18 @@ For HTTP, the body is the raw payload bytes; `Content-Type` is
 - **2xx** for accepted records → committed
 - **4xx (except 408, 429)** for rejected records → dead-lettered
 - **408, 429, 5xx** for retryable failures → drain retries the whole
-  segment with exponential backoff (up to `MAX_RETRIES`)
+  segment with exponential backoff (up to `sink_max_retries`)
 
 Network-layer failures (connect refused, DNS failure, timeout) are
 treated as transient.
 
-**`MAX_RETRIES` is a fixed `3`** (100 ms base delay, doubling) — it is **not**
-currently configurable via flag/env/TOML. Once a segment exhausts its retries it
-is left on disk ("stranded"), increments `weir_drain_segments_stranded_total`,
-and is re-attempted **only on daemon restart** — not automatically when the sink
-recovers. See [monitoring.md](../monitoring.md#weirsegmentstranded).
+**The retry budget is configurable** via `sink_max_retries` (default `3`,
+range 0–100) and `sink_retry_base_delay_ms` (default `100`, doubling on each
+retry) — see their sections below. Once a segment exhausts its retries it is
+left on disk ("stranded"), increments `weir_drain_segments_stranded_total`, and
+is re-drained **automatically on the next health poll after the sink recovers**
+(within `health_poll_interval_secs`), or on the next daemon restart.
+See [monitoring.md](../monitoring.md#weirsegmentstranded).
 
 **Health probe (`HEAD`).** weir periodically sends an HTTP `HEAD` to `sink_url`
 to populate `weir_sink_health`. A reachable endpoint that doesn't implement HEAD
@@ -660,14 +846,21 @@ that legitimately take seconds (some logging ingesters do).
 - **Env**: `WEIR_SINK_MAX_BATCH_SIZE`
 - **TOML**: `sink_max_batch_size`
 
-Maximum records the drain hands to a single `Sink::commit` call. The
-HTTP sink sends one POST per record inside `commit` (up to
-`sink_http_concurrency` in flight), so this also caps the longest run
-of POSTs before the drain re-checks its shutdown signal and
-dead-letter state.
+Maximum records the drain hands to a single `Sink::commit` call. Its effect
+depends on the HTTP framing mode (`sink_http_batch`):
 
-**When to tune**: lower for endpoints that prefer many small calls; the
-default 100 is a balanced point for most deployments.
+- **per-record** (`none`, default): the sink sends one POST per record (up to
+  `sink_http_concurrency` in flight), so this caps the longest run of POSTs
+  before the drain re-checks its shutdown signal and dead-letter state.
+- **ndjson**: this **is** the number of records packed into each single
+  newline-delimited POST. Raise it (toward 1000–10000) for high-throughput
+  log/trace shipping, where larger batches amortise the per-POST overhead.
+
+For the SQL sinks it is the number of rows per multi-row `INSERT`.
+
+**When to tune**: lower for endpoints that prefer many small calls; raise it for
+ndjson/SQL bulk throughput. The default 100 is a balanced point for most
+deployments.
 
 > **Keep this stable for dedup-by-batch sinks (ClickHouse).** The ClickHouse
 > sink's `insert_deduplication_token` is a hash of the **per-`commit` batch**.
@@ -706,6 +899,23 @@ breaking parsers.
 header (strict CORS, header allow-lists). In that case the endpoint
 must implement its own dedup — usually by hashing the body server-side.
 
+> ⚠ **Content-collision caveat.** The key is `sha256(payload)` — a function of
+> the payload bytes *only*, with no per-record identity. So two **legitimately
+> distinct** records that happen to have byte-identical payloads (heartbeats,
+> repeated `OK`/empty bodies, identical log lines, repeated metric samples)
+> produce the **same** key. An endpoint that dedupes on the key will accept the
+> first and drop the rest — silently collapsing at-least-once into at-most-once
+> for duplicate-payload workloads. This is safe only when payloads are unique or
+> already carry their own dedup id. If your workload has repeating payloads,
+> either set `sink_send_idempotency_key = false` (and let the endpoint dedupe on
+> its own record id), or ensure each record embeds a unique field. (A future
+> per-record dedup token — `sha256(segment_id ‖ offset ‖ payload)`, stable across
+> retries but distinct per record — is parked for an on-disk WAB-format revision;
+> see "Generalized dedup token → WAB format v2" in
+> `docs/explorations/parked-future-directions.md`.
+> It can't be done without a format change because the sink today receives no
+> per-record identity, only the payload bytes.)
+
 ---
 
 #### `sink_http_concurrency`
@@ -728,6 +938,90 @@ per-record. Results are committed in submission order.
 **When to tune**: raise it for high-latency endpoints where the RTT
 dominates; lower it (or set `1` for fully serial) for endpoints that
 rate-limit aggressively or can't handle concurrent connections.
+
+---
+
+#### `sink_http_batch`
+
+- **Type**: string (`none` | `ndjson`)
+- **Default**: `none`
+- **CLI**: `--sink-http-batch <mode>`
+- **Env**: `WEIR_SINK_HTTP_BATCH`
+- **TOML**: `sink_http_batch`
+
+How the HTTP sink frames a `commit` batch into HTTP requests.
+
+- **`none`** (default): one POST per record. Per-record `Idempotency-Key`,
+  per-record dead-lettering, up to `sink_http_concurrency` POSTs in flight.
+  Any endpoint that accepts a single-record POST body works — no batch
+  format to agree on.
+- **`ndjson`**: the **whole** `commit` batch (up to `sink_max_batch_size`
+  records) goes in **one** POST, newline-delimited (one record per line,
+  `Content-Type: application/x-ndjson`). This is the framing Loki, the
+  Elasticsearch `_bulk` API, and similar log/trace ingesters expect. One
+  POST per batch instead of N collapses the round-trip cost for sustained
+  high-throughput forwarding.
+
+**Trade-off (NDJSON is all-or-nothing).** The endpoint returns a single
+status for the whole batch, so there is no per-record outcome: a `2xx`
+commits every record in the batch, a permanent `4xx` dead-letters the
+**entire** batch, and a transient error (`408`/`429`/`5xx`/transport)
+retries the whole segment. If you need a single bad record dead-lettered
+without taking its batch-mates with it, use `none`.
+
+**Records with embedded newlines are dead-lettered** in `ndjson` mode — a
+`\n`/`\r` inside a payload can't be NDJSON-framed (the endpoint would read one
+record as several). Rather than silently corrupt the batch, weir routes those
+records straight to the dead-letter store with a clear reason (and logs a
+`warn!`); only the clean records are POSTed. If your payloads can contain
+newlines, use per-record mode (`sink_http_batch = "none"`), where each record is
+its own POST body and newlines are fine.
+
+**Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
+is sent for the whole batch, computed over the joined body. Because the
+key is a hash of the exact bytes, it inherits the same batch-stability
+caveat as ClickHouse's dedup token — see the note under
+[`sink_max_batch_size`](#sink_max_batch_size): changing
+`sink_max_batch_size` across a restart re-splits a replayed segment into
+different batches with different keys, so an endpoint deduping on the
+batch key would not recognise them as duplicates. Keep
+`sink_max_batch_size` frozen for the life of the deployment if you rely
+on batch-level dedup.
+
+---
+
+#### `sink_max_retries`
+
+- **Type**: u32
+- **Default**: `3`
+- **Range**: 0–100
+- **CLI**: `--sink-max-retries <n>`
+- **Env**: `WEIR_SINK_MAX_RETRIES`
+- **TOML**: `sink_max_retries`
+
+How many times the drain retries a segment on a **transient** sink error
+(with exponential backoff seeded by `sink_retry_base_delay_ms`) before it
+gives up and **strands** the segment on disk. A stranded segment is durable
+(no data loss) but undelivered; it is re-drained automatically when the sink
+health recovers, or on the next daemon restart. `0` strands on the first
+transient failure. Increments `weir_drain_segments_stranded_total` on strand.
+
+**When to tune**: raise it to ride out longer downstream outages without
+stranding (each extra retry waits up to the backoff cap of 5 minutes); lower
+it if you'd rather strand quickly and rely on the recovery rescan / restart.
+
+#### `sink_retry_base_delay_ms`
+
+- **Type**: u64 (milliseconds)
+- **Default**: `100`
+- **Range**: 1–60000
+- **CLI**: `--sink-retry-base-delay-ms <n>`
+- **Env**: `WEIR_SINK_RETRY_BASE_DELAY_MS`
+- **TOML**: `sink_retry_base_delay_ms`
+
+The first transient-retry backoff delay; it doubles on each subsequent retry
+(capped at 5 minutes), and a downstream `Retry-After` header overrides it when
+present. With the defaults the retry delays are 100 ms → 200 ms → 400 ms.
 
 ---
 
@@ -864,6 +1158,18 @@ The `UNIQUE (payload_sha256)` constraint pairs with the default
 `sink_postgres_insert_mode = "on_conflict_do_nothing"` so crash-recovery
 retries are idempotent: duplicate inserts are silently dropped by the
 server, no consumer-side dedup required.
+
+> **The generated `payload_sha256` column is a dedup key, not at-rest
+> tamper-evidence.** It is `GENERATED ALWAYS … STORED`, so Postgres
+> **recomputes** it on every `UPDATE` — an attacker (or a buggy migration) that
+> rewrites `payload` also rewrites the hash, leaving the row internally
+> consistent. It anchors the bytes only at *insert* time, against accidental
+> duplication; it does **not** detect a later mutation. Real at-rest
+> tamper-evidence needs an **append-only** table (revoke `UPDATE`/`DELETE`) or an
+> application-maintained **hash chain** (each row's hash folds in the previous
+> row's), neither of which weir provides — see the
+> [threat model](../security/threat-model.md) ("Signed audit log": records are
+> written verbatim, with no hash chain beyond the per-record wire CRC).
 
 #### `sink_postgres_table`
 
@@ -1019,9 +1325,12 @@ SETTINGS non_replicated_deduplication_window = 100;
   `tracing-subscriber::EnvFilter` directive (e.g.
   `"weir_server=debug,info"` to set per-module levels).
 - **CLI**: `--log-level <level>`
-- **Env**: `WEIR_LOG_LEVEL` (also `RUST_LOG`, which `EnvFilter` reads
-  natively as a fallback)
+- **Env**: `WEIR_LOG_LEVEL`
 - **TOML**: `log_level`
+
+> Note: `RUST_LOG` is **not** consulted — the subscriber's `EnvFilter` is built
+> only from the resolved `log_level` (CLI > `WEIR_LOG_LEVEL` > TOML > `info`).
+> Set the level through one of those, not `RUST_LOG`.
 
 The `tracing-subscriber` `EnvFilter` directive used to initialise the
 logging subscriber.

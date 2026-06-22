@@ -116,11 +116,13 @@ fn load_key(p: &Path) -> Result<rustls_pki_types::PrivateKeyDer<'static>, Client
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 //
-// The full mTLS handshake round-trip (connect_tls against a live daemon,
-// cert-rejection paths, the timeout setters on a real TlsStream) is covered by
-// the `tls_listener` integration suite in weir-server/tests. These unit tests
-// cover the PEM-loader error mapping the integration suite can't easily hit
-// (G03).
+// The full mTLS round-trip THROUGH `connect_tls` against a live daemon — the
+// happy path plus the wrong-CA / expired-cert / mismatched-server_name rejection
+// cases — is covered by the non-ignored `tls_client` integration suite in
+// weir-server/tests. (`tls_listener` covers the *server's* rejection behaviour
+// with a hand-rolled rustls client; it does not exercise `connect_tls`.) These
+// unit tests cover the PEM-loader error mapping the integration suites can't
+// easily hit (G03).
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -303,10 +303,20 @@ where
                 .await?;
             }
             _ => {
+                // A structurally valid frame carrying a daemon→client message type
+                // (Ack / Nack / HealthCheckResponse) — the client sent something it
+                // should only ever receive. This is a PERMANENT client protocol
+                // error and we close the connection, so the Nack reason must be
+                // UnknownMessage (permanent, connection-closing), not InternalError
+                // (which the protocol defines as transient + keep-open → "retry on
+                // this connection"). Returning InternalError here told a client to
+                // retry on a socket we were about to close. This matches the
+                // decode-level unknown-message-type path (an unrecognised type byte
+                // also maps to UnknownMessage).
                 debug!(msg_type = ?header.message_type(), "unexpected message type from client");
                 send_nack(
                     stream.get_mut(),
-                    WireNack::InternalError,
+                    WireNack::UnknownMessage,
                     &[],
                     config.read_timeout,
                 )
@@ -315,7 +325,7 @@ where
                     .records_nack
                     .get_or_create(&NackLabel {
                         tier: TierValue::sync,
-                        reason: MetricNack::internal_error,
+                        reason: MetricNack::unknown_message,
                     })
                     .inc();
                 return Ok(());
@@ -835,6 +845,33 @@ mod tests {
             client.read(&mut buf).await.unwrap(),
             0,
             "connection must close after an UnknownMessage Nack"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_sent_response_message_type_returns_unknown_message_and_closes() {
+        // A client must never SEND a daemon→client message type (Ack / Nack /
+        // HealthCheckResponse). Such a frame DECODES fine (the type byte is valid),
+        // but is dispatch-rejected. It is a permanent protocol error that closes the
+        // connection, so the Nack reason must be UnknownMessage (permanent /
+        // connection-closing) — NOT InternalError, which the protocol defines as
+        // transient + keep-open ("retry on this connection"). Regression: the
+        // dispatch arm previously returned InternalError, telling the client to
+        // retry on a socket the daemon was about to close.
+        let mut client = spawn_handler(test_cfg()).await;
+        let mut frame = push_frame(b"");
+        frame[5] = MessageType::Ack as u8; // 0x02 — a daemon→client type
+        let crc = crc32fast::hash(&frame[..12]).to_le_bytes();
+        frame[12..16].copy_from_slice(&crc);
+        client.write_all(&frame).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::UnknownMessage as u8);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            client.read(&mut buf).await.unwrap(),
+            0,
+            "connection must close after the UnknownMessage Nack"
         );
     }
 

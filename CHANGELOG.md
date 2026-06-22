@@ -7,8 +7,221 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 From v1.0 onward, `weir` follows Semantic Versioning: a breaking change to the
 public Rust API of a published crate (`weir-core`, `weir-client`,
-`weir-sink-sdk`) or to the wire protocol requires a major version bump. Wire
-protocol version changes are tracked separately under **Wire protocol** below.
+`weir-sink-sdk`, `weir-wab`) or to the wire protocol requires a major version
+bump. Wire protocol version changes are tracked separately under **Wire
+protocol** below.
+
+---
+
+## [1.3.0] - 2026-06-22
+
+Hardening + test-completeness release from four pre-publication sweeps (three
+adversarial bug-hunts plus a per-logic-layer action audit covering all 204
+actions on two axes: behavioural test coverage and "the operator cannot
+accidentally break their own system"). Two operator-foolproofing guardrails, a
+few additive APIs, and ~30 new tests. No wire, on-disk-format, or existing-API
+breaks — a clean minor.
+
+### Added
+
+- **weir-core — `From<MessageType> for u8`**, completing the symmetric
+  `TryFrom<u8>` ⇄ `From<Self>` pair the other frozen wire enums (`Durability`,
+  `NackReason`) already expose.
+- **weir-wab — `SegmentVerifyError::FooterMismatch`** (the enum is
+  `#[non_exhaustive]`): `verify_sealed_segment` now cross-checks the footer's
+  `record_count` / `data_bytes` against the records actually walked — the one
+  segment region the whole-file CRC does not cover.
+- **`weir_recovery_quarantine_copy_failed_total`** metric — an alertable signal
+  that recovery is stuck on a corrupt segment it cannot preserve (see Reliability).
+- **weir-core — `NackReason` is now `#[non_exhaustive]`** so promoting a reserved
+  reason byte (`0x0A`–`0xFF`) is an additive, not breaking, change.
+
+### Reliability
+
+- **Recovery fails closed on an un-preservable corrupt tail.** When a mid-file
+  corrupt segment's quarantine *copy* fails (disk full / read-only mount / inode
+  exhaustion), recovery no longer truncates the valid prefix — that discarded any
+  acked-durable records sitting after the corruption. It now leaves the segment
+  untouched, returns an error (left for manual inspection), and bumps
+  `weir_recovery_quarantine_copy_failed_total`, so the crown invariant (an acked
+  record is never lost) holds even when preservation is impossible.
+- **`tls_handshake_timeout_secs` is range-validated `[1, 300]`.** A `0` (a
+  plausible fat-finger) previously made every TLS handshake time out instantly,
+  silently rejecting all TCP/mTLS clients while the daemon looked healthy.
+- **WAB segment + shard-directory ordering is numeric, not lexicographic** — the
+  documented "ascending counter order" held only while every name shared the same
+  zero-pad width.
+- **weir-ctl `dl requeue` skips a torn / unsealed `.wab.sealed` tail** instead of
+  pushing its readable prefix and then deleting the file (which silently dropped
+  the torn remainder).
+- **Accept loop reaps finished connection handlers** each iteration (the `JoinSet`
+  was only drained at shutdown, growing unbounded under many short connections).
+
+### Wire protocol & conformance
+
+- **Canonical decode order is length-before-magic** across the Rust reference and
+  all five polyglot demo decoders; the Java decoder's field-parse order was fixed
+  to match (`message_type` → `durability` → reserved flags). The conformance suite
+  grew to **30 vectors** (`reject_partial_magic_short`,
+  `reject_flags_and_unknown_durability`) to pin both precedences. No wire-format
+  change — only which rejection tag a malformed frame carries.
+
+### Tests
+
+- **Per-layer action audit** added ~30 tests across all 11 layers, closing the
+  coverage + secure-by-design gaps it surfaced: the client mTLS `connect_tls`
+  trust boundary (previously zero-coverage), DST mid-batch rotation ack-fate +
+  seal-error-during-rotation, client refuse-and-poison on hostile daemon
+  responses, sink bearer / basic-auth delivery on the wire, the drain
+  commit-timeout-resumes-past-cursor + supervisor give-up paths, recovery
+  symlink / format-version trust boundaries, and the config range / zero guards.
+
+### Docs
+
+- Truth-ups: the architecture durability-tier claim (Buffered does **not** uphold
+  "ack ⇒ durable"), the README throughput headline, the README→architecture DST
+  cross-reference plus a "Deterministic Simulation Testing" section, version-
+  agnostic crates.io-publish framing, and the conformance-vector counts across the
+  demos.
+
+---
+
+## [1.2.0] - 2026-06-21
+
+Additive operability + ecosystem release from the post-1.1 finalization sweeps: a
+public `weir-wab` forensics read surface, machine-readable `weir-ctl --json`, a
+Prometheus-label accessor on `NackReason`, a recoverable client-side empty-payload
+guard, a Buffered-throughput fix, and a 5-language polyglot demo showcase. All
+backward compatible — no wire, on-disk-format, or existing-API breaks (a clean
+minor). The new `weir-wab` error enums are `#[non_exhaustive]` so future variants
+stay additive.
+
+### Added
+
+- **weir-wab — public forensics read surface.** `verify_sealed_segment` (streamed
+  whole-file CRC check) returning `SegmentVerification` / `SegmentVerifyError`;
+  `list_segment_files` → `SegmentState` (Active/Sealed/Confirmed); `parse_segment_header`
+  / `parse_segment_footer` / `crc32` with `SegmentHeaderMeta` / `SegmentFooterMeta`;
+  and `SegmentReader::header()` / `into_inner()` / `get_ref()` / `terminated_cleanly()`.
+- **weir-ctl — opt-in `--json`** global flag for machine-readable output on
+  `health` / `metrics` / `segments` / `push` / `dl` (human tables stay the default).
+- **weir-core — `NackReason::as_metric_label()` / `from_metric_label()`** mapping wire
+  reasons to the Prometheus `reason=` labels (the wire byte `0x07` is unchanged).
+- **weir-client — `ClientError::EmptyPayload`**, a recoverable local pre-send guard in
+  `WeirClient::push` (an empty payload is rejected before any bytes are sent, leaving
+  the connection usable, mirroring the oversized-payload guard).
+- **demos/ — 5-language polyglot wire clients** (C, Java, TypeScript, Python, Go) built
+  from the spec + conformance vectors with no weir-crate dependency, each passing all
+  30 conformance vectors, plus per-client subpages in the demo bundle.
+
+### Changed
+
+- **Tier-aware coalesce.** A Buffered-only batch no longer pays the worker's Phase-2
+  coalesce window (it has no group-fsync to amortise), restoring single-shard Buffered
+  throughput (~8–12× when connections co-locate); per-shard FIFO and durability are
+  unchanged.
+- **Drain stranded-segment auto-resume** now runs from the `BlockedDeadLetterFull` and
+  `RetryingTransient` states as well as `Draining`; a strand→resume reprocesses the
+  whole segment (documented whole-segment at-least-once — sinks already dedupe).
+- **Demo bundle restyled** to the personal-site "hr2" palette (dark neutral + sky/violet/
+  green, Inter + JetBrains Mono).
+- **Docs** — protocol/ops/monitoring truth-ups, decoder-tag→Nack-byte table, consumer
+  rustdoc + integrating guide, conformance/sink-integration; **publish order corrected to
+  `weir-core → weir-wab → weir-sink-sdk → weir-client / weir-server / weir-ctl`**
+  (`weir-testkit` is `publish = false`).
+
+### Fixed
+
+- WAB mid-record truncation now surfaces a contextual error (preserving the
+  `UnexpectedEof` kind); `verify_sealed_segment` rejects trailing bytes after the footer.
+- weir-ctl: a missing wab dir now errors (instead of an empty-OK), `dl requeue`
+  skip-semantics documented, `--socket-path` alias made visible, `--json` failures emit a
+  JSON error object.
+- weir-server: a one-shot warning when the HTTP sink runs unauthenticated, absolute
+  socket-path help text, `weir_drain_state` / nack-counter metric truth-ups (nack series
+  pre-initialised at 0).
+- config: range guards asserted on every bounded scalar knob.
+
+## [1.1.0] - 2026-06-19
+
+Additive operability features, a recovery hardening, and extensive doc truth-ups
+from the post-1.0 hands-on usage sweeps (Tier-4 features plus several rounds of
+"build a real app against the crates" persona sweeps). All backward compatible —
+no wire, on-disk, or API breaks.
+
+### Added
+
+- **Auto-resume for stranded segments** (drain). When the sink exhausts its
+  transient-retry budget on a segment, the segment is left durably on disk
+  ("stranded"). The drain now re-queues stranded segments automatically when the
+  sink health recovers (a down→up edge at the idle health-poll), instead of
+  waiting for a daemon restart. New `weir_drain_segments_resumed_total` metric.
+- **Configurable sink retry budget** (config). `sink_max_retries` (default 3) and
+  `sink_retry_base_delay_ms` (default 100) are now exposed via CLI/env/TOML; they
+  were previously hardcoded.
+- **HTTP sink NDJSON batch mode** (`sink_http_batch = none | ndjson`, default
+  `none`). `ndjson` sends a whole commit batch as one newline-delimited POST
+  (`application/x-ndjson`) with a single per-batch `Idempotency-Key` — the
+  framing Loki / Elasticsearch `_bulk` ingesters expect — collapsing the
+  per-record round-trip cost for sustained forwarding. The default per-record
+  mode is unchanged.
+- **`weir-ctl dl requeue`** re-submits dead-lettered records back through the
+  daemon's socket and deletes each segment once all its records are re-accepted.
+  Re-delivery is at-least-once (the HTTP sink's idempotency key dedupes identical
+  payloads if a run is interrupted). Defaults to a dry run; `--yes` to apply.
+- **New crate `weir-wab`** — the on-disk WAB segment format and `SegmentReader`,
+  extracted so `weir-ctl` can read dead-letter segments with the *same* parser
+  the daemon uses, without depending on the daemon's async/sink dependency tree.
+  `FORMAT_VERSION = 1` is frozen under the SemVer promise above.
+- **Client reconnect helpers** — `WeirClient::is_poisoned()` and
+  `ClientError::is_recoverable()` let a long-lived or async-bridged producer
+  decide when to drop and rebuild a connection without matching the
+  `#[non_exhaustive]` `ClientError` enum.
+- **`weir-server --version` / `-V`** (previously only `weir-ctl` had it).
+- **`weir-wab` re-exports `Payload`** so a `weir-wab`-only consumer can name the
+  `SegmentReader` item type without a direct `weir-core` dependency; the
+  bad-segment-magic error is now human-readable (ASCII rendering + expected magic).
+- **systemd deployment artifacts** (`deploy/systemd/`) — a hardened `weir.service`
+  unit, an `EnvironmentFile` secret pattern, and a liveness+readiness probe
+  script, for bare-metal / VM operators (the deploy story was previously
+  Docker-only).
+
+### Reliability
+
+- **Active-segment crash recovery now quarantines a mid-file-corrupt tail**
+  instead of silently truncating it. On a CRC mismatch in the *middle* of a
+  recovered active segment (bit-rot, not a torn trailing write), recovery now
+  copies the whole segment to `quarantine/`, bumps
+  `weir_recovery_segments_quarantined_total`, and logs at ERROR — so acked
+  records sitting after the corruption are preserved and surfaced rather than
+  silently dropped, symmetric with the sealed-segment drain path. The normal
+  torn-tail crash case is unchanged (clean truncate, no quarantine).
+
+### Fixed
+
+- **`docker build` was broken** — the Dockerfile's dependency-stub stage omitted
+  the new `weir-wab` workspace member, failing the build; the `weir-wab` stub is
+  now included.
+- **docker-compose** used a `wget` healthcheck (absent from the
+  `ca-certificates`-only runtime image) and did not set
+  `WEIR_METRICS_BIND=0.0.0.0`, so the mapped metrics port was unscrapeable from
+  the host while the container still reported healthy. Both fixed.
+- **systemd readiness probe** compared gauge values as `"1"` while the daemon
+  emits `1.0`, so the sink-down / drain-blocked not-ready paths never tripped;
+  it also exited 1 silently on a wrong-but-live `/metrics` target. Both fixed.
+
+### Documentation
+
+- Extensive truth-ups from the persona sweeps: an async-producer guide (the
+  blocking-`push()`-starves-the-runtime trap + the recommended dedicated-thread
+  bridge); accurate `Durability` tier rustdoc (Sync and Batched both
+  group-`fdatasync` at the batch boundary before ack); the Windows /
+  cross-platform story (`weir-client`'s client type is Unix-only); a
+  concurrency-aware tuning note (`shard_count` is non-monotonic, not a throughput
+  dial); the transient-strands vs permanent-dead-letters distinction; the
+  `weir_sink_health` HEAD-probe lag; and a quarantined-segment recovery recipe.
+  The startup `shard_count` advisory no longer claims raising it "can unlock
+  additional throughput."
 
 ---
 
@@ -1426,6 +1639,9 @@ The five commits making up this pass:
 
 ---
 
+[1.3.0]: https://github.com/miki-przygoda/weir/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/miki-przygoda/weir/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/miki-przygoda/weir/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/miki-przygoda/weir/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/miki-przygoda/weir/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/miki-przygoda/weir/compare/v0.4.0...v0.5.0

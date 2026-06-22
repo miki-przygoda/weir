@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords = ["weir", "client", "durability", "ingestion", "ipc"]
 categories = ["network-programming", "database"]
 
@@ -17,7 +18,7 @@ default = []
 tls = ["dep:rustls", "dep:rustls-pki-types"]
 
 [dependencies]
-weir-core = { path = "../weir-core", version = "1.0.0" }
+weir-core = { workspace = true }
 crc32fast = "1"
 # Crypto provider unified on `ring` workspace-wide (no aws-lc-rs). default-features
 # = false drops rustls's default aws_lc_rs provider; the client names the provider

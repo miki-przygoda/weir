@@ -41,12 +41,12 @@ use std::{
 use tracing::{info, warn};
 
 use config::{Config, SinkType};
-use drain::{DrainConfig, MAX_RETRIES};
+use drain::DrainConfig;
 use models::WorkUnit;
 #[cfg(feature = "clickhouse-sink")]
 use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
 #[cfg(feature = "http-sink")]
-use sink::http::{HttpSink, HttpSinkConfig};
+use sink::http::{HttpBatchMode, HttpSink, HttpSinkConfig};
 #[cfg(feature = "mysql-sink")]
 use sink::mysql::{MySqlSink, MySqlSinkConfig};
 use sink::noop::NoopSink;
@@ -209,6 +209,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("config: {w}");
     }
 
+    // On macOS the durable-write path uses F_BARRIERFSYNC, which orders writes
+    // and survives a process/OS crash but is NOT a guaranteed media flush on
+    // sudden power loss (a drive with a volatile write cache can still lose the
+    // most recent writes). Surface this once at startup so it isn't a surprise.
+    #[cfg(target_os = "macos")]
+    warn!(
+        "durability note: this is a macOS build — fsync uses F_BARRIERFSYNC, which is \
+         NOT power-loss-durable on drives with a volatile write cache. Run production \
+         data paths on Linux (fdatasync). See the durability section of the README."
+    );
+
     info!(
         socket = %config.socket_path.display(),
         wab_dir = %config.wab_dir.display(),
@@ -274,6 +285,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch_size: config.batch_size,
         batch_deadline: Duration::from_millis(config.batch_deadline_ms),
         segment_max_bytes: config.wab_segment_max_bytes,
+        // 0 = idle-seal disabled (historical behaviour).
+        segment_max_age: (config.wab_segment_max_age_secs > 0)
+            .then(|| Duration::from_secs(config.wab_segment_max_age_secs)),
     };
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),
@@ -305,11 +319,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wab_dir: config.wab_dir.clone(),
         dead_letter_max_bytes: config.dead_letter_max_bytes,
         dead_letter_check_interval: Duration::from_secs(config.dead_letter_check_interval_secs),
-        base_retry_delay: Duration::from_millis(100),
-        max_retries: MAX_RETRIES,
+        base_retry_delay: Duration::from_millis(config.sink_retry_base_delay_ms),
+        max_retries: config.sink_max_retries,
+        max_respawns: drain::MAX_DRAIN_RESPAWNS,
         // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
         // sink hangs without honouring its internal timeout.
         commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
+        health_poll_interval: Duration::from_secs(config.health_poll_interval_secs),
+        // A health probe is a liveness check, not a delivery, so cap it well below
+        // commit_timeout: 5s, or the sink's own timeout if that's shorter.
+        health_probe_timeout: Duration::from_secs(config.sink_timeout_secs.min(5)),
     };
     // Surface the configured sink type as a metric so operators (and
     // `weir-ctl metrics`) can see whether records actually go downstream or to
@@ -342,6 +361,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .filter(|t| !t.is_empty())
                 .map(Arc::from);
+            // One-shot startup hint: with no token set the sink POSTs
+            // unauthenticated, and the first symptom is otherwise a flood of 401
+            // dead-letters at drain time. Gated to the http arm, so it only fires
+            // when the http sink is actually selected.
+            if bearer_token.is_none() {
+                warn!(
+                    "sink: http — WEIR_SINK_BEARER_TOKEN is unset; requests will be sent \
+                     UNAUTHENTICATED (no Authorization header). If the endpoint requires auth, \
+                     set WEIR_SINK_BEARER_TOKEN or expect 401s to dead-letter at drain time."
+                );
+            }
+            // Validated to "none"|"ndjson" at config load; "ndjson" sends the
+            // whole batch as one newline-delimited POST, anything else (i.e.
+            // "none") keeps the per-record default.
+            let batch_mode = if config.sink_http_batch == "ndjson" {
+                HttpBatchMode::Ndjson
+            } else {
+                HttpBatchMode::PerRecord
+            };
+            // sink_http_concurrency only applies to per-record POSTs; in ndjson
+            // mode the whole batch is one POST, so report it as inert rather than
+            // logging a misleading "concurrency = 8".
+            let concurrency_display = match batch_mode {
+                HttpBatchMode::Ndjson => "n/a (ndjson)".to_string(),
+                HttpBatchMode::PerRecord => config.sink_http_concurrency.to_string(),
+            };
             info!(
                 // The URL may carry userinfo (user:password@host); redact the
                 // password so it never reaches a log line (S25).
@@ -349,13 +394,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bearer = bearer_token.is_some(),
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
-                concurrency = config.sink_http_concurrency,
+                concurrency = %concurrency_display,
+                batch = %config.sink_http_batch,
                 "sink: http"
             );
             let http_cfg = HttpSinkConfig {
                 url,
                 timeout: Duration::from_secs(config.sink_timeout_secs),
                 max_batch_size: config.sink_max_batch_size,
+                batch_mode,
                 bearer_token,
                 send_idempotency_key: config.sink_send_idempotency_key,
                 concurrency: config.sink_http_concurrency,
@@ -767,10 +814,14 @@ fn advise_agent_count(shard_count: usize, worker_count: usize) {
             shard_count,
             worker_count,
             recommended_agent_count = recommended,
-            "shard_count/worker_count is well below the recommended value for this core \
-             count. On systems with parallel-fsync-capable storage (NVMe RAID, virtualised \
-             block devices) raising it can unlock additional throughput. This is advisory — \
-             override via config if you've measured your workload."
+            "shard_count/worker_count is below the recommended agent count for this core \
+             count. This is fine and often optimal: shard_count is a parallelism knob, not a \
+             throughput dial. Raising it helps only with many concurrent producers to spread \
+             across shards AND parallel-fsync-capable storage (NVMe RAID, virtualised block \
+             devices); with few connections more shards collapse group-fsync batching and can \
+             REDUCE throughput (the relationship is non-monotonic). The real durable-throughput \
+             lever is connection density into a few shards. Advisory only — see the shard_count \
+             tuning notes in docs/operations/configuration.md."
         );
     }
 }

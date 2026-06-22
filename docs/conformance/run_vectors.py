@@ -49,12 +49,13 @@ def decode_frame(buf: bytes, max_payload_bytes: int):
     Follows the mandatory decode order from docs/wire_protocol.md. `reason` is
     the rejection tag used in the vectors' `decode` field.
     """
-    # 1. Magic — valid magic but a short buffer is TruncatedFrame, not BadMagic.
-    n = min(len(buf), 4)
-    if buf[:n] != MAGIC[:n]:
-        return "BadMagic", None
+    # 1. Length, then magic — a buffer shorter than the 16-byte header is
+    #    TruncatedFrame regardless of its leading bytes; magic is only interpreted
+    #    once a full header is present (length-before-magic, matching weir-core).
     if len(buf) < HEADER_LEN:
         return "TruncatedFrame", None
+    if buf[:4] != MAGIC:
+        return "BadMagic", None
 
     # 2. Version (before header CRC, so a v2 client gets an actionable error).
     if buf[4] != WIRE_VERSION:

@@ -63,7 +63,7 @@ Three-layer configuration: `CLI > env > TOML file > defaults`.
 
 The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exist on Windows; `weir-core` remains cross-platform.
 
-- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, `chmod 0o600` after bind).
+- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, then a tightened umask of `0o177` so `bind(2)` creates the socket inode at mode `0o600` directly — no post-bind `chmod`, which was the exact TOCTOU window the design removed). See [security/socket-bind.md](security/socket-bind.md).
 - Accepts connections up to `max_connections` (Semaphore-gated; over-cap streams are dropped immediately).
 - Assigns each accepted connection a `shard_id` round-robin (`accept_counter % shard_count`). Every WorkUnit pushed on that connection inherits the same shard_id, so a connection is pinned to one WAB flusher for its lifetime — no per-record routing decision on the hot path.
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
@@ -81,7 +81,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 
 ### Worker pool (`src/worker.rs`, `src/models.rs`)
 
-- `WorkUnit { shard_id: u32, payload: Payload, ack_tx: oneshot::Sender<bool> }` — the ack channel travels intact through the worker and batch to the WAB drain, which resolves it after the durable write. Workers do not ack.
+- `WorkUnit { shard_id: u32, payload: Payload, durability: Durability, ack_tx: oneshot::Sender<bool> }` — the ack channel travels intact through the worker and batch to the WAB drain, which resolves it after the durable write. Workers do not ack.
 - `Batch { shard_id: u32, records: Vec<WorkUnit> }` — per-shard buffer flushed on batch-full or `batch_deadline`.
 - Flush uses `std::mem::replace` to swap in a fresh pre-allocated buffer; zero allocation on the hot path.
 - `on_disconnect` is `#[cold] #[inline(never)]` to keep it off the hot path and bias the branch predictor toward the `Ok(unit)` arm.
@@ -94,7 +94,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary format and recovery algorithm.
 
 - One flusher thread per shard; each holds an active `WabSegment`.
-- Three durability tiers, all upholding "ack ⇒ durable": `Sync` and `Batched` both group-fdatasync at the batch boundary before acking every record in the batch; `Buffered` acks after the in-memory write with no fsync. (The historical distinction was "Sync = one fdatasync per record, Batched = one fdatasync per batch" — both now share the batch-boundary fsync, since one fsync at the end of the batch covers every record written during it. Single-producer serial workloads see no difference because the batch holds one record anyway; under concurrent producers, Sync amortises into the group fsync just like Batched.)
+- Three durability tiers. `Sync` and `Batched` uphold "ack ⇒ durable": both group-fdatasync at the batch boundary before acking every record in the batch. `Buffered` trades durability for latency — it acks after the in-memory write, before any fsync, so it does **not** uphold "ack ⇒ durable" (a Buffered ack survives a process crash but not power loss). (The historical distinction was "Sync = one fdatasync per record, Batched = one fdatasync per batch" — both now share the batch-boundary fsync, since one fsync at the end of the batch covers every record written during it. Single-producer serial workloads see no difference because the batch holds one record anyway; under concurrent producers, Sync amortises into the group fsync just like Batched.)
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
 - Path validation (`validate_path`) is consolidated in `src/config/mod.rs` and used for `wab_dir` and `socket_path` at config-load time. The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
 
@@ -111,7 +111,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 | `sink_type` | Module | Records per `commit()` | Use |
 |------------|--------|--------------------|-----|
 | `noop` | `sink::noop::NoopSink` | accepts all, forwards nothing | soak-testing the daemon pipeline |
-| `http` | `sink::http::HttpSink` | one HTTP POST **per record**, up to `sink_http_concurrency` in flight | endpoints that already accept POST bodies |
+| `http` | `sink::http::HttpSink` | one HTTP POST **per record** (up to `sink_http_concurrency` in flight), or one NDJSON POST **per batch** with `sink_http_batch = "ndjson"` | endpoints that accept POST bodies; NDJSON for Loki / ES `_bulk`-style ingesters |
 | `mysql` | `sink::mysql::MySqlSink` | one multi-row `INSERT` **per batch** | the IOPS-compression downstream |
 | `postgres` | `sink::postgres::PostgresSink` | one multi-row `INSERT … ON CONFLICT DO NOTHING` **per batch** | the IOPS-compression downstream on Postgres |
 | `clickhouse` | `sink::clickhouse::ClickHouseSink` | one HTTP `INSERT … FORMAT RowBinary` **per batch** (opt-in `clickhouse-sink` feature) | bulk inserts into ClickHouse with replay-safe dedup |
@@ -179,6 +179,7 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 | `weir_queue_depth` | gauge | Work queue occupancy |
 | `weir_recovery_records_replayed_total` | counter | Records replayed on startup |
 | `weir_recovery_segments_quarantined_total` | counter | Segments quarantined on startup |
+| `weir_recovery_quarantine_copy_failed_total` | counter | Mid-file-corrupt segments whose quarantine copy failed; recovery left them un-truncated to preserve acked-durable tail records (fail-closed) and will retry |
 | `weir_wab_unexpected_mode_total` | counter | WAB segment files seen during recovery with permissions ≠ 0o600 (tampering / operator-error signal) |
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size |
 | `weir_dead_letter_full_total` | counter | Distinct `BlockedDeadLetterFull` entries |
@@ -199,6 +200,16 @@ Coverage includes: basic push/ack round-trips, all three durability tiers, multi
 
 Throughput and latency measurements for single-threaded, thundering-herd, connection-churn, fire-and-forget overload, latency, and saturation-ramp scenarios. Results are emitted as `BENCH: {json}` lines; `deploy/avg_benchmarks.py` averages multiple runs and writes `docs/benchmarks/latest.md` and appends a row to `docs/benchmarks/history.md` (the `docs/benchmarks.md` index is hand-maintained). CI runs 5 passes at each of two batch deadlines (1ms and 2ms) and commits the averaged result on pushes to `main`.
 
+**Deterministic simulation testing — DST** (`crates/weir-server/src/wab/dst.rs`, behind the `dst` cargo feature):
+
+The crown invariant — *an ack is never a false ack; no acked record is ever lost* — is checked directly against the durability path under injected fault schedules. The harness swaps the real segment backend for one that injects faults on a seeded schedule, then drives the flusher through scenarios and asserts the invariant in-process.
+
+- **Fault/scenario model.** Injected faults: `fdatasync` returns `EIO`, a short/torn write at the *n*-th record, `rename` fails, and the shutdown seal fails with `ENOSPC`. These are exercised across five scenarios per seed — a synchronous flush under an fsync-`EIO`, a torn write mid-batch, a crash between `sync_all` and the seal-rename, an `ENOSPC` at the shutdown seal, and a cooperatively-scheduled producer/flusher interleaving. Every run asserts that no acked record is lost and that acks never precede stable storage.
+- **Replayable seeds.** All randomness comes from a seeded `SplitMix64`, so every run is fully reproducible from its seed. A violated invariant panics with the invariant name and a one-line `WEIR_DST_SEED=0x… cargo test … --features dst` reproducer.
+- **Pinned regression seeds.** Any discovered failure serialises into `crates/weir-server/tests/dst_seeds/*.json`; the `replay_pinned_seeds` test re-runs every pinned spec on each CI run, so a fixed bug stays fixed.
+- **Random-seed sweep.** `sweep_random_seeds` runs `WEIR_DST_SWEEP` seeds (default 16 for fast PR runs; CI sets `WEIR_DST_SWEEP=300`), five scenarios each, on every push. Any seed that breaks an invariant fails the build with a pin-able repro.
+- **Property-based fault-list exploration.** A proptest layer varies the *fault list* itself (durability-barrier faults at arbitrary record positions) and shrinks any failure to a minimal `(seed, fault-list, records)` counterexample — a standing auto-minimising guard for the day a regression reintroduces a false ack.
+
 ---
 
 ## Security design
@@ -215,3 +226,55 @@ Throughput and latency measurements for single-threaded, thundering-herd, connec
 | Torn write in crash recovery               | Per-record CRC32 checked; replay truncates at the first corrupt entry                                                                                                                                                            |
 | Blocked socket semaphore (dead workers)    | `push_timeout` (5 s) returns `InternalError` Nack rather than blocking indefinitely                                                                                                                                              |
 | WAB integrity on shared/network storage    | **Out of scope.** CRC32 detects accidental corruption; it does not detect malicious modification. The WAB directory must be local storage accessible only to the daemon (`0o700`). Network filesystems break the security model. |
+
+---
+
+## Workspace & crate boundaries
+
+weir ships as several crates rather than one, and the split is deliberate: each
+piece is usable **without** pulling in the daemon, so you can compose the parts
+you want instead of taking the whole thing. The boundaries are enforced by the
+dependency graph, not just convention — verify with `cargo tree`.
+
+| Crate | Depends on (normal) | Standalone use without the daemon |
+|-------|---------------------|-----------------------------------|
+| `weir-core` | — (just `bytes`, `crc32fast`) | The wire types + `Payload`. Build a producer or a non-Rust client against the frozen v1 wire protocol. |
+| `weir-wab` | `weir-core`, `crc32fast` | Read/inspect/recover on-disk WAB segments. No async runtime, no daemon. `SegmentReader::open(path)` streams CRC-verified records straight off disk — useful for a recovery tool, an offline inspector, or a custom reader. |
+| `weir-sink-sdk` | `weir-core` | Implement **and unit-test** a custom `Sink` against the stable trait — no `weir-server`, no tokio required (the crate's own tests drive `commit`/`health` with a tiny `block_on`). `BasicSinkError` / `Infallible` cover quick error types. |
+| `weir-client` | `weir-core` | The synchronous producer client. Push records over the socket from your own app. |
+| `weir-ctl` | `weir-core`, `weir-client`, `weir-wab` | The admin CLI. Notably does **not** depend on `weir-server` — it's a thin tool over the wire client + the segment reader, so it (and the WAB-reading capability it's built on) work independently of the daemon binary. |
+| `weir-server` | the above + tokio/sink stacks | The daemon itself. |
+
+**What this enables.** You can build your own system on the pieces — e.g. read
+the WAB with `weir-wab`, run operations with `weir-ctl`, and forward to your own
+destination by implementing a `Sink` with `weir-sink-sdk` — and only depend on
+the daemon if you actually run it. (Today, *running* a custom sink inside the
+shipped daemon still means compiling it into the sink-selection path; the SDK's
+present, delivered value is authoring + testing a sink against a frozen contract.
+A first-class plugin/entry-point is a candidate for a future minor release.)
+
+The cost of the split is real but small — more `Cargo.toml`s and a published
+surface to keep stable — and it buys genuine composability, not speculative
+modularity: the boundaries have present consumers (`weir-ctl` uses `weir-wab`;
+the built-in sinks implement `weir-sink-sdk`).
+
+## Design notes
+
+A couple of deliberate choices a contributor should know:
+
+- **Config knobs are operability levers, not speculation.** The configuration
+  surface is broad, but each knob is a tuning or safety dial with a
+  production-ready default — you rarely set them, but they're there for the
+  incident where the default is wrong for *your* deployment and a recompile isn't
+  an option. Defaults are defined once as named constants (e.g.
+  `drain::MAX_RETRIES`, `drain::HEALTH_POLL_INTERVAL`) and the knobs fall back to
+  them, so the default and the tested behaviour can't drift. Adding a knob is
+  SemVer-additive; removing one is breaking — so the bar to *add* is "a real
+  deployment would plausibly need to change this," not "someone might." See the
+  [Configuration reference](operations/configuration.md).
+- **`Sink::Record` / `SinkRecord` is a known over-generalisation.** The drain is
+  generic over a record type, but the only implementation is the identity on
+  `Payload`, and every built-in sink uses `type Record = Payload`. It's wired but
+  effectively a no-op everywhere. It's part of the **frozen 1.0** `Sink` trait, so
+  it can't be removed without a major version; flagged here as a deliberate
+  candidate to drop in a hypothetical 2.0, not a bug.

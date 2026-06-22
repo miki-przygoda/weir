@@ -144,6 +144,12 @@ pub async fn run(
                 let accept_start = Instant::now();
                 match res {
                     Ok((stream, _addr)) => {
+                        // Reap handlers that have already finished so the JoinSet
+                        // doesn't grow one node per lifetime connection — it is
+                        // otherwise only drained at shutdown, an unbounded leak
+                        // under the documented many-short-connections model.
+                        // Non-blocking: returns None once nothing is ready (F1).
+                        while join_set.try_join_next().is_some() {}
                         // Peer-credential check: refuse mismatched uids before
                         // any further work. See peer.rs for the platform impls.
                         if config.peer_uid_check {
@@ -308,7 +314,7 @@ pub(super) const ACCEPT_BACKOFF_ON_EXHAUSTION: Duration = Duration::from_millis(
 pub(super) fn is_accept_resource_exhaustion(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
-        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
     )
 }
 
@@ -1021,6 +1027,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn stat_at_dir_observes_inode_swap() {
+        // Serialize with the bind tests that toggle the process-global umask —
+        // without this lock a concurrent umask=0o177 sibling could perturb the
+        // files this test creates and make it flake under parallelism (#14).
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("weir_stat_at_dir_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let name = std::ffi::OsString::from("entry");

@@ -60,20 +60,52 @@ before the frame-length check) are documented in
 [`wire_protocol.md`](wire_protocol.md#frame-decode-order-server-side); the vectors
 encode the observable result, not the internal order.
 
+### Decoder tag → wire Nack byte
+
+The rejection tags above are *decoder* names (they describe what the codec
+detected). They are **not** the same vocabulary as the wire `NackReason` bytes
+the daemon sends back — several decoder tags collapse to one Nack byte, and two
+are decode-only with no Nack at all. When a Push fails decoding, the daemon maps
+the decoder verdict to a wire Nack as follows:
+
+| Decoder tag          | Wire `NackReason`        | Byte   | Notes                                                            |
+|----------------------|--------------------------|--------|------------------------------------------------------------------|
+| `BadMagic`           | `BadMagic`               | `0x01` |                                                                  |
+| `VersionMismatch`    | `VersionMismatch`        | `0x02` | Nack carries a second byte = daemon `WIRE_VERSION`.              |
+| `HeaderCrcMismatch`  | `BadHeaderCrc`           | `0x03` | Decoder/wire names differ; same condition.                       |
+| `PayloadTooLarge`    | `PayloadTooLarge`        | `0x04` | Boundary is `min(max_payload_bytes, 16 MiB hard cap)` on the wire.|
+| `PayloadCrcMismatch` | `BadPayloadCrc`          | `0x05` | Decoder/wire names differ; same condition.                       |
+| `UnknownMessageType` | `UnknownMessage`         | `0x08` | **Both `UnknownMessageType` and `UnknownDurability` map here.**  |
+| `UnknownDurability`  | `UnknownMessage`         | `0x08` | Same wire byte as `UnknownMessageType` — distinct decoder tags.  |
+| `ReservedFlagsSet`   | `ReservedFlagsSet`       | `0x09` |                                                                  |
+| `TruncatedFrame`     | *(none — local decode)*  | —      | A streaming reader frames bytes itself; a short read is read-more/timeout, never an on-wire Nack. |
+| `TrailingBytes`      | *(none — local decode)*  | —      | A reference-codec verdict for an over-long buffer (G18); the daemon reads exactly one frame, so it never emits this. |
+
+`EmptyPayload` (`0x07`) and `InternalError` (`0x06`) are wire Nacks with **no
+decoder tag**: an empty Push is a daemon admission-policy rejection (the codec
+accepts a zero-length payload), and `InternalError` is a runtime/transient
+condition, not a decode verdict. The full byte table is in
+[`wire_protocol.md`](wire_protocol.md#nack-payload-format); the source of truth
+for this mapping is `nack_for_decode_error` in `crates/weir-server/src/socket/connection.rs`.
+
 ## Coverage
 
 The suite covers every message type, **all nine** Nack reason bytes
-(`0x01`–`0x09`) as decodable Nack frames, and one rejection vector per
+(`0x01`–`0x09`) as decodable Nack frames, and at least one rejection vector per
 `DecodeError` variant, including the boundary cases (empty payloads, the
-payload-cap boundary, a truncated header vs. a truncated payload, and trailing
-bytes after a complete frame).
+payload-cap boundary, a truncated header vs. a truncated payload, trailing
+bytes after a complete frame, and a doubly-malformed header that pins the
+field-parse precedence — unknown durability *and* a nonzero flags byte resolves
+to `UnknownDurability`, since durability is parsed before the flags check).
 
 ## CRC algorithm
 
 Both CRC fields are **IEEE / ISO-3309 CRC-32** — the zlib/PNG/Ethernet variant,
 *not* CRC-32C (Castagnoli). The vectors are generated with Python's
 `zlib.crc32` and verified against the Rust `crc32fast` crate, so a passing
-vector means two independent CRC implementations agree on the bytes. See
+vector means two independent CRC implementations agree on the bytes. The same
+variant is exposed by Go's `hash/crc32.IEEETable`, Java's `java.util.zip.CRC32`,
+and Node's `node:zlib.crc32` (Node >= 22.2). See
 [`wire_protocol.md`](wire_protocol.md#crc32-algorithm) for the full parameter
 table.
 
@@ -95,7 +127,7 @@ It includes a small reference codec that passes all vectors, so it doubles as a
 worked non-Rust implementation:
 
 ```bash
-python3 docs/conformance/run_vectors.py   # "28/28 vectors passed"; non-zero exit on mismatch
+python3 docs/conformance/run_vectors.py   # "30/30 vectors passed"; non-zero exit on mismatch
 ```
 
 To validate **your own** client, replace its `decode_frame()` / `encode_frame()`

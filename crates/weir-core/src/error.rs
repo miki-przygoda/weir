@@ -189,6 +189,59 @@ mod tests {
         );
     }
 
+    /// Every DecodeError variant renders a non-empty, operator-facing message
+    /// that carries its salient datum — these strings are what a rejected frame
+    /// surfaces, and only the VersionMismatch arm was previously asserted.
+    #[test]
+    fn every_decode_error_variant_displays_its_datum() {
+        let cases: Vec<(DecodeError, &str)> = vec![
+            (DecodeError::BadMagic, "magic"),
+            (
+                DecodeError::VersionMismatch {
+                    supported: 1,
+                    received: 2,
+                },
+                "v2",
+            ),
+            (DecodeError::UnknownMessageType(0xff), "0xff"),
+            (DecodeError::UnknownDurability(0xaa), "0xaa"),
+            (
+                DecodeError::HeaderCrcMismatch {
+                    expected: 1,
+                    computed: 2,
+                },
+                "CRC",
+            ),
+            (
+                DecodeError::PayloadCrcMismatch {
+                    expected: 1,
+                    computed: 2,
+                },
+                "CRC",
+            ),
+            (DecodeError::TruncatedFrame, "truncated"),
+            (DecodeError::PayloadTooLarge { len: 99, cap: 10 }, "99"),
+            (DecodeError::ReservedFlagsSet { flags: 0x01 }, "0x01"),
+            (DecodeError::TrailingBytes { extra: 7 }, "7"),
+        ];
+        for (e, needle) in cases {
+            let s = e.to_string();
+            assert!(!s.is_empty(), "{e:?}: Display must be non-empty");
+            assert!(
+                s.contains(needle),
+                "{e:?}: Display {s:?} must contain {needle:?}"
+            );
+        }
+    }
+
+    /// The three byte-mapping error structs render the offending byte as 0x..
+    #[test]
+    fn unknown_byte_error_structs_render_the_raw_byte() {
+        assert!(crate::UnknownMessageType(0xff).to_string().contains("0xff"));
+        assert!(crate::UnknownDurability(0xaa).to_string().contains("0xaa"));
+        assert!(crate::UnknownNackReason(0x0a).to_string().contains("0x0a"));
+    }
+
     #[test]
     fn weir_error_source_chains_to_decode_error() {
         use std::error::Error;

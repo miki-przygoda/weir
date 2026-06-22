@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — Java wire client</title>
+<meta name="description" content="A stdlib-only JDK weir v1 wire-protocol producer for enterprise audit logging — built from the spec, zero weir-crate deps, 30/30 conformance vectors byte-exact." />
+<link rel="stylesheet" href="../weir.css" />
+</head>
+<body>
+
+<div class="statusbar top">
+  <span>weir <span data-weir-version></span> · polyglot wire client · Java</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">one wire, five languages, from the spec</span>
+</div>
+
+<nav class="nav">
+  <a href="../index.html">Demo</a>
+  <a href="../crates.html">Crates</a>
+  <a href="../examples.html" class="active">Examples</a>
+  <span class="nav-ext">
+    <a href="https://github.com/miki-przygoda/weir" target="_blank" rel="noopener">GitHub ↗</a>
+    <a href="https://miki-przygoda.github.io/weir" target="_blank" rel="noopener">Docs ↗</a>
+  </span>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <p class="role"><a href="../examples.html">← Example projects</a></p>
+    <h1>Java <span class="accent">· weir wire client</span></h1>
+    <p class="tag"><strong>An enterprise audit-event logger.</strong> A self-contained JDK producer that speaks the weir v1 wire protocol over a Unix domain socket — built from the spec, <em>zero weir-crate deps</em>, only the JDK standard library (no Maven, no Gradle, no third-party jars) — writing each audit event at <code class="inline">Sync</code> durability, so the producer only proceeds once the record is fsynced.</p>
+    <div class="chips" style="gap:8px">
+      <span class="chip wire">30/30 conformance vectors</span>
+      <span class="chip wire">byte-exact</span>
+      <span class="chip dim">JDK stdlib only</span>
+      <span class="chip dim">zero Rust deps</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">What it is</div>
+    <div class="panel-body">
+      <p>A clean polyglot Java implementation of the wire, written straight from <code class="inline">docs/wire_protocol.md</code> with no dependency on any weir crate — exactly what a skeptical enterprise team would write to integrate a JVM service with weir without pulling in a Rust toolchain. It uses <code class="inline">UnixDomainSocketAddress</code> + <code class="inline">SocketChannel</code> (JDK 21+) for the transport and <code class="inline">java.util.zip.CRC32</code> for the CRC.</p>
+      <p style="margin-bottom:0">The domain is enterprise event logging: <code class="inline">AuditEventProducer</code> streams structured JSON audit events to weir at <em>Sync</em> durability — so an <code class="inline">Ack</code> means "on stable storage", the guarantee a compliance auditor cares about.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Run it</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
+    <div class="panel-body">
+<pre class="code">javac -d out $(find src -name '*.java')
+java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
+<span class="c"># -> 30/30 vectors passed (4 encode round-trips verified)</span></pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: JDK stdlib only (<code class="inline">UnixDomainSocketAddress</code>, <code class="inline">java.util.zip.CRC32</code>, <code class="inline">ByteBuffer</code>) · requires JDK 21+ (current LTS) · tested on OpenJDK 25.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Live <span class="pt-right">against a running daemon</span></div>
+    <div class="panel-body">
+<pre class="code">SOCK=$PWD/weir.sock
+weir-server --socket-path "$SOCK" --wab-dir "$PWD/wab" --metrics-port 19104 &amp;
+
+java -cp out dev.weir.client.LiveSmokeTest "$SOCK"        <span class="c"># 13/13 checks</span>
+java -cp out dev.weir.client.AuditEventProducer "$SOCK" 7 <span class="c"># 7/7 durable acks</span></pre>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">The codec</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">Frame.java <span class="pt-right">frame encode — 16-byte header + payload + CRC32</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="c">// Encodes this frame: HEADER_LEN + payload.length + CRC_LEN bytes.</span>
+<span class="k">public</span> <span class="t">byte</span>[] <span class="f">encode</span>() {
+    <span class="t">int</span> total = Wire.HEADER_LEN + payload.length + Wire.CRC_LEN;
+    <span class="t">ByteBuffer</span> buf = <span class="t">ByteBuffer</span>.<span class="f">allocate</span>(total).<span class="f">order</span>(<span class="t">ByteOrder</span>.LITTLE_ENDIAN);
+
+    buf.<span class="f">put</span>(Wire.MAGIC);                   <span class="c">// [0..4)  "WEIR"</span>
+    buf.<span class="f">put</span>((<span class="t">byte</span>) Wire.WIRE_VERSION);     <span class="c">// [4]</span>
+    buf.<span class="f">put</span>(messageType.code);             <span class="c">// [5]</span>
+    buf.<span class="f">put</span>(durability.code);              <span class="c">// [6]</span>
+    buf.<span class="f">put</span>((<span class="t">byte</span>) (flags &amp; <span class="t">0xFF</span>));        <span class="c">// [7]  reserved, must be 0</span>
+    buf.<span class="f">putInt</span>(payload.length);            <span class="c">// [8..12) LE</span>
+    buf.<span class="f">putInt</span>((<span class="t">int</span>) <span class="f">crc32</span>(buf.<span class="f">array</span>(), <span class="t">0</span>, <span class="t">12</span>)); <span class="c">// header CRC over [0..12)</span>
+    buf.<span class="f">put</span>(payload);                      <span class="c">// [16..16+n)</span>
+    buf.<span class="f">putInt</span>((<span class="t">int</span>) <span class="f">crc32</span>(payload, <span class="t">0</span>, payload.length));
+    <span class="k">return</span> buf.<span class="f">array</span>();
+}</pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">CRC is <code class="inline">java.util.zip.CRC32</code> (IEEE / ISO-3309), <em>not</em> CRC-32C. Built and verified on OpenJDK 25; requires JDK 21+ (current LTS).</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Source</span><span class="rule"></span></div>
+  <p style="margin-top:0"><a href="https://github.com/miki-przygoda/weir/tree/main/demos/java-wire-client" target="_blank" rel="noopener">→ demos/java-wire-client on GitHub</a></p>
+  <p style="margin-top:0.4rem"><a href="../examples.html">← back to example projects</a></p>
+
+  <p class="foot">One of five from-spec polyglot wire clients shipped with
+     <a href="https://github.com/miki-przygoda/weir">weir</a> —
+     each speaks the same 16-byte-header wire protocol with zero weir-crate deps.
+     Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
+</div>
+
+<script src="../version.js"></script>
+</body>
+</html>

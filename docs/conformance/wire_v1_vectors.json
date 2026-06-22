@@ -165,7 +165,7 @@
     },
     {
       "name": "ack_nonsync_durability_filler",
-      "notes": "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must ignore the durability field on responses.",
+      "notes": "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must not interpret the durability field on responses, but it stays a valid Durability value (0x01-0x03) that the decoder range-checks.",
       "hex": "574549520102030000000000c2e6837700000000",
       "decode": "ok",
       "message_type": "Ack",
@@ -178,6 +178,12 @@
       "notes": "First four bytes are not \"WEIR\".",
       "hex": "58585858010101000400000003cac1846461746163f3f3ad",
       "decode": "BadMagic"
+    },
+    {
+      "name": "reject_partial_magic_short",
+      "notes": "2-byte buffer 0x57 0x99 (first byte matches magic 'W', but shorter than the 16-byte header): TruncatedFrame, not BadMagic \u2014 length is checked first.",
+      "hex": "5799",
+      "decode": "TruncatedFrame"
     },
     {
       "name": "reject_version_mismatch",
@@ -208,6 +214,12 @@
       "notes": "flags byte 0x01 (reserved; must be zero in v1).",
       "hex": "574549520101010104000000b3e3a1b96461746163f3f3ad",
       "decode": "ReservedFlagsSet"
+    },
+    {
+      "name": "reject_flags_and_unknown_durability",
+      "notes": "durability 0xFF AND flags 0x01, valid CRC: durability is parsed before the reserved-flags check, so the result is UnknownDurability, not ReservedFlagsSet (locks type/durability-before-flags precedence).",
+      "hex": "574549520101ff0104000000da9b39966461746163f3f3ad",
+      "decode": "UnknownDurability"
     },
     {
       "name": "reject_payload_too_large",

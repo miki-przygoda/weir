@@ -6,6 +6,7 @@
 
 - [Install](getting-started/install.md)
 - [Quickstart](getting-started/quickstart.md)
+- [Integrating & extending](getting-started/integrating.md)
 
 # Operations
 

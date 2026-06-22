@@ -1,0 +1,13 @@
+# Build artifacts from the demo projects (source-only is committed; build locally)
+node_modules/
+target/
+out/
+*.class
+*.o
+# Python bytecode (source-only is committed)
+__pycache__/
+*.pyc
+# C client binaries (built via `make`)
+/c-wire-client/conformance
+/c-wire-client/telemetry
+/c-wire-client/negative

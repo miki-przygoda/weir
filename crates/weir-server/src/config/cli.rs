@@ -10,7 +10,9 @@ USAGE:
 
 OPTIONS:
     --config <path>                          Config file path [default: /etc/weir/weir.toml]
-    --socket-path <path>                     Unix socket path [env: WEIR_SOCKET_PATH]
+    --socket-path <path>                     Unix socket path; must be ABSOLUTE
+                                               (no '..' components)
+                                               [env: WEIR_SOCKET_PATH]
     --wab-dir <path>                         WAB directory [env: WEIR_WAB_DIR]
     --shard-count <n>                        Number of WAB shards (1-256) [default: 1]
     --worker-count <n>                       Worker thread count (1-64)
@@ -19,6 +21,8 @@ OPTIONS:
     --batch-deadline-ms <n>                  Batch accumulation time ms (1-60000) [default: 1]
     --wab-segment-max-bytes <n>              WAB segment rotation threshold (4096-4294967296)
                                                [default: 268435456 (256 MiB)]
+    --wab-segment-max-age-secs <n>           Idle-seal threshold secs, 0=disabled (0-86400)
+                                               [default: 0]
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
@@ -39,6 +43,12 @@ OPTIONS:
     --sink-send-idempotency-key <bool>       Send Idempotency-Key header (http) [default: true]
     --sink-http-concurrency <n>              Max concurrent POSTs per batch (http, 1-1024)
                                                [default: 8]
+    --sink-http-batch <mode>                 HTTP framing: none (per-record POSTs) or
+                                               ndjson (one POST/batch) [default: none]
+    --sink-max-retries <n>                   Transient-retry attempts before a segment is
+                                               stranded (0-100) [default: 3]
+    --sink-retry-base-delay-ms <ms>          First retry backoff, doubles each retry
+                                               (1-60000) [default: 100]
     --sink-mysql-table <name>                MySQL target table [default: weir_records]
     --sink-mysql-column <name>               MySQL target column [default: payload]
     --sink-mysql-insert-mode <mode>          MySQL: ignore | plain [default: ignore]
@@ -52,6 +62,8 @@ OPTIONS:
     --sink-clickhouse-column <name>          ClickHouse target column [default: payload]
     --dead-letter-max-bytes <n>              Dead-letter dir size cap [default: 1073741824]
     --dead-letter-check-interval-secs <n>    Blocked-state wake interval (1-3600) [default: 30]
+    --health-poll-interval-secs <n>          Sink health + stranded-segment rescan cadence
+                                               secs (1-3600) [default: 30]
     --log-level <level>                      Log level (trace/debug/info/warn/error) [default: info]
     --tcp-bind <addr>                        TCP listen address for the mTLS listener
                                                (e.g. '0.0.0.0:7100'). Requires --features tls
@@ -61,6 +73,7 @@ OPTIONS:
     --tls-client-ca <path>                   Path to the client CA certificate for mTLS (PEM)
     --tls-handshake-timeout-secs <n>         TLS handshake timeout in seconds [default: 10]
     -h, --help                               Print this help and exit
+    -V, --version                            Print version and exit
 
 ENVIRONMENT:
     Every option above can be set via WEIR_<UPPER_SNAKE_NAME>.
@@ -89,6 +102,13 @@ pub(super) fn parse_from(
         std::process::exit(0);
     }
 
+    // Mirror --help: short-circuit before any config load/validation. Matches the
+    // format clap gives weir-ctl (`<bin> <version>`), so the two CLIs agree.
+    if pargs.contains(["-V", "--version"]) {
+        println!("weir-server {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     let config_path: PathBuf = pargs
         .opt_value_from_str("--config")
         .map_err(pico_err)?
@@ -111,6 +131,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         wab_segment_max_bytes: pargs
             .opt_value_from_str("--wab-segment-max-bytes")
+            .map_err(pico_err)?,
+        wab_segment_max_age_secs: pargs
+            .opt_value_from_str("--wab-segment-max-age-secs")
             .map_err(pico_err)?,
         max_connections: pargs
             .opt_value_from_str("--max-connections")
@@ -145,6 +168,15 @@ pub(super) fn parse_from(
         sink_send_idempotency_key: opt_bool(&mut pargs, "--sink-send-idempotency-key")?,
         sink_http_concurrency: pargs
             .opt_value_from_str("--sink-http-concurrency")
+            .map_err(pico_err)?,
+        sink_http_batch: pargs
+            .opt_value_from_str("--sink-http-batch")
+            .map_err(pico_err)?,
+        sink_max_retries: pargs
+            .opt_value_from_str("--sink-max-retries")
+            .map_err(pico_err)?,
+        sink_retry_base_delay_ms: pargs
+            .opt_value_from_str("--sink-retry-base-delay-ms")
             .map_err(pico_err)?,
         #[cfg(feature = "mysql-sink")]
         sink_mysql_table: pargs
@@ -187,6 +219,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         dead_letter_check_interval_secs: pargs
             .opt_value_from_str("--dead-letter-check-interval-secs")
+            .map_err(pico_err)?,
+        health_poll_interval_secs: pargs
+            .opt_value_from_str("--health-poll-interval-secs")
             .map_err(pico_err)?,
         log_level: pargs.opt_value_from_str("--log-level").map_err(pico_err)?,
         tcp_bind: pargs.opt_value_from_str("--tcp-bind").map_err(pico_err)?,

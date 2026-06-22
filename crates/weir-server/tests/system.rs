@@ -296,6 +296,36 @@ fn records_written_to_wab_on_disk() {
     );
 }
 
+#[test]
+fn idle_seal_drains_low_volume_segment_without_shutdown() {
+    // With wab_segment_max_age_secs set, a lone record's segment is sealed and
+    // drained after it sits idle — instead of waiting to fill wab_segment_max_bytes
+    // (256 MiB) or for shutdown. Without the knob a single record never seals, so
+    // the committed counter would stay 0 here. The noop sink commits whatever it's
+    // handed, so a non-zero committed count proves the segment sealed + drained.
+    let srv = weir_server!("idle_seal")
+        .extra_config("wab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    client.push(b"lonely-record", Durability::Batched).unwrap();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+    // Poll past the 1s idle-seal threshold + the drain hop.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while committed() == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        committed() >= 1,
+        "idle-seal should have sealed + drained the lone record (committed stayed 0)"
+    );
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
@@ -357,11 +387,13 @@ fn metrics_all_families_registered() {
         // Recovery
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
+        "weir_recovery_quarantine_copy_failed",
         "weir_wab_unexpected_mode",
         // Dead letter
         "weir_dead_letter_bytes_on_disk",
         "weir_dead_letter_full",
         "weir_drain_segments_stranded",
+        "weir_drain_segments_resumed",
         "weir_drain_state",
         "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",
@@ -511,19 +543,73 @@ fn new_connection_accepted_after_previous_client_drops() {
 // ── Payload edge cases ────────────────────────────────────────────────────────
 
 #[test]
-fn empty_payload_is_rejected() {
-    // An empty Push payload collides with the WAB end-of-records sentinel
-    // (a zero-length prefix), so the server rejects it at ingest with
-    // Nack(EmptyPayload) rather than risk truncating a segment. HealthCheck
-    // frames also carry a zero-length payload but are unaffected — see
-    // `health_check_returns_ok`.
-    use weir_core::NackReason;
-    let srv = weir_server!("empty_payload").start();
+fn empty_payload_rejected_locally_by_client() {
+    // An empty Push payload collides with the WAB end-of-records sentinel (a
+    // zero-length prefix). weir-client rejects it LOCALLY, before any bytes are
+    // sent, with a recoverable ClientError::EmptyPayload — so the connection is
+    // never drawn into the daemon's connection-closing Nack(EmptyPayload), and
+    // the client stays usable. The DAEMON-side guard (for non-weir-client
+    // producers) is covered by `empty_payload_rejected_by_daemon_for_raw_frame`
+    // below and by connection::tests::empty_payload_rejected_at_ingest.
+    let srv = weir_server!("empty_payload_client").start();
     let mut client = srv.client();
     let err = client.push(b"", Durability::Sync).unwrap_err();
     assert!(
-        matches!(err, ClientError::Nack(NackReason::EmptyPayload)),
-        "expected Nack(EmptyPayload), got {err:?}"
+        matches!(err, ClientError::EmptyPayload),
+        "expected local ClientError::EmptyPayload, got {err:?}"
+    );
+    assert!(
+        !client.is_poisoned(),
+        "a local empty-payload reject must keep the client usable"
+    );
+}
+
+#[test]
+fn empty_payload_rejected_by_daemon_for_raw_frame() {
+    // A producer that is NOT weir-client (e.g. a polyglot wire client) and does
+    // not implement the local guard can still put an empty Push on the wire. The
+    // daemon must reject it at ingest with Nack(EmptyPayload) rather than risk
+    // truncating a segment. Bypass weir-client's local guard with a raw socket to
+    // prove the end-to-end daemon behavior. HealthCheck frames also carry a
+    // zero-length payload but are unaffected — see `health_check_returns_ok`.
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream as RawStream,
+    };
+    use weir_core::{Envelope, HEADER_LEN, Header, MessageType, NackReason};
+
+    let srv = weir_server!("empty_payload_raw").start();
+    let mut stream = RawStream::connect(&srv.socket_path).expect("raw connect");
+    // A Push whose Envelope-derived payload_len is 0. The daemon rejects on the
+    // zero length right after the header, before reading any body — so writing
+    // just the 16-byte header is enough to draw the Nack.
+    let frame = Envelope::new(
+        Header::new(MessageType::Push, Durability::Sync, 0),
+        Vec::new(),
+    )
+    .encode();
+    stream
+        .write_all(&frame[..HEADER_LEN])
+        .expect("write empty push header");
+
+    let mut resp_header_buf = [0u8; HEADER_LEN];
+    stream
+        .read_exact(&mut resp_header_buf)
+        .expect("read response header");
+    let resp_header = Header::decode(&resp_header_buf).expect("decode response header");
+    assert_eq!(
+        resp_header.message_type(),
+        MessageType::Nack,
+        "expected a Nack for a raw empty Push"
+    );
+    let mut payload = vec![0u8; resp_header.payload_len() as usize];
+    stream.read_exact(&mut payload).expect("read nack payload");
+    let mut crc = [0u8; 4];
+    stream.read_exact(&mut crc).expect("read response crc");
+    assert_eq!(
+        payload.first().copied(),
+        Some(NackReason::EmptyPayload as u8),
+        "daemon must Nack a raw empty Push with EmptyPayload"
     );
 }
 
@@ -1149,6 +1235,48 @@ fn graceful_shutdown_under_load() {
         "graceful_shutdown_under_load: {oks} ok, {io_errs} io_err, \
          {unexpected} unexpected | wab={wab_bytes}B | shutdown={shutdown_elapsed:?}"
     );
+}
+
+/// `--version` and `--help` short-circuit before any config load (no
+/// `--config`, no socket, no wab dir needed) and exit 0. `--version` prints
+/// `weir-server <version>`, matching the format `weir-ctl` uses. This can only
+/// be an integration test: the handler calls `process::exit(0)`, so it must run
+/// the real binary, not the in-process parser.
+#[test]
+fn version_and_help_flags_short_circuit_and_exit_zero() {
+    use std::process::Command;
+    let binary = env!("CARGO_BIN_EXE_weir-server");
+
+    let out = Command::new(binary)
+        .arg("--version")
+        .output()
+        .expect("spawn weir-server --version");
+    assert!(
+        out.status.success(),
+        "--version must exit 0, got {:?}",
+        out.status
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with("weir-server "),
+        "--version stdout must start with 'weir-server ', got: {stdout:?}"
+    );
+    assert!(
+        stdout.trim().ends_with(env!("CARGO_PKG_VERSION")),
+        "--version must print the crate version {}, got: {stdout:?}",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    let help = Command::new(binary)
+        .arg("--help")
+        .output()
+        .expect("spawn weir-server --help");
+    assert!(
+        help.status.success(),
+        "--help must exit 0, got {:?}",
+        help.status
+    );
+    assert!(!help.stdout.is_empty(), "--help must print usage to stdout");
 }
 
 // ── Stalled client isolation ──────────────────────────────────────────────────

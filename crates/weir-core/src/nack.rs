@@ -8,6 +8,17 @@
 /// "daemon is on wire protocol v1; this client is built against v2 — upgrade the daemon or downgrade the client."
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Reason bytes 0x0A-0xFF are reserved for future use within wire v1 (see
+// wire_protocol.md): a new reason can be added in a minor release without a
+// WIRE_VERSION bump. #[non_exhaustive] makes that growth non-breaking for
+// downstream matchers (they must already carry a wildcard arm), matching the
+// rationale on its decode-side twin DecodeError. Adding it later would itself be
+// breaking, so it lands before 1.x ships. The wire stays forward-compatible
+// regardless: an unknown byte surfaces as ClientError::UnknownNack(u8), not a
+// new variant. MessageType/Durability are deliberately left exhaustive because
+// changing them requires a WIRE_VERSION bump (a major event); that does not
+// apply here.
+#[non_exhaustive]
 pub enum NackReason {
     /// Frame did not start with the `b"WEIR"` magic.
     BadMagic = 0x01,
@@ -41,6 +52,92 @@ pub enum NackReason {
     /// did not). Permanent; the daemon closes the connection (F52).
     ReservedFlagsSet = 0x09,
 }
+
+impl NackReason {
+    /// The canonical snake_case metric-label string for this reason.
+    ///
+    /// These strings match the daemon's Prometheus `reason` label values exactly
+    /// (the `nack_total{reason=...}` series), so an ops consumer — an autoscaler,
+    /// an alerting rule, a dashboard — can map a `NackReason` it receives over the
+    /// wire to the metric label it must query, without hard-coding the strings.
+    /// Inverse of [`NackReason::from_metric_label`].
+    ///
+    /// ```
+    /// use weir_core::NackReason;
+    /// assert_eq!(NackReason::PayloadTooLarge.as_metric_label(), "payload_too_large");
+    /// ```
+    #[must_use]
+    pub fn as_metric_label(&self) -> &'static str {
+        match self {
+            NackReason::BadMagic => "bad_magic",
+            NackReason::VersionMismatch => "version_mismatch",
+            NackReason::BadHeaderCrc => "bad_header_crc",
+            NackReason::PayloadTooLarge => "payload_too_large",
+            NackReason::BadPayloadCrc => "bad_payload_crc",
+            NackReason::InternalError => "internal_error",
+            NackReason::EmptyPayload => "empty_payload",
+            NackReason::UnknownMessage => "unknown_message",
+            NackReason::ReservedFlagsSet => "reserved_flags_set",
+        }
+    }
+
+    /// Parses a snake_case metric label back into its [`NackReason`], or `None` if
+    /// the string is not a known label. Inverse of
+    /// [`NackReason::as_metric_label`].
+    ///
+    /// ```
+    /// use weir_core::NackReason;
+    /// assert_eq!(
+    ///     NackReason::from_metric_label("payload_too_large"),
+    ///     Some(NackReason::PayloadTooLarge),
+    /// );
+    /// assert_eq!(NackReason::from_metric_label("nope"), None);
+    /// ```
+    #[must_use]
+    pub fn from_metric_label(s: &str) -> Option<NackReason> {
+        match s {
+            "bad_magic" => Some(NackReason::BadMagic),
+            "version_mismatch" => Some(NackReason::VersionMismatch),
+            "bad_header_crc" => Some(NackReason::BadHeaderCrc),
+            "payload_too_large" => Some(NackReason::PayloadTooLarge),
+            "bad_payload_crc" => Some(NackReason::BadPayloadCrc),
+            "internal_error" => Some(NackReason::InternalError),
+            "empty_payload" => Some(NackReason::EmptyPayload),
+            "unknown_message" => Some(NackReason::UnknownMessage),
+            "reserved_flags_set" => Some(NackReason::ReservedFlagsSet),
+            _ => None,
+        }
+    }
+}
+
+impl From<NackReason> for u8 {
+    /// The wire byte for this reason. Inverse of [`NackReason::try_from`].
+    fn from(reason: NackReason) -> u8 {
+        reason as u8
+    }
+}
+
+impl std::fmt::Display for NackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            NackReason::BadMagic => "bad frame magic",
+            NackReason::VersionMismatch => "wire protocol version mismatch",
+            NackReason::BadHeaderCrc => "header CRC mismatch",
+            NackReason::PayloadTooLarge => "payload exceeds the daemon's cap",
+            NackReason::BadPayloadCrc => "payload CRC mismatch",
+            NackReason::InternalError => "daemon internal error (transient)",
+            NackReason::EmptyPayload => "empty payload (not representable)",
+            NackReason::UnknownMessage => "unknown message type or durability byte",
+            NackReason::ReservedFlagsSet => "reserved flags byte was non-zero",
+        };
+        write!(f, "{msg}")
+    }
+}
+
+// A Nack reason is a legitimate error a producer can propagate, so it implements
+// the std error trait (Display + Debug are both present). Lets callers do
+// `Box<dyn Error>`/`?` with a `NackReason` directly.
+impl std::error::Error for NackReason {}
 
 /// Error returned when a `u8` does not map to a known `NackReason` variant.
 /// Preserves the raw byte so the client can log or display it.
@@ -117,6 +214,17 @@ mod tests {
     }
 
     #[test]
+    fn from_for_u8_is_inverse_of_try_from_and_display_is_nonempty() {
+        for byte in 0x01u8..=0x09 {
+            let r = NackReason::try_from(byte).unwrap();
+            assert_eq!(u8::from(r), byte);
+            assert!(!r.to_string().is_empty());
+        }
+        // Usable as a std error.
+        let _: &dyn std::error::Error = &NackReason::BadMagic;
+    }
+
+    #[test]
     fn try_from_returns_unknown_for_unrecognised_byte() {
         // 0x0A is the first unassigned reason byte (0x01..=0x09 are known).
         let err = NackReason::try_from(0x0A).unwrap_err();
@@ -138,6 +246,56 @@ mod tests {
         assert_eq!(NackReason::EmptyPayload as u8, 0x07);
         assert_eq!(NackReason::UnknownMessage as u8, 0x08);
         assert_eq!(NackReason::ReservedFlagsSet as u8, 0x09);
+    }
+
+    #[test]
+    fn as_metric_label_pins_every_variant() {
+        // Drift guard: these strings MUST match the daemon's private metrics
+        // `NackReason` label enum (weir-server/src/metrics/mod.rs) exactly, so an
+        // ops consumer can map a wire NackReason to the metric label it queries.
+        // If a variant is added or renamed, update both this test and the server.
+        assert_eq!(NackReason::BadMagic.as_metric_label(), "bad_magic");
+        assert_eq!(
+            NackReason::VersionMismatch.as_metric_label(),
+            "version_mismatch"
+        );
+        assert_eq!(NackReason::BadHeaderCrc.as_metric_label(), "bad_header_crc");
+        assert_eq!(
+            NackReason::PayloadTooLarge.as_metric_label(),
+            "payload_too_large"
+        );
+        assert_eq!(
+            NackReason::BadPayloadCrc.as_metric_label(),
+            "bad_payload_crc"
+        );
+        assert_eq!(
+            NackReason::InternalError.as_metric_label(),
+            "internal_error"
+        );
+        assert_eq!(NackReason::EmptyPayload.as_metric_label(), "empty_payload");
+        assert_eq!(
+            NackReason::UnknownMessage.as_metric_label(),
+            "unknown_message"
+        );
+        assert_eq!(
+            NackReason::ReservedFlagsSet.as_metric_label(),
+            "reserved_flags_set"
+        );
+    }
+
+    #[test]
+    fn metric_label_round_trips_for_every_variant() {
+        for byte in 0x01u8..=0x09 {
+            let r = NackReason::try_from(byte).unwrap();
+            assert_eq!(
+                NackReason::from_metric_label(r.as_metric_label()),
+                Some(r),
+                "metric label for {r:?} did not round-trip"
+            );
+        }
+        // An unknown label maps to None.
+        assert_eq!(NackReason::from_metric_label("not_a_reason"), None);
+        assert_eq!(NackReason::from_metric_label(""), None);
     }
 
     /// Verifies the VersionMismatch Nack payload is [reason_byte, daemon_version_byte].

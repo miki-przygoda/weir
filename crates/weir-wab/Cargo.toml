@@ -1,0 +1,15 @@
+[package]
+name = "weir-wab"
+description = "On-disk WAB segment format and reader for weir (shared by the daemon and weir-ctl)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["weir", "wal", "durability", "segment", "format"]
+categories = ["encoding", "filesystem"]
+
+[dependencies]
+weir-core = { workspace = true }
+crc32fast = "1.4"

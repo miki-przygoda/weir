@@ -3,7 +3,7 @@
 [![CI](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
-<!-- crates.io + docs.rs badges to be added in the same commit as the 1.0 crates.io publish -->
+<!-- crates.io + docs.rs badges to be added in the same commit as the first crates.io publish -->
 
 A durable, high-throughput write buffer for Rust.
 
@@ -15,7 +15,7 @@ commits into 1. **An ack is never a false ack:** an acked record is on disk and
 replays after a crash.
 
 `~69 µs` Buffered (non-durable) ack p50 · `~364 µs` durable Sync ack p50 ·
-`~2,550` Sync RPS · `~58,600` RPS at the 48-connection cap
+`~2,550` Sync RPS · `~58,600` RPS at saturation (Buffered, ~64 threads)
 *(indicative — single box, sandboxed CI runners; reproduce on your own hardware, see [benchmarks](docs/benchmarks.md))* ·
 5 built-in sinks (4 in a default build; `clickhouse` opt-in) · v1 wire + Rust API frozen under SemVer
 
@@ -25,8 +25,8 @@ daemon mid-flight, and watch unconfirmed segments replay, side by side with a
 naive insert-per-record baseline. No build step — open `demo/index.html` in any
 browser. *(Hosted version coming with the public launch.)*
 
-> **Status — 1.0.** The v1 wire protocol and public Rust API (`weir-core`,
-> `weir-client`, `weir-sink-sdk`) are frozen under
+> **Status — 1.x (stable).** The v1 wire protocol and public Rust API (`weir-core`,
+> `weir-client`, `weir-sink-sdk`, `weir-wab`) are frozen under
 > [Semantic Versioning](https://semver.org/), with a
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
 > format for non-Rust implementers. The WAB on-disk format is stable and
@@ -34,7 +34,7 @@ browser. *(Hosted version coming with the public launch.)*
 > `mysql`, `postgres` in the default build, plus `clickhouse` behind the opt-in
 > `clickhouse-sink` Cargo feature (see [Crates](#crates) and the
 > [configuration reference](docs/operations/configuration.md)). WAB flusher and
-> drain threads are panic-supervised. Publishing to crates.io with the 1.0 release.
+> drain threads are panic-supervised. Publishing to crates.io with the public release.
 
 ## How it works
 
@@ -63,6 +63,14 @@ mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
 > (`http`/`mysql`/`postgres`/`clickhouse`) + `--sink-url` to actually deliver.
 > Records also only drain once a WAB segment seals, so a few small records won't
 > reach the sink until shutdown — see the quickstart.
+>
+> **Two more producer gotchas:** `push()` is **blocking** — never call it directly
+> from an `async fn` (it starves the runtime; use the
+> [async bridge](docs/getting-started/integrating.md#producing-from-an-async-runtime)).
+> And `Buffered` acks *before* fsync, so it survives a process crash but **not**
+> power loss — use `Sync`/`Batched` for data you can't lose. The
+> [quickstart](docs/getting-started/quickstart.md#push-your-first-record) has the
+> full rundown.
 
 Full walk-through, including pushing your first record: [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md).
 
@@ -134,6 +142,15 @@ NSQ), an embedded queryable store (RocksDB, sled, bbolt) or in-JVM low-latency
 queue (Chronicle Queue), or a telemetry pipeline with transforms and many
 destinations (Vector, Fluentd, Fluent Bit, Beats).
 
+**Delivery contract (read before migrating from Kafka/NATS):** delivery is
+**at-least-once** — a crash or retry can redeliver a record, so **your sink must
+dedupe** (e.g. on an `Idempotency-Key` / `ON CONFLICT`). **Ordering holds only
+within a single connection's** sequential pushes — there is **no ordering across
+connections, and no per-key or global order**. And **routing/keys live in your
+payload**: the wire envelope is opaque bytes, with no topic/subject/key field —
+weir does not inspect or route on content. Details in
+[architecture](docs/architecture.md) and [integrating](docs/getting-started/integrating.md).
+
 *No popular project combines all three of weir's defining properties — a local
 microsecond fsync'd ack, N→1 transactional SQL-commit compression, and a
 non-broker single binary. Comparisons reflect public positioning as of June 2026,
@@ -144,11 +161,19 @@ not benchmarks.*
 | Crate           | Type       | Description                                                                                          |
 |-----------------|------------|------------------------------------------------------------------------------------------------------|
 | `weir-core`     | lib        | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`, `Payload`. Cross-platform.   |
+| `weir-wab`      | lib        | On-disk WAB segment format + `SegmentReader`. Shared by the daemon and `weir-ctl` (one parser) so `dl requeue` can read dead-letter segments without the daemon's dep tree. Cross-platform. |
 | `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
-| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. |
+| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **Client type is Unix-only** — it compiles everywhere but `WeirClient` is `#[cfg(unix)]`; on Windows only the `Durability`/`NackReason` re-exports are usable (produce from non-Unix via the [wire protocol](docs/wire_protocol.md) — which in practice means the daemon's [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md), since the Unix socket is unreachable cross-host and the Windows server binary is a non-functional stub). |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
-| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop). |
+| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
+
+These are deliberately separate so you can compose the pieces you need without
+the daemon — produce with `weir-client`, forward with a custom `weir-sink-sdk`
+sink, or read the buffer with `weir-wab`, and only depend on `weir-server` if you
+run it. See [Integrating & extending](docs/getting-started/integrating.md) for
+how, and [Architecture → Workspace & crate boundaries](docs/architecture.md#workspace--crate-boundaries)
+for why.
 
 ## Non-goals (v1)
 
@@ -170,13 +195,17 @@ listener is available behind the `tls` feature for cross-host producers.
   platform; run production on Linux.)
 - **Deterministic simulation (DST):** the WAB durability invariants are checked
   under injected crash/fault schedules with **replayable seeds**, on every CI run
-  (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md).
+  (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md#testing-infrastructure).
 - **Language-neutral conformance vectors:** canonical hex frames plus the result
   a conformant decoder must produce for every message type, all nine Nack
   reasons, and each rejection case — run your own codec against them
   ([docs/conformance.md](docs/conformance.md)).
 - **Cross-platform CI:** `fmt` + `clippy` across the feature matrix + `cargo-deny`
-  + the full test suites + a monitoring-stack end-to-end smoke test, on every push.
+  + the full test suites + a monitoring-stack end-to-end smoke test, on every
+  push. The build matrix compiles `weir-server` on all five release targets,
+  including `x86_64-pc-windows-msvc` — though the Windows binary is a
+  non-functional stub (no Unix-socket listener); the daemon runs only on
+  Linux and macOS.
 
 ## Contributing
 

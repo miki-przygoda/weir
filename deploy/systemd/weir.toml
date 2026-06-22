@@ -1,0 +1,74 @@
+# weir.toml — config for the systemd / bare-metal deployment.
+# Install to /etc/weir/weir.toml, mode 0640 root:weir.
+#
+# NO credentials here — a credential-bearing sink_url and the bearer token go in
+# /etc/weir/weir.env (EnvironmentFile=). WEIR_* env vars override every key below.
+#
+# Every key is a real knob, validated against docs/operations/configuration.md
+# and deploy/docker/weir.toml.example. Unknown keys only log a `warn!` (they do
+# not fail startup), so this file loads clean. All options live under [server].
+# Anything omitted falls back to the documented default.
+
+[server]
+# Paths must line up with the systemd unit: RuntimeDirectory=weir -> /run/weir,
+# StateDirectory=weir -> /var/lib/weir, and the ExecStartPre-created wab/ subdir.
+socket_path = "/run/weir/weir.sock"
+wab_dir     = "/var/lib/weir/wab"
+
+# A single shard is correct on a single disk (multiple shards just contend for
+# one disk queue). worker_count defaults to shard_count; keep them equal.
+shard_count  = 1
+worker_count = 1
+
+# Balanced batch defaults (the (256, 1ms) sweet spot from batch-tuning.md).
+# NOTE: batch_deadline_ms is the producer-ACK accumulation deadline (how long the
+# flusher waits to fill an fsync batch before acking) — it is NOT a segment-seal
+# trigger and does NOT make records reach the sink. Don't conflate it with
+# wab_segment_max_age_secs below; only sealing (size, age, or shutdown) drains.
+batch_size        = 256
+batch_deadline_ms = 1
+
+# Low-volume / edge box: seal an idle segment after 5s so its records drain
+# promptly instead of waiting to fill wab_segment_max_bytes (256 MiB) or for a
+# restart. Set to 0 on a high-throughput box where segments fill on their own.
+#
+# Why this matters: a low-volume or bursty producer's records sit in the ACTIVE,
+# unsealed segment until it hits wab_segment_max_bytes (256 MiB default) or the
+# daemon stops. Until the segment seals it is durable on disk but INVISIBLE to the
+# sink — the drain never runs, so nothing is delivered (reads as "weir isn't
+# delivering"). A small age here (1-5s) seals an idle segment on a timer so
+# delivery doesn't stall. 0 disables it (size/shutdown sealing only).
+wab_segment_max_age_secs = 5
+
+# Connection + payload caps. Lowering max_payload_bytes bounds worst-case
+# transient memory (max_connections x max_payload_bytes); keep MemoryMax in the
+# systemd unit in sync if you change either.
+max_connections              = 256
+connection_read_timeout_secs = 30
+max_payload_bytes            = 1048576   # 1 MiB
+
+# Prometheus /metrics on the default port, localhost-only. /metrics is
+# UNAUTHENTICATED — only set metrics_bind = "0.0.0.0" behind a firewall.
+metrics_port = 9185
+metrics_bind = "127.0.0.1"
+
+# Graceful-shutdown budget. Keep this BELOW the unit's TimeoutStopSec (35s) so
+# the daemon finishes its own drain before systemd SIGKILLs it.
+shutdown_timeout_secs = 30
+
+# Dead-letter cap. At the cap the drain BLOCKS all delivery, surfaced as
+# weir_drain_state{state="blocked_dead_letter_full"} = 1 (the WeirDrainBlocked alert).
+dead_letter_max_bytes           = 1073741824   # 1 GiB
+dead_letter_check_interval_secs = 30
+health_poll_interval_secs       = 30
+
+# Sink. The default "noop" ACCEPTS records then DISCARDS them — switch to
+# http/mysql/postgres/clickhouse for a real downstream and put the
+# credential-bearing URL + bearer token in /etc/weir/weir.env (WEIR_SINK_URL /
+# WEIR_SINK_BEARER_TOKEN), not here.
+sink_type = "noop"
+# sink_url is intentionally absent — set it via WEIR_SINK_URL in weir.env.
+# sink_timeout_secs = 10        # default; raise for slow endpoints
+# sink_max_retries  = 3         # default; raise to ride out longer outages
+
+log_level = "info"

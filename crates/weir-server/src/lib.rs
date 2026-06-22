@@ -10,24 +10,16 @@
 //! and the binary build compiles independently of the library
 //! build.
 //!
-//! The surface is deliberately narrow — only the WAB format module
-//! and its closures of pure-byte parsers. Exposing wider modules
-//! (sink, drain, socket) would surface visibility-leak warnings
-//! because their `pub fn` signatures reference `pub(crate)` types
-//! like `Metrics`; the fuzz harness has no need for that surface
-//! anyway.
+//! The surface is deliberately narrow — only the WAB format module,
+//! re-exported from the `weir-wab` crate (the single source of truth
+//! for the on-disk format). Exposing wider modules (sink, drain,
+//! socket) would surface visibility-leak warnings because their
+//! `pub fn` signatures reference `pub(crate)` types like `Metrics`;
+//! the fuzz harness has no need for that surface anyway.
 
-/// WAB on-disk format parsers. Surface mirrors the underlying module
-/// (`src/wab/format.rs`). Only the parsing entry points are reachable
-/// here; segment / recovery state machines stay private.
+/// WAB on-disk format parsers. Re-exports `weir_wab::format` — the same
+/// module the daemon reaches internally via `crate::wab::format` — so the
+/// fuzz harness can call `weir_server::wab::format::parse_confirmed`.
 pub mod wab {
-    pub mod format {
-        pub use crate::wab_format::*;
-    }
+    pub use weir_wab::format;
 }
-
-// Internal re-export — the file is shared with main.rs's `mod wab; mod
-// format;` chain, so the actual source is `src/wab/format.rs` declared
-// via this `#[path]` attribute.
-#[path = "wab/format.rs"]
-mod wab_format;

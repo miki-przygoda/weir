@@ -198,6 +198,7 @@ pub(crate) struct PartialConfig {
     pub batch_size: Option<usize>,
     pub batch_deadline_ms: Option<u64>,
     pub wab_segment_max_bytes: Option<u64>,
+    pub wab_segment_max_age_secs: Option<u64>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
@@ -212,6 +213,9 @@ pub(crate) struct PartialConfig {
     pub sink_max_batch_size: Option<usize>,
     pub sink_send_idempotency_key: Option<bool>,
     pub sink_http_concurrency: Option<usize>,
+    pub sink_http_batch: Option<String>,
+    pub sink_max_retries: Option<u32>,
+    pub sink_retry_base_delay_ms: Option<u64>,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: Option<String>,
     #[cfg(feature = "mysql-sink")]
@@ -232,6 +236,7 @@ pub(crate) struct PartialConfig {
     pub sink_clickhouse_column: Option<String>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
+    pub health_poll_interval_secs: Option<u64>,
     pub log_level: Option<String>,
     pub tcp_bind: Option<String>,
     pub tls_cert_path: Option<PathBuf>,
@@ -289,6 +294,11 @@ pub struct Config {
     pub batch_size: usize,
     pub batch_deadline_ms: u64,
     pub wab_segment_max_bytes: u64,
+    /// Idle-seal threshold in seconds. `0` (default) disables it: the active
+    /// segment seals only at `wab_segment_max_bytes` or shutdown. When > 0, a
+    /// segment idle for this long is sealed and drained — timely delivery for
+    /// low-volume deployments.
+    pub wab_segment_max_age_secs: u64,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
@@ -362,6 +372,17 @@ pub struct Config {
     /// Only consumed by the http-sink arm.
     #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
     pub sink_http_concurrency: usize,
+    /// HTTP request framing: `"none"` (per-record POSTs, default) or `"ndjson"`
+    /// (one newline-delimited POST per commit batch). Validated at load to one
+    /// of those two literals; mapped to `HttpBatchMode` in the http-sink arm.
+    /// Only consumed by the http-sink arm.
+    #[cfg_attr(not(feature = "http-sink"), allow(dead_code))]
+    pub sink_http_batch: String,
+    /// Transient-retry attempts per segment before it is stranded on disk
+    /// (left for the recovery rescan / restart to re-drain).
+    pub sink_max_retries: u32,
+    /// Base (first) transient-retry backoff in milliseconds; doubles each retry.
+    pub sink_retry_base_delay_ms: u64,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_table: String,
     #[cfg(feature = "mysql-sink")]
@@ -382,6 +403,9 @@ pub struct Config {
     pub sink_clickhouse_column: String,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
+    /// How often (seconds) the drain re-probes sink health and rescans for
+    /// stranded segments to re-drain. Wall-clock cadence (fires under load too).
+    pub health_poll_interval_secs: u64,
     pub log_level: String,
     /// TCP listen address for the mTLS listener (e.g. `0.0.0.0:7100`).
     /// `None` ⇒ no TCP listener; Unix-only. When `Some`, the three `tls_*`
@@ -490,6 +514,15 @@ impl Config {
                 ),
             });
         }
+        // Idle-seal threshold. 0 = disabled (historical behaviour); otherwise seal
+        // an idle active segment after this many seconds. Capped at a day.
+        let wab_segment_max_age_secs = merge!(wab_segment_max_age_secs).unwrap_or(0);
+        check_range(
+            "wab_segment_max_age_secs",
+            wab_segment_max_age_secs,
+            0,
+            86_400,
+        )?;
 
         let max_connections = merge!(max_connections).unwrap_or(256);
         check_range("max_connections", max_connections, 1, 512)?;
@@ -614,6 +647,31 @@ impl Config {
         // overlap, collapsing a segment's serial RTT cost. Default 8.
         let sink_http_concurrency = merge!(sink_http_concurrency).unwrap_or(8);
         check_range("sink_http_concurrency", sink_http_concurrency, 1, 1024)?;
+        // HTTP request framing: "none" = one POST per record (default), "ndjson"
+        // = one newline-delimited POST per commit batch. Validated here (even when
+        // the http-sink feature is off) so a typo fails fast at load; the http-sink
+        // arm maps the literal to HttpBatchMode.
+        let sink_http_batch = merge!(sink_http_batch).unwrap_or_else(|| "none".to_string());
+        if !matches!(sink_http_batch.as_str(), "none" | "ndjson") {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_http_batch",
+                reason: format!(
+                    "sink_http_batch must be \"none\" or \"ndjson\", got {sink_http_batch:?}"
+                ),
+            });
+        }
+        // Transient-retry budget per segment before it is stranded (left on disk,
+        // re-drained when the sink recovers or on restart). 0 = strand on the
+        // first transient failure. Default 3.
+        let sink_max_retries = merge!(sink_max_retries).unwrap_or(crate::drain::MAX_RETRIES);
+        check_range("sink_max_retries", sink_max_retries, 0, 100)?;
+        let sink_retry_base_delay_ms = merge!(sink_retry_base_delay_ms).unwrap_or(100);
+        check_range(
+            "sink_retry_base_delay_ms",
+            sink_retry_base_delay_ms,
+            1,
+            60_000,
+        )?;
 
         // MySQL sink: identifier validation happens inside MySqlSink::new at
         // startup (strict [A-Za-z_][A-Za-z0-9_]{0,63} rule, single source of
@@ -675,6 +733,17 @@ impl Config {
             1,
             3_600,
         )?;
+        // Sink health-poll + stranded-segment rescan cadence (default = the
+        // HEALTH_POLL_INTERVAL const). Lower it for faster stranded-segment
+        // recovery; raise it to probe a flaky sink less often.
+        let health_poll_interval_secs = merge!(health_poll_interval_secs)
+            .unwrap_or_else(|| crate::drain::HEALTH_POLL_INTERVAL.as_secs());
+        check_range(
+            "health_poll_interval_secs",
+            health_poll_interval_secs,
+            1,
+            3_600,
+        )?;
 
         // Treat an empty / whitespace-only value as unset → "info". Otherwise an
         // empty WEIR_LOG_LEVEL="" wins the merge and main's EnvFilter::try_new("")
@@ -689,6 +758,17 @@ impl Config {
         let tls_key_path = merge!(tls_key_path);
         let tls_client_ca_path = merge!(tls_client_ca_path);
         let tls_handshake_timeout_secs = merge!(tls_handshake_timeout_secs).unwrap_or(10);
+        // Floor at 1s like every other timeout knob: a 0 here (a plausible
+        // fat-finger or a "disable the timeout" misunderstanding) makes
+        // tokio::time::timeout fire IMMEDIATELY on every handshake, silently
+        // rejecting 100% of TLS clients while the daemon looks healthy. Reject
+        // it (and absurdly large values) at startup with a named error.
+        check_range(
+            "tls_handshake_timeout_secs",
+            tls_handshake_timeout_secs,
+            1,
+            300,
+        )?;
 
         let tcp_bind = match tcp_bind_str {
             None => None,
@@ -744,6 +824,7 @@ impl Config {
             batch_size,
             batch_deadline_ms,
             wab_segment_max_bytes,
+            wab_segment_max_age_secs,
             max_connections,
             max_payload_bytes,
             metrics_port,
@@ -758,6 +839,9 @@ impl Config {
             sink_max_batch_size,
             sink_send_idempotency_key,
             sink_http_concurrency,
+            sink_http_batch,
+            sink_max_retries,
+            sink_retry_base_delay_ms,
             #[cfg(feature = "mysql-sink")]
             sink_mysql_table,
             #[cfg(feature = "mysql-sink")]
@@ -778,6 +862,7 @@ impl Config {
             sink_clickhouse_column,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
+            health_poll_interval_secs,
             log_level,
             tcp_bind,
             tls_cert_path,
@@ -931,9 +1016,16 @@ mod tests {
         assert_eq!(c.batch_size, 256);
         assert_eq!(c.batch_deadline_ms, 1);
         assert_eq!(c.wab_segment_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(c.wab_segment_max_age_secs, 0);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
+        // Secure-by-design: /metrics binds localhost by default, never 0.0.0.0 —
+        // catches a regression that would expose the unauthenticated endpoint.
+        assert_eq!(
+            c.metrics_bind,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
         assert_eq!(c.shutdown_timeout_secs, 30);
         assert_eq!(c.connection_read_timeout_secs, 30);
         assert_eq!(c.sink_type, SinkType::Noop);
@@ -942,6 +1034,9 @@ mod tests {
         assert_eq!(c.sink_max_batch_size, 100);
         assert!(c.sink_send_idempotency_key);
         assert_eq!(c.sink_http_concurrency, 8);
+        assert_eq!(c.sink_http_batch, "none");
+        assert_eq!(c.sink_max_retries, 3);
+        assert_eq!(c.sink_retry_base_delay_ms, 100);
         #[cfg(feature = "mysql-sink")]
         assert_eq!(c.sink_mysql_table, "weir_records");
         #[cfg(feature = "mysql-sink")]
@@ -953,6 +1048,7 @@ mod tests {
         );
         assert_eq!(c.dead_letter_max_bytes, 1_073_741_824);
         assert_eq!(c.dead_letter_check_interval_secs, 30);
+        assert_eq!(c.health_poll_interval_secs, 30);
         assert_eq!(c.log_level, "info");
         fs::remove_dir_all(dir).ok();
     }
@@ -1211,6 +1307,87 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    // ── Bounded scalar knobs: every check_range-guarded field ──────────────────
+
+    /// Sets one knob to an out-of-range value on an otherwise-default config and
+    /// asserts `from_layers` rejects it, naming the field in the error.
+    fn assert_knob_rejected(label: &str, field: &str, mutate: impl FnOnce(&mut PartialConfig)) {
+        let dir = tmp_dir(label);
+        let mut p = PartialConfig {
+            wab_dir: Some(dir.clone()),
+            ..PartialConfig::empty()
+        };
+        mutate(&mut p);
+        let err =
+            Config::from_layers(p, PartialConfig::empty(), PartialConfig::empty()).unwrap_err();
+        assert!(
+            err.to_string().contains(field),
+            "{field}: out-of-range value must be rejected and name the field, got: {err}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Pins the range guard on every bounded scalar knob that the dedicated
+    /// shard_count / wab_segment_max_bytes / dead_letter_* tests above don't
+    /// already cover. They share the `check_range` helper (range tested there),
+    /// but each call wires a distinct field+bounds — this catches a future edit
+    /// that drops or mis-wires one knob's guard. Each case sets exactly one knob
+    /// just past a bound; all others default to in-range, so only the target
+    /// field's check fires.
+    #[test]
+    fn bounded_scalar_knobs_reject_out_of_range() {
+        assert_knob_rejected("rng_batch_size", "batch_size", |p| p.batch_size = Some(0));
+        assert_knob_rejected("rng_batch_deadline", "batch_deadline_ms", |p| {
+            p.batch_deadline_ms = Some(0)
+        });
+        assert_knob_rejected("rng_seg_age", "wab_segment_max_age_secs", |p| {
+            p.wab_segment_max_age_secs = Some(86_401)
+        });
+        assert_knob_rejected("rng_max_conn", "max_connections", |p| {
+            p.max_connections = Some(0)
+        });
+        assert_knob_rejected("rng_metrics_conn", "metrics_max_connections", |p| {
+            p.metrics_max_connections = Some(0)
+        });
+        assert_knob_rejected("rng_read_to", "connection_read_timeout_secs", |p| {
+            p.connection_read_timeout_secs = Some(0)
+        });
+        assert_knob_rejected("rng_hs_to", "tls_handshake_timeout_secs", |p| {
+            p.tls_handshake_timeout_secs = Some(0)
+        });
+        assert_knob_rejected("rng_sink_to", "sink_timeout_secs", |p| {
+            p.sink_timeout_secs = Some(0)
+        });
+        assert_knob_rejected("rng_sink_batch", "sink_max_batch_size", |p| {
+            p.sink_max_batch_size = Some(0)
+        });
+        assert_knob_rejected("rng_sink_conc", "sink_http_concurrency", |p| {
+            p.sink_http_concurrency = Some(0)
+        });
+        assert_knob_rejected("rng_sink_retries", "sink_max_retries", |p| {
+            p.sink_max_retries = Some(101)
+        });
+        assert_knob_rejected("rng_retry_delay", "sink_retry_base_delay_ms", |p| {
+            p.sink_retry_base_delay_ms = Some(0)
+        });
+        assert_knob_rejected("rng_health_poll", "health_poll_interval_secs", |p| {
+            p.health_poll_interval_secs = Some(3_601)
+        });
+        // Bespoke `== 0` guards (not check_range, but the same "a 0 must not boot a
+        // broken daemon" contract): a zero payload cap, metrics port, or shutdown
+        // timeout is a foreseeable fat-finger that would break ingest / metrics /
+        // graceful drain.
+        assert_knob_rejected("rng_max_payload", "max_payload_bytes", |p| {
+            p.max_payload_bytes = Some(0)
+        });
+        assert_knob_rejected("rng_metrics_port", "metrics_port", |p| {
+            p.metrics_port = Some(0)
+        });
+        assert_knob_rejected("rng_shutdown_to", "shutdown_timeout_secs", |p| {
+            p.shutdown_timeout_secs = Some(0)
+        });
+    }
+
     // ── Sink: MySQL ───────────────────────────────────────────────────────────
 
     #[cfg(feature = "mysql-sink")]
@@ -1325,6 +1502,44 @@ mod tests {
         assert!(msg.contains("http"), "{msg}");
         assert!(msg.contains("mysql"), "{msg}");
         assert!(msg.contains("postgres"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_sink_http_batch_rejected() {
+        // A typo'd framing mode must fail fast at load (validated regardless of
+        // which sink features are compiled in).
+        let dir = tmp_dir("bad_http_batch");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_http_batch: Some("jsonl".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sink_http_batch"), "{msg}");
+        assert!(msg.contains("ndjson"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn sink_http_batch_ndjson_accepted() {
+        let dir = tmp_dir("ndjson_http_batch");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_http_batch: Some("ndjson".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.sink_http_batch, "ndjson");
         fs::remove_dir_all(dir).ok();
     }
 

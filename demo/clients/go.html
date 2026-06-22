@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — Go wire client</title>
+<meta name="description" content="A pure-Go weir v1 wire-protocol producer — built from the spec, zero weir-crate deps, 30/30 conformance vectors plus a 15-case adversarial live harness." />
+<link rel="stylesheet" href="../weir.css" />
+</head>
+<body>
+
+<div class="statusbar top">
+  <span>weir <span data-weir-version></span> · polyglot wire client · Go</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">one wire, five languages, from the spec</span>
+</div>
+
+<nav class="nav">
+  <a href="../index.html">Demo</a>
+  <a href="../crates.html">Crates</a>
+  <a href="../examples.html" class="active">Examples</a>
+  <span class="nav-ext">
+    <a href="https://github.com/miki-przygoda/weir" target="_blank" rel="noopener">GitHub ↗</a>
+    <a href="https://miki-przygoda.github.io/weir" target="_blank" rel="noopener">Docs ↗</a>
+  </span>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <p class="role"><a href="../examples.html">← Example projects</a></p>
+    <h1>Go <span class="accent">· weir wire client</span></h1>
+    <p class="tag"><strong>The adversarial conformance harness.</strong> A pure-Go producer that speaks the weir v1 wire protocol straight to the daemon socket — built from the spec, <em>zero weir-crate deps</em>, stdlib only (<code class="inline">hash/crc32</code>, <code class="inline">encoding/binary</code>, <code class="inline">net</code>) — paired with a 15-case live harness that deliberately fires <em>every</em> rejection (Nack) reason at a running daemon and checks it gets the right one back.</p>
+    <div class="chips" style="gap:8px">
+      <span class="chip wire">30/30 conformance vectors</span>
+      <span class="chip wire">byte-exact</span>
+      <span class="chip wire">+ 15-case adversarial live harness</span>
+      <span class="chip dim">stdlib only</span>
+      <span class="chip dim">zero Rust deps</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">What it is</div>
+    <div class="panel-body">
+      <p>A from-scratch Go implementation of the weir v1 wire protocol, built only from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors — it does <em>not</em> link the Rust <code class="inline">weir-client</code>. A frame codec (<code class="inline">wire.go</code>), a synchronous producer over a Unix socket (<code class="inline">client.go</code>), and an adversarial live harness (<code class="inline">main.go</code>).</p>
+      <p style="margin-bottom:0">The goal: prove the wire spec is sufficient to build a wire-compatible producer in another language, and adversarially test <em>every Nack reason</em> and edge case against a live daemon.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Run it</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
+    <div class="panel-body">
+<pre class="code">go test ./...                         <span class="c"># offline: 30/30 conformance vectors</span></pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: stdlib only (<code class="inline">net</code>, <code class="inline">encoding/binary</code>, <code class="inline">hash/crc32</code>, <code class="inline">encoding/json</code>), zero external deps · tested on go 1.26.3 (the <code class="inline">go</code> directive in <code class="inline">go.mod</code>).</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Live <span class="pt-right">15 adversarial cases against a running daemon</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="c"># start the daemon yourself with a unique socket/wab/port:</span>
+weir-server --socket-path ./weir.sock --wab-dir ./wab --metrics-port 19009 &amp;
+go build -o weir-go-client .
+./weir-go-client -socket ./weir.sock  <span class="c"># 15 adversarial cases, all PASS</span></pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">15/15 live adversarial cases pass: every Nack reason, the happy path at all 3 durability tiers, HealthCheck, pipelining, and the documented connection-close semantics for permanent errors. Daemon <code class="inline">weir_records_nack_total{reason=...}</code> metrics matched the harness 1:1.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">The codec</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">wire.go <span class="pt-right">frame encode — 16-byte header + payload + CRC32</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="c">// EncodeFrame builds a complete on-the-wire frame.</span>
+<span class="k">func</span> <span class="f">EncodeFrame</span>(f <span class="t">Frame</span>) []<span class="t">byte</span> {
+    plen := <span class="f">len</span>(f.Payload)
+    buf := <span class="f">make</span>([]<span class="t">byte</span>, HeaderLen+plen+<span class="t">4</span>)
+    <span class="f">copy</span>(buf[<span class="t">0</span>:<span class="t">4</span>], magic[:])              <span class="c">// "WEIR"</span>
+    buf[<span class="t">4</span>] = f.Version
+    buf[<span class="t">5</span>] = <span class="t">byte</span>(f.MessageType)
+    buf[<span class="t">6</span>] = <span class="t">byte</span>(f.Durability)
+    buf[<span class="t">7</span>] = f.Flags                      <span class="c">// reserved, must be 0</span>
+    binary.LittleEndian.<span class="f">PutUint32</span>(buf[<span class="t">8</span>:<span class="t">12</span>], <span class="t">uint32</span>(plen))
+    binary.LittleEndian.<span class="f">PutUint32</span>(buf[<span class="t">12</span>:<span class="t">16</span>], <span class="f">crc</span>(buf[<span class="t">0</span>:<span class="t">12</span>]))
+    <span class="f">copy</span>(buf[<span class="t">16</span>:<span class="t">16</span>+plen], f.Payload)
+    binary.LittleEndian.<span class="f">PutUint32</span>(buf[<span class="t">16</span>+plen:], <span class="f">crc</span>(f.Payload))
+    <span class="k">return</span> buf
+}</pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)"><code class="inline">crc</code> is the IEEE / ISO-3309 CRC-32 (<code class="inline">crc32.IEEETable</code>), <em>not</em> CRC-32C.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Source</span><span class="rule"></span></div>
+  <p style="margin-top:0"><a href="https://github.com/miki-przygoda/weir/tree/main/demos/go-wire-client" target="_blank" rel="noopener">→ demos/go-wire-client on GitHub</a></p>
+  <p style="margin-top:0.4rem"><a href="../examples.html">← back to example projects</a></p>
+
+  <p class="foot">One of five from-spec polyglot wire clients shipped with
+     <a href="https://github.com/miki-przygoda/weir">weir</a> —
+     each speaks the same 16-byte-header wire protocol with zero weir-crate deps.
+     Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
+</div>
+
+<script src="../version.js"></script>
+</body>
+</html>

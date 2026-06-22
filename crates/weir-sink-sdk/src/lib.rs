@@ -8,29 +8,18 @@
 //! [`Sink`] (and [`SinkError`] for your error type); the drain retries transient
 //! failures with backoff and dead-letters permanent ones.
 //!
+//! A sink whose `commit` can never fail picks `type Error = std::convert::Infallible`
+//! — no error type to hand-roll, no `is_transient` to write:
+//!
 //! ```
-//! use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth};
+//! use weir_sink_sdk::{CommitResult, Payload, Sink, SinkHealth};
 //!
 //! struct StdoutSink;
 //!
-//! #[derive(Debug)]
-//! struct Never;
-//! impl std::fmt::Display for Never {
-//!     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//!         write!(f, "unreachable")
-//!     }
-//! }
-//! impl std::error::Error for Never {}
-//! impl SinkError for Never {
-//!     fn is_transient(&self) -> bool {
-//!         true
-//!     }
-//! }
-//!
 //! impl Sink for StdoutSink {
 //!     type Record = Payload;
-//!     type Error = Never;
-//!     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Never> {
+//!     type Error = std::convert::Infallible; // this commit never returns Err
+//!     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Self::Error> {
 //!         for r in &batch {
 //!             println!("{} bytes", r.len());
 //!         }
@@ -42,14 +31,22 @@
 //! }
 //! ```
 //!
+//! A sink that *can* fail returns a [`SinkError`] that classifies the failure as
+//! transient (retried) or permanent (dead-lettered). Reach for the ready-made
+//! [`BasicSinkError`] before writing your own error type.
+//!
 //! # Idempotency contract
 //!
 //! The drain guarantees **at-least-once delivery per segment**, not per record.
 //! If the daemon crashes after a partial commit but before recording the segment
 //! as confirmed, `commit` is called again with the full segment — including
-//! records already committed. Implementations **must** handle duplicates
-//! gracefully (upsert, `INSERT IGNORE`, a content-derived dedup key, etc.). This
-//! is the explicit durability trade-off, not a protocol weakness.
+//! records already committed. The same whole-segment replay also occurs when a
+//! segment is *stranded* (its transient-retry budget is exhausted while the sink
+//! is unavailable) and later auto-resumed once the sink recovers: the resume
+//! reprocesses from the start, not from the last durably-committed sub-batch.
+//! Implementations **must** handle duplicates gracefully (upsert, `INSERT IGNORE`,
+//! a content-derived dedup key, etc.). This is the explicit durability trade-off,
+//! not a protocol weakness.
 //!
 //! # Running your sink in the daemon
 //!
@@ -79,6 +76,29 @@ pub use weir_core::Payload;
 ///
 /// The simplest implementation is `type Record = Payload` (opaque bytes). Richer
 /// sinks can define a concrete record type that deserialises the payload.
+///
+/// # Footgun
+///
+/// The two dead-letter paths recover bytes differently, and a custom record type
+/// can make them disagree:
+///
+/// - **Per-record** (a successful `commit` that returns records in
+///   [`CommitResult::dead_lettered`]): the drain calls [`into_payload`] on each
+///   rejected record to recover the bytes it writes to the dead-letter store.
+/// - **Whole-batch `Err`** (`commit` returns a permanent error): the typed
+///   records were moved into `commit` and are gone, so the drain dead-letters the
+///   **original** raw segment payload bytes — the same bytes it passed to
+///   [`from_payload`] — and never calls [`into_payload`] at all.
+///
+/// **Rule:** if `into_payload(from_payload(x))` is not byte-identical to `x`,
+/// your dead-letter bytes differ between the per-record path (uses
+/// [`into_payload`]) and the whole-batch-`Err` path (uses the original payload) —
+/// make the round-trip byte-preserving, or carry the raw payload inside your
+/// record. For the identity [`Payload`] record the round-trip is exact, so the
+/// two paths always agree.
+///
+/// [`into_payload`]: SinkRecord::into_payload
+/// [`from_payload`]: SinkRecord::from_payload
 pub trait SinkRecord: Send + 'static {
     /// Build the record from the raw payload bytes handed over by the drain.
     fn from_payload(payload: Payload) -> Self;
@@ -86,15 +106,12 @@ pub trait SinkRecord: Send + 'static {
     /// Recover the raw payload bytes for a record the sink returned in
     /// [`CommitResult::dead_lettered`].
     ///
-    /// This is the **per-record** dead-letter path: when a `commit` call succeeds
-    /// but reports some records as permanently rejected, the drain calls
+    /// Called on the **per-record** dead-letter path only: when a `commit` call
+    /// succeeds but reports some records as permanently rejected, the drain calls
     /// `into_payload` on each to recover the bytes it writes to the dead-letter
-    /// store. It is **not** used when `commit` returns `Err`: a whole-batch
-    /// permanent error dead-letters the original segment's raw payload bytes
-    /// directly (the typed records were moved into `commit` and are gone on the
-    /// error path). For the identity [`Payload`] record the two are the same
-    /// bytes; a custom record type only sees `into_payload` on the per-record
-    /// path, so it must not rely on it being called for whole-batch errors.
+    /// store. It is **not** called when `commit` returns `Err` — see the
+    /// [`SinkRecord`] type-level `# Footgun` for the whole-batch-`Err` divergence
+    /// and the byte-preserving round-trip rule.
     fn into_payload(self) -> Payload;
 }
 
@@ -127,6 +144,57 @@ pub trait SinkError: Send + Sync + std::error::Error + 'static {
     }
 }
 
+/// [`SinkError`] for a sink whose `commit` can never fail: use
+/// `type Error = std::convert::Infallible` instead of hand-rolling a never-type.
+/// `is_transient` is unreachable (an `Infallible` value cannot exist).
+impl SinkError for std::convert::Infallible {
+    fn is_transient(&self) -> bool {
+        match *self {}
+    }
+}
+
+/// A ready-made [`SinkError`] for sinks that don't need a bespoke error type —
+/// a message plus a transient/permanent classification. Construct it with
+/// [`BasicSinkError::transient`] (the drain retries the segment) or
+/// [`BasicSinkError::permanent`] (the records are dead-lettered).
+#[derive(Debug, Clone)]
+pub struct BasicSinkError {
+    message: String,
+    transient: bool,
+}
+
+impl BasicSinkError {
+    /// A transient failure — the drain retries the whole segment with backoff.
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: true,
+        }
+    }
+
+    /// A permanent failure — the affected records are dead-lettered.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+        }
+    }
+}
+
+impl std::fmt::Display for BasicSinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for BasicSinkError {}
+
+impl SinkError for BasicSinkError {
+    fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
 /// The result of a successful [`Sink::commit`].
 ///
 /// Build one with [`CommitResult::new`]. The fields are public for reading, but
@@ -134,12 +202,124 @@ pub trait SinkError: Send + Sync + std::error::Error + 'static {
 /// constructor variant) without a breaking change — construct it through `new`
 /// rather than a struct literal.
 ///
-/// Every record handed to [`Sink::commit`] must appear in exactly one of
-/// `committed` or `dead_lettered`. This partition invariant is enforced by the
-/// drain at runtime (it refuses to confirm a segment whose
-/// `committed.len() + dead_lettered.len()` does not cover the batch) rather than
-/// by this type, because the record type `R` carries no identity the constructor
-/// could check.
+/// Conceptually, every record handed to [`Sink::commit`] should appear in
+/// exactly one of `committed` or `dead_lettered`. **Nothing enforces that set
+/// partition.** This type does not (the record type `R` carries no identity the
+/// constructor could check), and the drain only validates total **count**
+/// coverage: it refuses to confirm a segment unless
+/// `committed.len() + dead_lettered.len()` equals the batch length. That count
+/// check catches a sink that simply drops a record, but it does **not** catch a
+/// sink that emits the same record in *both* vectors while dropping a different
+/// one — the counts still add up, so the segment is confirmed and the dropped
+/// record is silently false-acked (never delivered, never dead-lettered).
+///
+/// **Author warning:** do not emit a record in both partitions, and do not drop
+/// or duplicate records — a count-correct but identity-incorrect partition can
+/// still cause a lost record. Built-in sinks always partition cleanly; the
+/// burden is on custom sinks.
+///
+/// # Reading a `CommitResult`
+///
+/// Both fields are public, so inspect them directly. `committed` is a
+/// `Vec<R>` of the accepted records; `dead_lettered` is a `Vec<(R, String)>`
+/// pairing each permanently-rejected record with its human-readable reason.
+///
+/// ```
+/// use weir_sink_sdk::{CommitResult, Payload};
+///
+/// // The drain hands you back a CommitResult; here we build one to read it.
+/// let result = CommitResult::new(
+///     vec![Payload::from(b"keep-1".as_ref()), Payload::from(b"keep-2".as_ref())],
+///     vec![(Payload::from(b"reject".as_ref()), "400 bad request".to_string())],
+/// );
+///
+/// // `committed`: the records the sink accepted.
+/// assert_eq!(result.committed.len(), 2);
+/// for record in &result.committed {
+///     println!("committed {} bytes", record.len());
+/// }
+///
+/// // `dead_lettered`: each rejected record paired with WHY it was rejected.
+/// assert_eq!(result.dead_lettered.len(), 1);
+/// for (record, reason) in &result.dead_lettered {
+///     println!("dead-lettered {} bytes: {reason}", record.len());
+/// }
+/// let (rejected, reason) = &result.dead_lettered[0];
+/// assert_eq!(&rejected[..], b"reject");
+/// assert_eq!(reason, "400 bad request");
+/// ```
+///
+/// # Driving an async `commit` from a sync test (no runtime)
+///
+/// `Sink::commit` is `async`, but you can unit-test a sink whose commit is
+/// immediately ready (no real I/O await points) without pulling in a runtime,
+/// by polling the future to completion with a no-op waker. This is the same
+/// `block_on` helper the SDK's own tests use — copy it into your sink's tests:
+///
+/// <div class="warning">
+///
+/// **Only for sinks with no real I/O await points.** This `block_on` busy-polls
+/// with a *no-op* waker — it never sleeps and never wakes. If the future ever
+/// returns `Poll::Pending` (any real `await` that yields: a socket read, a timer,
+/// `tokio::fs`, `sqlx`, `reqwest`), this loop spins the CPU at 100% forever and
+/// **never makes progress** — the no-op waker can't reschedule it. It is fine
+/// only when `commit`/`health` complete synchronously (in-memory work, a `Vec`
+/// push, no yield point). For a sink that does real I/O, use a real runtime —
+/// write a `#[tokio::test]` and `.await` the commit directly (see
+/// `docs/getting-started/integrating.md` → "Unit-testing a real-I/O sink").
+///
+/// </div>
+///
+/// ```
+/// use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth};
+///
+/// /// Minimal std-only executor: drives a future to completion by polling with
+/// /// a no-op waker. ONLY for a sink whose `commit`/`health` are immediately
+/// /// ready (no real I/O await points) — it busy-spins forever on any future
+/// /// that returns `Poll::Pending`. For real I/O use a `#[tokio::test]` instead.
+/// fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+///     use std::task::{Context, Poll};
+///     let mut fut = std::pin::pin!(fut);
+///     let waker = std::task::Waker::noop();
+///     let mut cx = Context::from_waker(waker);
+///     loop {
+///         if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+///             return v;
+///         }
+///     }
+/// }
+///
+/// // A sink that dead-letters anything equal to `b"reject"` and commits the rest.
+/// struct MySink;
+/// impl Sink for MySink {
+///     type Record = Payload;
+///     type Error = std::convert::Infallible;
+///     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Self::Error> {
+///         let (mut ok, mut dead) = (Vec::new(), Vec::new());
+///         for r in batch {
+///             if r.as_ref() == b"reject" {
+///                 dead.push((r, "rejected by MySink".to_string()));
+///             } else {
+///                 ok.push(r);
+///             }
+///         }
+///         Ok(CommitResult::new(ok, dead))
+///     }
+///     async fn health(&self) -> SinkHealth {
+///         SinkHealth::Healthy
+///     }
+/// }
+///
+/// let batch = vec![
+///     Payload::from(b"keep".as_ref()),
+///     Payload::from(b"reject".as_ref()),
+/// ];
+/// // Drive the async commit to completion synchronously, then read the result.
+/// let result = block_on(MySink.commit(batch)).unwrap();
+/// assert_eq!(result.committed.len(), 1);
+/// assert_eq!(result.dead_lettered.len(), 1);
+/// assert_eq!(result.dead_lettered[0].1, "rejected by MySink");
+/// ```
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct CommitResult<R> {
@@ -153,8 +333,9 @@ impl<R> CommitResult<R> {
     /// Builds a commit result from the accepted and permanently-rejected records.
     ///
     /// Every record passed to [`Sink::commit`] should appear in exactly one of the
-    /// two lists; see the type-level note for how the partition invariant is
-    /// enforced.
+    /// two lists. Neither this constructor nor the drain enforces that partition
+    /// by identity (only total count coverage is checked) — see the type-level
+    /// note for the failure mode and the author warning.
     #[must_use]
     pub fn new(committed: Vec<R>, dead_lettered: Vec<(R, String)>) -> Self {
         Self {
@@ -216,6 +397,93 @@ pub trait Sink: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal std-only executor: drives a future to completion by polling with a
+    /// no-op waker. Enough to test a sink whose `commit`/`health` are immediately
+    /// ready (no real I/O await points), without pulling a runtime into the SDK.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let mut fut = std::pin::pin!(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    /// A trivial sink that counts committed records and dead-letters anything
+    /// equal to `b"reject"`. Shows the pattern sink authors use to unit-test a
+    /// `Sink` impl against the stable contract (no daemon, no runtime).
+    #[test]
+    fn a_custom_sink_can_be_driven_and_unit_tested() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Never;
+        impl std::fmt::Display for Never {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "never")
+            }
+        }
+        impl std::error::Error for Never {}
+        impl SinkError for Never {
+            fn is_transient(&self) -> bool {
+                true
+            }
+        }
+
+        struct CountingSink {
+            committed: AtomicUsize,
+        }
+        impl Sink for CountingSink {
+            type Record = Payload;
+            type Error = Never;
+            async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Never> {
+                let (mut ok, mut dead) = (Vec::new(), Vec::new());
+                for r in batch {
+                    if r.as_ref() == b"reject" {
+                        dead.push((r, "rejected by CountingSink".to_string()));
+                    } else {
+                        ok.push(r);
+                    }
+                }
+                self.committed.fetch_add(ok.len(), Ordering::Relaxed);
+                Ok(CommitResult::new(ok, dead))
+            }
+            async fn health(&self) -> SinkHealth {
+                SinkHealth::Healthy
+            }
+        }
+
+        let sink = CountingSink {
+            committed: AtomicUsize::new(0),
+        };
+        let batch = vec![
+            Payload::copy_from_slice(b"keep-1"),
+            Payload::copy_from_slice(b"reject"),
+            Payload::copy_from_slice(b"keep-2"),
+        ];
+        let result = block_on(sink.commit(batch)).unwrap();
+        assert_eq!(result.committed.len(), 2);
+        assert_eq!(result.dead_lettered.len(), 1);
+        assert_eq!(&result.dead_lettered[0].0[..], b"reject");
+        assert_eq!(sink.committed.load(Ordering::Relaxed), 2);
+        assert!(matches!(block_on(sink.health()), SinkHealth::Healthy));
+    }
+
+    #[test]
+    fn basic_sink_error_classifies_and_displays() {
+        let t = BasicSinkError::transient("503 from upstream");
+        assert!(t.is_transient());
+        assert_eq!(t.to_string(), "503 from upstream");
+        let p = BasicSinkError::permanent("400 bad request");
+        assert!(!p.is_transient());
+        // Usable as a SinkError trait object / std error.
+        let _: &dyn SinkError = &p;
+        let _: &dyn std::error::Error = &p;
+    }
 
     #[test]
     fn commit_result_new_keeps_both_partitions() {

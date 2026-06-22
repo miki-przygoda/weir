@@ -11,6 +11,7 @@ WORKDIR /build
 # Copy manifests first so this layer is only invalidated when deps change.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/weir-core/Cargo.toml     crates/weir-core/Cargo.toml
+COPY crates/weir-wab/Cargo.toml      crates/weir-wab/Cargo.toml
 COPY crates/weir-server/Cargo.toml   crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml   crates/weir-client/Cargo.toml
 # weir-sink-sdk is a real dependency of weir-server (the Sink trait contract);
@@ -25,6 +26,7 @@ COPY crates/weir-testkit/Cargo.toml  crates/weir-testkit/Cargo.toml
 # Stub sources so Cargo can resolve the workspace and compile dependencies.
 RUN mkdir -p \
         crates/weir-core/src \
+        crates/weir-wab/src \
         crates/weir-server/src \
         crates/weir-client/src \
         crates/weir-sink-sdk/src \
@@ -34,6 +36,7 @@ RUN mkdir -p \
     echo 'fn main(){}' > crates/weir-ctl/src/main.rs && \
     touch \
         crates/weir-core/src/lib.rs \
+        crates/weir-wab/src/lib.rs \
         crates/weir-client/src/lib.rs \
         crates/weir-sink-sdk/src/lib.rs \
         crates/weir-testkit/src/lib.rs
@@ -97,10 +100,14 @@ VOLUME ["/var/lib/weir/wab", "/run/weir"]
 # and waits for in-flight connections to drain (shutdown_timeout_secs).
 STOPSIGNAL SIGTERM
 
-# Lightweight liveness check using bash's /dev/tcp magic (no extra packages
+# Lightweight LIVENESS check using bash's /dev/tcp magic (no extra packages
 # needed). Opens a TCP connection to the metrics port; succeeds iff the
-# daemon is alive and the metrics server has bound. Tunable via
-# --health-* flags at run time.
+# daemon is alive and the metrics server has bound. Adjust the cadence via the
+# HEALTHCHECK --interval/--timeout/--retries options below (there are no weir
+# "--health-*" CLI flags). This is liveness only — it does not check sink
+# health or drain progress; the image ships only weir-server (no curl/awk/
+# weir-ctl), so a readiness gate must be an external probe over /metrics
+# (see deploy/systemd/weir-readiness.sh for the logic).
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
 

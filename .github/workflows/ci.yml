@@ -22,6 +22,23 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      # The demo banners show the weir version via demo/version.js (single source,
+      # generated from [workspace.package] in Cargo.toml). Fail if it drifts — after
+      # a version bump, run scripts/sync-demo-version.sh and commit demo/version.js.
+      - run: ./scripts/sync-demo-version.sh && git diff --exit-code demo/version.js
+
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The declared MSRV (workspace.package.rust-version). This job is what makes
+      # the floor real: a dependency or syntax bump that needs a newer compiler
+      # fails here instead of silently raising the requirement (escalation #15).
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features --locked
 
   advisories:
     name: advisories (cargo-deny)
@@ -58,7 +75,7 @@ jobs:
       # Builds the WAB deterministic-simulation harness with the `dst` feature
       # ON (compile-checks the non-test path too), replays every pinned
       # regression seed in tests/dst_seeds/, and runs a deeper random-seed
-      # sweep than the default `cargo test` (300 seeds × 2 fault scenarios).
+      # sweep than the default `cargo test` (300 seeds × 5 fault scenarios).
       # A violated durability invariant fails here with a WEIR_DST_SEED repro.
       - name: DST scenarios + regression seeds + sweep
         env:

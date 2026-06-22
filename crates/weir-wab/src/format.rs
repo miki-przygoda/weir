@@ -63,6 +63,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// but the FORMAT_VERSION byte distinguishes segment files from wire frames.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"WEIR";
 
+/// On-disk segment format version, byte `[4]` of the header. A reader rejects
+/// any header whose version byte is not this value.
 pub const FORMAT_VERSION: u8 = 1;
 
 /// Segment header size in bytes. Fixed for the lifetime of FORMAT_VERSION = 1.
@@ -77,7 +79,12 @@ pub const SENTINEL: [u8; 4] = [0u8; 4];
 /// Rotate the active segment when it reaches this size (including header).
 pub const SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Magic for a `.confirmed` sidecar file, bytes `[0..4]`. Distinct from
+/// [`SEGMENT_MAGIC`] so a misplaced segment file cannot be parsed as a
+/// confirmation file (`b"WCON"`).
 pub const CONFIRMED_MAGIC: [u8; 4] = *b"WCON";
+/// On-disk `.confirmed` file format version, byte `[4]`. A parse rejects any
+/// other value (quarantines rather than risk a double-drain).
 pub const CONFIRMED_VERSION: u8 = 1;
 /// Total byte length of a `.confirmed` file.
 pub const CONFIRMED_LEN: usize = 36;
@@ -147,8 +154,11 @@ pub fn build_segment_footer(
 /// Parsed confirmation file contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedMeta {
+    /// Seal timestamp copied from the segment footer, bytes `[8..16]` LE — unix nanoseconds.
     pub sealed_at: i64,
+    /// Number of records drained from the segment, bytes `[16..24]` LE.
     pub record_count: u64,
+    /// Timestamp when the drain completed, bytes `[24..32]` LE — unix nanoseconds.
     pub drained_at: i64,
 }
 
@@ -167,17 +177,28 @@ pub fn build_confirmed(sealed_at: i64, record_count: u64, drained_at: i64) -> [u
     buf
 }
 
+/// Why a [`parse_confirmed`] call failed. Carries `Display` +
+/// [`std::error::Error`] so callers can render or wrap it.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ConfirmedParseError {
     /// Not 36 bytes.
-    WrongLength { got: usize },
+    WrongLength {
+        /// The actual buffer length received.
+        got: usize,
+    },
     /// First four bytes are not `b"WCON"`.
     BadMagic,
     /// Version byte is not 1. Quarantine instead of treating as unconfirmed to
     /// avoid potential double-drain on unknown format.
     UnknownVersion(u8),
     /// CRC32 of bytes [0..32] does not match bytes [32..36].
-    CrcMismatch { expected: u32, computed: u32 },
+    CrcMismatch {
+        /// CRC32 read from the file's trailing 4 bytes.
+        expected: u32,
+        /// CRC32 freshly computed over bytes `[0..32]`.
+        computed: u32,
+    },
 }
 
 impl std::fmt::Display for ConfirmedParseError {
@@ -200,6 +221,8 @@ impl std::fmt::Display for ConfirmedParseError {
         }
     }
 }
+
+impl std::error::Error for ConfirmedParseError {}
 
 /// Parses a `.confirmed` file's byte content.
 /// Returns `Ok(ConfirmedMeta)` only when magic, version, and CRC all pass.
@@ -226,6 +249,139 @@ pub fn parse_confirmed(buf: &[u8]) -> Result<ConfirmedMeta, ConfirmedParseError>
         record_count: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
         drained_at: i64::from_le_bytes(buf[24..32].try_into().unwrap()),
     })
+}
+
+/// Parsed segment-header fields. The additive READ counterpart to
+/// [`build_segment_header`], for forensics tools that need the header metadata
+/// without re-deriving the byte offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentHeaderMeta {
+    /// The on-disk [`FORMAT_VERSION`] byte (always `1` for a parse to succeed).
+    pub format_version: u8,
+    /// Owning shard id, header bytes `[6..8]` LE.
+    pub shard_id: u16,
+    /// Creation timestamp, header bytes `[8..16]` LE — unix nanoseconds.
+    pub created_at: i64,
+}
+
+/// Why a [`parse_segment_header`] call failed. Mirrors the structured style of
+/// [`ConfirmedParseError`] (`Display` + [`std::error::Error`]).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SegmentHeaderParseError {
+    /// Buffer length is not exactly [`SEGMENT_HEADER_LEN`].
+    WrongLength {
+        /// The actual buffer length received.
+        got: usize,
+    },
+    /// First four bytes are not [`SEGMENT_MAGIC`] (`b"WEIR"`).
+    BadMagic,
+    /// Version byte is not [`FORMAT_VERSION`].
+    UnknownVersion(u8),
+}
+
+impl std::fmt::Display for SegmentHeaderParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongLength { got } => write!(
+                f,
+                "segment header is {got} bytes, expected {SEGMENT_HEADER_LEN}"
+            ),
+            Self::BadMagic => write!(f, "segment header has bad magic (expected b\"WEIR\")"),
+            Self::UnknownVersion(v) => write!(f, "unknown segment format version {v}"),
+        }
+    }
+}
+
+impl std::error::Error for SegmentHeaderParseError {}
+
+/// Parses a [`SEGMENT_HEADER_LEN`]-byte segment header. The READ counterpart to
+/// [`build_segment_header`]: validates length, magic, and version, then extracts
+/// `shard_id` (bytes `[6..8]` LE) and `created_at` (bytes `[8..16]` LE).
+///
+/// Returns `Ok(SegmentHeaderMeta)` only when length, magic, and version all pass.
+pub fn parse_segment_header(buf: &[u8]) -> Result<SegmentHeaderMeta, SegmentHeaderParseError> {
+    if buf.len() != SEGMENT_HEADER_LEN {
+        return Err(SegmentHeaderParseError::WrongLength { got: buf.len() });
+    }
+    if buf[0..4] != SEGMENT_MAGIC {
+        return Err(SegmentHeaderParseError::BadMagic);
+    }
+    if buf[4] != FORMAT_VERSION {
+        return Err(SegmentHeaderParseError::UnknownVersion(buf[4]));
+    }
+    Ok(SegmentHeaderMeta {
+        format_version: buf[4],
+        shard_id: u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+        created_at: i64::from_le_bytes(buf[8..16].try_into().unwrap()),
+    })
+}
+
+/// Parsed segment-footer fields. The additive READ counterpart to
+/// [`build_segment_footer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentFooterMeta {
+    /// Number of records in the segment, footer bytes `[0..8]` LE.
+    pub record_count: u64,
+    /// Total payload bytes across all records, footer bytes `[8..16]` LE.
+    pub data_bytes: u64,
+    /// CRC32 of all file bytes before the sentinel, footer bytes `[16..20]` LE.
+    pub file_crc32: u32,
+    /// Seal timestamp, footer bytes `[20..28]` LE — unix nanoseconds.
+    pub sealed_at: i64,
+}
+
+/// Why a [`parse_segment_footer`] call failed. The footer is *positional* (it has
+/// no magic — it is located by file offset, immediately after the sentinel), so
+/// the only structural check is its length.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SegmentFooterParseError {
+    /// Buffer length is not exactly [`SEGMENT_FOOTER_LEN`].
+    WrongLength {
+        /// The actual buffer length received.
+        got: usize,
+    },
+}
+
+impl std::fmt::Display for SegmentFooterParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongLength { got } => write!(
+                f,
+                "segment footer is {got} bytes, expected {SEGMENT_FOOTER_LEN}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SegmentFooterParseError {}
+
+/// Parses a [`SEGMENT_FOOTER_LEN`]-byte segment footer. The READ counterpart to
+/// [`build_segment_footer`]: extracts `record_count` (`[0..8]` LE), `data_bytes`
+/// (`[8..16]` LE), `file_crc32` (`[16..20]` LE), and `sealed_at` (`[20..28]` LE).
+///
+/// The footer carries no magic — it is positional (located by file offset,
+/// immediately after the sentinel) — so the only structural check is its length.
+pub fn parse_segment_footer(buf: &[u8]) -> Result<SegmentFooterMeta, SegmentFooterParseError> {
+    if buf.len() != SEGMENT_FOOTER_LEN {
+        return Err(SegmentFooterParseError::WrongLength { got: buf.len() });
+    }
+    Ok(SegmentFooterMeta {
+        record_count: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        data_bytes: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        file_crc32: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+        sealed_at: i64::from_le_bytes(buf[20..28].try_into().unwrap()),
+    })
+}
+
+/// CRC32 of `bytes`, a thin wrapper over `crc32fast::hash`. Exposed so a
+/// downstream forensics tool can recompute and verify the footer's `file_crc32`
+/// without taking its own direct dependency on `crc32fast` (the same algorithm
+/// every CRC in this format uses).
+#[inline]
+pub fn crc32(bytes: &[u8]) -> u32 {
+    crc32fast::hash(bytes)
 }
 
 #[cfg(test)]
@@ -314,5 +470,72 @@ mod tests {
             confirmed_path_for(Path::new("/x/odd_name")),
             Path::new("/x/odd_name.wab.confirmed"),
         );
+    }
+
+    #[test]
+    fn segment_header_parse_round_trip() {
+        let header = build_segment_header(0x1234);
+        let meta = parse_segment_header(&header).unwrap();
+        assert_eq!(meta.format_version, FORMAT_VERSION);
+        assert_eq!(meta.shard_id, 0x1234);
+        // created_at is stamped from unix_nanos_now() at build time.
+        assert!(meta.created_at > 0);
+        // The created_at decodes exactly from its byte range.
+        assert_eq!(
+            meta.created_at,
+            i64::from_le_bytes(header[8..16].try_into().unwrap())
+        );
+    }
+
+    #[test]
+    fn segment_header_parse_rejects_wrong_length() {
+        assert!(matches!(
+            parse_segment_header(&[0u8; SEGMENT_HEADER_LEN - 1]),
+            Err(SegmentHeaderParseError::WrongLength { got }) if got == SEGMENT_HEADER_LEN - 1
+        ));
+    }
+
+    #[test]
+    fn segment_header_parse_rejects_bad_magic() {
+        let mut header = build_segment_header(0);
+        header[0] = b'X';
+        assert!(matches!(
+            parse_segment_header(&header),
+            Err(SegmentHeaderParseError::BadMagic)
+        ));
+    }
+
+    #[test]
+    fn segment_header_parse_rejects_unknown_version() {
+        let mut header = build_segment_header(0);
+        header[4] = 99;
+        match parse_segment_header(&header) {
+            Err(SegmentHeaderParseError::UnknownVersion(99)) => {}
+            other => panic!("expected UnknownVersion(99), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn segment_footer_parse_round_trip() {
+        let footer = build_segment_footer(7, 1234, 0xdead_beef, 1_700_000_000_000_000_000i64);
+        let meta = parse_segment_footer(&footer).unwrap();
+        assert_eq!(meta.record_count, 7);
+        assert_eq!(meta.data_bytes, 1234);
+        assert_eq!(meta.file_crc32, 0xdead_beef);
+        assert_eq!(meta.sealed_at, 1_700_000_000_000_000_000i64);
+    }
+
+    #[test]
+    fn segment_footer_parse_rejects_wrong_length() {
+        assert!(matches!(
+            parse_segment_footer(&[0u8; SEGMENT_FOOTER_LEN + 1]),
+            Err(SegmentFooterParseError::WrongLength { got }) if got == SEGMENT_FOOTER_LEN + 1
+        ));
+    }
+
+    #[test]
+    fn crc32_matches_underlying_hash() {
+        let data = b"the quick brown fox";
+        assert_eq!(crc32(data), crc32fast::hash(data));
     }
 }

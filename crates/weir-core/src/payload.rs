@@ -7,9 +7,12 @@ use bytes::Bytes;
 /// Opaque payload bytes — a newtype over ref-counted [`bytes::Bytes`] so clones
 /// through the drain / sink path are O(1) instead of heap copies.
 ///
-/// `Payload` *wraps* `Bytes` rather than aliasing it so weir's 1.0 public API
-/// does not leak the `bytes` crate's semver: a future `bytes 2.0` would
-/// otherwise be a breaking change to weir's own 1.0. It derefs to `[u8]`, so
+/// `Payload` *wraps* `Bytes` rather than aliasing it, so the common path of
+/// weir's public API (slicing, `&[u8]` / `Vec<u8>` / `&str` interop) never names
+/// the `bytes` crate and is insulated from its semver. The zero-copy `Bytes`
+/// conversions (`From<Bytes>`, `From<Payload> for Bytes`, `into_bytes`) do
+/// expose `Bytes` deliberately, so a future `bytes 2.0` is a *contained* breaking
+/// surface there — not across the whole API. It derefs to `[u8]`, so
 /// slicing, indexing, iteration, `len()`, and `&payload` → `&[u8]` coercion all
 /// work transparently. `Debug` prints only the length — never the bytes — so a
 /// stray `debug!(?payload)` cannot leak (possibly sensitive) record contents.
@@ -101,6 +104,22 @@ impl From<&[u8]> for Payload {
     }
 }
 
+impl From<&str> for Payload {
+    /// Copies the string's UTF-8 bytes into a new payload. Convenience for the
+    /// common case of pushing text records (`Payload::from("hello")`).
+    fn from(s: &str) -> Self {
+        Payload(Bytes::copy_from_slice(s.as_bytes()))
+    }
+}
+
+impl From<String> for Payload {
+    /// Takes ownership of the string's buffer with no copy (`String` → `Vec<u8>`
+    /// → `Bytes` is a move).
+    fn from(s: String) -> Self {
+        Payload(Bytes::from(s.into_bytes()))
+    }
+}
+
 impl PartialEq<[u8]> for Payload {
     fn eq(&self, other: &[u8]) -> bool {
         self.0.as_ref() == other
@@ -150,6 +169,12 @@ mod tests {
         assert_eq!(&p[..], b"hello");
         assert_eq!(p.len(), 5);
         assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn from_str_and_string_carry_utf8_bytes() {
+        assert_eq!(&Payload::from("héllo")[..], "héllo".as_bytes());
+        assert_eq!(&Payload::from(String::from("world"))[..], b"world");
     }
 
     #[test]

@@ -48,6 +48,80 @@ pub enum ClientError {
     Protocol(String),
     /// `push_default` was called but no default durability was set.
     NoDefaultDurability,
+    /// `push` was called with an empty payload, rejected locally before any bytes
+    /// are sent. An empty payload IS the WAB end-of-records sentinel, so the daemon
+    /// Nacks it ([`NackReason::EmptyPayload`]) and closes the connection; rejecting
+    /// up front keeps the connection usable, mirroring the local
+    /// [`PayloadTooLarge`][Self::PayloadTooLarge] reject.
+    EmptyPayload,
+}
+
+impl ClientError {
+    /// Whether the connection is still usable after this error.
+    ///
+    /// - **Recoverable (`true`)** — the connection is still usable: the error is a
+    ///   *local* or *per-record* rejection that does **not** poison the client.
+    ///   Retry a different payload, or continue, on the **same** client.
+    /// - **Non-recoverable (`false`)** — the connection is dead or in an
+    ///   indeterminate state: the error poisoned the client (set its internal
+    ///   `poisoned`/`closed_after_nack` flag). **Drop this client and reconnect**;
+    ///   every subsequent call on it will fail fast (see [`WeirClient::is_poisoned`]).
+    ///
+    /// This is the stable way to branch on whether to reconnect: [`ClientError`] is
+    /// `#[non_exhaustive]`, so an exhaustive `match` on its variants will not compile
+    /// downstream, and the variant set may grow post-1.0. Calling `is_recoverable`
+    /// (or checking [`WeirClient::is_poisoned`] after a failed call) keeps working
+    /// across additions.
+    ///
+    /// The classification is kept in lock-step with the client's poison logic: a
+    /// variant is recoverable **iff** producing it does not set the client's
+    /// `poisoned` or `closed_after_nack` flag.
+    ///
+    /// | Variant | Recoverable? | Why |
+    /// |---|---|---|
+    /// | [`PayloadTooLarge`][Self::PayloadTooLarge] | yes | local pre-send rejection; no bytes sent, connection untouched |
+    /// | [`EmptyPayload`][Self::EmptyPayload] | yes | local pre-send rejection; no bytes sent, connection untouched |
+    /// | [`NoDefaultDurability`][Self::NoDefaultDurability] | yes | local misconfiguration; returned before any I/O |
+    /// | [`Nack`][Self::Nack]`(`[`InternalError`][NackReason::InternalError]`)` | yes | transient daemon condition; the daemon keeps the connection open |
+    /// | [`Nack`][Self::Nack]`(`any other reason`)` | no | the daemon closes the connection after the Nack |
+    /// | [`VersionMismatch`][Self::VersionMismatch] | no | a Nack reason; the daemon closes the connection |
+    /// | [`UnknownNack`][Self::UnknownNack] | no | a Nack reason; the daemon closes the connection |
+    /// | [`Io`][Self::Io] | no | a socket read/write failure poisons the client |
+    /// | [`Protocol`][Self::Protocol] | no | a malformed/aborted response poisons the client (also the "reconnect" guard error) |
+    ///
+    /// Note: a *server* `Nack(PayloadTooLarge)` (a payload over the daemon's
+    /// configured cap) is **not** recoverable — the daemon Nacks then closes the
+    /// connection — whereas the *local* [`PayloadTooLarge`][Self::PayloadTooLarge]
+    /// error (a payload over the protocol hard cap, rejected before any bytes are
+    /// sent) **is**. They are distinct variants despite the shared name.
+    ///
+    /// New `#[non_exhaustive]` variants default to **non-recoverable** (`false`):
+    /// "drop and reconnect" is the safe assumption for an error this build does not
+    /// yet understand.
+    #[must_use]
+    pub fn is_recoverable(&self) -> bool {
+        match self {
+            // Local, pre-I/O rejections: the connection was never touched.
+            Self::PayloadTooLarge { .. } | Self::NoDefaultDurability | Self::EmptyPayload => true,
+            // The only Nack the daemon keeps the connection open for (transient);
+            // every other Nack reason closes it (see `WeirClient::note_nack`).
+            Self::Nack(NackReason::InternalError) => true,
+            // Every other Nack reason closes the connection.
+            Self::Nack(_) => false,
+            // VersionMismatch / UnknownNack are Nack reasons too — the daemon
+            // closes the connection after them (they route through `note_nack`).
+            Self::VersionMismatch { .. } | Self::UnknownNack(_) => false,
+            // A socket failure poisons the client; a protocol violation either
+            // poisons it (bad response) or IS the "drop and reconnect" guard error.
+            Self::Io(_) | Self::Protocol(_) => false,
+            // `#[non_exhaustive]`: a future variant we don't recognise — assume the
+            // worst (reconnect) rather than risk reusing a poisoned connection.
+            // Unreachable within this crate (all current variants are matched
+            // above), but required so the match stays total if a variant is added.
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for ClientError {
@@ -69,6 +143,10 @@ impl std::fmt::Display for ClientError {
             Self::NoDefaultDurability => {
                 write!(f, "push_default called but no default durability was set")
             }
+            Self::EmptyPayload => write!(
+                f,
+                "payload is empty; rejected locally (an empty payload is the WAB end-of-records sentinel)"
+            ),
         }
     }
 }
@@ -150,6 +228,17 @@ impl<S: Read + Write> WeirClient<S> {
     /// An `Ack` means the record is durably **buffered** at the requested tier —
     /// **not** that it has reached the downstream sink yet (the daemon drains in
     /// batches once a segment seals). See the crate-level "Ack vs. delivery" note.
+    ///
+    /// The ack is **per record, not a liveness probe for the next one.** If the
+    /// daemon dies (or the socket is severed) between two pushes, the *first*
+    /// push after the failure can still return `Ok` — its frame was written and
+    /// acked, or the breakage isn't observed until the next read/write — and only
+    /// the *following* push surfaces the broken pipe. So a single `Ok` does not
+    /// guarantee the connection is healthy for subsequent pushes. After any push
+    /// error, branch on [`ClientError::is_recoverable`] /
+    /// [`is_poisoned`][Self::is_poisoned] to decide whether to keep using this
+    /// client or drop and reconnect, rather than assuming a prior `Ok` proved the
+    /// connection good.
     #[must_use = "a dropped push result hides whether the record was acked; an \
                   unhandled Nack also closes the connection"]
     pub fn push(
@@ -159,6 +248,14 @@ impl<S: Read + Write> WeirClient<S> {
     ) -> Result<(), ClientError> {
         self.ensure_usable()?;
         let bytes = payload.as_ref();
+        // Local guard against an empty payload. An empty payload IS the WAB
+        // end-of-records sentinel, so the daemon Nacks it (NackReason::EmptyPayload)
+        // and closes the connection — which would poison this client. Reject it up
+        // front, before any bytes are sent, so the connection stays usable
+        // (recoverable), mirroring the hard-cap guard below.
+        if bytes.is_empty() {
+            return Err(ClientError::EmptyPayload);
+        }
         // Local guard against the protocol hard cap. The daemon always rejects a
         // payload this large, and for a big frame it Nacks then closes the
         // connection before we finish streaming — so the Nack races our write and
@@ -196,10 +293,19 @@ impl<S: Read + Write> WeirClient<S> {
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::Ack => Ok(()),
-            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
-            other => Err(ClientError::Protocol(format!(
-                "expected Ack or Nack, got {other:?}"
-            ))),
+            // A Nack may carry an empty payload, which `nack_error` reports as a
+            // `Protocol` desync; poison in that case (see `surface_nack`).
+            MessageType::Nack => Err(self.surface_nack(resp.payload())),
+            // Any other frame type is a stream desync: the daemon sent something we
+            // never expect here, so leftover/unexpected bytes could be mis-read as a
+            // later reply (a false ack). Poison the connection (Protocol → not
+            // recoverable, matching `ensure_usable`).
+            other => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(format!(
+                    "expected Ack or Nack, got {other:?}"
+                )))
+            }
         }
     }
 
@@ -212,6 +318,24 @@ impl<S: Read + Write> WeirClient<S> {
             self.closed_after_nack = true;
         }
         err
+    }
+
+    /// Decodes a Nack frame's payload and records its connection effect.
+    ///
+    /// `nack_error` maps a well-formed Nack to a `Nack`/`VersionMismatch`/`UnknownNack`
+    /// error (routed through [`note_nack`][Self::note_nack] to mark a closing Nack),
+    /// but an **empty** Nack payload is a stream desync that it reports as
+    /// [`ClientError::Protocol`]. A desync means leftover/unexpected bytes could be
+    /// mis-read as a later reply (a false ack), so we poison the connection in that
+    /// case — keeping `Protocol` non-recoverable and `is_poisoned()` in agreement.
+    fn surface_nack(&mut self, payload: &[u8]) -> ClientError {
+        match nack_error(payload) {
+            ClientError::Protocol(msg) => {
+                self.poisoned = true;
+                ClientError::Protocol(msg)
+            }
+            other => self.note_nack(other),
+        }
     }
 
     /// Pushes at the connection's default durability tier.
@@ -239,11 +363,63 @@ impl<S: Read + Write> WeirClient<S> {
         let resp = self.read_response()?;
         match resp.header().message_type() {
             MessageType::HealthCheckResponse => Ok(()),
-            MessageType::Nack => Err(self.note_nack(nack_error(resp.payload()))),
-            other => Err(ClientError::Protocol(format!(
-                "expected HealthCheckResponse, got {other:?}"
-            ))),
+            // An empty Nack payload is a desync `nack_error` reports as `Protocol`;
+            // poison in that case (see `surface_nack`).
+            MessageType::Nack => Err(self.surface_nack(resp.payload())),
+            // Any other frame type is a stream desync: poison the connection so a
+            // later call can't mis-read a stale frame as its reply (Protocol → not
+            // recoverable, matching `ensure_usable`).
+            other => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(format!(
+                    "expected HealthCheckResponse, got {other:?}"
+                )))
+            }
         }
+    }
+
+    /// Whether this client's connection is dead and must be rebuilt.
+    ///
+    /// Reports the union of the two ways a connection becomes unusable, so it is the
+    /// exact complement of [`is_recoverable`][ClientError::is_recoverable] for the
+    /// error that caused it:
+    ///
+    /// - an **indeterminate stream** (the internal `poisoned` flag) — a
+    ///   response-read failure/timeout, a protocol violation in the reply, or any
+    ///   stream desync (an unexpected daemon message type, an empty-payload Nack);
+    ///   leftover/unexpected bytes could be mis-read as a later reply (a false ack);
+    /// - a **connection-closing Nack** (the internal `closed_after_nack` flag) —
+    ///   every Nack reason except the transient
+    ///   [`InternalError`][NackReason::InternalError], after which the daemon closes
+    ///   the connection.
+    ///
+    /// In either state **every** method fails fast (it will not touch the socket
+    /// again); the caller must drop this client and open a fresh connection.
+    ///
+    /// A long-lived producer thread (e.g. one driven from an async runtime) should
+    /// check this after a failed call — or, equivalently, branch on
+    /// [`ClientError::is_recoverable`] — and rebuild the connection when it reports
+    /// poisoned / non-recoverable, rather than retrying on the dead client:
+    ///
+    /// ```no_run
+    /// # use weir_client::{WeirClient, ClientError};
+    /// # use weir_core::Durability;
+    /// # fn reconnect() -> WeirClient { unreachable!() }
+    /// # let mut client = reconnect();
+    /// if let Err(e) = client.push(b"record", Durability::Sync) {
+    ///     if !e.is_recoverable() || client.is_poisoned() {
+    ///         client = reconnect(); // drop the dead client, rebuild
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// See [`ClientError::is_recoverable`] for the per-error view of the same
+    /// distinction (recoverable = connection still usable; non-recoverable = drop
+    /// and reconnect). The two are kept equivalent: `is_poisoned()` is true after a
+    /// failed call exactly when that call's error is non-recoverable.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned || self.closed_after_nack
     }
 
     /// Returns the poisoned-connection error if a prior response read failed.
@@ -630,6 +806,183 @@ mod tests {
         server.join().unwrap();
     }
 
+    // ── Hostile / malformed daemon responses: refuse + poison, never false-ack ──
+
+    /// F44: a daemon-declared response payload_len above the hard cap must be
+    /// refused BEFORE allocating ~4 GiB, and poison the connection.
+    #[test]
+    fn response_oversized_payload_len_refuses_to_allocate_and_poisons() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // A valid 16-byte header whose payload_len is CAP+1, with a recomputed
+            // header CRC; then EOF (no payload) — the client must refuse before it
+            // would try to read/allocate the declared payload.
+            let mut hdr = Header::new(MessageType::Ack, Durability::Sync, 0).encode();
+            let big = (MAX_PAYLOAD_HARD_CAP as u32).wrapping_add(1);
+            hdr[8..12].copy_from_slice(&big.to_le_bytes());
+            let crc = crc32fast::hash(&hdr[0..12]);
+            hdr[12..16].copy_from_slice(&crc.to_le_bytes());
+            server_end.write_all(&hdr).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        match err {
+            ClientError::Protocol(msg) => assert!(
+                msg.contains("refusing to allocate"),
+                "expected the cap refusal, got: {msg}"
+            ),
+            other => panic!("expected a Protocol cap refusal, got {other:?}"),
+        }
+        assert!(
+            c.is_poisoned(),
+            "an oversized response must poison the client"
+        );
+    }
+
+    /// An empty Nack payload is a stream desync: `nack_error` reports `Protocol`,
+    /// and the connection must be poisoned so a stale frame can't be mis-read as a
+    /// later ack (a false ack).
+    #[test]
+    fn empty_nack_payload_is_protocol_desync_and_poisons() {
+        // (1) the helper maps an empty payload to a Protocol error.
+        match nack_error(&[]) {
+            ClientError::Protocol(msg) => assert!(msg.contains("empty payload"), "{msg}"),
+            other => panic!("expected Protocol for empty Nack, got {other:?}"),
+        }
+        // (2) end-to-end: an empty-payload Nack poisons + is not recoverable.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            let frame =
+                Envelope::new(Header::new(MessageType::Nack, Durability::Sync, 0), vec![]).encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(err, ClientError::Protocol(_)), "got {err:?}");
+        assert!(
+            !err.is_recoverable(),
+            "a desync Protocol error is not recoverable"
+        );
+        assert!(
+            c.is_poisoned(),
+            "an empty-Nack desync must poison the client"
+        );
+    }
+
+    /// A corrupted response payload CRC is a protocol violation: surface it and
+    /// poison (the stream tail is now untrustworthy).
+    #[test]
+    fn response_payload_crc_mismatch_poisons() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // A Nack frame with a flipped trailing CRC byte.
+            let mut frame = nack_frame(NackReason::InternalError);
+            *frame.last_mut().unwrap() ^= 0xff;
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        match err {
+            ClientError::Protocol(msg) => assert!(msg.contains("CRC mismatch"), "{msg}"),
+            other => panic!("expected a CRC-mismatch Protocol error, got {other:?}"),
+        }
+        assert!(
+            c.is_poisoned(),
+            "a CRC-mismatched response must poison the client"
+        );
+    }
+
+    /// An unrecognised Nack reason byte (reserved range) surfaces as
+    /// `UnknownNack(byte)` and closes the connection.
+    #[test]
+    fn unknown_nack_reason_byte_surfaces_unknown_nack() {
+        assert!(matches!(
+            nack_error(&[0x0A]),
+            ClientError::UnknownNack(0x0A)
+        ));
+
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            let frame = Envelope::new(
+                Header::new(MessageType::Nack, Durability::Sync, 0),
+                vec![0x0A],
+            )
+            .encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(err, ClientError::UnknownNack(0x0A)), "got {err:?}");
+        assert!(
+            c.is_poisoned(),
+            "an unknown closing Nack must mark the client unusable"
+        );
+    }
+
+    /// A VersionMismatch Nack surfaces the daemon's version through push() and is
+    /// non-recoverable + connection-closing.
+    #[test]
+    fn version_mismatch_surfaces_through_push() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            let frame = Envelope::new(
+                Header::new(MessageType::Nack, Durability::Sync, 0),
+                vec![NackReason::VersionMismatch as u8, 9],
+            )
+            .encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(err, ClientError::VersionMismatch { daemon_version: 9 }),
+            "got {err:?}"
+        );
+        assert!(!err.is_recoverable());
+        assert!(c.is_poisoned());
+    }
+
+    /// health_check() against a daemon that replies with the wrong frame type is a
+    /// desync: Protocol error + poison + non-recoverable.
+    #[test]
+    fn health_check_unexpected_frame_type_poisons() {
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // Reply to a HealthCheck with an Ack — never expected here.
+            let frame =
+                Envelope::new(Header::new(MessageType::Ack, Durability::Sync, 0), vec![]).encode();
+            server_end.write_all(&frame).unwrap();
+        });
+        let err = c.health_check().unwrap_err();
+        server.join().unwrap();
+        match &err {
+            ClientError::Protocol(msg) => {
+                assert!(msg.contains("expected HealthCheckResponse"), "{msg}")
+            }
+            other => panic!("expected a Protocol desync, got {other:?}"),
+        }
+        assert!(!err.is_recoverable());
+        assert!(c.is_poisoned());
+    }
+
     // ── F43: opt-in socket timeouts ───────────────────────────────────────────
 
     #[test]
@@ -690,5 +1043,197 @@ mod tests {
             ClientError::Protocol(msg) => assert!(msg.contains("poisoned"), "{msg}"),
             other => panic!("expected a poisoned Protocol error, got {other:?}"),
         }
+    }
+
+    // ── is_poisoned / is_recoverable helpers ─────────────────────────────────
+
+    #[test]
+    fn is_poisoned_flips_after_a_read_failure() {
+        // A fresh client is not poisoned; after a response-read failure (here a
+        // timeout) the flag flips, mirroring `client_is_poisoned_after_a_read_failure`.
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        assert!(!c.is_poisoned(), "a fresh client must not be poisoned");
+
+        c.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        // Peer never replies → the response read times out → the client poisons.
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        assert!(matches!(err, ClientError::Io(_)), "{err:?}");
+        assert!(
+            c.is_poisoned(),
+            "a read failure must flip is_poisoned() to true"
+        );
+        // And the poisoning error itself is non-recoverable.
+        assert!(!err.is_recoverable(), "an Io failure is not recoverable");
+    }
+
+    #[test]
+    fn is_poisoned_after_a_connection_closing_nack() {
+        // A connection-closing Nack (every reason except InternalError) leaves the
+        // connection dead. `is_poisoned()` must report that — it reflects
+        // `closed_after_nack`, not just `poisoned` — and the connection must be
+        // refused by `ensure_usable` on the next call. (Models the closing-nack
+        // test `closing_nack_makes_next_call_fail_with_a_clear_reconnect_error`.)
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        assert!(!c.is_poisoned(), "a fresh client must not be poisoned");
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            server_end
+                .write_all(&nack_frame(NackReason::EmptyPayload))
+                .unwrap();
+            // drop server_end → connection closes, as the daemon does after a Nack.
+        });
+        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(first, ClientError::Nack(NackReason::EmptyPayload)),
+            "expected the real Nack reason, got {first:?}"
+        );
+        // The closing Nack is non-recoverable, and the client reports poisoned.
+        assert!(
+            !first.is_recoverable(),
+            "a connection-closing Nack is non-recoverable"
+        );
+        assert!(
+            c.is_poisoned(),
+            "a connection-closing Nack must flip is_poisoned() to true"
+        );
+        // And the connection is refused fast on the next attempt.
+        assert!(
+            matches!(c.ensure_usable(), Err(ClientError::Protocol(_))),
+            "ensure_usable must reject a closed-after-nack connection"
+        );
+    }
+
+    #[test]
+    fn is_poisoned_and_is_recoverable_agree_after_a_desync() {
+        // A stream desync — the daemon sends an unexpected message type where an
+        // Ack/Nack was expected — poisons the connection: leftover/unexpected bytes
+        // could be mis-read as a later reply (a false ack). `is_poisoned()` must be
+        // true AND the returned error must be non-recoverable, i.e. the two agree.
+        let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        assert!(!c.is_poisoned(), "a fresh client must not be poisoned");
+        let server = std::thread::spawn(move || {
+            use std::io::Write;
+            drain_one_frame(&mut server_end);
+            // A HealthCheck frame is a valid frame, but it is NOT a reply push expects
+            // (push expects Ack or Nack) — a genuine stream desync.
+            let bogus = weir_core::Envelope::new(
+                weir_core::Header::new(
+                    weir_core::MessageType::HealthCheck,
+                    weir_core::Durability::Sync,
+                    0,
+                ),
+                vec![],
+            )
+            .encode();
+            server_end.write_all(&bogus).unwrap();
+        });
+        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        server.join().unwrap();
+        // The error is a Protocol desync, which is non-recoverable...
+        assert!(
+            matches!(err, ClientError::Protocol(_)),
+            "expected a Protocol desync error, got {err:?}"
+        );
+        assert!(!err.is_recoverable(), "a stream desync is non-recoverable");
+        // ...and is_poisoned() agrees (the two must never disagree).
+        assert!(
+            c.is_poisoned(),
+            "a stream desync must flip is_poisoned() to true"
+        );
+        assert_eq!(
+            c.is_poisoned(),
+            !err.is_recoverable(),
+            "is_poisoned() and !is_recoverable() must agree"
+        );
+    }
+
+    #[test]
+    fn is_recoverable_true_for_local_over_cap_rejection() {
+        // The local pre-send PayloadTooLarge rejection does not touch the socket, so
+        // it is recoverable and must not poison the client.
+        let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let oversized = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        let err = c.push(&oversized, Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::PayloadTooLarge { .. }),
+            "expected a local PayloadTooLarge, got {err:?}"
+        );
+        assert!(
+            err.is_recoverable(),
+            "a local over-cap rejection keeps the connection usable"
+        );
+        assert!(!c.is_poisoned(), "a recoverable error must not poison");
+    }
+
+    #[test]
+    fn push_rejects_empty_payload_locally_without_poisoning() {
+        // An empty payload is the WAB end-of-records sentinel; the daemon would
+        // Nack+close it. The local guard rejects it before any bytes are sent, so
+        // the connection stays usable (recoverable, not poisoned) — mirroring the
+        // over-cap guard.
+        let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let err = c.push(b"", Durability::Sync).unwrap_err();
+        assert!(
+            matches!(err, ClientError::EmptyPayload),
+            "expected a local EmptyPayload, got {err:?}"
+        );
+        assert!(
+            err.is_recoverable(),
+            "a local empty-payload rejection keeps the connection usable"
+        );
+        assert!(!c.is_poisoned(), "a recoverable error must not poison");
+    }
+
+    #[test]
+    fn is_recoverable_true_for_no_default_durability() {
+        // A local misconfiguration returned before any I/O is recoverable.
+        let err = ClientError::NoDefaultDurability;
+        assert!(err.is_recoverable());
+    }
+
+    #[test]
+    fn is_recoverable_true_for_internal_error_nack() {
+        // InternalError is the one Nack the daemon keeps the connection open for.
+        let err = ClientError::Nack(NackReason::InternalError);
+        assert!(
+            err.is_recoverable(),
+            "a transient InternalError Nack keeps the connection usable"
+        );
+    }
+
+    #[test]
+    fn is_recoverable_false_for_connection_closing_nacks() {
+        // Every Nack reason except InternalError closes the connection, so it is
+        // non-recoverable. VersionMismatch and UnknownNack are Nacks too.
+        for err in [
+            ClientError::Nack(NackReason::EmptyPayload),
+            ClientError::Nack(NackReason::PayloadTooLarge),
+            ClientError::Nack(NackReason::UnknownMessage),
+            ClientError::VersionMismatch { daemon_version: 7 },
+            ClientError::UnknownNack(0xff),
+        ] {
+            assert!(
+                !err.is_recoverable(),
+                "{err:?} closes the connection and must be non-recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn is_recoverable_false_for_io_and_protocol() {
+        // A socket failure poisons; a protocol violation poisons or IS the
+        // reconnect guard — both non-recoverable.
+        let io = ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "pipe"));
+        assert!(!io.is_recoverable());
+        let proto = ClientError::Protocol("connection poisoned".into());
+        assert!(!proto.is_recoverable());
     }
 }

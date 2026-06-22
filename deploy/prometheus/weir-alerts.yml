@@ -108,13 +108,26 @@ groups:
           description: "The configured sink reports itself unhealthy. The WAB keeps buffering durably (no data loss), but delivery is stalled. Check the downstream system."
           runbook: "docs/monitoring.md#weirsinkdown"
 
+      - alert: WeirSinkDegraded
+        # weir_sink_health one-hot family; match the `degraded` series directly
+        # (same reasoning as WeirSinkDown above). Degraded = reachable but not
+        # fully healthy (e.g. a non-404 4xx on the HEAD probe) — delivery may
+        # still work, so warning, not critical.
+        expr: weir_sink_health{job=~"weir", state="degraded"} == 1
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir sink reporting DEGRADED on {{ $labels.instance }}"
+          description: "The configured sink reports itself degraded (reachable but not fully healthy). The WAB keeps buffering durably, but delivery may be impaired. Check the downstream system; correlate with WeirSegmentStranded / WeirDeadLettered."
+          runbook: "docs/monitoring.md#weirsinkdegraded"
+
       - alert: WeirSegmentStranded
         expr: increase(weir_drain_segments_stranded_total{job=~"weir"}[15m]) > 0
         for: 0m
         labels: { severity: critical }
         annotations:
-          summary: "weir stranded a WAB segment on {{ $labels.instance }} — delivery stalled"
-          description: "The drain exhausted max_retries of TRANSIENT sink failures on a segment and abandoned it on disk; it is only re-attempted on daemon restart. The data is durable (no loss), but delivery for that segment has stopped. Fix the sink (correlate with WeirSinkDown), then restart the daemon to replay the stranded segment."
+          summary: "weir stranded a WAB segment on {{ $labels.instance }} — delivery paused"
+          description: "The drain exhausted sink_max_retries of TRANSIENT sink failures on a segment and left it on disk. The data is durable (no loss), but delivery is paused. Fix the sink (correlate with WeirSinkDown); the drain re-drains stranded segments automatically when the sink recovers (watch weir_drain_segments_resumed_total), or on restart."
           runbook: "docs/monitoring.md#weirsegmentstranded"
 
       - alert: WeirDeadLettered

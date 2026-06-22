@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>weir — C wire client</title>
+<meta name="description" content="A dependency-free C weir v1 wire-protocol producer for embedded telemetry — built from the spec, zero weir-crate deps, 30/30 conformance vectors plus 112 checks." />
+<link rel="stylesheet" href="../weir.css" />
+</head>
+<body>
+
+<div class="statusbar top">
+  <span>weir <span data-weir-version></span> · polyglot wire client · C</span>
+  <span class="sb-spacer"></span>
+  <span class="sb-dim">one wire, five languages, from the spec</span>
+</div>
+
+<nav class="nav">
+  <a href="../index.html">Demo</a>
+  <a href="../crates.html">Crates</a>
+  <a href="../examples.html" class="active">Examples</a>
+  <span class="nav-ext">
+    <a href="https://github.com/miki-przygoda/weir" target="_blank" rel="noopener">GitHub ↗</a>
+    <a href="https://miki-przygoda.github.io/weir" target="_blank" rel="noopener">Docs ↗</a>
+  </span>
+</nav>
+
+<div class="wrap">
+
+  <div class="hero">
+    <p class="role"><a href="../examples.html">← Example projects</a></p>
+    <h1>C <span class="accent">· weir wire client</span></h1>
+    <p class="tag">A dependency-free C producer that speaks the weir v1 wire protocol over a Unix socket — built from the spec, <em>zero weir-crate deps</em>, just the C standard library and POSIX sockets. The use case: embedded-systems telemetry.</p>
+    <div class="chips" style="gap:8px">
+      <span class="chip wire">30/30 conformance vectors</span>
+      <span class="chip wire">byte-exact</span>
+      <span class="chip wire">+ 112 checks</span>
+      <span class="chip dim">C stdlib + POSIX</span>
+      <span class="chip dim">zero Rust deps</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">What it is</div>
+    <div class="panel-body">
+      <p>A dependency-free C producer for the weir daemon, built entirely from <code class="inline">docs/wire_protocol.md</code> and the conformance vectors — no weir crate is linked. A zero-dependency wire codec (<code class="inline">weir_wire.c</code>), a blocking POSIX <code class="inline">AF_UNIX</code> transport with correct stream framing (<code class="inline">weir_conn.c</code>), and a telemetry producer (<code class="inline">telemetry.c</code>).</p>
+      <p style="margin-bottom:0">The use case is embedded telemetry: a sensor node emitting compact fixed-width binary records — the kind of payload an MCU actually pushes, not JSON — and streaming them to weir for durable buffering.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Run it</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
+    <div class="panel-body">
+<pre class="code">make            <span class="c"># builds: conformance, telemetry, negative</span>
+./conformance /path/to/weir/docs/conformance/wire_v1_vectors.json</pre>
+      <p style="color:var(--n-fg-dim)">Expected: <code class="inline">vectors scanned: 30&nbsp;&nbsp;&nbsp;checks passed: 112&nbsp;&nbsp;&nbsp;failed: 0</code> → <em>C codec is wire-compatible with weir v1.</em> The strongest check is byte-exact re-encoding.</p>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: C11 + POSIX sockets, no deps · requires a C11 compiler (<code class="inline">-std=c11</code>) · tested with clang 21.</p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Live <span class="pt-right">stream telemetry to a running daemon</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="c"># start a daemon with a private socket:</span>
+weir-server --socket-path /tmp/weir-demo/weir.sock \
+            --wab-dir /tmp/weir-demo/wab --metrics-port 19102
+
+<span class="c"># HealthCheck probe, then N records at a durability tier:</span>
+./telemetry /tmp/weir-demo/weir.sock 8 sync
+./telemetry /tmp/weir-demo/weir.sock 5 batched
+
+<span class="c"># exercise the error paths (5 PASS):</span>
+./negative /tmp/weir-demo/weir.sock</pre>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">The codec</span><span class="rule"></span></div>
+
+  <div class="panel">
+    <div class="panel-title">weir_wire.c <span class="pt-right">Push encode — 16-byte header + payload + CRC32</span></div>
+    <div class="panel-body">
+<pre class="code"><span class="t">weir_result</span> <span class="f">weir_encode_push</span>(<span class="t">weir_durability</span> dur,
+                             <span class="k">const</span> <span class="t">uint8_t</span> *payload, <span class="t">size_t</span> payload_len,
+                             <span class="t">uint8_t</span> *out, <span class="t">size_t</span> out_cap, <span class="t">size_t</span> *out_len) {
+    <span class="k">if</span> (payload_len == <span class="t">0</span>) <span class="k">return</span> WEIR_ERR_EMPTY_PAYLOAD;
+    <span class="k">if</span> (payload_len &gt; WEIR_MAX_PAYLOAD_HARD_CAP) <span class="k">return</span> WEIR_ERR_PAYLOAD_TOO_LARGE;
+
+    <span class="t">size_t</span> total = WEIR_HEADER_LEN + payload_len + WEIR_CRC_LEN;
+    <span class="k">if</span> (out_cap &lt; total) <span class="k">return</span> WEIR_ERR_BUF_TOO_SMALL;
+
+    <span class="f">write_header</span>(out, WEIR_MSG_PUSH, dur, (<span class="t">uint32_t</span>)payload_len);
+    <span class="f">memcpy</span>(out + WEIR_HEADER_LEN, payload, payload_len);
+    <span class="f">put_u32_le</span>(out + WEIR_HEADER_LEN + payload_len,
+               <span class="f">weir_crc32</span>(payload, payload_len));
+    <span class="k">if</span> (out_len) *out_len = total;
+    <span class="k">return</span> WEIR_OK;
+}</pre>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">CRC is CRC-32 / ISO-3309 (zlib / PNG / Ethernet) — a lazily-built 256-entry reflected table, <em>not</em> CRC-32C. The tree builds warning-clean under strict flags.</p>
+    </div>
+  </div>
+
+  <div class="sec-head"><span class="label">Source</span><span class="rule"></span></div>
+  <p style="margin-top:0"><a href="https://github.com/miki-przygoda/weir/tree/main/demos/c-wire-client" target="_blank" rel="noopener">→ demos/c-wire-client on GitHub</a></p>
+  <p style="margin-top:0.4rem"><a href="../examples.html">← back to example projects</a></p>
+
+  <p class="foot">One of five from-spec polyglot wire clients shipped with
+     <a href="https://github.com/miki-przygoda/weir">weir</a> —
+     each speaks the same 16-byte-header wire protocol with zero weir-crate deps.
+     Full reference at the <a href="https://miki-przygoda.github.io/weir">docs site</a>.</p>
+</div>
+
+<script src="../version.js"></script>
+</body>
+</html>

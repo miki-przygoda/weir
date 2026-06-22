@@ -251,6 +251,13 @@ pub(crate) struct Metrics {
     // ── Recovery ──────────────────────────────────────────────────────────────
     pub recovery_records_replayed: Counter<u64, AtomicU64>,
     pub recovery_segments_quarantined: Counter<u64, AtomicU64>,
+    /// Counts mid-file-corrupt WAB segments whose quarantine COPY failed during
+    /// recovery (disk full / read-only mount / inode exhaustion). On this event
+    /// recovery refuses to truncate the valid prefix — it leaves the segment in
+    /// place to preserve any acked-durable records sitting after the corruption,
+    /// rather than fail open and lose them. Alertable so the stuck-on-full-disk
+    /// state is visible instead of silent.
+    pub recovery_quarantine_copy_failed: Counter<u64, AtomicU64>,
     /// Counts WAB segment files seen during recovery whose permissions are
     /// not 0o600. Defense-in-depth signal for tampering or operator error.
     pub wab_unexpected_mode: Counter<u64, AtomicU64>,
@@ -277,10 +284,21 @@ pub(crate) struct Metrics {
     pub dead_letter_full: Counter<u64, AtomicU64>,
     /// Increments once each time the drain abandons a segment after exhausting
     /// `max_retries` transient sink failures. The segment is left on disk and is
-    /// only re-attempted on daemon restart, so any non-zero value means delivery
-    /// has stalled for at least one segment — the silent counterpart to the
-    /// `error!` log emitted on the same event.
+    /// re-drained when the sink recovers (see `weir_drain_segments_resumed_total`)
+    /// or on daemon restart, so a rising value means delivery has stalled for at
+    /// least one segment — the silent counterpart to the `error!` log on strand.
     pub drain_segments_stranded: Counter<u64, AtomicU64>,
+    /// Increments per stranded segment re-queued when the sink health recovers
+    /// (down→up). Pairs with `drain_segments_stranded`: convergence of the two
+    /// means the backlog from an outage has been picked back up for delivery.
+    ///
+    /// May transiently OVER-COUNT at a recovery-edge rescan: a segment still
+    /// sitting in the drain channel can be re-queued and counted again, so
+    /// convergence with `stranded` is approximate / eventually-consistent rather
+    /// than exact. Deduplicating in code is impractical — crossbeam channels are
+    /// not enumerable, so the resume path cannot cheaply check whether a segment
+    /// is already in flight.
+    pub drain_segments_resumed: Counter<u64, AtomicU64>,
     /// Gauge vector: exactly one state label value is 1 at any time; the others are 0.
     pub drain_state: Family<DrainStateLabel, Gauge<f64, AtomicU64>>,
     /// Seconds elapsed since the drain entered `BlockedDeadLetterFull`. Resets to 0
@@ -288,8 +306,14 @@ pub(crate) struct Metrics {
     pub dead_letter_blocked_duration: Gauge<f64, AtomicU64>,
 }
 
-/// Latency histogram buckets covering 1 ms–1 s; suitable for fsync and network round-trips.
-const LATENCY_BUCKETS: &[f64] = &[0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+/// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
+/// round-trips. The 2.5/5/10 s tail keeps a multi-second p99.9 quantifiable
+/// instead of saturating at the old 1 s top bucket — a failing disk or saturated
+/// network storage can push fsync well past a second and the critical alert
+/// needs the real value (escalation #12).
+const LATENCY_BUCKETS: &[f64] = &[
+    0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Buckets for `accept_latency`, which measures only accept→semaphore→spawn —
 /// microsecond-scale CPU work that would all land in LATENCY_BUCKETS' first
@@ -356,14 +380,14 @@ impl Metrics {
             "weir_connection_rejected_peer_uid",
             "Connections refused by the peer-credential check (peer uid != daemon uid, \
              or credential lookup failed). Any non-zero value suggests an attempted \
-             bypass of the socket file's 0o600 mode or a misconfigured producer."
+             bypass of the socket file's 0o600 mode or a misconfigured producer"
         );
         let accept_resource_exhaustion = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_accept_resource_exhaustion",
             "accept(2) failures due to resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM). \
              The accept loop backs off briefly on each. A rising value means the daemon is \
-             out of file descriptors or socket buffers."
+             out of file descriptors or socket buffers"
         );
         let connections_aborted_at_shutdown = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -371,14 +395,14 @@ impl Metrics {
             "Connections force-aborted at shutdown because they didn't drain within \
              shutdown_timeout_secs. Each may correspond to a push whose record was \
              written to the WAB but whose producer never received an ack/nack. \
-             Increase shutdown_timeout_secs if this is non-zero on graceful shutdown."
+             Increase shutdown_timeout_secs if this is non-zero on graceful shutdown"
         );
         let ack_timeout = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_ack_timeout",
             "Pushes nacked because the WAB ack channel did not fire within \
              ACK_TIMEOUT. Indicates a wedged flusher (slow fsync, lock contention) \
-             that hasn't panicked. Investigate alongside weir_wab_fsync_duration_seconds."
+             that hasn't panicked. Investigate alongside weir_wab_fsync_duration_seconds"
         );
         let tls_handshake_failures = reg!(
             Family::<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>::default(),
@@ -398,7 +422,10 @@ impl Metrics {
         let wab_bytes_on_disk = reg!(
             Gauge::<f64, AtomicU64>::default(),
             "weir_wab_bytes_on_disk",
-            "Current total bytes used by WAB segment files on disk"
+            "Current bytes used by live WAB shard segments on disk: the open active \
+             segment (.wab) plus sealed segments awaiting drain (.wab.sealed). Excludes \
+             drained-marker segments (.wab.confirmed) and the dead_letter/ and quarantine/ \
+             subdirs (which have their own accounting)"
         );
         let wab_fsync_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),
@@ -411,7 +438,7 @@ impl Metrics {
             "WAB flusher thread panics. A panicked flusher leaves its shard offline \
              (records routed to it receive Nack(InternalError)) until the daemon \
              restarts. Any non-zero value requires operator attention; check logs \
-             for the shard_id and panic payload."
+             for the shard_id and panic payload"
         );
         let drain_panics = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -419,7 +446,7 @@ impl Metrics {
             "weir-drain thread panics caught and respawned by its supervisor. \
              Sustained values indicate a logic bug in the sink/drain path; if the \
              supervisor exhausts its respawn budget, delivery stops and the WAB \
-             accumulates on disk until restart."
+             accumulates on disk until restart"
         );
         let wab_fsync_failures = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -427,7 +454,7 @@ impl Metrics {
             "fsync/fdatasync calls that returned an error. Durability hazard: \
              the kernel buffered the write but couldn't push it to stable storage. \
              Producers whose records were in the failed fsync receive \
-             Nack(InternalError). Check logs for the shard_id and error string."
+             Nack(InternalError). Check logs for the shard_id and error string"
         );
         let sink_commit_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),
@@ -448,7 +475,7 @@ impl Metrics {
             Family::<SinkInfoLabel, Gauge<f64, AtomicU64>>::default(),
             "weir_sink_info",
             "Configured sink type, set to 1 for the active sink. sink_type=\"noop\" means \
-             records are acked then DISCARDED (not forwarded downstream)."
+             records are acked then DISCARDED (not forwarded downstream)"
         );
         let queue_depth = reg!(
             Gauge::<f64, AtomicU64>::default(),
@@ -465,11 +492,19 @@ impl Metrics {
             "weir_recovery_segments_quarantined",
             "WAB segments quarantined due to corruption detected during crash recovery"
         );
+        let recovery_quarantine_copy_failed = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_recovery_quarantine_copy_failed",
+            "Mid-file-corrupt WAB segments whose quarantine copy failed during \
+             recovery; the valid prefix was left un-truncated to preserve any \
+             acked-durable tail records (recovery is stuck until the operator clears \
+             disk space / read-only state)"
+        );
         let wab_unexpected_mode = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_wab_unexpected_mode",
             "WAB segment files seen during recovery whose permissions are not 0o600. \
-             Non-zero values indicate tampering or operator error."
+             Non-zero values indicate tampering or operator error"
         );
         let dead_letter_bytes_on_disk = reg!(
             Gauge::<f64, AtomicU64>::default(),
@@ -481,55 +516,66 @@ impl Metrics {
             "weir_dead_letter_full",
             "Number of times the drain entered BlockedDeadLetterFull state. Each increment \
              represents a distinct episode where a permanently-rejected record could not be \
-             dead-lettered due to cap exhaustion. Operator intervention required."
+             dead-lettered due to cap exhaustion. Operator intervention required"
         );
         let drain_segments_stranded = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_drain_segments_stranded",
             "WAB segments abandoned by the drain after exhausting max_retries transient \
-             sink failures. The segment is left on disk and is only re-attempted on daemon \
-             restart (crash-recovery replay), so any non-zero value means delivery has \
-             stalled for at least one segment. Investigate the sink (see weir_sink_health) \
-             and restart once it recovers. Distinct from weir_dead_letter_full, which counts \
-             PERMANENT rejections; this counts TRANSIENT failures that never succeeded."
+             sink failures. The segment is left on disk and is re-drained automatically when \
+             the sink health recovers (see weir_drain_segments_resumed) or on daemon restart, \
+             so a rising value means delivery has stalled for at least one segment. Investigate \
+             the sink (see weir_sink_health). Distinct from weir_dead_letter_full, which counts \
+             PERMANENT rejections; this counts TRANSIENT failures that never succeeded"
+        );
+        let drain_segments_resumed = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_segments_resumed",
+            "Stranded WAB segments re-queued for delivery after the sink health recovered \
+             (down to up). Convergence with weir_drain_segments_stranded means an outage's \
+             backlog has been picked back up; a persistent gap means segments are still \
+             stranded (sink not yet recovered, or recovering then re-failing)"
         );
         let drain_state = reg!(
             Family::<DrainStateLabel, Gauge<f64, AtomicU64>>::default(),
             "weir_drain_state",
             "Current drain state (1 = active, 0 = inactive). Exactly one state label value \
-             is 1 at any time; the others are 0."
+             is 1 at any time; the others are 0. NOTE: state=\"draining\" does NOT imply \
+             delivery progress — a segment stranded waiting on a fully-down sink still reads \
+             draining. Watch weir_sink_health{state=\"down\"} and weir_drain_segments_stranded \
+             for that case, not this gauge alone"
         );
         let dead_letter_blocked_duration = reg!(
             Gauge::<f64, AtomicU64>::default(),
             "weir_dead_letter_blocked_duration_seconds",
             "Seconds elapsed since the drain entered BlockedDeadLetterFull. Resets to 0 on \
              transition out. Fire an alert if this gauge exceeds your operator-defined \
-             threshold (e.g. 300 s)."
+             threshold (e.g. 300 s)"
         );
 
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_queue_seconds",
-            "Per-record queue + coalesce wait (enqueue → worker flush). bench-trace only."
+            "Per-record queue + coalesce wait (enqueue → worker flush). bench-trace only"
         );
         #[cfg(feature = "bench-trace")]
         let stage_bridge_wait = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_bridge_wait_seconds",
-            "Per-record bridge hop + flusher recv wait (worker flush → flusher dequeue). bench-trace only."
+            "Per-record bridge hop + flusher recv wait (worker flush → flusher dequeue). bench-trace only"
         );
         #[cfg(feature = "bench-trace")]
         let stage_write = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_write_seconds",
-            "Per-record write time (flusher dequeue → write_record done, pre-fsync). bench-trace only."
+            "Per-record write time (flusher dequeue → write_record done, pre-fsync). bench-trace only"
         );
         #[cfg(feature = "bench-trace")]
         let stage_total = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
             "weir_stage_total_seconds",
-            "Per-record end-to-end server-side latency (enqueue → ack fired). bench-trace only."
+            "Per-record end-to-end server-side latency (enqueue → ack fired). bench-trace only"
         );
 
         let metrics = Self {
@@ -557,10 +603,12 @@ impl Metrics {
             queue_depth,
             recovery_records_replayed,
             recovery_segments_quarantined,
+            recovery_quarantine_copy_failed,
             wab_unexpected_mode,
             dead_letter_bytes_on_disk,
             dead_letter_full,
             drain_segments_stranded,
+            drain_segments_resumed,
             drain_state,
             dead_letter_blocked_duration,
             #[cfg(feature = "bench-trace")]
@@ -612,6 +660,34 @@ impl Metrics {
                 state: SinkHealthState::down,
             })
             .set(0.0);
+
+        // Pre-initialise the labeled nack counter family so the series exist at 0
+        // on the first scrape — without this a scraper can't baseline them until
+        // the first nack actually happens (unlike the pre-initialised gauges and
+        // the unlabeled weir_ack_timeout counter, which exist at 0 from boot).
+        // The decode-error reject path attributes its nack to tier=sync (the
+        // durability tier isn't known until the header parses), so touching every
+        // reason at tier=sync covers the always-reachable label combinations; the
+        // per-tier payload_too_large/internal_error/empty_payload series still
+        // appear on first occurrence as before.
+        for reason in [
+            NackReason::bad_magic,
+            NackReason::version_mismatch,
+            NackReason::bad_header_crc,
+            NackReason::payload_too_large,
+            NackReason::bad_payload_crc,
+            NackReason::internal_error,
+            NackReason::empty_payload,
+            NackReason::unknown_message,
+            NackReason::reserved_flags_set,
+        ] {
+            // get_or_create returns a guard; binding it to `_` is enough — the
+            // series is registered at 0 by the lookup itself.
+            let _ = metrics.records_nack.get_or_create(&NackLabel {
+                tier: TierValue::sync,
+                reason,
+            });
+        }
 
         (metrics, reg)
     }
@@ -674,6 +750,7 @@ mod tests {
             "weir_dead_letter_bytes_on_disk",
             "weir_dead_letter_full",
             "weir_drain_segments_stranded",
+            "weir_drain_segments_resumed",
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
         ];

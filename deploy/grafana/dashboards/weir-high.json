@@ -500,6 +500,74 @@
       }
     },
     {
+      "type": "stat",
+      "title": "Sink fwd",
+      "description": "Is the configured sink forwarding? 1 = \"noop\" (records acked then DISCARDED, not delivered); 0 = a real sink is forwarding.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "Forwarding",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "NOOP \u26a0",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "graphMode": "area",
+        "colorMode": "background",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "I",
+          "expr": "sum(weir_sink_info{job=\"weir-levels\", level=\"high\", sink_type=\"noop\"})"
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
       "type": "row",
       "title": "Latency percentiles",
       "collapsed": false,
@@ -507,7 +575,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 9
       }
     },
     {
@@ -545,17 +613,17 @@
       },
       "targets": [
         {
-          "refId": "I",
+          "refId": "J",
           "expr": "histogram_quantile(0.5,  sum by (le) (rate(weir_wab_fsync_duration_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])))",
           "legendFormat": "p50"
         },
         {
-          "refId": "J",
+          "refId": "K",
           "expr": "histogram_quantile(0.99, sum by (le) (rate(weir_wab_fsync_duration_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])))",
           "legendFormat": "p99"
         },
         {
-          "refId": "K",
+          "refId": "L",
           "expr": "histogram_quantile(0.999, sum by (le) (rate(weir_wab_fsync_duration_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])))",
           "legendFormat": "p99.9"
         }
@@ -564,7 +632,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 6
+        "y": 10
       }
     },
     {
@@ -577,7 +645,7 @@
       },
       "targets": [
         {
-          "refId": "L",
+          "refId": "M",
           "expr": "sum(rate(weir_wab_fsync_duration_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])) by (le)",
           "legendFormat": "{{le}}",
           "format": "heatmap"
@@ -617,7 +685,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 6
+        "y": 10
       }
     },
     {
@@ -655,22 +723,22 @@
       },
       "targets": [
         {
-          "refId": "M",
+          "refId": "N",
           "expr": "histogram_quantile(0.5,  sum by (le) (rate(weir_accept_latency_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])))",
           "legendFormat": "accept p50"
         },
         {
-          "refId": "N",
+          "refId": "O",
           "expr": "histogram_quantile(0.99, sum by (le) (rate(weir_accept_latency_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])))",
           "legendFormat": "accept p99"
         },
         {
-          "refId": "O",
+          "refId": "P",
           "expr": "histogram_quantile(0.5,  sum by (le) (rate(weir_sink_commit_duration_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])))",
           "legendFormat": "commit p50"
         },
         {
-          "refId": "P",
+          "refId": "Q",
           "expr": "histogram_quantile(0.99, sum by (le) (rate(weir_sink_commit_duration_seconds_bucket{job=\"weir-levels\", level=\"high\"}[$__rate_interval])))",
           "legendFormat": "commit p99"
         }
@@ -679,7 +747,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 14
+        "y": 18
       }
     },
     {
@@ -690,7 +758,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 26
       }
     },
     {
@@ -728,7 +796,7 @@
       },
       "targets": [
         {
-          "refId": "Q",
+          "refId": "R",
           "expr": "sum by (tier) (rate(weir_records_accepted_total{job=\"weir-levels\", level=\"high\"}[$__rate_interval]))",
           "legendFormat": "{{tier}}"
         }
@@ -737,7 +805,7 @@
         "h": 7,
         "w": 8,
         "x": 0,
-        "y": 23
+        "y": 27
       }
     },
     {
@@ -775,7 +843,7 @@
       },
       "targets": [
         {
-          "refId": "R",
+          "refId": "S",
           "expr": "sum by (tier) (rate(weir_records_ack_total{job=\"weir-levels\", level=\"high\"}[$__rate_interval]))",
           "legendFormat": "{{tier}}"
         }
@@ -784,7 +852,7 @@
         "h": 7,
         "w": 8,
         "x": 8,
-        "y": 23
+        "y": 27
       }
     },
     {
@@ -819,7 +887,7 @@
       },
       "targets": [
         {
-          "refId": "S",
+          "refId": "T",
           "expr": "sum by (tier) (weir_records_accepted_total{job=\"weir-levels\", level=\"high\"})",
           "legendFormat": "{{tier}}"
         }
@@ -828,7 +896,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 23
+        "y": 27
       }
     },
     {
@@ -839,7 +907,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 34
       }
     },
     {
@@ -877,7 +945,7 @@
       },
       "targets": [
         {
-          "refId": "T",
+          "refId": "U",
           "expr": "sum by (state) (rate(weir_wab_segments_total{job=\"weir-levels\", level=\"high\"}[$__rate_interval]))",
           "legendFormat": "{{state}}"
         }
@@ -886,7 +954,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 31
+        "y": 35
       }
     },
     {
@@ -924,7 +992,7 @@
       },
       "targets": [
         {
-          "refId": "U",
+          "refId": "V",
           "expr": "sum(weir_wab_bytes_on_disk{job=\"weir-levels\", level=\"high\"})",
           "legendFormat": "wab bytes"
         }
@@ -933,7 +1001,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 31
+        "y": 35
       }
     },
     {
@@ -944,7 +1012,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 42
       }
     },
     {
@@ -998,7 +1066,7 @@
       },
       "targets": [
         {
-          "refId": "V",
+          "refId": "W",
           "expr": "sum by (outcome) (rate(weir_sink_commit_records_total{job=\"weir-levels\", level=\"high\"}[$__rate_interval]))",
           "legendFormat": "{{outcome}}"
         }
@@ -1007,7 +1075,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 39
+        "y": 43
       }
     },
     {
@@ -1061,7 +1129,7 @@
       },
       "targets": [
         {
-          "refId": "W",
+          "refId": "X",
           "expr": "weir_drain_state{job=\"weir-levels\", level=\"high\"}",
           "legendFormat": "{{state}}"
         }
@@ -1070,7 +1138,7 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 39
+        "y": 43
       }
     },
     {
@@ -1108,7 +1176,7 @@
       },
       "targets": [
         {
-          "refId": "X",
+          "refId": "Y",
           "expr": "weir_queue_depth{job=\"weir-levels\", level=\"high\"}",
           "legendFormat": "queue depth"
         }
@@ -1117,7 +1185,7 @@
         "h": 7,
         "w": 12,
         "x": 0,
-        "y": 46
+        "y": 50
       }
     },
     {
@@ -1155,7 +1223,7 @@
       },
       "targets": [
         {
-          "refId": "Y",
+          "refId": "Z",
           "expr": "sum(weir_dead_letter_bytes_on_disk{job=\"weir-levels\", level=\"high\"})",
           "legendFormat": "dead-letter bytes"
         }
@@ -1164,7 +1232,75 @@
         "h": 7,
         "w": 12,
         "x": 12,
-        "y": 46
+        "y": 50
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Stranded vs resumed segments/sec",
+      "description": "Segments stranded (transient retries exhausted) vs auto-resumed when the sink recovered (4a). Stranded climbing without matching resumed = delivery is stuck; correlate with sink health.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "stranded"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "[",
+          "expr": "sum(rate(weir_drain_segments_stranded_total{job=\"weir-levels\", level=\"high\"}[$__rate_interval]))",
+          "legendFormat": "stranded"
+        },
+        {
+          "refId": "\\",
+          "expr": "sum(rate(weir_drain_segments_resumed_total{job=\"weir-levels\", level=\"high\"}[$__rate_interval]))",
+          "legendFormat": "resumed"
+        }
+      ],
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 57
       }
     }
   ]

@@ -543,6 +543,15 @@ pub enum Scenario {
     /// Drive the panic supervisor under [`SimClock`]; assert it caps out in
     /// virtual (instantly-advanced) time.
     PanicSupervisor,
+    /// Write `records` to an un-sealed `.wab`, flip one byte inside record
+    /// `corrupt_index`'s payload (so its CRC fails while records after it stay
+    /// fully written), then run recovery. Asserts the valid prefix is delivered
+    /// AND the corrupt-and-after bytes are preserved in quarantine (not silently
+    /// dropped) — the mid-file bit-rot durability fix.
+    MidFileCorruption {
+        records: usize,
+        corrupt_index: usize,
+    },
 }
 
 /// A fully specified, reproducible run. Serialises to a `tests/dst_seeds/*.json`
@@ -575,6 +584,10 @@ impl SimSpec {
                 records_per_batch,
             } => run_interleaved_flush(self.seed, &self.faults, *batches, *records_per_batch),
             Scenario::PanicSupervisor => run_panic_supervisor(self.seed),
+            Scenario::MidFileCorruption {
+                records,
+                corrupt_index,
+            } => run_mid_file_corruption(self.seed, *records, *corrupt_index),
         }
     }
 }
@@ -636,6 +649,9 @@ pub struct SimReport {
     pub virtual_elapsed: Duration,
     /// `PanicSupervisor`: real wall-clock spent (should be ~0, proving collapse).
     pub real_elapsed: Duration,
+    /// `MidFileCorruption`: count of segments quarantined during recovery (the
+    /// preserved-corrupt-tail metric).
+    pub quarantined: u64,
 }
 
 // ── Invariant oracle ────────────────────────────────────────────────────────
@@ -779,6 +795,7 @@ fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutco
             records.max(1),
             Duration::from_millis(5),
             64 * 1024 * 1024,
+            None,
             None,
             metrics,
             coalesce_hint,
@@ -933,6 +950,7 @@ fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimRep
                     Duration::from_millis(5),
                     64 * 1024 * 1024,
                     None,
+                    None,
                     metrics,
                     coalesce_hint,
                     &clock,
@@ -1048,6 +1066,104 @@ fn run_panic_supervisor(seed: u64) -> SimReport {
     }
 }
 
+/// Scenario — mid-file bit-rot during crash recovery of an un-sealed segment.
+///
+/// Writes `records` real records to an active `.wab`, drops the writer (flushing
+/// the segment), then flips ONE byte inside record `corrupt_index`'s payload so
+/// its CRC fails while records `corrupt_index+1..records` remain fully written on
+/// disk. Runs the real `recover_segment` and asserts the durability fix:
+///
+///   * the valid prefix (records `0..corrupt_index`) is recovered + sealed and
+///     replays exactly (delivered), AND
+///   * the corrupt-and-after bytes were PRESERVED (a quarantine copy of the full
+///     original-corrupt segment exists, the quarantine metric was bumped) — i.e.
+///     the loss is surfaced, never silent.
+///
+/// The companion `i_torn_tail_*` invariant in the sweep stays unchanged: this is
+/// genuine mid-file corruption, not a torn tail, so the two paths are distinct.
+fn run_mid_file_corruption(seed: u64, records: usize, corrupt_index: usize) -> SimReport {
+    use super::segment::{WabSegment, sealed_path_for, segment_path};
+    assert!(corrupt_index < records, "corrupt_index must be in range");
+
+    let env = SimEnv::new("midfile_corruption");
+    let shard_dir = env.shard_dir(0);
+    let path = segment_path(&shard_dir, 1);
+
+    // Write real records to an un-sealed segment via the production writer.
+    let mut rng = SplitMix64::new(seed);
+    let mut written: Vec<Vec<u8>> = Vec::with_capacity(records);
+    {
+        let mut seg = WabSegment::create(&path, 0).expect("create segment");
+        for i in 0..records {
+            let payload = rng.unique_payload(i as u64);
+            seg.write_record(&payload).expect("write_record");
+            written.push(payload);
+        }
+        // Drop flushes/closes the segment, leaving an active `.wab` on disk.
+    }
+
+    // Locate record `corrupt_index`'s payload by walking the on-disk layout:
+    // header(24) then per record [4 len][4 crc][len payload]. Flip a payload byte
+    // so length + crc read fine but the CRC check fails, with later records still
+    // fully present.
+    let original = std::fs::read(&path).expect("read segment");
+    let mut off = super::format::SEGMENT_HEADER_LEN;
+    let mut payload_off = None;
+    for i in 0..records {
+        let len = u32::from_le_bytes(original[off..off + 4].try_into().unwrap()) as usize;
+        let p_start = off + 8;
+        if i == corrupt_index {
+            payload_off = Some(p_start);
+            break;
+        }
+        off = p_start + len;
+    }
+    let payload_off = payload_off.expect("found corrupt record offset");
+    let mut corrupt = original.clone();
+    corrupt[payload_off] ^= 0xFF;
+    std::fs::write(&path, &corrupt).expect("write corrupt segment");
+
+    // Run the real recovery.
+    let sealed = super::recovery::recover_segment(&path, &env.wab_dir, &env.metrics)
+        .expect("recover_segment");
+    assert_eq!(sealed, sealed_path_for(&path));
+
+    let recovered = read_sealed_payloads(&shard_dir);
+    let quarantined = env.metrics.recovery_segments_quarantined.get();
+
+    // I — the valid prefix is delivered exactly (records 0..corrupt_index).
+    assert_invariant(
+        seed,
+        "i_midfile_valid_prefix_delivered",
+        recovered == written[..corrupt_index],
+    );
+
+    // I — the corrupt tail is PRESERVED, not silently dropped: a quarantine copy
+    // exists holding the full original-corrupt bytes (incl. records after the
+    // corrupt one), and the quarantine metric was bumped exactly once.
+    let q_dir = env.wab_dir.join("quarantine");
+    let preserved_ok = std::fs::read_dir(&q_dir)
+        .ok()
+        .and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find_map(|p| std::fs::read(&p).ok())
+        })
+        .map(|bytes| bytes == corrupt)
+        .unwrap_or(false);
+    assert_invariant(seed, "i_midfile_corrupt_tail_preserved", preserved_ok);
+    assert_invariant(seed, "i_midfile_quarantine_counted", quarantined == 1);
+
+    env.cleanup();
+    SimReport {
+        seed,
+        written,
+        recovered,
+        quarantined,
+        ..Default::default()
+    }
+}
+
 /// Scenario (Phase 3) — a producer and the real flusher run as two cooperatively
 /// scheduled threads ([`SimScheduler`]), so the seed deterministically chooses
 /// how the producer's sends interleave with the flusher's receives (i.e. how
@@ -1133,6 +1249,7 @@ fn run_interleaved_flush(
             Duration::from_millis(5),
             64 * 1024 * 1024,
             None,
+            None,
             metrics,
             coalesce_hint,
             &clock,
@@ -1199,6 +1316,146 @@ mod tests {
         assert!(report.acks.iter().all(|&ok| ok), "acks: {:?}", report.acks);
     }
 
+    /// Drives the REAL [`super::flusher_thread`] over one Sync batch of
+    /// fixed-size payloads with a small `segment_max_bytes`, so rotation fires
+    /// MID-batch. Fixed-size payloads keep the rotation split deterministic
+    /// (`drive_sync_flusher` uses variable-size payloads, so no flusher-driving
+    /// scenario ever rotated — these branches were untested). Returns each
+    /// record's ack, the durability ledger, and the sealed paths forwarded to the
+    /// drain (proof a rotation occurred).
+    fn drive_rotating_batch(
+        faults: &[Fault],
+        payloads: Vec<Vec<u8>>,
+        segment_max_bytes: u64,
+    ) -> (Vec<bool>, Ledger, Vec<PathBuf>, SimEnv) {
+        let env = SimEnv::new("rotation");
+        let sim_faults = SimFaults::from_faults(faults);
+        let ledger = Ledger::default();
+        let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(
+            Arc::clone(&sim_faults),
+            ledger.clone(),
+        ));
+        let clock = SimClock::new();
+
+        let n = payloads.len();
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(n.max(1) * 4);
+        let (drain_tx, drain_rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let coalesce_hint = Arc::new(AtomicU64::new(200));
+
+        let mut ack_rxs = Vec::with_capacity(n);
+        let mut units = Vec::with_capacity(n);
+        for p in &payloads {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            ack_rxs.push(ack_rx);
+            units.push(make_unit(p.clone(), Durability::Sync, ack_tx));
+        }
+        work_tx.send(make_batch(units)).expect("send batch");
+        drop(work_tx);
+
+        let shard_dir = env.shard_dir(0);
+        let metrics = Arc::clone(&env.metrics);
+        let handle = std::thread::spawn(move || {
+            crate::wab::flusher_thread(
+                0,
+                shard_dir,
+                work_rx,
+                drain_tx,
+                n.max(1),
+                Duration::from_millis(5),
+                segment_max_bytes,
+                None,
+                None,
+                metrics,
+                coalesce_hint,
+                &clock,
+                store,
+            );
+        });
+        handle.join().expect("flusher join");
+
+        // A dropped ack sender (a record whose batch was aborted) reads as Nack.
+        let acks: Vec<bool> = ack_rxs
+            .into_iter()
+            .map(|mut rx| rx.try_recv().unwrap_or(false))
+            .collect();
+        let drain_paths: Vec<PathBuf> = drain_rx.try_iter().collect();
+        (acks, ledger, drain_paths, env)
+    }
+
+    /// Rotation ack-fate (the `durable_acks` branch of `flush_batch`): records in
+    /// a segment that ROTATED (sealed + fsynced) mid-batch ack `true` and stay
+    /// durable EVEN IF the next active segment's group fsync then fails. Three
+    /// 50-byte payloads over `segment_max_bytes = 100` (≈58 B/record on disk + a
+    /// 24 B header): rec0→A (no rotate), rec1→A hits the threshold and ROTATES
+    /// (seals A=[0,1]), rec2→fresh B. The batch's lone counted group fsync lands
+    /// on B (the seal's own fsync is not counted), so `FsyncReturns { nth: 1 }`
+    /// fails B: rec2 is Nacked while the sealed records 0,1 stay durable + acked
+    /// true. Pins "a rotated record is durable even if the next fsync fails".
+    #[test]
+    fn rotation_sealed_records_ack_true_even_when_next_fsync_fails() {
+        let payloads: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 50]).collect();
+        let (acks, ledger, drain_paths, env) =
+            drive_rotating_batch(&[Fault::FsyncReturns { nth: 1 }], payloads.clone(), 100);
+
+        assert_eq!(
+            acks,
+            vec![true, true, false],
+            "sealed (rotated) records ack true; the active record whose fsync failed is Nacked"
+        );
+        // I1 (crown invariant): every acked-TRUE record is genuinely durable. (The
+        // Nacked rec2 may still become durable later via the flusher's shutdown
+        // seal of the active segment — that's harmless at-least-once, NOT a false
+        // ack, so we only check the acked-true direction.)
+        for (p, &ok) in payloads.iter().zip(&acks) {
+            if ok {
+                assert!(
+                    ledger.is_durable(p),
+                    "acked-true record {p:?} must be durable (no false ack)"
+                );
+            }
+        }
+        assert!(
+            !drain_paths.is_empty(),
+            "rotation must have sealed + forwarded a segment to the drain"
+        );
+        env.cleanup();
+    }
+
+    /// Seal error DURING rotation: when the rotation seal itself fails (ENOSPC),
+    /// the records in that un-fsynced segment are Nacked — never false-acked —
+    /// while a record that lands in a subsequently-opened, group-fsynced segment
+    /// is correctly acked true and durable. Same layout as above but with
+    /// `Fault::SealFails`: rec1's rotation seal fails, so flush_batch Nacks the
+    /// pending rec0 + the triggering rec1; rec2 opens a fresh segment that the
+    /// batch's group fsync makes durable. No false ack, no acked record lost.
+    #[test]
+    fn rotation_seal_error_nacks_unsynced_records_without_false_ack() {
+        let payloads: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 50]).collect();
+        let (acks, ledger, _drain, env) =
+            drive_rotating_batch(&[Fault::SealFails], payloads.clone(), 100);
+
+        assert_eq!(
+            acks,
+            vec![false, false, true],
+            "the failed-seal segment's records are Nacked; the fresh group-fsynced record is acked"
+        );
+        // Crown invariant: no acked-true record is non-durable.
+        for (p, &ok) in payloads.iter().zip(&acks) {
+            if ok {
+                assert!(
+                    ledger.is_durable(p),
+                    "acked-true record {p:?} must be durable"
+                );
+            } else {
+                assert!(
+                    !ledger.is_durable(p),
+                    "Nacked record {p:?} from the failed-seal segment must not be durable"
+                );
+            }
+        }
+        env.cleanup();
+    }
+
     /// Scenario 2: a crash between sync_all and rename leaves a fully-formed
     /// `.wab`; recovery must replay every synced record, intact and in order.
     #[test]
@@ -1211,6 +1468,33 @@ mod tests {
         assert_eq!(
             report.recovered, report.written,
             "recovery must return exactly the synced records"
+        );
+    }
+
+    /// Mid-file bit-rot in an un-sealed segment: a CRC mismatch on a fully-read
+    /// record (with valid records after it) must recover+deliver the valid prefix
+    /// AND preserve the corrupt-and-after bytes in quarantine — never silently
+    /// drop them. Mirrors the unit test, but through the DST harness so it serves
+    /// as a pinned, seed-reproducible durability regression.
+    #[test]
+    fn midfile_corruption_delivers_prefix_and_preserves_corrupt_tail() {
+        let report = Sim::new(0x5EED_0009)
+            .scenario(Scenario::MidFileCorruption {
+                records: 6,
+                corrupt_index: 3,
+            })
+            .run();
+        // The driver's invariant oracle already asserts prefix-delivered +
+        // tail-preserved + quarantine-counted; re-assert at the test boundary so a
+        // failure reads clearly here too.
+        assert_eq!(
+            report.recovered,
+            report.written[..3],
+            "only records 0..3 (the valid prefix) are delivered"
+        );
+        assert_eq!(
+            report.quarantined, 1,
+            "the corrupt segment must be quarantined exactly once"
         );
     }
 
@@ -1389,7 +1673,7 @@ mod tests {
         );
     }
 
-    /// Random-seed sweep across the two fault scenarios. Every run checks its
+    /// Random-seed sweep across the five fault scenarios. Every run checks its
     /// invariants in-harness, so any seed that breaks one fails here with a
     /// pin-able repro. The count is `WEIR_DST_SWEEP` (small by default so PR
     /// runs stay fast; the CI `dst` job cranks it up).

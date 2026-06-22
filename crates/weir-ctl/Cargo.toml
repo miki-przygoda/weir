@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords = ["weir", "cli", "operations", "admin", "durability"]
 categories = ["command-line-utilities", "database"]
 
@@ -14,8 +15,23 @@ name = "weir-ctl"
 path = "src/main.rs"
 
 [dependencies]
-weir-core = { path = "../weir-core", version = "1.0.0" }
-weir-client = { path = "../weir-client", version = "1.0.0" }
-# clap with derive for the subcommand surface. The proc-macro build cost is
-# already paid elsewhere in the workspace (serde derive, etc.).
-clap = { version = "4", features = ["derive"] }
+weir-core = { workspace = true }
+weir-client = { workspace = true }
+# Shared on-disk WAB segment reader — lets `dl requeue` read dead-letter
+# segments using the SAME parser the daemon uses, without pulling in the
+# daemon's async/sink dep tree.
+weir-wab = { workspace = true }
+# clap with derive for the subcommand surface + env for the WEIR_WAB_DIR
+# fallback on --wab-dir. The proc-macro build cost is already paid elsewhere in
+# the workspace (serde derive, etc.).
+clap = { version = "4", features = ["derive", "env"] }
+# Machine-readable `--json` output for the read/inspect subcommands. weir-ctl is
+# a binary (no public API), so the runtime dep cost is fine; serde_json is
+# already in the workspace lock tree as a transitive dep.
+serde_json = "1"
+
+[dev-dependencies]
+# Test-only: the requeue tests hand-build dead-letter segment fixtures and need
+# to compute the per-record CRC32 that SegmentReader verifies. Same crate +
+# algorithm weir-wab uses internally.
+crc32fast = "1.4"

@@ -1,13 +1,18 @@
 pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
 pub(crate) mod dst;
-pub(crate) mod format;
 pub(crate) mod recovery;
 pub(crate) mod segment;
 
+// The on-disk segment format + reader live in the `weir-wab` crate (shared with
+// weir-ctl, so there is exactly one parser). Re-exported here so the daemon's
+// existing `crate::wab::format::…` and `crate::wab::SegmentReader` paths are
+// unchanged.
+pub(crate) use weir_wab::{SegmentReader, format};
+
 use std::{
-    fs::{self, File},
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    fs,
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -24,10 +29,10 @@ use tracing::{error, info, warn};
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::Batch;
 use clock::{BlockingClock, RealClock};
-use format::{EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::{FsSegmentStore, SegmentStore, ShardWriter};
-use weir_core::{Durability, MAX_PAYLOAD_HARD_CAP, Payload};
+use weir_core::Durability;
+use weir_wab::format::{EXT_SEALED, SEGMENT_FOOTER_LEN};
 
 /// Exponential moving average update, fixed-point microseconds.
 /// alpha = 1/4 (new sample weighted 25%). Pure fn so it's unit-testable.
@@ -56,6 +61,11 @@ pub(crate) struct WabConfig {
     /// the historical hard-coded behaviour; tests and storage-constrained
     /// deployments may set it lower.
     pub(crate) segment_max_bytes: u64,
+    /// Optional idle-seal: if set, a flusher seals its active segment (handing it
+    /// to the drain) after this much time with no new records, instead of waiting
+    /// to fill `segment_max_bytes` or for shutdown. `None` (default) preserves the
+    /// historical behaviour. Lets low-volume deployments deliver promptly.
+    pub(crate) segment_max_age: Option<Duration>,
 }
 
 impl Default for WabConfig {
@@ -65,6 +75,7 @@ impl Default for WabConfig {
             batch_size: 256,
             batch_deadline: Duration::from_millis(1),
             segment_max_bytes: crate::wab::format::SEGMENT_MAX_BYTES,
+            segment_max_age: None,
         }
     }
 }
@@ -252,6 +263,7 @@ pub(crate) fn spawn(
         let batch_size = config.batch_size;
         let batch_deadline = config.batch_deadline;
         let segment_max_bytes = config.segment_max_bytes;
+        let segment_max_age = config.segment_max_age;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
         let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
 
@@ -283,6 +295,7 @@ pub(crate) fn spawn(
                             batch_size,
                             batch_deadline,
                             segment_max_bytes,
+                            segment_max_age,
                             core_id,
                             metrics_for_flusher,
                             coalesce_hint,
@@ -303,30 +316,35 @@ pub(crate) fn spawn(
     })
 }
 
-/// Replays sealed-but-unconfirmed segments from a previous run by sending their
-/// paths to the drain. MUST be called only after the drain consumer is running:
-/// the sends block on the bounded drain channel, so with no consumer a backlog
-/// larger than the channel capacity would dead-lock the caller (B3).
-pub(crate) fn replay_unconfirmed(
+/// Scans every shard directory under `wab_dir` for sealed-but-unconfirmed
+/// segments (`.wab.sealed` with no `.confirmed` sidecar), returning their paths
+/// in ascending per-shard counter order. Already-confirmed segments are skipped;
+/// a segment that fails the confirmed check is quarantined by `check_confirmed`
+/// and skipped. Shared by startup [`replay_unconfirmed`] and the drain's
+/// sink-recovery rescan of stranded segments.
+///
+/// Enumerates EVERY shard directory on disk, not just `0..shard_count` —
+/// scanning only the configured range would strand sealed-but-unconfirmed
+/// segments in dirs whose index is >= shard_count after an operator REDUCED
+/// shard_count across a restart (acked-durable data never replayed, S05). The
+/// drain is shard-agnostic, so draining an orphaned dir's backlog is correct.
+/// Dirent errors propagate (no `.ok()` filtering): a silently-skipped sealed
+/// segment is silently-dropped acked data.
+///
+/// `shard_count` only drives the "backlog beyond the configured count" advisory;
+/// pass `None` (e.g. from the recovery rescan) to skip it.
+pub(crate) fn scan_unconfirmed_sealed(
     wab_dir: &Path,
-    shard_count: usize,
-    drain_tx: &Sender<PathBuf>,
-    metrics: &Arc<Metrics>,
-) -> io::Result<()> {
-    // Enumerate EVERY shard directory on disk, not just 0..shard_count. recovery
-    // (recover_open_segments) already seals active segments in all of them;
-    // scanning only the configured range here would strand sealed-but-unconfirmed
-    // segments in shard dirs whose index is >= shard_count after an operator
-    // REDUCED shard_count across a restart — records acked durable but then never
-    // replayed, confirmed, or dead-lettered (S05). The drain is shard-agnostic, so
-    // draining an orphaned dir's backlog is correct; the dir is left empty once
-    // its segments confirm. Propagate dirent errors (don't filter .ok()): a
-    // silently-skipped sealed segment is silently-dropped acked data.
+    shard_count: Option<usize>,
+) -> io::Result<Vec<PathBuf>> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
-    shard_dirs.sort();
+    // Numeric shard order (not lexicographic): `shard_{id:02}` is a minimum
+    // width, so a plain sort would mis-order shard_100 before shard_20 (P2-F3).
+    shard_dirs.sort_by_key(|p| segment::shard_id_from_path(p));
 
+    let mut unconfirmed = Vec::new();
     for sdir in shard_dirs {
         if !sdir.is_dir() {
             continue;
@@ -342,12 +360,10 @@ pub(crate) fn replay_unconfirmed(
         if name == "quarantine" || name == "dead_letter" {
             continue;
         }
-        // A shard directory beyond the configured count means shard_count was
-        // reduced with undrained data present. Its backlog is recovered here (not
-        // stranded), but surface the misconfiguration so the operator notices.
-        if let Some(idx) = name
-            .strip_prefix("shard_")
-            .and_then(|n| n.parse::<usize>().ok())
+        if let Some(shard_count) = shard_count
+            && let Some(idx) = name
+                .strip_prefix("shard_")
+                .and_then(|n| n.parse::<usize>().ok())
             && idx >= shard_count
         {
             warn!(
@@ -363,40 +379,59 @@ pub(crate) fn replay_unconfirmed(
             .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
             .collect();
-        sealed_segments.sort(); // ascending counter order
+        // Ascending numeric counter order. A plain PathBuf sort is lexicographic,
+        // which tracks counter order only while every name shares the :08 digit
+        // width; past 99_999_999 segments the pad grows a 9th digit and
+        // "seg_100000000" would sort before "seg_99999999" (P2-F3). Parsing the
+        // counter keeps the order numerically correct and the claim honest.
+        sealed_segments.sort_by_key(|p| segment::segment_counter_from_path(p));
 
         for sealed in sealed_segments {
             match check_confirmed(&sealed, wab_dir) {
                 Ok(true) => {
-                    info!(sealed = %sealed.display(), "skipping replay — segment already confirmed");
+                    info!(sealed = %sealed.display(), "skipping — segment already confirmed");
                 }
-                Ok(false) => {
-                    // A footer-read failure here only undercounts the
-                    // recovery_records_replayed metric (the segment is still
-                    // queued + delivered); surface it rather than silently
-                    // reporting 0 so the undercount is explainable.
-                    let record_count = match read_segment_record_count(&sealed) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
-                            0
-                        }
-                    };
-                    info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
-                    metrics.recovery_records_replayed.inc_by(record_count);
-                    drain_tx.send(sealed).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "drain channel closed during startup replay",
-                        )
-                    })?;
-                }
+                Ok(false) => unconfirmed.push(sealed),
                 Err(e) => {
                     // check_confirmed quarantined the segment; skip it.
-                    warn!(error = %e, "skipping quarantined segment during replay");
+                    warn!(error = %e, "skipping quarantined segment");
                 }
             }
         }
+    }
+    Ok(unconfirmed)
+}
+
+/// Replays sealed-but-unconfirmed segments from a previous run by sending their
+/// paths to the drain. MUST be called only after the drain consumer is running:
+/// the sends block on the bounded drain channel, so with no consumer a backlog
+/// larger than the channel capacity would dead-lock the caller (B3).
+pub(crate) fn replay_unconfirmed(
+    wab_dir: &Path,
+    shard_count: usize,
+    drain_tx: &Sender<PathBuf>,
+    metrics: &Arc<Metrics>,
+) -> io::Result<()> {
+    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count))? {
+        // A footer-read failure here only undercounts the
+        // recovery_records_replayed metric (the segment is still queued +
+        // delivered); surface it rather than silently reporting 0 so the
+        // undercount is explainable.
+        let record_count = match read_segment_record_count(&sealed) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
+                0
+            }
+        };
+        info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
+        metrics.recovery_records_replayed.inc_by(record_count);
+        drain_tx.send(sealed).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "drain channel closed during startup replay",
+            )
+        })?;
     }
     Ok(())
 }
@@ -439,6 +474,7 @@ fn flusher_thread<C: BlockingClock>(
     batch_size: usize,
     batch_deadline: Duration,
     segment_max_bytes: u64,
+    segment_max_age: Option<Duration>,
     core_id: Option<core_affinity::CoreId>,
     metrics: Arc<Metrics>,
     coalesce_hint: Arc<AtomicU64>,
@@ -526,6 +562,14 @@ fn flusher_thread<C: BlockingClock>(
     let mut batches: Vec<Batch> = Vec::new();
     let mut record_count = 0usize;
 
+    // Idle-seal bookkeeping (opt-in via segment_max_age; None = off). Tracks when
+    // records were last flushed to the active segment so we can seal it after it
+    // sits idle, handing it to the drain instead of waiting to fill
+    // segment_max_bytes or for shutdown. Uses real time (not the BlockingClock
+    // seam) — only active when the operator opts in, so DST, which never sets
+    // segment_max_age, is unaffected.
+    let mut last_write_at: Option<Instant> = None;
+
     loop {
         // Block on the first Batch (or detect channel close / deadline).
         match clock.recv_timeout(&work_rx, batch_deadline) {
@@ -545,6 +589,42 @@ fn flusher_thread<C: BlockingClock>(
                         &coalesce_hint,
                     );
                     record_count = 0;
+                    last_write_at = Some(Instant::now());
+                } else if let Some(max_age) = segment_max_age {
+                    // No new records this cycle: if the active segment has been
+                    // idle past max_age, seal it so the drain delivers it now
+                    // rather than at the next rotation/shutdown (low-volume
+                    // timely-delivery; the open segment always holds >=1 record).
+                    let idle_enough = last_write_at.is_some_and(|t| t.elapsed() >= max_age);
+                    if idle_enough && writer.has_active_segment() {
+                        match writer.seal_current() {
+                            Ok(Some(sealed)) => {
+                                metrics
+                                    .wab_segments
+                                    .get_or_create(&SegmentStateLabel {
+                                        state: SegmentState::sealed,
+                                    })
+                                    .inc();
+                                if let Err(crossbeam_channel::SendError(unsent)) =
+                                    drain_tx.send(sealed)
+                                {
+                                    error!(
+                                        shard = shard_id,
+                                        path = %unsent.display(),
+                                        "drain channel closed; idle-sealed segment not handed off \
+                                         (recovered on restart via replay)"
+                                    );
+                                }
+                                last_write_at = None;
+                            }
+                            Ok(None) => last_write_at = None,
+                            Err(e) => warn!(
+                                shard = shard_id,
+                                error = %e,
+                                "idle-seal failed; will retry next cycle (segment stays active)"
+                            ),
+                        }
+                    }
                 }
                 continue;
             }
@@ -572,6 +652,10 @@ fn flusher_thread<C: BlockingClock>(
             &coalesce_hint,
         );
         record_count = 0;
+        // Records just hit the active segment — restart the idle-seal clock.
+        if segment_max_age.is_some() {
+            last_write_at = Some(Instant::now());
+        }
     }
 
     // Graceful shutdown: seal the active segment and send to drain.
@@ -654,22 +738,19 @@ fn flush_batch(
             };
 
             // write_record returns Some(sealed_path) when the segment rotated.
-            let rotation = match writer.write_record(&unit.payload) {
-                Ok(rotation) => rotation,
-                Err(_) => {
-                    // The active segment was dropped. Records already collected
-                    // for it (pending_acks) are now in an abandoned, un-fsynced
-                    // file — Nack them rather than let the group fsync below
-                    // falsely ack them. Records in already-rotated (sealed +
-                    // fsynced) segments are durable and untouched.
-                    for ack_tx in pending_acks.drain(..) {
-                        let _ = ack_tx.send(false);
-                    }
-                    #[cfg(feature = "bench-trace")]
-                    pending_ts.clear();
-                    let _ = unit.ack_tx.send(false);
-                    continue;
+            let Ok(rotation) = writer.write_record(&unit.payload) else {
+                // The active segment was dropped. Records already collected
+                // for it (pending_acks) are now in an abandoned, un-fsynced
+                // file — Nack them rather than let the group fsync below
+                // falsely ack them. Records in already-rotated (sealed +
+                // fsynced) segments are durable and untouched.
+                for ack_tx in pending_acks.drain(..) {
+                    let _ = ack_tx.send(false);
                 }
+                #[cfg(feature = "bench-trace")]
+                pending_ts.clear();
+                let _ = unit.ack_tx.send(false);
+                continue;
             };
 
             // Observe the write stage (pre-fsync).
@@ -791,113 +872,15 @@ fn fsync_observed(
     }
 }
 
-/// An iterator over records in a sealed WAB segment file.
-///
-/// Streams records without materialising the whole segment. Applies
-/// `MAX_PAYLOAD_HARD_CAP` before every heap allocation to bound memory usage
-/// during recovery. Stops at the end-of-records sentinel or on the first error.
-pub(crate) struct SegmentReader {
-    reader: BufReader<File>,
-    done: bool,
-}
-
-impl SegmentReader {
-    pub(crate) fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-
-        let mut header = [0u8; SEGMENT_HEADER_LEN];
-        reader.read_exact(&mut header)?;
-
-        if &header[0..4] != b"WEIR" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad segment magic: {:?}", &header[0..4]),
-            ));
-        }
-        if header[4] != FORMAT_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown segment format version: {}", header[4]),
-            ));
-        }
-
-        Ok(SegmentReader {
-            reader,
-            done: false,
-        })
-    }
-}
-
-impl Iterator for SegmentReader {
-    type Item = io::Result<Payload>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-
-        let mut len_buf = [0u8; 4];
-        match self.reader.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
-            Err(e) => {
-                self.done = true;
-                return Some(Err(e));
-            }
-        }
-
-        let payload_len = u32::from_le_bytes(len_buf) as usize;
-        if payload_len == 0 {
-            self.done = true;
-            return None; // sentinel
-        }
-
-        // Cap check before allocation — MAX_PAYLOAD_HARD_CAP from weir-core.
-        if payload_len > MAX_PAYLOAD_HARD_CAP {
-            self.done = true;
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "record payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"
-                ),
-            )));
-        }
-
-        let mut crc_buf = [0u8; 4];
-        if let Err(e) = self.reader.read_exact(&mut crc_buf) {
-            self.done = true;
-            return Some(Err(e));
-        }
-        let expected_crc = u32::from_le_bytes(crc_buf);
-
-        let mut payload_buf = vec![0u8; payload_len];
-        if let Err(e) = self.reader.read_exact(&mut payload_buf) {
-            self.done = true;
-            return Some(Err(e));
-        }
-
-        let computed_crc = crc32fast::hash(&payload_buf);
-        if expected_crc != computed_crc {
-            self.done = true;
-            return Some(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "record CRC mismatch: expected {expected_crc:#010x}, computed {computed_crc:#010x}"
-                ),
-            )));
-        }
-
-        // Freeze: O(1) ownership transfer from Vec allocation to Bytes.
-        Some(Ok(Payload::from(payload_buf)))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wab::segment::{WabSegment, segment_path};
     use std::fs;
+    // SegmentReader (and the round-trip tests that pair it with WabSegment) live
+    // here even though the reader itself moved to weir-wab — these exercise the
+    // reader against the real writer. Payload + the cap are only used by them.
+    use weir_core::{MAX_PAYLOAD_HARD_CAP, Payload};
 
     fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weir_wab_{label}_{}", std::process::id()));
@@ -1074,6 +1057,74 @@ mod tests {
             "the undrained segment must be the one queued, not the confirmed one"
         );
         let _ = sealed1;
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Directly exercises `scan_unconfirmed_sealed` on the `shard_count = None`
+    /// path — the entry point the 4a sink-recovery rescan
+    /// (`drain::probe_and_resume_stranded`) uses. That path is otherwise only
+    /// covered indirectly (the drain resume test queues a *single* segment, and
+    /// the replay tests always pass `Some(count)`), so the cross-shard ordering
+    /// and confirmed-skip behaviour of the recovery scan itself is untested.
+    ///
+    /// Asserts the contract the rescan relies on: every sealed-but-unconfirmed
+    /// segment across ALL shard dirs is returned in deterministic ascending
+    /// order, already-confirmed segments are skipped, and `None` neither filters
+    /// dirs by index nor warns (it must still scan dirs a `Some` count would flag
+    /// as "beyond configured count" — recovery must not strand them).
+    #[test]
+    fn scan_unconfirmed_sealed_none_count_returns_all_shards_ordered_skipping_confirmed() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        let dir = tmp_dir("scan_none_recovery");
+
+        // shard_00: two unconfirmed sealed segments (counters 1 and 2).
+        let sd0 = shard_dir_path(&dir, 0);
+        fs::create_dir_all(&sd0).unwrap();
+        let s0_1 = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 1), 0).unwrap();
+            s.write_record(b"a").unwrap();
+            s.seal().unwrap()
+        };
+        let s0_2 = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 2), 0).unwrap();
+            s.write_record(b"b").unwrap();
+            s.seal().unwrap()
+        };
+
+        // shard_01: one CONFIRMED (must be skipped) + one unconfirmed sealed.
+        let sd1 = shard_dir_path(&dir, 1);
+        fs::create_dir_all(&sd1).unwrap();
+        let s1_confirmed = {
+            let mut s = WabSegment::create(&segment_path(&sd1, 1), 1).unwrap();
+            s.write_record(b"done").unwrap();
+            s.seal().unwrap()
+        };
+        fs::write(confirmed_path_for(&s1_confirmed), build_confirmed(1, 1, 1)).unwrap();
+        let s1_2 = {
+            let mut s = WabSegment::create(&segment_path(&sd1, 2), 1).unwrap();
+            s.write_record(b"c").unwrap();
+            s.seal().unwrap()
+        };
+
+        // shard_05: an "orphaned" dir whose index would be >= a small configured count.
+        let sd5 = shard_dir_path(&dir, 5);
+        fs::create_dir_all(&sd5).unwrap();
+        let s5_1 = {
+            let mut s = WabSegment::create(&segment_path(&sd5, 1), 5).unwrap();
+            s.write_record(b"orphan").unwrap();
+            s.seal().unwrap()
+        };
+
+        let got = scan_unconfirmed_sealed(&dir, None).unwrap();
+        assert!(
+            !got.contains(&s1_confirmed),
+            "the confirmed segment must be skipped by the recovery scan: {got:?}"
+        );
+        assert_eq!(
+            got,
+            vec![s0_1, s0_2, s1_2, s5_1],
+            "all unconfirmed sealed segments across every shard dir, ascending"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

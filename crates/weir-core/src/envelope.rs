@@ -74,6 +74,13 @@ impl TryFrom<u8> for MessageType {
     }
 }
 
+impl From<MessageType> for u8 {
+    /// The wire byte for this message type. Inverse of [`MessageType::try_from`].
+    fn from(m: MessageType) -> u8 {
+        m as u8
+    }
+}
+
 /// Decoded wire header. `magic` and `header_crc32` are not stored: magic is always
 /// `b"WEIR"` after a successful decode (storing it invites confusion about validity),
 /// and CRC is computed on encode rather than held as state.
@@ -103,6 +110,11 @@ impl Header {
     /// a bare `Header::encode` always declares `payload_len = 0`, so it is only
     /// valid for the genuinely-empty-payload frames (Ack / HealthCheck) that use
     /// it (F50).
+    ///
+    /// In wire v1 `flags` MUST be 0. Any other value encodes a frame that
+    /// [`Header::decode`] rejects with [`DecodeError::ReservedFlagsSet`] (and the
+    /// daemon Nacks then closes the connection); the parameter is kept non-zero-
+    /// capable only so the codec can construct reject-path test frames.
     #[must_use]
     pub fn new(message_type: MessageType, durability: Durability, flags: u8) -> Self {
         Self {
@@ -149,8 +161,8 @@ impl Header {
         let mut buf = [0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(&MAGIC);
         buf[4] = self.version;
-        buf[5] = self.message_type as u8;
-        buf[6] = self.durability as u8;
+        buf[5] = u8::from(self.message_type);
+        buf[6] = u8::from(self.durability);
         buf[7] = self.flags;
         buf[8..12].copy_from_slice(&self.payload_len.to_le_bytes());
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
@@ -503,6 +515,21 @@ mod tests {
     }
 
     #[test]
+    fn message_type_from_u8_round_trips() {
+        // From<MessageType> for u8 is the inverse of TryFrom<u8>, matching the
+        // symmetric pair Durability and NackReason already expose (P3-F3).
+        for mt in [
+            MessageType::Push,
+            MessageType::Ack,
+            MessageType::Nack,
+            MessageType::HealthCheck,
+            MessageType::HealthCheckResponse,
+        ] {
+            assert_eq!(MessageType::try_from(u8::from(mt)).unwrap(), mt);
+        }
+    }
+
+    #[test]
     fn message_type_repr_values_match_wire() {
         assert_eq!(MessageType::Push as u8, 0x01);
         assert_eq!(MessageType::Ack as u8, 0x02);
@@ -554,6 +581,24 @@ mod tests {
         let encoded = env.encode();
         let decoded = Envelope::decode(&encoded).unwrap();
         assert_eq!(env, decoded);
+    }
+
+    /// F49: Envelope::new makes the payload authoritative for the header's
+    /// payload_len. The >4 GiB saturation arm is intentionally untestable without
+    /// a multi-GiB allocation, but pinning the equality across the realistic
+    /// in-cap range proves no `as`-truncation snuck in (a declared len that
+    /// disagreed with the payload would be a desync the crown invariant relies on
+    /// never happening).
+    #[test]
+    fn envelope_new_payload_len_equals_payload_length() {
+        for len in [0usize, 1, 7, 256, 65_536, 1_000_000] {
+            let env = Envelope::new(push_header(), vec![0xAB; len]);
+            assert_eq!(
+                env.header().payload_len() as usize,
+                len,
+                "payload_len must equal the actual payload length for len={len}"
+            );
+        }
     }
 
     #[test]

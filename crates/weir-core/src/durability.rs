@@ -3,15 +3,46 @@
 
 /// Durability tier requested by the producer for a given record.
 /// Wire values are fixed and must not change without a WIRE_VERSION bump.
+///
+/// `Sync` and `Batched` carry the **same durability guarantee today**: the
+/// record is written and `fdatasync`ed — as part of one batch-boundary group
+/// fsync — *before* the ACK is sent, so an ack means the bytes are on stable
+/// storage and replay after a crash. They remain distinct wire values for
+/// historical and forward-compatibility reasons (originally `Sync` fsynced once
+/// per record and `Batched` once per batch; both now share the batch-boundary
+/// group fsync — see `docs/architecture.md`). `Buffered` trades durability for
+/// latency: it acks before any fsync.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
-    /// fsync before ACK. Producer blocks until the record is on stable storage.
+    /// Durable before ACK: written and `fdatasync`ed (via the batch-boundary
+    /// group fsync) before the ACK — on stable storage, replays after a crash.
     Sync = 0x01,
-    /// Batch fsync. Record is written before ACK but fsync is deferred to the batch boundary.
+    /// Durable before ACK — the same guarantee as [`Durability::Sync`] today:
+    /// written and `fdatasync`ed at the batch boundary before the ACK.
+    /// (Historically `Batched` deferred fsync to the batch boundary while `Sync`
+    /// fsynced per record; both now share the batch-boundary group fsync.)
     Batched = 0x02,
     /// Memory write only. ACK is sent after the record enters the in-memory queue.
     Buffered = 0x03,
+}
+
+impl From<Durability> for u8 {
+    /// The wire byte for this tier. Inverse of [`Durability::try_from`].
+    fn from(d: Durability) -> u8 {
+        d as u8
+    }
+}
+
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Durability::Sync => "sync",
+            Durability::Batched => "batched",
+            Durability::Buffered => "buffered",
+        };
+        write!(f, "{s}")
+    }
 }
 
 /// Error returned when a `u8` does not map to a known `Durability` variant.
@@ -49,6 +80,15 @@ mod tests {
         assert_eq!(Durability::try_from(0x01).unwrap(), Durability::Sync);
         assert_eq!(Durability::try_from(0x02).unwrap(), Durability::Batched);
         assert_eq!(Durability::try_from(0x03).unwrap(), Durability::Buffered);
+    }
+
+    #[test]
+    fn from_for_u8_round_trips_and_display() {
+        for d in [Durability::Sync, Durability::Batched, Durability::Buffered] {
+            assert_eq!(Durability::try_from(u8::from(d)).unwrap(), d);
+        }
+        assert_eq!(Durability::Sync.to_string(), "sync");
+        assert_eq!(Durability::Buffered.to_string(), "buffered");
     }
 
     #[test]

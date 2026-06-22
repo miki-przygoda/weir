@@ -45,11 +45,21 @@ Total frame size: `16 + payload_len + 4` bytes.
 
 ## Durability tiers
 
-| Byte | Name      | Guarantee                                              |
-|------|-----------|--------------------------------------------------------|
-| 0x01 | Sync      | fdatasync before Ack — record on stable storage        |
-| 0x02 | Batched   | Group fdatasync at batch boundary before Ack           |
-| 0x03 | Buffered  | Ack after memory write; fsync is deferred              |
+| Byte | Name      | Guarantee                                                       |
+|------|-----------|-----------------------------------------------------------------|
+| 0x01 | Sync      | Group fdatasync at the batch boundary before Ack — on stable storage |
+| 0x02 | Batched   | Group fdatasync at the batch boundary before Ack — on stable storage |
+| 0x03 | Buffered  | Ack after memory write; fsync is deferred                       |
+
+> **Sync and Batched share the same durability guarantee.** Both fdatasync at the
+> batch boundary before acking every record in the batch — one group fsync at the
+> end of the batch covers every record written during it, so there is no
+> durability or speed distinction between the two tiers. The historical
+> "Sync = one fdatasync per record, Batched = one fdatasync per batch" distinction
+> **no longer applies** (a single-producer serial workload sees no difference
+> because the batch holds one record anyway; under concurrent producers, Sync
+> amortises into the group fsync just like Batched). See
+> [architecture.md → durability tiers](architecture.md).
 
 ---
 
@@ -79,10 +89,14 @@ an unrecognised reason byte should surface it (e.g. log the raw byte) rather
 than assume a specific meaning.
 
 `UnknownMessage` (`0x08`) is sent when a frame's header passes magic / version /
-header-CRC validation but carries a `message_type` or `durability` byte the
-daemon does not recognise — a **permanent** protocol error (typically version
-skew). It is distinct from `InternalError`: the daemon **closes** the connection
-after it, and retrying the identical frame will not succeed.
+header-CRC validation but the daemon will not act on the message: either the
+`message_type` or `durability` byte is unrecognised (typically version skew), **or
+the `message_type` is a valid daemon→client type** (`Ack` `0x02`, `Nack` `0x03`,
+or `HealthCheckResponse` `0x05`) that a client must only ever *receive*, never
+*send*. All of these are **permanent** protocol errors. It is distinct from
+`InternalError`: the daemon **closes** the connection after an `UnknownMessage`,
+and retrying the identical frame will not succeed (so a client must not retry on
+the same connection).
 
 `ReservedFlagsSet` (`0x09`) is sent when a frame's header is otherwise valid but
 sets one or more bits in the reserved `flags` byte (byte 7), which **must be
@@ -101,10 +115,10 @@ The `VersionMismatch` second byte lets a client produce a specific error:
 
 The server decodes in this order to minimise DoS surface. **This order is mandatory and must not be changed.**
 
-1. **Magic** — cheapest check; eliminates non-weir traffic before any further work. Magic is validated against whatever leading bytes are present; a buffer that *starts* with valid magic but is shorter than the 16-byte header is `TruncatedFrame`, **not** `BadMagic` — a complete header is required before any field is interpreted.
+1. **Length, then magic** — a buffer shorter than the 16-byte header is `TruncatedFrame` **regardless of its leading bytes**; magic is only interpreted once a complete header is present. So a 1–15 byte buffer is *always* `TruncatedFrame` — never `BadMagic`, even if its bytes differ from `WEIR`. Once a full header is present, magic is the cheapest check and eliminates non-weir traffic before any further work. (Length-before-magic is the reference `Envelope::decode` order in `weir-core`; conformance vector `reject_partial_magic_short` pins it.)
 2. **Version** — checked before header CRC so a v2 client gets `VersionMismatch` (actionable) rather than `HeaderCrcMismatch` (confusing) when the frame layout has shifted between versions.
 3. **Header CRC** — validates the remaining header bytes are uncorrupted.
-4. **Header field parsing** — only after the header CRC passes are the `message_type`, `durability`, and reserved `flags` bytes interpreted. An unknown `message_type` (or `durability`) yields `UnknownMessage`; a nonzero reserved `flags` byte yields `ReservedFlagsSet`. Both close the connection. (Steps 1–4 are `Header::decode` in `weir-core`.)
+4. **Header field parsing** — only after the header CRC passes are the `message_type`, `durability`, and reserved `flags` bytes interpreted. An unknown `message_type` (or `durability`) yields `UnknownMessage`; a nonzero reserved `flags` byte yields `ReservedFlagsSet`. Both close the connection. (The sub-header length check in step 1 lives in `Envelope::decode`, which slices the buffer; magic through field parsing — the rest of steps 1–4 — are `Header::decode`, which takes a fixed 16-byte header.)
 5. **Payload length cap** — `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)` checked **before any heap allocation**. Exceeding the cap returns `PayloadTooLarge` and closes the connection without reading the payload bytes. A zero-length `Push` payload is rejected here with `EmptyPayload` (a `HealthCheck` legitimately carries none).
 6. **Payload read** — only after the cap check passes.
 7. **Payload CRC** — validates the payload bytes before the record is queued.
@@ -129,6 +143,15 @@ implementation that reads from a stream must therefore frame the bytes itself
 single decode call. This keeps a desynced or concatenated stream from silently
 losing records (G18).
 
+`TruncatedFrame` (and `TrailingBytes`) are therefore **decoder-only verdicts** —
+they describe the reference codec's *exactly-one-frame* contract. A streaming
+reader never observes them: a short read is just "read more bytes" (or, past
+`connection_read_timeout_secs`, a timeout), and an over-long buffer never arises
+because the reader takes exactly `payload_len + 4` bytes. The daemon itself reads
+the header and payload separately and so never produces `TruncatedFrame` or
+`TrailingBytes` on the wire — there is no Nack reason for either (see the
+[decoder-tag → wire-Nack mapping](conformance.md#decoder-tag--wire-nack-byte)).
+
 ---
 
 ## CRC32 algorithm
@@ -147,7 +170,8 @@ algorithm as zlib, PNG, and Ethernet. Concretely:
 
 This is the algorithm exposed by the Rust [`crc32fast`](https://crates.io/crates/crc32fast)
 crate (`crc32fast::hash(bytes) -> u32`), Python's `zlib.crc32`,
-Go's `hash/crc32.IEEETable`, and Java's `java.util.zip.CRC32`. It is
+Go's `hash/crc32.IEEETable`, Java's `java.util.zip.CRC32`, and Node's
+`node:zlib.crc32` (Node >= 22.2). It is
 **not** CRC-32C (Castagnoli, polynomial `0x1EDC6F41`) — using
 CRC-32C will produce frames the daemon rejects with
 `BadHeaderCrc` or `BadPayloadCrc`.
@@ -180,6 +204,15 @@ in-flight Pushes (those without a matching Ack/Nack received yet) as
 depending on where in the pipeline the close happened. Retry on a
 fresh connection.
 
+**Cap the response `payload_len` at ≤ 2 bytes before allocating.** Every weir
+response payload is **≤ 2 bytes** (`Ack`/`HealthCheckResponse` = 0; `Nack` = 1,
+except `VersionMismatch` = 2). When reading a *response* header, reject (and close
+the connection) any declared `payload_len` larger than that *before* allocating a
+buffer — a larger length on a response is a desync or a non-weir peer, and the
+daemon never sends a large response, so honouring an attacker-chosen length would
+allocate an arbitrary buffer. This is the read-side mirror of the send-path cap
+and is also enumerated in the [producer checklist](#minimum-producer-checklist).
+
 ### When the server keeps the connection open
 
 | Event | Connection |
@@ -199,6 +232,7 @@ fresh connection.
 | Push with a zero-length payload | closed after Nack(EmptyPayload) |
 | Push with bad payload CRC | closed after Nack(BadPayloadCrc) |
 | Push with unknown message_type / durability | closed after Nack(UnknownMessage) |
+| Client sends a daemon→client message type (Ack / Nack / HealthCheckResponse) | closed after Nack(UnknownMessage) |
 | Push with a nonzero reserved `flags` byte | closed after Nack(ReservedFlagsSet) |
 | Idle past `connection_read_timeout_secs` mid-frame | closed silently (slowloris guard); no Nack |
 
@@ -214,6 +248,11 @@ bytes on the same connection.
   uid can connect. Producers must run as the same uid (or root).
 - The parent directory must exist before the daemon starts; the
   daemon does not create it.
+- **`sun_path` length cap (non-Rust producers).** A `sockaddr_un.sun_path` is a
+  fixed-size buffer — roughly **104 bytes on macOS/BSD and 108 bytes on Linux,
+  including the NUL terminator**. A socket path at or over that length fails with
+  `ENAMETOOLONG` at `connect()` (or `bind()` on the daemon side). Keep the socket
+  path comfortably short, or `chdir` near it and connect via a relative path.
 - There is no in-band handshake. Producers connect and immediately
   send a Push (or HealthCheck) frame.
 
@@ -296,10 +335,26 @@ single-byte payload.
 
 ### HealthCheck request and response
 
-A HealthCheck request has a zero-length payload. The `durability`
-field is unused (set to anything; the server doesn't read it). The
-HealthCheckResponse mirrors the shape — zero payload, all-zero
-payload CRC.
+A HealthCheck request has a zero-length payload. The daemon does not
+*act* on the `durability` field for a HealthCheck — but it still **must
+be a valid durability byte** (`0x01` Sync, `0x02` Batched, or `0x03`
+Buffered), because the daemon validates the entire header (including
+durability) before it dispatches on the message type. A HealthCheck
+carrying an out-of-range durability byte (e.g. `0x00`) is rejected with
+`UnknownDurability` → `Nack(UnknownMessage)` and the connection is
+closed, exactly as any other frame with a bad durability byte would be.
+Set it to `0x01` (Sync) by convention; the canonical `healthcheck`
+[conformance vector](conformance.md) does. The HealthCheckResponse
+mirrors the shape — zero payload, all-zero payload CRC.
+
+The canonical HealthCheck carries a **zero-length** payload. The daemon is
+currently **lenient** on this point: a HealthCheck frame that declares a
+non-empty payload (with a matching, CRC-valid `payload_crc32`) is still answered
+with a HealthCheckResponse rather than rejected — the daemon reads and CRC-checks
+the payload bytes, then dispatches on the message type and ignores the payload
+contents (the zero-length empty-payload guard applies only to `Push`). Do not
+rely on this: send a zero-length payload, and treat the non-empty case as
+unspecified — a future version may reject it.
 
 ## Minimum producer checklist
 
@@ -312,13 +367,30 @@ A non-Rust client that satisfies the following is wire-compatible:
 - [ ] Writes 4-byte payload CRC32 (same algorithm) after the payload.
 - [ ] Reads 16-byte response header, then `header.payload_len`
       response-payload bytes, then 4 response-CRC bytes.
+- [ ] **Caps the response `payload_len` at a few bytes before allocating.**
+      Every weir response payload is **≤ 2 bytes** (`Ack`/`HealthCheckResponse`
+      = 0; `Nack` = 1, except `VersionMismatch` = 2). A larger declared length
+      on a *response* is a desync or a non-weir peer — treat it as a protocol
+      error and close the connection rather than allocating an attacker-chosen
+      buffer. (This mirrors the send-path cap below; the daemon never sends a
+      large response.)
 - [ ] Verifies the response header magic, version, and CRC before
       consuming the payload.
 - [ ] Treats response `message_type == Nack` as failure; decodes the
       first byte of the response payload as `NackReason`.
-- [ ] Caps `payload_len` at the daemon's `MAX_PAYLOAD_HARD_CAP`
-      (16 MiB) — sending larger frames is wasted I/O; the daemon
-      closes the connection after the Nack.
+- [ ] Sends a **non-empty** payload on every `Push`: a zero-length `Push`
+      is rejected with `Nack(EmptyPayload 0x07)` and the connection is closed.
+      To probe liveness without a payload, send a `HealthCheck` (the correct
+      no-payload frame) — **not** an empty `Push`.
+- [ ] Caps its **send** `payload_len` at the **effective** cap —
+      `min(configured max_payload_bytes, MAX_PAYLOAD_HARD_CAP)` — not just at
+      the 16 MiB hard cap. The daemon's `max_payload_bytes` (default 16 MiB,
+      but lower in many deployments) may be **below** the hard cap, so the
+      effective boundary is the smaller of the two and a client cannot know it
+      a priori. Treat a `Nack(PayloadTooLarge 0x04)` as **authoritative**: the
+      frame exceeded the daemon's effective cap regardless of the client's own
+      estimate. Sending larger frames is wasted I/O; the daemon closes the
+      connection after the Nack without reading the payload.
 - [ ] Handles connection close mid-stream as "in-flight requests had
       unknown outcomes; retry on a fresh connection."
 

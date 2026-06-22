@@ -16,8 +16,10 @@ see [configuration.md](../operations/configuration.md).
 
 - **Rust 1.88+** (edition 2024) — `rustup toolchain install stable` (1.88
   is the declared MSRV, enforced in CI)
-- **Unix host** — Linux or macOS. weir-server does not run on Windows;
-  the `weir-core` and `weir-client` crates are cross-platform.
+- **Unix host** — Linux or macOS. `weir-server` builds on Windows but is a
+  non-functional stub there (no Unix-socket listener), so run the daemon only
+  on Linux or macOS. `weir-core` is genuinely cross-platform; `weir-client`
+  compiles everywhere but its client type is Unix-only.
 - **A writable directory** — for the WAB segments. Anywhere works;
   the examples below use `/tmp/weir-quickstart/wab`.
 
@@ -32,52 +34,117 @@ mkdir -p /tmp/weir-quickstart/wab /tmp/weir-quickstart/run
 chmod 0700 /tmp/weir-quickstart/run
 
 # 3. Run.
+#    --wab-segment-max-age-secs 2 is the low-volume default you almost
+#    certainly want (see the note right below): with the stock 256 MiB
+#    segment cap and no idle-seal, a handful of small records are acked but
+#    never sealed — so the sink (and any downstream you wire up) sees NOTHING
+#    until you stop the daemon. A 2-second idle seal drains quiet segments
+#    promptly. Drop the flag on a high-volume deployment where segments fill
+#    on their own.
 ./target/release/weir-server \
     --wab-dir /tmp/weir-quickstart/wab \
-    --socket-path /tmp/weir-quickstart/run/weir.sock
+    --socket-path /tmp/weir-quickstart/run/weir.sock \
+    --wab-segment-max-age-secs 2
 ```
 
-You should see output like:
+> **Why the idle-seal flag is here.** Idle seal (`wab_segment_max_age_secs`,
+> CLI `--wab-segment-max-age-secs`) defaults to `0` (**disabled**): a segment
+> seals only when it reaches `wab_segment_max_bytes` (default 256 MiB) or the
+> daemon shuts down. A low-volume producer that writes a few small records and
+> goes quiet gets **acked** but never seals — so the drain never forwards them
+> and the sink receives nothing until shutdown. Setting it to a couple seconds
+> (here `2`) makes a quiet segment seal on a timer and drain promptly. This is a
+> first-class knob for any low-throughput deployment; details in
+> [configuration.md](../operations/configuration.md#wab_segment_max_age_secs).
+
+You should see a few `INFO` startup lines ending with the socket and the metrics
+endpoint coming up — the two stable signals that it's ready:
 
 ```
-2026-05-26T15:23:01Z  INFO weir_server: starting weir-server  socket=/tmp/weir-quickstart/run/weir.sock wab_dir=/tmp/weir-quickstart/wab shards=1 workers=1
-2026-05-26T15:23:01Z  INFO weir_server::wab: scanning for unsealed WAB segments
-2026-05-26T15:23:01Z  INFO weir_server::socket: socket listening  path=/tmp/weir-quickstart/run/weir.sock
-2026-05-26T15:23:01Z  INFO weir_server::metrics::server: metrics endpoint bound  addr=127.0.0.1:9185
-2026-05-26T15:23:01Z  INFO weir_server: pipeline assembled; awaiting connections
+INFO weir_server::socket: socket listening  path=/tmp/weir-quickstart/run/weir.sock
+INFO weir_server::metrics::server: metrics endpoint bound  addr=127.0.0.1:9185
 ```
 
-(Exact log wording may vary by version; `workers` defaults to `shard_count`.)
+(Exact wording varies by version. You may also see benign `WARN` lines at
+startup — e.g. a CPU-affinity note, or on macOS a durability note that
+`F_BARRIERFSYNC` is not power-loss-durable; run production on Linux. `workers`
+defaults to `shard_count`.)
 
 That's a fully-functional weir daemon. Leave it running and move on
 to pushing a record.
 
 ## Push your first record
 
-**Fastest path — the bundled example.** From the weir checkout, in a
-second terminal, run the ready-made `push_simple` example against the
-socket from the run above. No project setup, no deps to wire up:
+**Fastest path — `weir-ctl push`.** If you built `weir-ctl` (it's in the
+workspace), one already-compiled command pushes a record and prints the ack —
+nothing to wire up:
+
+```bash
+weir-ctl push --socket /tmp/weir-quickstart/run/weir.sock 'hello, weir!'
+# ack  12 bytes, Batched
+```
+
+**A small load — the bundled example.** From the weir checkout, in a second
+terminal, run the ready-made `push_simple` example against the socket from the
+run above:
 
 ```bash
 cargo run --release -p weir-client --example push_simple -- \
     --socket /tmp/weir-quickstart/run/weir.sock --count 5
 ```
 
+> `push_simple` pushes `--count` records at **each** durability tier (Sync,
+> Batched, Buffered), so `--count 5` sends **15** records in total.
+
+> **Before you build a producer — three gotchas that compile and pass a smoke
+> test, then bite under load:**
+> 1. **`push()` is blocking — never call it directly from an `async fn`.** It
+>    blocks the executor thread and starves the runtime (a multi-thread runtime
+>    masks it; a single-threaded one freezes). Use the bridge in
+>    [Integrating → Producing from an async runtime](integrating.md#producing-from-an-async-runtime).
+> 2. **Ack ≠ delivered.** A successful `push` means *durably buffered*, not
+>    delivered to your sink. Nothing reaches the sink until a WAB segment seals,
+>    and the **default `noop` sink discards everything**. For low volume, set
+>    [`wab_segment_max_age_secs`](../operations/configuration.md#wab_segment_max_age_secs)
+>    so idle segments seal on a timer; configure a real
+>    [`sink_type`](../operations/configuration.md#sink_type) to actually deliver.
+>    Details in the [Ack ≠ delivered](#what-just-happened) note below.
+> 3. **`Buffered` is not power-loss durable.** It acks *before* fsync. A process
+>    crash survives (page cache), but power loss / OS crash is a loss window — use
+>    `Sync`/`Batched` for data you can't lose. (macOS is not power-safe at any
+>    tier; see the durability-tier notes in [Internals](../architecture.md).)
+
 **From your own project.** When you're ready to push from your own code,
-add `weir-client` and `weir-core` as dependencies and write a small
-program against the synchronous client API:
+add just `weir-client` and write a small program against the synchronous
+client API. `Durability` is re-exported from `weir-client`, so the basic
+producer path needs **only this one dependency** — pull in `weir-core`
+separately only if you need the lower-level wire types directly. weir isn't
+on crates.io yet (it publishes with the first crates.io release), so until then
+use a git or path dependency:
+
+```toml
+[dependencies]
+# Until the first crates.io publish lands, depend on the repo directly:
+weir-client = { git = "https://github.com/miki-przygoda/weir" }
+# (or a local path: weir-client = { path = "../weir/crates/weir-client" })
+# weir-core is only needed for the lower-level wire types, not a basic producer.
+```
+
+Then write the program against the synchronous client API:
 
 ```rust
 // examples/hello.rs
-use weir_client::WeirClient;
-use weir_core::Durability;
+use weir_client::{Durability, WeirClient}; // Durability is re-exported here
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = WeirClient::connect("/tmp/weir-quickstart/run/weir.sock")?;
 
-    // Push a 12-byte record with Sync durability (fsync before ack).
+    // push() returns Result<(), ClientError>: Ok(()) means the record was
+    // durably acked at the requested tier. There is no ack payload — no
+    // server-assigned offset or id comes back. A dropped/ignored result hides a
+    // failed push, so `push` is #[must_use]; handle it (here via `?`).
     let payload = b"hello, weir!";
-    client.push(payload, Durability::Sync)?;
+    client.push(payload, Durability::Sync)?; // Sync = fsync before ack
     println!("pushed {} bytes", payload.len());
 
     // Verify the daemon is healthy.
@@ -88,9 +155,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The client API is synchronous — one blocking socket round-trip per call,
-no async runtime required. Add `weir-client` and `weir-core` to your
-example/dev deps, then:
+The client API is synchronous — one blocking socket round-trip per call, so you
+don't *need* an async runtime to use it. (If you're calling from inside one,
+`push()` blocks the executor thread — see
+[Integrating → Producing from an async runtime](integrating.md#producing-from-an-async-runtime)
+for the bridge pattern.) Add `weir-client` to your example/dev deps, then:
 
 ```bash
 cargo run --release --example hello
@@ -117,14 +186,19 @@ You'll see weir's Prometheus metric families (the full catalogue is in
 [monitoring.md](../monitoring.md)):
 
 ```
-# HELP weir_records_accepted_total Records accepted from producers
-# TYPE weir_records_accepted_total counter
+# HELP weir_records_accepted Total records accepted from producers, by durability tier
+# TYPE weir_records_accepted counter
 weir_records_accepted_total{tier="sync"} 1
-# HELP weir_records_ack_total Records acknowledged to producers
-# TYPE weir_records_ack_total counter
+# HELP weir_records_ack Total records acknowledged to producers, by durability tier
+# TYPE weir_records_ack counter
 weir_records_ack_total{tier="sync"} 1
 ...
 ```
+
+The exporter (`prometheus-client`) appends the `_total` suffix only to the
+counter **data** rows — the `# HELP`/`# TYPE` rows carry the base name. A labeled
+counter series is also absent until the first matching event initialises it, so a
+family with no traffic yet shows only its `# HELP`/`# TYPE` lines and no data row.
 
 The full metrics catalogue — every family, its labels, and the alerts
 that matter — lives in [monitoring.md](../monitoring.md).
@@ -159,14 +233,19 @@ For the full pipeline detail, see
 > a handful of small records the sink isn't touched until you stop the daemon,
 > and with the default `noop` sink nothing is forwarded at all (it's a soak-test
 > sink). Confirm acceptance with `weir_records_ack_total`, not the sink-commit
-> metric; to force a drain in a demo, send `SIGTERM` (graceful shutdown seals
-> the open segment).
+> metric. To make a low-volume deployment drain promptly, set
+> `wab_segment_max_age_secs` (e.g. `2`) so an idle segment seals on a timer
+> instead of waiting to fill 256 MiB; for a one-off demo you can also just send
+> `SIGTERM` (graceful shutdown seals the open segment).
 
 ## Cleaning up
 
 ```bash
-# Stop the daemon (Ctrl-C in its terminal, or):
-pkill weir-server
+# Stop the daemon: Ctrl-C in its terminal, or kill the specific PID you started:
+kill "$(pgrep -f -- '--wab-dir /tmp/weir-quickstart')"
+# (This matches only the quickstart daemon by its --wab-dir flag. Avoid
+#  `pkill weir-server` on a shared host — it kills every weir daemon, not
+#  just this quickstart's.)
 
 # Remove the quickstart data.
 rm -rf /tmp/weir-quickstart
@@ -203,6 +282,8 @@ shrink the payload.
 
 ## Next steps
 
+- [Integrating & extending](integrating.md) — use weir's crates without the
+  daemon: produce from your own app, write a custom sink, or read the WAB directly.
 - [Configuration reference](../operations/configuration.md) — every
   option, default, range, and when to tune.
 - [Install options](install.md) — building from source, container

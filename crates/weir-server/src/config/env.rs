@@ -11,6 +11,7 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         batch_size: env_parse("WEIR_BATCH_SIZE")?,
         batch_deadline_ms: env_parse("WEIR_BATCH_DEADLINE_MS")?,
         wab_segment_max_bytes: env_parse("WEIR_WAB_SEGMENT_MAX_BYTES")?,
+        wab_segment_max_age_secs: env_parse("WEIR_WAB_SEGMENT_MAX_AGE_SECS")?,
         max_connections: env_parse("WEIR_MAX_CONNECTIONS")?,
         max_payload_bytes: env_parse("WEIR_MAX_PAYLOAD_BYTES")?,
         metrics_port: env_parse("WEIR_METRICS_PORT")?,
@@ -25,6 +26,9 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         sink_max_batch_size: env_parse("WEIR_SINK_MAX_BATCH_SIZE")?,
         sink_send_idempotency_key: env_bool("WEIR_SINK_SEND_IDEMPOTENCY_KEY")?,
         sink_http_concurrency: env_parse("WEIR_SINK_HTTP_CONCURRENCY")?,
+        sink_http_batch: env_string("WEIR_SINK_HTTP_BATCH")?,
+        sink_max_retries: env_parse("WEIR_SINK_MAX_RETRIES")?,
+        sink_retry_base_delay_ms: env_parse("WEIR_SINK_RETRY_BASE_DELAY_MS")?,
         #[cfg(feature = "mysql-sink")]
         sink_mysql_table: env_string("WEIR_SINK_MYSQL_TABLE")?,
         #[cfg(feature = "mysql-sink")]
@@ -45,6 +49,7 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         sink_clickhouse_column: env_string("WEIR_SINK_CLICKHOUSE_COLUMN")?,
         dead_letter_max_bytes: env_parse("WEIR_DEAD_LETTER_MAX_BYTES")?,
         dead_letter_check_interval_secs: env_parse("WEIR_DEAD_LETTER_CHECK_INTERVAL_SECS")?,
+        health_poll_interval_secs: env_parse("WEIR_HEALTH_POLL_INTERVAL_SECS")?,
         log_level: env_string("WEIR_LOG_LEVEL")?,
         tcp_bind: env_string("WEIR_TCP_BIND")?,
         tls_cert_path: env_path("WEIR_TLS_CERT")?,
