@@ -1666,4 +1666,41 @@ mod tests {
         assert!(!classify_status_transient(StatusCode::CONFLICT));
         assert!(!classify_status_transient(StatusCode::PAYLOAD_TOO_LARGE));
     }
+
+    #[tokio::test]
+    async fn bearer_token_is_attached_as_authorization_header() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let url = spawn_header_capture_server(Arc::clone(&captured)).await;
+        let mut c = cfg(&url);
+        c.bearer_token = Some(Arc::from("s3cr3t-token"));
+        let sink = HttpSink::new(c).unwrap();
+        sink.commit(vec![p(b"rec")]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 1, "the server must have received one POST");
+        assert!(
+            headers[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer s3cr3t-token"),
+            "the bearer token must be on the wire, got headers:\n{}",
+            headers[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_bearer_token_means_no_authorization_header() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let url = spawn_header_capture_server(Arc::clone(&captured)).await;
+        let sink = HttpSink::new(cfg(&url)).unwrap(); // bearer_token: None
+        sink.commit(vec![p(b"rec")]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 1);
+        assert!(
+            !headers[0].to_ascii_lowercase().contains("authorization:"),
+            "no Authorization header must be sent when no token is configured"
+        );
+    }
 }

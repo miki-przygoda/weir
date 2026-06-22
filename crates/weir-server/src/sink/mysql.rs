@@ -498,6 +498,33 @@ mod tests {
         assert!(!is_transient_server_code(1406)); // data too long for column
     }
 
+    #[test]
+    fn classify_maps_driver_errors_to_transient_or_permanent() {
+        use mysql_async::{Error as E, ServerError};
+        let server = |code| {
+            E::Server(ServerError {
+                code,
+                message: "msg".to_string(),
+                state: "HY000".to_string(),
+            })
+        };
+        // Server error: routed through is_transient_server_code.
+        assert!(
+            classify(server(1205)).is_transient(),
+            "lock-wait-timeout (1205) must be transient"
+        );
+        assert!(
+            classify(server(1045)).is_transient(),
+            "access-denied (1045) is a fixable misconfig — transient, not dead-letter (F31)"
+        );
+        assert!(
+            !classify(server(1064)).is_transient(),
+            "syntax error (1064) is the data's fault — permanent"
+        );
+        // Driver/IO errors are always transient (network/pool blips).
+        assert!(classify(E::Driver(mysql_async::DriverError::ConnectionClosed)).is_transient());
+    }
+
     #[tokio::test]
     async fn empty_batch_is_a_noop() {
         // Builds a sink against a URL whose host is unreachable; if the

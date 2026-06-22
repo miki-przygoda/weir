@@ -716,7 +716,6 @@ mod tests {
                         }
                     };
                     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                    let request_line = head.lines().next().unwrap_or("").to_string();
                     // Drain the body so the client's send() completes cleanly.
                     let content_length = head
                         .lines()
@@ -735,7 +734,10 @@ mod tests {
                             Ok(n) => have += n,
                         }
                     }
-                    captured.lock().unwrap().push(request_line);
+                    // Capture the FULL header block (request line + headers) so
+                    // tests can assert both the request-line query params and the
+                    // headers the sink sent (e.g. Authorization).
+                    captured.lock().unwrap().push(head);
                     if !sleep_before.is_zero() {
                         tokio::time::sleep(sleep_before).await;
                     }
@@ -765,6 +767,33 @@ mod tests {
             reqs[0].contains("insert_deduplication_token="),
             "no dedup token on the wire: {}",
             reqs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn url_credentials_are_sent_as_basic_auth_not_in_the_request_line() {
+        let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
+        // Inject userinfo into the authority: http://weiruser:s3cr3t@host/
+        let cred_url = url.replacen("http://", "http://weiruser:s3cr3t@", 1);
+        let sink = ClickHouseSink::new(cfg(&cred_url, "weir_records", "payload")).unwrap();
+        sink.commit(vec![p(b"a")]).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "expected exactly one POST");
+        // Credentials are moved into an Authorization: Basic header...
+        assert!(
+            reqs[0]
+                .to_ascii_lowercase()
+                .contains("authorization: basic "),
+            "URL credentials must become a Basic auth header, got:\n{}",
+            reqs[0]
+        );
+        // ...and never appear in the request-line target.
+        let request_line = reqs[0].lines().next().unwrap_or("");
+        assert!(
+            !request_line.contains("weiruser") && !request_line.contains("s3cr3t"),
+            "credentials leaked into the request line: {request_line}"
         );
     }
 
