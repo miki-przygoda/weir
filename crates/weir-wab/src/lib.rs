@@ -352,6 +352,18 @@ pub enum SegmentVerifyError {
     /// extra bytes after the footer — a sealed segment ends at the footer, so a
     /// trailing byte signals appended garbage or a concatenated second segment.
     TrailingBytes,
+    /// The footer's `record_count` / `data_bytes` did not match the records
+    /// actually walked. These two fields sit AFTER the sentinel, so `file_crc32`
+    /// (which covers only pre-sentinel bytes) does not protect them — a corrupt
+    /// value here would otherwise be handed to a forensics/ctl consumer as truth.
+    FooterMismatch {
+        /// `"record_count"` or `"data_bytes"`.
+        field: &'static str,
+        /// The value recorded in the footer.
+        expected: u64,
+        /// The value computed by walking the records.
+        computed: u64,
+    },
 }
 
 impl std::fmt::Display for SegmentVerifyError {
@@ -376,6 +388,14 @@ impl std::fmt::Display for SegmentVerifyError {
             Self::TrailingBytes => write!(
                 f,
                 "extra bytes after the footer: a sealed segment must end at its footer"
+            ),
+            Self::FooterMismatch {
+                field,
+                expected,
+                computed,
+            } => write!(
+                f,
+                "footer {field} mismatch: footer recorded {expected}, records walked give {computed}"
             ),
         }
     }
@@ -434,6 +454,8 @@ pub fn verify_sealed_segment(
     let header = parse_segment_header(&header_buf).map_err(SegmentVerifyError::Header)?;
 
     // --- Records: walk framing to the sentinel, hashing every pre-sentinel byte. ---
+    let mut walked_records: u64 = 0;
+    let mut walked_data_bytes: u64 = 0;
     loop {
         let mut len_buf = [0u8; 4];
         match reader.read_exact(&mut len_buf) {
@@ -451,6 +473,8 @@ pub fn verify_sealed_segment(
             // covers only the pre-sentinel bytes. Break to read the footer.
             break;
         }
+        walked_records += 1;
+        walked_data_bytes += payload_len as u64;
         // A real record header → hash the length field.
         hasher.update(&len_buf);
 
@@ -514,6 +538,24 @@ pub fn verify_sealed_segment(
         return Err(SegmentVerifyError::CrcMismatch {
             expected: footer.file_crc32,
             computed,
+        });
+    }
+
+    // The footer's record_count / data_bytes sit after the sentinel, so file_crc32
+    // does not protect them. Cross-check against what we actually walked so a
+    // corrupt count is never reported to a consumer as truth.
+    if footer.record_count != walked_records {
+        return Err(SegmentVerifyError::FooterMismatch {
+            field: "record_count",
+            expected: footer.record_count,
+            computed: walked_records,
+        });
+    }
+    if footer.data_bytes != walked_data_bytes {
+        return Err(SegmentVerifyError::FooterMismatch {
+            field: "data_bytes",
+            expected: footer.data_bytes,
+            computed: walked_data_bytes,
         });
     }
 
@@ -1008,6 +1050,49 @@ mod tests {
             other => panic!("expected TrailingBytes, got {other:?}"),
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn verify_sealed_segment_detects_footer_count_corruption() {
+        // record_count / data_bytes sit AFTER the sentinel, so file_crc32 does not
+        // cover them — corrupting either still leaves the CRC valid and must be
+        // caught by the footer cross-check.
+        let base = build_sealed_segment(7, &[b"alpha", b"beta", b"gamma"]); // 3 recs, 14 bytes
+        let foot = base.bytes.len() - SEGMENT_FOOTER_LEN;
+
+        let mut b1 = base.bytes.clone();
+        b1[foot..foot + 8].copy_from_slice(&99u64.to_le_bytes());
+        let p1 = write_bytes("verify_footer_rc", &b1);
+        match verify_sealed_segment(&p1) {
+            Err(SegmentVerifyError::FooterMismatch {
+                field: "record_count",
+                expected: 99,
+                computed: 3,
+            }) => {}
+            other => panic!("expected record_count FooterMismatch, got {other:?}"),
+        }
+        std::fs::remove_file(&p1).ok();
+
+        let mut b2 = base.bytes.clone();
+        b2[foot + 8..foot + 16].copy_from_slice(&12_345u64.to_le_bytes());
+        let p2 = write_bytes("verify_footer_db", &b2);
+        match verify_sealed_segment(&p2) {
+            Err(SegmentVerifyError::FooterMismatch {
+                field: "data_bytes",
+                expected: 12_345,
+                computed: 14,
+            }) => {}
+            other => panic!("expected data_bytes FooterMismatch, got {other:?}"),
+        }
+        std::fs::remove_file(&p2).ok();
+    }
+
+    #[test]
+    fn list_segment_files_propagates_read_dir_error() {
+        // Fail closed on a missing directory rather than returning an empty Ok.
+        let missing = tmp_path("list_missing_dir");
+        let err = list_segment_files(&missing).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
