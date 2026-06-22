@@ -110,6 +110,11 @@ impl Header {
     /// a bare `Header::encode` always declares `payload_len = 0`, so it is only
     /// valid for the genuinely-empty-payload frames (Ack / HealthCheck) that use
     /// it (F50).
+    ///
+    /// In wire v1 `flags` MUST be 0. Any other value encodes a frame that
+    /// [`Header::decode`] rejects with [`DecodeError::ReservedFlagsSet`] (and the
+    /// daemon Nacks then closes the connection); the parameter is kept non-zero-
+    /// capable only so the codec can construct reject-path test frames.
     #[must_use]
     pub fn new(message_type: MessageType, durability: Durability, flags: u8) -> Self {
         Self {
