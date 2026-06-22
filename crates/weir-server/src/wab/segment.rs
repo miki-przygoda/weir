@@ -630,6 +630,52 @@ mod tests {
         dir
     }
 
+    /// WabSegment::create is the daemon's segment-creation trust boundary:
+    /// O_EXCL (never clobber an existing file), O_NOFOLLOW (never follow a
+    /// symlink), and mode 0o600 (private to the daemon). Pins all three.
+    #[test]
+    fn wab_segment_create_is_exclusive_nofollow_and_private() {
+        let dir = tmp_dir("create_guards");
+
+        // O_EXCL: creating over an existing file fails with AlreadyExists and
+        // leaves the existing bytes untouched.
+        let existing = dir.join("seg_00000001.wab");
+        fs::write(&existing, b"pre-existing").unwrap();
+        let err = match WabSegment::create(&existing, 0) {
+            Ok(_) => panic!("create over an existing file must fail (O_EXCL)"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&existing).unwrap(), b"pre-existing");
+
+        // Fresh create: mode is exactly 0o600 (no group/other access).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let fresh = dir.join("seg_00000002.wab");
+            let _seg = WabSegment::create(&fresh, 0).unwrap();
+            let mode = fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "segment files must be private (0o600)");
+        }
+
+        // O_NOFOLLOW: creating at a path that is a symlink fails rather than
+        // following it (create_new on a symlink errors regardless, but this pins
+        // the no-follow intent).
+        #[cfg(unix)]
+        {
+            let target = dir.join("nofollow_target.bin");
+            let link = dir.join("seg_00000003.wab");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(
+                WabSegment::create(&link, 0).is_err(),
+                "create must refuse a symlinked target path"
+            );
+            assert!(!target.exists(), "the symlink target must not be created");
+        }
+
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn wab_segment_tracks_record_count() {
         let dir = tmp_dir("count");

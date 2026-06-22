@@ -1461,6 +1461,58 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// An unknown segment-header FORMAT_VERSION is quarantined like a bad magic
+    /// (mirrors `recovery_quarantines_bad_magic` for the version byte at [4]).
+    #[test]
+    fn recovery_quarantines_unknown_format_version() {
+        let dir = tmp_dir("badversion");
+        let path = make_segment(&dir, 0, &[b"keep"]);
+        // Bump the header's format-version byte (offset 4) to an unknown value.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[4] = bytes[4].wrapping_add(7);
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        let err = recover_segment(&path, &dir, &metrics).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("unknown format version"),
+            "got: {err}"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        assert!(!path.exists(), "the bad-version segment must be quarantined");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// O_NOFOLLOW on the recovery read pass: a segment path that is a symlink
+    /// (swapped in by an attacker with write access to the WAB dir) must fail the
+    /// open with ELOOP rather than be followed to an attacker-chosen target. Pins
+    /// the threat-model claim (S26) that segment opens don't follow symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_to_follow_a_symlinked_segment_path() {
+        use crate::wab::segment::segment_path;
+        let dir = tmp_dir("recover_symlink");
+        // A real target file the symlink points at (must NOT be opened/followed).
+        let target = dir.join("target.bin");
+        fs::write(&target, b"attacker-controlled").unwrap();
+        // seg_00000001.wab is a symlink to the target.
+        let link = segment_path(&dir, 1);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let metrics = noop_metrics();
+        let err = recover_segment(&link, &dir, &metrics).unwrap_err();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "O_NOFOLLOW must refuse the symlink (ELOOP), got: {err}"
+        );
+        // The symlink target was not touched, and nothing was quarantined.
+        assert_eq!(fs::read(&target).unwrap(), b"attacker-controlled");
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn quarantine_preserves_same_named_segments_from_different_shards() {
         // Segment counters are shard-local, so seg_00000001.wab exists in every
