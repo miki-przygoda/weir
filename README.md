@@ -3,7 +3,7 @@
 [![CI](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
-<!-- crates.io + docs.rs badges to be added in the same commit as the 1.0 crates.io publish -->
+<!-- crates.io + docs.rs badges to be added in the same commit as the first crates.io publish -->
 
 A durable, high-throughput write buffer for Rust.
 

@@ -119,12 +119,12 @@ add just `weir-client` and write a small program against the synchronous
 client API. `Durability` is re-exported from `weir-client`, so the basic
 producer path needs **only this one dependency** — pull in `weir-core`
 separately only if you need the lower-level wire types directly. weir isn't
-on crates.io yet (it publishes with 1.0), so until then use a git or path
-dependency:
+on crates.io yet (it publishes with the first crates.io release), so until then
+use a git or path dependency:
 
 ```toml
 [dependencies]
-# Until the crates.io publish lands with 1.0, depend on the repo directly:
+# Until the first crates.io publish lands, depend on the repo directly:
 weir-client = { git = "https://github.com/miki-przygoda/weir" }
 # (or a local path: weir-client = { path = "../weir/crates/weir-client" })
 # weir-core is only needed for the lower-level wire types, not a basic producer.
