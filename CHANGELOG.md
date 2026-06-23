@@ -13,6 +13,23 @@ protocol** below.
 
 ---
 
+## [1.3.1] - 2026-06-23
+
+Test/CI-robustness patch. **No functional change to any published crate** — the
+library and daemon code is byte-identical to 1.3.0.
+
+### Fixed
+
+- **`batch_deadline_timer_keeps_latency_bounded` is no longer flaky.** Its
+  per-sample tail assertion (every one of 100 Sync pushes within 5× the batch
+  deadline) tripped on a single OS scheduling hiccup on a loaded CI runner.
+  Replaced with distribution bounds — median ≤ 2× deadline (the primary
+  starvation guard) and **p95** ≤ 5× deadline (the tail, tolerant of jitter
+  outliers). A real starvation regression still trips it; transient CI jitter
+  no longer does.
+
+---
+
 ## [1.3.0] - 2026-06-22
 
 Hardening + test-completeness release from four pre-publication sweeps (three
@@ -1639,6 +1656,7 @@ The five commits making up this pass:
 
 ---
 
+[1.3.1]: https://github.com/miki-przygoda/weir/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/miki-przygoda/weir/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/miki-przygoda/weir/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/miki-przygoda/weir/compare/v1.0.0...v1.1.0
