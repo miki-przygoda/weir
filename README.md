@@ -19,7 +19,7 @@ replays after a crash.
 *(indicative — single box, sandboxed CI runners; reproduce on your own hardware, see [benchmarks](docs/benchmarks.md))* ·
 5 built-in sinks (4 in a default build; `clickhouse` opt-in) · v1 wire + Rust API frozen under SemVer
 
-**▶ [Try the demo](demo/index.html)** — a self-contained, browser-only
+**▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
 simulation of the pipeline: push records, flip the durability tier, crash the
 daemon mid-flight, and watch unconfirmed segments replay, side by side with a
 naive insert-per-record baseline. No build step — open `demo/index.html` in any
