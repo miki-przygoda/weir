@@ -15,13 +15,14 @@ COPY crates/weir-wab/Cargo.toml      crates/weir-wab/Cargo.toml
 COPY crates/weir-server/Cargo.toml   crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml   crates/weir-client/Cargo.toml
 # weir-sink-sdk is a real dependency of weir-server (the Sink trait contract);
-# weir-ctl and weir-testkit are workspace members that don't ship in the image
-# but whose manifests Cargo must read to resolve the workspace. All member
-# Cargo.tomls must be present here (+ a stub source below) or `cargo build`
-# fails resolving the workspace.
+# weir-ctl, weir-testkit, and the `weir` facade are workspace members that don't
+# ship in the image but whose manifests Cargo must read to resolve the workspace.
+# All member Cargo.tomls must be present here (+ a stub source below) or
+# `cargo build` fails resolving the workspace.
 COPY crates/weir-sink-sdk/Cargo.toml crates/weir-sink-sdk/Cargo.toml
 COPY crates/weir-ctl/Cargo.toml      crates/weir-ctl/Cargo.toml
 COPY crates/weir-testkit/Cargo.toml  crates/weir-testkit/Cargo.toml
+COPY crates/weir/Cargo.toml          crates/weir/Cargo.toml
 
 # Stub sources so Cargo can resolve the workspace and compile dependencies.
 RUN mkdir -p \
@@ -31,7 +32,8 @@ RUN mkdir -p \
         crates/weir-client/src \
         crates/weir-sink-sdk/src \
         crates/weir-ctl/src \
-        crates/weir-testkit/src && \
+        crates/weir-testkit/src \
+        crates/weir/src && \
     echo 'fn main(){}' > crates/weir-server/src/main.rs && \
     echo 'fn main(){}' > crates/weir-ctl/src/main.rs && \
     touch \
@@ -39,7 +41,8 @@ RUN mkdir -p \
         crates/weir-wab/src/lib.rs \
         crates/weir-client/src/lib.rs \
         crates/weir-sink-sdk/src/lib.rs \
-        crates/weir-testkit/src/lib.rs
+        crates/weir-testkit/src/lib.rs \
+        crates/weir/src/lib.rs
 
 # --locked enforces that Cargo.lock is used verbatim; cargo refuses to update
 # it during the build. Without --locked, a transient lockfile-resolution issue
