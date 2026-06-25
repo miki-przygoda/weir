@@ -1,0 +1,39 @@
+[package]
+name = "weir"
+description = "Durable write buffer for Rust — facade re-exporting the weir-* libraries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["durability", "write-buffer", "wal", "ingestion", "buffer"]
+categories = ["database", "network-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# Core-only by default: a bare `weir` dep re-exports just `weir::core` (the shared
+# wire-protocol types). Everything else is opt-in so consumers pull only the dep
+# tree they actually use — the small client without the sink/segment crates, etc.
+default = []
+# Connect to the daemon and send records (`weir::client`).
+client = ["dep:weir-client"]
+# Build a custom downstream sink (`weir::sink_sdk`).
+sink-sdk = ["dep:weir-sink-sdk"]
+# Read on-disk WAB segments (`weir::wab`).
+wab = ["dep:weir-wab"]
+# Everything above at once.
+full = ["client", "sink-sdk", "wab"]
+# The mutual-TLS client — passthrough to weir-client's own `tls` feature.
+tls = ["client", "weir-client/tls"]
+
+[dependencies]
+# weir-core is the only non-optional dependency: it carries the shared wire types
+# (Payload, Durability, NackReason, …) that every other piece builds on, and it is
+# tiny (crc32fast + bytes), so it is always re-exported as `weir::core`.
+weir-core = { workspace = true }
+weir-client = { workspace = true, optional = true }
+weir-sink-sdk = { workspace = true, optional = true }
+weir-wab = { workspace = true, optional = true }
