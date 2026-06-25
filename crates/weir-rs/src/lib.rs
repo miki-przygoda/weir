@@ -3,9 +3,10 @@
 //!
 //! [weir]: https://github.com/miki-przygoda/weir
 //!
-//! `weir` re-exports the published `weir-*` **library** crates under short module
-//! names so an application can depend on a single crate and a single version line.
-//! It adds no functionality of its own — each module *is* the corresponding crate:
+//! `weir-rs` re-exports the published `weir-*` **library** crates under short
+//! module names so an application can depend on a single crate and a single
+//! version line. It adds no functionality of its own — each module *is* the
+//! corresponding crate:
 //!
 //! | Module       | Crate           | Feature     | Purpose                                |
 //! |--------------|-----------------|-------------|----------------------------------------|
@@ -15,18 +16,19 @@
 //! | [`wab`]      | `weir-wab`      | `wab`       | Read on-disk WAB segments              |
 //!
 //! Enable `full` for all of the above at once, or `tls` for the mutual-TLS client.
+//! The crate is published as `weir-rs`; the import root is `weir_rs`.
 //!
 //! ```toml
 //! # just the wire types
-//! weir = "1.3"
+//! weir-rs = "1.3"
 //! # an app that talks to the daemon
-//! weir = { version = "1.3", features = ["client"] }
+//! weir-rs = { version = "1.3", features = ["client"] }
 //! ```
 //!
 //! The daemon (`weir-server`) and the admin CLI (`weir-ctl`) are **binaries**, not
 //! libraries — install them with `cargo install weir-server` / `cargo install
-//! weir-ctl`. They are intentionally not re-exported here, so depending on `weir`
-//! never pulls the daemon's async/sink/TLS dependency tree.
+//! weir-ctl`. They are intentionally not re-exported here, so depending on
+//! `weir-rs` never pulls the daemon's async/sink/TLS dependency tree.
 #![deny(missing_docs)]
 
 /// Shared wire-protocol types — [`Payload`](weir_core::Payload),

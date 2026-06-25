@@ -20,13 +20,15 @@ library and daemon code is byte-identical to 1.3.0.
 
 ### Added
 
-- **New `weir` facade crate.** Re-exports the published library crates under
-  short module names behind features (`weir::core` always on; `client`,
+- **New `weir-rs` facade crate.** Re-exports the published library crates under
+  short module names behind features (`weir_rs::core` always on; `client`,
   `sink-sdk`, `wab`, plus `full` and `tls`), so a consumer can depend on a
-  single crate and a single version line. Purely additive — the six existing
-  crates are unchanged (the byte-identical note above still holds), and the
-  daemon (`weir-server`) and CLI (`weir-ctl`) remain `cargo install` binaries
-  that are intentionally not re-exported.
+  single crate and a single version line. Published as `weir-rs` because the
+  bare `weir` name is already taken on crates.io by an unrelated project; the
+  import root is `weir_rs`. Purely additive — the six existing crates are
+  unchanged (the byte-identical note above still holds), and the daemon
+  (`weir-server`) and CLI (`weir-ctl`) remain `cargo install` binaries that are
+  intentionally not re-exported.
 
 ### Fixed
 

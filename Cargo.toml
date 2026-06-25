@@ -7,7 +7,7 @@ members = [
     "crates/weir-client",
     "crates/weir-ctl",
     "crates/weir-testkit",
-    "crates/weir",
+    "crates/weir-rs",
 ]
 resolver = "2"
 
