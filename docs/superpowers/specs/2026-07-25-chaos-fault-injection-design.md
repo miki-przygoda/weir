@@ -117,10 +117,19 @@ fault zone.**
 Sustained producer pool over `weir-client`. Per record it assigns a unique
 identity and records the outcome in an in-memory **ledger**.
 
-- **Record identity.** The payload carries a 16-byte prefix:
-  `[run_id: u64 LE][seq: u64 LE]`, followed by filler to the configured record
+- **Record identity.** The payload is **newline-free ASCII JSON**:
+  `{"run":<u64>,"seq":<u64>,"pad":"aaa…"}`, padded to the configured record
   size. `run_id` is derived from the schedule seed, so records from a previous
   run can never be mistaken for the current one.
+
+  > **This encoding is load-bearing, not cosmetic.** The HTTP sink's NDJSON
+  > batch mode **dead-letters any record containing an embedded `0x0A`**
+  > (`sink/http.rs:513-525`) rather than failing the batch. A binary payload
+  > whose bytes happened to include a newline would be acked, silently
+  > diverted to the dead-letter store, and never delivered — which the
+  > verifier would report as an I1 violation that is really a harness bug.
+  > ASCII JSON makes that class of false positive unrepresentable, and
+  > doubles as the recorder's parse format.
 - **Ledger outcomes** — exactly three, and the third is not a failure:
   - `Acked` — weir returned `Ack`. **This is a promise and the suite holds weir
     to it.**
