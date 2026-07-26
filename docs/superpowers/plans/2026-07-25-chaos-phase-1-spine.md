@@ -402,7 +402,7 @@ impl LedgerEntry {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd chaos && cargo test`
-Expected: PASS — 6 tests.
+Expected: PASS — 7 tests (4 from Task 1 + 3 new).
 
 - [ ] **Step 5: Commit**
 
