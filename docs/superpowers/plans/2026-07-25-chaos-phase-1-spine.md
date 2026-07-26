@@ -554,7 +554,7 @@ fn unescape_reason(s: &str) -> String {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd chaos && cargo test`
-Expected: PASS — 12 tests (4 from Task 1 + 8 new).
+Expected: PASS — 11 tests (4 from Task 1 + 7 ledger tests).
 
 - [ ] **Step 5: Commit**
 
