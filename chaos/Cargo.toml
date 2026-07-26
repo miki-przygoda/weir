@@ -24,3 +24,9 @@ weir-core = { path = "../crates/weir-core" }
 # `cargo build` and bare `cargo test` here fail with "can't find bin". Tasks 3
 # and 4 each add their own block alongside the file it points at, so this
 # project builds and its tests pass after every task.
+
+[[bin]]
+name = "recorder"
+path = "src/bin/recorder.rs"
+test = true
+doc = false
