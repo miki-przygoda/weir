@@ -246,6 +246,7 @@ Create `chaos/.gitignore`:
 ```
 target/
 runs/
+__pycache__/
 ```
 
 - [ ] **Step 6: Verify the weir workspace is unaffected**
