@@ -21,7 +21,6 @@ import urllib.request
 
 DRAINING = 'weir_drain_state{state="draining"}'
 BLOCKED = 'weir_drain_state{state="blocked_dead_letter_full"}'
-RETRYING = 'weir_drain_state{state="retrying_transient"}'
 
 
 def parse(text):
@@ -35,14 +34,28 @@ def parse(text):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.rsplit(" ", 1)
-        if len(parts) != 2:
+        head, sep, last = line.rpartition(" ")
+        if not sep:
             continue
-        name, value = parts
         try:
-            out[name] = float(value)
+            value = float(last)
         except ValueError:
             continue
+        # OpenMetrics permits an optional trailing timestamp (`name value ts`).
+        # Taking the last field blindly would read the timestamp as the value
+        # AND fold the real value into the key, so the canonical key silently
+        # vanishes from the dict. If the remainder also ends in a number, the
+        # last field was the timestamp. (Checking this way, rather than
+        # splitting on the first space, keeps a label value containing a space
+        # intact — weir emits none, but the parser should not depend on that.)
+        head2, sep2, prev = head.rpartition(" ")
+        if sep2:
+            try:
+                value = float(prev)
+                head = head2
+            except ValueError:
+                pass
+        out[head] = value
     return out
 
 
@@ -65,13 +78,25 @@ def wait_for_quiescence(
     deadline = time.monotonic() + timeout_s
     last_bytes = None
     stable = 0
+    ok_scrapes = 0
+    failed_scrapes = 0
+    last_error = ""
 
-    while time.monotonic() < deadline:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             m = scrape_fn(metrics_url)
-        except Exception:  # daemon may be mid-restart; keep polling
+            ok_scrapes += 1
+        except Exception as exc:  # daemon may be mid-restart; keep polling
+            failed_scrapes += 1
+            last_error = f"{type(exc).__name__}: {exc}"
             if poll_interval_s:
-                time.sleep(poll_interval_s)
+                # Never sleep past the deadline — an unconditional sleep
+                # overshoots badly whenever poll_interval_s is large relative
+                # to timeout_s (measured 6x over at 3s poll / 0.5s timeout).
+                time.sleep(min(poll_interval_s, max(0.0, deadline - time.monotonic())))
             continue
 
         if m.get(BLOCKED, 0.0) == 1.0:
@@ -90,6 +115,19 @@ def wait_for_quiescence(
         last_bytes = wab_bytes
 
         if poll_interval_s:
-            time.sleep(poll_interval_s)
+            time.sleep(min(poll_interval_s, max(0.0, deadline - time.monotonic())))
 
-    return False, f"timeout after {timeout_s}s waiting for drain quiescence"
+    # Distinguish a harness/config problem from a genuine finding. Both return
+    # False, but on a multi-day run an identical reason string for "the URL was
+    # wrong the whole time" and "the drain really never settled" costs hours of
+    # misdirected investigation.
+    if ok_scrapes == 0:
+        return False, (
+            f"timeout after {timeout_s}s: every scrape of {metrics_url} failed "
+            f"({failed_scrapes} attempts, last: {last_error}). This is a harness "
+            "or configuration problem, not a weir finding."
+        )
+    return False, (
+        f"timeout after {timeout_s}s waiting for drain quiescence "
+        f"({ok_scrapes} successful scrapes, {failed_scrapes} failed)"
+    )
