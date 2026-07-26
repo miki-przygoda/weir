@@ -2330,6 +2330,89 @@ class TestAccumulator(unittest.TestCase):
         self.assertEqual(r.delivered_distinct, 1)
         self.assertAlmostEqual(r.duplicate_rate, 3.0)
 
+    def test_a_conflicting_tag_for_one_seq_fails_and_keeps_the_first(self):
+        # loadgen allocates seq from a single monotonic counter, so a repeat
+        # means corruption or cross-run pollution. Silently overwriting would
+        # RECLASSIFY an outcome, which this module's contract forbids.
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["5 S 1 1 UNK"], [])
+        acc.ingest(["5 S 2 2 ACK"], [])
+        r = acc.check()
+        self.assertFalse(r.ok, "verification against a corrupt ledger is meaningless")
+        self.assertEqual(r.ledger_conflicts, [(5, "UNK", "ACK")])
+        self.assertEqual(r.unknown_count, 1, "the first observation must stand")
+        self.assertEqual(r.i1_missing, [], "and it must not become an I1 violation")
+
+
+class TestOrphansAndProvenance(unittest.TestCase):
+    def test_a_delivered_record_with_no_ledger_entry_is_reported_not_absorbed(self):
+        # Folding it into the duplicate rate would distort a headline metric
+        # with a record that is not a redelivery of anything real.
+        r = verify.check({1: ("ACK", "")}, [1, 999])
+        self.assertTrue(r.ok, "an orphan is not a durability violation")
+        self.assertEqual(r.orphaned_delivered, [999])
+        self.assertEqual(r.delivered_distinct, 1, "orphans excluded from the count")
+        self.assertAlmostEqual(r.duplicate_rate, 1.0, msg="and from the rate")
+
+    def test_an_unknown_record_that_arrives_is_not_an_orphan(self):
+        r = verify.check({1: ("UNK", "")}, [1])
+        self.assertTrue(r.ok)
+        self.assertEqual(r.orphaned_delivered, [], "UNK is provenance, not an orphan")
+
+
+class TestLedgerLineStrictness(unittest.TestCase):
+    def test_rejects_what_the_rust_encoder_would_never_emit(self):
+        # Mirrors LedgerEntry::from_line. Divergence between the two parsers of
+        # one contract is a latent way for corrupt input to enter the oracle.
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 NACK"), "truncated NACK")
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 ACK junk"), "ACK + trailing")
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 UNK junk"), "UNK + trailing")
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 WAT"), "unknown tag")
+        self.assertIsNone(verify.parse_ledger_line("notanint S 1 2 ACK"), "bad seq")
+
+    def test_accepts_exactly_what_the_encoder_emits(self):
+        self.assertEqual(verify.parse_ledger_line("42 S 1 2 ACK"), (42, "ACK"))
+        self.assertEqual(verify.parse_ledger_line("42 U 1 2 UNK"), (42, "UNK"))
+        # NACK always carries a reason field, even an empty one (trailing space).
+        self.assertEqual(verify.parse_ledger_line("42 B 1 2 NACK "), (42, "NACK"))
+        self.assertEqual(
+            verify.parse_ledger_line("42 B 1 2 NACK reason with spaces"), (42, "NACK")
+        )
+
+
+class TestTailerSafety(unittest.TestCase):
+    def test_a_shrinking_log_raises_rather_than_silently_skipping(self):
+        # Seeking past a truncated file's EOF returns b"" forever, so every
+        # later line would vanish with no signal — the oracle losing evidence
+        # silently, which is worse than a false alarm.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log")
+            with open(path, "w") as f:
+                f.write("a\nb\nc\n")
+            tailer = verify.LogTailer(path)
+            self.assertEqual(tailer.read_new(), ["a", "b", "c"])
+            with open(path, "w") as f:  # truncate + rewrite shorter
+                f.write("x\n")
+            with self.assertRaises(RuntimeError) as ctx:
+                tailer.read_new()
+            self.assertIn("shrank", str(ctx.exception))
+
+    def test_a_form_feed_in_a_reason_does_not_fabricate_a_line(self):
+        # splitlines() would split on \x0c; the Rust side escapes only \\, \n, \r.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log")
+            with open(path, "w") as f:
+                f.write("1 S 2 3 NACK err\x0cmore\n")
+            self.assertEqual(
+                verify.LogTailer(path).read_new(), ["1 S 2 3 NACK err\x0cmore"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -2361,6 +2444,7 @@ I3 - Unknown records are unconstrained but counted. Either outcome conforms.
 Phase 1 treats all tiers alike. Tier- and fault-aware I1 (where Buffered may
 lose records under simulated power loss) arrives in Phase 2 with dm-flakey.
 """
+import os
 from dataclasses import dataclass, field
 
 
@@ -2374,17 +2458,33 @@ class VerifyResult:
     acked_count: int = 0
     delivered_distinct: int = 0
     duplicate_rate: float = 0.0
+    #: Delivered seqs with NO ledger provenance — the sink saw something the
+    #: producer never recorded pushing. Not a durability violation (more likely
+    #: a stale log from a previous run of the same seed, since run_id derives
+    #: from it), but they must not be folded into the duplicate rate as though
+    #: they were redeliveries of something real.
+    orphaned_delivered: list = field(default_factory=list)
+    #: Seqs the ledger reports under two different tags. Ledger corruption:
+    #: verification against corrupt input is meaningless, so this fails the
+    #: episode — but it is reported distinctly so it is never mistaken for a
+    #: durability violation by weir.
+    ledger_conflicts: list = field(default_factory=list)
 
     def summary(self):
+        extra = ""
+        if self.orphaned_delivered:
+            extra += f" orphaned={len(self.orphaned_delivered)}"
+        if self.ledger_conflicts:
+            extra += f" LEDGER_CONFLICTS={len(self.ledger_conflicts)}"
         if self.ok:
             return (
                 f"PASS  acked={self.acked_count} distinct_delivered="
                 f"{self.delivered_distinct} dup_rate={self.duplicate_rate:.3f} "
-                f"unknown={self.unknown_count}"
+                f"unknown={self.unknown_count}{extra}"
             )
         return (
             f"FAIL  I1_missing={len(self.i1_missing)} I2_leaked={len(self.i2_leaked)} "
-            f"acked={self.acked_count} unknown={self.unknown_count}"
+            f"acked={self.acked_count} unknown={self.unknown_count}{extra}"
         )
 
 
@@ -2407,11 +2507,24 @@ class LogTailer:
 
     def read_new(self):
         try:
-            with open(self.path, "rb") as f:
-                f.seek(self.offset)
-                chunk = f.read()
+            size = os.path.getsize(self.path)
         except FileNotFoundError:
             return []
+        if size < self.offset:
+            # The log shrank. Seeking past a shrunken file's EOF returns b""
+            # indefinitely, so every line written after the truncation would be
+            # skipped SILENTLY — the oracle losing evidence without saying so,
+            # which is the one failure mode worse than a false alarm. These logs
+            # are append-only for the life of one run, so this can only mean the
+            # file was truncated, rotated or recreated. Refuse rather than guess.
+            raise RuntimeError(
+                f"{self.path} shrank from {self.offset} to {size} bytes. This log is "
+                "append-only, so it was truncated, rotated or recreated mid-run. "
+                "Refusing to continue rather than silently skipping records."
+            )
+        with open(self.path, "rb") as f:
+            f.seek(self.offset)
+            chunk = f.read()
         if not chunk:
             return []
         # Keep only up to the last complete line; leave the remainder for later.
@@ -2419,11 +2532,22 @@ class LogTailer:
         if cut == -1:
             return []
         complete, self.offset = chunk[: cut + 1], self.offset + cut + 1
-        return complete.decode("utf-8", errors="replace").splitlines()
+        # split("\n"), NOT splitlines(): the latter also splits on \x0b, \x0c,
+        # \x1c-\x1e and U+2028/9, none of which the Rust side escapes — so a form
+        # feed inside a sink error message would fabricate an extra line.
+        text = complete.decode("utf-8", errors="replace")
+        return [ln for ln in text.split("\n") if ln]
 
 
 def parse_ledger_line(line):
-    """Parses one ledger line into (seq, tag). Returns None if malformed."""
+    """Parses one ledger line into (seq, tag). Returns None if malformed.
+
+    Strict, mirroring the Rust decoder (`LedgerEntry::from_line`): the sixth
+    field is present iff the tag is `NACK`. The two implementations parse the
+    same contract, so a line one accepts and the other rejects is a latent
+    divergence — and for an oracle, wrongly accepting a corrupt line is worse
+    than rejecting it.
+    """
     parts = line.rstrip("\n").split(" ", 5)
     if len(parts) < 5:
         return None
@@ -2431,7 +2555,15 @@ def parse_ledger_line(line):
         seq = int(parts[0])
     except ValueError:
         return None
-    return seq, parts[4]
+    tag = parts[4]
+    has_reason = len(parts) > 5
+    if tag == "NACK":
+        # `to_line` always emits a reason field for NACK, even an empty one.
+        return (seq, tag) if has_reason else None
+    if tag in ("ACK", "UNK"):
+        # Neither carries a reason; trailing content means corruption.
+        return None if has_reason else (seq, tag)
+    return None
 
 
 def parse_delivered_line(line, run_id):
@@ -2458,31 +2590,63 @@ class Accumulator:
         self.run_id = delivered_run_id
         self.ledger = {}
         self.delivered_counts = {}
+        # Running total, maintained incrementally. Materialising the full
+        # delivery list on every check() would be O(everything delivered so
+        # far) per episode — reintroducing, in memory, the same accumulating
+        # cost LogTailer exists to eliminate on disk.
+        self.delivered_total = 0
+        self.conflicts = []
 
     def ingest(self, ledger_lines, delivered_lines):
         """Folds newly-read lines into the accumulated state."""
         for line in ledger_lines:
             parsed = parse_ledger_line(line)
-            if parsed:
-                seq, tag = parsed
-                self.ledger[seq] = (tag, "")
+            if not parsed:
+                continue
+            seq, tag = parsed
+            prior = self.ledger.get(seq)
+            if prior is not None and prior[0] != tag:
+                # Two different tags for one seq. loadgen allocates seq from a
+                # single monotonic counter, so no legitimate retry reuses one —
+                # this means corruption or cross-run pollution. Keep the FIRST
+                # observation and record the conflict; silently overwriting
+                # would reclassify an outcome, which this module's own contract
+                # forbids.
+                self.conflicts.append((seq, prior[0], tag))
+                continue
+            self.ledger[seq] = (tag, "")
         for line in delivered_lines:
             seq = parse_delivered_line(line, self.run_id)
             if seq is not None:
                 self.delivered_counts[seq] = self.delivered_counts.get(seq, 0) + 1
+                self.delivered_total += 1
 
     def check(self):
         """Runs I1/I2/I3 against everything accumulated so far."""
-        delivered = []
-        for seq, count in self.delivered_counts.items():
-            delivered.extend([seq] * count)
-        return check(self.ledger, delivered)
+        return check_counts(
+            self.ledger, self.delivered_counts, self.delivered_total, self.conflicts
+        )
 
 
 def check(ledger, delivered):
     """Runs I1, I2 and I3. `ledger` is {seq: (tag, reason)}, `delivered` a list
-    of seq values (duplicates intact)."""
-    delivered_set = set(delivered)
+    of seq values (duplicates intact).
+
+    Convenience wrapper over [`check_counts`] for callers holding a plain list.
+    """
+    counts = {}
+    for s in delivered:
+        counts[s] = counts.get(s, 0) + 1
+    return check_counts(ledger, counts, len(delivered), [])
+
+
+def check_counts(ledger, delivered_counts, delivered_total, conflicts=()):
+    """The invariant core. `delivered_counts` is {seq: times_delivered}.
+
+    Takes counts rather than a list so an accumulating caller never has to
+    rebuild the whole delivery history to re-check.
+    """
+    delivered_set = set(delivered_counts)
 
     acked = {s for s, (tag, _) in ledger.items() if tag == "ACK"}
     nacked = {s for s, (tag, _) in ledger.items() if tag == "NACK"}
@@ -2490,25 +2654,37 @@ def check(ledger, delivered):
 
     i1_missing = sorted(acked - delivered_set)
     i2_leaked = sorted(nacked & delivered_set)
+    # Delivered with no ledger provenance. Excluded from the duplicate rate
+    # rather than absorbed into it: the rate is a headline deliverable ("how
+    # much redelivery does a crash cost"), and a record that is not a
+    # redelivery of anything real would quietly distort it.
+    orphaned = sorted(delivered_set - acked - nacked - unknown)
+    orphan_set = set(orphaned)
 
-    distinct = len(delivered_set)
-    dup_rate = (len(delivered) / distinct) if distinct else 0.0
+    known_total = delivered_total - sum(delivered_counts[s] for s in orphan_set)
+    known_distinct = len(delivered_set) - len(orphan_set)
+    dup_rate = (known_total / known_distinct) if known_distinct else 0.0
 
     return VerifyResult(
-        ok=not i1_missing and not i2_leaked,
+        # A ledger conflict fails the episode: verification against corrupt
+        # input is meaningless. Reported separately from I1/I2 so it is never
+        # read as a durability violation by weir.
+        ok=not i1_missing and not i2_leaked and not conflicts,
         i1_missing=i1_missing,
         i2_leaked=i2_leaked,
         unknown_count=len(unknown),
         acked_count=len(acked),
-        delivered_distinct=distinct,
+        delivered_distinct=known_distinct,
         duplicate_rate=dup_rate,
+        orphaned_delivered=orphaned,
+        ledger_conflicts=list(conflicts),
     )
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd chaos/orchestrator && python3 test_verify.py`
-Expected: PASS — 7 tests.
+Expected: PASS — 20 tests.
 
 - [ ] **Step 5: Commit**
 
