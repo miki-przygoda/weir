@@ -56,6 +56,79 @@ fn extract_u64(haystack: &str, key: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// What the daemon told the producer about one record.
+///
+/// Exactly three outcomes, and the third is not a failure. `Unknown` records
+/// are legitimately indeterminate — the connection died before a response — so
+/// the verifier constrains neither their delivery nor their absence. Counting
+/// them rather than reclassifying them is what keeps the oracle honest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The daemon returned Ack. This is a promise and the suite holds weir to it.
+    Acked,
+    /// The daemon returned Nack. It explicitly refused the record.
+    Nacked(String),
+    /// Pushed, but no response arrived. Either outcome conforms.
+    Unknown,
+}
+
+/// One record's fate, as recorded by the load generator.
+///
+/// Serialised as a single space-delimited line. The Nack reason comes last so
+/// it may contain spaces without needing quoting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerEntry {
+    /// Per-run sequence number; pairs with the run id to identify the record.
+    pub seq: u64,
+    /// Durability tier: 'S' Sync, 'B' Batched, 'U' Buffered (unsynced).
+    pub tier: char,
+    /// What the daemon said.
+    pub outcome: Outcome,
+    /// Wall-clock microseconds since the Unix epoch at push time.
+    pub t_micros: u64,
+    /// Round-trip time of the push call, in microseconds.
+    pub rtt_micros: u64,
+}
+
+impl LedgerEntry {
+    /// Serialises to one line: `seq tier t_micros rtt_micros outcome [reason…]`.
+    #[must_use]
+    pub fn to_line(&self) -> String {
+        let (tag, reason) = match &self.outcome {
+            Outcome::Acked => ("ACK", String::new()),
+            Outcome::Unknown => ("UNK", String::new()),
+            Outcome::Nacked(r) => ("NACK", format!(" {}", r.replace('\n', " "))),
+        };
+        format!(
+            "{} {} {} {} {}{}",
+            self.seq, self.tier, self.t_micros, self.rtt_micros, tag, reason
+        )
+    }
+
+    /// Parses a line produced by [`LedgerEntry::to_line`].
+    #[must_use]
+    pub fn from_line(line: &str) -> Option<Self> {
+        let mut parts = line.splitn(6, ' ');
+        let seq = parts.next()?.parse().ok()?;
+        let tier = parts.next()?.chars().next()?;
+        let t_micros = parts.next()?.parse().ok()?;
+        let rtt_micros = parts.next()?.parse().ok()?;
+        let outcome = match parts.next()? {
+            "ACK" => Outcome::Acked,
+            "UNK" => Outcome::Unknown,
+            "NACK" => Outcome::Nacked(parts.next().unwrap_or("").to_string()),
+            _ => return None,
+        };
+        Some(Self {
+            seq,
+            tier,
+            outcome,
+            t_micros,
+            rtt_micros,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +183,45 @@ mod tests {
         assert_eq!(decode_record("not json"), None);
         assert_eq!(decode_record(""), None);
         assert_eq!(decode_record("{\"run\":1}"), None, "missing seq");
+    }
+
+    #[test]
+    fn ledger_entry_round_trips_every_outcome() {
+        let cases = vec![
+            Outcome::Acked,
+            Outcome::Nacked("PayloadTooLarge".to_string()),
+            Outcome::Unknown,
+        ];
+        for outcome in cases {
+            let entry = LedgerEntry {
+                seq: 99,
+                tier: 'S',
+                outcome: outcome.clone(),
+                t_micros: 1_700_000_000_000_000,
+                rtt_micros: 364,
+            };
+            let line = entry.to_line();
+            assert!(!line.contains('\n'), "ledger lines must be single-line");
+            let parsed = LedgerEntry::from_line(&line).expect("must parse back");
+            assert_eq!(parsed, entry);
+        }
+    }
+
+    #[test]
+    fn ledger_nack_reason_with_spaces_survives_round_trip() {
+        let entry = LedgerEntry {
+            seq: 1,
+            tier: 'B',
+            outcome: Outcome::Nacked("some reason with spaces".to_string()),
+            t_micros: 5,
+            rtt_micros: 6,
+        };
+        assert_eq!(LedgerEntry::from_line(&entry.to_line()), Some(entry));
+    }
+
+    #[test]
+    fn ledger_rejects_malformed_lines() {
+        assert_eq!(LedgerEntry::from_line(""), None);
+        assert_eq!(LedgerEntry::from_line("1 S"), None);
     }
 }
