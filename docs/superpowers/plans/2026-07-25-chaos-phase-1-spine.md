@@ -319,6 +319,89 @@ Append to the `tests` module in `chaos/src/lib.rs`:
         assert_eq!(LedgerEntry::from_line(""), None);
         assert_eq!(LedgerEntry::from_line("1 S"), None);
     }
+
+    #[test]
+    fn ledger_rejects_lines_the_encoder_would_never_emit() {
+        // A kill -9 mid-write can truncate the final ledger line. Accepting a
+        // truncated line as well-formed would let the verifier trust corrupt
+        // ground truth — for an oracle, wrongly accepting beats nothing.
+        assert_eq!(
+            LedgerEntry::from_line("42 S 100 200 NACK"),
+            None,
+            "a NACK with no reason field is truncated, not an empty reason"
+        );
+        assert_eq!(
+            LedgerEntry::from_line("42 S 100 200 ACK trailing garbage"),
+            None,
+            "ACK carries no reason; trailing content means corruption"
+        );
+        assert_eq!(
+            LedgerEntry::from_line("42 S 100 200 UNK trailing garbage"),
+            None,
+            "UNK carries no reason; trailing content means corruption"
+        );
+        assert_eq!(LedgerEntry::from_line("42 S 100 200 WAT"), None, "unknown tag");
+    }
+
+    #[test]
+    fn ledger_round_trips_an_empty_nack_reason() {
+        // Distinct from the truncated case above: `to_line` emits a trailing
+        // space, so the empty reason IS present as a sixth field.
+        let entry = LedgerEntry {
+            seq: 1,
+            tier: 'S',
+            outcome: Outcome::Nacked(String::new()),
+            t_micros: 2,
+            rtt_micros: 3,
+        };
+        assert_eq!(entry.to_line(), "1 S 2 3 NACK ");
+        assert_eq!(LedgerEntry::from_line(&entry.to_line()), Some(entry));
+    }
+
+    #[test]
+    fn ledger_round_trips_reasons_containing_newlines_and_backslashes() {
+        // Phase 2+ puts sink error text here, and HTTP body excerpts contain
+        // newlines. Escaping must be lossless, not lossy.
+        for reason in [
+            "line1\nline2",
+            "carriage\r\nreturn",
+            "back\\slash",
+            "escaped-looking \\n literal",
+            "ACK",
+            "  leading and trailing  ",
+            "multiple   consecutive   spaces",
+        ] {
+            let entry = LedgerEntry {
+                seq: 9,
+                tier: 'B',
+                outcome: Outcome::Nacked(reason.to_string()),
+                t_micros: 1,
+                rtt_micros: 1,
+            };
+            let line = entry.to_line();
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "ledger line must stay single-line for reason {reason:?}, got {line:?}"
+            );
+            assert_eq!(
+                LedgerEntry::from_line(&line),
+                Some(entry),
+                "round trip must be lossless for reason {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_round_trips_numeric_boundaries() {
+        let entry = LedgerEntry {
+            seq: u64::MAX,
+            tier: 'U',
+            outcome: Outcome::Unknown,
+            t_micros: u64::MAX,
+            rtt_micros: u64::MAX,
+        };
+        assert_eq!(LedgerEntry::from_line(&entry.to_line()), Some(entry));
+    }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -367,12 +450,24 @@ pub struct LedgerEntry {
 
 impl LedgerEntry {
     /// Serialises to one line: `seq tier t_micros rtt_micros outcome [reason…]`.
+    ///
+    /// A Nack reason is escaped rather than stripped, so the line stays
+    /// single-line **and** the round trip is lossless. Later phases put sink
+    /// error text in this field, and HTTP body excerpts legitimately contain
+    /// newlines — replacing them with spaces would silently corrupt the audit
+    /// trail while looking like it worked.
     #[must_use]
     pub fn to_line(&self) -> String {
+        debug_assert!(
+            matches!(self.tier, 'S' | 'B' | 'U'),
+            "tier must be S, B or U; {:?} would collide with the field separator \
+             and corrupt the line",
+            self.tier
+        );
         let (tag, reason) = match &self.outcome {
             Outcome::Acked => ("ACK", String::new()),
             Outcome::Unknown => ("UNK", String::new()),
-            Outcome::Nacked(r) => ("NACK", format!(" {}", r.replace('\n', " "))),
+            Outcome::Nacked(r) => ("NACK", format!(" {}", escape_reason(r))),
         };
         format!(
             "{} {} {} {} {}{}",
@@ -381,6 +476,14 @@ impl LedgerEntry {
     }
 
     /// Parses a line produced by [`LedgerEntry::to_line`].
+    ///
+    /// **Strict by design: rejects anything `to_line` would never emit.** This
+    /// is the oracle's audit trail, and the harness kills the daemon mid-write
+    /// by design — so a truncated final line is a realistic input, not a
+    /// hypothetical one. Accepting `"42 S 100 200 NACK"` (no reason field) or
+    /// `"42 S 100 200 ACK <garbage>"` as well-formed would let the verifier
+    /// trust corrupt ground truth. For an oracle, wrongly accepting is worse
+    /// than rejecting.
     #[must_use]
     pub fn from_line(line: &str) -> Option<Self> {
         let mut parts = line.splitn(6, ' ');
@@ -388,21 +491,70 @@ impl LedgerEntry {
         let tier = parts.next()?.chars().next()?;
         let t_micros = parts.next()?.parse().ok()?;
         let rtt_micros = parts.next()?.parse().ok()?;
-        let outcome = match parts.next()? {
-            "ACK" => Outcome::Acked,
-            "UNK" => Outcome::Unknown,
-            "NACK" => Outcome::Nacked(parts.next().unwrap_or("").to_string()),
+        let tag = parts.next()?;
+        // The 6th field: present iff the tag is NACK.
+        let trailing = parts.next();
+        let outcome = match (tag, trailing) {
+            ("ACK", None) => Outcome::Acked,
+            ("UNK", None) => Outcome::Unknown,
+            ("NACK", Some(reason)) => Outcome::Nacked(unescape_reason(reason)),
             _ => return None,
         };
         Some(Self { seq, tier, outcome, t_micros, rtt_micros })
     }
 }
+
+/// Escapes a Nack reason so it survives a single-line format losslessly.
+fn escape_reason(r: &str) -> String {
+    let mut out = String::with_capacity(r.len());
+    for c in r.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Inverse of [`escape_reason`].
+///
+/// An unrecognised escape is preserved verbatim rather than guessed at: this
+/// text ends up in a report a human reads, so showing the raw bytes beats
+/// inventing an interpretation.
+fn unescape_reason(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
 ```
+
+> **Note for the Python verifier (Task 7).** It reads only `parts[4]` (the tag)
+> and discards the reason, so it needs no unescaping. Escaping is
+> Rust-side-only and does not change the field layout the Python parser
+> depends on.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd chaos && cargo test`
-Expected: PASS — 7 tests (4 from Task 1 + 3 new).
+Expected: PASS — 12 tests (4 from Task 1 + 8 new).
 
 - [ ] **Step 5: Commit**
 
