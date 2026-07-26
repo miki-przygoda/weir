@@ -46,6 +46,10 @@ class TestStorageStack(unittest.TestCase):
                 ["losetup", "-j", img], capture_output=True, text=True
             ).stdout
             self.assertEqual(out.strip(), "", "loop device must be detached")
+            self.assertFalse(
+                os.path.exists(img),
+                "backing image must be removed — the test name promises nothing is left",
+            )
 
 
 if __name__ == "__main__":

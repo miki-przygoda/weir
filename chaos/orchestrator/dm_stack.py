@@ -8,14 +8,28 @@ Linux and root only.
 """
 import os
 import subprocess
+import sys
 
 # ext4 needs a few MiB of metadata before it will even mkfs.
 MIN_SIZE_MB = 16
 
 
 def _run(cmd, check=True):
-    """Runs a command, returning CompletedProcess. Raises on failure if check."""
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    """Runs a command, returning CompletedProcess.
+
+    On failure with `check=True` this raises with stderr INCLUDED in the
+    message. `subprocess.run(check=True)` raises `CalledProcessError`, whose
+    `__str__` omits captured stderr entirely — so a real `mkfs.ext4` refusal
+    would reach the orchestrator as an undiagnosable "returned non-zero exit
+    status 1" and the operator would have no idea why the run died.
+    """
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed (exit {proc.returncode}): {' '.join(cmd)}\n"
+            f"stderr: {proc.stderr.strip()}"
+        )
+    return proc
 
 
 class StorageStack:
@@ -49,7 +63,11 @@ class StorageStack:
 
         # -F: the device is fresh; don't prompt. -q: quiet.
         _run(["mkfs.ext4", "-F", "-q", self.loop_device])
-        _run(["mount", self.loop_device, self.mount_point])
+        # -t ext4 explicitly, rather than relying on blkid auto-probe. Phases
+        # 2-3 insert dm-delay/dm-flakey between the loop device and the
+        # filesystem; being explicit makes a mis-stacked device fail fast here
+        # instead of mounting something unexpected.
+        _run(["mount", "-t", "ext4", self.loop_device, self.mount_point])
         # weir requires 0700 on its WAB dir, and create_dir_private's mode only
         # applies to directories it actually creates — not a pre-existing mount
         # point. Set it here.
@@ -63,7 +81,20 @@ class StorageStack:
         """
         _run(["umount", self.mount_point], check=False)
         if self.loop_device:
-            _run(["losetup", "--detach", self.loop_device], check=False)
+            detach = _run(["losetup", "--detach", self.loop_device], check=False)
+            if detach.returncode != 0:
+                # Do NOT clear `loop_device`, and do NOT remove the image.
+                # Unlinking it would not free the device — the loop driver's
+                # open fd keeps the inode alive — and it would make the orphan
+                # UN-FINDABLE, because `losetup -j <path>` matches by path.
+                # Leaving both in place keeps the leak visible to an operator.
+                print(
+                    f"WARNING: could not detach {self.loop_device}: "
+                    f"{detach.stderr.strip()}. Leaving it and {self.backing_file} "
+                    f"in place so `losetup -j {self.backing_file}` still finds it.",
+                    file=sys.stderr,
+                )
+                return
             self.loop_device = None
         if os.path.exists(self.backing_file):
             os.remove(self.backing_file)
