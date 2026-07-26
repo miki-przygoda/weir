@@ -17,6 +17,8 @@
 - **Python: stdlib only.** No pip installs. Matches existing repo tooling.
 - **Record payloads MUST be newline-free ASCII.** The HTTP sink's NDJSON mode dead-letters records containing `0x0A` (`crates/weir-server/src/sink/http.rs:513-525`), which would manufacture false I1 violations.
 - **Observers write outside the fault zone.** The recorder log and ledger checkpoints go to a host-filesystem path, never the device-mapper mount.
+- **Values and semantics from a task's code blocks are binding; whitespace is not.** Transcribe the exact strings, numbers, signatures and test cases, then run `cargo fmt` (Rust) before committing. The blocks in this plan are hand-written and not all rustfmt-normalised, so a verbatim copy will fail `cargo fmt --check`.
+- **Every task leaves `chaos/` building and its tests passing.** No task may forward-declare a target, module, or import whose file a later task creates.
 - **Phase 1 does NOT implement:** the eBPF probe, `dm-flakey`, `dm-delay`, ENOSPC, read-only remount, dead-letter exhaustion, tier-aware invariants, or plots. Those are Phases 2–4. Phase 1 builds the dm stack *plumbing* (create/teardown) but injects no dm faults.
 - **Branch:** `feat/chaos-fault-injection` (already created, spec already committed).
 
@@ -140,15 +142,14 @@ members = ["."]
 # weir, which is worse than publishing no report at all.
 weir-client = { path = "../crates/weir-client" }
 weir-core = { path = "../crates/weir-core" }
-
-[[bin]]
-name = "loadgen"
-path = "src/bin/loadgen.rs"
-
-[[bin]]
-name = "recorder"
-path = "src/bin/recorder.rs"
 ```
+
+> **No `[[bin]]` sections yet — deliberately.** Cargo resolves bin targets at
+> load time, so declaring `loadgen`/`recorder` before their files exist makes
+> every `cargo build` and bare `cargo test` in `chaos/` fail with "can't find
+> bin". Tasks 3 and 4 each add their own `[[bin]]` block alongside the file it
+> points at, so the project builds and its tests pass after **every** task
+> rather than only after Task 4.
 
 Append to `chaos/src/lib.rs` (above the `#[cfg(test)]` module):
 
@@ -423,7 +424,18 @@ git commit -m "feat(chaos): add outcome ledger with three-state record fate"
 
 - [ ] **Step 1: Write the failing test**
 
-Create `chaos/src/bin/recorder.rs`:
+First append the bin target to `chaos/Cargo.toml` (Task 1 deliberately left it
+out so the project stayed buildable before this file existed):
+
+```toml
+[[bin]]
+name = "recorder"
+path = "src/bin/recorder.rs"
+test = true
+doc = false
+```
+
+Then create `chaos/src/bin/recorder.rs`:
 
 ```rust
 //! The recording sink — the oracle's delivery log.
@@ -669,7 +681,18 @@ git commit -m "feat(chaos): add recording sink with durable-before-ack append"
 
 - [ ] **Step 1: Write the failing test**
 
-Create `chaos/src/bin/loadgen.rs`:
+First append the bin target to `chaos/Cargo.toml` (same reason as Task 3 — the
+declaration lands with the file it points at):
+
+```toml
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
+test = true
+doc = false
+```
+
+Then create `chaos/src/bin/loadgen.rs`:
 
 ```rust
 //! The load generator — sustained producer pool and the outcome ledger.
