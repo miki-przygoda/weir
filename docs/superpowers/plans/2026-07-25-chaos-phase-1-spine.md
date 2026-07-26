@@ -720,6 +720,58 @@ mod tests {
         assert_eq!(tier_from_char('U'), Some(Durability::Buffered));
         assert_eq!(tier_from_char('x'), None);
     }
+
+    /// A writer that always fails, to prove ledger write errors propagate.
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "disk gone"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_entries_propagates_io_errors_instead_of_swallowing_them() {
+        // The ledger IS the oracle. A silently-dropped ledger write loses the
+        // record of what weir acked, which either invents a violation or hides
+        // one. It must be loud.
+        let entries = vec![weir_chaos::LedgerEntry {
+            seq: 1,
+            tier: 'S',
+            outcome: weir_chaos::Outcome::Acked,
+            t_micros: 1,
+            rtt_micros: 2,
+        }];
+        let err = write_entries(&mut FailingWriter, &entries).expect_err("must propagate");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn write_entries_emits_one_newline_terminated_line_per_entry() {
+        let entries = vec![
+            weir_chaos::LedgerEntry {
+                seq: 1,
+                tier: 'S',
+                outcome: weir_chaos::Outcome::Acked,
+                t_micros: 10,
+                rtt_micros: 20,
+            },
+            weir_chaos::LedgerEntry {
+                seq: 2,
+                tier: 'U',
+                outcome: weir_chaos::Outcome::Unknown,
+                t_micros: 11,
+                rtt_micros: 21,
+            },
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        write_entries(&mut buf, &entries).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(text, "1 S 10 20 ACK\n2 U 11 21 UNK\n");
+    }
 }
 ```
 
@@ -824,7 +876,10 @@ fn main() {
             .expect("open ledger"),
     ));
     let seq = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
+    // Set when any thread cannot durably record an outcome. Every thread
+    // watches it, so one ledger failure winds the whole generator down rather
+    // than leaving the run producing records nobody is keeping track of.
+    let fatal = Arc::new(AtomicBool::new(false));
 
     let deadline = Instant::now() + Duration::from_secs(args.duration_secs);
     let mut handles = Vec::new();
@@ -832,7 +887,7 @@ fn main() {
     for _ in 0..args.threads {
         let ledger = Arc::clone(&ledger);
         let seq = Arc::clone(&seq);
-        let stop = Arc::clone(&stop);
+        let fatal = Arc::clone(&fatal);
         let socket = args.socket.clone();
         let run_id = args.run_id;
         let record_size = args.record_size;
@@ -842,7 +897,7 @@ fn main() {
             let mut client: Option<WeirClient> = None;
             let mut pending: Vec<LedgerEntry> = Vec::with_capacity(256);
 
-            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            while !fatal.load(Ordering::Relaxed) && Instant::now() < deadline {
                 // Reconnect as needed. The daemon is killed repeatedly by
                 // design, so a dead connection is expected, not exceptional.
                 if client.is_none() {
@@ -880,33 +935,65 @@ fn main() {
                     rtt_micros: t0.elapsed().as_micros() as u64,
                 });
 
-                if pending.len() >= 256 {
-                    flush(&ledger, &mut pending);
+                if pending.len() >= 256 && !flush(&ledger, &mut pending, &fatal) {
+                    break;
                 }
             }
-            flush(&ledger, &mut pending);
+            flush(&ledger, &mut pending, &fatal);
         }));
     }
 
     for h in handles {
         let _ = h.join();
     }
-    eprintln!("loadgen: finished, {} records pushed", seq.load(Ordering::Relaxed));
+
+    let pushed = seq.load(Ordering::Relaxed);
+    if fatal.load(Ordering::Relaxed) {
+        eprintln!("loadgen: ABORTED after {pushed} records — ledger write failed");
+        std::process::exit(1);
+    }
+    eprintln!("loadgen: finished, {pushed} records pushed");
 }
 
-fn flush(ledger: &Arc<Mutex<std::fs::File>>, pending: &mut Vec<LedgerEntry>) {
-    if pending.is_empty() {
-        return;
-    }
-    let mut buf = String::with_capacity(pending.len() * 48);
-    for e in pending.iter() {
+/// Serialises entries to a writer. Generic over `Write` so the error path is
+/// testable with a deliberately-failing writer.
+fn write_entries<W: Write>(w: &mut W, entries: &[LedgerEntry]) -> std::io::Result<()> {
+    let mut buf = String::with_capacity(entries.len() * 48);
+    for e in entries {
         buf.push_str(&e.to_line());
         buf.push('\n');
     }
+    w.write_all(buf.as_bytes())
+}
+
+/// Durably appends `pending` to the ledger. Returns false if the write failed,
+/// having set `fatal`.
+///
+/// A ledger write failure is not recoverable and must not be swallowed: the
+/// ledger is the oracle, so losing an entry either invents a durability
+/// violation or hides a real one. `pending` is cleared only on success, so a
+/// transient caller could retry without losing entries.
+fn flush(
+    ledger: &Arc<Mutex<std::fs::File>>,
+    pending: &mut Vec<LedgerEntry>,
+    fatal: &Arc<AtomicBool>,
+) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
     let mut f = ledger.lock().expect("ledger mutex");
-    let _ = f.write_all(buf.as_bytes());
-    let _ = f.sync_data();
-    pending.clear();
+    let result = write_entries(&mut *f, pending).and_then(|()| f.sync_data());
+    match result {
+        Ok(()) => {
+            pending.clear();
+            true
+        }
+        Err(e) => {
+            eprintln!("loadgen: FATAL — could not durably record {} ledger entries: {e}", pending.len());
+            fatal.store(true, Ordering::Relaxed);
+            false
+        }
+    }
 }
 ```
 
@@ -1348,9 +1435,14 @@ git commit -m "feat(chaos): add three-signal drain-quiescence detection"
 **Interfaces:**
 - Consumes: ledger lines from Task 2, delivery-log lines from Task 3.
 - Produces:
-  - `verify.load_ledger(path) -> dict[int, tuple[str, str]]` — `seq -> (outcome_tag, reason)`
-  - `verify.load_delivered(path, run_id) -> list[int]`
+  - `verify.LogTailer(path)` with `.read_new() -> list[str]` — returns only lines appended since the last call, never a partial trailing line
+  - `verify.Accumulator(delivered_run_id)` with `.ingest(ledger_lines, delivered_lines)` and `.check() -> VerifyResult`
   - `verify.check(ledger, delivered) -> VerifyResult` with fields `ok`, `i1_missing`, `i2_leaked`, `unknown_count`, `acked_count`, `delivered_distinct`, `duplicate_rate`
+
+Verification runs after **every** episode, so re-reading both logs each time is
+O(n²) — by the late episodes of a 20-episode run those files hold millions of
+records and each pass costs tens of seconds, which eats into the load window
+(see Task 8). The tailer reads each byte exactly once.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1410,14 +1502,81 @@ class TestInvariants(unittest.TestCase):
         self.assertEqual(r.duplicate_rate, 0.0)
 
 
-class TestLoaders(unittest.TestCase):
-    def test_load_delivered_filters_by_run_id(self):
-        import tempfile, os
+class TestLogTailer(unittest.TestCase):
+    def test_returns_only_newly_appended_lines(self):
+        import os
+        import tempfile
+
         with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "delivered.log")
+            p = os.path.join(d, "log")
             with open(p, "w") as f:
-                f.write("7 1\n7 2\n9 3\njunk\n")
-            self.assertEqual(verify.load_delivered(p, 7), [1, 2])
+                f.write("a\nb\n")
+            t = verify.LogTailer(p)
+            self.assertEqual(t.read_new(), ["a", "b"])
+            self.assertEqual(t.read_new(), [], "no new data means no lines")
+            with open(p, "a") as f:
+                f.write("c\n")
+            self.assertEqual(t.read_new(), ["c"])
+
+    def test_withholds_a_partial_trailing_line_until_it_completes(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "log")
+            with open(p, "w") as f:
+                f.write("full\npar")
+            t = verify.LogTailer(p)
+            # "par" has no newline yet: the writer is mid-append. Consuming it
+            # would corrupt the oracle with a truncated record.
+            self.assertEqual(t.read_new(), ["full"])
+            with open(p, "a") as f:
+                f.write("tial\n")
+            self.assertEqual(t.read_new(), ["partial"])
+
+    def test_missing_file_yields_nothing_rather_than_raising(self):
+        t = verify.LogTailer("/nonexistent/path/log")
+        self.assertEqual(t.read_new(), [])
+
+
+class TestAccumulator(unittest.TestCase):
+    def test_accumulates_across_episodes_without_rereading(self):
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["1 S 10 20 ACK"], ["7 1"])
+        r = acc.check()
+        self.assertTrue(r.ok)
+        self.assertEqual(r.acked_count, 1)
+
+        # Second episode adds more; earlier state must persist.
+        acc.ingest(["2 S 11 21 ACK"], ["7 2"])
+        r = acc.check()
+        self.assertTrue(r.ok)
+        self.assertEqual(r.acked_count, 2)
+        self.assertEqual(r.delivered_distinct, 2)
+
+    def test_filters_delivered_lines_by_run_id(self):
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["1 S 10 20 ACK"], ["7 1", "9 1", "junk"])
+        r = acc.check()
+        self.assertTrue(r.ok)
+        self.assertEqual(r.delivered_distinct, 1, "run 9's record must be ignored")
+
+    def test_detects_a_violation_that_spans_episodes(self):
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["1 S 10 20 ACK"], [])
+        self.assertFalse(acc.check().ok, "acked but undelivered")
+        # Delivery arrives late — which is legal, and the violation clears.
+        acc.ingest([], ["7 1"])
+        self.assertTrue(acc.check().ok)
+
+    def test_preserves_duplicate_counts_across_episodes(self):
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["1 S 10 20 ACK"], ["7 1"])
+        acc.ingest([], ["7 1", "7 1"])
+        r = acc.check()
+        self.assertTrue(r.ok)
+        self.assertEqual(r.delivered_distinct, 1)
+        self.assertAlmostEqual(r.duplicate_rate, 3.0)
 
 
 if __name__ == "__main__":
@@ -1477,46 +1636,95 @@ class VerifyResult:
         )
 
 
-def load_ledger(path):
-    """Reads a loadgen ledger into {seq: (tag, reason)}.
+class LogTailer:
+    """Reads only what has been appended to a file since the last call.
 
-    A later entry for the same seq wins; seq values are unique per run so this
-    only matters if a partial line was rewritten.
+    Verification runs after every episode, so re-reading the whole log each
+    time is O(n^2) — millions of records re-parsed twenty times. This reads
+    each byte exactly once.
+
+    A trailing line without a newline is WITHHELD and re-read next time: the
+    writer is mid-append, and consuming a truncated record would corrupt the
+    oracle. A missing file yields nothing rather than raising, because the
+    recorder may not have received its first batch yet.
     """
-    out = {}
-    with open(path) as f:
-        for line in f:
-            parts = line.rstrip("\n").split(" ", 5)
-            if len(parts) < 5:
-                continue
-            try:
-                seq = int(parts[0])
-            except ValueError:
-                continue
-            tag = parts[4]
-            reason = parts[5] if len(parts) > 5 else ""
-            out[seq] = (tag, reason)
-    return out
+
+    def __init__(self, path):
+        self.path = path
+        self.offset = 0
+
+    def read_new(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except FileNotFoundError:
+            return []
+        if not chunk:
+            return []
+        # Keep only up to the last complete line; leave the remainder for later.
+        cut = chunk.rfind(b"\n")
+        if cut == -1:
+            return []
+        complete, self.offset = chunk[: cut + 1], self.offset + cut + 1
+        return complete.decode("utf-8", errors="replace").splitlines()
 
 
-def load_delivered(path, run_id):
-    """Reads a recorder delivery log, keeping only this run's seq values.
+def parse_ledger_line(line):
+    """Parses one ledger line into (seq, tag). Returns None if malformed."""
+    parts = line.rstrip("\n").split(" ", 5)
+    if len(parts) < 5:
+        return None
+    try:
+        seq = int(parts[0])
+    except ValueError:
+        return None
+    return seq, parts[4]
 
-    Duplicates are PRESERVED — the duplicate rate is a deliverable.
+
+def parse_delivered_line(line, run_id):
+    """Parses one delivery line, keeping it only if it belongs to `run_id`."""
+    parts = line.split()
+    if len(parts) != 2:
+        return None
+    try:
+        r, s = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    return s if r == run_id else None
+
+
+class Accumulator:
+    """Accumulated verification state across episodes.
+
+    Holds the ledger outcome per seq and the delivery count per seq, both
+    growing monotonically. `check()` runs the same pure invariants as the
+    standalone `check()` function on the accumulated state.
     """
-    out = []
-    with open(path) as f:
-        for line in f:
-            parts = line.split()
-            if len(parts) != 2:
-                continue
-            try:
-                r, s = int(parts[0]), int(parts[1])
-            except ValueError:
-                continue
-            if r == run_id:
-                out.append(s)
-    return out
+
+    def __init__(self, delivered_run_id):
+        self.run_id = delivered_run_id
+        self.ledger = {}
+        self.delivered_counts = {}
+
+    def ingest(self, ledger_lines, delivered_lines):
+        """Folds newly-read lines into the accumulated state."""
+        for line in ledger_lines:
+            parsed = parse_ledger_line(line)
+            if parsed:
+                seq, tag = parsed
+                self.ledger[seq] = (tag, "")
+        for line in delivered_lines:
+            seq = parse_delivered_line(line, self.run_id)
+            if seq is not None:
+                self.delivered_counts[seq] = self.delivered_counts.get(seq, 0) + 1
+
+    def check(self):
+        """Runs I1/I2/I3 against everything accumulated so far."""
+        delivered = []
+        for seq, count in self.delivered_counts.items():
+            delivered.extend([seq] * count)
+        return check(self.ledger, delivered)
 
 
 def check(ledger, delivered):
@@ -1829,7 +2037,14 @@ def main():
         delays = kill_delays(
             seed, sched["episodes"], sched["steady_lo_secs"], sched["steady_hi_secs"]
         )
-        total_secs = int(sum(delays)) + 120
+        # The load must outlast the episodes. Steady-state sleeps are only part
+        # of the wall clock: each episode also spends time on restart,
+        # quiescence polling, and verification. Budget the worst case per
+        # episode rather than a flat margin — if load stops early, the final
+        # episodes verify an idle daemon and PASS vacuously, which is precisely
+        # the false-confidence Phase 1 exists to rule out.
+        per_episode_overhead = sched["quiescence_timeout_secs"] + 30
+        total_secs = int(sum(delays) + per_episode_overhead * len(delays))
 
         loadgen = subprocess.Popen([
             loadgen_bin,
@@ -1842,9 +2057,33 @@ def main():
             "--duration-secs", str(total_secs),
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+        # Read each log byte exactly once across the whole run.
+        ledger_tail = verify.LogTailer(ledger_path)
+        delivered_tail = verify.LogTailer(delivered_path)
+        acc = verify.Accumulator(delivered_run_id=run_id)
+
         with open(episodes_path, "a") as ep_log:
             for i, delay in enumerate(delays):
                 time.sleep(delay)
+
+                # A dead load generator makes every subsequent verification
+                # vacuous: an idle daemon trivially satisfies I1 and I2. Assert
+                # liveness BEFORE the fault so a PASS always means something.
+                if loadgen.poll() is not None:
+                    print(
+                        f"episode {i:3d}  ABORT — load generator exited "
+                        f"(code {loadgen.returncode}) before the fault; "
+                        "remaining episodes would pass vacuously",
+                        flush=True,
+                    )
+                    violations += 1
+                    ep_log.write(json.dumps({
+                        "episode": i, "fault": "kill_random", "ok": False,
+                        "quiesced": False, "abort_reason": "loadgen_exited",
+                        "loadgen_exit_code": loadgen.returncode, "seed": seed,
+                    }) + "\n")
+                    ep_log.flush()
+                    break
 
                 daemon.kill9()
                 daemon.start("http://127.0.0.1:9900/ingest")
@@ -1855,9 +2094,8 @@ def main():
 
                 # Give the recorder a moment to finish its final append.
                 time.sleep(1.0)
-                ledger = verify.load_ledger(ledger_path)
-                delivered = verify.load_delivered(delivered_path, run_id)
-                result = verify.check(ledger, delivered)
+                acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
+                result = acc.check()
 
                 if not result.ok or not ok:
                     violations += 1
@@ -1973,6 +2211,18 @@ class TestRender(unittest.TestCase):
         out = report.render([], {})
         self.assertIn("0 episodes", out)
 
+    def test_an_aborted_run_says_so_prominently(self):
+        # A vacuous-pass guard firing must never be buried in a table cell.
+        aborted = [
+            EPISODES[0],
+            {"episode": 1, "fault": "kill_random", "ok": False, "quiesced": False,
+             "abort_reason": "loadgen_exited", "loadgen_exit_code": 1, "seed": 24301},
+        ]
+        out = report.render(aborted, {})
+        self.assertIn("aborted early", out)
+        self.assertIn("loadgen_exited", out)
+        self.assertIn("absent, not passing", out)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -2025,6 +2275,15 @@ def render(episodes, meta):
         lines.append(
             f"{len(unquiesced)} episode(s) did not reach drain quiescence within "
             "the timeout. A drain that never quiesces is itself a finding.\n"
+        )
+
+    aborted = [e for e in episodes if e.get("abort_reason")]
+    if aborted:
+        lines.append(
+            f"**Run aborted early at episode {aborted[0].get('episode')}: "
+            f"`{aborted[0]['abort_reason']}`.** The run stopped because "
+            "continuing would have produced passing episodes that verified an "
+            "idle daemon. Every episode after this point is absent, not passing.\n"
         )
 
     if episodes:
