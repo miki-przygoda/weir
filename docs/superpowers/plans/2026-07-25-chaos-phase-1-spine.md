@@ -1187,6 +1187,130 @@ mod tests {
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text, "1 S 10 20 ACK\n2 U 11 21 UNK\n");
     }
+
+    /// A ledger sink that can be made to fail on append, on sync, or neither.
+    #[derive(Default)]
+    struct FlakySink {
+        fail_append: bool,
+        fail_sync: bool,
+        written: Vec<u8>,
+        synced: usize,
+    }
+
+    impl LedgerSink for FlakySink {
+        fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            if self.fail_append {
+                return Err(std::io::Error::other("append failed"));
+            }
+            self.written.extend_from_slice(bytes);
+            Ok(())
+        }
+        fn sync(&mut self) -> std::io::Result<()> {
+            if self.fail_sync {
+                return Err(std::io::Error::other("sync failed"));
+            }
+            self.synced += 1;
+            Ok(())
+        }
+    }
+
+    fn sample_entry(seq: u64) -> weir_chaos::LedgerEntry {
+        weir_chaos::LedgerEntry {
+            seq,
+            tier: 'S',
+            outcome: weir_chaos::Outcome::Acked,
+            t_micros: 1,
+            rtt_micros: 2,
+        }
+    }
+
+    #[test]
+    fn flush_clears_pending_and_syncs_on_success() {
+        let sink = Arc::new(Mutex::new(FlakySink::default()));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut pending = vec![sample_entry(1), sample_entry(2)];
+        assert!(flush(&sink, &mut pending, &fatal));
+        assert!(pending.is_empty(), "pending must be cleared on success");
+        assert!(!fatal.load(Ordering::Relaxed));
+        let s = sink.lock().unwrap();
+        assert_eq!(s.synced, 1, "durability needs a sync, not just a write");
+        assert_eq!(
+            String::from_utf8(s.written.clone()).unwrap(),
+            "1 S 1 2 ACK\n2 S 1 2 ACK\n"
+        );
+    }
+
+    #[test]
+    fn flush_sets_fatal_and_retains_pending_when_append_fails() {
+        let sink = Arc::new(Mutex::new(FlakySink {
+            fail_append: true,
+            ..Default::default()
+        }));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut pending = vec![sample_entry(1)];
+        assert!(!flush(&sink, &mut pending, &fatal));
+        assert!(
+            fatal.load(Ordering::Relaxed),
+            "a ledger entry that cannot be recorded must be fatal, never swallowed"
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "pending must survive a failed flush rather than vanish"
+        );
+    }
+
+    #[test]
+    fn flush_sets_fatal_when_only_the_sync_fails() {
+        // Written but not durable is still a lost entry: this harness kills the
+        // machine's processes by design, and an unsynced ledger tail goes with
+        // them.
+        let sink = Arc::new(Mutex::new(FlakySink {
+            fail_sync: true,
+            ..Default::default()
+        }));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut pending = vec![sample_entry(1)];
+        assert!(!flush(&sink, &mut pending, &fatal));
+        assert!(fatal.load(Ordering::Relaxed));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn flush_on_empty_pending_is_a_no_op() {
+        let sink = Arc::new(Mutex::new(FlakySink {
+            fail_append: true,
+            ..Default::default()
+        }));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut pending: Vec<weir_chaos::LedgerEntry> = Vec::new();
+        assert!(
+            flush(&sink, &mut pending, &fatal),
+            "nothing to write is not a failure"
+        );
+        assert!(!fatal.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn classify_maps_every_refusal_shape_to_nacked() {
+        // The Nacked/Unknown split is load-bearing: invariant I2 later asserts a
+        // nacked record never appears downstream, so a refusal misfiled as
+        // Unknown silently weakens that check.
+        use weir_client::ClientError;
+        let refusals = [
+            ClientError::VersionMismatch { daemon_version: 2 },
+            ClientError::UnknownNack(0x0a),
+            ClientError::PayloadTooLarge { len: 1, limit: 0 },
+            ClientError::EmptyPayload,
+            ClientError::NoDefaultDurability,
+        ];
+        for e in refusals {
+            assert!(
+                matches!(classify(&e), weir_chaos::Outcome::Nacked(_)),
+                "{e:?} is an explicit refusal and must classify as Nacked"
+            );
+        }
+    }
 }
 ```
 
@@ -1208,6 +1332,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use weir_chaos::{encode_record, LedgerEntry, Outcome};
 use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
+
+/// Read/write timeout on the producer's socket.
+///
+/// Without it `--duration-secs` is not a deadline at all: the loop checks the
+/// clock only between iterations, so a daemon that accepts a connection and
+/// then stops responding without closing it blocks `push` forever. That is
+/// worse here than a plain hang — Task 8 asserts this process is *alive* before
+/// each fault, and a wedged generator is alive while producing nothing, so load
+/// would silently stop without tripping the guard. Generous relative to a
+/// Sync-tier ack (hundreds of microseconds) even under injected slow-disk
+/// faults.
+const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maps a client error to a ledger outcome.
 ///
@@ -1317,7 +1453,12 @@ fn main() {
                 // design, so a dead connection is expected, not exceptional.
                 if client.is_none() {
                     match WeirClient::connect(&socket) {
-                        Ok(c) => client = Some(c),
+                        Ok(c) => {
+                            // Bound every push. See PUSH_TIMEOUT.
+                            let _ = c.set_read_timeout(Some(PUSH_TIMEOUT));
+                            let _ = c.set_write_timeout(Some(PUSH_TIMEOUT));
+                            client = Some(c);
+                        }
                         Err(_) => {
                             std::thread::sleep(Duration::from_millis(50));
                             continue;
@@ -1358,8 +1499,16 @@ fn main() {
         }));
     }
 
+    // A panicking thread must not be silent. It would drop its buffered ledger
+    // entries — possibly including genuinely acked records — WITHOUT setting
+    // `fatal`, so the run would report success while the oracle had quietly
+    // lost evidence. That is the one failure mode that conceals a real
+    // durability violation rather than inventing one.
+    let mut panicked = 0usize;
     for h in handles {
-        let _ = h.join();
+        if h.join().is_err() {
+            panicked += 1;
+        }
     }
 
     let pushed = seq.load(Ordering::Relaxed);
@@ -1367,18 +1516,52 @@ fn main() {
         eprintln!("loadgen: ABORTED after {pushed} records — ledger write failed");
         std::process::exit(1);
     }
+    if panicked > 0 {
+        eprintln!(
+            "loadgen: ABORTED after {pushed} records — {panicked} producer thread(s) \
+             panicked; their unflushed ledger entries are lost, so this run's \
+             verification cannot be trusted"
+        );
+        std::process::exit(1);
+    }
     eprintln!("loadgen: finished, {pushed} records pushed");
 }
 
-/// Serialises entries to a writer. Generic over `Write` so the error path is
-/// testable with a deliberately-failing writer.
-fn write_entries<W: Write>(w: &mut W, entries: &[LedgerEntry]) -> std::io::Result<()> {
+/// Serialises entries, one line each. Split from the I/O so the formatting and
+/// the failure path are independently testable.
+fn serialise(entries: &[LedgerEntry]) -> String {
     let mut buf = String::with_capacity(entries.len() * 48);
     for e in entries {
         buf.push_str(&e.to_line());
         buf.push('\n');
     }
-    w.write_all(buf.as_bytes())
+    buf
+}
+
+/// Serialises entries to a writer. Generic over `Write` so the error path is
+/// testable with a deliberately-failing writer.
+fn write_entries<W: Write>(w: &mut W, entries: &[LedgerEntry]) -> std::io::Result<()> {
+    w.write_all(serialise(entries).as_bytes())
+}
+
+/// The ledger's durable-append surface.
+///
+/// A trait rather than a concrete `File` so that [`flush`] — the function that
+/// decides whether the whole run is still trustworthy — is testable without a
+/// real filesystem. Leaving it untestable would mean the harness's own
+/// fail-loud path is the one piece of it with no coverage.
+trait LedgerSink {
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn sync(&mut self) -> std::io::Result<()>;
+}
+
+impl LedgerSink for std::fs::File {
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes)
+    }
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.sync_data()
+    }
 }
 
 /// Durably appends `pending` to the ledger. Returns false if the write failed,
@@ -1388,16 +1571,17 @@ fn write_entries<W: Write>(w: &mut W, entries: &[LedgerEntry]) -> std::io::Resul
 /// ledger is the oracle, so losing an entry either invents a durability
 /// violation or hides a real one. `pending` is cleared only on success, so a
 /// transient caller could retry without losing entries.
-fn flush(
-    ledger: &Arc<Mutex<std::fs::File>>,
+fn flush<S: LedgerSink>(
+    ledger: &Arc<Mutex<S>>,
     pending: &mut Vec<LedgerEntry>,
     fatal: &Arc<AtomicBool>,
 ) -> bool {
     if pending.is_empty() {
         return true;
     }
-    let mut f = ledger.lock().expect("ledger mutex");
-    let result = write_entries(&mut *f, pending).and_then(|()| f.sync_data());
+    let mut sink = ledger.lock().expect("ledger mutex");
+    let bytes = serialise(pending);
+    let result = sink.append(bytes.as_bytes()).and_then(|()| sink.sync());
     match result {
         Ok(()) => {
             pending.clear();
@@ -1415,7 +1599,7 @@ fn flush(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd chaos && cargo test`
-Expected: PASS — 25 tests (21 from Tasks 1-3 + 4 loadgen tests).
+Expected: PASS — 30 tests (21 from Tasks 1-3 + 9 loadgen tests).
 
 - [ ] **Step 5: Verify it builds clean**
 
