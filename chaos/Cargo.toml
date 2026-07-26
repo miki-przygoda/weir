@@ -30,3 +30,9 @@ name = "recorder"
 path = "src/bin/recorder.rs"
 test = true
 doc = false
+
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
+test = true
+doc = false
