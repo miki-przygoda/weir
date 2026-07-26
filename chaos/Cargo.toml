@@ -1,0 +1,28 @@
+[package]
+name = "weir-chaos"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+# Standalone workspace so the chaos harness — which is Linux-only, needs root,
+# and depends on device-mapper tooling — never enters the weir workspace build,
+# the MSRV matrix, or the publish flow. Mirrors `fuzz/` for the same reason.
+# Run everything from inside this directory.
+[workspace]
+members = ["."]
+
+[dependencies]
+# Path dep, deliberately: the harness must test the working tree. A git or
+# crates.io dep would let a run report "durability verified" against a stale
+# weir, which is worse than publishing no report at all.
+weir-client = { path = "../crates/weir-client" }
+weir-core = { path = "../crates/weir-core" }
+
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
+
+[[bin]]
+name = "recorder"
+path = "src/bin/recorder.rs"
