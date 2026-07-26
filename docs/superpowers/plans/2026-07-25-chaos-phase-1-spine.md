@@ -3041,6 +3041,13 @@ def main():
                     "unknown": result.unknown_count,
                     "i1_missing": result.i1_missing[:50],
                     "i2_leaked": result.i2_leaked[:50],
+                    # Provenance anomalies, kept distinct from I1/I2 so neither is
+                    # ever read as a durability violation by weir: an orphan is
+                    # most likely a stale log from an earlier run of this seed,
+                    # and a ledger conflict means the oracle's own input is
+                    # corrupt.
+                    "orphaned_delivered": result.orphaned_delivered[:50],
+                    "ledger_conflicts": result.ledger_conflicts[:50],
                     "seed": seed,
                 }
                 ep_log.write(json.dumps(record) + "\n")
@@ -3233,6 +3240,24 @@ def render(episodes, meta):
             "duplicates conformant; this is what a crash actually costs a sink that "
             "must dedupe.\n"
         )
+
+    orphaned = sum(len(e.get("orphaned_delivered", [])) for e in episodes)
+    conflicts = sum(len(e.get("ledger_conflicts", [])) for e in episodes)
+    if orphaned or conflicts:
+        lines.append("## Provenance anomalies\n")
+        if orphaned:
+            lines.append(
+                f"{orphaned} delivered record(s) had no ledger entry. These are NOT "
+                "durability violations and are excluded from the duplicate rate. The "
+                "likeliest cause is a stale delivery log from an earlier run of this "
+                "seed, since the run id derives from it.\n"
+            )
+        if conflicts:
+            lines.append(
+                f"{conflicts} sequence number(s) appeared under two different ledger "
+                "tags. That is corruption of the oracle's own input, so the affected "
+                "episodes fail — but it is a harness finding, not a weir one.\n"
+            )
 
     lines.append("## Episodes\n")
     lines.append("| # | Fault | Quiesced | Verdict | Acked | Distinct | Dup rate | Unknown |")
