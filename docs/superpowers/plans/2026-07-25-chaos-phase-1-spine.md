@@ -1941,6 +1941,80 @@ class TestWait(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("timeout", reason)
 
+    def test_a_missing_wab_bytes_gauge_never_counts_as_quiesced(self):
+        # A partial scrape must not read as "drained". Every default has to be
+        # the conservative one, because a false True here becomes a phantom
+        # durability violation two steps downstream.
+        partial = {
+            "weir_queue_depth": 0.0,
+            'weir_drain_state{state="draining"}': 1.0,
+        }
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.01, scrape_fn=lambda _: partial,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok, "absent wab_bytes must never satisfy quiescence")
+        self.assertIn("timeout", reason)
+
+    def test_a_missing_queue_depth_never_counts_as_quiesced(self):
+        partial = {
+            "weir_wab_bytes_on_disk": 8192.0,
+            'weir_drain_state{state="draining"}': 1.0,
+        }
+        ok, _ = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.01, scrape_fn=lambda _: partial,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok, "absent queue_depth must default to non-quiesced")
+
+    def test_an_always_failing_scrape_is_reported_as_a_harness_problem(self):
+        # A wrong URL and a genuinely stuck drain must not produce the same
+        # reason string — on a multi-day run that ambiguity costs hours.
+        def boom(_):
+            raise ConnectionRefusedError("connection refused")
+
+        ok, reason = quiescence.wait_for_quiescence(
+            "http://127.0.0.1:1/metrics", timeout_s=0.01, scrape_fn=boom,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok)
+        self.assertIn("harness", reason)
+        self.assertIn("ConnectionRefusedError", reason)
+
+    def test_the_poll_interval_cannot_overshoot_the_timeout(self):
+        import time as _time
+
+        readings = {"weir_queue_depth": 5.0, "weir_wab_bytes_on_disk": 1.0,
+                    'weir_drain_state{state="draining"}': 1.0}
+        start = _time.monotonic()
+        ok, _ = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.2, scrape_fn=lambda _: readings,
+            poll_interval_s=3.0, stable_polls=3,
+        )
+        elapsed = _time.monotonic() - start
+        self.assertFalse(ok)
+        self.assertLess(
+            elapsed, 1.0,
+            f"a 3s poll interval must not overshoot a 0.2s timeout; took {elapsed:.2f}s",
+        )
+
+
+class TestParse2(unittest.TestCase):
+    def test_a_trailing_timestamp_does_not_corrupt_the_key_or_value(self):
+        # OpenMetrics allows `name value timestamp`. Reading the timestamp as
+        # the value would also fold the real value into the key, so the
+        # canonical key vanishes and quiescence silently reads a default.
+        m = quiescence.parse("weir_wab_bytes_on_disk 4096.0 1721990400000\n")
+        self.assertEqual(m["weir_wab_bytes_on_disk"], 4096.0)
+
+    def test_a_label_value_containing_a_space_survives(self):
+        m = quiescence.parse('foo{note="a b"} 7.0\n')
+        self.assertEqual(m['foo{note="a b"}'], 7.0)
+
+    def test_lines_without_a_value_are_skipped(self):
+        m = quiescence.parse("garbage\nweir_queue_depth 0.0\n")
+        self.assertEqual(m, {"weir_queue_depth": 0.0})
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -1979,7 +2053,6 @@ import urllib.request
 
 DRAINING = 'weir_drain_state{state="draining"}'
 BLOCKED = 'weir_drain_state{state="blocked_dead_letter_full"}'
-RETRYING = 'weir_drain_state{state="retrying_transient"}'
 
 
 def parse(text):
@@ -1993,14 +2066,28 @@ def parse(text):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.rsplit(" ", 1)
-        if len(parts) != 2:
+        head, sep, last = line.rpartition(" ")
+        if not sep:
             continue
-        name, value = parts
         try:
-            out[name] = float(value)
+            value = float(last)
         except ValueError:
             continue
+        # OpenMetrics permits an optional trailing timestamp (`name value ts`).
+        # Taking the last field blindly would read the timestamp as the value
+        # AND fold the real value into the key, so the canonical key silently
+        # vanishes from the dict. If the remainder also ends in a number, the
+        # last field was the timestamp. (Checking this way, rather than
+        # splitting on the first space, keeps a label value containing a space
+        # intact — weir emits none, but the parser should not depend on that.)
+        head2, sep2, prev = head.rpartition(" ")
+        if sep2:
+            try:
+                value = float(prev)
+                head = head2
+            except ValueError:
+                pass
+        out[head] = value
     return out
 
 
@@ -2023,13 +2110,25 @@ def wait_for_quiescence(
     deadline = time.monotonic() + timeout_s
     last_bytes = None
     stable = 0
+    ok_scrapes = 0
+    failed_scrapes = 0
+    last_error = ""
 
-    while time.monotonic() < deadline:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             m = scrape_fn(metrics_url)
-        except Exception:  # daemon may be mid-restart; keep polling
+            ok_scrapes += 1
+        except Exception as exc:  # daemon may be mid-restart; keep polling
+            failed_scrapes += 1
+            last_error = f"{type(exc).__name__}: {exc}"
             if poll_interval_s:
-                time.sleep(poll_interval_s)
+                # Never sleep past the deadline — an unconditional sleep
+                # overshoots badly whenever poll_interval_s is large relative
+                # to timeout_s (measured 6x over at 3s poll / 0.5s timeout).
+                time.sleep(min(poll_interval_s, max(0.0, deadline - time.monotonic())))
             continue
 
         if m.get(BLOCKED, 0.0) == 1.0:
@@ -2048,15 +2147,28 @@ def wait_for_quiescence(
         last_bytes = wab_bytes
 
         if poll_interval_s:
-            time.sleep(poll_interval_s)
+            time.sleep(min(poll_interval_s, max(0.0, deadline - time.monotonic())))
 
-    return False, f"timeout after {timeout_s}s waiting for drain quiescence"
+    # Distinguish a harness/config problem from a genuine finding. Both return
+    # False, but on a multi-day run an identical reason string for "the URL was
+    # wrong the whole time" and "the drain really never settled" costs hours of
+    # misdirected investigation.
+    if ok_scrapes == 0:
+        return False, (
+            f"timeout after {timeout_s}s: every scrape of {metrics_url} failed "
+            f"({failed_scrapes} attempts, last: {last_error}). This is a harness "
+            "or configuration problem, not a weir finding."
+        )
+    return False, (
+        f"timeout after {timeout_s}s waiting for drain quiescence "
+        f"({ok_scrapes} successful scrapes, {failed_scrapes} failed)"
+    )
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd chaos/orchestrator && python3 test_quiescence.py`
-Expected: PASS — 5 tests.
+Expected: PASS — 12 tests.
 
 - [ ] **Step 5: Commit**
 
