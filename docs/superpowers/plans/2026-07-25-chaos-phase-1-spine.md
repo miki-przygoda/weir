@@ -842,9 +842,14 @@ Replace the `fn main()` stub in `chaos/src/bin/recorder.rs` with:
 ```rust
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::time::Duration;
+// `Shutdown` is used only by the socket tests. `cargo clippy --all-targets`
+// also builds the plain bin target, where an unconditional import would be
+// an unused-import warning and fail under `-D warnings`.
+#[cfg(test)]
+use std::net::Shutdown;
 
 /// Append-only log of delivered record identities, fsynced before each ack.
 struct DeliveryLog {
