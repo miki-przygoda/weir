@@ -288,13 +288,26 @@ mod tests {
             let mut s = TcpStream::connect(addr).unwrap();
             let _ = s.write_all(&request);
             let _ = s.flush();
-            std::thread::sleep(linger);
+            if !linger.is_zero() {
+                std::thread::sleep(linger);
+            }
+            // Drain the response before dropping the socket. Without this the
+            // client's close can send an RST that beats the server's response
+            // write, failing the test spuriously with ConnectionReset. A flaky
+            // test in a durability harness discredits every result the harness
+            // reports, so the handshake is completed deliberately rather than
+            // raced.
+            let mut discard = Vec::new();
+            let _ = s.read_to_end(&mut discard);
         });
 
         let (mut server_side, _) = listener.accept().unwrap();
         server_side.set_read_timeout(Some(timeout)).unwrap();
         server_side.set_write_timeout(Some(timeout)).unwrap();
         let result = handle(&mut server_side, &mut log);
+        // Close the server side so the client's `read_to_end` sees EOF and the
+        // join below cannot deadlock.
+        drop(server_side);
 
         client.join().unwrap();
         let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
