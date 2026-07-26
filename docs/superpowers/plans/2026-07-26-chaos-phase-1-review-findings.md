@@ -1,0 +1,215 @@
+# Chaos Phase 1 — Final Review Findings (must land before merge)
+
+**Date:** 2026-07-26
+**Branch:** `feat/chaos-fault-injection`
+**Reviewed range:** `0b8151b..7bec2b8` (41 commits, ~3000 lines under `chaos/`)
+**Verdict:** needs work
+
+Phase 1's nine implementable tasks are complete and all gates are green — `cargo
+fmt --check` and `cargo clippy --all-targets -- -D warnings` clean, 30 Rust
+tests, 44 Python tests (1 root-only skip), and `cargo metadata` from the repo
+root confirms `weir-chaos` is not a workspace member. The Rust↔Python ledger
+contract was checked exhaustively and agrees on every case tried.
+
+**But the harness cannot yet distinguish "weir is durable" from "the harness did
+not look."** That is precisely the failure Phase 1's exit criterion — *zero false
+violations* — exists to prevent, so these land before merge.
+
+---
+
+## C1 — Quiescence returns `True` unconditionally ~1.5 s after restart
+
+`chaos/orchestrator/quiescence.py:109-118`, defaults at `:69`
+
+**The premise of the design is invalid as implemented.** `weir_wab_bytes_on_disk`
+is refreshed by a background task **every 5 seconds**
+(`crates/weir-server/src/main.rs:563-576`). The stability window is
+`stable_polls=3 × poll_interval_s=0.5 = 1.5 s` — **3.3× shorter than the refresh
+period**. So "stable across consecutive polls" is satisfied by the gauge being
+*stale*, never by drain progress.
+
+The other two signals are trivially satisfied at the same instant:
+
+- `weir_queue_depth` is socket→worker channel occupancy (`main.rs:545-555`),
+  empty right after a restart before loadgen reconnects.
+- `weir_drain_state{state="draining"}` is the daemon's *initial* state, and its
+  own registered HELP text warns: *"state=\"draining\" does NOT imply delivery
+  progress — a segment stranded waiting on a fully-down sink still reads
+  draining"* (`metrics/mod.rs:543-546`).
+
+Demonstrated with 40 MiB of sealed-awaiting-drain segments held constant:
+`quiesced=True after 1.51s and 4 polls`.
+
+Two consequences: verification runs while the pre-crash backlog is still
+draining → **I1 false violations**; and the 120 s timeout is unreachable, so *"a
+drain that never quiesces is itself a finding"* can never fire.
+
+**Fix:** stability window strictly longer than the gauge's refresh period
+(`poll_interval_s=2.0, stable_polls=4`, or `stable_polls>=12` at 0.5 s);
+**require at least one observed change** before counting stability, so a
+never-refreshed gauge cannot satisfy it; and add `weir_sink_health{state="up"}==1`
+plus a stable `weir_drain_segments_stranded`, exactly as weir's own metric docs
+instruct.
+
+## C2 — A run where weir refuses or delivers nothing passes 20/20
+
+`chaos/orchestrator/verify.py:213-251`, `chaos/orchestrator/run.py:256-277`
+
+I1 is `acked − delivered_set` and I2 is `nacked ∩ delivered_set`; **both are
+vacuously satisfied when `acked` is empty.** `Nack(NackReason::InternalError)` is
+*recoverable* (`crates/weir-client/src/unix.rs:108`), so with every shard flusher
+offline loadgen keeps its connection and keeps pushing at full rate while every
+record is nacked.
+
+Demonstrated with 100 000 nacked records and 0 delivered: `ok=True acked=0
+i1=0 i2=0`.
+
+`VerifyResult` has no `nacked_count`, and neither `episodes.jsonl` nor
+`report.md` records a *pushed* total, so nothing distinguishes this from a
+healthy run. Task 8's guards cover "the observer process died", not "the observer
+is alive and the run is meaningless."
+
+**Fix:** add `nacked_count` and `pushed` to `VerifyResult` and the episode
+record; fail the episode when the per-episode **delta** in acked or delivered
+falls below a schedule-configured floor.
+
+---
+
+## Important
+
+**I1 — `report.py` sums cumulative totals; headline numbers inflated ~N/2×.**
+`report.py:50-53, 69-70`. `verify.Accumulator` is cumulative and `run.py:298-313`
+writes running totals into `episodes.jsonl`. 20 episodes ending at 20 000 acked
+render as `210000` (10.5×). `avg_dup` averages a monotone cumulative series. Use
+the last episode's values, or record per-episode deltas.
+
+**I2 — `orphaned_delivered` will be large on every healthy episode, with a wrong
+diagnosis.** `verify.py:231`, `report.py:74-79`, `loadgen.rs:181`. The recorder
+fsyncs a delivery *before* its 200, ~ms after the ack; the ledger entry sits in
+loadgen's per-thread buffer until `pending.len() >= 256` — **there is no
+time-based flush**, though the spec says "checkpointed to disk every N seconds"
+(design §3.1). With 8 threads that is ~2000 delivered-but-unprovenanced records
+at every check, and the report announces them as *"the likeliest cause is a stale
+delivery log from an earlier run of this seed"*. Deterministic, not racy: the
+harness crying wolf on a clean run, with a diagnosis that sends the operator
+hunting a bug that does not exist.
+
+**I3 — I1 has no watermark; whether it fires is a race.** `run.py:287-289`. Load
+runs continuously through the kill, the quiescence wait and the 1 s sleep, so
+there is always a set of acked-but-undelivered records at check time. The only
+thing preventing a false I1 today is incidental ordering. Fixing I2 makes the
+ledger more current and a false I1 **more** likely. `LedgerEntry.t_micros` exists
+for exactly this and is discarded by `parse_ledger_line`. Fix: carry `t_micros`
+and exempt records acked after `quiescence_start − margin` from both I1 and the
+orphan set; or SIGSTOP loadgen before waiting.
+
+**I4 — `Nack(InternalError)` is held to I2 but means indeterminate, not
+refused.** `loadgen.rs:40`. weir emits it when the flusher returns a non-durable
+outcome or its ack sender was dropped (`socket/connection.rs:651-675`) — the
+bytes may already be in the segment, so recovery legitimately replays and
+delivers them. `weir_wab_fsync_failures`' HELP text states producers in a failed
+fsync receive it. Holding those to I2 is stricter than weir's own contract, and
+design §6.1 calls any I2 violation "a P0 finding". Barely reachable under
+SIGKILL-only; near-certain once Phase 3 adds ENOSPC and read-only remount.
+`Unknown`/I3 is the correct classification.
+
+**I5 — "violation" means two different things and the README gate uses both.**
+`run.py:270, 291-292` counts durability failure **or** quiescence timeout **or**
+observer death; `report.py:19` counts only `not e["ok"]`. Five clean-but-unquiesced
+episodes → run.py prints `5 violation(s)` and exits 1 while `report.md` says "0
+violations". README:42 gates on both.
+
+**I6 — Recorder never sends `Connection: close`, but weir's sink pools
+connections.** `recorder.rs:133, 156` vs `sink/http.rs:158-159`
+(`pool_idle_timeout(60s)`, `pool_max_idle_per_host(8)`). Verified live: the second
+POST on a reused socket hit EOF and its record never reached the log. Inflates the
+duplicate rate (a headline deliverable), flaps `weir_sink_health`, and after
+`sink_max_retries=3` strands segments — acked records not delivered, which C1's
+broken quiescence then reads as an I1 violation. Three-line fix.
+
+**I7 — Both observers' stderr goes to `/dev/null`.** `run.py:188, 236`. The
+recorder's stderr is the only place `refused a request with {code}` appears — and
+a recorder 4xx is *permanent* to weir's drain, so a refused batch is dead-lettered,
+producing acked-never-delivered records indistinguishable from a weir defect.
+loadgen's stderr carries the `FATAL — could not durably record N ledger entries`
+message. Send both to files in `run_dir`, as `weir-server.log` already is.
+
+**I8 — "Exactly one privileged component" is documented but not implemented.**
+`chaos/README.md:14-16` and design §3 vs `run.py:186, 227`: run.py is root and
+spawns both observers as root children with no privilege drop. This is the
+branch's central architectural claim.
+
+---
+
+## Minor (triaged)
+
+Must fix (escalated from the deferred roll-up):
+- Recorder keep-alive → this is I6, not out of scope.
+- `report.py:61` renders "Duplicate rate (mean)" with no unit. Rename to
+  "Deliveries per distinct record (1.000 = no redelivery)" — the prose was fixed
+  in `7bec2b8`, the table cell was not.
+
+Can stand: recorder sockopt failures swallowed (unreachable, and the log line
+survives once I7 lands); recorder temp-dir cleanup on success only; loadgen's
+coincident-failure message (mooted by I7); `dm_stack` absolute-path enforcement
+(both call sites build absolute paths); `dm_stack.name == ""` at `/` (unreachable,
+and `name` is dead); loadgen `--tier Sx` → `'S'` (visible misconfiguration, not a
+silent false verdict).
+
+Also worth doing:
+- **`--wab-dir` is the mount root, which contains `lost+found`** after
+  `mkfs.ext4` (`run.py:154, 209`). Benign as root; becomes a startup failure
+  (EACCES) the moment I8 is fixed. Point it at `<mount>/wab`.
+- `[faults] kill_random = true` is never read; `run.py:10` refers to branches in
+  an `inject` function that does not exist.
+- `report.py` is never invoked by `run.py` — one line would remove a manual step
+  from the gate.
+- No final verification after the last episode, and `finally` SIGTERMs loadgen
+  (no handler), so up to 256×threads ledger entries are never written.
+- `progress.md` has two "Minor findings roll-up" sections; the empty one shadows
+  the real list.
+- `chaos/Cargo.toml`'s "No `[[bin]]` sections yet" comment now sits above two
+  `[[bin]]` blocks.
+- Dead surface: `dm_stack.StorageStack.name`; `verify.check()` (used only by
+  tests); `t_micros`/`rtt_micros` and the whole `escape_reason`/`unescape_reason`
+  machinery are write-only — nothing reads a NACK reason and the report has no
+  nacked figure at all.
+- `parse_ledger_line`'s docstring overclaims strict parity with the Rust decoder.
+- `test_report.py:46` uses `loadgen_exit_code` while `run.py:274` writes
+  `exit_code` — the fixture was not derived from real output.
+- `run.py` has ~25 of 358 lines under test. `Daemon.start()`'s argv is a pure
+  function of `cfg`; a test asserting each flag appears in
+  `crates/weir-server/src/config/cli.rs` would pin the Rust↔Python CLI contract
+  without needing root.
+
+---
+
+## What the review confirmed sound
+
+Worth recording so it is not re-litigated: the ledger round trip agrees between
+Rust and Python on every case tried (empty-reason NACK including its trailing
+space, reasons with spaces, escaped `\n`/`\r`/`\\`, a reason that is literally
+`"ACK"`, truncated NACK, ACK/UNK with trailing garbage, `u64::MAX`); the delivery
+log contract holds; the observers' logs are genuinely outside the fault zone;
+payload encoding is newline-free at every boundary so the NDJSON dead-letter trap
+is unrepresentable; all 11 weir-server flags exist and `--sink-http-batch ndjson`
+is accepted; the health probe is `HEAD` and the recorder answers it; the socket
+unlink before restart is correct; teardown ordering is right; and Phases 2–4
+features are genuinely absent.
+
+## Predicted first-Linux-run behaviour
+
+1. **Every episode reports thousands of orphans** (I2), deterministically, with
+   the report blaming a stale log. Crying wolf on a clean run.
+2. **Quiescence returns True ~2 s after every restart** (C1). On a 512 MiB loop
+   with `batch_deadline_ms=2` the backlog is usually small, so this will *mostly
+   pass* — the dangerous outcome, because it passes for reasons nobody chose and
+   starts failing the moment Phase 2's `dm-delay` slows the drain.
+3. **Sporadic sink errors** from the pooled-connection mismatch (I6), first
+   visible as an inflated duplicate rate, with the recorder's stderr discarded (I7).
+4. **Nothing breaks outright** — `run.py` should get through a run.
+
+What a green first run would **not** have exercised: the quiescence timeout
+(unreachable, C1), the observer-death guards, and `dm_stack.setup/teardown` on
+real hardware. And it *cannot* fail for the reason it most needs to be able to
+fail (C2).
