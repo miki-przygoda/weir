@@ -796,8 +796,8 @@ Note: the `use std::io::Write;` already at the top of the file stays; add the ot
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd chaos && cargo test --bin recorder`
-Expected: PASS — 3 tests.
+Run: `cd chaos && cargo test`
+Expected: PASS — 14 tests (11 from Tasks 1-2 + 3 recorder tests).
 
 - [ ] **Step 5: Verify it serves a real request**
 
@@ -816,7 +816,7 @@ Expected: `200`, then a log containing exactly `1 1` and `1 2` on separate lines
 - [ ] **Step 6: Commit**
 
 ```bash
-git add chaos/src/bin/recorder.rs
+git add chaos/Cargo.toml chaos/src/bin/recorder.rs
 git commit -m "feat(chaos): add recording sink with durable-before-ack append"
 ```
 
@@ -1185,7 +1185,7 @@ Expected: no output, exit 0.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add chaos/src/bin/loadgen.rs
+git add chaos/Cargo.toml chaos/src/bin/loadgen.rs
 git commit -m "feat(chaos): add load generator with reconnecting producer pool"
 ```
 
