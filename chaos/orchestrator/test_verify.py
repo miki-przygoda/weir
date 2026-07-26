@@ -127,6 +127,89 @@ class TestAccumulator(unittest.TestCase):
         self.assertEqual(r.delivered_distinct, 1)
         self.assertAlmostEqual(r.duplicate_rate, 3.0)
 
+    def test_a_conflicting_tag_for_one_seq_fails_and_keeps_the_first(self):
+        # loadgen allocates seq from a single monotonic counter, so a repeat
+        # means corruption or cross-run pollution. Silently overwriting would
+        # RECLASSIFY an outcome, which this module's contract forbids.
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["5 S 1 1 UNK"], [])
+        acc.ingest(["5 S 2 2 ACK"], [])
+        r = acc.check()
+        self.assertFalse(r.ok, "verification against a corrupt ledger is meaningless")
+        self.assertEqual(r.ledger_conflicts, [(5, "UNK", "ACK")])
+        self.assertEqual(r.unknown_count, 1, "the first observation must stand")
+        self.assertEqual(r.i1_missing, [], "and it must not become an I1 violation")
+
+
+class TestOrphansAndProvenance(unittest.TestCase):
+    def test_a_delivered_record_with_no_ledger_entry_is_reported_not_absorbed(self):
+        # Folding it into the duplicate rate would distort a headline metric
+        # with a record that is not a redelivery of anything real.
+        r = verify.check({1: ("ACK", "")}, [1, 999])
+        self.assertTrue(r.ok, "an orphan is not a durability violation")
+        self.assertEqual(r.orphaned_delivered, [999])
+        self.assertEqual(r.delivered_distinct, 1, "orphans excluded from the count")
+        self.assertAlmostEqual(r.duplicate_rate, 1.0, msg="and from the rate")
+
+    def test_an_unknown_record_that_arrives_is_not_an_orphan(self):
+        r = verify.check({1: ("UNK", "")}, [1])
+        self.assertTrue(r.ok)
+        self.assertEqual(r.orphaned_delivered, [], "UNK is provenance, not an orphan")
+
+
+class TestLedgerLineStrictness(unittest.TestCase):
+    def test_rejects_what_the_rust_encoder_would_never_emit(self):
+        # Mirrors LedgerEntry::from_line. Divergence between the two parsers of
+        # one contract is a latent way for corrupt input to enter the oracle.
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 NACK"), "truncated NACK")
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 ACK junk"), "ACK + trailing")
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 UNK junk"), "UNK + trailing")
+        self.assertIsNone(verify.parse_ledger_line("42 S 1 2 WAT"), "unknown tag")
+        self.assertIsNone(verify.parse_ledger_line("notanint S 1 2 ACK"), "bad seq")
+
+    def test_accepts_exactly_what_the_encoder_emits(self):
+        self.assertEqual(verify.parse_ledger_line("42 S 1 2 ACK"), (42, "ACK"))
+        self.assertEqual(verify.parse_ledger_line("42 U 1 2 UNK"), (42, "UNK"))
+        # NACK always carries a reason field, even an empty one (trailing space).
+        self.assertEqual(verify.parse_ledger_line("42 B 1 2 NACK "), (42, "NACK"))
+        self.assertEqual(
+            verify.parse_ledger_line("42 B 1 2 NACK reason with spaces"), (42, "NACK")
+        )
+
+
+class TestTailerSafety(unittest.TestCase):
+    def test_a_shrinking_log_raises_rather_than_silently_skipping(self):
+        # Seeking past a truncated file's EOF returns b"" forever, so every
+        # later line would vanish with no signal — the oracle losing evidence
+        # silently, which is worse than a false alarm.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log")
+            with open(path, "w") as f:
+                f.write("a\nb\nc\n")
+            tailer = verify.LogTailer(path)
+            self.assertEqual(tailer.read_new(), ["a", "b", "c"])
+            with open(path, "w") as f:  # truncate + rewrite shorter
+                f.write("x\n")
+            with self.assertRaises(RuntimeError) as ctx:
+                tailer.read_new()
+            self.assertIn("shrank", str(ctx.exception))
+
+    def test_a_form_feed_in_a_reason_does_not_fabricate_a_line(self):
+        # splitlines() would split on \x0c; the Rust side escapes only \\, \n, \r.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log")
+            with open(path, "w") as f:
+                f.write("1 S 2 3 NACK err\x0cmore\n")
+            self.assertEqual(
+                verify.LogTailer(path).read_new(), ["1 S 2 3 NACK err\x0cmore"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
