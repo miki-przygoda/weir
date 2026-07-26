@@ -2816,8 +2816,8 @@ Usage: sudo python3 run.py schedules/smoke.toml
 import json
 import os
 import random
-import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -2857,20 +2857,36 @@ def kill_delays(seed, count, lo, hi):
 class Daemon:
     """A weir-server process under test."""
 
-    def __init__(self, binary, wab_dir, socket_path, metrics_port, cfg):
+    def __init__(self, binary, wab_dir, socket_path, metrics_port, cfg, log_file):
         self.binary = binary
         self.wab_dir = wab_dir
         self.socket_path = socket_path
         self.metrics_port = metrics_port
         self.cfg = cfg
+        # A FILE, not a pipe. An undrained `stderr=PIPE` fills its OS buffer and
+        # blocks the daemon's writer, which would surface as a false quiescence
+        # timeout blamed on weir. A file also keeps the logs for diagnosis.
+        self.log_file = log_file
         self.proc = None
 
     def start(self, sink_url):
+        # Remove any stale socket BEFORE spawning. `kill -9` leaves the file on
+        # disk, so the readiness poll below would be satisfied instantly by the
+        # dead process's socket — defeating the check on every restart after
+        # episode 0, and misreporting a genuine crash-on-restart as a
+        # quiescence timeout rather than the finding it is.
+        try:
+            os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
         cmd = [
             self.binary,
             "--wab-dir", self.wab_dir,
             "--socket-path", self.socket_path,
             "--metrics-port", str(self.metrics_port),
+            # Bind the metrics server to loopback explicitly; the harness never
+            # needs it reachable off-box.
+            "--metrics-bind", "127.0.0.1",
             "--sink-type", "http",
             "--sink-url", sink_url,
             "--sink-http-batch", "ndjson",
@@ -2879,14 +2895,16 @@ class Daemon:
             "--batch-deadline-ms", str(self.cfg["batch_deadline_ms"]),
             "--wab-segment-max-bytes", str(self.cfg["wab_segment_max_bytes"]),
         ]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(cmd, stdout=self.log_file, stderr=self.log_file)
         # Wait for the socket to appear rather than sleeping a fixed interval.
         for _ in range(200):
             if os.path.exists(self.socket_path):
                 return
             if self.proc.poll() is not None:
-                err = self.proc.stderr.read().decode(errors="replace")
-                raise RuntimeError(f"weir-server exited during startup: {err}")
+                raise RuntimeError(
+                    f"weir-server exited during startup (code {self.proc.returncode}); "
+                    f"see the daemon log in the run directory"
+                )
             time.sleep(0.05)
         raise RuntimeError("weir-server did not create its socket within 10s")
 
@@ -2924,8 +2942,24 @@ def main():
     delivered_path = os.path.join(run_dir, "delivered.log")
     episodes_path = os.path.join(run_dir, "episodes.jsonl")
 
+    # Refuse to start on top of a previous run's leftovers rather than silently
+    # stacking a mount or mixing two runs' logs. Re-running the same seed reuses
+    # this directory, and mixed logs would produce spurious ledger conflicts on
+    # exactly the reproduction run meant to confirm a finding.
+    for path in (ledger_path, delivered_path, episodes_path):
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            sys.exit(
+                f"{path} already exists and is non-empty. Move or delete "
+                f"{run_dir} before re-running this seed."
+            )
+
     mount_point = "/mnt/weir-wab"
     os.makedirs(mount_point, exist_ok=True)
+    if os.path.ismount(mount_point):
+        sys.exit(
+            f"{mount_point} is already a mount point — a previous run did not tear "
+            "down cleanly. Unmount it (and check `losetup -a`) before starting."
+        )
     socket_dir = "/run/weir-chaos"
     os.makedirs(socket_dir, mode=0o700, exist_ok=True)
 
@@ -2945,6 +2979,7 @@ def main():
     recorder = None
     loadgen = None
     daemon = None
+    daemon_log = None
     violations = 0
 
     try:
@@ -2954,11 +2989,28 @@ def main():
             [recorder_bin, "--bind", "127.0.0.1:9900", "--log", delivered_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        time.sleep(0.5)
+        # Poll for the recorder's port rather than sleeping a fixed interval — if
+        # it is not accepting when the daemon's first batch drains, weir sees a
+        # failed sink and the episode's numbers are about the harness, not weir.
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", 9900), timeout=0.2):
+                    break
+            except OSError:
+                if recorder.poll() is not None:
+                    sys.exit(
+                        f"recorder exited during startup (code {recorder.returncode})"
+                    )
+                time.sleep(0.05)
+        else:
+            sys.exit("recorder did not accept connections within 5s")
 
+        daemon_log = open(os.path.join(run_dir, "weir-server.log"), "ab")
         daemon = Daemon(
             weir_bin, mount_point, os.path.join(socket_dir, "weir.sock"),
-            9185, sched["weir"],
+            # NOT 9185: that is weir-server's compiled-in default, so a real
+            # instance on this host would collide with the harness.
+            19185, sched["weir"], daemon_log,
         )
         daemon.start("http://127.0.0.1:9900/ingest")
 
@@ -2997,18 +3049,31 @@ def main():
                 # A dead load generator makes every subsequent verification
                 # vacuous: an idle daemon trivially satisfies I1 and I2. Assert
                 # liveness BEFORE the fault so a PASS always means something.
+                # Both observers must be alive. A dead LOADGEN makes every
+                # later verification vacuous — an idle daemon trivially
+                # satisfies I1 and I2, so the run would go green while proving
+                # nothing. A dead RECORDER is worse in the other direction:
+                # deliveries stop arriving and every acked record looks lost,
+                # manufacturing I1 violations that are pure harness failure.
+                dead = None
                 if loadgen.poll() is not None:
+                    dead = ("loadgen_exited", loadgen.returncode,
+                            "remaining episodes would pass vacuously")
+                elif recorder.poll() is not None:
+                    dead = ("recorder_exited", recorder.returncode,
+                            "every acked record would look undelivered")
+                if dead:
+                    reason, code, consequence = dead
                     print(
-                        f"episode {i:3d}  ABORT — load generator exited "
-                        f"(code {loadgen.returncode}) before the fault; "
-                        "remaining episodes would pass vacuously",
+                        f"episode {i:3d}  ABORT — {reason} (code {code}) before the "
+                        f"fault; {consequence}",
                         flush=True,
                     )
                     violations += 1
                     ep_log.write(json.dumps({
                         "episode": i, "fault": "kill_random", "ok": False,
-                        "quiesced": False, "abort_reason": "loadgen_exited",
-                        "loadgen_exit_code": loadgen.returncode, "seed": seed,
+                        "quiesced": False, "abort_reason": reason,
+                        "exit_code": code, "seed": seed,
                     }) + "\n")
                     ep_log.flush()
                     break
@@ -3062,12 +3127,30 @@ def main():
                         flush=True,
                     )
     finally:
-        for p in (loadgen, recorder):
-            if p and p.poll() is None:
-                p.terminate()
-        if daemon:
-            daemon.stop()
-        stack.teardown()
+        # Each step isolated. A process can exit between `poll()` and
+        # `terminate()`, and an unguarded ProcessLookupError there would skip
+        # stack.teardown() — leaking a loop device and a mount — while also
+        # masking whatever original exception brought us here.
+        for label, proc in (("loadgen", loadgen), ("recorder", recorder)):
+            try:
+                if proc and proc.poll() is None:
+                    proc.terminate()
+            except Exception as exc:
+                print(f"cleanup: {label} terminate failed: {exc}", file=sys.stderr)
+        try:
+            if daemon:
+                daemon.stop()
+        except Exception as exc:
+            print(f"cleanup: daemon stop failed: {exc}", file=sys.stderr)
+        try:
+            stack.teardown()
+        except Exception as exc:
+            print(f"cleanup: storage teardown failed: {exc}", file=sys.stderr)
+        if daemon_log:
+            try:
+                daemon_log.close()
+            except Exception:
+                pass
 
     print(f"\nrun {run_id} complete: {violations} violation(s) across {sched['episodes']} episodes")
     sys.exit(1 if violations else 0)
