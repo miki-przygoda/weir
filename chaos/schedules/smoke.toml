@@ -1,0 +1,35 @@
+# Phase 1 smoke schedule — ~30 minutes, random kills only.
+#
+# The Phase 1 exit criterion is ZERO FALSE VIOLATIONS, not "it ran". A chaos
+# harness that cries wolf is worse than no harness on a multi-day run, so this
+# schedule exists to prove the oracle is trustworthy before any real fault
+# class is added.
+
+seed = 0x5EED
+episodes = 20
+
+# Seconds of steady-state load between kills, sampled from this range.
+steady_lo_secs = 45.0
+steady_hi_secs = 90.0
+
+# Seconds to wait for drain quiescence after a restart before verifying.
+quiescence_timeout_secs = 120.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "S"
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+# Small segments so rotation actually happens inside a small volume. The
+# config range is [4096, 4 GiB]; 8 MiB gives frequent seals without thrashing.
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 512
+
+[faults]
+kill_random = true
