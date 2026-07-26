@@ -698,15 +698,22 @@ mod tests {
             let mut s = TcpStream::connect(addr).unwrap();
             let _ = s.write_all(&request);
             let _ = s.flush();
-            if !linger.is_zero() {
+            if linger.is_zero() {
+                // Half-close: FIN on the write side only. The server sees a
+                // real EOF — so an incomplete request head is rejected
+                // promptly instead of waiting out its timeout — while this
+                // side can still read the response. A full `drop` here would
+                // instead risk an RST that beats the server's response write,
+                // which is what made these tests flaky.
+                let _ = s.shutdown(Shutdown::Write);
+            } else {
+                // Simulate a HALF-OPEN peer: hold the connection open with no
+                // FIN at all, which is what a process killed mid-POST leaves
+                // behind. The server must time out rather than block forever.
+                // Do NOT half-close here — that would hand the server a clean
+                // EOF and the timeout would never be exercised.
                 std::thread::sleep(linger);
             }
-            // Drain the response before dropping the socket. Without this the
-            // client's close can send an RST that beats the server's response
-            // write, failing the test spuriously with ConnectionReset. A flaky
-            // test in a durability harness discredits every result the harness
-            // reports, so the handshake is completed deliberately rather than
-            // raced.
             let mut discard = Vec::new();
             let _ = s.read_to_end(&mut discard);
         });
@@ -835,7 +842,7 @@ Replace the `fn main()` stub in `chaos/src/bin/recorder.rs` with:
 ```rust
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::time::Duration;
 
