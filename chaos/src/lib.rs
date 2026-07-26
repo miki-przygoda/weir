@@ -50,10 +50,9 @@ pub fn decode_record(line: &str) -> Option<Record> {
 fn extract_u64(haystack: &str, key: &str) -> Option<u64> {
     let start = haystack.find(key)? + key.len();
     let rest = &haystack[start..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    if end == 0 {
-        return None;
-    }
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -64,7 +63,11 @@ mod tests {
     #[test]
     fn round_trips_and_never_contains_a_newline() {
         let line = encode_record(7, 42, 128);
-        assert_eq!(line.len(), 128, "encoded record must hit the requested size");
+        assert_eq!(
+            line.len(),
+            128,
+            "encoded record must hit the requested size"
+        );
         assert!(
             !line.as_bytes().contains(&b'\n'),
             "payload must be newline-free: the NDJSON sink dead-letters records \
@@ -77,8 +80,29 @@ mod tests {
     fn rejects_a_size_too_small_to_hold_the_identity() {
         // 8 bytes cannot hold `{"run":7,"seq":42,"pad":""}`.
         let line = encode_record(7, 42, 8);
-        assert!(line.len() > 8, "encoder must not truncate identity to hit size");
+        assert!(
+            line.len() > 8,
+            "encoder must not truncate identity to hit size"
+        );
         assert_eq!(decode_record(&line), Some(Record { run_id: 7, seq: 42 }));
+    }
+
+    #[test]
+    fn round_trips_at_numeric_and_size_boundaries() {
+        for (run_id, seq) in [(0u64, 0u64), (u64::MAX, u64::MAX), (0, u64::MAX)] {
+            for size in [0usize, 32, 4096] {
+                let line = encode_record(run_id, seq, size);
+                assert!(
+                    !line.as_bytes().contains(&b'\n'),
+                    "payload must stay newline-free at every boundary"
+                );
+                assert_eq!(
+                    decode_record(&line),
+                    Some(Record { run_id, seq }),
+                    "round-trip must hold for run_id={run_id} seq={seq} size={size}"
+                );
+            }
+        }
     }
 
     #[test]
