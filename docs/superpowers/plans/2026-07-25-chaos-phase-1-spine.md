@@ -1141,7 +1141,7 @@ mod tests {
 
     impl std::io::Write for FailingWriter {
         fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "disk gone"))
+            Err(std::io::Error::other("disk gone"))
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
@@ -1414,8 +1414,8 @@ fn flush(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cd chaos && cargo test --bin loadgen`
-Expected: PASS — 2 tests.
+Run: `cd chaos && cargo test`
+Expected: PASS — 25 tests (21 from Tasks 1-3 + 4 loadgen tests).
 
 - [ ] **Step 5: Verify it builds clean**
 
