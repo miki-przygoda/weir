@@ -1540,6 +1540,11 @@ fn serialise(entries: &[LedgerEntry]) -> String {
 
 /// Serialises entries to a writer. Generic over `Write` so the error path is
 /// testable with a deliberately-failing writer.
+///
+/// Test-only: production writes go through [`flush`] via [`LedgerSink`]. Left
+/// unconditional it would be `dead_code` in the plain bin build, which
+/// `clippy --all-targets -- -D warnings` rejects.
+#[cfg(test)]
 fn write_entries<W: Write>(w: &mut W, entries: &[LedgerEntry]) -> std::io::Result<()> {
     w.write_all(serialise(entries).as_bytes())
 }
