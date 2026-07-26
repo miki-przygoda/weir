@@ -3319,9 +3319,11 @@ def render(episodes, meta):
         lines.append(f"| Duplicate rate (mean) | {avg_dup:.3f} |")
         lines.append("")
         lines.append(
-            "Duplicate rate is delivered-over-distinct. At-least-once delivery makes "
-            "duplicates conformant; this is what a crash actually costs a sink that "
-            "must dedupe.\n"
+            "Duplicate rate is a **multiplicity factor**, not a percentage: 1.0 means "
+            "no redelivery, 2.0 means every record arrived twice on average. "
+            "At-least-once delivery makes duplicates conformant — this is what a crash "
+            "actually costs a sink that has to dedupe, which weir's own docs require "
+            "but never quantify.\n"
         )
 
     orphaned = sum(len(e.get("orphaned_delivered", [])) for e in episodes)
