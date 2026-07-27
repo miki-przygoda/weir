@@ -80,9 +80,16 @@ cheap if it happens.
 
 ## 3. Architecture
 
-Four harness components alongside the daemon, exactly one of them privileged,
-and one deliberate rule: **the observers are unprivileged and live outside the
-fault zone.**
+Four harness components alongside the daemon. The design goal is that exactly
+one of them is privileged, with one deliberate rule: **the observers are
+unprivileged and live outside the fault zone.** **As implemented, this is not
+yet enforced:** `run.py` execs both `loadgen` and `recorder` as direct
+`subprocess.Popen` children with no privilege drop, so today they inherit
+root from the orchestrator, same as the daemon under test. A real drop needs
+`setuid`/capability plumbing that is its own piece of work; it is deferred,
+not landed (see `chaos/README.md`'s Requirements section). "Unprivileged"
+below describes what each component is *intended* to run as, not what it
+runs as today.
 
 ```
                     ┌──────────────────────────────────────┐
@@ -112,7 +119,7 @@ fault zone.**
         └────────────────────────────┘
 ```
 
-### 3.1 `loadgen` — Rust binary, unprivileged
+### 3.1 `loadgen` — Rust binary, intended unprivileged (runs as root today; see §3)
 
 Sustained producer pool over `weir-client`. Per record it assigns a unique
 identity and records the outcome in an in-memory **ledger**.
@@ -145,7 +152,7 @@ identity and records the outcome in an in-memory **ledger**.
   time-series log with a timestamp and tier. This is the soak half of the
   deliverable — p50/p99/p99.9 over hours.
 
-### 3.2 `recorder` — Rust binary, unprivileged
+### 3.2 `recorder` — Rust binary, intended unprivileged (runs as root today; see §3)
 
 The recording sink. weir is configured with `--sink-type http` pointed at it,
 using **NDJSON batch mode** (`sink_http_batch = "ndjson"`) so one POST carries a
@@ -165,9 +172,12 @@ no injected fault can corrupt the observer.
 
 ### 3.3 `orchestrator` — Python, root
 
-Owns everything privileged, and is the only component that is. Builds and tears
-down the device-mapper stack, applies faults, manages the eBPF probe, drives the
-episode loop, and invokes the verifier.
+Owns everything that is privileged **by design** — the device-mapper stack,
+fault injection, the eBPF probe, and process lifecycle — and is the only
+component the design *intends* to run as root. As built, it is not yet the
+only component that *does*: `run.py` spawns `loadgen` and `recorder` as its
+direct children with no privilege drop, so both inherit its root privilege
+(see §3). Drives the episode loop and invokes the verifier.
 
 Python matches existing repo precedent for tooling: `deploy/avg_benchmarks.py`,
 `deploy/grafana/gen-dashboards.py`, `docs/conformance/gen_vectors.py`.

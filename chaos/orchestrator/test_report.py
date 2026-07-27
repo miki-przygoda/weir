@@ -73,6 +73,55 @@ class TestRender(unittest.TestCase):
         self.assertIn("0 violations", out)
         self.assertIn("1 anomaly", out)
 
+    def test_the_episode_table_renders_nacked_pushed_and_provenance_fields(self):
+        # Important: the prose says "Check the episode's nacked/pushed figures
+        # below" and claims the exempted count (i1_exempt/pending_provenance)
+        # is reported — but until this fix the episode table carried none of
+        # them. Whatever the prose points readers at must actually be there.
+        episodes = [
+            {"episode": 0, "fault": "kill_random", "ok": True, "quiesced": True,
+             "acked": 5000, "delivered_distinct": 5000, "acked_delta": 5000,
+             "delivered_delta": 5000, "no_progress": False, "duplicate_rate": 1.0,
+             "unknown": 0, "nacked": 17, "pushed": 5017, "i1_exempt": 3,
+             "pending_provenance": 2, "i1_missing": [], "i2_leaked": [],
+             "seed": 24301},
+        ]
+        out = report.render(episodes, {})
+        self.assertIn("Nacked", out)
+        self.assertIn("Pushed", out)
+        self.assertIn("I1 exempt", out)
+        self.assertIn("Pending prov", out)
+        # The actual values from the episode record must appear, not just the
+        # column headings.
+        self.assertIn("| 17 |", out)
+        self.assertIn("| 5017 |", out)
+        self.assertIn("| 3 |", out)
+        self.assertIn("| 2 |", out)
+
+    def test_missing_provenance_fields_render_as_a_dash_not_a_crash(self):
+        # An abort record (or any episode written before these fields
+        # existed) has none of nacked/pushed/i1_exempt/pending_provenance.
+        episodes = [
+            {"episode": 0, "fault": "kill_random", "ok": True, "quiesced": True,
+             "acked": 100, "delivered_distinct": 100, "duplicate_rate": 1.0,
+             "unknown": 0, "i1_missing": [], "i2_leaked": [], "seed": 1},
+        ]
+        out = report.render(episodes, {})
+        self.assertIn("—", out)
+
+    def test_an_aborted_episode_is_not_counted_as_a_quiescence_timeout(self):
+        # Minor: an abort happens BEFORE the fault, so no quiescence wait
+        # ever ran. run.py writes "quiesced": False on the abort record
+        # (there being no meaningful value), which must not be read the same
+        # way as "waited and timed out".
+        aborted = [
+            {"episode": 0, "fault": "kill_random", "ok": True, "quiesced": False,
+             "abort_reason": "loadgen_exited", "exit_code": 1, "seed": 24301},
+        ]
+        out = report.render(aborted, {})
+        self.assertNotIn("did not reach drain quiescence", out)
+        self.assertIn("aborted early", out)
+
     def test_no_progress_episode_is_an_anomaly_not_a_violation(self):
         # C2 + I5: a no-progress episode must read as an anomaly (the
         # harness observed nothing happening) and must NOT be mistaken for a

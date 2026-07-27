@@ -24,7 +24,14 @@ def render(episodes, meta):
     """Renders episodes (list of dicts) into markdown."""
     total = len(episodes)
     violations = [e for e in episodes if not e.get("ok", True)]
-    unquiesced = [e for e in episodes if not e.get("quiesced", True)]
+    # An episode aborted before the fault (a dead observer, `abort_reason`
+    # set) never ran a quiescence wait at all, so it must not be counted
+    # among episodes that waited and timed out — those are two different
+    # findings with two different remedies.
+    unquiesced = [
+        e for e in episodes
+        if not e.get("quiesced", True) and not e.get("abort_reason")
+    ]
     no_progress_eps = [e for e in episodes if e.get("no_progress")]
     # An anomaly is anything that makes an episode's verdict mean "the
     # harness didn't get a clean look", not "weir is broken": a quiescence
@@ -140,10 +147,18 @@ def render(episodes, meta):
 
     lines.append("## Episodes\n")
     lines.append(
-        "| # | Fault | Quiesced | Verdict | Acked Δ | Delivered Δ | Dup rate | "
-        "Unknown | Notes |"
+        "Nacked/Pushed are cumulative counts (as stored in the episode record, "
+        "same basis as the Totals table above), not per-episode deltas — labelled "
+        "explicitly so they are never read the way the pre-I1-fix totals were. "
+        "I1 exempt / Pending prov. are the frontier-exemption counts from the "
+        "same check (see Provenance anomalies above): how many would-be I1/orphan "
+        "hits were excused as not-yet-caught-up rather than lost.\n"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|")
+    lines.append(
+        "| # | Fault | Quiesced | Verdict | Acked Δ | Delivered Δ | Dup rate | "
+        "Unknown | Nacked (cum.) | Pushed (cum.) | I1 exempt | Pending prov. | Notes |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for e in episodes:
         notes = []
         if e.get("no_progress"):
@@ -168,6 +183,15 @@ def render(episodes, meta):
         # totals table by ~10x. If a delta is genuinely absent, say so.
         acked_delta = e.get("acked_delta")
         delivered_delta = e.get("delivered_delta")
+        # nacked/pushed are cumulative (no per-episode delta is computed for
+        # them), so they render under headings that say so, rather than
+        # bare "Nacked"/"Pushed" that would invite the same misreading I1
+        # fixed for acked/delivered. i1_exempt/pending_provenance are already
+        # per-check counts (I3), not cumulative, so no such caveat applies.
+        nacked = e.get("nacked")
+        pushed = e.get("pushed")
+        i1_exempt = e.get("i1_exempt")
+        pending_provenance = e.get("pending_provenance")
         lines.append(
             f"| {e.get('episode')} | {e.get('fault', '?')} | "
             f"{'yes' if e.get('quiesced') else 'NO'} | "
@@ -175,6 +199,10 @@ def render(episodes, meta):
             f"{'—' if acked_delta is None else acked_delta} | "
             f"{'—' if delivered_delta is None else delivered_delta} | "
             f"{e.get('duplicate_rate', 0.0):.3f} | {e.get('unknown', 0)} | "
+            f"{'—' if nacked is None else nacked} | "
+            f"{'—' if pushed is None else pushed} | "
+            f"{'—' if i1_exempt is None else i1_exempt} | "
+            f"{'—' if pending_provenance is None else pending_provenance} | "
             f"{', '.join(notes) or '—'} |"
         )
     lines.append("")

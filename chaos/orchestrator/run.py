@@ -35,6 +35,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHAOS_ROOT = os.path.dirname(HERE)
 WEIR_ROOT = os.path.dirname(CHAOS_ROOT)
 
+#: Loadgen's per-thread ledger flush threshold (`chaos/src/bin/loadgen.rs`'s
+#: `LEDGER_FLUSH_THRESHOLD`), duplicated here as a bare Python int because
+#: Python cannot import a Rust const. `test_run.py`'s
+#: TestFrontierSlackContract pins the two together, in the same spirit as
+#: TestDaemonCliContract pins the CLI flags, so a change on one side without
+#: the other is caught immediately instead of silently reopening I3.
+LEDGER_FLUSH_THRESHOLD = 256
+
 
 def load_schedule(path):
     """Reads a schedule TOML relative to the orchestrator directory."""
@@ -272,11 +280,12 @@ def main():
         delivered_tail = verify.LogTailer(delivered_path)
         acc = verify.Accumulator(delivered_run_id=run_id)
         # Frontier slack (I3): bounds how far a still-buffering loadgen thread
-        # can lag the delivery log. 256 is loadgen's LEDGER_FLUSH_THRESHOLD —
-        # the most records one thread can hold unflushed before it is forced
-        # to write them — so `threads * 256` is the worst case across all of
+        # can lag the delivery log. LEDGER_FLUSH_THRESHOLD is loadgen's
+        # per-thread flush threshold — the most records one thread can hold
+        # unflushed before it is forced to write them — so
+        # `threads * LEDGER_FLUSH_THRESHOLD` is the worst case across all of
         # them at once.
-        frontier_slack = sched["load"]["threads"] * 256
+        frontier_slack = sched["load"]["threads"] * LEDGER_FLUSH_THRESHOLD
         # C2: the previous episode's CUMULATIVE totals, so the per-episode
         # DELTA (not the running total) is what gets judged against the
         # schedule's progress floors.
@@ -446,11 +455,17 @@ def main():
             except Exception:
                 pass
 
-    # Render the report here rather than leaving it as a manual post-run step
-    # — episodes.jsonl is the source of truth on disk, so this reads back
-    # exactly what a separate `python3 report.py <run_dir>` invocation would.
-    report_path = report.write_report(run_dir)
-    print(f"wrote {report_path}")
+        # Render the report INSIDE this finally block, not after it: an
+        # exception escaping the try body above (setup failure, an unguarded
+        # bug in the episode loop) would otherwise propagate straight past a
+        # report.write_report() call placed after the try/finally, skipping
+        # it entirely. Putting it here means it runs on every exit path,
+        # exceptional or not — episodes.jsonl is the source of truth on
+        # disk, so this reads back exactly what a separate
+        # `python3 report.py <run_dir>` invocation would, from whatever
+        # episodes got through before the exception.
+        report_path = report.write_report(run_dir)
+        print(f"wrote {report_path}")
 
     v_word = "violation" if violations == 1 else "violations"
     a_word = "anomaly" if anomalies == 1 else "anomalies"

@@ -1,36 +1,65 @@
 """Drain-quiescence detection via weir's existing /metrics endpoint.
 
 Verification must not run before the drain has caught up, or it reports
-violations that are really timing artefacts. Several signals settle the
-question, all already exported — no new instrumentation was needed:
+violations that are really timing artefacts.
 
-1. `weir_wab_bytes_on_disk` STABLE. Its registered HELP text states it counts
-   the active segment plus sealed segments awaiting drain, and excludes
-   `.confirmed`, `dead_letter/` and `quarantine/` — so it falls to
-   active-segment-only exactly when drain has caught up. Stability across
-   consecutive polls matters more than any absolute threshold, because the
-   active segment's size is workload-dependent.
+Two earlier versions of this module got that wrong in opposite directions.
+The first compared `weir_wab_bytes_on_disk` across a window shorter than the
+5s period that gauge is recomputed on (`main.rs`'s background refresh task),
+so "unchanged" meant "not yet recomputed" and quiescence returned True almost
+immediately after every restart. The second widened the window but kept the
+same gauge — and `weir_wab_bytes_on_disk` (`compute_wab_bytes_on_disk`,
+`main.rs:58-91`) counts the OPEN, still-growing active segment plus sealed
+segments awaiting drain. Under continuous load (which `run.py` never pauses)
+that total changes on every genuine 5s recompute, so byte-exact stability
+across consecutive polls never occurs at all — the gate became unreachable
+in the other direction (0 of 800 simulated episodes quiesced). Bytes-on-disk
+conflates two things that need to be judged separately: how much is
+BUFFERED (workload-dependent, and irrelevant to "has the drain caught up")
+and whether SEALED WORK has reached a terminal state (exactly what matters).
+Neither version of the bytes gauge belongs in this function; it has been
+removed from the quiescence logic entirely.
 
-   CAUTION: this gauge is recomputed by a background task on
-   `tokio::time::interval(Duration::from_secs(5))` (`main.rs:563-576`), NOT on
-   every scrape. A stability window shorter than that 5s refresh period is
-   satisfied by the gauge simply not having been recomputed yet — "unchanged"
-   then means "stale", never "drain caught up". `GAUGE_REFRESH_SECS` below
-   records the real period, `wait_for_quiescence` refuses to run with a
-   window that does not exceed it (see its docstring), and the defaults
-   (`poll_interval_s=2.0, stable_polls=4`, an 8s window) are chosen so a
-   5s timer necessarily ticks at least once inside it.
-2. `weir_queue_depth` at zero — nothing still in flight to the WAB.
-3. `weir_drain_state{state="draining"}` == 1. Kept as necessary-but-NOT-
-   sufficient: its own registered HELP text says outright that
-   state="draining" does NOT imply delivery progress — a segment stranded
-   waiting on a fully-down sink still reads draining (`metrics/mod.rs:543-546`).
-   That is exactly what signals 4 and 5 exist to catch.
-4. `weir_sink_health{state="down"}` != 1 — a down sink means nothing is
+The replacement signal is `weir_wab_segments_total`, a Counter family with
+states open/sealed/confirmed/quarantined, incremented at the actual
+transition sites (`wab/mod.rs:603,666,769` on seal, `drain/confirmed.rs:55`
+on confirm, `wab/recovery.rs` on quarantine) — transition-driven, not
+timer-refreshed, so an unchanged reading really means "no transition
+happened since the last poll", never "not yet recomputed".
+
+Quiescence requires ALL of the following to hold for `stable_polls`
+consecutive polls:
+
+1. `sealed_total == confirmed_total + quarantined_total` — every sealed
+   segment has reached a terminal state. A sealed segment ends as either
+   confirmed or quarantined, so both must be counted; this is the real
+   "has the drain caught up" test.
+2. `stranded_total == resumed_total` — no segment is still stranded. weir's
+   own HELP text for `weir_drain_segments_resumed` says this directly:
+   "Convergence with weir_drain_segments_stranded means an outage's backlog
+   has been picked back up; a persistent gap means segments are still
+   stranded." This is EQUALITY, not stability: an already-stranded segment
+   that never resumes must keep failing this check for as long as it stays
+   stranded — a counter that is merely not RISING is not good enough, or an
+   outage that stranded a segment before polling ever started would satisfy
+   every condition while the segment sits there undelivered.
+3. `weir_queue_depth == 0` — nothing still in flight to the WAB.
+4. `weir_drain_state{state="draining"} == 1` — kept, but demoted to
+   necessary-not-sufficient: its own registered HELP text says outright
+   that state="draining" does NOT imply delivery progress (a segment
+   stranded on a fully-down sink still reads draining). Conditions 1 and 2
+   are what actually catch that case.
+5. `weir_sink_health{state="down"} != 1` — a down sink means nothing is
    actually draining, no matter what `drain_state` reads.
-5. `weir_drain_segments_stranded_total` STABLE across the same window as the
-   bytes gauge, when present — a rising count means segments are being
-   abandoned to the sink outage even while bytes-on-disk looks quiet.
+
+None of these five signals is refreshed by a background timer — every
+counter above is incremented synchronously at its transition site, and every
+gauge is updated synchronously on the state change it reports — so there is
+no "stale but unchanged" trap here, and no runtime guard is needed to keep a
+retuned poll interval from reintroducing one. If a future signal added here
+IS timer-refreshed, it needs a guard like the one this module used to carry
+(and removed once the bytes gauge was dropped) — don't add one without
+re-adding that protection.
 
 A timeout REPORTS "stuck" rather than hanging. A drain that never quiesces is
 itself a finding, and silently waiting forever would hide it.
@@ -38,16 +67,19 @@ itself a finding, and silently waiting forever would hide it.
 import time
 import urllib.request
 
-#: How often weir recomputes `weir_wab_bytes_on_disk` (main.rs:563-576).
-GAUGE_REFRESH_SECS = 5.0
-
 DRAINING = 'weir_drain_state{state="draining"}'
 BLOCKED = 'weir_drain_state{state="blocked_dead_letter_full"}'
 #: `weir_sink_health` is a per-state gauge family (healthy/degraded/down);
 #: this is the "down" member specifically.
 SINK_DOWN = 'weir_sink_health{state="down"}'
-#: A counter, so the exposition name carries the `_total` suffix.
+#: `weir_wab_segments` is a Counter family (open/sealed/confirmed/
+#: quarantined), so the exposition name carries the `_total` suffix.
+SEALED = 'weir_wab_segments_total{state="sealed"}'
+CONFIRMED = 'weir_wab_segments_total{state="confirmed"}'
+QUARANTINED = 'weir_wab_segments_total{state="quarantined"}'
+#: Counters, so both carry the `_total` suffix.
 STRANDED = "weir_drain_segments_stranded_total"
+RESUMED = "weir_drain_segments_resumed_total"
 
 
 def parse(text):
@@ -93,7 +125,7 @@ def scrape(metrics_url):
 
 
 def wait_for_quiescence(
-    metrics_url, timeout_s, scrape_fn=None, poll_interval_s=2.0, stable_polls=4
+    metrics_url, timeout_s, scrape_fn=None, poll_interval_s=0.5, stable_polls=3
 ):
     """Blocks until the drain is quiesced or the timeout expires.
 
@@ -101,29 +133,14 @@ def wait_for_quiescence(
     on a stuck drain — a stuck drain is a finding to report, not an exception
     to crash on.
 
-    Raises ValueError before polling starts if `scrape_fn` is None (i.e. this
-    is a real scrape against a live daemon, not an injected fake) and
-    `poll_interval_s * stable_polls` does not exceed `GAUGE_REFRESH_SECS`. A
-    window that fits inside one refresh period of `weir_wab_bytes_on_disk` can
-    be satisfied by the gauge simply not having been recomputed yet, which
-    measures staleness, not drain progress — this is exactly the bug the
-    defaults above were chosen to avoid, and the guard keeps a later
-    "optimisation" of the poll interval from silently reintroducing it. Tests
-    inject a fake scraper with no 5s gauge to outrun, so they are exempt.
+    Every condition checked here (see the module docstring) is a snapshot
+    property of a single scrape, not a delta against the previous one, so
+    `stable_polls` consecutive passing polls is a guard against a single
+    flicker rather than a comparison across polls — unlike the bytes-gauge
+    approach this replaced, there is no "last observed value" to track.
     """
-    if scrape_fn is None and poll_interval_s * stable_polls <= GAUGE_REFRESH_SECS:
-        raise ValueError(
-            f"poll_interval_s ({poll_interval_s}) * stable_polls ({stable_polls}) "
-            f"= {poll_interval_s * stable_polls}s does not exceed GAUGE_REFRESH_SECS "
-            f"({GAUGE_REFRESH_SECS}s): a window this short measures gauge staleness, "
-            "not drain progress, because weir_wab_bytes_on_disk may not have been "
-            "recomputed even once within it."
-        )
     scrape_fn = scrape_fn or scrape
     deadline = time.monotonic() + timeout_s
-    last_bytes = None
-    last_stranded = None
-    stranded_ever_seen = False
     stable = 0
     ok_scrapes = 0
     failed_scrapes = 0
@@ -139,6 +156,11 @@ def wait_for_quiescence(
         except Exception as exc:  # daemon may be mid-restart; keep polling
             failed_scrapes += 1
             last_error = f"{type(exc).__name__}: {exc}"
+            # Minor 6: a failed scrape must not leave `stable` as-is. Without
+            # this reset, a window could straddle an observability gap and
+            # count polls from either side of it as consecutive, when they
+            # were never observed back-to-back.
+            stable = 0
             if poll_interval_s:
                 # Never sleep past the deadline — an unconditional sleep
                 # overshoots badly whenever poll_interval_s is large relative
@@ -149,39 +171,44 @@ def wait_for_quiescence(
         if m.get(BLOCKED, 0.0) == 1.0:
             return False, "drain is blocked (BlockedDeadLetterFull)"
 
+        # Counters default to 0.0 when absent, and that is a genuine zero,
+        # not a conservative guess: prometheus-client only emits a Family
+        # member once it has been incremented at least once, so "absent"
+        # means "never happened" — `0 == 0 + 0` correctly reports "nothing
+        # sealed yet, nothing to drain" rather than blocking forever on a
+        # daemon that has done nothing yet.
+        sealed = m.get(SEALED, 0.0)
+        confirmed = m.get(CONFIRMED, 0.0)
+        quarantined = m.get(QUARANTINED, 0.0)
+        stranded = m.get(STRANDED, 0.0)
+        resumed = m.get(RESUMED, 0.0)
+
+        # Gauges keep the conservative blocking default: absent means we
+        # cannot tell, and the reading that blocks quiescence is the safe
+        # one. In practice `drain_state` and `sink_health` are pre-initialised
+        # by weir, so these defaults are a belt-and-braces fallback, not the
+        # common case.
         depth = m.get("weir_queue_depth", 1.0)
-        wab_bytes = m.get("weir_wab_bytes_on_disk")
         # Necessary, not sufficient — see the module docstring: a segment
         # stranded on a fully-down sink still reads "draining".
         draining = m.get(DRAINING, 0.0) == 1.0
-        # Absent means we cannot tell whether the sink is down, and the
-        # conservative reading is "not quiesced" — default to the value that
-        # BLOCKS quiescence, not the one that would let it through.
         sink_down = m.get(SINK_DOWN, 1.0)
-        stranded = m.get(STRANDED)
-        if stranded is not None:
-            stranded_ever_seen = True
-        # Present: must be stable across the same window as the bytes gauge.
-        # Absent: skip this sub-check (weir may not expose it) rather than
-        # block forever — but stranded_ever_seen makes that weaker check
-        # visible in the timeout reason below, instead of failing silently.
-        stranded_stable = stranded is None or stranded == last_stranded
+
+        sealed_resolved = sealed == confirmed + quarantined
+        nothing_stranded = stranded == resumed
 
         if (
-            wab_bytes is not None
-            and wab_bytes == last_bytes
+            sealed_resolved
+            and nothing_stranded
             and depth == 0.0
             and draining
             and sink_down != 1.0
-            and stranded_stable
         ):
             stable += 1
             if stable >= stable_polls:
                 return True, ""
         else:
             stable = 0
-        last_bytes = wab_bytes
-        last_stranded = stranded
 
         if poll_interval_s:
             time.sleep(min(poll_interval_s, max(0.0, deadline - time.monotonic())))
@@ -196,13 +223,7 @@ def wait_for_quiescence(
             f"({failed_scrapes} attempts, last: {last_error}). This is a harness "
             "or configuration problem, not a weir finding."
         )
-    note = ""
-    if not stranded_ever_seen:
-        note = (
-            f"; {STRANDED} was absent from every scrape, so the stranded-segment "
-            "stability check was skipped"
-        )
     return False, (
         f"timeout after {timeout_s}s waiting for drain quiescence "
-        f"({ok_scrapes} successful scrapes, {failed_scrapes} failed){note}"
+        f"({ok_scrapes} successful scrapes, {failed_scrapes} failed)"
     )

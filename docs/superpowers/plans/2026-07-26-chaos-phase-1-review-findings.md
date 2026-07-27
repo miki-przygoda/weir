@@ -313,3 +313,75 @@ and 0 anomalies".
 - Dead surface removed: `dm_stack.StorageStack.name`, the stale `[[bin]]` comment
   in `chaos/Cargo.toml`, the unread `[faults] kill_random` key and the `inject`
   reference in run.py's docstring.
+
+---
+
+# C1 — second correction (2026-07-27)
+
+The fix above landed (`poll_interval_s=2.0`, `stable_polls=4`, a
+`GAUGE_REFRESH_SECS` guard) and made the immediate symptom — quiescing ~1.5s
+after every restart — go away. A second review round found it broke in the
+**opposite** direction instead of actually working: run.py never pauses the
+load generator, and `weir_wab_bytes_on_disk` (`compute_wab_bytes_on_disk`,
+`main.rs:58-91`) counts the open, still-growing active segment plus sealed
+segments awaiting drain. Under continuous load that total changes on every
+genuine 5s recompute, so byte-exact stability across consecutive polls never
+occurs at all. Simulated across four load rates and the full poll/refresh
+phase space: **0 of 800 episodes quiesced.** Every episode would time out at
+120s, so the gate was unreachable by construction — the inverse of the
+original bug, but equally fatal to Phase 1's exit criterion.
+
+**The bytes gauge was abandoned entirely, not re-tuned a second time.** It
+conflates two things that need to be judged separately: how much is
+*buffered* (workload-dependent, and irrelevant to "has the drain caught up")
+and whether *sealed work* has reached a terminal state (exactly what
+matters). No stability window, however chosen, can separate those two once
+they're combined into one number.
+
+**Replacement: `weir_wab_segments_total`**, a Counter family with states
+`open`/`sealed`/`confirmed`/`quarantined`, incremented at the actual
+transition sites (`wab/mod.rs:603,666,769` on seal, `drain/confirmed.rs:55`
+on confirm, `wab/recovery.rs` on quarantine) — transition-driven, not
+timer-refreshed, so it carries no staleness trap in either direction.
+Quiescence now requires, for `stable_polls` consecutive polls:
+
+1. `sealed_total == confirmed_total + quarantined_total` — every sealed
+   segment has reached a terminal state (the real "drain caught up" test).
+2. `stranded_total == resumed_total` — no segment is still stranded.
+   **Equality, not stability**: the previous fix's stranded check tested for
+   an *unchanging* counter, which catches a counter that is rising but not
+   one that has *already* risen — an already-stranded segment satisfied it
+   forever while acked-undelivered records sat on disk. weir's own HELP text
+   for `weir_drain_segments_resumed` states the correct test directly:
+   convergence with `stranded` means the backlog was picked back up.
+3. `weir_queue_depth == 0`.
+4. `weir_drain_state{state="draining"} == 1` — kept, still
+   necessary-not-sufficient.
+5. `weir_sink_health{state="down"} != 1`.
+
+Because every signal here is snapshot-based (no delta against the previous
+poll, unlike the bytes gauge), `stable_polls` consecutive passes is now a
+guard against a single flicker, not a stability comparison — and because
+none of the five is timer-refreshed, `GAUGE_REFRESH_SECS` and its
+`ValueError` guard were deleted rather than re-tuned; a comment in
+`quiescence.py` explains why no such guard is needed and what to do if a
+future timer-refreshed signal is ever added here. Defaults dropped to
+`poll_interval_s=0.5, stable_polls=3` (a 1.5s window) now that there is no
+refresh period to outrun. Missing-key defaults differ by metric type: the
+four counters default to `0.0` (prometheus-client only emits a `Family`
+member once incremented, so absent genuinely means zero), while the gauges
+keep their conservative blocking defaults (`queue_depth` absent → `1.0`,
+`draining` absent → `0.0`, `sink_down` absent → `1.0`).
+
+Proven both ways against the real new defaults (see
+`fix-c1-round2-report.md` for full output): a scrape simulating continuous
+load with `sealed_total` rising and `confirmed_total` permanently behind by a
+fixed backlog does not quiesce within a 5s budget; the same shape of load
+with `confirmed + quarantined` caught up to `sealed` (while `stranded`/
+`resumed` keep changing together, as they would under real load) quiesces in
+1.01s — three polls at the new 0.5s interval — nowhere near a realistic 120s
+timeout.
+
+Also fixed in the same pass: a failed scrape now resets the stability
+counter (previously a window could straddle an observability gap and stitch
+polls from either side of it into false consecutivity).

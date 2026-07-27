@@ -5,6 +5,7 @@ The episode loop itself needs root and a real daemon; it is exercised by the
 Task 9 end-to-end gate, not here.
 """
 import os
+import re
 import unittest
 from unittest import mock
 
@@ -116,6 +117,35 @@ class TestDaemonCliContract(unittest.TestCase):
                 f"weir-server's CLI parser ({cli_rs_path}) — the Rust<->Python "
                 "CLI contract has drifted",
             )
+
+
+class TestFrontierSlackContract(unittest.TestCase):
+    """`frontier_slack = threads * LEDGER_FLUSH_THRESHOLD` hard-codes loadgen's
+    per-thread ledger-flush threshold as a bare Python constant, with nothing
+    pinning the two together. Pin them the same way TestDaemonCliContract
+    pins the Rust<->Python CLI flags, so a change to loadgen.rs's constant
+    without a matching update here doesn't silently reopen I3 (the frontier
+    exemption would then be computed against the wrong bound)."""
+
+    def test_ledger_flush_threshold_matches_loadgen_rs(self):
+        loadgen_rs_path = os.path.join(run.CHAOS_ROOT, "src", "bin", "loadgen.rs")
+        with open(loadgen_rs_path) as f:
+            source = f.read()
+
+        match = re.search(
+            r"const\s+LEDGER_FLUSH_THRESHOLD\s*:\s*usize\s*=\s*(\d+)\s*;", source
+        )
+        self.assertIsNotNone(
+            match, f"could not find LEDGER_FLUSH_THRESHOLD in {loadgen_rs_path}"
+        )
+        rust_value = int(match.group(1))
+        self.assertEqual(
+            run.LEDGER_FLUSH_THRESHOLD, rust_value,
+            "run.py's LEDGER_FLUSH_THRESHOLD has drifted from loadgen.rs's "
+            "constant of the same name — this bounds the I3 frontier "
+            "exemption, so a mismatch silently changes how much in-flight "
+            "work is excused from the orphan/I1 checks",
+        )
 
 
 if __name__ == "__main__":
