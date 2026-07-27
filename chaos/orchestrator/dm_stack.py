@@ -50,7 +50,6 @@ class StorageStack:
         self.backing_file = backing_file
         self.size_mb = size_mb
         self.mount_point = mount_point
-        self.name = os.path.basename(mount_point.rstrip("/"))
         self.loop_device = None
 
     def setup(self):

@@ -21,10 +21,6 @@ class TestStorageStack(unittest.TestCase):
         with self.assertRaises(ValueError):
             dm_stack.StorageStack("/tmp/x.img", size_mb=1, mount_point="/mnt/x")
 
-    def test_names_are_derived_from_the_mount_point(self):
-        s = dm_stack.StorageStack("/tmp/x.img", size_mb=128, mount_point="/mnt/weir-wab")
-        self.assertEqual(s.name, "weir-wab")
-
     @unittest.skipIf(_needs_root_linux(), "needs root on Linux")
     def test_setup_then_teardown_leaves_nothing_behind(self):
         with tempfile.TemporaryDirectory() as tmp:

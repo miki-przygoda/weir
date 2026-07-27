@@ -11,9 +11,15 @@ Design: [`docs/superpowers/specs/2026-07-25-chaos-fault-injection-design.md`](..
 - **Linux.** Device-mapper and loopback devices. macOS is not supported and
   never will be: `F_BARRIERFSYNC` gives no power-loss guarantee, so a
   durability proof there would prove nothing.
-- **root**, for the orchestrator only. The load generator and recorder run
-  unprivileged by design — they are the observers and must not be able to
-  corrupt what they measure.
+- **root**, for the orchestrator (`run.py`): it owns loopback devices, mounts,
+  and process lifecycle. The load generator and recorder are *intended* to
+  run unprivileged, as observers that must not be able to corrupt what they
+  measure — but as implemented today, `run.py` execs both as direct
+  `subprocess.Popen` children with no privilege drop, so **they currently
+  inherit root from the parent, same as the daemon under test.** A real drop
+  needs `setuid`/capability plumbing that is its own piece of work; it is
+  deferred, not landed, and "the observers are unprivileged" should be read
+  as a design goal the code does not yet enforce.
 - **Python 3** (stdlib only) and `losetup` / `dmsetup` / `mkfs.ext4`.
 
 ## Running
@@ -29,23 +35,35 @@ does not build this project.
 
 ## Phase 1 exit gate
 
-Phase 1 is complete when a 30-minute smoke run produces **zero violations**:
+Phase 1 is complete when a 30-minute smoke run produces **zero violations and
+zero anomalies**:
 
 ```bash
 # From the weir repo root, build both sides first.
 cargo build --release -p weir-server
 cd chaos && cargo build --release
 sudo python3 orchestrator/run.py schedules/smoke.toml
-python3 orchestrator/report.py runs/<run_id>
 ```
 
-Exit code 0 and `0 violations` in the report.
+`run.py` renders `runs/<run_id>/report.md` itself at the end of the run — no
+separate `report.py` step. Exit code 0, and `0 violations, 0 anomalies` in
+both the console summary and the report.
+
+A **violation** is a durability failure (I1/I2): weir lost or leaked a
+record. An **anomaly** is the harness failing to observe an episode cleanly —
+a quiescence timeout, a dead observer, or an episode with no measurable
+progress — and is *not*, by itself, evidence of a weir defect. The two are
+counted and gated on separately so neither can hide inside the other.
 
 **The gate is zero FALSE violations, not "it ran".** Any violation at this
 stage is far more likely to be a harness bug than a weir bug — Phase 1 injects
 only random SIGKILL, which weir's existing system tests already cover. Treat a
 Phase 1 violation as an oracle defect until proven otherwise: check that the
 recorder fsynced before its 200, that quiescence really settled, and that no
-record was NDJSON-dead-lettered for containing a newline.
+record was NDJSON-dead-lettered for containing a newline. An anomaly deserves
+the same scrutiny before it is dismissed as "just the harness": a recorder 4xx
+is permanent to weir's drain, so a refused batch is dead-lettered and looks
+identical to an acked-never-delivered weir defect — check `recorder.log`
+first.
 
 A harness that cries wolf is worse than no harness on a multi-day run.

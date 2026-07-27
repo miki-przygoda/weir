@@ -19,11 +19,10 @@ members = ["."]
 weir-client = { path = "../crates/weir-client" }
 weir-core = { path = "../crates/weir-core" }
 
-# No [[bin]] sections yet, deliberately. Cargo resolves bin targets at load
-# time, so declaring `loadgen`/`recorder` before their files exist makes every
-# `cargo build` and bare `cargo test` here fail with "can't find bin". Tasks 3
-# and 4 each add their own block alongside the file it points at, so this
-# project builds and its tests pass after every task.
+# Declared explicitly rather than relying on Cargo's src/bin auto-discovery:
+# each block needs `test = true, doc = false`, and being explicit means a
+# renamed or missing file fails at `cargo build` with "can't find bin" instead
+# of silently vanishing from the build.
 
 [[bin]]
 name = "recorder"

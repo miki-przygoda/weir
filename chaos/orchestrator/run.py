@@ -2,12 +2,17 @@
 """Chaos harness episode driver. Root, Linux only.
 
 Owns every privileged operation: the storage stack, process lifecycle, and
-fault injection. The load generator and recorder run unprivileged by design —
-they are the observers and must not be able to corrupt what they measure.
+fault injection. The load generator and recorder are *intended* to run
+unprivileged, as the observers that must not be able to corrupt what they
+measure — but this module execs both as direct children with no privilege
+drop, so today they inherit root from this process, same as the daemon under
+test. A real drop needs `setuid`/capability plumbing that is its own piece of
+work and is deferred; see README.md's Requirements section.
 
-Phase 1 injects one fault class (random SIGKILL). The dm-flakey, dm-delay,
-ENOSPC, remount and dead-letter classes land in Phases 2-3 as additional
-entries in the `[faults]` table and additional branches in `inject`.
+Phase 1 injects one fault class (random SIGKILL, applied unconditionally in
+the episode loop below). The dm-flakey, dm-delay, ENOSPC, remount and
+dead-letter classes land in Phases 2-3 as additional entries in the
+`[faults]` table.
 
 Usage: sudo python3 run.py schedules/smoke.toml
 """
@@ -23,6 +28,7 @@ import tomllib
 
 import dm_stack
 import quiescence
+import report
 import verify
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +56,19 @@ def kill_delays(seed, count, lo, hi):
     """Seeded steady-state durations between kills. Reproducible by design."""
     rng = random.Random(seed)
     return [rng.uniform(lo, hi) for _ in range(count)]
+
+
+def progress_floor_breached(delta_acked, delta_delivered, min_acked, min_delivered):
+    """True if either per-episode delta falls below its schedule floor.
+
+    C2: I1 (acked implies delivered) and I2 (nacked implies never delivered)
+    are BOTH vacuously satisfied when `acked` is empty — a weir that refuses
+    or delivers nothing would otherwise pass every episode. This is the
+    guard against that, pulled out as a pure function so it is testable
+    without root or a live daemon. Exactly at the floor does not breach it —
+    only strictly below does.
+    """
+    return delta_acked < min_acked or delta_delivered < min_delivered
 
 
 class Daemon:
@@ -178,14 +197,26 @@ def main():
     loadgen = None
     daemon = None
     daemon_log = None
+    recorder_log = None
+    loadgen_log = None
     violations = 0
+    anomalies = 0
 
     try:
         stack.setup()
+        # `mount_point` itself contains `lost+found` after `mkfs.ext4` — benign
+        # as root today, but the moment a privilege drop lands (see README's
+        # deferred-privilege-drop note) a non-root weir-server would EACCES on
+        # startup trying to use the mount root as its WAB dir. Give it its own
+        # subdirectory instead.
+        wab_dir = os.path.join(mount_point, "wab")
+        os.makedirs(wab_dir, exist_ok=True)
+        os.chmod(wab_dir, 0o700)
 
+        recorder_log = open(os.path.join(run_dir, "recorder.log"), "ab")
         recorder = subprocess.Popen(
             [recorder_bin, "--bind", "127.0.0.1:9900", "--log", delivered_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=recorder_log,
         )
         # Poll for the recorder's port rather than sleeping a fixed interval — if
         # it is not accepting when the daemon's first batch drains, weir sees a
@@ -205,7 +236,7 @@ def main():
 
         daemon_log = open(os.path.join(run_dir, "weir-server.log"), "ab")
         daemon = Daemon(
-            weir_bin, mount_point, os.path.join(socket_dir, "weir.sock"),
+            weir_bin, wab_dir, os.path.join(socket_dir, "weir.sock"),
             # NOT 9185: that is weir-server's compiled-in default, so a real
             # instance on this host would collide with the harness.
             19185, sched["weir"], daemon_log,
@@ -224,6 +255,7 @@ def main():
         per_episode_overhead = sched["quiescence_timeout_secs"] + 30
         total_secs = int(sum(delays) + per_episode_overhead * len(delays))
 
+        loadgen_log = open(os.path.join(run_dir, "loadgen.log"), "ab")
         loadgen = subprocess.Popen([
             loadgen_bin,
             "--socket", daemon.socket_path,
@@ -233,12 +265,23 @@ def main():
             "--record-size", str(sched["load"]["record_size"]),
             "--tier", sched["load"]["tier"],
             "--duration-secs", str(total_secs),
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ], stdout=subprocess.DEVNULL, stderr=loadgen_log)
 
         # Read each log byte exactly once across the whole run.
         ledger_tail = verify.LogTailer(ledger_path)
         delivered_tail = verify.LogTailer(delivered_path)
         acc = verify.Accumulator(delivered_run_id=run_id)
+        # Frontier slack (I3): bounds how far a still-buffering loadgen thread
+        # can lag the delivery log. 256 is loadgen's LEDGER_FLUSH_THRESHOLD —
+        # the most records one thread can hold unflushed before it is forced
+        # to write them — so `threads * 256` is the worst case across all of
+        # them at once.
+        frontier_slack = sched["load"]["threads"] * 256
+        # C2: the previous episode's CUMULATIVE totals, so the per-episode
+        # DELTA (not the running total) is what gets judged against the
+        # schedule's progress floors.
+        prev_acked = 0
+        prev_delivered = 0
 
         with open(episodes_path, "a") as ep_log:
             for i, delay in enumerate(delays):
@@ -267,9 +310,14 @@ def main():
                         f"fault; {consequence}",
                         flush=True,
                     )
-                    violations += 1
+                    # An observer dying is an anomaly (the harness failed to
+                    # observe), not a durability violation — no verification
+                    # ran, so there is no durability claim to have failed.
+                    # "ok": True reflects that (no I1/I2 failure was found);
+                    # `abort_reason` is what makes this count as an anomaly.
+                    anomalies += 1
                     ep_log.write(json.dumps({
-                        "episode": i, "fault": "kill_random", "ok": False,
+                        "episode": i, "fault": "kill_random", "ok": True,
                         "quiesced": False, "abort_reason": reason,
                         "exit_code": code, "seed": seed,
                     }) + "\n")
@@ -286,10 +334,30 @@ def main():
                 # Give the recorder a moment to finish its final append.
                 time.sleep(1.0)
                 acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
-                result = acc.check()
+                result = acc.check(frontier_slack=frontier_slack)
 
-                if not result.ok or not ok:
+                # C2: acked/delivered are CUMULATIVE totals, so the floor is
+                # judged against the DELTA since the previous episode — not
+                # the running total, which only ever grows and would never
+                # catch a weir that stopped making progress mid-run.
+                delta_acked = result.acked_count - prev_acked
+                delta_delivered = result.delivered_distinct - prev_delivered
+                prev_acked, prev_delivered = result.acked_count, result.delivered_distinct
+                no_progress = progress_floor_breached(
+                    delta_acked, delta_delivered,
+                    sched["load"]["min_acked_per_episode"],
+                    sched["load"]["min_delivered_per_episode"],
+                )
+
+                # Violations (durability, I1/I2) and anomalies (the harness
+                # failing to observe cleanly) are counted separately — see I5.
+                # A quiescence timeout or a no-progress episode is not
+                # evidence weir lost or leaked anything; it means this
+                # episode proved nothing, which is a different kind of bad.
+                if not result.ok:
                     violations += 1
+                if not ok or no_progress:
+                    anomalies += 1
 
                 record = {
                     "episode": i,
@@ -300,8 +368,15 @@ def main():
                     "ok": result.ok,
                     "acked": result.acked_count,
                     "delivered_distinct": result.delivered_distinct,
+                    # Per-episode deltas of the cumulative counts above — what
+                    # `no_progress` is actually judged against.
+                    "acked_delta": delta_acked,
+                    "delivered_delta": delta_delivered,
+                    "no_progress": no_progress,
                     "duplicate_rate": round(result.duplicate_rate, 4),
                     "unknown": result.unknown_count,
+                    "nacked": result.nacked_count,
+                    "pushed": result.pushed,
                     "i1_missing": result.i1_missing[:50],
                     "i2_leaked": result.i2_leaked[:50],
                     # Provenance anomalies, kept distinct from I1/I2 so neither is
@@ -311,14 +386,25 @@ def main():
                     # corrupt.
                     "orphaned_delivered": result.orphaned_delivered[:50],
                     "ledger_conflicts": result.ledger_conflicts[:50],
+                    # Frontier exemption (I3): how many would-be I1/orphan hits
+                    # were excused because they are within frontier_slack of
+                    # the ledger's high-water seq and may simply not have
+                    # caught up yet. Reported, not silently absorbed, so the
+                    # exemption stays visible.
+                    "i1_exempt": result.i1_exempt,
+                    "pending_provenance": result.pending_provenance,
                     "seed": seed,
                 }
                 ep_log.write(json.dumps(record) + "\n")
                 ep_log.flush()
 
                 status = result.summary()
-                print(f"episode {i:3d}  quiesced={ok}  {status}", flush=True)
-                if not result.ok:
+                print(
+                    f"episode {i:3d}  quiesced={ok}  no_progress={no_progress}  "
+                    f"{status}",
+                    flush=True,
+                )
+                if not result.ok or no_progress:
                     print(
                         f"  REPRODUCER: sudo python3 run.py {schedule_path}  "
                         f"# seed={hex(seed)} episode={i}",
@@ -349,9 +435,33 @@ def main():
                 daemon_log.close()
             except Exception:
                 pass
+        if recorder_log:
+            try:
+                recorder_log.close()
+            except Exception:
+                pass
+        if loadgen_log:
+            try:
+                loadgen_log.close()
+            except Exception:
+                pass
 
-    print(f"\nrun {run_id} complete: {violations} violation(s) across {sched['episodes']} episodes")
-    sys.exit(1 if violations else 0)
+    # Render the report here rather than leaving it as a manual post-run step
+    # — episodes.jsonl is the source of truth on disk, so this reads back
+    # exactly what a separate `python3 report.py <run_dir>` invocation would.
+    report_path = report.write_report(run_dir)
+    print(f"wrote {report_path}")
+
+    v_word = "violation" if violations == 1 else "violations"
+    a_word = "anomaly" if anomalies == 1 else "anomalies"
+    print(
+        f"\nrun {run_id} complete: {violations} {v_word}, {anomalies} {a_word} "
+        f"across {sched['episodes']} episodes"
+    )
+    # I5: gate on both. A violation is a durability failure; an anomaly is
+    # the harness failing to observe cleanly (quiescence timeout, dead
+    # observer, no-progress episode) — neither is acceptable in a clean run.
+    sys.exit(1 if (violations or anomalies) else 0)
 
 
 if __name__ == "__main__":
