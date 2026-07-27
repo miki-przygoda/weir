@@ -106,7 +106,7 @@ fn content_length(head: &str) -> Option<usize> {
 fn reject(stream: &mut TcpStream, code: u16, reason: &str) -> std::io::Result<Response> {
     write!(
         stream,
-        "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\n\r\n"
+        "HTTP/1.1 {code} {reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     )?;
     stream.flush()?;
     Ok(Response::Rejected(code))
@@ -130,7 +130,7 @@ fn handle(stream: &mut TcpStream, log: &mut DeliveryLog) -> std::io::Result<Resp
 
     // A HEAD probe is how the HTTP sink's health check works; answer it 200.
     if head.starts_with("HEAD") {
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+        stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")?;
         stream.flush()?;
         return Ok(Response::Health);
     }
@@ -153,7 +153,7 @@ fn handle(stream: &mut TcpStream, log: &mut DeliveryLog) -> std::io::Result<Resp
     // Durable BEFORE the 200 — see the module docs. If this errors we return
     // without acking, weir classifies it transient, and retries the segment.
     let recorded = log.append_ndjson(&body)?;
-    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+    stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")?;
     stream.flush()?;
     Ok(Response::Recorded(recorded))
 }
@@ -272,12 +272,15 @@ mod tests {
     ///
     /// `linger` keeps the client socket open after writing, so a
     /// short-body request genuinely stalls the server rather than hitting a
-    /// clean EOF. `timeout` is applied to the server side.
+    /// clean EOF. `timeout` is applied to the server side. The third element
+    /// of the return is whatever raw response bytes the client read back, so
+    /// tests can assert on response headers (e.g. `Connection: close`), not
+    /// just on the decision `handle` made.
     fn drive(
         request: Vec<u8>,
         linger: Duration,
         timeout: Duration,
-    ) -> (std::io::Result<Response>, String) {
+    ) -> (std::io::Result<Response>, String, Vec<u8>) {
         let dir = unique_dir("drive");
         std::fs::create_dir_all(&dir).unwrap();
         let log_path = dir.join("delivered.log");
@@ -306,8 +309,9 @@ mod tests {
                 // EOF and the timeout would never be exercised.
                 std::thread::sleep(linger);
             }
-            let mut discard = Vec::new();
-            let _ = s.read_to_end(&mut discard);
+            let mut response = Vec::new();
+            let _ = s.read_to_end(&mut response);
+            response
         });
 
         let (mut server_side, _) = listener.accept().unwrap();
@@ -318,10 +322,10 @@ mod tests {
         // join below cannot deadlock.
         drop(server_side);
 
-        client.join().unwrap();
+        let response = client.join().unwrap();
         let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
         std::fs::remove_dir_all(&dir).ok();
-        (result, contents)
+        (result, contents, response)
     }
 
     fn post(body: &str) -> Vec<u8> {
@@ -340,17 +344,32 @@ mod tests {
             weir_chaos::encode_record(3, 1, 64),
             weir_chaos::encode_record(3, 2, 64)
         );
-        let (res, log) = drive(post(&body), Duration::ZERO, Duration::from_secs(5));
+        let (res, log, resp) = drive(post(&body), Duration::ZERO, Duration::from_secs(5));
         assert_eq!(res.unwrap(), Response::Recorded(2));
         assert_eq!(log, "3 1\n3 2\n");
+        // weir's HTTP sink pools idle connections (pool_idle_timeout(60s),
+        // pool_max_idle_per_host(8)); without this header HTTP/1.1 advertises
+        // the connection as reusable even though the recorder is about to
+        // close it, and the next POST on the reused socket hits EOF.
+        assert!(
+            contains_header_line(&resp, "Connection: close"),
+            "a 200 must advertise the connection as non-reusable: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
     }
 
     #[test]
     fn head_probe_is_answered_without_touching_the_log() {
         let req = b"HEAD /ingest HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
-        let (res, log) = drive(req, Duration::ZERO, Duration::from_secs(5));
+        let (res, log, resp) = drive(req, Duration::ZERO, Duration::from_secs(5));
         assert_eq!(res.unwrap(), Response::Health);
         assert_eq!(log, "", "a health probe must not write a delivery");
+        assert!(
+            contains_header_line(&resp, "Connection: close"),
+            "the health probe's 200 must also advertise the connection as \
+             non-reusable: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
     }
 
     #[test]
@@ -359,9 +378,14 @@ mod tests {
         // a delivery never read off the socket — a phantom ack, which is the
         // one thing the oracle must never produce.
         let req = b"POST /ingest HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
-        let (res, log) = drive(req, Duration::ZERO, Duration::from_secs(5));
+        let (res, log, resp) = drive(req, Duration::ZERO, Duration::from_secs(5));
         assert_eq!(res.unwrap(), Response::Rejected(411));
         assert_eq!(log, "");
+        assert!(
+            contains_header_line(&resp, "Connection: close"),
+            "a rejection must also advertise the connection as non-reusable: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
     }
 
     #[test]
@@ -374,7 +398,7 @@ mod tests {
             MAX_BODY_BYTES + 1
         )
         .into_bytes();
-        let (res, log) = drive(req, Duration::ZERO, Duration::from_secs(5));
+        let (res, log, _resp) = drive(req, Duration::ZERO, Duration::from_secs(5));
         assert_eq!(res.unwrap(), Response::Rejected(413));
         assert_eq!(log, "");
     }
@@ -382,7 +406,7 @@ mod tests {
     #[test]
     fn a_non_post_method_is_refused() {
         let req = b"GET /ingest HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
-        let (res, log) = drive(req, Duration::ZERO, Duration::from_secs(5));
+        let (res, log, _resp) = drive(req, Duration::ZERO, Duration::from_secs(5));
         assert_eq!(res.unwrap(), Response::Rejected(405));
         assert_eq!(log, "");
     }
@@ -398,7 +422,7 @@ mod tests {
         // phantom durability violation.
         let req = b"POST /ingest HTTP/1.1\r\nContent-Length: 1000\r\n\r\n0123456789".to_vec();
         let start = std::time::Instant::now();
-        let (res, log) = drive(req, Duration::from_millis(600), Duration::from_millis(150));
+        let (res, log, _resp) = drive(req, Duration::from_millis(600), Duration::from_millis(150));
         assert!(res.is_err(), "a stalled peer must error, not hang");
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -411,8 +435,16 @@ mod tests {
     #[test]
     fn a_connection_closed_mid_headers_is_refused_not_acked() {
         let req = b"POST /ingest HTTP/1.1\r\nHost: x\r\n".to_vec();
-        let (res, log) = drive(req, Duration::ZERO, Duration::from_secs(5));
+        let (res, log, _resp) = drive(req, Duration::ZERO, Duration::from_secs(5));
         assert_eq!(res.unwrap(), Response::Rejected(0));
         assert_eq!(log, "");
+    }
+
+    /// Whether `resp` (raw HTTP response bytes) contains `header` as a
+    /// standalone CRLF-terminated line, case-sensitive on the exact form the
+    /// recorder writes.
+    fn contains_header_line(resp: &[u8], header: &str) -> bool {
+        let text = String::from_utf8_lossy(resp);
+        text.split("\r\n").any(|line| line == header)
     }
 }

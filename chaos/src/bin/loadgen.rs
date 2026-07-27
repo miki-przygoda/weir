@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use weir_chaos::{LedgerEntry, Outcome, encode_record};
 use weir_client::{ClientError, WeirClient};
-use weir_core::Durability;
+use weir_core::{Durability, NackReason};
 
 /// Read/write timeout on the producer's socket.
 ///
@@ -28,6 +28,21 @@ use weir_core::Durability;
 /// faults.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Records buffered per thread before a flush is forced.
+///
+/// Named because the verifier derives its frontier slack from
+/// `threads * LEDGER_FLUSH_THRESHOLD` — the bound on how far a still-buffering
+/// thread can lag the delivery log.
+const LEDGER_FLUSH_THRESHOLD: usize = 256;
+
+/// Longest a ledger entry may sit unflushed.
+///
+/// Without a time bound the ledger only flushes at the threshold above, while
+/// the recorder fsyncs each delivery ~ms after its ack — so the delivery log
+/// runs thousands of records ahead and every one looks like a delivery with no
+/// provenance. Spec §3.1 asked for this; it was never implemented.
+const LEDGER_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Maps a client error to a ledger outcome.
 ///
 /// The distinction that matters: a `Nack` is weir *explicitly refusing* the
@@ -37,6 +52,13 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
 /// nothing about it.
 fn classify(err: &ClientError) -> Outcome {
     match err {
+        // INDETERMINATE, not a refusal. weir emits InternalError when a flusher
+        // returned a non-durable outcome or its ack sender was dropped, so the
+        // record may already be in the segment and recovery may legitimately
+        // replay it. Holding it to I2 ("a nacked record is never delivered")
+        // would be stricter than weir's own contract and would manufacture a P0
+        // finding out of correct behaviour.
+        ClientError::Nack(NackReason::InternalError) => Outcome::Unknown,
         ClientError::Nack(reason) => Outcome::Nacked(format!("{reason:?}")),
         ClientError::VersionMismatch { daemon_version } => {
             Outcome::Nacked(format!("VersionMismatch({daemon_version})"))
@@ -133,7 +155,8 @@ fn main() {
 
         handles.push(std::thread::spawn(move || {
             let mut client: Option<WeirClient> = None;
-            let mut pending: Vec<LedgerEntry> = Vec::with_capacity(256);
+            let mut pending: Vec<LedgerEntry> = Vec::with_capacity(LEDGER_FLUSH_THRESHOLD);
+            let mut last_flush = Instant::now();
 
             while !fatal.load(Ordering::Relaxed) && Instant::now() < deadline {
                 // Reconnect as needed. The daemon is killed repeatedly by
@@ -178,8 +201,13 @@ fn main() {
                     rtt_micros: t0.elapsed().as_micros() as u64,
                 });
 
-                if pending.len() >= 256 && !flush(&ledger, &mut pending, &fatal) {
-                    break;
+                let due = pending.len() >= LEDGER_FLUSH_THRESHOLD
+                    || last_flush.elapsed() >= LEDGER_FLUSH_INTERVAL;
+                if due {
+                    if !flush(&ledger, &mut pending, &fatal) {
+                        break;
+                    }
+                    last_flush = Instant::now();
                 }
             }
             flush(&ledger, &mut pending, &fatal);
@@ -296,9 +324,6 @@ mod tests {
 
     #[test]
     fn classifies_client_errors_into_ledger_outcomes() {
-        use weir_client::ClientError;
-        use weir_core::NackReason;
-
         // A Nack is an explicit refusal — weir said no, and I2 will hold it to that.
         assert!(matches!(
             classify(&ClientError::Nack(NackReason::PayloadTooLarge)),
@@ -312,6 +337,20 @@ mod tests {
         // A protocol violation is equally indeterminate from the producer's view.
         assert_eq!(
             classify(&ClientError::Protocol("bad".into())),
+            weir_chaos::Outcome::Unknown
+        );
+    }
+
+    #[test]
+    fn nack_internal_error_is_indeterminate_not_a_refusal() {
+        // weir emits InternalError when a flusher returned a non-durable
+        // outcome or its ack sender was dropped — the bytes may already be in
+        // the segment, so recovery may legitimately replay and deliver them.
+        // Holding this to I2 ("a nacked record is never delivered") would be
+        // stricter than weir's own contract and would manufacture a P0 finding
+        // out of correct behaviour.
+        assert_eq!(
+            classify(&ClientError::Nack(NackReason::InternalError)),
             weir_chaos::Outcome::Unknown
         );
     }
