@@ -213,3 +213,103 @@ What a green first run would **not** have exercised: the quiescence timeout
 (unreachable, C1), the observer-death guards, and `dm_stack.setup/teardown` on
 real hardware. And it *cannot* fail for the reason it most needs to be able to
 fail (C2).
+
+---
+
+# Fix design (decided 2026-07-27)
+
+Verified against the weir source before deciding, since C1's diagnosis depends
+on them:
+
+- `weir_wab_bytes_on_disk` is set by a background task on
+  `tokio::time::interval(Duration::from_secs(5))` — `main.rs:563-576`. The 5 s
+  refresh is real.
+- `weir_sink_health{state="healthy"|"degraded"|"down"}` exists
+  (`metrics/mod.rs:471`, `SinkHealthState` at `:95`).
+- `weir_drain_segments_stranded` and `weir_drain_segments_resumed` exist
+  (`:523`, `:533`) as **counters**, so the exposition names carry a `_total`
+  suffix.
+
+## C1 — quiescence
+
+The root error was a stability window **shorter than the gauge's refresh
+period**, which makes "unchanged" mean "not yet recomputed".
+
+1. **`poll_interval_s = 2.0`, `stable_polls = 4`.** Four stable comparisons at
+   2 s span 8 s of wall clock, and a 5 s timer necessarily ticks inside any 8 s
+   window — so an unchanged value has survived at least one genuine recompute.
+2. **A runtime guard makes the invariant un-tunable-into-brokenness:**
+   `wait_for_quiescence` refuses to run when
+   `poll_interval_s * stable_polls <= GAUGE_REFRESH_SECS` (5.0). Someone
+   "optimising" the poll interval later cannot silently reintroduce this bug.
+3. **Two signals added, both named by weir's own HELP text:**
+   `weir_sink_health{state="down"} != 1` (a down sink means nothing is draining,
+   yet `drain_state` still reads `draining`), and
+   `weir_drain_segments_stranded_total` stable across the window.
+
+`drain_state{state="draining"}` is **kept but demoted** — its registered HELP
+text says outright that it does not imply delivery progress, so it is a
+necessary-not-sufficient signal.
+
+## C2 — vacuous pass
+
+1. `VerifyResult` gains **`nacked_count`** and **`pushed`** (every ledger entry,
+   whatever its outcome).
+2. The episode record carries **per-episode deltas**, not just cumulative totals.
+3. The schedule gains **`min_acked_per_episode`** and
+   **`min_delivered_per_episode`**; an episode whose delta falls below either
+   fails with `abort_reason = "no_progress"`. A run in which weir refuses or
+   delivers nothing can no longer read as twenty clean passes.
+
+## I2 + I3 — the frontier
+
+Two symptoms, one cause: continuous load means there is always in-flight work at
+check time. Records acked but not yet ledger-flushed look like **orphans**;
+records ledger-flushed but not yet delivered look like **I1 violations**.
+
+1. **Time-based ledger flush** in loadgen (every `LEDGER_FLUSH_INTERVAL` = 200 ms,
+   in addition to the 256-record threshold), so ledger staleness is bounded.
+   The spec asked for this in §3.1 and it was never implemented.
+2. **Frontier exemption, derived rather than magic.** At verification the
+   frontier is the ledger's high-water seq; `frontier_slack = threads *
+   ledger_flush_threshold` bounds how far a still-buffered thread can lag. Acked
+   seqs above `frontier - slack` are exempt from I1, and delivered seqs above it
+   are "pending provenance" rather than orphans.
+3. **The exempted count is reported.** Hiding it would replace one silent
+   distortion with another.
+
+## I4 — `Nack(InternalError)` is indeterminate
+
+Reclassified from `Nacked` to `Unknown`. weir emits it when a flusher returns a
+non-durable outcome or its ack sender was dropped, so the bytes may already be in
+the segment and recovery may legitimately replay them. Holding those to I2 is
+stricter than weir's own contract, and design §6.1 calls an I2 violation a P0
+finding. `Unknown`/I3 is exactly the category for "no answer arrived".
+
+## I5 — one word, two meanings
+
+`run.py` counts durability failure, quiescence timeout and observer death all as
+"violations"; `report.py` counts only `not ok`. Split into **`violations`**
+(durability only) and **`anomalies`** (everything else), reported separately and
+both surfaced in the exit line. The README gate becomes "exit 0 and 0 violations
+and 0 anomalies".
+
+## I6, I7, I8 and the minors
+
+- **I6:** the recorder sends `Connection: close` on every response. weir's sink
+  pools up to 8 idle connections for 60 s and would otherwise reuse a socket the
+  recorder has already closed.
+- **I7:** both observers' stderr goes to files in `run_dir`, as the daemon's
+  already does.
+- **I8:** deferred, and the README/spec claim corrected to match reality — a real
+  privilege drop needs `setuid` plumbing that is its own piece of work. The
+  claim, not the code, was wrong.
+- `--wab-dir` becomes `<mount>/wab` so `lost+found` is not inside it.
+- The duplicate-rate table cell becomes "Deliveries per distinct record
+  (1.000 = no redelivery)".
+- `report.py` totals come from the last episode, not a sum of a cumulative
+  series.
+- `run.py` invokes the report renderer at the end of a run.
+- Dead surface removed: `dm_stack.StorageStack.name`, the stale `[[bin]]` comment
+  in `chaos/Cargo.toml`, the unread `[faults] kill_random` key and the `inject`
+  reference in run.py's docstring.
