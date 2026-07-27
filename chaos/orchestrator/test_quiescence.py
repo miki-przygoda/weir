@@ -36,19 +36,19 @@ class TestParse(unittest.TestCase):
 
 
 class TestWait(unittest.TestCase):
-    def test_quiesces_when_all_three_signals_settle(self):
+    def test_quiesces_when_all_signals_settle(self):
         # Bytes must be STABLE across consecutive polls, not merely low.
         readings = [
             {"weir_queue_depth": 5.0, "weir_wab_bytes_on_disk": 900000.0,
-             'weir_drain_state{state="draining"}': 1.0},
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0},
             {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
-             'weir_drain_state{state="draining"}': 1.0},
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0},
             {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
-             'weir_drain_state{state="draining"}': 1.0},
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0},
             {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
-             'weir_drain_state{state="draining"}': 1.0},
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0},
             {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
-             'weir_drain_state{state="draining"}': 1.0},
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0},
         ]
         # Five readings, not four: stability is measured BETWEEN consecutive
         # polls, so the first stable reading only establishes the baseline.
@@ -83,6 +83,7 @@ class TestWait(unittest.TestCase):
                 "weir_queue_depth": 0.0,
                 "weir_wab_bytes_on_disk": 1000.0 * counter["n"],
                 'weir_drain_state{state="draining"}': 1.0,
+                quiescence.SINK_DOWN: 0.0,
             }
 
         ok, reason = quiescence.wait_for_quiescence(
@@ -148,6 +149,153 @@ class TestWait(unittest.TestCase):
             elapsed, 1.0,
             f"a 3s poll interval must not overshoot a 0.2s timeout; took {elapsed:.2f}s",
         )
+
+
+class TestGaugeRefreshGuard(unittest.TestCase):
+    """C1: the stability window must strictly exceed GAUGE_REFRESH_SECS, or
+    "unchanged" means "not yet recomputed" rather than "drain caught up" —
+    and the guard is what keeps a later retune from reintroducing that bug.
+    """
+
+    def test_the_guard_rejects_a_too_short_window_against_a_real_scrape(self):
+        # scrape_fn=None means this would hit a real daemon: the old broken
+        # defaults (poll_interval_s=0.5, stable_polls=3 => a 1.5s window)
+        # must be refused before a single scrape is attempted.
+        with self.assertRaises(ValueError) as ctx:
+            quiescence.wait_for_quiescence(
+                "http://127.0.0.1:1/metrics", timeout_s=0.01,
+                poll_interval_s=0.5, stable_polls=3,
+            )
+        self.assertIn("GAUGE_REFRESH_SECS", str(ctx.exception))
+
+    def test_the_guard_does_not_apply_to_an_injected_scrape_fn(self):
+        # Tests inject a fake with no 5s gauge to outrun — that is the point
+        # of keying the guard on scrape_fn rather than on the parameters alone.
+        reading = {
+            "weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+            'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+        }
+        try:
+            quiescence.wait_for_quiescence(
+                "unused", timeout_s=0.01, scrape_fn=lambda _: reading,
+                poll_interval_s=0.5, stable_polls=3,
+            )
+        except ValueError:
+            self.fail("the guard must not fire when scrape_fn is injected")
+
+    def test_a_stale_but_unchanging_gauge_no_longer_quiesces_within_a_window_shorter_than_a_refresh(self):
+        # 40 MiB of sealed-awaiting-drain backlog, held perfectly constant —
+        # exactly the "stale gauge" scenario the review demonstrated reaching
+        # quiesced=True after 1.51s under the old defaults. Under the fixed
+        # defaults (poll_interval_s=2.0, stable_polls=4, an 8s window), a
+        # budget shorter than GAUGE_REFRESH_SECS cannot accumulate the
+        # required stable comparisons, however unchanging the reading is.
+        stale = {
+            "weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 41943040.0,
+            'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+        }
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=3.0, scrape_fn=lambda _: stale,
+            # module defaults: poll_interval_s=2.0, stable_polls=4
+        )
+        self.assertFalse(
+            ok, "an unchanging gauge must not quiesce inside a window shorter "
+            "than one gauge refresh"
+        )
+        self.assertIn("timeout", reason)
+
+    def test_a_down_sink_prevents_quiescence(self):
+        down = {
+            "weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+            'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 1.0,
+        }
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.01, scrape_fn=lambda _: down,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok, "a down sink must block quiescence even if drain_state reads draining")
+        self.assertIn("timeout", reason)
+
+    def test_an_advancing_stranded_counter_prevents_quiescence(self):
+        counter = {"n": 0}
+
+        def growing_stranded(_):
+            counter["n"] += 1
+            return {
+                "weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+                'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+                quiescence.STRANDED: float(counter["n"]),
+            }
+
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.01, scrape_fn=growing_stranded,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok, "segments still being abandoned to the sink outage must block quiescence")
+        self.assertIn("timeout", reason)
+
+    def test_a_missing_sink_down_key_prevents_quiescence(self):
+        # Absent means we cannot tell — the conservative reading is "not
+        # quiesced", so a missing key must default to blocking, not passing.
+        partial = {
+            "weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+            'weir_drain_state{state="draining"}': 1.0,
+            # SINK_DOWN deliberately absent
+        }
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.01, scrape_fn=lambda _: partial,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok, "absent SINK_DOWN must default to 'down', not quiesced")
+
+    def test_a_present_and_stable_stranded_counter_does_not_block_quiescence(self):
+        # The positive case: STRANDED present but unchanging must not, on its
+        # own, prevent quiescence once it clears its own baseline poll.
+        readings = [
+            {"weir_queue_depth": 5.0, "weir_wab_bytes_on_disk": 900000.0,
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+             quiescence.STRANDED: 2.0},
+            {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+             quiescence.STRANDED: 2.0},
+            {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+             quiescence.STRANDED: 2.0},
+            {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+             quiescence.STRANDED: 2.0},
+            {"weir_queue_depth": 0.0, "weir_wab_bytes_on_disk": 8192.0,
+             'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+             quiescence.STRANDED: 2.0},
+        ]
+        it = iter(readings)
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=10, scrape_fn=lambda _: next(it),
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertTrue(ok, reason)
+
+    def test_a_missing_stranded_counter_is_skipped_but_noted_on_timeout(self):
+        # If weir doesn't expose it, the check must not block forever — but
+        # the weaker check must stay visible rather than fail silently.
+        growing_bytes = {"n": 0}
+
+        def unstable(_):
+            growing_bytes["n"] += 1
+            return {
+                "weir_queue_depth": 0.0,
+                "weir_wab_bytes_on_disk": 1000.0 * growing_bytes["n"],
+                'weir_drain_state{state="draining"}': 1.0, quiescence.SINK_DOWN: 0.0,
+                # STRANDED deliberately absent
+            }
+
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.01, scrape_fn=unstable,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok)
+        self.assertIn(quiescence.STRANDED, reason)
+        self.assertIn("skipped", reason)
 
 
 class TestParse2(unittest.TestCase):

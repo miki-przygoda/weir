@@ -211,5 +211,108 @@ class TestTailerSafety(unittest.TestCase):
             )
 
 
+class TestPushedAndNacked(unittest.TestCase):
+    """C2: acked and nacked are BOTH vacuous when acked is empty — a run where
+    weir refuses or delivers everything must not read as a healthy 20/20.
+    """
+
+    def test_a_fully_nacked_run_is_distinguishable_from_a_healthy_one(self):
+        # Demonstrated finding: Nack(InternalError) is recoverable, so loadgen
+        # keeps pushing at full rate while every record is refused. acked=0
+        # makes I1 and I2 vacuously true; nothing about ok/i1_missing/i2_leaked
+        # told this apart from an idle daemon. nacked_count and pushed do.
+        ledger_dict = {i: ("NACK", "InternalError") for i in range(1, 100001)}
+        r = verify.check(ledger_dict, [])
+        self.assertEqual(r.acked_count, 0)
+        self.assertEqual(r.i1_missing, [])
+        self.assertEqual(r.i2_leaked, [])
+        self.assertEqual(r.nacked_count, 100000, "the missing figure the review flagged")
+        self.assertEqual(r.pushed, 100000, "so 'nothing happened' is no longer silent")
+
+    def test_pushed_counts_every_outcome_regardless_of_tag(self):
+        r = verify.check({1: ("ACK", ""), 2: ("NACK", "x"), 3: ("UNK", "")}, [1])
+        self.assertEqual(r.pushed, 3)
+        self.assertEqual(r.acked_count, 1)
+        self.assertEqual(r.nacked_count, 1)
+        self.assertEqual(r.unknown_count, 1)
+
+    def test_summary_surfaces_pushed_and_nacked(self):
+        r = verify.check({1: ("NACK", "x")}, [])
+        self.assertIn("pushed=1", r.summary())
+        self.assertIn("nacked=1", r.summary())
+
+    def test_accumulator_exposes_nacked_and_pushed(self):
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["1 S 10 20 NACK oops", "2 S 11 21 ACK"], ["7 2"])
+        r = acc.check()
+        self.assertEqual(r.nacked_count, 1)
+        self.assertEqual(r.pushed, 2)
+
+
+class TestFrontier(unittest.TestCase):
+    """I3: continuous load means there is always in-flight work at check
+    time. `frontier_slack` exempts records right at the edge of the ledger's
+    coverage rather than misreading them as violations — but the default
+    (0) must be a complete no-op, since every pre-existing caller never heard
+    of a frontier.
+    """
+
+    def test_default_frontier_slack_is_a_no_op(self):
+        r = verify.check({1: ("ACK", ""), 2: ("ACK", "")}, [1, 999])
+        self.assertFalse(r.ok)
+        self.assertEqual(r.i1_missing, [2], "unexempted: identical to pre-frontier behaviour")
+        self.assertEqual(r.i1_exempt, 0)
+        self.assertEqual(r.orphaned_delivered, [999], "a plain orphan, not reclassified")
+        self.assertEqual(r.pending_provenance, 0)
+
+    def test_an_acked_seq_above_the_frontier_is_exempt_from_i1_not_failed(self):
+        # ledger_hwm=2, frontier_slack=1 -> frontier=1. Seq 2 (>1) is acked but
+        # undelivered: it may simply not have arrived yet, not lost.
+        r = verify.check({1: ("ACK", ""), 2: ("ACK", "")}, [1], frontier_slack=1)
+        self.assertTrue(r.ok, "an exempted seq must not fail the episode")
+        self.assertEqual(r.i1_missing, [])
+        self.assertEqual(r.i1_exempt, 1, "the exemption must still be visible")
+
+    def test_a_delivered_seq_above_the_frontier_is_pending_not_orphaned(self):
+        # ledger_hwm=1, frontier_slack=1 -> frontier=0. Seq 2 (>0) has no
+        # ledger entry yet because the ledger hasn't flushed that far, not
+        # because it is a stale/foreign record.
+        r = verify.check({1: ("ACK", "")}, [1, 2], frontier_slack=1)
+        self.assertEqual(r.orphaned_delivered, [])
+        self.assertEqual(r.pending_provenance, 1)
+        self.assertTrue(r.ok)
+
+    def test_pending_provenance_is_still_excluded_from_the_duplicate_rate(self):
+        # Hiding the exemption inside the duplicate rate would replace one
+        # silent distortion with another; it stays excluded, just relabelled.
+        r = verify.check({1: ("ACK", "")}, [1, 1, 2], frontier_slack=1)
+        self.assertEqual(r.delivered_distinct, 1)
+        self.assertAlmostEqual(r.duplicate_rate, 2.0)
+        self.assertEqual(r.pending_provenance, 1)
+
+    def test_a_seq_at_or_below_the_frontier_is_a_real_i1_violation(self):
+        # ledger_hwm=3, frontier_slack=1 -> frontier=2. Seq 1 (<=2) is below
+        # the frontier: the ledger has genuinely caught up past it, so a
+        # missing delivery there is real, not a timing artefact.
+        r = verify.check(
+            {1: ("ACK", ""), 2: ("ACK", ""), 3: ("ACK", "")}, [2, 3], frontier_slack=1
+        )
+        self.assertFalse(r.ok)
+        self.assertEqual(r.i1_missing, [1])
+        self.assertEqual(r.i1_exempt, 0)
+
+    def test_accumulator_check_passes_frontier_slack_through(self):
+        acc = verify.Accumulator(delivered_run_id=7)
+        acc.ingest(["1 S 10 20 ACK", "2 S 11 21 ACK"], ["7 1"])
+        self.assertEqual(acc.ledger_hwm, 2)
+
+        r = acc.check(frontier_slack=1)
+        self.assertTrue(r.ok, "seq 2 is within slack of the ledger high-water seq")
+        self.assertEqual(r.i1_exempt, 1)
+
+        r0 = acc.check()  # default frontier_slack=0
+        self.assertFalse(r0.ok, "no slack means seq 2 is an unexempted miss")
+
+
 if __name__ == "__main__":
     unittest.main()
