@@ -1,7 +1,8 @@
 # Real-Kernel Fault Injection & Chaos Soak — Design
 
 **Date:** 2026-07-25
-**Status:** design approved, not implemented
+**Status:** Phase 1 **implemented but never executed on real hardware** — see
+`chaos/README.md`. Phases 2–4 not started.
 **Target platform:** Linux (x86_64), dedicated bare-metal host
 
 ---

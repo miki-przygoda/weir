@@ -33,6 +33,22 @@ sudo python3 orchestrator/run.py schedules/smoke.toml
 Everything runs from inside this directory. `cargo build` at the weir repo root
 does not build this project.
 
+## Status — built, never run
+
+> **This harness has never executed against real hardware.** Every component is
+> implemented and unit-tested (31 Rust tests, 73 Python), and the whole suite is
+> green on macOS — but `run.py` requires Linux and root, and no Linux host has
+> been available. `dm_stack.setup()`/`teardown()`, the episode loop, and the
+> quiescence *success* path have therefore never executed outside a test double.
+>
+> **No durability claim about weir rests on this harness yet, and none should be
+> made from it until the gate below has actually passed.** The whole point of the
+> suite is evidence a skeptic would accept; "the code exists" is not that.
+>
+> Two rounds of review found the quiescence check broken in *opposite* directions
+> (it always reported drained, then never did), so treat the first real run as
+> genuinely unproven rather than a formality.
+
 ## Phase 1 exit gate
 
 Phase 1 is complete when a 30-minute smoke run produces **zero violations and
