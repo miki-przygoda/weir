@@ -97,6 +97,230 @@ def progress_floor_breached(delta_acked, delta_delivered, min_acked, min_deliver
     return delta_acked < min_acked or delta_delivered < min_delivered
 
 
+def cumulative_deltas(result, prev):
+    """Per-episode deltas from the accumulator's CUMULATIVE totals.
+
+    Returns `(deltas, totals)`; the caller passes `totals` back as `prev` next
+    time. Every figure `verify.Accumulator` reports only ever grows, so a
+    running total can never catch a weir that stopped making progress mid-run
+    — C2's whole point — and rendering one under a "Δ" heading is the
+    mislabelling that inflated the totals table by ~10x before I1 fixed it.
+    """
+    totals = {
+        "acked": result.acked_count,
+        "delivered": result.delivered_distinct,
+        "nacked": result.nacked_count,
+        "pushed": result.pushed,
+    }
+    return {k: v - prev.get(k, 0) for k, v in totals.items()}, totals
+
+
+def final_pass(
+    loadgen, daemon, recorder, acc, ledger_tail, delivered_tail, wab_dir,
+    frontier_slack, seed, prev_totals=None, scrape_fn=None, residue_fn=None,
+    sleep_fn=None, stop_loadgen_fn=None, settle_secs=1.0,
+):
+    """The verification pass that runs AFTER the last episode. D1.
+
+    Returns `(record, violations, anomalies)`. The record is appended to
+    `episodes.jsonl` as `{"episode": "final", ...}`.
+
+    Until this existed the episode loop verified after each fault and then the
+    run simply stopped, which threw away the cheapest, highest-signal evidence
+    in the whole harness:
+
+    - weir's SIGTERM path runs a FULL drain, not a seal-and-exit, so it
+      delivers the final tens of thousands of records — and nothing read them
+      before `stack.teardown()` unmounted and deleted the backing image.
+    - The last episode's frontier-exempt records were never re-judged.
+    - This is the ONLY moment in a run when the producer is stopped and the
+      drain has been given a real chance to finish.
+
+    ORDER IS THE POINT, and each step depends on the one before it:
+
+    1. Stop the load generator and `wait()` for it — its exit status decides
+       whether step 4 may use zero slack (D2).
+    2. Scrape `/metrics` while the daemon is STILL ALIVE. After step 3 there is
+       nothing left to scrape, and stranded/resumed and queue depth at the
+       moment of shutdown are exactly the numbers a stranded-segment finding
+       would need.
+    3. `daemon.stop()` — the real graceful drain. Having to `kill9` is an
+       anomaly, recorded.
+    4. Verify with `frontier_slack=0`. Zero slack is legitimate HERE AND ONLY
+       HERE: the producer is stopped and both logs are complete, so "no
+       exemption" is a true statement rather than a stricter-than-reality one.
+       If any of the preconditions failed, fall back to the normal slack and
+       mark the check ADVISORY — see `advisory_reasons` below.
+    5. WAB post-mortem, BEFORE teardown, while the mount still exists.
+
+    Everything after that (recorder, `stack.teardown()`, report) stays with the
+    caller's `finally` block.
+
+    A non-advisory failure here is a VIOLATION; everything else this can find
+    is an ANOMALY, and the record carries at most one of each so run.py's tally
+    and report.py's row count cannot drift apart.
+    """
+    scrape_fn = scrape_fn or quiescence.scrape
+    residue_fn = residue_fn or quiescence.scan_wab_residue
+    sleep_fn = sleep_fn or time.sleep
+    stop_loadgen_fn = stop_loadgen_fn or stop_loadgen
+    prev_totals = prev_totals or {}
+
+    record = {"episode": "final", "fault": "none", "seed": seed}
+    #: Conditions under which "acked but not delivered" is NOT weir's fault, so
+    #: `frontier_slack=0` would manufacture a violation out of a harness or
+    #: teardown artefact. Any one of them downgrades the check to advisory.
+    advisory_reasons = []
+    anomaly_reasons = []
+
+    # 1. Stop the producer and reap it.
+    exit_code, forced = stop_loadgen_fn(loadgen)
+    record["loadgen_exit_code"] = exit_code
+    record["loadgen_forced_kill"] = forced
+    if loadgen is None:
+        anomaly_reasons.append("loadgen_never_started")
+        advisory_reasons.append("no load generator ran, so the ledger is empty")
+    elif forced or exit_code != 0:
+        anomaly_reasons.append(f"loadgen_dirty_exit(code={exit_code}, killed={forced})")
+        # Exit code 1 is loadgen's own "ledger entries lost — verification
+        # cannot be trusted"; a kill means the same thing by another route.
+        # Either way the ledger's tail may be truncated, which is exactly what
+        # a zero-slack pass must not run on top of.
+        advisory_reasons.append(
+            f"the load generator exited dirty (code={exit_code}, killed={forced}), "
+            "so its ledger tail may be truncated"
+        )
+
+    # 2. Last scrape, while there is still something to scrape.
+    daemon_alive = bool(daemon and daemon.proc and daemon.proc.poll() is None)
+    record["daemon_alive_before_stop"] = daemon_alive
+    if not daemon_alive:
+        # `Daemon.stop()` reports True for an already-dead process, so without
+        # this the run would read "clean shutdown" for a daemon that never got
+        # one — and then hold weir to I1 for a drain it never had the chance to
+        # perform.
+        anomaly_reasons.append("daemon_not_running_at_final_pass")
+        advisory_reasons.append(
+            "the daemon was already dead, so it never ran a shutdown drain"
+        )
+        record["final_metrics"] = None
+    else:
+        try:
+            m = scrape_fn(daemon.metrics_url)
+        except Exception as exc:
+            record["final_metrics"] = None
+            record["final_metrics_error"] = f"{type(exc).__name__}: {exc}"
+            anomaly_reasons.append("final_metrics_scrape_failed")
+        else:
+            record["final_metrics"] = {
+                "stranded": m.get(quiescence.STRANDED),
+                "resumed": m.get(quiescence.RESUMED),
+                "queue_depth": m.get("weir_queue_depth"),
+                "draining": m.get(quiescence.DRAINING),
+                "sink_down": m.get(quiescence.SINK_DOWN),
+            }
+
+    # 2b. The sink weir is about to drain into must still be answering. The
+    # episode loop only checks this at the TOP of an episode, so a recorder
+    # that died during the LAST episode's quiescence wait was never noticed —
+    # and the shutdown drain would then hit a dead sink, reintroducing exactly
+    # the failure the teardown reorder removed.
+    recorder_alive = recorder is not None and recorder.poll() is None
+    record["recorder_alive"] = recorder_alive
+    if not recorder_alive:
+        anomaly_reasons.append("recorder_not_running")
+        advisory_reasons.append(
+            "the recorder was not running, so the shutdown drain had no sink"
+        )
+
+    # 3. The real graceful drain.
+    clean_stop = daemon.stop() if daemon else True
+    record["daemon_clean_stop"] = clean_stop
+    if daemon_alive and not clean_stop:
+        anomaly_reasons.append("daemon_kill_at_stop")
+        advisory_reasons.append(
+            "the shutdown drain overran its budget and the daemon was killed, "
+            "so undrained segments are expected"
+        )
+
+    # 4. Final verification.
+    advisory = bool(advisory_reasons)
+    slack = frontier_slack if advisory else 0
+    record["frontier_slack"] = slack
+    record["advisory"] = advisory
+    if advisory:
+        record["advisory_reasons"] = advisory_reasons
+    # The recorder fsyncs before its 200 and the daemon has now exited, so
+    # every delivery it acked is already durable; this only covers the last
+    # response still being written as the daemon's socket closed.
+    sleep_fn(settle_secs)
+    result = None
+    try:
+        acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
+        result = acc.check(frontier_slack=slack)
+    except Exception as exc:
+        # Do NOT let this skip step 5. A `LogTailer` refusal (an append-only
+        # log that shrank) is a real finding, but the WAB post-mortem is the
+        # one piece of evidence `stack.teardown()` is about to destroy — so
+        # record the failure loudly and keep going.
+        record["final_check_error"] = f"{type(exc).__name__}: {exc}"
+        anomaly_reasons.append("final_check_failed_to_run")
+
+    if result is not None:
+        deltas, _ = cumulative_deltas(result, prev_totals)
+        record.update({
+            "ok": result.ok,
+            "acked": result.acked_count,
+            "delivered_distinct": result.delivered_distinct,
+            "acked_delta": deltas["acked"],
+            "delivered_delta": deltas["delivered"],
+            "duplicate_rate": round(result.duplicate_rate, 4),
+            "unknown": result.unknown_count,
+            "nacked": result.nacked_count,
+            "pushed": result.pushed,
+            "nacked_delta": deltas["nacked"],
+            "pushed_delta": deltas["pushed"],
+            "i1_missing": result.i1_missing[:50],
+            "i2_leaked": result.i2_leaked[:50],
+            "orphaned_delivered": result.orphaned_delivered[:50],
+            "ledger_conflicts": result.ledger_conflicts[:50],
+            "i1_exempt": result.i1_exempt,
+            "pending_provenance": result.pending_provenance,
+        })
+    else:
+        # No check ran, so there is no durability claim to have passed. "ok":
+        # True with an anomaly recorded, the same shape the loop's abort
+        # record uses.
+        record["ok"] = True
+
+    # 5. WAB post-mortem, before teardown deletes the filesystem.
+    try:
+        residue = residue_fn(wab_dir)
+    except Exception as exc:
+        record["wab_scan_error"] = f"{type(exc).__name__}: {exc}"
+        anomaly_reasons.append("wab_postmortem_scan_failed")
+    else:
+        record["wab_residue"] = {
+            "unconfirmed_sealed": residue.unconfirmed_sealed,
+            "nonempty_active": residue.nonempty_active,
+            "quarantined": residue.quarantined,
+            "dead_letter": residue.dead_letter,
+        }
+        survivors = list(residue.survivors)
+        record["wab_survivor_count"] = len(survivors)
+        record["wab_survivors"] = survivors[:50]
+        if survivors:
+            anomaly_reasons.append(f"wab_survivors={len(survivors)}")
+
+    if result is not None and not result.ok and advisory:
+        anomaly_reasons.append("advisory_check_failed")
+
+    record["anomaly_reasons"] = anomaly_reasons
+    violations = 1 if (result is not None and not result.ok and not advisory) else 0
+    anomalies = 1 if anomaly_reasons else 0
+    return record, violations, anomalies
+
+
 def stop_loadgen(proc, timeout_secs=LOADGEN_STOP_TIMEOUT_SECS):
     """Stops the load generator and REAPS it. Returns `(exit_code, forced)`.
 
@@ -375,9 +599,8 @@ def main():
         frontier_slack = sched["load"]["threads"] * LEDGER_FLUSH_THRESHOLD
         # C2: the previous episode's CUMULATIVE totals, so the per-episode
         # DELTA (not the running total) is what gets judged against the
-        # schedule's progress floors.
-        prev_acked = 0
-        prev_delivered = 0
+        # schedule's progress floors — and what the report renders.
+        prev_totals = {}
 
         with open(episodes_path, "a") as ep_log:
             for i, delay in enumerate(delays):
@@ -457,15 +680,24 @@ def main():
                     # later episode into a no-load episode.
                     loadgen.send_signal(signal.SIGCONT)
 
+                # The recorder's liveness was asserted at the TOP of this
+                # episode, but the quiescence wait is the longest unobserved
+                # stretch in the loop and it can die inside one. If it did,
+                # every delivery after its death is missing from the log, so
+                # this episode's I1 result is about the harness rather than
+                # about weir: the verdict becomes ADVISORY (an anomaly, never
+                # a violation) and the run stops, because continuing would
+                # drain into a dead sink at teardown.
+                recorder_alive = recorder.poll() is None
+                advisory = not recorder_alive
+
                 # C2: acked/delivered are CUMULATIVE totals, so the floor is
                 # judged against the DELTA since the previous episode — not
                 # the running total, which only ever grows and would never
                 # catch a weir that stopped making progress mid-run.
-                delta_acked = result.acked_count - prev_acked
-                delta_delivered = result.delivered_distinct - prev_delivered
-                prev_acked, prev_delivered = result.acked_count, result.delivered_distinct
+                deltas, prev_totals = cumulative_deltas(result, prev_totals)
                 no_progress = progress_floor_breached(
-                    delta_acked, delta_delivered,
+                    deltas["acked"], deltas["delivered"],
                     sched["load"]["min_acked_per_episode"],
                     sched["load"]["min_delivered_per_episode"],
                 )
@@ -475,9 +707,9 @@ def main():
                 # A quiescence timeout or a no-progress episode is not
                 # evidence weir lost or leaked anything; it means this
                 # episode proved nothing, which is a different kind of bad.
-                if not result.ok:
+                if not result.ok and not advisory:
                     violations += 1
-                if not ok or no_progress:
+                if not ok or no_progress or advisory:
                     anomalies += 1
 
                 record = {
@@ -487,17 +719,22 @@ def main():
                     "quiesced": ok,
                     "quiescence_note": reason,
                     "ok": result.ok,
+                    "recorder_alive": recorder_alive,
+                    "advisory": advisory,
                     "acked": result.acked_count,
                     "delivered_distinct": result.delivered_distinct,
                     # Per-episode deltas of the cumulative counts above — what
-                    # `no_progress` is actually judged against.
-                    "acked_delta": delta_acked,
-                    "delivered_delta": delta_delivered,
+                    # `no_progress` is actually judged against, and what the
+                    # report renders under its "Δ" headings.
+                    "acked_delta": deltas["acked"],
+                    "delivered_delta": deltas["delivered"],
                     "no_progress": no_progress,
                     "duplicate_rate": round(result.duplicate_rate, 4),
                     "unknown": result.unknown_count,
                     "nacked": result.nacked_count,
                     "pushed": result.pushed,
+                    "nacked_delta": deltas["nacked"],
+                    "pushed_delta": deltas["pushed"],
                     "i1_missing": result.i1_missing[:50],
                     "i2_leaked": result.i2_leaked[:50],
                     # Provenance anomalies, kept distinct from I1/I2 so neither is
@@ -516,6 +753,8 @@ def main():
                     "pending_provenance": result.pending_provenance,
                     "seed": seed,
                 }
+                if advisory:
+                    record["advisory_reasons"] = ["recorder_exited"]
                 ep_log.write(json.dumps(record) + "\n")
                 ep_log.flush()
 
@@ -531,6 +770,35 @@ def main():
                         f"# seed={hex(seed)} episode={i}",
                         flush=True,
                     )
+                if not recorder_alive:
+                    print(
+                        f"episode {i:3d}  ABORT — the recorder died during this "
+                        "episode; its verdict is advisory and the run stops here "
+                        "rather than draining into a dead sink at teardown",
+                        flush=True,
+                    )
+                    break
+
+            # D1: the final pass. Inside the `with`, so it appends to the same
+            # episode log; after the loop, so it also runs on the abort paths
+            # above — a run that stopped early still has a WAB directory worth
+            # a post-mortem before teardown deletes it.
+            final_record, v, a = final_pass(
+                loadgen, daemon, recorder, acc, ledger_tail, delivered_tail,
+                daemon.wab_dir, frontier_slack, seed, prev_totals=prev_totals,
+            )
+            violations += v
+            anomalies += a
+            ep_log.write(json.dumps(final_record) + "\n")
+            ep_log.flush()
+            print(
+                f"episode fin  advisory={final_record['advisory']}  "
+                f"slack={final_record['frontier_slack']}  "
+                f"clean_stop={final_record['daemon_clean_stop']}  "
+                f"wab_survivors={final_record.get('wab_survivor_count', '?')}  "
+                f"anomalies={final_record['anomaly_reasons'] or 'none'}",
+                flush=True,
+            )
     finally:
         # Each step isolated. A process can exit between `poll()` and
         # `terminate()`, and an unguarded ProcessLookupError there would skip

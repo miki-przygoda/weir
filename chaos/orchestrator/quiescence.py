@@ -55,9 +55,13 @@ consecutive polls:
 
 1. Zero `*.wab.sealed` files lacking a corresponding `.confirmed` sidecar —
    sealed work that has not reached a terminal state (drained or
-   quarantined; quarantined segments are moved into `quarantine/`, which is
-   skipped by the scan, so nothing there can hold this open). This is the
+   quarantined; quarantined segments are moved into `quarantine/`, which the
+   shard walk skips, so nothing there can hold this open). This is the
    direct, on-disk analogue of what bug 3 tried to compute from counters.
+   `scan_wab_residue` does count `quarantine/` and `dead_letter/` contents
+   separately, for the end-of-run post-mortem — they are NOT quiescence
+   conditions, and must not become any: quarantine is terminal, so waiting
+   on it would never finish.
 2. Zero non-empty active `*.wab` files — records buffered in an open segment
    are acked and undelivered. `run.py` passes `--wab-segment-max-age-secs 2`
    so an idle open segment seals and drains; without that, this condition
@@ -131,22 +135,72 @@ SEGMENT_HEADER_LEN = 24
 #: by the `DeadLetterWriter`.
 RESERVED_SUBDIRS = frozenset({"quarantine", "dead_letter"})
 
-#: Snapshot of on-disk WAB backlog: `scan_wab_residue`'s return type.
-Residue = collections.namedtuple("Residue", ["unconfirmed_sealed", "nonempty_active"])
+#: Snapshot of on-disk WAB state: `scan_wab_residue`'s return type.
+#:
+#: The first two fields are the QUIESCENCE conditions — the only two
+#: `wait_for_quiescence` looks at. The rest are POST-MORTEM material for the
+#: end-of-run pass in `run.py`, which walks the same tree once more, after the
+#: daemon has shut down and before `stack.teardown()` deletes the mount.
+#: They default so that every existing `Residue(unconfirmed_sealed=...,
+#: nonempty_active=...)` construction (the injected fakes in
+#: `test_quiescence.py`) keeps working unchanged.
+#:
+#: `quarantined` and `dead_letter` are deliberately NOT quiescence conditions.
+#: Quarantine is a TERMINAL state — a segment parked there has reached one, so
+#: it can never "catch up" and waiting on it would hang forever — and dead
+#: lettering is weir doing its documented job. Both are still findings at the
+#: end of a Phase 1 run against a healthy sink, which is what the post-mortem
+#: is for.
+#:
+#: `survivors` is a tuple of `{"kind", "path", "size"}` dicts covering all four
+#: categories: what was left on the filesystem, where, and how big.
+Residue = collections.namedtuple(
+    "Residue",
+    [
+        "unconfirmed_sealed",
+        "nonempty_active",
+        "quarantined",
+        "dead_letter",
+        "survivors",
+    ],
+    defaults=(0, 0, ()),
+)
+
+
+def _entry_size(entry):
+    """`entry.stat().st_size`, or 0 if it vanished mid-scan.
+
+    A segment can be renamed or unlinked between the `scandir` and the `stat`
+    — the drain is running during quiescence polling. A vanished file is not
+    residue, so reporting 0 is honest; raising would turn a benign race into a
+    failed poll.
+    """
+    try:
+        return entry.stat().st_size
+    except OSError:
+        return 0
 
 
 def scan_wab_residue(wab_dir):
-    """Ground-truth scan of `wab_dir` for undrained backlog.
+    """Ground-truth scan of `wab_dir` for undrained backlog and leftovers.
 
     Descends into every shard directory directly under `wab_dir` (skipping
     `RESERVED_SUBDIRS`) and counts:
 
     - `unconfirmed_sealed`: `*.wab.sealed` files with no matching
       `*.wab.confirmed` sidecar (sealed work not yet drained or
-      quarantined — quarantined copies live under `quarantine/`, which this
-      scan never descends into, so they cannot appear here).
+      quarantined — quarantined copies live under `quarantine/`, which the
+      shard walk never descends into, so they cannot appear here).
     - `nonempty_active`: `*.wab` files larger than `SEGMENT_HEADER_LEN`,
       i.e. an open segment holding at least one buffered record.
+
+    Then walks the two reserved subdirectories separately and counts every
+    regular file in each as `quarantined` / `dead_letter`. These do NOT gate
+    quiescence (see `Residue`); they exist so the end-of-run post-mortem has
+    one scanner rather than two, and so this evidence stops being deleted
+    unread by `stack.teardown()`.
+
+    Every counted file also appears in `survivors` with its path and size.
 
     Raises whatever `os.scandir`/`os.stat` raise (e.g. `FileNotFoundError`
     if `wab_dir` does not exist, `PermissionError`) — the caller is
@@ -155,12 +209,12 @@ def scan_wab_residue(wab_dir):
     """
     unconfirmed_sealed = 0
     nonempty_active = 0
+    survivors = []
     with os.scandir(wab_dir) as it:
-        shard_dirs = [
-            e.path
-            for e in it
-            if e.is_dir(follow_symlinks=False) and e.name not in RESERVED_SUBDIRS
-        ]
+        top = [e for e in it if e.is_dir(follow_symlinks=False)]
+    shard_dirs = [e.path for e in top if e.name not in RESERVED_SUBDIRS]
+    reserved_dirs = [(e.name, e.path) for e in top if e.name in RESERVED_SUBDIRS]
+
     for shard_dir in shard_dirs:
         with os.scandir(shard_dir) as it:
             entries = list(it)
@@ -173,12 +227,48 @@ def scan_wab_residue(wab_dir):
                 confirmed_path = os.path.join(shard_dir, base + EXT_CONFIRMED)
                 if not os.path.exists(confirmed_path):
                     unconfirmed_sealed += 1
+                    survivors.append({
+                        "kind": "unconfirmed_sealed",
+                        "path": entry.path,
+                        "size": _entry_size(entry),
+                    })
             elif name.endswith(EXT_ACTIVE):
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                if entry.stat().st_size > SEGMENT_HEADER_LEN:
+                size = _entry_size(entry)
+                if size > SEGMENT_HEADER_LEN:
                     nonempty_active += 1
-    return Residue(unconfirmed_sealed=unconfirmed_sealed, nonempty_active=nonempty_active)
+                    survivors.append({
+                        "kind": "nonempty_active",
+                        "path": entry.path,
+                        "size": size,
+                    })
+
+    reserved_counts = {"quarantine": 0, "dead_letter": 0}
+    for name, path in reserved_dirs:
+        # Non-recursive: weir writes both flat (`recovery.rs`'s `quarantine()`
+        # renames into `quarantine/`, `DeadLetterWriter` creates
+        # `dead_letter/dl_<counter>.wab`). A nested directory here would be
+        # something neither of them made, so counting only regular files keeps
+        # this reporting what weir actually left.
+        with os.scandir(path) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                reserved_counts[name] += 1
+                survivors.append({
+                    "kind": name,
+                    "path": entry.path,
+                    "size": _entry_size(entry),
+                })
+
+    return Residue(
+        unconfirmed_sealed=unconfirmed_sealed,
+        nonempty_active=nonempty_active,
+        quarantined=reserved_counts["quarantine"],
+        dead_letter=reserved_counts["dead_letter"],
+        survivors=tuple(survivors),
+    )
 
 
 def parse(text):

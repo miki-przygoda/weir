@@ -483,6 +483,20 @@ class TestResidueBlocksQuiescence(unittest.TestCase):
         )
         self.assertIn("timeout", reason)
 
+    def test_quarantined_and_dead_lettered_segments_do_not_block_quiescence(self):
+        # `Residue` grew these two for the end-of-run post-mortem (D1). They
+        # must NOT become quiescence conditions: quarantine is a TERMINAL
+        # state, so a segment parked there can never catch up and waiting on
+        # it would hang until the timeout, every episode, forever. Dead
+        # lettering is likewise weir doing its documented job.
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=30.0, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(),
+            residue_fn=lambda _: healthy_residue(quarantined=4, dead_letter=9),
+            poll_interval_s=0.01, stable_polls=3,
+        )
+        self.assertTrue(ok, reason)
+
     def test_clean_residue_and_healthy_metrics_quiesces_promptly(self):
         start = time.monotonic()
         ok, reason = quiescence.wait_for_quiescence(
@@ -624,11 +638,71 @@ class TestWabResidueScanRealFs(unittest.TestCase):
                 "header; the shard_00 one and the dead_letter one must be excluded",
             )
 
+    def test_reserved_subdir_contents_are_counted_for_the_post_mortem(self):
+        # D1: the same walk feeds the end-of-run post-mortem, which runs after
+        # the daemon has stopped and before stack.teardown() deletes the
+        # mount. quarantine/ and dead_letter/ files are findings there — but
+        # they must still be invisible to the two QUIESCENCE counts, or
+        # waiting on a terminal state would hang forever.
+        with tempfile.TemporaryDirectory() as wab_dir:
+            shard0 = os.path.join(wab_dir, "shard_00")
+            quarantine = os.path.join(wab_dir, "quarantine")
+            dead_letter = os.path.join(wab_dir, "dead_letter")
+            for d in (shard0, quarantine, dead_letter):
+                os.makedirs(d)
+
+            self._write(os.path.join(shard0, "seg_00000002.wab.sealed"),
+                        quiescence.SEGMENT_HEADER_LEN + 5)
+            self._write(os.path.join(quarantine, "shard_00_seg_00000009.wab.sealed"), 128)
+            self._write(os.path.join(dead_letter, "dl_1.wab.sealed"), 512)
+            self._write(os.path.join(dead_letter, "dl_2.wab.sealed"), 256)
+
+            residue = quiescence.scan_wab_residue(wab_dir)
+
+            self.assertEqual(
+                (residue.unconfirmed_sealed, residue.nonempty_active), (1, 0),
+                "reserved-subdir files must not inflate the quiescence counts",
+            )
+            self.assertEqual(residue.quarantined, 1)
+            self.assertEqual(residue.dead_letter, 2)
+
+            by_kind = {}
+            for s in residue.survivors:
+                by_kind.setdefault(s["kind"], []).append(s)
+            self.assertEqual(
+                sorted(by_kind), ["dead_letter", "quarantine", "unconfirmed_sealed"]
+            )
+            self.assertEqual(
+                sum(s["size"] for s in by_kind["dead_letter"]), 768,
+                "the post-mortem records sizes, not just counts",
+            )
+            self.assertTrue(
+                by_kind["unconfirmed_sealed"][0]["path"].endswith(
+                    "shard_00/seg_00000002.wab.sealed"
+                ),
+                "and paths, so a survivor can actually be gone and looked at",
+            )
+
+    def test_survivors_carry_the_active_segments_real_size(self):
+        with tempfile.TemporaryDirectory() as wab_dir:
+            shard0 = os.path.join(wab_dir, "shard_00")
+            os.makedirs(shard0)
+            size = quiescence.SEGMENT_HEADER_LEN + 4096
+            self._write(os.path.join(shard0, "seg_00000001.wab"), size)
+            residue = quiescence.scan_wab_residue(wab_dir)
+            self.assertEqual(residue.nonempty_active, 1)
+            self.assertEqual(len(residue.survivors), 1)
+            self.assertEqual(residue.survivors[0]["kind"], "nonempty_active")
+            self.assertEqual(residue.survivors[0]["size"], size)
+
     def test_a_completely_empty_wab_dir_scans_clean(self):
         with tempfile.TemporaryDirectory() as wab_dir:
             residue = quiescence.scan_wab_residue(wab_dir)
             self.assertEqual(residue.unconfirmed_sealed, 0)
             self.assertEqual(residue.nonempty_active, 0)
+            self.assertEqual(residue.quarantined, 0)
+            self.assertEqual(residue.dead_letter, 0)
+            self.assertEqual(residue.survivors, ())
 
     def test_a_missing_wab_dir_raises(self):
         with tempfile.TemporaryDirectory() as tmp:

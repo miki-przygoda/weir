@@ -5,6 +5,7 @@ The episode loop itself needs root and a real daemon; it is exercised by the
 Task 9 end-to-end gate, not here. `final_pass` and `stop_loadgen` are written
 against injected collaborators precisely so they do NOT need either.
 """
+import json
 import os
 import re
 import signal
@@ -12,7 +13,9 @@ import subprocess
 import unittest
 from unittest import mock
 
+import quiescence
 import run
+import verify
 
 
 class FakeProc:
@@ -49,6 +52,79 @@ class FakeProc:
         if self.returncode is None:
             self.returncode = 0
         return self.returncode
+
+
+class FakeDaemon:
+    """A `run.Daemon` stand-in whose shutdown is scripted."""
+
+    def __init__(self, alive=True, clean_stop=True, log=None):
+        self.proc = FakeProc(returncode=None if alive else 0)
+        self.metrics_url = "http://127.0.0.1:19185/metrics"
+        self.wab_dir = "/unused/wab"
+        self._clean_stop = clean_stop
+        self.log = log if log is not None else []
+
+    def stop(self):
+        self.log.append("daemon.stop")
+        self.proc.returncode = 0 if self._clean_stop else -9
+        return self._clean_stop
+
+
+class FakeTailer:
+    """A `verify.LogTailer` stand-in. `raises` reproduces the refusal a real
+    tailer issues when an append-only log shrank."""
+
+    def __init__(self, name, lines=(), log=None, raises=None):
+        self.name = name
+        self.lines = list(lines)
+        self.log = log if log is not None else []
+        self.raises = raises
+
+    def read_new(self):
+        self.log.append(f"{self.name}.read_new")
+        if self.raises:
+            raise self.raises
+        lines, self.lines = self.lines, []
+        return lines
+
+
+def final_pass_fixture(
+    log=None, loadgen=None, daemon=None, recorder_alive=True, ledger=(),
+    delivered=(), ledger_raises=None, residue=None, scrape_raises=None,
+    frontier_slack=2048, run_id=7,
+):
+    """Builds the collaborators `run.final_pass` needs, all fake but for the
+    accumulator — the real oracle, so these tests exercise the real I1."""
+    log = [] if log is None else log
+    residue = residue if residue is not None else quiescence.Residue(0, 0)
+
+    def scrape_fn(url):
+        log.append("scrape")
+        if scrape_raises:
+            raise scrape_raises
+        return {"weir_queue_depth": 0.0, quiescence.STRANDED: 2.0,
+                quiescence.RESUMED: 2.0}
+
+    def residue_fn(wab_dir):
+        log.append("residue_scan")
+        if isinstance(residue, Exception):
+            raise residue
+        return residue
+
+    return dict(
+        loadgen=FakeProc(log=log) if loadgen is None else loadgen,
+        daemon=FakeDaemon(log=log) if daemon is None else daemon,
+        recorder=FakeProc(returncode=None if recorder_alive else 0),
+        acc=verify.Accumulator(delivered_run_id=run_id),
+        ledger_tail=FakeTailer("ledger", ledger, log, raises=ledger_raises),
+        delivered_tail=FakeTailer("delivered", delivered, log),
+        wab_dir="/unused/wab",
+        frontier_slack=frontier_slack,
+        seed=0x5EED,
+        scrape_fn=scrape_fn,
+        residue_fn=residue_fn,
+        sleep_fn=lambda _s: None,
+    ), log
 
 
 class TestSchedule(unittest.TestCase):
@@ -244,6 +320,212 @@ class TestStopLoadgen(unittest.TestCase):
 
     def test_no_loadgen_at_all_is_not_an_error(self):
         self.assertEqual(run.stop_loadgen(None), (None, False))
+
+
+class TestCumulativeDeltas(unittest.TestCase):
+    def test_deltas_are_taken_against_the_previous_cumulative_totals(self):
+        first = verify.check({1: ("ACK", ""), 2: ("NACK", "")}, [1])
+        deltas, totals = run.cumulative_deltas(first, {})
+        self.assertEqual(deltas, totals)
+        self.assertEqual(deltas["acked"], 1)
+        self.assertEqual(deltas["nacked"], 1)
+        self.assertEqual(deltas["pushed"], 2)
+
+        second = verify.check(
+            {1: ("ACK", ""), 2: ("NACK", ""), 3: ("ACK", "")}, [1, 3]
+        )
+        deltas, _ = run.cumulative_deltas(second, totals)
+        self.assertEqual(
+            deltas, {"acked": 1, "delivered": 1, "nacked": 0, "pushed": 1},
+            "nacked/pushed must be per-episode deltas like acked/delivered — a "
+            "running total under the same heading is the mislabelling I1 fixed",
+        )
+
+
+class TestFinalPass(unittest.TestCase):
+    """D1: the one verification pass that runs with the producer stopped and
+    the drain given a real chance to finish. Every collaborator is injected,
+    so the ordering and the post-mortem are testable without root."""
+
+    def test_it_runs_its_steps_in_the_only_order_that_works(self):
+        kwargs, log = final_pass_fixture()
+        run.final_pass(**kwargs)
+        self.assertEqual(
+            log,
+            ["loadgen.wait", "scrape", "daemon.stop",
+             "ledger.read_new", "delivered.read_new", "residue_scan"],
+            "the producer must be reaped before the daemon is asked to drain; "
+            "/metrics must be scraped while the daemon is still alive; the WAB "
+            "post-mortem must happen before the caller's stack.teardown()",
+        )
+
+    def test_a_clean_shutdown_verifies_with_zero_frontier_slack(self):
+        kwargs, _ = final_pass_fixture()
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertEqual(
+            record["frontier_slack"], 0,
+            "the producer is stopped and both logs are complete: this is the "
+            "one instant where 'no exemption' is a true statement",
+        )
+        self.assertFalse(record["advisory"])
+        self.assertEqual((violations, anomalies), (0, 0))
+        self.assertEqual(record["episode"], "final")
+
+    def test_an_acked_but_undelivered_record_after_a_clean_shutdown_is_a_violation(self):
+        kwargs, _ = final_pass_fixture(
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"],
+        )
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertFalse(record["ok"])
+        self.assertEqual(record["i1_missing"], [2])
+        self.assertEqual(
+            (violations, anomalies), (1, 0),
+            "with zero slack and a clean shutdown, an undelivered acked record "
+            "is a durability violation, not an anomaly",
+        )
+
+    def test_a_dirty_loadgen_exit_falls_back_to_the_normal_slack_and_is_advisory(self):
+        # loadgen exit code 1 is its own "ledger entries lost — verification
+        # cannot be trusted". A zero-slack pass on a truncated ledger is
+        # unsound, so the same missing record must NOT read as a violation.
+        kwargs, _ = final_pass_fixture(
+            loadgen=FakeProc(returncode=1),
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"],
+        )
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertTrue(record["advisory"])
+        self.assertEqual(record["frontier_slack"], 2048)
+        self.assertEqual(record["loadgen_exit_code"], 1)
+        self.assertEqual(record["i1_exempt"], 1)
+        self.assertEqual((violations, anomalies), (0, 1))
+        self.assertTrue(
+            any("loadgen_dirty_exit" in r for r in record["anomaly_reasons"])
+        )
+
+    def test_a_killed_loadgen_is_dirty_too(self):
+        kwargs, _ = final_pass_fixture(loadgen=FakeProc(wait_raises=True))
+        record, _, anomalies = run.final_pass(**kwargs)
+        self.assertTrue(record["loadgen_forced_kill"])
+        self.assertTrue(record["advisory"])
+        self.assertEqual(anomalies, 1)
+
+    def test_a_shutdown_drain_that_had_to_be_killed_is_an_anomaly_not_a_violation(self):
+        # An un-drained segment after a forced kill is not a durability
+        # failure: weir was never given time to finish. Holding it to
+        # frontier_slack=0 would manufacture tens of thousands of I1 misses.
+        kwargs, _ = final_pass_fixture(
+            daemon=FakeDaemon(clean_stop=False),
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"],
+        )
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertFalse(record["daemon_clean_stop"])
+        self.assertTrue(record["advisory"])
+        self.assertIn("daemon_kill_at_stop", record["anomaly_reasons"])
+        self.assertEqual((violations, anomalies), (0, 1))
+
+    def test_a_daemon_that_was_already_dead_is_not_read_as_a_clean_shutdown(self):
+        # Daemon.stop() returns True for an already-exited process, so without
+        # an explicit liveness check the run would credit weir with a drain it
+        # never performed and then hold it to I1 for the result.
+        kwargs, log = final_pass_fixture(daemon=FakeDaemon(alive=False))
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertFalse(record["daemon_alive_before_stop"])
+        self.assertIn("daemon_not_running_at_final_pass", record["anomaly_reasons"])
+        self.assertTrue(record["advisory"])
+        self.assertNotIn("scrape", log, "nothing to scrape from a dead daemon")
+        self.assertEqual((violations, anomalies), (0, 1))
+
+    def test_a_dead_recorder_makes_the_shutdown_drain_sinkless_and_the_check_advisory(self):
+        kwargs, _ = final_pass_fixture(recorder_alive=False)
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertFalse(record["recorder_alive"])
+        self.assertIn("recorder_not_running", record["anomaly_reasons"])
+        self.assertTrue(record["advisory"])
+        self.assertEqual((violations, anomalies), (0, 1))
+
+    def test_the_last_metrics_scrape_is_kept_in_the_run_record(self):
+        kwargs, _ = final_pass_fixture()
+        record, _, _ = run.final_pass(**kwargs)
+        self.assertEqual(record["final_metrics"]["stranded"], 2.0)
+        self.assertEqual(record["final_metrics"]["resumed"], 2.0)
+        self.assertEqual(record["final_metrics"]["queue_depth"], 0.0)
+
+    def test_a_failed_final_scrape_is_reported_not_swallowed(self):
+        kwargs, _ = final_pass_fixture(scrape_raises=OSError("connection refused"))
+        record, _, anomalies = run.final_pass(**kwargs)
+        self.assertIn("final_metrics_scrape_failed", record["anomaly_reasons"])
+        self.assertIn("connection refused", record["final_metrics_error"])
+        self.assertEqual(anomalies, 1)
+
+    def test_surviving_wab_files_are_an_anomaly_with_paths_and_sizes(self):
+        # This evidence used to be deleted, unread, by stack.teardown().
+        survivors = (
+            {"kind": "unconfirmed_sealed",
+             "path": "/mnt/weir-wab/wab/shard_00/seg_00000007.wab.sealed",
+             "size": 8388608},
+            {"kind": "dead_letter",
+             "path": "/mnt/weir-wab/wab/dead_letter/dl_1.wab", "size": 512},
+        )
+        kwargs, _ = final_pass_fixture(
+            residue=quiescence.Residue(1, 0, 0, 1, survivors)
+        )
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertEqual(record["wab_survivor_count"], 2)
+        self.assertEqual(record["wab_residue"]["unconfirmed_sealed"], 1)
+        self.assertEqual(record["wab_residue"]["dead_letter"], 1)
+        self.assertIn("seg_00000007.wab.sealed", record["wab_survivors"][0]["path"])
+        self.assertEqual(record["wab_survivors"][0]["size"], 8388608)
+        self.assertIn("wab_survivors=2", record["anomaly_reasons"])
+        self.assertEqual((violations, anomalies), (0, 1))
+
+    def test_a_verification_that_blows_up_still_gets_the_post_mortem(self):
+        # A LogTailer refusal is a real finding, but the WAB directory is what
+        # teardown is about to destroy — losing it to an exception would be the
+        # same disappearing act D1 exists to stop.
+        kwargs, log = final_pass_fixture(
+            ledger_raises=RuntimeError("ledger.log shrank"),
+            residue=quiescence.Residue(2, 1),
+        )
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertIn("ledger.log shrank", record["final_check_error"])
+        self.assertIn("final_check_failed_to_run", record["anomaly_reasons"])
+        self.assertIn("residue_scan", log, "the post-mortem must still run")
+        self.assertEqual(record["wab_residue"]["unconfirmed_sealed"], 2)
+        self.assertEqual((violations, anomalies), (0, 1))
+
+    def test_a_failed_post_mortem_scan_is_itself_reported(self):
+        kwargs, _ = final_pass_fixture(residue=PermissionError("EACCES"))
+        record, _, anomalies = run.final_pass(**kwargs)
+        self.assertIn("wab_postmortem_scan_failed", record["anomaly_reasons"])
+        self.assertEqual(anomalies, 1)
+
+    def test_the_record_is_json_serialisable(self):
+        # run.py appends it to episodes.jsonl; anything non-serialisable here
+        # would take the whole run's report down with it at the last step.
+        kwargs, _ = final_pass_fixture(
+            residue=quiescence.Residue(1, 0, 0, 0, (
+                {"kind": "unconfirmed_sealed", "path": "/x", "size": 1},
+            )),
+            ledger=["1 S 10 20 ACK"], delivered=["7 1"],
+        )
+        record, _, _ = run.final_pass(**kwargs)
+        round_tripped = json.loads(json.dumps(record))
+        self.assertEqual(round_tripped["episode"], "final")
+
+    def test_at_most_one_violation_and_one_anomaly_come_from_the_final_pass(self):
+        # It is ONE row in episodes.jsonl, and report.py counts rows. Emitting
+        # a count per problem here would drift run.py's tally away from the
+        # report's headline.
+        kwargs, _ = final_pass_fixture(
+            loadgen=FakeProc(returncode=1),
+            daemon=FakeDaemon(clean_stop=False),
+            recorder_alive=False,
+            residue=quiescence.Residue(3, 2, 1, 1, ()),
+            scrape_raises=OSError("gone"),
+        )
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertGreater(len(record["anomaly_reasons"]), 3)
+        self.assertEqual((violations, anomalies), (0, 1))
 
 
 if __name__ == "__main__":

@@ -80,6 +80,29 @@ a quiescence timeout, a dead observer, or an episode with no measurable
 progress — and is *not*, by itself, evidence of a weir defect. The two are
 counted and gated on separately so neither can hide inside the other.
 
+### The final pass
+
+After the last episode, and before anything is torn down, the run does one
+more thing — recorded as `{"episode": "final"}` in `episodes.jsonl` and as the
+last row of the report:
+
+1. the load generator is stopped and **reaped** (it catches SIGTERM and
+   flushes its ledger, so its exit status says whether the ledger is complete);
+2. `/metrics` is scraped once more **while the daemon is still alive**;
+3. the daemon is asked to shut down — weir's SIGTERM path is a *full drain*,
+   not a seal-and-exit, so this is where the last tens of thousands of records
+   are actually delivered;
+4. verification runs at **`frontier_slack=0`**. This is the only moment in a
+   run where zero slack is a true statement rather than a stricter-than-reality
+   one: the producer is stopped and both logs are complete. If any precondition
+   failed — a dirty loadgen exit, a killed drain, a dead recorder — the check
+   falls back to the normal slack and is marked **advisory**, and an advisory
+   failure counts as an anomaly rather than a violation;
+5. the WAB directory gets a **post-mortem** — surviving sealed segments,
+   non-empty active segments, `quarantine/` and `dead_letter/` contents, with
+   paths and sizes. Any survivor is an anomaly. This evidence used to be
+   deleted, unread, by `stack.teardown()`.
+
 **The gate is zero FALSE violations, not "it ran".** Any violation at this
 stage is far more likely to be a harness bug than a weir bug — Phase 1 injects
 only random SIGKILL, which weir's existing system tests already cover. Treat a
