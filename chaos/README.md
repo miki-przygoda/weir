@@ -33,21 +33,30 @@ sudo python3 orchestrator/run.py schedules/smoke.toml
 Everything runs from inside this directory. `cargo build` at the weir repo root
 does not build this project.
 
-## Status — built, never run
+## Status — Phase 1 gate PASSED (2026-08-01)
 
-> **This harness has never executed against real hardware.** Every component is
-> implemented and unit-tested (31 Rust tests, 73 Python), and the whole suite is
-> green on macOS — but `run.py` requires Linux and root, and no Linux host has
-> been available. `dm_stack.setup()`/`teardown()`, the episode loop, and the
-> quiescence *success* path have therefore never executed outside a test double.
+> **The Phase 1 exit gate passes: 20/20 episodes, 0 violations, 0 anomalies.**
+> 7,383,717 records, 20 `kill -9`s, 86 unconfirmed segments replayed across
+> restarts. Every acked record was delivered (`i1_missing = 0`), no refused
+> record ever appeared downstream (`i2_leaked = 0`), and nothing was excused by
+> the frontier exemption (`i1_exempt = 0`). Report and per-episode data:
+> [`docs/benchmarks/chaos-phase1/`](../docs/benchmarks/chaos-phase1/).
 >
-> **No durability claim about weir rests on this harness yet, and none should be
-> made from it until the gate below has actually passed.** The whole point of the
-> suite is evidence a skeptic would accept; "the code exists" is not that.
+> **Read the venue caveat before quoting any of it.** The run was in a
+> privileged Linux container on virtualised storage, so **no number with a unit
+> attached means anything** — this venue answers "does the harness work, and
+> does it report false violations", which is Phase 1's whole criterion, and
+> nothing about performance.
 >
-> Two rounds of review found the quiescence check broken in *opposite* directions
-> (it always reported drained, then never did), so treat the first real run as
-> genuinely unproven rather than a formality.
+> **What it does NOT establish.** Only `kill -9` was injected. Power loss, disk
+> full, slow disk, torn writes and read-only remount are Phases 2–3, and they
+> are where the more interesting claims live — the `Buffered`-vs-`Sync` tier
+> distinction is entirely untested here (the schedule runs `Sync` only). This is
+> minutes of load, not the multi-day soak the design calls for.
+>
+> Getting here took six defects in the harness against two in weir. Quiescence
+> alone was wrong four times, in both directions. Treat a green run as a claim
+> that needs its reasoning checked, not as a formality.
 
 ## Phase 1 exit gate
 
