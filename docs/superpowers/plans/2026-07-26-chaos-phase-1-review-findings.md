@@ -385,3 +385,117 @@ timeout.
 Also fixed in the same pass: a failed scrape now resets the stability
 counter (previously a window could straddle an observability gap and stitch
 polls from either side of it into false consecutivity).
+
+---
+
+# First real run (2026-08-01, privileged Linux container) + two investigations
+
+Phase 1 needs only `losetup`/`mkfs.ext4`/`mount` — **no device-mapper at all**
+— so the gate does not need the dedicated box. It ran in a privileged container
+(LinuxKit 6.12.54). `chaos/Dockerfile.gate` reproduces it.
+
+## What the run found immediately
+
+- **`load_schedule` resolved relative paths against the orchestrator directory**,
+  so the invocation the README documents died before doing any work. The unit
+  test missed it by passing a path that resolves correctly under *both* rules —
+  it pinned the bug rather than catching it. Fixed, with a test that runs from
+  the documented cwd and genuinely fails when reverted.
+- **Teardown killed the recorder before the daemon**, so weir spent its whole
+  shutdown draining into a dead sink: 32 transport errors, `sink health: down`,
+  4 stranded segments — all in 24.6 ms, all pure noise that reads like a real
+  outage. Order is now loadgen → daemon → recorder → stack.
+
+## My diagnosis of the quiescence timeouts was WRONG
+
+I concluded "the drain can never catch up under sustained load" and applied
+`SIGSTOP` to the producer. The investigation disproved the premise: **the drain
+was never behind.** `weir-server.log` shows exactly `shard_count` segments
+queued for replay per restart and **zero** pre-existing unconfirmed sealed
+segments.
+
+The 78–87 k gap is the contents of the four **open active segments**. Modal
+delivery run is 31,775 records (8 MiB / 264 B); × 4 shards = up to **127,100
+acked records** that weir has no reason to seal, because idle-seal is off. The
+density profile across the gap is a textbook four-shard staircase
+(0.505 → 0.750 → 0.873 → 1.000), not drain lag.
+
+### And SIGSTOP made things worse in a way the run concealed
+
+**On a freshly restarted daemon every quiescence condition is trivially
+satisfied because nothing has happened yet** — the counter families are absent
+(correctly read as 0), `drain_state{draining}` is pre-initialised to 1.0 and
+`sink_health{down}` to 0.0. The only condition that blocked a false pass was
+`queue_depth > 0` under load — **which is exactly what SIGSTOP removes.**
+Demonstrated against the real module: `quiesced=True after 1.02s` with four
+replay segments queued and undelivered.
+
+The corollary is the uncomfortable part: **the SIGSTOP run only produced
+"0 violations" because quiescence kept timing out.** The broken predicate was
+accidentally doing the job the predicate was meant to do, and correctness hinged
+on losing a race. A green result there was luck, not evidence.
+
+## Root cause 2 — a genuine weir finding, the harness's first
+
+`recover_segment` (`crates/weir-server/src/wab/recovery.rs:497-503`) seals a
+recovered segment — rename + fsync + `info!("recovery sealed segment")` — and
+**never increments `weir_wab_segments{state="sealed"}`**. The drain's confirm
+*does* increment `confirmed` (`drain/confirmed.rs:51-58`). So after every
+restart `confirmed = sealed + shard_count` permanently, and any predicate of the
+form `sealed == confirmed + quarantined` is unsatisfiable at rest.
+
+That is a real defect in weir's metric contract — the counter family is
+non-conserving across a restart — not merely inconvenient for the harness.
+Observed live as `sealed(0) != confirmed(4)` on every episode.
+
+## Root cause 3 — idle-seal was disabled
+
+`wab_segment_max_age_secs` defaults to `0` (disabled). A frozen producer
+produces no seal, so no drain, so no convergence. Note the branch *requires* a
+pause — it only fires on an empty batch cycle — so pause and idle-seal are
+complementary and neither alone does anything. `run.py` now passes
+`--wab-segment-max-age-secs 2` (`deploy/systemd/weir.toml` ships `5`, so this is
+a supported posture, not a test hack).
+
+## The fix that follows: stop inferring, measure
+
+`run.py` is root and owns the mount. Ground truth is a `glob`, not a derived
+identity over cross-process counters: **zero `*.wab.sealed` lacking a
+`.confirmed` sidecar, and zero non-empty active `*.wab`**, stable across polls.
+That is immune to counter resets, to the recovery-seal asymmetry, and to Phase
+2/3 conditions where counters may lie — and it kills the ~1 s false positive for
+free, because at T+50 ms the replay segments are physically on disk. The metric
+conditions stay as necessary-but-not-sufficient companions.
+
+## Also established, worth not re-deriving
+
+- **Recorder capacity is not the problem.** 1,782,145 delivered in 408.9 s =
+  4,358 rec/s = 43.6 POST/s at 23 ms/POST *including* TCP connect and fsync, and
+  that figure is supply-limited so it is a floor. Draining 127 k records takes
+  ~29 s, comfortably inside a 120 s budget.
+- **weir's SIGTERM does a FULL drain**, not a seal-and-exit, and
+  `shutdown_timeout_secs` does not bound it (that covers only the socket
+  layer). The old 30 s budget was never binding because the recorder died first
+  and every sink call failed instantly. Raised to 300 s and a kill is now
+  reported.
+- **The teardown fix produces no verified evidence on its own.** weir will now
+  deliver the final ~82 k records, and nothing reads them before
+  `stack.teardown()` deletes the filesystem. A final verification pass after a
+  clean shutdown is the single highest-value addition available — it is the only
+  moment in a run where `frontier_slack=0` is a *true* statement.
+- **SIGTERM on a handler-less loadgen** discards up to `threads × 256` buffered
+  ledger entries. Safe direction (under-checking, not false accusation) but
+  concealing; `loadgen.log` was 0 bytes because it died before printing.
+- **RTT contamination**: a push straddling a freeze yields a ~120 s sample.
+  Measured against the real 1.86 M-sample ledger: p50/p99/p99.9 survive, but the
+  mean nearly doubles and max goes 1.98 s → 120 s. The *kill* already
+  contaminates the stream (24 samples > 1 s). Fix is not SIGSTOP-specific —
+  record each episode's excluded wall-clock windows and drop straddling samples
+  in analysis.
+- **Slowloris**: `connection_read_timeout_secs` defaults to 30 s, so a 120 s
+  freeze drops all 8 connections. loadgen's poison/reconnect handles it
+  correctly; cost is 8 spurious `Unknown` entries per episode.
+- weir shutdown **skips the retry backoff entirely** (`drain/mod.rs:511-524`):
+  `Disconnected` breaks the wait, so the 100/200/400 ms ladder collapses to
+  zero. All four segments burned all four attempts in 0.4 ms. A merely-slow sink
+  gets no retry at shutdown.

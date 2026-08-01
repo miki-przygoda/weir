@@ -45,9 +45,20 @@ LEDGER_FLUSH_THRESHOLD = 256
 
 
 def load_schedule(path):
-    """Reads a schedule TOML relative to the orchestrator directory."""
-    full = path if os.path.isabs(path) else os.path.join(HERE, path)
-    with open(full, "rb") as f:
+    """Reads a schedule TOML.
+
+    A relative path resolves against the CURRENT WORKING DIRECTORY, i.e. normal
+    shell semantics. It previously resolved against this file's directory, which
+    meant the invocation the README documents —
+
+        cd chaos && python3 orchestrator/run.py schedules/smoke.toml
+
+    — looked for `orchestrator/schedules/smoke.toml` and died before doing any
+    work. The unit test missed it by passing `../schedules/smoke.toml` from
+    inside `orchestrator/`, which happens to resolve correctly under both rules,
+    so the test pinned the bug rather than catching it.
+    """
+    with open(path, "rb") as f:
         return tomllib.load(f)
 
 
@@ -93,6 +104,8 @@ class Daemon:
         # timeout blamed on weir. A file also keeps the logs for diagnosis.
         self.log_file = log_file
         self.proc = None
+        #: Generous: the shutdown drain is real now. See stop().
+        self.stop_timeout_secs = 300
 
     def start(self, sink_url):
         # Remove any stale socket BEFORE spawning. `kill -9` leaves the file on
@@ -119,6 +132,17 @@ class Daemon:
             "--batch-size", str(self.cfg["batch_size"]),
             "--batch-deadline-ms", str(self.cfg["batch_deadline_ms"]),
             "--wab-segment-max-bytes", str(self.cfg["wab_segment_max_bytes"]),
+            # Idle-seal (weir default is 0 = disabled). Without it the OPEN
+            # active segment never seals while the producer is paused, and its
+            # contents are acked-but-undelivered records that no quiescence
+            # signal covers: `weir_wab_bytes_on_disk` counts the open segment,
+            # so it simply goes flat and reads as "drained". Under kill_random
+            # that is masked, because crash recovery seals the pre-kill segments
+            # before the socket reappears — but every Phase 2/3 fault that does
+            # NOT restart the daemon (dm-delay, ENOSPC, remount) would leave a
+            # full open segment and reproduce the ~85k phantom-I1 failure the
+            # producer pause was written to cure.
+            "--wab-segment-max-age-secs", "2",
         ]
         self.proc = subprocess.Popen(cmd, stdout=self.log_file, stderr=self.log_file)
         # Wait for the socket to appear rather than sleeping a fixed interval.
@@ -139,12 +163,26 @@ class Daemon:
             self.proc.wait()
 
     def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.kill9()
+        """Graceful shutdown. Returns True if it exited cleanly, False if killed.
+
+        weir's SIGTERM path runs a FULL drain of every sealed segment, not just
+        a seal-and-exit, and `shutdown_timeout_secs` does not bound it — that
+        setting covers only the socket layer's connection drain. The old 30 s
+        budget was never binding because the recorder was killed first, so every
+        sink call failed instantly and shutdown took 24.6 ms. Now that the
+        recorder outlives the daemon, the drain is real and needs a real budget.
+        A kill here means un-drained segments, which `stack.teardown()` then
+        deletes — so the caller reports it rather than swallowing it.
+        """
+        if not (self.proc and self.proc.poll() is None):
+            return True
+        self.proc.send_signal(signal.SIGTERM)
+        try:
+            self.proc.wait(timeout=self.stop_timeout_secs)
+            return True
+        except subprocess.TimeoutExpired:
+            self.kill9()
+            return False
 
     @property
     def metrics_url(self):
@@ -336,14 +374,37 @@ def main():
                 daemon.kill9()
                 daemon.start("http://127.0.0.1:9900/ingest")
 
-                ok, reason = quiescence.wait_for_quiescence(
-                    daemon.metrics_url, sched["quiescence_timeout_secs"]
-                )
+                # PAUSE THE PRODUCER before waiting for the drain.
+                #
+                # "The drain has caught up" is not a reachable state while the
+                # producer runs flat out: new segments seal as fast as old ones
+                # confirm, so `sealed == confirmed + quarantined` never holds.
+                # The first real run proved it — 3/3 episodes timed out at 120 s
+                # with a steady ~78k acked-but-undelivered gap, and verification
+                # then ran early and reported ~85k phantom I1 misses against a
+                # weir that had done nothing wrong.
+                #
+                # SIGSTOP is enough and needs no IPC. Records buffered in a
+                # thread's ledger at freeze time simply stay unflushed, so they
+                # are absent from the ledger and therefore not held to I1 —
+                # under-checking, which is the safe direction. Their deliveries
+                # land inside the frontier slack and count as pending
+                # provenance rather than orphans.
+                loadgen.send_signal(signal.SIGSTOP)
+                try:
+                    ok, reason = quiescence.wait_for_quiescence(
+                        daemon.metrics_url, sched["quiescence_timeout_secs"]
+                    )
 
-                # Give the recorder a moment to finish its final append.
-                time.sleep(1.0)
-                acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
-                result = acc.check(frontier_slack=frontier_slack)
+                    # Give the recorder a moment to finish its final append.
+                    time.sleep(1.0)
+                    acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
+                    result = acc.check(frontier_slack=frontier_slack)
+                finally:
+                    # Always resume, even if the wait or the check raised —
+                    # leaving the producer stopped would silently turn every
+                    # later episode into a no-load episode.
+                    loadgen.send_signal(signal.SIGCONT)
 
                 # C2: acked/delivered are CUMULATIVE totals, so the floor is
                 # judged against the DELTA since the previous episode — not
@@ -424,9 +485,22 @@ def main():
         # `terminate()`, and an unguarded ProcessLookupError there would skip
         # stack.teardown() — leaking a loop device and a mount — while also
         # masking whatever original exception brought us here.
-        for label, proc in (("loadgen", loadgen), ("recorder", recorder)):
+        # ORDER MATTERS: loadgen, then the daemon, then the recorder.
+        #
+        # Killing the recorder first left weir draining into a dead sink during
+        # its own shutdown — the first real run ended with 32 transport errors,
+        # "sink health: down", and 4 stranded segments, all of it pure teardown
+        # noise that reads exactly like a genuine sink outage. Stopping the
+        # producer first means no new records; stopping the daemon next lets it
+        # drain and seal against a recorder that is still answering; the
+        # recorder goes last.
+        for label, proc in (("loadgen", loadgen),):
             try:
                 if proc and proc.poll() is None:
+                    # SIGCONT first: a process stopped by SIGSTOP will not act
+                    # on SIGTERM until it is resumed, so terminating a frozen
+                    # loadgen would hang until the wait timed out.
+                    proc.send_signal(signal.SIGCONT)
                     proc.terminate()
             except Exception as exc:
                 print(f"cleanup: {label} terminate failed: {exc}", file=sys.stderr)
@@ -435,6 +509,11 @@ def main():
                 daemon.stop()
         except Exception as exc:
             print(f"cleanup: daemon stop failed: {exc}", file=sys.stderr)
+        try:
+            if recorder and recorder.poll() is None:
+                recorder.terminate()
+        except Exception as exc:
+            print(f"cleanup: recorder terminate failed: {exc}", file=sys.stderr)
         try:
             stack.teardown()
         except Exception as exc:

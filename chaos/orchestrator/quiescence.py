@@ -72,11 +72,17 @@ BLOCKED = 'weir_drain_state{state="blocked_dead_letter_full"}'
 #: `weir_sink_health` is a per-state gauge family (healthy/degraded/down);
 #: this is the "down" member specifically.
 SINK_DOWN = 'weir_sink_health{state="down"}'
-#: `weir_wab_segments` is a Counter family (open/sealed/confirmed/
-#: quarantined), so the exposition name carries the `_total` suffix.
-SEALED = 'weir_wab_segments_total{state="sealed"}'
-CONFIRMED = 'weir_wab_segments_total{state="confirmed"}'
-QUARANTINED = 'weir_wab_segments_total{state="quarantined"}'
+#: Bytes currently held by live WAB segments: the open active segment plus
+#: sealed segments awaiting drain. EXCLUDES confirmed/dead-letter/quarantine
+#: (its registered HELP text says so), and confirmed segments are deleted, so
+#: this falls as the drain catches up and goes flat once it has.
+WAB_BYTES = "weir_wab_bytes_on_disk"
+
+#: How often weir recomputes WAB_BYTES — a background task on
+#: `tokio::time::interval(Duration::from_secs(5))` (`main.rs:563-576`). The
+#: stability window MUST exceed this, or "unchanged" means "not yet
+#: recomputed". Guarded at call time below.
+GAUGE_REFRESH_SECS = 5.0
 #: Counters, so both carry the `_total` suffix.
 STRANDED = "weir_drain_segments_stranded_total"
 RESUMED = "weir_drain_segments_resumed_total"
@@ -125,7 +131,7 @@ def scrape(metrics_url):
 
 
 def wait_for_quiescence(
-    metrics_url, timeout_s, scrape_fn=None, poll_interval_s=0.5, stable_polls=3
+    metrics_url, timeout_s, scrape_fn=None, poll_interval_s=2.0, stable_polls=4
 ):
     """Blocks until the drain is quiesced or the timeout expires.
 
@@ -145,6 +151,18 @@ def wait_for_quiescence(
     ok_scrapes = 0
     failed_scrapes = 0
     last_error = ""
+    last_unmet = []
+    last_bytes = None
+
+    # A window shorter than the gauge's refresh period measures STALENESS, not
+    # drain progress — that was this module's first bug. Keyed on scrape_fn
+    # being absent (a real daemon); an injected fake has no 5s gauge to outrun.
+    if scrape_fn is None and poll_interval_s * stable_polls <= GAUGE_REFRESH_SECS:
+        raise ValueError(
+            f"poll_interval_s * stable_polls = {poll_interval_s * stable_polls}s "
+            f"does not exceed the {GAUGE_REFRESH_SECS}s gauge refresh period; a "
+            "shorter window would report a stale reading as a stable one"
+        )
 
     while True:
         remaining = deadline - time.monotonic()
@@ -161,6 +179,7 @@ def wait_for_quiescence(
             # count polls from either side of it as consecutive, when they
             # were never observed back-to-back.
             stable = 0
+            last_bytes = None
             if poll_interval_s:
                 # Never sleep past the deadline — an unconditional sleep
                 # overshoots badly whenever poll_interval_s is large relative
@@ -177,9 +196,7 @@ def wait_for_quiescence(
         # means "never happened" — `0 == 0 + 0` correctly reports "nothing
         # sealed yet, nothing to drain" rather than blocking forever on a
         # daemon that has done nothing yet.
-        sealed = m.get(SEALED, 0.0)
-        confirmed = m.get(CONFIRMED, 0.0)
-        quarantined = m.get(QUARANTINED, 0.0)
+        wab_bytes = m.get(WAB_BYTES)
         stranded = m.get(STRANDED, 0.0)
         resumed = m.get(RESUMED, 0.0)
 
@@ -194,11 +211,32 @@ def wait_for_quiescence(
         draining = m.get(DRAINING, 0.0) == 1.0
         sink_down = m.get(SINK_DOWN, 1.0)
 
-        sealed_resolved = sealed == confirmed + quarantined
+        # Absent means we cannot tell, and the conservative reading blocks.
+        drained = wab_bytes is not None and wab_bytes == last_bytes
+        last_bytes = wab_bytes
         nothing_stranded = stranded == resumed
 
+        # Record WHICH conditions are unmet, not just that some are. A timeout
+        # reading "waiting for drain quiescence" and nothing else sends the
+        # operator to read metrics by hand — the same diagnostic dead end that
+        # made "every scrape failed" indistinguishable from "the drain never
+        # settled" before it was fixed. Only the last poll's state is kept:
+        # that is the state the timeout actually fired on.
+        unmet = []
+        if not drained:
+            unmet.append(f"wab_bytes_on_disk still changing (now {wab_bytes})")
+        if not nothing_stranded:
+            unmet.append(f"stranded({stranded:.0f}) != resumed({resumed:.0f})")
+        if depth != 0.0:
+            unmet.append(f"queue_depth={depth:.0f}")
+        if not draining:
+            unmet.append("drain_state is not 'draining'")
+        if sink_down == 1.0:
+            unmet.append("sink_health is 'down'")
+        last_unmet = unmet
+
         if (
-            sealed_resolved
+            drained
             and nothing_stranded
             and depth == 0.0
             and draining
@@ -223,7 +261,8 @@ def wait_for_quiescence(
             f"({failed_scrapes} attempts, last: {last_error}). This is a harness "
             "or configuration problem, not a weir finding."
         )
+    detail = f"; unmet on the final poll: {', '.join(last_unmet)}" if last_unmet else ""
     return False, (
         f"timeout after {timeout_s}s waiting for drain quiescence "
-        f"({ok_scrapes} successful scrapes, {failed_scrapes} failed)"
+        f"({ok_scrapes} successful scrapes, {failed_scrapes} failed){detail}"
     )

@@ -1,0 +1,47 @@
+# Runs the Phase 1 chaos gate on Linux, for machines that do not have one.
+#
+# Phase 1 needs ONLY a loop device, ext4 and root — no device-mapper at all
+# (dm-flakey / dm-delay arrive in Phases 2-3). That fits in a privileged
+# container, so the gate does not need dedicated hardware.
+#
+# WHAT THIS VENUE IS AND IS NOT GOOD FOR
+#   Good: does the harness work at all — the episode loop, dm_stack
+#   setup/teardown, the quiescence success path, and above all whether it
+#   reports FALSE violations. That is Phase 1's entire exit criterion.
+#
+#   Not good: any number with a unit. Storage is virtualised through the
+#   Docker Desktop VM, so latency and throughput here mean nothing about weir
+#   and must never be published from a container run.
+#
+# Build (from the repo root, so the whole tree is in context):
+#   docker build -f chaos/Dockerfile.gate -t weir-chaos-gate .
+# Run:
+#   docker run --rm --privileged weir-chaos-gate
+FROM rust:1.90-bookworm
+
+# util-linux: losetup.  e2fsprogs: mkfs.ext4.  python3 >= 3.11 for tomllib
+# (bookworm ships 3.11, which is the floor run.py needs).
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends \
+      util-linux e2fsprogs python3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+
+# Release binaries, but with LTO off and codegen-units raised. The workspace
+# profile sets `lto = "fat"` and `codegen-units = 1`, which roughly triples
+# build time — worth it for a benchmark, pointless here because this venue
+# cannot produce a trustworthy timing anyway. The binaries still land in
+# target/release/ where run.py expects them, and behaviour is unchanged.
+ENV CARGO_PROFILE_RELEASE_LTO=false \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_TERM_COLOR=never
+
+RUN cargo build --release -p weir-server
+RUN cd chaos && cargo build --release
+
+# The schedule is passed on the command line so a shorter shakeout schedule can
+# be substituted without rebuilding the image.
+WORKDIR /src/chaos
+CMD ["python3", "orchestrator/run.py", "schedules/smoke.toml"]

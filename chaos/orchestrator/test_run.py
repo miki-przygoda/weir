@@ -18,6 +18,25 @@ class TestSchedule(unittest.TestCase):
         self.assertEqual(s["seed"], 0x5EED)
         self.assertGreater(s["episodes"], 0)
 
+    def test_the_invocation_the_readme_documents_actually_works(self):
+        # The first real container run died here, before doing any work:
+        # load_schedule resolved a relative path against THIS file's directory,
+        # so `cd chaos && python3 orchestrator/run.py schedules/smoke.toml`
+        # looked for orchestrator/schedules/smoke.toml.
+        #
+        # The test above did not catch it because `../schedules/smoke.toml`
+        # from inside orchestrator/ resolves correctly under BOTH rules — it
+        # pinned the bug instead of finding it. This one runs from the working
+        # directory the README tells the operator to use, with the exact path
+        # the README tells them to pass.
+        prev = os.getcwd()
+        os.chdir(run.CHAOS_ROOT)
+        try:
+            s = run.load_schedule("schedules/smoke.toml")
+        finally:
+            os.chdir(prev)
+        self.assertEqual(s["seed"], 0x5EED)
+
     def test_run_id_is_derived_from_the_seed(self):
         # Same seed must give the same run_id, so a replay cannot collide with
         # or be confused for a different run.
