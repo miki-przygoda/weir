@@ -574,10 +574,21 @@ dirty loadgen exit, a killed shutdown drain, an already-dead daemon, a dead
 recorder. Each independently makes "acked but not delivered" a statement about
 the harness rather than about weir.
 
-**Unverified on Linux:** the signal handling is reasoned, not run. The unit test
-proves `SIGTERM` latches the flag without killing the process; it does not prove
-a `SIGSTOP`ped process defers a *caught* signal until `SIGCONT`. It degrades
-safely if wrong (dirty exit → advisory) but silently costs the zero-slack check.
-First real run should show `loadgen.log` ending with `stopped by signal after N
-records pushed; ledger flushed`, and the final record reading
-`loadgen_exit_code: 0, advisory: false`.
+**VERIFIED on Linux (2026-08-01).** The signal reasoning was reasoned, not run;
+it has now been run, and it holds. `loadgen.log` is 71 bytes ending with
+`loadgen: stopped by signal after 164705 records pushed; ledger flushed` — it
+was **0 bytes** before, because the process died before it could print anything.
+So a `SIGSTOP`ped process really does defer a *caught* `SIGTERM` until `SIGCONT`,
+and the `SIGCONT`-before-`SIGTERM` ordering in the teardown is load-bearing
+rather than decorative.
+
+The final record reads `loadgen_exit_code: 0, advisory: False,
+frontier_slack: 0, daemon_clean_stop: True, recorder_alive: True,
+wab_survivor_count: 0, ok: True, i1_missing: 0, i2_leaked: 0` — so the
+zero-slack check genuinely ran rather than silently degrading to advisory, which
+was the failure mode worth worrying about (it would have read as a clean pass).
+
+The same run exercised both weir fixes for the first time: 12 `recovery sealed
+segment` events (4 shards × 3 restarts) now counted by W1, and 0 stranded
+segments with 0 sink errors through a *real* graceful drain under W2's clamped
+backoff — where the pre-fix behaviour stranded 4 segments in 0.4 ms.
