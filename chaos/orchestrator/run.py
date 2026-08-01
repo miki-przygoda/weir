@@ -393,7 +393,9 @@ def main():
                 loadgen.send_signal(signal.SIGSTOP)
                 try:
                     ok, reason = quiescence.wait_for_quiescence(
-                        daemon.metrics_url, sched["quiescence_timeout_secs"]
+                        daemon.metrics_url,
+                        sched["quiescence_timeout_secs"],
+                        wab_dir=daemon.wab_dir,
                     )
 
                     # Give the recorder a moment to finish its final append.

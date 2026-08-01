@@ -1,8 +1,15 @@
 """Tests for drain-quiescence detection.
 
 Parsing is tested against real OpenMetrics text; the wait loop is tested with
-an injected scrape function so no daemon is required.
+an injected scrape function AND an injected residue function so no daemon and
+no real mount is required. `TestWabResidueScanRealFs` is the one exception:
+it exercises `scan_wab_residue` against an actual directory tree built with
+`tempfile`, because the shard-directory / extension / sidecar-naming logic is
+exactly the kind of "did I get the on-disk layout right" question a fake
+can't answer.
 """
+import os
+import tempfile
 import time
 import unittest
 
@@ -37,21 +44,15 @@ class TestParse(unittest.TestCase):
 
 
 def healthy_reading(**overrides):
-    """A fully-quiesced snapshot: every signal in its settled state.
+    """A fully-quiesced metrics snapshot: every signal in its settled state.
 
     Individual tests override just the field(s) they want to exercise, so
-    each test isolates the one condition it is about. WAB_BYTES is fixed at
-    a constant value here; `wait_for_quiescence` judges it by comparing each
-    poll against the PREVIOUS poll's value, so returning this same dict
-    (or a dict with the same WAB_BYTES value) on every call is what makes a
-    scenario read as byte-stable. A test that wants the "still draining"
-    case instead overrides WAB_BYTES to something that changes call to call.
+    each test isolates the one condition it is about.
     """
     base = {
         "weir_queue_depth": 0.0,
         quiescence.DRAINING: 1.0,
         quiescence.SINK_DOWN: 0.0,
-        quiescence.WAB_BYTES: 4096.0,
         quiescence.STRANDED: 2.0,
         quiescence.RESUMED: 2.0,
     }
@@ -59,15 +60,37 @@ def healthy_reading(**overrides):
     return base
 
 
+def healthy_residue(**overrides):
+    """A fully-drained WAB directory: nothing sealed-without-a-sidecar, no
+    buffered records sitting in an open active segment."""
+    base = {"unconfirmed_sealed": 0, "nonempty_active": 0}
+    base.update(overrides)
+    return quiescence.Residue(**base)
+
+
+#: Most tests care about exactly one condition and want everything else to
+#: read as healthy. `wab_dir` is a dummy value here -- the default
+#: `scan_wab_residue` is never reached because every test below injects its
+#: own `residue_fn`, so nothing ever actually touches the filesystem at this
+#: path. It only needs to be non-None to satisfy the constructor guard (see
+#: TestWabDirRequired).
+UNUSED_WAB_DIR = "/unused"
+
+
+def healthy_residue_fn(_wab_dir):
+    return healthy_residue()
+
+
 class TestWait(unittest.TestCase):
     def test_quiesces_when_all_signals_settle(self):
-        # WAB_BYTES stability is a delta against the PREVIOUS poll, so the
-        # very first reading can never itself count as stable -- there is
-        # nothing to compare it to yet. N stable comparisons therefore need
-        # N+1 readings. Here queue_depth is what fails reading 1 (which also
-        # plants the WAB_BYTES baseline of 4096.0); readings 2-4 then match
-        # that baseline and are otherwise fully healthy, giving exactly the
-        # 3 consecutive stable comparisons stable_polls=3 requires.
+        # Every condition here (residue counts, stranded/resumed equality,
+        # queue depth, drain_state, sink_health) is a snapshot property of a
+        # single poll, not a delta against the previous poll -- there is no
+        # baseline to plant, unlike the bytes-gauge approach this module used
+        # to carry. So stable_polls=3 needs exactly 3 GOOD readings, no more.
+        # Reading 1 here is bad (queue_depth=5) to prove a leading failure
+        # doesn't get counted or otherwise confuse the window; readings 2-4
+        # are healthy and are exactly the 3 consecutive stable polls needed.
         readings = [
             {**healthy_reading(), "weir_queue_depth": 5.0},
             healthy_reading(),
@@ -76,16 +99,20 @@ class TestWait(unittest.TestCase):
         ]
         it = iter(readings)
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=10, scrape_fn=lambda _: next(it),
+            "unused", timeout_s=10, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: next(it), residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertTrue(ok, reason)
 
-    def test_stable_polls_requires_one_more_reading_than_the_count(self):
-        # Pins down the N+1 arithmetic directly: with a constant healthy
-        # reading on every call, stable_polls=3 must take exactly 4 scrapes
-        # -- the 1st plants the WAB_BYTES baseline (and can never itself
-        # count as stable), and the following 3 each match it.
+    def test_stable_polls_requires_exactly_that_many_readings(self):
+        # Pins down the arithmetic directly: with a constant healthy reading
+        # on every call, stable_polls=3 must take EXACTLY 3 scrapes -- not 4.
+        # The old bytes-gauge design needed N+1 readings because the first
+        # one only planted a delta baseline and could never itself count as
+        # stable; this design has no baseline (every poll independently
+        # either meets every condition or it doesn't), so N readings quiesce
+        # N stable polls with nothing left over.
         calls = {"n": 0}
 
         def counting(_):
@@ -93,15 +120,36 @@ class TestWait(unittest.TestCase):
             return healthy_reading()
 
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=10, scrape_fn=counting,
+            "unused", timeout_s=10, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=counting, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertTrue(ok, reason)
         self.assertEqual(
-            calls["n"], 4,
-            "3 stable comparisons need 4 readings: the first plants the "
-            "WAB_BYTES baseline and can never itself count as stable",
+            calls["n"], 3,
+            "3 stable polls need exactly 3 readings -- each poll stands "
+            "alone, there is no baseline-planting read to add on top",
         )
+
+    def test_an_iterator_exhausted_one_read_short_of_stable_polls_times_out(self):
+        # A trap that has bitten repeatedly: supply one fewer healthy reading
+        # than stable_polls requires. The next scrape call raises
+        # StopIteration (an exhausted iterator's next()), which the retry
+        # path must swallow like any other scrape failure -- reset
+        # stability, keep polling -- not propagate and crash the run, and
+        # not spuriously count towards stable_polls either. With only 2
+        # readings available and 3 required, this must run out the clock and
+        # report a timeout, not hang and not raise.
+        stable_polls = 3
+        readings = [healthy_reading() for _ in range(stable_polls - 1)]
+        it = iter(readings)
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: next(it), residue_fn=healthy_residue_fn,
+            poll_interval_s=0, stable_polls=stable_polls,
+        )
+        self.assertFalse(ok)
+        self.assertIn("timeout", reason)
 
     def test_reports_stuck_when_drain_is_blocked(self):
         blocked = healthy_reading(**{
@@ -110,7 +158,8 @@ class TestWait(unittest.TestCase):
         })
         start = time.monotonic()
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=10, scrape_fn=lambda _: blocked,
+            "unused", timeout_s=10, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: blocked, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         elapsed = time.monotonic() - start
@@ -125,7 +174,8 @@ class TestWait(unittest.TestCase):
     def test_a_missing_queue_depth_never_counts_as_quiesced(self):
         partial = {k: v for k, v in healthy_reading().items() if k != "weir_queue_depth"}
         ok, _ = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: partial,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: partial, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok, "absent queue_depth must default to non-quiesced")
@@ -133,7 +183,8 @@ class TestWait(unittest.TestCase):
     def test_a_missing_draining_key_prevents_quiescence(self):
         partial = {k: v for k, v in healthy_reading().items() if k != quiescence.DRAINING}
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: partial,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: partial, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok, "absent DRAINING must default to 0.0 (not draining), not quiesced")
@@ -143,28 +194,17 @@ class TestWait(unittest.TestCase):
         # quiesced", so a missing key must default to blocking, not passing.
         partial = {k: v for k, v in healthy_reading().items() if k != quiescence.SINK_DOWN}
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: partial,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: partial, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok, "absent SINK_DOWN must default to 'down', not quiesced")
 
-    def test_a_missing_wab_bytes_never_counts_as_quiesced(self):
-        # WAB_BYTES is the primary signal now. Absent must not be treated as
-        # "stable" -- a false True here is a phantom durability violation
-        # two steps downstream, which is the entire reason this module
-        # exists.
-        partial = {k: v for k, v in healthy_reading().items() if k != quiescence.WAB_BYTES}
-        ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: partial,
-            poll_interval_s=0, stable_polls=3,
-        )
-        self.assertFalse(ok, "absent WAB_BYTES must never read as stable")
-        self.assertIn("wab_bytes_on_disk still changing", reason)
-
     def test_a_down_sink_prevents_quiescence(self):
         down = healthy_reading(**{quiescence.SINK_DOWN: 1.0})
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: down,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: down, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok, "a down sink must block quiescence even if drain_state reads draining")
@@ -176,7 +216,8 @@ class TestWait(unittest.TestCase):
             raise ConnectionRefusedError("connection refused")
 
         ok, reason = quiescence.wait_for_quiescence(
-            "http://127.0.0.1:1/metrics", timeout_s=0.05, scrape_fn=boom,
+            "http://127.0.0.1:1/metrics", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=boom, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok)
@@ -187,9 +228,9 @@ class TestWait(unittest.TestCase):
         # Without a reset, two passing polls separated by a failed scrape
         # would still add up to "consecutive" stability even though the
         # window straddled an observability gap. A scrape that fails every
-        # 3rd call can only ever reach stable=1 (plant the WAB_BYTES
-        # baseline, match it once) before the next failure wipes it out
-        # again -- it must never reach stable_polls=3.
+        # 3rd call can reach stable=2 at most (two healthy polls) before the
+        # next failure wipes it out again -- it must never reach
+        # stable_polls=3.
         calls = {"n": 0}
 
         def periodic_gap(_):
@@ -199,59 +240,19 @@ class TestWait(unittest.TestCase):
             return healthy_reading()
 
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=periodic_gap,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=periodic_gap, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(
             ok, "a failed scrape must reset stability, not be silently skipped"
         )
 
-    def test_a_failed_scrape_resets_the_wab_bytes_baseline(self):
-        # Differential test for the byte-baseline reset specifically (not
-        # just the stable counter). Sequence: success, FAIL, success,
-        # success, then the fake source runs dry and every further call
-        # fails too (a `next()` on an exhausted iterator raises
-        # StopIteration, which the retry path swallows like any other
-        # scrape failure).
-        #
-        # WITHOUT resetting last_bytes on failure, call 1's baseline would
-        # silently survive the call-2 failure, so call 3 would already read
-        # as matching it (drained=True) and call 4 would push stable to 2,
-        # quiescing right there with stable_polls=2.
-        #
-        # WITH the reset (the current, correct behaviour), the call-2
-        # failure wipes the baseline, so call 3 has to re-plant it (drained
-        # stays False) and call 4 only reaches stable=1 -- a second matching
-        # reading is still needed, which this sequence deliberately never
-        # supplies, so it must run out the clock instead.
-        readings = [healthy_reading(), None, healthy_reading(), healthy_reading()]
-        it = iter(readings)
-
-        def flaky(_):
-            r = next(it)
-            if r is None:
-                raise ConnectionResetError("mid-restart hiccup")
-            return r
-
-        ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=flaky,
-            poll_interval_s=0, stable_polls=2,
-        )
-        self.assertFalse(
-            ok, "the WAB_BYTES baseline must not survive a failed scrape"
-        )
-        self.assertIn(
-            "3 successful scrapes", reason,
-            "exactly 3 scrapes should have succeeded (calls 1, 3, 4) before "
-            "quiescence should have been reachable at 2 stable polls, yet it "
-            "wasn't -- proving the reset, not a fluke of timing, is what "
-            "blocked it",
-        )
-
     def test_the_poll_interval_cannot_overshoot_the_timeout(self):
         start = time.monotonic()
         ok, _ = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.2, scrape_fn=lambda _: {"weir_queue_depth": 5.0},
+            "unused", timeout_s=0.2, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: {"weir_queue_depth": 5.0}, residue_fn=healthy_residue_fn,
             poll_interval_s=3.0, stable_polls=3,
         )
         elapsed = time.monotonic() - start
@@ -259,51 +260,6 @@ class TestWait(unittest.TestCase):
         self.assertLess(
             elapsed, 1.0,
             f"a 3s poll interval must not overshoot a 0.2s timeout; took {elapsed:.2f}s",
-        )
-
-
-class TestWabBytesStability(unittest.TestCase):
-    """`weir_wab_bytes_on_disk` is the primary quiescence signal again (3rd
-    iteration): it's a gauge of CURRENT state (open active segment + sealed
-    segments awaiting drain, excluding confirmed, which are deleted), so
-    unlike a restart-reset counter it stays valid across weir's per-episode
-    restarts. `run.py` SIGSTOPs the load generator before waiting, so the
-    active segment stops growing and the gauge is expected to hold steady
-    once the drain has actually caught up."""
-
-    def test_a_changing_wab_bytes_gauge_never_quiesces_even_with_a_generous_budget(self):
-        # The drain is still actively moving segments: bytes-on-disk changes
-        # on every poll. Every OTHER condition is healthy throughout, so
-        # only the bytes-stability check can be what's blocking this -- and
-        # it must, even given a budget many times the poll interval.
-        counter = {"n": 0}
-
-        def still_draining(_):
-            counter["n"] += 1
-            return healthy_reading(**{quiescence.WAB_BYTES: float(10_000 - counter["n"])})
-
-        ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.3, scrape_fn=still_draining,
-            poll_interval_s=0.01, stable_polls=3,
-        )
-        self.assertFalse(ok, "a changing WAB_BYTES gauge must never quiesce")
-        self.assertIn("timeout", reason)
-
-    def test_a_stable_wab_bytes_gauge_quiesces_promptly(self):
-        # Same shape of scenario, but the load generator has been SIGSTOPped
-        # (as run.py does before waiting), so the active segment stops
-        # growing and the gauge holds steady. All other conditions healthy
-        # -> must quiesce well inside a realistic timeout, and quickly, not
-        # near the deadline.
-        start = time.monotonic()
-        ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=30.0, scrape_fn=lambda _: healthy_reading(),
-            poll_interval_s=0.01, stable_polls=3,
-        )
-        elapsed = time.monotonic() - start
-        self.assertTrue(ok, reason)
-        self.assertLess(
-            elapsed, 5.0, f"a stable gauge must quiesce promptly, took {elapsed:.2f}s"
         )
 
 
@@ -323,7 +279,8 @@ class TestStrandedResumed(unittest.TestCase):
         # catches it: 5 != 0, so this must never quiesce.
         stuck = healthy_reading(**{quiescence.STRANDED: 5.0, quiescence.RESUMED: 0.0})
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: stuck,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: stuck, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok, "a stranded segment that never resumes must never quiesce")
@@ -339,7 +296,8 @@ class TestStrandedResumed(unittest.TestCase):
             })
 
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=growing_stranded,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=growing_stranded, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok, "segments still being abandoned to the sink outage must block quiescence")
@@ -349,7 +307,8 @@ class TestStrandedResumed(unittest.TestCase):
         # equality holds and this condition no longer blocks quiescence.
         caught_up = healthy_reading(**{quiescence.STRANDED: 4.0, quiescence.RESUMED: 4.0})
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=10, scrape_fn=lambda _: caught_up,
+            "unused", timeout_s=10, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: caught_up, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertTrue(ok, reason)
@@ -359,23 +318,24 @@ class TestCounterDefaults(unittest.TestCase):
     """Missing-key defaults differ by metric TYPE: counters (stranded/
     resumed) default to 0.0 because prometheus-client only emits a Family
     member once it has been incremented -- absent genuinely means zero.
-    Gauges (queue_depth, draining, sink_down, and WAB_BYTES) keep the
-    conservative blocking defaults instead (covered in TestWait above)."""
+    Gauges (queue_depth, draining, sink_down) keep the conservative blocking
+    defaults instead (covered in TestWait above)."""
 
     def test_absent_stranded_and_resumed_default_to_zero_and_can_quiesce_trivially(self):
         # A freshly-started daemon that has stranded nothing yet: both
         # weir_drain_segments_stranded_total and _resumed_total are absent
         # because nothing has incremented them. 0 == 0 correctly reads as
-        # "nothing stranded", not "cannot tell".
+        # "nothing stranded", not "cannot tell". Paired with a clean (empty)
+        # WAB directory, this must quiesce.
         fresh = {
             "weir_queue_depth": 0.0,
             quiescence.DRAINING: 1.0,
             quiescence.SINK_DOWN: 0.0,
-            quiescence.WAB_BYTES: 0.0,
             # STRANDED / RESUMED both absent.
         }
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=10, scrape_fn=lambda _: fresh,
+            "unused", timeout_s=10, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: fresh, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertTrue(ok, reason)
@@ -383,11 +343,12 @@ class TestCounterDefaults(unittest.TestCase):
     def test_gauges_absent_still_blocks_even_though_counters_default_to_zero(self):
         # An entirely empty scrape must not quiesce: STRANDED/RESUMED
         # defaulting to 0 make that one condition trivially true, but the
-        # GAUGES (queue_depth, draining, sink_down, wab_bytes) still default
-        # to their conservative blocking values, so quiescence must not
-        # follow.
+        # GAUGES (queue_depth, draining, sink_down) still default to their
+        # conservative blocking values, so quiescence must not follow --
+        # even though the WAB directory itself is clean.
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: {},
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: {}, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok, "an empty scrape must never read as quiesced")
@@ -403,7 +364,8 @@ class TestTimeoutDiagnostics(unittest.TestCase):
     def test_timeout_reason_reports_the_stranded_resumed_gap_with_values(self):
         gap = healthy_reading(**{quiescence.STRANDED: 3.0, quiescence.RESUMED: 1.0})
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: gap,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: gap, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok)
@@ -412,61 +374,267 @@ class TestTimeoutDiagnostics(unittest.TestCase):
     def test_timeout_reason_reports_the_queue_depth_value(self):
         backed_up = healthy_reading(**{"weir_queue_depth": 5.0})
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=lambda _: backed_up,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: backed_up, residue_fn=healthy_residue_fn,
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok)
         self.assertIn("queue_depth=5", reason)
 
-    def test_timeout_reason_reports_wab_bytes_still_changing(self):
-        counter = {"n": 0}
-
-        def still_draining(_):
-            counter["n"] += 1
-            return healthy_reading(**{quiescence.WAB_BYTES: float(counter["n"])})
-
+    def test_timeout_reason_reports_unconfirmed_sealed_count(self):
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=0.05, scrape_fn=still_draining,
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(),
+            residue_fn=lambda _: healthy_residue(unconfirmed_sealed=2),
             poll_interval_s=0, stable_polls=3,
         )
         self.assertFalse(ok)
-        self.assertIn("wab_bytes_on_disk still changing", reason)
+        self.assertIn("unconfirmed_sealed=2", reason)
+
+    def test_timeout_reason_reports_nonempty_active_segment_count(self):
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(),
+            residue_fn=lambda _: healthy_residue(nonempty_active=1),
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok)
+        self.assertIn("nonempty_active_segments=1", reason)
 
 
-class TestGaugeRefreshGuard(unittest.TestCase):
-    """`poll_interval_s * stable_polls` must exceed GAUGE_REFRESH_SECS
-    (5.0s) when talking to a real daemon (scrape_fn=None), or an unchanged
-    WAB_BYTES reading could mean "not yet recomputed" rather than "drain
-    caught up" -- the module's very first bug, reintroduced. Every other
-    test in this file injects a fake scrape_fn, so the guard must NOT apply
-    to them; only scrape_fn=None triggers it."""
+class TestWabDirRequired(unittest.TestCase):
+    """The module used to carry a runtime guard (poll_interval_s * stable_polls
+    must exceed the bytes-gauge's 5s refresh period) that turned out to be
+    dead code: it reassigned `scrape_fn = scrape_fn or scrape` BEFORE
+    checking `if scrape_fn is None`, so the check could never see None and
+    never fired. That guard and the gauge it protected are both gone now, but
+    the same reassign-then-check mistake would be just as fatal here, so this
+    pins down that the wab_dir/residue_fn guard actually fires -- unlike its
+    predecessor."""
 
-    def test_guard_raises_for_a_real_scrape_with_too_short_a_window(self):
-        # 1.0 * 3 = 3.0s, which does not exceed the 5.0s gauge refresh.
-        # scrape_fn=None means "use the real HTTP scrape function", so this
-        # must raise before ever attempting a network call (no daemon is
-        # running at "unused").
-        # timeout_s is deliberately small: if the guard is doing its job it
-        # raises before the polling loop ever starts, so the timeout value
-        # is irrelevant to a passing run -- it only bounds how long this
-        # test takes if the guard fails to fire and execution falls through
-        # into a real (doomed to fail, "unused" is not a URL) scrape loop.
+    def test_omitting_both_wab_dir_and_residue_fn_raises_immediately(self):
+        # Not `assertFalse(ok)` -- this must not even reach the polling
+        # loop. Silently falling back to `os.scandir`'s default (the
+        # orchestrator's current working directory, NOT the WAB mount) would
+        # be a wrong-but-plausible-looking answer; failing loud is safer.
         with self.assertRaises(ValueError):
             quiescence.wait_for_quiescence(
-                "unused", timeout_s=0.05, scrape_fn=None,
-                poll_interval_s=1.0, stable_polls=3,
+                "unused", timeout_s=0.05, scrape_fn=lambda _: healthy_reading(),
+                poll_interval_s=0, stable_polls=3,
             )
 
-    def test_guard_does_not_raise_for_an_injected_scrape_with_an_equally_short_window(self):
-        # 0.01 * 3 = 0.03s -- shorter still than the real-scrape case above
-        # -- but with an injected scrape_fn there is no real 5s-refreshed
-        # gauge to outrun, so the guard must not fire, and this should
-        # simply quiesce normally.
+    def test_supplying_only_residue_fn_does_not_raise(self):
         ok, reason = quiescence.wait_for_quiescence(
-            "unused", timeout_s=1.0, scrape_fn=lambda _: healthy_reading(),
-            poll_interval_s=0.01, stable_polls=3,
+            "unused", timeout_s=10, scrape_fn=lambda _: healthy_reading(),
+            residue_fn=healthy_residue_fn, poll_interval_s=0, stable_polls=2,
         )
         self.assertTrue(ok, reason)
+
+    def test_supplying_only_wab_dir_uses_the_real_scanner(self):
+        # No residue_fn injected: this exercises the real `scan_wab_residue`
+        # against an actual empty temp directory (no shard dirs at all yet,
+        # e.g. a daemon that hasn't created any) -- an empty directory has
+        # nothing sealed and nothing buffered, so it reads as clean.
+        with tempfile.TemporaryDirectory() as tmp:
+            ok, reason = quiescence.wait_for_quiescence(
+                tmp, timeout_s=10, wab_dir=tmp,
+                scrape_fn=lambda _: healthy_reading(),
+                poll_interval_s=0, stable_polls=2,
+            )
+            self.assertTrue(ok, reason)
+
+
+class TestResidueBlocksQuiescence(unittest.TestCase):
+    """The two on-disk conditions from `scan_wab_residue`, exercised through
+    the wait loop via an injected `residue_fn` (no real mount needed). Every
+    metric condition is healthy throughout each of these, so only the
+    residue condition under test can be what's blocking -- and it must,
+    even given a budget many times the poll interval."""
+
+    def test_outstanding_sealed_without_confirmed_never_quiesces(self):
+        counter = {"n": 0}
+
+        def stuck_residue(_):
+            counter["n"] += 1
+            return healthy_residue(unconfirmed_sealed=1)
+
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.3, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(), residue_fn=stuck_residue,
+            poll_interval_s=0.01, stable_polls=3,
+        )
+        self.assertFalse(
+            ok, "a sealed segment with no .confirmed sidecar must never quiesce"
+        )
+        self.assertIn("timeout", reason)
+        self.assertGreater(
+            counter["n"], 3, "must have kept polling across the generous budget"
+        )
+
+    def test_nonempty_active_segment_never_quiesces(self):
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.3, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(),
+            residue_fn=lambda _: healthy_residue(nonempty_active=1),
+            poll_interval_s=0.01, stable_polls=3,
+        )
+        self.assertFalse(
+            ok, "a non-empty active segment (buffered, undelivered records) must never quiesce"
+        )
+        self.assertIn("timeout", reason)
+
+    def test_clean_residue_and_healthy_metrics_quiesces_promptly(self):
+        start = time.monotonic()
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=30.0, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(), residue_fn=healthy_residue_fn,
+            poll_interval_s=0.01, stable_polls=3,
+        )
+        elapsed = time.monotonic() - start
+        self.assertTrue(ok, reason)
+        self.assertLess(
+            elapsed, 5.0, f"a clean WAB dir must quiesce promptly, took {elapsed:.2f}s"
+        )
+
+
+class TestResidueScanFailure(unittest.TestCase):
+    """A filesystem scan can fail for the same mundane reasons a metrics
+    scrape can (a transient dirent error mid-write, a directory disappearing
+    mid-scan on an unmounting device) and must be handled exactly the same
+    way: reset stability, keep polling, and never propagate out of
+    `wait_for_quiescence` and crash the run."""
+
+    def test_a_raising_residue_scan_is_handled_not_propagated(self):
+        def boom(_):
+            raise OSError("simulated transient dirent error")
+
+        # Must not raise -- this call itself is the assertion.
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(), residue_fn=boom,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok)
+        self.assertIn("harness", reason, "every poll failed -- a harness problem, not a stuck drain")
+        self.assertIn("OSError", reason)
+
+    def test_a_residue_scan_failure_is_distinguishable_from_a_scrape_failure(self):
+        # Both are "failed polls" for stability-counting purposes, but the
+        # reason string must say WHICH stage failed -- otherwise a flaky
+        # metrics endpoint and a flaky filesystem look identical in the log,
+        # and an operator debugging one wastes time on the other.
+        def boom(_):
+            raise OSError("simulated transient dirent error")
+
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(), residue_fn=boom,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(ok)
+        self.assertIn("residue scan", reason)
+
+    def test_a_residue_scan_failure_resets_the_stability_counter(self):
+        # Mirrors test_a_failed_scrape_resets_the_stability_counter: a
+        # residue scan that fails every 3rd call can reach stable=2 at most
+        # before the next failure wipes it out -- it must never reach
+        # stable_polls=3.
+        calls = {"n": 0}
+
+        def periodic_gap(_):
+            calls["n"] += 1
+            if calls["n"] % 3 == 0:
+                raise OSError("simulated transient dirent error")
+            return healthy_residue()
+
+        ok, reason = quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.05, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: healthy_reading(), residue_fn=periodic_gap,
+            poll_interval_s=0, stable_polls=3,
+        )
+        self.assertFalse(
+            ok, "a failed residue scan must reset stability, not be silently skipped"
+        )
+
+
+class TestWabResidueScanRealFs(unittest.TestCase):
+    """`scan_wab_residue` against a real directory tree built with
+    `tempfile` -- the shard-directory naming, extension matching, and
+    sidecar-naming logic is exactly the kind of "did I get the on-disk
+    layout right" question an injected fake can't answer. Mirrors the exact
+    naming weir itself uses: `crates/weir-wab/src/format.rs` for the
+    extensions and `confirmed_path_for`'s suffix-swap, and
+    `crates/weir-server/src/wab/mod.rs::shard_dir_path` for `shard_{id:02}`.
+    """
+
+    def _write(self, path, size):
+        with open(path, "wb") as f:
+            f.write(b"\0" * size)
+
+    def test_scan_counts_correctly_across_a_realistic_tree(self):
+        with tempfile.TemporaryDirectory() as wab_dir:
+            shard0 = os.path.join(wab_dir, "shard_00")
+            shard1 = os.path.join(wab_dir, "shard_01")
+            os.makedirs(shard0)
+            os.makedirs(shard1)
+
+            header_only = quiescence.SEGMENT_HEADER_LEN
+
+            # shard_00: one sealed segment WITH a confirmed sidecar (drained,
+            # not yet garbage-collected) -- must NOT count.
+            self._write(os.path.join(shard0, "seg_00000001.wab.sealed"), header_only + 5)
+            self._write(os.path.join(shard0, "seg_00000001.wab.confirmed"), 36)
+
+            # shard_00: one sealed segment with NO sidecar -- genuine
+            # backlog, MUST count as unconfirmed_sealed.
+            self._write(os.path.join(shard0, "seg_00000002.wab.sealed"), header_only + 5)
+
+            # shard_00: an active segment holding just the header, zero
+            # records written yet -- must NOT count as non-empty.
+            self._write(os.path.join(shard0, "seg_00000003.wab"), header_only)
+
+            # shard_01: an active segment with at least one buffered record
+            # (larger than the bare header) -- MUST count as nonempty_active.
+            self._write(os.path.join(shard1, "seg_00000001.wab"), header_only + 12)
+
+            # shard_01: a second sealed-without-sidecar segment, to prove
+            # counts accumulate across shard directories, not just within one.
+            self._write(os.path.join(shard1, "seg_00000002.wab.sealed"), header_only + 5)
+
+            # Reserved subdirectories: a sealed-without-sidecar file and a
+            # non-empty active-looking file in EACH, which would inflate both
+            # counts if the scan didn't skip them entirely.
+            quarantine = os.path.join(wab_dir, "quarantine")
+            dead_letter = os.path.join(wab_dir, "dead_letter")
+            os.makedirs(quarantine)
+            os.makedirs(dead_letter)
+            self._write(os.path.join(quarantine, "seg_00000099.wab.sealed"), header_only + 5)
+            self._write(os.path.join(dead_letter, "seg_00000099.wab"), header_only + 5)
+
+            residue = quiescence.scan_wab_residue(wab_dir)
+
+            self.assertEqual(
+                residue.unconfirmed_sealed, 2,
+                "the confirmed segment and both reserved-subdir segments "
+                "must be excluded; only the two genuinely undrained ones count",
+            )
+            self.assertEqual(
+                residue.nonempty_active, 1,
+                "only the shard_01 active segment has records past the bare "
+                "header; the shard_00 one and the dead_letter one must be excluded",
+            )
+
+    def test_a_completely_empty_wab_dir_scans_clean(self):
+        with tempfile.TemporaryDirectory() as wab_dir:
+            residue = quiescence.scan_wab_residue(wab_dir)
+            self.assertEqual(residue.unconfirmed_sealed, 0)
+            self.assertEqual(residue.nonempty_active, 0)
+
+    def test_a_missing_wab_dir_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "does-not-exist")
+            with self.assertRaises(OSError):
+                quiescence.scan_wab_residue(missing)
 
 
 class TestParse2(unittest.TestCase):
