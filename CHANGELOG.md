@@ -13,6 +13,35 @@ protocol** below.
 
 ---
 
+## [Unreleased]
+
+Defects found by the chaos fault-injection harness (`chaos/`) on its first live
+run — 20 episodes, 20 `kill -9`s, 86 replayed segments. No data-loss defects;
+both are observability / behaviour-under-shutdown fixes.
+
+### Fixed
+
+- **`weir_wab_segments_total{state="sealed"}` now counts crash-recovery seals.**
+  Recovery finalises an unsealed `.wab` (sentinel + footer + fsync), renames it
+  to `.wab.sealed` and hands it to the drain — a real `open → sealed` transition
+  — but never incremented the counter, while the drain's confirm always
+  incremented `state="confirmed"`. The family was therefore **non-conserving
+  across a restart**: `confirmed` ran permanently ahead of `sealed` by one
+  segment per shard for the whole life of the process, so the obvious backlog
+  alert ("`sealed − confirmed` is growing ⇒ the drain is falling behind") gave a
+  permanently wrong answer after the first crash. The increment sits after the
+  rename + parent fsync, so only a segment that really became a `.wab.sealed` is
+  counted: a quarantined segment (bad header, failed quarantine copy) is not,
+  and a mid-file-corrupt segment counts **both** `quarantined` (the preserved
+  forensic copy) and `sealed` (the truncated valid prefix, which is still
+  delivered). Segments sealed by an *earlier* process and merely replayed at
+  startup are still **not** counted — a replay is not a transition — so the
+  family remains per-process; `docs/monitoring.md` now states that caveat
+  explicitly and points at `weir_wab_bytes_on_disk` / `weir-ctl segments` for
+  the live backlog.
+
+---
+
 ## [1.3.1] - 2026-06-23
 
 Test/CI-robustness patch. **No functional change to any published crate** — the

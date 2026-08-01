@@ -496,6 +496,38 @@ pub(crate) fn recover_segment(
     // recovered seal as durable as a live one (F14).
     super::segment::fsync_parent_dir(&sealed)?;
 
+    // Count the open → sealed transition, exactly as the three live seal sites do
+    // (rotation, idle-seal, shutdown-seal in wab/mod.rs). A recovery seal IS a
+    // real transition — this process wrote the sentinel + footer and published the
+    // .wab.sealed dirent — and the drain will later count the matching
+    // `confirmed`. Omitting it left `weir_wab_segments` non-conserving after every
+    // restart: `confirmed` ran permanently ahead of `sealed` by one segment per
+    // shard, so "sealed − confirmed is growing ⇒ the drain is behind" read wrong
+    // for the whole life of the process (W1, found by the chaos harness over 20
+    // kill -9 episodes).
+    //
+    // Placement: AFTER the rename+fsync, so only a segment that actually became a
+    // .wab.sealed is counted. The earlier returns (header quarantine, failed
+    // quarantine copy) produce no sealed file and so are correctly uncounted; the
+    // mid-file-corruption path falls through to here and is counted BOTH
+    // `quarantined` (the preserved forensic copy) and `sealed` (the truncated
+    // prefix, which the drain will confirm) — both transitions really happened.
+    //
+    // Not double-counted anywhere: `replay_unconfirmed` only *queues* pre-existing
+    // .wab.sealed files, which were counted by whichever process sealed them; a
+    // replay is not a transition, so it must not bump this counter. Idempotency:
+    // recovery runs once per process (wab::spawn) and only ever sees unsealed
+    // .wab files, so within a process each seal is counted exactly once. If a
+    // crash between the rename and the parent fsync lost the dirent, the next
+    // process re-seals and re-counts — but that is a different process with a
+    // freshly-zeroed counter, so the per-process totals stay consistent.
+    metrics
+        .wab_segments
+        .get_or_create(&SegmentStateLabel {
+            state: SegmentState::sealed,
+        })
+        .inc();
+
     info!(
         sealed = %sealed.display(),
         records = record_count,
@@ -686,6 +718,16 @@ mod tests {
         path
     }
 
+    /// Current `weir_wab_segments{state="sealed"}` value.
+    fn sealed_count(metrics: &Metrics) -> u64 {
+        metrics
+            .wab_segments
+            .get_or_create(&SegmentStateLabel {
+                state: SegmentState::sealed,
+            })
+            .get()
+    }
+
     #[test]
     fn recovery_seals_a_clean_segment() {
         let dir = tmp_dir("clean");
@@ -694,6 +736,134 @@ mod tests {
         assert!(sealed.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
         assert!(!path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── W1: the recovery seal is a counted open → sealed transition ───────────
+
+    /// W1. Recovery renames an unsealed `.wab` to `.wab.sealed` and hands it to
+    /// the drain, which later bumps `weir_wab_segments{state="confirmed"}`. If the
+    /// seal itself isn't counted, `confirmed` runs permanently ahead of `sealed`
+    /// after every restart (one segment per shard) and the counter family stops
+    /// conserving — the chaos harness measured exactly that over 20 `kill -9`
+    /// episodes.
+    #[test]
+    fn recovery_seal_counts_the_sealed_transition() {
+        let dir = tmp_dir("seal_counter");
+        let path = make_segment(&dir, 0, &[b"alpha", b"beta"]);
+        let metrics = noop_metrics();
+        assert_eq!(sealed_count(&metrics), 0, "counter starts at zero");
+
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert!(sealed.exists());
+        assert_eq!(
+            sealed_count(&metrics),
+            1,
+            "recovery sealing a segment must bump weir_wab_segments{{state=\"sealed\"}} — \
+             the drain will bump the matching confirmed"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// W1. A segment that never becomes a `.wab.sealed` must not be counted as
+    /// sealed. The header-quarantine branches return before the rename, so the
+    /// increment's placement after the rename+fsync is what makes this hold.
+    #[test]
+    fn quarantined_segment_counts_no_sealed_transition() {
+        let dir = tmp_dir("seal_counter_quarantine");
+        let path = crate::wab::segment::segment_path(&dir, 1);
+        // Fewer than SEGMENT_HEADER_LEN bytes — quarantined, never sealed.
+        fs::write(&path, b"WEI").unwrap();
+
+        let metrics = noop_metrics();
+        assert!(recover_segment(&path, &dir, &metrics).is_err());
+
+        assert_eq!(
+            sealed_count(&metrics),
+            0,
+            "a quarantined segment produced no .wab.sealed and must not be counted as sealed"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// W1. Mid-file corruption preserves a forensic COPY in quarantine and still
+    /// seals the valid prefix for delivery. Both transitions really happen, so
+    /// both are counted — otherwise the drain's `confirmed` for the sealed prefix
+    /// would again have no matching `sealed`.
+    #[test]
+    fn mid_file_corruption_counts_both_sealed_and_quarantined() {
+        let dir = tmp_dir("seal_counter_midfile");
+        let path = make_segment(&dir, 0, &[b"recordA", b"recordB"]);
+        // Flip a byte inside record B's payload (offset 24 + 15 + 8 = 47) so its
+        // CRC fails with its length + CRC fields intact — the mid-file branch.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[47] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert!(sealed.exists());
+        assert_eq!(
+            sealed_count(&metrics),
+            1,
+            "the truncated-but-sealed prefix is a real open → sealed transition"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "the preserved forensic copy is still counted as quarantined"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// W1. A `.wab.sealed` left by a previous process was already counted as
+    /// sealed by whichever process sealed it. Startup must NOT re-count it: the
+    /// replay path (`wab::replay_unconfirmed`) only *queues* it for the drain, and
+    /// `recover_open_segments` only touches unsealed `.wab` files. Exactly one
+    /// sealed transition is counted here — for the active segment recovery
+    /// actually seals.
+    #[test]
+    fn already_sealed_segments_are_not_recounted_on_startup() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("seal_counter_replay");
+        let shard_dir = dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // seg 1: sealed by the "previous process" — already counted there.
+        let mut seg = WabSegment::create(&segment_path(&shard_dir, 1), 0).unwrap();
+        seg.write_record(b"old").unwrap();
+        let pre_sealed = seg.seal().unwrap();
+        // seg 2: still active at crash time — recovery seals this one.
+        let active = segment_path(&shard_dir, 2);
+        let mut seg = WabSegment::create(&active, 0).unwrap();
+        seg.write_record(b"new").unwrap();
+        drop(seg);
+
+        let metrics = noop_metrics();
+        recover_open_segments(&dir, &metrics).unwrap();
+
+        assert!(
+            pre_sealed.exists(),
+            "the pre-sealed segment is left untouched"
+        );
+        assert!(
+            sealed_path_for(&active).exists(),
+            "the active one was sealed"
+        );
+        assert_eq!(
+            sealed_count(&metrics),
+            1,
+            "only the segment recovery actually sealed is counted; a segment sealed by an \
+             earlier process must not be re-counted when it is replayed"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

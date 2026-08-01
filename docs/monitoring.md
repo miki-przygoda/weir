@@ -275,7 +275,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_wab_fsync_failures_total` | counter | fsync returned an error. **Must be 0.** |
 | `weir_wab_flusher_panics_total` | counter | Flusher thread panics. **Must be 0.** |
 | `weir_drain_panics_total` | counter | weir-drain thread panics caught and respawned by its supervisor. **Must be 0**; sustained values indicate a sink/drain logic bug, and exhausting the respawn budget stops delivery. |
-| `weir_wab_segments_total{state}` | counter | Lifecycle: `open` → `sealed` → `confirmed`; `quarantined` on corruption. |
+| `weir_wab_segments_total{state}` | counter | Segment lifecycle transitions: `open` → `sealed` → `confirmed`; `quarantined` on corruption. A segment is counted `sealed` whichever way it was sealed — rotation, idle-seal, shutdown-seal, **or crash recovery** (recovery finalises an unsealed `.wab` and renames it, which is a real transition and is counted). A mid-file-corrupt segment counts **both** `quarantined` (the preserved forensic copy) and `sealed` (the truncated valid prefix, which is still delivered). **Backlog caveat across a restart** — see the note below. |
 | `weir_wab_bytes_on_disk` | gauge | Bytes used by **live** WAB shard segments: the open active segment (`.wab`) **plus** sealed segments awaiting drain (`.wab.sealed`). It scans on a 5 s cadence, so it trails real-time by up to that interval. It is **not** a total-disk-usage gauge: it excludes drained-marker files (`.wab.confirmed`) and the `dead_letter/` (own gauge: `weir_dead_letter_bytes_on_disk`) and `quarantine/` subdirs, and it doesn't measure the filesystem's free space — for the "disk filling up" signal use a node/host filesystem alert on the partition holding `wab_dir` (see *Capacity*). |
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
 | `weir_recovery_records_replayed_total` | counter | Records replayed from sealed-but-unconfirmed segments on startup. |
@@ -283,6 +283,19 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_recovery_quarantine_copy_failed_total` | counter | Mid-file-corrupt segments whose quarantine copy failed (disk full / read-only / inode exhaustion); recovery left the segment un-truncated to preserve acked-durable tail records and will retry. **Non-zero means recovery is stuck on that segment — clear the disk/read-only state and restart.** |
 | `weir_ack_timeout_total` | counter | Acks that never fired within the timeout (wedged flusher). |
 | `weir_stage_{queue,bridge_wait,write,total}_seconds` | histogram | Per-stage latency decomposition (`bench-trace` builds only — diagnostic). |
+
+> **Using `weir_wab_segments_total` for drain backlog.** Within a single process
+> run the family conserves: every segment counted `sealed` is later counted
+> `confirmed` (or `quarantined`), so a growing `sealed − confirmed` really does
+> mean the drain is falling behind. **It does not survive a restart.** Like every
+> other counter here it is a per-process in-memory atomic, and segments that were
+> sealed by the *previous* process and replayed on startup are counted
+> `confirmed` by this one with no matching `sealed` — a replay is not a
+> transition, so it is deliberately not re-counted (`weir_recovery_records_replayed_total`
+> is the signal for that backlog). So after a restart the raw difference can go
+> negative and stay negative. For the live backlog use
+> `weir_wab_bytes_on_disk`, or list the files with `weir-ctl segments`; use
+> `rate(...)`/`increase(...)` over a window for the trend.
 
 ### Drain / sink
 | Metric | Type | Meaning |
