@@ -499,3 +499,85 @@ conditions stay as necessary-but-not-sufficient companions.
   `Disconnected` breaks the wait, so the 100/200/400 ms ladder collapses to
   zero. All four segments burned all four attempts in 0.4 ms. A merely-slow sink
   gets no retry at shutdown.
+
+---
+
+# Resolution (2026-08-01)
+
+## weir defects — both fixed
+
+**W1 — `weir_wab_segments{state="sealed"}` missed the crash-recovery seal**
+(`83e1c58`). Recovery finalises an unsealed `.wab`, renames it to
+`.wab.sealed` and hands it to the drain — a real `open → sealed` transition —
+without counting it, while the drain's confirm always counted `confirmed`. The
+obvious backlog alert (`sealed − confirmed` growing ⇒ the drain is behind) gave
+a permanently wrong answer after the first crash.
+
+The increment sits after the rename + parent fsync, so only a segment that
+really became a `.wab.sealed` counts. A quarantined segment does not; a
+mid-file-corrupt segment counts **both** `quarantined` (the preserved forensic
+copy) and `sealed` (the truncated valid prefix, which is still delivered).
+
+**Residual limit, stated in `docs/monitoring.md` rather than papered over:**
+segments sealed by an *earlier* process and merely replayed at startup are still
+not counted — a replay is not a transition — so the family is *less*
+non-conserving, not fully conserving. Counting replays was considered and
+rejected; `open` has the same asymmetry.
+
+**W2 — shutdown zeroed the retry backoff** (`d522ce2`). On `Disconnected` the
+whole ladder collapsed, including the final `retries_left == 0` pass:
+independently reproduced at **3.2 ms for an entire episode with a 5 s base
+delay**. The "prompt shutdown" defence does not survive contact with the code —
+on disconnect the retry still *runs*, bounded by `commit_timeout` (30 s), so
+shutdown already tolerates `max_retries × 30 s`. Dropping a ~700 ms ladder to
+protect shutdown latency while keeping 90 s of commit timeouts is not coherent.
+
+Now clamped to **250 ms per retry, from a 1 s per-process budget**. The
+aggregate budget is not belt-and-braces: stranding marks the sink down, so the
+next health poll sees a down→up edge and re-queues the segment (the 4a
+auto-resume). With a per-retry clamp alone, a sink that is HEAD-healthy but
+POST-failing keeps that cycle alive and **shutdown never finishes**. The
+existing suite caught this.
+
+Behaviour change worth knowing: a segment stranded during shutdown may now be
+auto-resumed and delivered before exit rather than deferred to the next start.
+
+## W3 — found, NOT fixed: a process-global umask race
+
+`socket::bind_hardened` sets the **process-global** umask to `0o177` while
+binding (the deliberate TOCTOU fix — it makes `bind(2)` create the socket inode
+at `0o600` with no post-bind `chmod`). It is correct for the daemon, which binds
+once at startup. But it is a process-global mutation, so **any thread creating a
+directory during that window gets `0o600` — no execute bit.**
+
+Concretely: `cargo test -p weir-server` **cannot run in parallel** — 63 failures
+with `PermissionDenied` creating shard dirs, and leftover `drw-------`
+directories confirm the cause. `--test-threads=1` is required, which the
+CONTRIBUTING gate already does for other reasons, so this has been masked.
+
+Not fixed here: it is pre-existing, out of scope for a chaos-harness branch, and
+the fix is a design decision (scope the umask, or create the socket in a private
+directory and move it). Worth its own issue — and worth noting that a library
+consumer embedding this code would inherit the same surprise.
+
+## Harness defects — the five open ones closed
+
+`77d4dd3` loadgen keeps its ledger tail (`SIGTERM`/`SIGINT` handler → stop flag
+→ the existing final flush runs; no new dependency), and `run.py` reads its exit
+status. `7b0f426` adds the final verification pass and the WAB post-mortem, both
+before teardown deletes the filesystem. `e23f7bb` makes the report surface them.
+
+The final check runs at `frontier_slack=0` — legitimate *only there*, because the
+producer is stopped and both logs are complete. Four conditions downgrade it to
+**advisory** (normal slack, failure counted as an anomaly not a violation): a
+dirty loadgen exit, a killed shutdown drain, an already-dead daemon, a dead
+recorder. Each independently makes "acked but not delivered" a statement about
+the harness rather than about weir.
+
+**Unverified on Linux:** the signal handling is reasoned, not run. The unit test
+proves `SIGTERM` latches the flag without killing the process; it does not prove
+a `SIGSTOP`ped process defers a *caught* signal until `SIGCONT`. It degrades
+safely if wrong (dirty exit → advisory) but silently costs the zero-slack check.
+First real run should show `loadgen.log` ending with `stopped by signal after N
+records pushed; ledger flushed`, and the final record reading
+`loadgen_exit_code: 0, advisory: false`.
