@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 import quiescence
+import report
 import run
 import verify
 
@@ -511,6 +512,33 @@ class TestFinalPass(unittest.TestCase):
         record, _, _ = run.final_pass(**kwargs)
         round_tripped = json.loads(json.dumps(record))
         self.assertEqual(round_tripped["episode"], "final")
+
+    def test_the_record_it_produces_actually_renders_in_the_report(self):
+        # The seam between D1 and D3. A finding that lands in episodes.jsonl
+        # and never reaches report.md is the same disappearing act the
+        # stranded segments already performed, so pin the two ends together
+        # rather than testing each against its own idea of the record shape.
+        kwargs, _ = final_pass_fixture(
+            loadgen=FakeProc(returncode=1),
+            daemon=FakeDaemon(clean_stop=False),
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"],
+            residue=quiescence.Residue(1, 0, 0, 1, (
+                {"kind": "unconfirmed_sealed",
+                 "path": "/mnt/weir-wab/wab/shard_00/seg_00000041.wab.sealed",
+                 "size": 8388608},
+                {"kind": "dead_letter",
+                 "path": "/mnt/weir-wab/wab/dead_letter/dl_1.wab", "size": 512},
+            )),
+        )
+        record, _, _ = run.final_pass(**kwargs)
+        out = report.render([record], {})
+        self.assertIn("| final |", out)
+        self.assertIn("seg_00000041.wab.sealed", out)
+        self.assertIn("daemon_kill_at_stop", out)
+        self.assertIn("loadgen_dirty_exit", out)
+        self.assertIn("Shutdown drain completed without a kill | **NO**", out)
+        self.assertIn("0 violations", out)
+        self.assertIn("1 anomaly", out)
 
     def test_at_most_one_violation_and_one_anomaly_come_from_the_final_pass(self):
         # It is ONE row in episodes.jsonl, and report.py counts rows. Emitting

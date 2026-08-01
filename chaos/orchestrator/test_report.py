@@ -15,6 +15,27 @@ EPISODES = [
 ]
 
 
+def final_record(**overrides):
+    """A clean end-of-run record, as `run.final_pass` writes it."""
+    base = {
+        "episode": "final", "fault": "none", "seed": 24301,
+        "loadgen_exit_code": 0, "loadgen_forced_kill": False,
+        "daemon_alive_before_stop": True, "daemon_clean_stop": True,
+        "recorder_alive": True, "advisory": False, "frontier_slack": 0,
+        "ok": True, "acked": 3000, "delivered_distinct": 3000,
+        "acked_delta": 1000, "delivered_delta": 1002, "duplicate_rate": 1.0,
+        "unknown": 0, "nacked": 0, "pushed": 3000, "nacked_delta": 0,
+        "pushed_delta": 1000, "i1_missing": [], "i2_leaked": [],
+        "i1_exempt": 0, "pending_provenance": 0,
+        "final_metrics": {"stranded": 4.0, "resumed": 4.0, "queue_depth": 0.0},
+        "wab_residue": {"unconfirmed_sealed": 0, "nonempty_active": 0,
+                        "quarantined": 0, "dead_letter": 0},
+        "wab_survivors": [], "wab_survivor_count": 0, "anomaly_reasons": [],
+    }
+    base.update(overrides)
+    return base
+
+
 class TestRender(unittest.TestCase):
     def test_headline_states_the_violation_count(self):
         out = report.render(EPISODES, {"weir_commit": "abc123", "kernel": "6.8.0"})
@@ -82,9 +103,9 @@ class TestRender(unittest.TestCase):
             {"episode": 0, "fault": "kill_random", "ok": True, "quiesced": True,
              "acked": 5000, "delivered_distinct": 5000, "acked_delta": 5000,
              "delivered_delta": 5000, "no_progress": False, "duplicate_rate": 1.0,
-             "unknown": 0, "nacked": 17, "pushed": 5017, "i1_exempt": 3,
-             "pending_provenance": 2, "i1_missing": [], "i2_leaked": [],
-             "seed": 24301},
+             "unknown": 0, "nacked": 17, "pushed": 5017, "nacked_delta": 17,
+             "pushed_delta": 5017, "i1_exempt": 3, "pending_provenance": 2,
+             "i1_missing": [], "i2_leaked": [], "seed": 24301},
         ]
         out = report.render(episodes, {})
         self.assertIn("Nacked", out)
@@ -97,6 +118,149 @@ class TestRender(unittest.TestCase):
         self.assertIn("| 5017 |", out)
         self.assertIn("| 3 |", out)
         self.assertIn("| 2 |", out)
+
+    def test_nacked_and_pushed_render_as_deltas_beside_the_other_deltas(self):
+        # D3: they used to render CUMULATIVE totals under "(cum.)" headings,
+        # sitting next to per-episode deltas in the same row. Internally
+        # inconsistent, and exactly the mislabelling that inflated the totals
+        # table by ~10x before it was fixed there.
+        episodes = [
+            {"episode": 0, "fault": "kill_random", "ok": True, "quiesced": True,
+             "acked_delta": 5000, "delivered_delta": 5000, "duplicate_rate": 1.0,
+             "unknown": 0, "nacked": 40, "pushed": 5040, "nacked_delta": 40,
+             "pushed_delta": 5040, "seed": 1},
+            {"episode": 1, "fault": "kill_random", "ok": True, "quiesced": True,
+             "acked_delta": 5000, "delivered_delta": 5000, "duplicate_rate": 1.0,
+             "unknown": 0, "nacked": 81, "pushed": 10081, "nacked_delta": 41,
+             "pushed_delta": 5041, "seed": 1},
+        ]
+        out = report.render(episodes, {})
+        self.assertIn("Nacked Δ", out)
+        self.assertIn("Pushed Δ", out)
+        self.assertNotIn("(cum.)", out)
+        self.assertIn("| 41 |", out)
+        self.assertIn("| 5041 |", out)
+        self.assertNotIn(
+            "| 10081 |", out,
+            "the cumulative total must not appear under a Δ heading",
+        )
+
+
+class TestFinalPassSection(unittest.TestCase):
+    """D1's findings have to reach the report. Landing them in
+    episodes.jsonl and nowhere else is the same disappearing act the
+    stranded segments already performed."""
+
+    def test_a_non_integer_episode_key_does_not_crash_the_report(self):
+        out = report.render([EPISODES[0], final_record()], {})
+        self.assertIn("| final |", out)
+
+    def test_the_final_row_is_not_counted_as_an_episode(self):
+        out = report.render(EPISODES + [final_record()], {})
+        self.assertIn("2 episodes plus a final verification pass", out)
+        out = report.render([EPISODES[0], final_record()], {})
+        self.assertIn("1 episode plus a final verification pass", out)
+
+    def test_the_final_pass_reports_the_zero_slack_claim_and_its_basis(self):
+        out = report.render([EPISODES[0], final_record()], {})
+        self.assertIn("frontier_slack=0", out)
+        self.assertIn("only moment in a run", out)
+        self.assertIn("0 violations", out)
+        self.assertIn("0 anomalies", out)
+
+    def test_the_final_row_shows_no_quiescence_verdict_rather_than_a_failed_one(self):
+        # The final pass runs no quiescence wait. Rendering the missing key as
+        # "NO" would invent a timeout that never happened.
+        out = report.render([final_record()], {})
+        self.assertIn("| n/a |", out)
+        self.assertNotIn("did not reach drain quiescence", out)
+
+    def test_totals_come_from_the_final_pass_when_there_is_one(self):
+        out = report.render([EPISODES[0], final_record()], {})
+        self.assertIn("| Acked records | 3000 |", out)
+
+    def test_an_advisory_failure_is_an_anomaly_not_a_violation(self):
+        # A truncated ledger, an unfinished drain or a dead sink all make
+        # "acked but not delivered" a statement about the harness, not weir.
+        final = final_record(
+            ok=False, advisory=True, frontier_slack=2048,
+            loadgen_exit_code=1,
+            advisory_reasons=["the load generator exited dirty (code=1, "
+                              "killed=False), so its ledger tail may be truncated"],
+            anomaly_reasons=["loadgen_dirty_exit(code=1, killed=False)",
+                             "advisory_check_failed"],
+            i1_missing=[900, 901],
+        )
+        out = report.render([EPISODES[0], final], {})
+        self.assertIn("0 violations", out)
+        self.assertIn("1 anomaly", out)
+        self.assertIn("ADVISORY", out)
+        self.assertIn("ledger tail may be truncated", out)
+        self.assertNotIn(
+            "**FAIL**", out,
+            "an advisory failure must not read as a durability violation",
+        )
+
+    def test_a_non_advisory_final_failure_is_a_violation(self):
+        final = final_record(ok=False, i1_missing=[7])
+        out = report.render([final], {})
+        self.assertIn("1 violation", out)
+        self.assertIn("**FAIL**", out)
+
+    def test_surviving_wab_files_reach_the_report_with_paths_and_sizes(self):
+        final = final_record(
+            wab_residue={"unconfirmed_sealed": 1, "nonempty_active": 0,
+                         "quarantined": 0, "dead_letter": 2},
+            wab_survivors=[
+                {"kind": "unconfirmed_sealed",
+                 "path": "/mnt/weir-wab/wab/shard_02/seg_00000041.wab.sealed",
+                 "size": 8388608},
+                {"kind": "dead_letter",
+                 "path": "/mnt/weir-wab/wab/dead_letter/dl_3.wab", "size": 1024},
+            ],
+            wab_survivor_count=3,
+            anomaly_reasons=["wab_survivors=3"],
+        )
+        out = report.render([final], {})
+        self.assertIn("WAB post-mortem", out)
+        self.assertIn("seg_00000041.wab.sealed", out)
+        self.assertIn("8388608", out)
+        self.assertIn("dl_3.wab", out)
+        self.assertIn("1 anomaly", out)
+        self.assertIn("1 more not shown", out)
+
+    def test_a_killed_shutdown_drain_is_surfaced(self):
+        final = final_record(
+            daemon_clean_stop=False, advisory=True, frontier_slack=2048,
+            advisory_reasons=["the shutdown drain overran its budget and the "
+                              "daemon was killed, so undrained segments are expected"],
+            anomaly_reasons=["daemon_kill_at_stop"],
+        )
+        out = report.render([final], {})
+        self.assertIn("daemon_kill_at_stop", out)
+        self.assertIn("Shutdown drain completed without a kill | **NO**", out)
+        self.assertIn("1 anomaly", out)
+
+    def test_a_run_with_no_final_pass_says_so(self):
+        out = report.render(EPISODES, {})
+        self.assertIn("No final verification pass is recorded", out)
+
+    def test_a_clean_run_with_a_final_pass_does_not_warn(self):
+        out = report.render([EPISODES[0], final_record()], {})
+        self.assertNotIn("No final verification pass is recorded", out)
+
+    def test_an_episode_whose_recorder_died_is_advisory_not_a_violation(self):
+        # The loop's own advisory path: the recorder can die during the
+        # quiescence wait, and every delivery after that is missing from the
+        # log — so the episode's I1 result is about the harness.
+        episodes = [
+            dict(EPISODES[1], advisory=True, recorder_alive=False,
+                 advisory_reasons=["recorder_exited"]),
+        ]
+        out = report.render(episodes, {})
+        self.assertIn("0 violations", out)
+        self.assertIn("1 anomaly", out)
+        self.assertIn("recorder_exited", out)
 
     def test_missing_provenance_fields_render_as_a_dash_not_a_crash(self):
         # An abort record (or any episode written before these fields

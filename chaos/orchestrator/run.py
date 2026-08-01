@@ -878,11 +878,12 @@ def main():
     a_word = "anomaly" if anomalies == 1 else "anomalies"
     print(
         f"\nrun {run_id} complete: {violations} {v_word}, {anomalies} {a_word} "
-        f"across {sched['episodes']} episodes"
+        f"across {sched['episodes']} episodes plus the final pass"
     )
     # I5: gate on both. A violation is a durability failure; an anomaly is
     # the harness failing to observe cleanly (quiescence timeout, dead
-    # observer, no-progress episode) — neither is acceptable in a clean run.
+    # observer, no-progress episode, a shutdown drain that had to be killed,
+    # WAB files surviving teardown) — neither is acceptable in a clean run.
     sys.exit(1 if (violations or anomalies) else 0)
 
 
