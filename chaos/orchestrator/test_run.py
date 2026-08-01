@@ -1,15 +1,54 @@
 """Tests for schedule parsing, the seeded random killer, the no-progress
-floor, and the Rust<->Python CLI contract.
+floor, the Rust<->Python CLI contract, and the teardown-time final pass.
 
 The episode loop itself needs root and a real daemon; it is exercised by the
-Task 9 end-to-end gate, not here.
+Task 9 end-to-end gate, not here. `final_pass` and `stop_loadgen` are written
+against injected collaborators precisely so they do NOT need either.
 """
 import os
 import re
+import signal
+import subprocess
 import unittest
 from unittest import mock
 
 import run
+
+
+class FakeProc:
+    """A `subprocess.Popen` stand-in that records the signals it receives.
+
+    `wait_raises` makes `wait()` raise `TimeoutExpired` once, so the escalation
+    path (kill, then report the loss) is reachable without a real process.
+    """
+
+    def __init__(self, returncode=None, wait_raises=False, log=None):
+        self.returncode = returncode
+        self.signals = []
+        self.wait_raises = wait_raises
+        self.log = log if log is not None else []
+
+    def poll(self):
+        return self.returncode
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+
+    def terminate(self):
+        self.signals.append(signal.SIGTERM)
+
+    def kill(self):
+        self.signals.append(signal.SIGKILL)
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        self.log.append("loadgen.wait")
+        if self.wait_raises:
+            self.wait_raises = False
+            raise subprocess.TimeoutExpired("loadgen", timeout)
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
 
 
 class TestSchedule(unittest.TestCase):
@@ -165,6 +204,46 @@ class TestFrontierSlackContract(unittest.TestCase):
             "exemption, so a mismatch silently changes how much in-flight "
             "work is excused from the orphan/I1 checks",
         )
+
+
+class TestStopLoadgen(unittest.TestCase):
+    """D2: the producer must be resumed, asked to stop, and REAPED — in that
+    order — before the daemon is sent its own SIGTERM."""
+
+    def test_resumes_then_terminates_then_waits(self):
+        proc = FakeProc()
+        code, forced = run.stop_loadgen(proc)
+        self.assertEqual(
+            proc.signals, [signal.SIGCONT, signal.SIGTERM],
+            "SIGCONT must come first: loadgen CATCHES SIGTERM now, and a caught "
+            "signal is not delivered to a SIGSTOPped process until it resumes",
+        )
+        self.assertIn("loadgen.wait", proc.log, "an unreaped loadgen races weir's own SIGTERM")
+        self.assertEqual((code, forced), (0, False))
+
+    def test_an_already_exited_loadgen_is_not_signalled_again(self):
+        proc = FakeProc(returncode=1)
+        code, forced = run.stop_loadgen(proc)
+        self.assertEqual(proc.signals, [])
+        self.assertEqual(
+            (code, forced), (1, False),
+            "exit code 1 means loadgen lost ledger entries — it must reach the "
+            "caller intact, not be normalised away",
+        )
+
+    def test_a_loadgen_that_will_not_stop_is_killed_and_reported_as_forced(self):
+        proc = FakeProc(wait_raises=True)
+        code, forced = run.stop_loadgen(proc, timeout_secs=0.01)
+        self.assertIn(signal.SIGKILL, proc.signals)
+        self.assertTrue(
+            forced,
+            "a killed loadgen lost its ledger tail; swallowing that would let "
+            "the final pass run frontier_slack=0 against a truncated ledger",
+        )
+        self.assertEqual(code, -9)
+
+    def test_no_loadgen_at_all_is_not_an_error(self):
+        self.assertEqual(run.stop_loadgen(None), (None, False))
 
 
 if __name__ == "__main__":

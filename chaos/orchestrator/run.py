@@ -43,6 +43,13 @@ WEIR_ROOT = os.path.dirname(CHAOS_ROOT)
 #: the other is caught immediately instead of silently reopening I3.
 LEDGER_FLUSH_THRESHOLD = 256
 
+#: How long to wait for the load generator to flush its ledger and exit after
+#: SIGTERM. loadgen's `PUSH_TIMEOUT` is 30 s, so a thread parked in a push
+#: against a wedged daemon can take that long to notice the stop flag; this is
+#: two of those plus slack. Overrunning it means killing the generator, which
+#: loses the ledger tail — recorded as an anomaly, never silently absorbed.
+LOADGEN_STOP_TIMEOUT_SECS = 60
+
 
 def load_schedule(path):
     """Reads a schedule TOML.
@@ -88,6 +95,48 @@ def progress_floor_breached(delta_acked, delta_delivered, min_acked, min_deliver
     only strictly below does.
     """
     return delta_acked < min_acked or delta_delivered < min_delivered
+
+
+def stop_loadgen(proc, timeout_secs=LOADGEN_STOP_TIMEOUT_SECS):
+    """Stops the load generator and REAPS it. Returns `(exit_code, forced)`.
+
+    `forced` is True if it had to be SIGKILLed, which means its buffered ledger
+    entries were discarded after all.
+
+    SIGCONT FIRST, and it is now load-bearing. The episode loop SIGSTOPs the
+    producer around each quiescence wait, and loadgen CATCHES SIGTERM
+    (`chaos/src/bin/loadgen.rs`). A *caught* signal is not delivered to a
+    stopped process — it stays pending until SIGCONT — so terminating a frozen
+    loadgen without resuming it first would block until the wait below timed
+    out, and the kill that followed would discard exactly the ledger tail the
+    handler exists to preserve.
+
+    This step carried the same comment before the handler existed, and the
+    comment was WRONG: with the default disposition SIGTERM is fatal, and the
+    kernel wakes and kills a stopped process outright rather than leaving the
+    signal pending (`kernel/signal.c`'s `complete_signal()` sets
+    `SIGNAL_GROUP_EXIT` and `signal_wake_up()`s every thread for a `sig_fatal`
+    signal). The SIGCONT was a no-op that happened to describe a future.
+
+    Then WAIT. Without it, the daemon's own SIGTERM — `Daemon.stop()`, which
+    runs next — races producer connections that are still open, so weir begins
+    its shutdown drain against live traffic.
+    """
+    if proc is None:
+        return None, False
+    if proc.poll() is not None:
+        return proc.returncode, False
+    proc.send_signal(signal.SIGCONT)
+    proc.terminate()
+    try:
+        return proc.wait(timeout=timeout_secs), False
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return proc.returncode, True
 
 
 class Daemon:
@@ -496,16 +545,16 @@ def main():
         # producer first means no new records; stopping the daemon next lets it
         # drain and seal against a recorder that is still answering; the
         # recorder goes last.
-        for label, proc in (("loadgen", loadgen),):
-            try:
-                if proc and proc.poll() is None:
-                    # SIGCONT first: a process stopped by SIGSTOP will not act
-                    # on SIGTERM until it is resumed, so terminating a frozen
-                    # loadgen would hang until the wait timed out.
-                    proc.send_signal(signal.SIGCONT)
-                    proc.terminate()
-            except Exception as exc:
-                print(f"cleanup: {label} terminate failed: {exc}", file=sys.stderr)
+        #
+        # On the normal path `final_pass()` has ALREADY stopped the first two,
+        # having read the evidence they produce; every step below is a no-op
+        # then. This block is the exception path — an error escaping the try
+        # body before the final pass ran — and it still has to leave nothing
+        # behind.
+        try:
+            stop_loadgen(loadgen)
+        except Exception as exc:
+            print(f"cleanup: loadgen terminate failed: {exc}", file=sys.stderr)
         try:
             if daemon:
                 daemon.stop()
@@ -514,6 +563,15 @@ def main():
         try:
             if recorder and recorder.poll() is None:
                 recorder.terminate()
+                # Reap it. An unwaited child is a zombie that outlives this
+                # process's own accounting, and on the exception path the next
+                # thing that happens is `stack.teardown()` unmounting the
+                # filesystem — better to know the recorder is gone first.
+                try:
+                    recorder.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    recorder.kill()
+                    recorder.wait(timeout=10)
         except Exception as exc:
             print(f"cleanup: recorder terminate failed: {exc}", file=sys.stderr)
         try:
