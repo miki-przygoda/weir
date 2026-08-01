@@ -1023,6 +1023,12 @@ The first transient-retry backoff delay; it doubles on each subsequent retry
 (capped at 5 minutes), and a downstream `Retry-After` header overrides it when
 present. With the defaults the retry delays are 100 ms → 200 ms → 400 ms.
 
+**During shutdown** each remaining backoff is clamped to 250 ms, drawn from a
+1 s total budget, so a long delay (a big base, or a downstream `Retry-After`)
+can't hold the daemon open — while the retries still get real spacing rather
+than firing back-to-back. With the defaults the clamp is barely visible
+(100 ms → 200 ms → 250 ms).
+
 ---
 
 #### `WEIR_SINK_BEARER_TOKEN` (env-only)

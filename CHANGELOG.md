@@ -40,6 +40,36 @@ both are observability / behaviour-under-shutdown fixes.
   explicitly and points at `weir_wab_bytes_on_disk` / `weir-ctl segments` for
   the live backlog.
 
+### Reliability
+
+- **Shutdown no longer burns the whole sink-retry budget with zero delay.**
+  During a transient-error retry the drain consumes its backoff by polling the
+  drain channel, and on `Disconnected` — which is how it learns of shutdown — it
+  stopped waiting entirely. The effect the harness measured: at shutdown all
+  `sink_max_retries` attempts for a segment fired back-to-back and the segment
+  was then logged as stranded — four segments burned their whole budget in
+  **0.4 ms** between them. A unit test reproduces it independently: with a 5 s
+  base delay the entire retry episode took **3.2 ms**. Attempts that close
+  together against a sink needing milliseconds to answer fail identically for
+  the same reason, so the budget bought one effective attempt, not three, and
+  forced a strand a brief delay might have avoided.
+
+  The shutdown wait is now **clamped to 250 ms** rather than eliminated, so each
+  retry is an independent sample, drawn from a **1 s total budget** per process
+  so the added time cannot compound across segments or resume cycles. Worst case
+  this adds 1 s to shutdown — small against the per-attempt
+  `sink_commit_timeout_secs` (default 30 s) the shutdown path already tolerates
+  — and at the default `sink_retry_base_delay_ms` of 100 the clamp barely bites
+  (100/200/400 ms → 100/200/250 ms). Not a data-loss fix either way: a stranded
+  segment stays on disk and is replayed on the next start.
+
+  **Side effect worth knowing:** because a shutdown retry episode can now outlast
+  `health_poll_interval`, a segment that strands during shutdown may be picked up
+  by the stranded-segment auto-resume and *delivered* before the daemon exits,
+  where previously it was always left for the next start. That is a better
+  outcome (fewer segments deferred to restart) and it is bounded — once the
+  1 s budget is spent, retries fire immediately again exactly as before.
+
 ---
 
 ## [1.3.1] - 2026-06-23

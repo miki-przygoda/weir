@@ -57,6 +57,49 @@ use dead_letter::DeadLetterWriter;
 
 pub const MAX_RETRIES: u32 = 3;
 
+/// Upper bound on a single transient-retry backoff once shutdown has been
+/// observed (the drain channel disconnected). The backoff is clamped rather than
+/// dropped: firing the remaining attempts back-to-back with no delay spends the
+/// whole retry budget on what is effectively one attempt, since a sink that
+/// needs milliseconds to answer fails the same way three times inside the same
+/// instant (W2).
+///
+/// Why 250 ms:
+///
+///   * It is above the default `sink_retry_base_delay_ms` (100), so at default
+///     config the shutdown schedule (100 / 200 / 250 ms) is all but identical to
+///     the normal one (100 / 200 / 400 ms) — the clamp only bites on an operator's
+///     long base delay or a server-supplied `Retry-After` (up to 5 minutes).
+///   * With the default retry budget it covers a whole episode in
+///     `(MAX_RETRIES + 1) × 250 ms` = 1 s — which is what
+///     [`SHUTDOWN_RETRY_BACKOFF_BUDGET`] (the actual bound on total added
+///     shutdown time) is sized to. 1 s is small against the per-attempt
+///     `commit_timeout` (default 30 s) that the shutdown path already tolerates,
+///     so this is never the term that decides how long shutdown takes.
+///   * It is 5× the 50 ms channel-poll slice used while the channel is live, so
+///     the wait is a real delay and not a rounding artifact of the poll loop.
+const SHUTDOWN_RETRY_BACKOFF_CAP: Duration = Duration::from_millis(250);
+
+/// Total time the drain may spend on [`SHUTDOWN_RETRY_BACKOFF_CAP`]-clamped
+/// backoffs across the whole shutdown, after which shutdown retries fire
+/// immediately again.
+///
+/// A per-retry clamp alone is not enough to bound shutdown. Stranding a segment
+/// marks the sink down, so the Draining arm's next health poll sees a down→up
+/// edge and re-queues that same segment (the 4a auto-resume), starting a fresh
+/// retry episode. Against a sink whose HEAD probe stays healthy while every POST
+/// fails transiently, that cycle is unbounded — today it is only survivable
+/// because zero-delay retries never let `health_poll_interval` elapse. Spending
+/// from one budget keeps the worst case flat: shutdown grows by at most this
+/// much in total, no matter how many segments or resume cycles are involved.
+///
+/// 1 s is `(MAX_RETRIES + 1) × SHUTDOWN_RETRY_BACKOFF_CAP` — exactly enough for
+/// one full retry episode at the default retry budget, which is the case worth
+/// buying (the segment in flight when the operator sent SIGTERM). Anything after
+/// that is a sink that has already failed four spaced-out attempts, which is not
+/// worth delaying a shutdown for.
+const SHUTDOWN_RETRY_BACKOFF_BUDGET: Duration = Duration::from_secs(1);
+
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -407,6 +450,13 @@ fn drain_thread<S: Sink>(
     // recv_timeout branch alone never fired while segments kept arriving).
     let mut last_health_poll = Instant::now();
 
+    // Total time the drain may still spend on clamped transient-retry backoffs
+    // after shutdown has been observed. Consumed by the `RetryingTransient` arm;
+    // once exhausted, shutdown retries revert to firing immediately. See
+    // [`SHUTDOWN_RETRY_BACKOFF_BUDGET`] for why this is bounded in aggregate and
+    // not just per-retry.
+    let mut shutdown_backoff_left = SHUTDOWN_RETRY_BACKOFF_BUDGET;
+
     'outer: loop {
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
@@ -501,13 +551,35 @@ fn drain_thread<S: Sink>(
                 // recv_timeout so a shutdown — which the drain only learns of as the
                 // drain channel disconnecting (all WAB flushers have exited) — cuts
                 // the wait short instead of sleeping out a multi-minute Retry-After.
-                // On disconnect we stop waiting but STILL run the retry below (its
-                // commit is bounded by commit_timeout), preserving the existing
+                // On disconnect we shorten the wait but STILL run the retry below
+                // (its commit is bounded by commit_timeout), preserving the existing
                 // "complete in-flight work on shutdown" behaviour; the Draining loop
                 // then observes the same disconnect and exits. In production the
                 // channel only closes on shutdown, so the Retry-After delay is only
                 // ever cut at shutdown, never during normal operation. Segments that
                 // arrive during the wait are buffered (S15).
+                //
+                // W2: the shutdown wait is CLAMPED, not eliminated. Breaking outright
+                // made every remaining attempt fire back-to-back with zero delay —
+                // the chaos harness measured four segments each burning all
+                // MAX_RETRIES inside 0.4 ms before being logged as stranded. Three
+                // attempts inside one instant against a sink that needs milliseconds
+                // to answer fail identically for the same reason, so that spent the
+                // whole budget on what was effectively one attempt and forced a
+                // strand a brief delay might have avoided — neither "retry properly"
+                // nor "don't retry". Sleeping the clamped remainder makes each retry
+                // an independent sample again. `thread::sleep` rather than another
+                // recv_timeout because a disconnected channel returns immediately and
+                // would spin; nothing is missed, since no further segment can arrive.
+                //
+                // The clamp is drawn from a per-process budget so the added shutdown
+                // time cannot compound: a segment that strands makes the Draining
+                // arm's health poll re-queue it (the 4a auto-resume edge), which
+                // starts another retry episode, and with an unbudgeted per-retry
+                // clamp a HEAD-healthy / POST-transient-failing sink would keep that
+                // cycle alive and shutdown would never finish. Once the budget is
+                // spent the waits go to zero and the loop degenerates to the previous
+                // behaviour, which terminates.
                 let wait_end = Instant::now() + next_delay;
                 loop {
                     let remaining = wait_end.saturating_duration_since(Instant::now());
@@ -518,8 +590,17 @@ fn drain_thread<S: Sink>(
                     match drain_rx.recv_timeout(poll) {
                         Ok(new_seg) => pending.push_back(new_seg),
                         Err(RecvTimeoutError::Timeout) => {}
-                        // Channel closed (shutdown): stop waiting, finish the retry.
-                        Err(RecvTimeoutError::Disconnected) => break,
+                        // Channel closed (shutdown): serve the clamped remainder of
+                        // the backoff, then finish the retry.
+                        Err(RecvTimeoutError::Disconnected) => {
+                            let left = wait_end
+                                .saturating_duration_since(Instant::now())
+                                .min(SHUTDOWN_RETRY_BACKOFF_CAP)
+                                .min(shutdown_backoff_left);
+                            shutdown_backoff_left -= left;
+                            std::thread::sleep(left);
+                            break;
+                        }
                     }
                 }
 
@@ -2243,6 +2324,67 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// W2. At shutdown the retry backoff is CLAMPED, not eliminated.
+    ///
+    /// The drain only learns of shutdown as the drain channel disconnecting, and
+    /// it used to `break` out of the interruptible backoff on that signal — so
+    /// every remaining attempt fired back-to-back with zero delay (the chaos
+    /// harness measured four segments burning all `MAX_RETRIES` in 0.4 ms). Three
+    /// attempts inside one instant against a sink that needs milliseconds to
+    /// answer fail identically for the same reason: the budget bought one
+    /// effective attempt, not three, and forced a strand a brief delay might have
+    /// avoided.
+    ///
+    /// With a 5 s base delay the unclamped schedule would be 5 + 10 + 20 + 40 s.
+    /// The two bounds below are the whole property: **not zero** (each retry is a
+    /// genuinely independent sample) and **far below one full backoff** (shutdown
+    /// stays prompt).
+    #[test]
+    fn shutdown_clamps_the_retry_backoff_instead_of_zeroing_it() {
+        let dir = tmp_dir("shutdown_backoff");
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let responses: Vec<MockResult> = (0..=MAX_RETRIES)
+            .map(|_| Err(MockError::Transient))
+            .collect();
+        let sink = Arc::new(MockSink::with_responses(responses));
+        let metrics = noop_metrics();
+        // A base delay far larger than the clamp, so an unclamped wait is
+        // unmistakable and a zeroed one equally so.
+        let config = DrainConfig {
+            base_retry_delay: Duration::from_secs(5),
+            ..fast_config(dir.clone())
+        };
+
+        // run_drain drops the channel immediately — i.e. the whole retry episode
+        // runs in the shutdown regime.
+        let started = Instant::now();
+        run_drain(rx, tx, sink, config, Arc::clone(&metrics));
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            1,
+            "the segment still strands once the budget is spent"
+        );
+        // The RetryingTransient arm is entered MAX_RETRIES + 1 times (each retry
+        // plus the final give-up pass), so the expected total is ~4 × the clamp.
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "shutdown retries must still be spaced by the clamped backoff, not fired \
+             back-to-back with zero delay (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must not sleep out a full base_retry_delay, let alone the \
+             5 + 10 + 20 + 40 s exponential schedule (elapsed {elapsed:?})"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn stranded_segment_resumes_when_sink_recovers() {
         // 4a auto-resume: a segment strands (transient failures exhaust
@@ -3276,7 +3418,21 @@ mod tests {
         let responses: Vec<MockResult> = (0..=MAX_RETRIES + 1)
             .map(|_| Err(MockError::TransientWithRetryAfter(LONG)))
             .collect();
-        let sink = Arc::new(MockSink::with_responses(responses));
+        // The probe reports Down for the whole test, matching the scenario: a sink
+        // that transiently fails every POST is a sink that is out. This has to be
+        // explicit now that the shutdown backoff is clamped rather than dropped
+        // (W2) — the retry episode outlives `health_poll_interval`, so a probe that
+        // answered Healthy would give the Draining arm a down→up edge, re-queue the
+        // stranded segment via the 4a auto-resume and deliver it before exit. That
+        // is a legitimate (better) outcome, but it is not the S15 property, and
+        // pinning it here would make this test about auto-resume instead of about
+        // shutdown latency.
+        let sink = Arc::new(MockSink {
+            health_script: Mutex::new(
+                std::iter::repeat_n(SinkHealth::Down("test".into()), 64).collect(),
+            ),
+            ..MockSink::with_responses(responses)
+        });
         let metrics = noop_metrics();
         let handle = spawn(rx, sink.clone(), fast_config(dir.clone()), metrics.clone());
 
