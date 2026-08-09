@@ -197,3 +197,39 @@ The unit tests in `crates/weir-server/src/socket/mod.rs::tests` cover:
   target while `bind_hardened` runs 200 times. Asserts the contract:
   every `Ok` return is accompanied by a socket of mode 0o600 at the path.
   Errors are allowed; silent corruption is not.
+
+## Known limitation — the umask window is process-global
+
+The bind sequence tightens the process umask to `0o177` around `bind(2)` so the
+socket inode is created at mode `0o600` without a post-bind `chmod`. The
+tightening is RAII-scoped to that single syscall, but umask is a **process**
+attribute, not a thread attribute, so it applies to every thread for the
+duration.
+
+Specifying mode bits explicitly does not escape it — `mkdir(2)` and `open(2)`
+both mask the requested mode. A directory created by another thread inside the
+window lands at `0o700 & !0o177 = 0o600`, losing its execute bit; a WAB segment
+lands at `0o600 & !0o177 = 0o400`.
+
+**In the daemon this is not exploitable and not reachable.** The bind happens
+before any producer can connect, so no records exist and no segment is being
+created. The WAB flushers and workers are running by then, but idle. (The
+earlier justification — that startup is single-threaded — was wrong: `main.rs`
+spawns the flushers at line 292 and the workers at line 306, well before the
+bind at line 507. The correct reason is that the process is *idle*, not that it
+is single-threaded.)
+
+**Under `cargo test` it is reachable and constant**, because ~300 unrelated
+tests create directories concurrently with ~50 tests that call `bind_hardened`.
+A parallel run of the `weir-server` bin target produces ~66 spurious
+`PermissionDenied` failures and leaves `crates/weir-server/proptest-regressions/`
+unwritable, so proptest cannot record failing seeds. That is why the documented
+gate runs this target with `--test-threads=1`.
+
+Removing the umask dependency is a security redesign, not a cleanup: `fchmod`
+operates on the sockfs object rather than the bound inode on Linux, and a
+path-based `chmod` reintroduces the symlink-swap window analysed above. The
+alternative worth evaluating if this is ever revisited is binding to a private
+name inside the already-`0o700` parent directory and publishing it with
+`renameat`, which would need its own analysis against the attack surface
+described in this document.

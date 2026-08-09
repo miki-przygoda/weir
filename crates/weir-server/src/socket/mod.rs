@@ -402,10 +402,18 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
     // the sockfs object, not the bound filesystem inode, and may not
     // propagate to the bind path's mode bits).
     //
-    // umask is process-global and applies to other threads briefly. Every
-    // other file-creation path in weir specifies its mode bits explicitly
-    // (WAB segments 0o600, dirs 0o700), so the temporary tightening is
-    // invisible to those paths. A tighter umask is also a safer default.
+    // umask is process-global and applies to other threads for the duration of
+    // the bind(2) below. Specifying mode bits explicitly does NOT escape it:
+    // mkdir(2) and open(2) both mask the requested mode, so a directory created
+    // by another thread in this window lands at 0o700 & !0o177 = 0o600 — no
+    // execute bit, nothing can be created inside it — and a segment file at
+    // 0o600 & !0o177 = 0o400. In the daemon nothing is created here because no
+    // producer can connect before the socket exists, so the process is idle
+    // (not single-threaded: the WAB flushers spawned at main.rs:292 and the
+    // workers at main.rs:306 are already running). Under `cargo test` the
+    // window is real and hit constantly, which is why weir-server's bin unit
+    // tests run with --test-threads=1 — see CONTRIBUTING.md and
+    // docs/security/socket-bind.md.
     //
     // The restore is RAII-guarded so an unwind (or the `?` below) between
     // tightening and restoring cannot leak umask 0o177 process-wide, silently
@@ -745,11 +753,15 @@ mod tests {
 
     // ── Hardened bind ─────────────────────────────────────────────────────────
 
-    // bind_hardened internally mutates the process umask. That makes
-    // concurrent calls (e.g. parallel test execution) interleave their
-    // save/restore and leak a tightened umask globally. The lock below
-    // serialises the tests; in production, bind_hardened is called once
-    // during single-threaded startup so the issue does not arise.
+    // bind_hardened internally mutates the process umask. The lock below
+    // serialises these tests against each other, but it CANNOT protect the
+    // ~300 other tests in this binary: any thread creating a directory while a
+    // bind_hardened call holds umask 0o177 gets mode 0o600 and fails with
+    // PermissionDenied. That is why the documented gate runs this target with
+    // --test-threads=1 (CONTRIBUTING.md). In the daemon the window is harmless
+    // because no producer can connect before the socket exists — but "called
+    // once during single-threaded startup" is not the reason: the WAB flushers
+    // (main.rs:292) and workers (main.rs:306) are already running by then.
 
     #[tokio::test]
     #[cfg(unix)]

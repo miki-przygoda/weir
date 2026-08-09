@@ -70,6 +70,34 @@ both are observability / behaviour-under-shutdown fixes.
   outcome (fewer segments deferred to restart) and it is bounded — once the
   1 s budget is spent, retries fire immediately again exactly as before.
 
+### Testing
+
+- **The documented pre-PR gate now passes.** `cargo test` had been failing on
+  `main` with ~66 spurious `PermissionDenied` errors: `socket::bind_hardened`
+  tightens the **process-global** umask to `0o177` around `bind(2)`, and any
+  other thread creating a directory in that window gets mode `0o600` — no
+  execute bit, so nothing can be created inside it. Explicit mode bits do not
+  help; `mkdir(2)` and `open(2)` both mask the requested mode, so
+  `WabSegment::create`'s `.mode(0o600)` would land at `0o400`. It also left
+  `proptest-regressions/` unwritable, so proptest could not record failing
+  seeds. `CONTRIBUTING.md` and CI now run `weir-server`'s bin unit tests with
+  `--test-threads=1` (~13 s versus ~1.5 s; the debug load tests dominate the job
+  either way). Two source comments claiming the window was harmless — one
+  asserting explicit modes escape umask, one asserting startup is
+  single-threaded — are corrected, and `docs/security/socket-bind.md` records
+  the limitation and what a real fix would have to analyse. No daemon behaviour
+  change: the window is unreachable in production because no producer can
+  connect before the socket exists.
+- **A drain test made flaky by the shutdown-backoff clamp above is now
+  deterministic.** `multiple_segments_second_processed_after_first_exhausts_retries`
+  asserts a stranded segment is still on disk when the drain exits, justified by
+  "the drain never reaches the idle poll" — which the clamp made untrue. Under
+  parallel load the retry sleeps overshot the 50 ms health poll, the
+  stranded-segment auto-resume delivered the segment, and the assertion failed
+  in roughly two runs out of three. The test now pins `health_poll_interval` for
+  its own run rather than asserting the pre-clamp outcome; the resume path stays
+  covered by `stranded_segment_resumes_when_sink_recovers`.
+
 ---
 
 ## [1.3.1] - 2026-06-23

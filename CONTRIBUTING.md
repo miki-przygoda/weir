@@ -45,10 +45,20 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 
-# Tests: default features, then the full matrix (compiles + runs the
+# Tests. weir-server's bin unit tests MUST run serially: socket::bind_hardened
+# mutates the process-global umask around bind(2), and a directory created by
+# another thread in that window loses its execute bit. See
+# docs/security/socket-bind.md. Running them in parallel produces ~66 spurious
+# PermissionDenied failures and leaves proptest-regressions/ unwritable.
+cargo test --workspace --exclude weir-server
+cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener
+cargo test -p weir-server --bins -- --test-threads=1
+
+# The same three, across the full feature matrix (compiles + runs the
 # clickhouse-sink and tls test code the default set never builds).
-cargo test
-cargo test --all-features
+cargo test --workspace --exclude weir-server --all-features
+cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener --all-features
+cargo test -p weir-server --bins --all-features -- --test-threads=1
 
 # Dependency advisories, license, bans, and sources.
 # Install once: cargo install cargo-deny
