@@ -589,15 +589,35 @@ validation, matching the guard-every-bounded-scalar convention established in
 
 ## 12. Open questions
 
-None blocking. Two to settle during implementation, both local:
+### 12.1 zstd crate choice — RESOLVED 2026-08-09: use `zstd`
 
-1. **zstd crate choice** — `zstd` (bindgen to libzstd) versus `ruzstd`
-   (pure-Rust decoder only). The C binding adds a non-Rust build dependency to a
-   project that currently has none, which affects the `cargo install` story;
-   `ruzstd` cannot compress. Resolve against `deny.toml` and the existing
-   dependency-reduction posture before the plan's first task.
-2. **Exact frame configuration** — whether to write the content-size field and
-   the frame checksum. The content size is redundant with the output limit and
-   the frame checksum is redundant with weir's own CRC, so both are candidates
-   for omission to reclaim bytes per record. Measure the per-record overhead
-   both ways.
+This section originally weighed `zstd` (binding to libzstd) against `ruzstd`
+(pure-Rust, decode-only) and argued the C binding "adds a non-Rust build
+dependency to a project that currently has none, which affects the
+`cargo install` story."
+
+**That premise was wrong.** A *default* `weir-server` build already pulls `ring`
+— which compiles C and assembly — through `rustls`, via both `reqwest`
+(`http-sink`) and `mysql_async` (`mysql-sink`), each of which is in
+`default = ["http-sink", "mysql-sink", "postgres-sink"]`. `cargo install
+weir-server` has always required a C toolchain, and CI already cross-compiles
+`ring` to all five release targets including `x86_64-pc-windows-msvc`. The cost
+the objection was protecting against is already paid.
+
+`ruzstd` cannot compress, so it was never viable alone. The remaining real
+alternative was a pure-Rust codec with both directions — `lz4_flex` — which was
+rejected because it trades away the ratio, and per §3.3 the ratio *is* the
+value: this is a capacity feature, not a latency one.
+
+**Decision: the `zstd` crate.** Licences are MIT (the crate) and
+BSD-3-Clause-OR-GPL-2.0 (vendored libzstd); `deny.toml` allows MIT and
+BSD-3-Clause, so `cargo deny check licenses` must confirm it resolves to the
+BSD arm — that is a verification step in the plan, not an assumption.
+
+### 12.2 Exact frame configuration
+
+Still open, and local to the implementation. Whether to write the frame's
+content-size field and the frame checksum: the content size is redundant with
+the decompression output limit (§4.7) and the frame checksum is redundant with
+weir's own per-record CRC, so both are candidates for omission to reclaim bytes
+per record. Measure the per-record overhead both ways before choosing.
