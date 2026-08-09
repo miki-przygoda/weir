@@ -2690,12 +2690,23 @@ mod tests {
         responses.push(MockSink::ok(vec![Payload::from(b"seg2".as_ref())]));
         // seg1's resume (after seg2 confirms) gets MockSink's default Ok.
         let sink = Arc::new(MockSink::with_responses(responses));
-        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
+        // The stranded-resume rescan runs at the idle health poll. This test
+        // asserts seg1 is STILL stranded when the drain exits, so the poll must
+        // not fire during the run. fast_config's 50 ms is short enough that
+        // under parallel load the clamped shutdown backoff (d522ce2 / W2) lets
+        // the poll fire, resume seg1, and delete it — the assertion below then
+        // fails ~2 runs in 3. The resume path is covered separately by
+        // `stranded_segment_resumes_when_sink_recovers`.
+        let config = DrainConfig {
+            health_poll_interval: Duration::from_secs(3600),
+            ..fast_config(dir.clone())
+        };
+        run_drain(rx, tx, sink, config, noop_metrics());
 
         // seg2 is delivered without being blocked by seg1 exhausting its retries
-        // (a stranded segment doesn't stall the queue). seg1 stays stranded here
-        // because run_drain drops the channel, so the drain never reaches the idle
-        // poll where the sink-recovery rescan runs (that path is covered by
+        // (a stranded segment doesn't stall the queue) — that is what this test
+        // is for. seg1 stays stranded because the health poll is pinned above so
+        // the sink-recovery rescan cannot run (that path is covered by
         // stranded_segment_resumes_when_sink_recovers).
         assert!(seg1.exists(), "seg1 left on disk after exhausted retries");
         assert!(!seg2.exists(), "seg2 confirmed and deleted");
