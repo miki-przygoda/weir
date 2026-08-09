@@ -360,6 +360,93 @@ pub enum SinkHealth {
     Down(String),
 }
 
+/// A content-derived, batch-scoped idempotency handle for one [`Sink::commit`]
+/// call.
+///
+/// # What it is
+///
+/// `sha256(len(p₀) ++ p₀ ++ len(p₁) ++ p₁ ++ …)`, each length an 8-byte
+/// little-endian prefix, over the batch's payload bytes in delivery order.
+///
+/// The length prefix is load-bearing, not decoration. Concatenating payloads
+/// without a delimiter makes `["ab", "c"]` and `["a", "bc"]` hash identically —
+/// a dedup-capable sink would then drop the second, genuinely distinct batch as
+/// a duplicate and **lose data**. The prefix restores a prefix-free framing.
+///
+/// # What it guarantees
+///
+/// A crash-replayed, byte-identical batch produces a byte-identical token, so a
+/// downstream that deduplicates on it (ClickHouse's `insert_deduplication_token`,
+/// an HTTP `Idempotency-Key`, a Postgres `ON CONFLICT` key) collapses the
+/// re-delivery that weir's at-least-once contract permits.
+///
+/// # Precondition — keep `sink_max_batch_size` stable
+///
+/// The token covers exactly the sub-batch handed to `commit`, which the drain
+/// sizes by `sink_max_batch_size`. If that config changes across a restart, a
+/// replayed segment re-splits into differently-sized sub-batches whose tokens
+/// differ from the originals, the downstream does not recognise them as
+/// duplicates, and at-least-once becomes a double-insert. **The guarantee above
+/// holds only while that setting is stable.**
+///
+/// # Stability
+///
+/// The digest is byte-identical to the token weir 1.x's ClickHouse sink computed
+/// internally, so an operator upgrading mid-outage keeps deduplicating. It is
+/// pinned by a known-answer test and must not change without a major version.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DedupToken([u8; 32]);
+
+impl DedupToken {
+    /// Derives the token from a batch's payloads, in delivery order.
+    pub fn for_payloads<'a>(payloads: impl IntoIterator<Item = &'a Payload>) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for p in payloads {
+            hasher.update((p.len() as u64).to_le_bytes());
+            hasher.update(p.as_ref());
+        }
+        Self(hasher.finalize().into())
+    }
+
+    /// Rebuilds a token from a previously captured digest. Intended for sink
+    /// authors' tests; the drain always uses [`DedupToken::for_payloads`].
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw 32-byte digest.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Lower-hex, 64 characters, no prefix.
+    pub fn to_hex(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(64);
+        for b in self.0 {
+            // Writing to a String is infallible.
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+
+    /// `sha256:<lower-hex>` — the form an HTTP `Idempotency-Key` wants, where
+    /// the prefix tells the endpoint which digest it is looking at.
+    pub fn to_prefixed_hex(&self) -> String {
+        format!("sha256:{}", self.to_hex())
+    }
+}
+
+impl std::fmt::Debug for DedupToken {
+    /// Prints the hex digest rather than 32 raw bytes — a token shows up in
+    /// drain error logs, where `[228, 91, ...]` is useless for correlating
+    /// against a downstream's dedup table.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DedupToken({})", self.to_hex())
+    }
+}
+
 /// A downstream commit target for weir records.
 ///
 /// The drain calls [`commit`](Sink::commit) with batches of records read from
@@ -504,5 +591,107 @@ mod tests {
         let p = Payload::from(b"weir".as_ref());
         let recovered = <Payload as SinkRecord>::from_payload(p.clone()).into_payload();
         assert_eq!(&recovered[..], &p[..]);
+    }
+
+    // ── DedupToken ────────────────────────────────────────────────────────────
+
+    fn p(bytes: &[u8]) -> Payload {
+        Payload::from(bytes)
+    }
+
+    /// Captured by running weir 1.3.1's `clickhouse::dedup_token` on
+    /// `[b"alpha", b"beta", b"gamma"]`. Changing this constant means breaking
+    /// compatibility with every deployment that deduplicates on the token.
+    /// Don't. See also the second, deliberately independent copy in
+    /// `weir-server`'s clickhouse sink tests.
+    const KNOWN_ANSWER_1_X: &str =
+        "5bc1fe58cc34db881c67b2acd898651311f6dfc576285c906c8f97e049b15342";
+
+    #[test]
+    fn dedup_token_is_deterministic() {
+        let batch = [p(b"a"), p(b"b")];
+        assert_eq!(
+            DedupToken::for_payloads(&batch).to_hex(),
+            DedupToken::for_payloads(&batch).to_hex()
+        );
+    }
+
+    #[test]
+    fn dedup_token_changes_on_reorder() {
+        let a = [p(b"a"), p(b"b")];
+        let b = [p(b"b"), p(b"a")];
+        assert_ne!(
+            DedupToken::for_payloads(&a).to_hex(),
+            DedupToken::for_payloads(&b).to_hex()
+        );
+    }
+
+    #[test]
+    fn dedup_token_distinguishes_different_batch_boundaries() {
+        // Without the length prefix these two hash identically, and a
+        // dedup-capable sink would drop the second as a duplicate — losing data.
+        let a = [p(b"ab"), p(b"c")];
+        let b = [p(b"a"), p(b"bc")];
+        assert_ne!(
+            DedupToken::for_payloads(&a).to_hex(),
+            DedupToken::for_payloads(&b).to_hex()
+        );
+    }
+
+    #[test]
+    fn dedup_token_empty_batch_is_the_empty_sha256() {
+        // sha256 of zero bytes. An empty batch never reaches a sink in practice
+        // (the drain skips it), but the function must be total.
+        assert_eq!(
+            DedupToken::for_payloads(&[] as &[Payload]).to_hex(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn dedup_token_hex_forms_agree() {
+        let t = DedupToken::for_payloads(&[p(b"x")]);
+        assert_eq!(t.to_prefixed_hex(), format!("sha256:{}", t.to_hex()));
+        assert_eq!(t.to_hex().len(), 64);
+        assert!(
+            t.to_hex()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn dedup_token_round_trips_through_bytes() {
+        let t = DedupToken::for_payloads(&[p(b"x")]);
+        assert_eq!(DedupToken::from_bytes(*t.as_bytes()).to_hex(), t.to_hex());
+    }
+
+    #[test]
+    fn dedup_token_debug_is_hex_not_a_byte_array() {
+        let t = DedupToken::for_payloads(&[p(b"x")]);
+        let d = format!("{t:?}");
+        assert!(
+            d.contains(&t.to_hex()),
+            "Debug should show the hex digest: {d}"
+        );
+        assert!(
+            !d.contains('['),
+            "Debug should not dump the byte array: {d}"
+        );
+    }
+
+    /// Known-answer vector. This exact digest is what weir 1.x's ClickHouse sink
+    /// sent as `insert_deduplication_token` for this batch. If this test fails,
+    /// the algorithm changed and every deployment that deduplicates on the token
+    /// will stop recognising replays across the upgrade. Do not re-bless it —
+    /// fix the code.
+    #[test]
+    fn dedup_token_matches_the_weir_1_x_digest() {
+        let batch = [p(b"alpha"), p(b"beta"), p(b"gamma")];
+        assert_eq!(
+            DedupToken::for_payloads(&batch).to_hex(),
+            KNOWN_ANSWER_1_X,
+            "the dedup digest changed — see the doc comment"
+        );
     }
 }
