@@ -58,7 +58,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 use weir_core::Payload;
 
-use super::{CommitResult, Sink, SinkError, SinkHealth};
+use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
 
 /// How the HTTP sink frames a commit batch into HTTP requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -415,10 +415,10 @@ pub enum HttpSinkBuildError {
 }
 
 impl Sink for HttpSink {
-    type Record = Payload;
     type Error = HttpSinkError;
 
-    async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, HttpSinkError> {
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, HttpSinkError> {
+        let batch = batch.into_records();
         match self.config.batch_mode {
             HttpBatchMode::PerRecord => self.commit_per_record(batch).await,
             HttpBatchMode::Ndjson => self.commit_ndjson(batch).await,
@@ -436,10 +436,7 @@ impl Sink for HttpSink {
 
 impl HttpSink {
     /// Per-record commit: one POST per record, up to `concurrency` in flight.
-    async fn commit_per_record(
-        &self,
-        batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, HttpSinkError> {
+    async fn commit_per_record(&self, batch: Vec<Payload>) -> Result<CommitResult, HttpSinkError> {
         use futures_util::stream::StreamExt;
 
         let concurrency = self.config.concurrency.max(1);
@@ -501,10 +498,7 @@ impl HttpSink {
     /// corrupt the batch they are **dead-lettered** with a clear reason and never
     /// sent. Use `sink_http_batch = "none"` (per-record mode) for payloads that
     /// may contain newlines.
-    async fn commit_ndjson(
-        &self,
-        batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, HttpSinkError> {
+    async fn commit_ndjson(&self, batch: Vec<Payload>) -> Result<CommitResult, HttpSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult::new(vec![], vec![]));
         }
@@ -784,7 +778,7 @@ mod tests {
             spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
         let result = sink
-            .commit(vec![p(b"alpha"), p(b"beta"), p(b"gamma")])
+            .commit(SinkBatch::from(vec![p(b"alpha"), p(b"beta"), p(b"gamma")]))
             .await
             .unwrap();
         assert_eq!(result.committed.len(), 3);
@@ -804,7 +798,7 @@ mod tests {
         c.concurrency = 4;
         let sink = HttpSink::new(c).unwrap();
         let batch = vec![p(b"r0"), p(b"r1"), p(b"r2"), p(b"r3"), p(b"r4")];
-        let result = sink.commit(batch.clone()).await.unwrap();
+        let result = sink.commit(SinkBatch::from(batch.clone())).await.unwrap();
         assert_eq!(result.committed, batch);
         assert!(result.dead_lettered.is_empty());
     }
@@ -857,10 +851,11 @@ mod tests {
         let batch: Vec<Payload> = (0..N)
             .map(|i| Payload::from(format!("rec{i}").into_bytes()))
             .collect();
-        let result = tokio::time::timeout(Duration::from_secs(5), sink.commit(batch))
-            .await
-            .expect("commit deadlocked — POSTs did not run concurrently")
-            .unwrap();
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), sink.commit(SinkBatch::from(batch)))
+                .await
+                .expect("commit deadlocked — POSTs did not run concurrently")
+                .unwrap();
         assert_eq!(result.committed.len(), N);
     }
 
@@ -871,7 +866,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink.commit(vec![p(b"alpha")]).await.unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap();
         assert!(result.committed.is_empty());
         assert_eq!(result.dead_lettered.len(), 1);
         let (_, reason) = &result.dead_lettered[0];
@@ -893,7 +891,7 @@ mod tests {
         let resp: &'static str = Box::leak(resp.into_boxed_str());
         let (url, _counter) = spawn_mock_server(vec![resp]).await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink.commit(vec![p(b"x")]).await.unwrap();
+        let result = sink.commit(SinkBatch::from(vec![p(b"x")])).await.unwrap();
         assert_eq!(result.dead_lettered.len(), 1);
         let (_, reason) = &result.dead_lettered[0];
         assert!(reason.contains("400"), "reason: {reason}");
@@ -910,7 +908,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "500 must be transient: {err}");
         assert!(
             matches!(err, HttpSinkError::TransientStatus { status, .. } if status.as_u16() == 500)
@@ -925,7 +926,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "429 must be transient: {err}");
     }
 
@@ -936,7 +940,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "408 must be transient: {err}");
     }
 
@@ -950,7 +957,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink.commit(vec![p(b"alpha")]).await.unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap();
         assert!(
             result.committed.is_empty(),
             "a redirected POST must never be reported committed"
@@ -970,7 +980,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink.commit(vec![p(b"alpha")]).await.unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap();
         assert_eq!(result.dead_lettered.len(), 1);
     }
 
@@ -978,7 +991,10 @@ mod tests {
     async fn connect_refused_is_transient() {
         // Pick a port that's almost certainly closed.
         let sink = HttpSink::new(cfg("http://127.0.0.1:1/")).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(
             err.is_transient(),
             "connect refused must be transient: {err}"
@@ -996,7 +1012,10 @@ mod tests {
         // ` for url (<url>)` with the FULL url (incl. userinfo) unless stripped.
         let sink =
             HttpSink::new(cfg("http://weiruser:s3cr3t-passw0rd@127.0.0.1:1/ingest")).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(
             err.is_transient(),
             "connect refused must be transient: {err}"
@@ -1037,7 +1056,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let result = sink.commit(vec![p(b"a"), p(b"b"), p(b"c")]).await.unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"a"), p(b"b"), p(b"c")]))
+            .await
+            .unwrap();
         assert_eq!(result.committed.len(), 2);
         assert_eq!(result.dead_lettered.len(), 1);
     }
@@ -1052,7 +1074,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a"), p(b"b")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient());
     }
 
@@ -1087,7 +1112,7 @@ mod tests {
         c.concurrency = 8;
         let sink = HttpSink::new(c).unwrap();
         let result = sink
-            .commit(vec![p(b"good-1"), p(b"bad"), p(b"good-2")])
+            .commit(SinkBatch::from(vec![p(b"good-1"), p(b"bad"), p(b"good-2")]))
             .await
             .unwrap();
 
@@ -1154,7 +1179,7 @@ mod tests {
         let batch = vec![p(b"boom"), p(b"slow-1"), p(b"slow-2"), p(b"slow-3")];
 
         let start = tokio::time::Instant::now();
-        let err = tokio::time::timeout(Duration::from_secs(3), sink.commit(batch))
+        let err = tokio::time::timeout(Duration::from_secs(3), sink.commit(SinkBatch::from(batch)))
             .await
             .expect("commit must return promptly, not wait out the stalled in-flight POSTs")
             .unwrap_err();
@@ -1190,7 +1215,7 @@ mod tests {
             spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
         let batch = vec![p(b"alpha"), p(b"beta"), p(b"gamma")];
-        let result = sink.commit(batch.clone()).await.unwrap();
+        let result = sink.commit(SinkBatch::from(batch.clone())).await.unwrap();
         assert_eq!(result.committed, batch);
         assert!(result.dead_lettered.is_empty());
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1211,7 +1236,7 @@ mod tests {
         .await;
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
         let batch = vec![p(b"alpha"), p(b"beta"), p(b"gamma")];
-        let result = sink.commit(batch).await.unwrap();
+        let result = sink.commit(SinkBatch::from(batch)).await.unwrap();
         assert!(result.committed.is_empty());
         assert_eq!(result.dead_lettered.len(), 3);
         for (_, reason) in &result.dead_lettered {
@@ -1229,7 +1254,7 @@ mod tests {
         .await;
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
         let err = sink
-            .commit(vec![p(b"alpha"), p(b"beta")])
+            .commit(SinkBatch::from(vec![p(b"alpha"), p(b"beta")]))
             .await
             .unwrap_err();
         assert!(err.is_transient(), "503 must be transient: {err}");
@@ -1290,7 +1315,7 @@ mod tests {
         });
 
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
-        sink.commit(vec![p(b"alpha"), p(b"beta"), p(b"gamma")])
+        sink.commit(SinkBatch::from(vec![p(b"alpha"), p(b"beta"), p(b"gamma")]))
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1346,7 +1371,11 @@ mod tests {
             spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
         let result = sink
-            .commit(vec![p(b"clean"), p(b"line1\nline2"), p(b"also-clean")])
+            .commit(SinkBatch::from(vec![
+                p(b"clean"),
+                p(b"line1\nline2"),
+                p(b"also-clean"),
+            ]))
             .await
             .unwrap();
         assert_eq!(result.committed, vec![p(b"clean"), p(b"also-clean")]);
@@ -1372,7 +1401,10 @@ mod tests {
         let (url, counter) =
             spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
-        let result = sink.commit(vec![p(b"a\nb"), p(b"c\rd")]).await.unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"a\nb"), p(b"c\rd")]))
+            .await
+            .unwrap();
         assert!(result.committed.is_empty());
         assert_eq!(result.dead_lettered.len(), 2);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1384,7 +1416,7 @@ mod tests {
         let (url, counter) =
             spawn_mock_server(vec!["HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]).await;
         let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
-        let result = sink.commit(vec![]).await.unwrap();
+        let result = sink.commit(SinkBatch::from(vec![])).await.unwrap();
         assert!(result.committed.is_empty());
         assert!(result.dead_lettered.is_empty());
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1485,7 +1517,9 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let url = spawn_header_capture_server(Arc::clone(&captured)).await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        sink.commit(vec![p(b"hello, weir")]).await.unwrap();
+        sink.commit(SinkBatch::from(vec![p(b"hello, weir")]))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let headers = captured.lock().unwrap();
@@ -1508,7 +1542,9 @@ mod tests {
         let mut c = cfg(&url);
         c.send_idempotency_key = false;
         let sink = HttpSink::new(c).unwrap();
-        sink.commit(vec![p(b"hello, weir")]).await.unwrap();
+        sink.commit(SinkBatch::from(vec![p(b"hello, weir")]))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let headers = captured.lock().unwrap();
@@ -1618,7 +1654,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient());
         assert_eq!(err.retry_after(), Some(Duration::from_secs(7)));
     }
@@ -1630,7 +1669,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient());
         assert_eq!(err.retry_after(), None);
     }
@@ -1644,7 +1686,10 @@ mod tests {
         ])
         .await;
         let sink = HttpSink::new(cfg(&url)).unwrap();
-        let err = sink.commit(vec![p(b"alpha")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient());
         assert_eq!(err.retry_after(), None);
     }
@@ -1674,7 +1719,7 @@ mod tests {
         let mut c = cfg(&url);
         c.bearer_token = Some(Arc::from("s3cr3t-token"));
         let sink = HttpSink::new(c).unwrap();
-        sink.commit(vec![p(b"rec")]).await.unwrap();
+        sink.commit(SinkBatch::from(vec![p(b"rec")])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let headers = captured.lock().unwrap();
@@ -1693,7 +1738,7 @@ mod tests {
         let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let url = spawn_header_capture_server(Arc::clone(&captured)).await;
         let sink = HttpSink::new(cfg(&url)).unwrap(); // bearer_token: None
-        sink.commit(vec![p(b"rec")]).await.unwrap();
+        sink.commit(SinkBatch::from(vec![p(b"rec")])).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let headers = captured.lock().unwrap();

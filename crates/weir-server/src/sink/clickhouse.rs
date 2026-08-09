@@ -31,7 +31,7 @@ use std::time::Duration;
 use weir_core::Payload;
 
 use super::sql_common;
-use super::{CommitResult, Sink, SinkHealth};
+use super::{CommitResult, Sink, SinkBatch, SinkHealth};
 
 /// ClickHouse identifier length cap. ClickHouse's own limit is generous; 63 is
 /// a safe conservative bound (shared with the PG sink's `NAMEDATALEN - 1`).
@@ -309,13 +309,10 @@ fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
 }
 
 impl Sink for ClickHouseSink {
-    type Record = Payload;
     type Error = sql_common::SqlSinkError;
 
-    async fn commit(
-        &self,
-        batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, sql_common::SqlSinkError> {
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, sql_common::SqlSinkError> {
+        let batch = batch.into_records();
         if batch.is_empty() {
             return Ok(CommitResult::new(Vec::new(), Vec::new()));
         }
@@ -754,7 +751,10 @@ mod tests {
     async fn commit_2xx_commits_batch_and_sends_query_and_dedup_token() {
         let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let result = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"a"), p(b"b")]))
+            .await
+            .unwrap();
         assert_eq!(result.committed.len(), 2);
         assert!(result.dead_lettered.is_empty());
 
@@ -776,7 +776,7 @@ mod tests {
         // Inject userinfo into the authority: http://weiruser:s3cr3t@host/
         let cred_url = url.replacen("http://", "http://weiruser:s3cr3t@", 1);
         let sink = ClickHouseSink::new(cfg(&cred_url, "weir_records", "payload")).unwrap();
-        sink.commit(vec![p(b"a")]).await.unwrap();
+        sink.commit(SinkBatch::from(vec![p(b"a")])).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let reqs = captured.lock().unwrap();
@@ -802,7 +802,10 @@ mod tests {
         let (url, _c) =
             spawn_ch_mock("HTTP/1.1 500 Internal Server Error", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "500 must be transient: {err}");
     }
 
@@ -810,7 +813,10 @@ mod tests {
     async fn commit_429_is_transient() {
         let (url, _c) = spawn_ch_mock("HTTP/1.1 429 Too Many Requests", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "429 must be transient: {err}");
     }
 
@@ -826,7 +832,10 @@ mod tests {
         )
         .await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(!err.is_transient(), "a redirect must be permanent: {err}");
         let msg = err.to_string();
         assert!(msg.contains("302"), "{msg}");
@@ -842,7 +851,10 @@ mod tests {
         )
         .await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(!err.is_transient(), "400 must be permanent: {err}");
         let msg = err.to_string();
         assert!(msg.contains("400"), "{msg}");
@@ -856,10 +868,13 @@ mod tests {
         let mut c = cfg(&url, "weir_records", "payload");
         c.timeout = Duration::from_millis(300);
         let sink = ClickHouseSink::new(c).unwrap();
-        let err = tokio::time::timeout(Duration::from_secs(2), sink.commit(vec![p(b"a")]))
-            .await
-            .expect("commit must honour its own timeout, not hang")
-            .unwrap_err();
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            sink.commit(SinkBatch::from(vec![p(b"a")])),
+        )
+        .await
+        .expect("commit must honour its own timeout, not hang")
+        .unwrap_err();
         // A timeout is classified transient (retry the segment).
         assert!(err.is_transient(), "timeout must be transient: {err}");
     }
@@ -868,7 +883,7 @@ mod tests {
     async fn commit_empty_batch_makes_no_request() {
         let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let result = sink.commit(vec![]).await.unwrap();
+        let result = sink.commit(SinkBatch::from(vec![])).await.unwrap();
         assert!(result.committed.is_empty() && result.dead_lettered.is_empty());
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(

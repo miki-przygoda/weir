@@ -46,7 +46,7 @@ use crate::{
         DrainStateLabel, DrainStateValue, Metrics, Outcome, OutcomeLabel, SinkHealthLabel,
         SinkHealthState,
     },
-    sink::{Sink, SinkError, SinkHealth, SinkRecord},
+    sink::{Sink, SinkError, SinkHealth},
     wab::{SegmentReader, read_segment_record_count},
 };
 
@@ -1093,19 +1093,28 @@ async fn commit_batch<S: Sink>(
     metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
 ) -> BatchResult {
-    // Convert payloads to the sink's record type. Cloning here keeps the original
-    // payloads available for dead-lettering on a Permanent error.
-    let records: Vec<S::Record> = payloads
-        .iter()
-        .cloned()
-        .map(S::Record::from_payload)
-        .collect();
+    // Derive the batch's dedup token. This runs on the drain thread — off the
+    // fsync path entirely — and costs ~170 us per 256 KiB against a sink commit
+    // measured in milliseconds.
+    //
+    // Batch-scoped, not segment-scoped: `process_segment` splits a segment into
+    // `max_batch_size` chunks and calls this once per chunk, so a token shared
+    // across chunks would make a dedup-capable sink discard every chunk after
+    // the first.
+    let dedup_token = weir_sink_sdk::DedupToken::for_payloads(payloads.iter());
+
+    // Clone into an owned Vec so the caller's `payloads` stay available for
+    // dead-lettering on a Permanent error. `Payload` is `Bytes`, so each clone
+    // is a refcount bump. (weir 1.x also ran every payload through
+    // `SinkRecord::from_payload` here; that conversion was the identity in every
+    // implementation that ever existed, and 2.0 removes it.)
+    let batch = weir_sink_sdk::SinkBatch::new(payloads.to_vec(), dedup_token);
 
     let t = std::time::Instant::now();
     // Backstop timeout: a sink that hangs (e.g. a third-party sink with no
     // internal timeout) must not stall the drain forever. On elapse, treat it
     // as a transient error so the segment is retried.
-    let commit = match tokio::time::timeout(config.commit_timeout, sink.commit(records)).await {
+    let commit = match tokio::time::timeout(config.commit_timeout, sink.commit(batch)).await {
         Ok(inner) => inner,
         Err(_elapsed) => {
             metrics
@@ -1159,7 +1168,7 @@ async fn commit_batch<S: Sink>(
                 let dead_payloads: Vec<Payload> = commit_result
                     .dead_lettered
                     .into_iter()
-                    .map(|(r, _reason)| r.into_payload())
+                    .map(|(payload, _reason)| payload)
                     .collect();
                 // A failed dead-letter write (or a cap block) must NOT fall through
                 // to Ok: confirming would delete the segment with these records
@@ -1288,6 +1297,7 @@ fn estimated_write_bytes(payloads: &[Payload]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::SinkBatch;
     use crate::{
         metrics::Metrics,
         sink::{CommitResult, SinkHealth},
@@ -1375,7 +1385,7 @@ mod tests {
         }
     }
 
-    type MockResult = Result<CommitResult<Payload>, MockError>;
+    type MockResult = Result<CommitResult, MockError>;
 
     struct MockSink {
         responses: Mutex<VecDeque<MockResult>>,
@@ -1521,10 +1531,10 @@ mod tests {
     }
 
     impl crate::sink::Sink for MockSink {
-        type Record = Payload;
         type Error = MockError;
 
-        async fn commit(&self, batch: Vec<Payload>) -> MockResult {
+        async fn commit(&self, batch: SinkBatch) -> MockResult {
+            let batch = batch.into_records();
             let nth = self.call_count.fetch_add(1, Ordering::Relaxed) + 1;
             self.call_timestamps.lock().unwrap().push(Instant::now());
             if nth <= self.panic_calls {
@@ -1687,7 +1697,7 @@ mod tests {
     #[test]
     fn commit_result_separates_committed_and_dead_lettered() {
         let p: Payload = Payload::from(b"hello".as_ref());
-        let result: CommitResult<Payload> =
+        let result: CommitResult =
             CommitResult::new(vec![p.clone()], vec![(p.clone(), "reason".into())]);
         assert_eq!(result.committed.len(), 1);
         assert_eq!(result.dead_lettered.len(), 1);

@@ -12,14 +12,14 @@
 //! — no error type to hand-roll, no `is_transient` to write:
 //!
 //! ```
-//! use weir_sink_sdk::{CommitResult, Payload, Sink, SinkHealth};
+//! use weir_sink_sdk::{CommitResult, Payload, Sink, SinkBatch, SinkHealth};
 //!
 //! struct StdoutSink;
 //!
 //! impl Sink for StdoutSink {
-//!     type Record = Payload;
 //!     type Error = std::convert::Infallible; // this commit never returns Err
-//!     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Self::Error> {
+//!     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, Self::Error> {
+//!         let batch = batch.into_records();
 //!         for r in &batch {
 //!             println!("{} bytes", r.len());
 //!         }
@@ -71,61 +71,6 @@
 /// yourself (e.g. in a unit test) use `Payload::copy_from_slice(bytes)`,
 /// `Payload::from(&b"..."[..])`, or `Payload::from(vec_of_u8)`.
 pub use weir_core::Payload;
-
-/// A record type carried through the drain pipeline.
-///
-/// The simplest implementation is `type Record = Payload` (opaque bytes). Richer
-/// sinks can define a concrete record type that deserialises the payload.
-///
-/// # Footgun
-///
-/// The two dead-letter paths recover bytes differently, and a custom record type
-/// can make them disagree:
-///
-/// - **Per-record** (a successful `commit` that returns records in
-///   [`CommitResult::dead_lettered`]): the drain calls [`into_payload`] on each
-///   rejected record to recover the bytes it writes to the dead-letter store.
-/// - **Whole-batch `Err`** (`commit` returns a permanent error): the typed
-///   records were moved into `commit` and are gone, so the drain dead-letters the
-///   **original** raw segment payload bytes — the same bytes it passed to
-///   [`from_payload`] — and never calls [`into_payload`] at all.
-///
-/// **Rule:** if `into_payload(from_payload(x))` is not byte-identical to `x`,
-/// your dead-letter bytes differ between the per-record path (uses
-/// [`into_payload`]) and the whole-batch-`Err` path (uses the original payload) —
-/// make the round-trip byte-preserving, or carry the raw payload inside your
-/// record. For the identity [`Payload`] record the round-trip is exact, so the
-/// two paths always agree.
-///
-/// [`into_payload`]: SinkRecord::into_payload
-/// [`from_payload`]: SinkRecord::from_payload
-pub trait SinkRecord: Send + 'static {
-    /// Build the record from the raw payload bytes handed over by the drain.
-    fn from_payload(payload: Payload) -> Self;
-
-    /// Recover the raw payload bytes for a record the sink returned in
-    /// [`CommitResult::dead_lettered`].
-    ///
-    /// Called on the **per-record** dead-letter path only: when a `commit` call
-    /// succeeds but reports some records as permanently rejected, the drain calls
-    /// `into_payload` on each to recover the bytes it writes to the dead-letter
-    /// store. It is **not** called when `commit` returns `Err` — see the
-    /// [`SinkRecord`] type-level `# Footgun` for the whole-batch-`Err` divergence
-    /// and the byte-preserving round-trip rule.
-    fn into_payload(self) -> Payload;
-}
-
-/// `Payload` is the pass-through record: the drain hands raw bytes to the sink
-/// without interpretation.
-impl SinkRecord for Payload {
-    fn from_payload(payload: Payload) -> Self {
-        payload
-    }
-
-    fn into_payload(self) -> Payload {
-        self
-    }
-}
 
 /// An error returned by [`Sink::commit`].
 ///
@@ -204,7 +149,7 @@ impl SinkError for BasicSinkError {
 ///
 /// Conceptually, every record handed to [`Sink::commit`] should appear in
 /// exactly one of `committed` or `dead_lettered`. **Nothing enforces that set
-/// partition.** This type does not (the record type `R` carries no identity the
+/// partition.** This type does not (a [`Payload`] carries no identity the
 /// constructor could check), and the drain only validates total **count**
 /// coverage: it refuses to confirm a segment unless
 /// `committed.len() + dead_lettered.len()` equals the batch length. That count
@@ -221,7 +166,8 @@ impl SinkError for BasicSinkError {
 /// # Reading a `CommitResult`
 ///
 /// Both fields are public, so inspect them directly. `committed` is a
-/// `Vec<R>` of the accepted records; `dead_lettered` is a `Vec<(R, String)>`
+/// `Vec<Payload>` of the accepted records; `dead_lettered` is a
+/// `Vec<(Payload, String)>`
 /// pairing each permanently-rejected record with its human-readable reason.
 ///
 /// ```
@@ -271,7 +217,7 @@ impl SinkError for BasicSinkError {
 /// </div>
 ///
 /// ```
-/// use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth};
+/// use weir_sink_sdk::{CommitResult, DedupToken, Payload, Sink, SinkBatch, SinkError, SinkHealth};
 ///
 /// /// Minimal std-only executor: drives a future to completion by polling with
 /// /// a no-op waker. ONLY for a sink whose `commit`/`health` are immediately
@@ -292,9 +238,9 @@ impl SinkError for BasicSinkError {
 /// // A sink that dead-letters anything equal to `b"reject"` and commits the rest.
 /// struct MySink;
 /// impl Sink for MySink {
-///     type Record = Payload;
 ///     type Error = std::convert::Infallible;
-///     async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Self::Error> {
+///     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, Self::Error> {
+///         let batch = batch.into_records();
 ///         let (mut ok, mut dead) = (Vec::new(), Vec::new());
 ///         for r in batch {
 ///             if r.as_ref() == b"reject" {
@@ -310,10 +256,11 @@ impl SinkError for BasicSinkError {
 ///     }
 /// }
 ///
-/// let batch = vec![
+/// let records = vec![
 ///     Payload::from(b"keep".as_ref()),
 ///     Payload::from(b"reject".as_ref()),
 /// ];
+/// let batch = SinkBatch::new(records.clone(), DedupToken::for_payloads(records.iter()));
 /// // Drive the async commit to completion synchronously, then read the result.
 /// let result = block_on(MySink.commit(batch)).unwrap();
 /// assert_eq!(result.committed.len(), 1);
@@ -322,14 +269,14 @@ impl SinkError for BasicSinkError {
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct CommitResult<R> {
+pub struct CommitResult {
     /// Records the sink accepted.
-    pub committed: Vec<R>,
+    pub committed: Vec<Payload>,
     /// Records the sink permanently rejected, each with a human-readable reason.
-    pub dead_lettered: Vec<(R, String)>,
+    pub dead_lettered: Vec<(Payload, String)>,
 }
 
-impl<R> CommitResult<R> {
+impl CommitResult {
     /// Builds a commit result from the accepted and permanently-rejected records.
     ///
     /// Every record passed to [`Sink::commit`] should appear in exactly one of the
@@ -337,7 +284,7 @@ impl<R> CommitResult<R> {
     /// by identity (only total count coverage is checked) — see the type-level
     /// note for the failure mode and the author warning.
     #[must_use]
-    pub fn new(committed: Vec<R>, dead_lettered: Vec<(R, String)>) -> Self {
+    pub fn new(committed: Vec<Payload>, dead_lettered: Vec<(Payload, String)>) -> Self {
         Self {
             committed,
             dead_lettered,
@@ -447,24 +394,117 @@ impl std::fmt::Debug for DedupToken {
     }
 }
 
+/// One batch of records on its way to [`Sink::commit`], with the
+/// [`DedupToken`] the drain derived from it.
+///
+/// The token is **batch-scoped, not segment-scoped**. The drain splits each
+/// sealed segment into `sink_max_batch_size` chunks and calls `commit` once per
+/// chunk; a token shared across those chunks would make a dedup-capable sink
+/// discard every chunk after the first. See [`DedupToken`] for the stability
+/// precondition that comes with it.
+///
+/// Records are [`Payload`] — opaque bytes. weir 1.x let a sink pick its own
+/// record type via `Sink::Record`, but the only implementation was ever the
+/// identity on `Payload`, so 2.0 drops the generic and its no-op conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkBatch {
+    records: Vec<Payload>,
+    dedup_token: DedupToken,
+}
+
+impl SinkBatch {
+    /// Builds a batch. The drain calls this; sink authors need it to construct
+    /// realistic input in their own tests.
+    pub fn new(records: Vec<Payload>, dedup_token: DedupToken) -> Self {
+        Self {
+            records,
+            dedup_token,
+        }
+    }
+
+    /// The records, borrowed.
+    pub fn records(&self) -> &[Payload] {
+        &self.records
+    }
+
+    /// Consumes the batch for its records, discarding the token. This is the
+    /// one-line migration for a sink written against weir 1.x:
+    /// `let batch = batch.into_records();` at the top of `commit`.
+    pub fn into_records(self) -> Vec<Payload> {
+        self.records
+    }
+
+    /// Consumes the batch for both halves.
+    pub fn into_parts(self) -> (Vec<Payload>, DedupToken) {
+        (self.records, self.dedup_token)
+    }
+
+    /// The batch's idempotency handle.
+    pub fn dedup_token(&self) -> &DedupToken {
+        &self.dedup_token
+    }
+
+    /// Number of records in the batch.
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the batch carries no records.
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+/// Builds a batch whose token is derived from its own records — the same thing
+/// the drain does, and the convenient form for a sink author's tests.
+///
+/// Use [`SinkBatch::new`] instead when you need to pin a specific token, e.g. to
+/// assert that your sink forwards it unchanged.
+impl From<Vec<Payload>> for SinkBatch {
+    fn from(records: Vec<Payload>) -> Self {
+        let dedup_token = DedupToken::for_payloads(records.iter());
+        Self {
+            records,
+            dedup_token,
+        }
+    }
+}
+
 /// A downstream commit target for weir records.
 ///
 /// The drain calls [`commit`](Sink::commit) with batches of records read from
 /// sealed segments. Implementations may be async (tokio, sqlx, reqwest, …); they
 /// run on a dedicated single-threaded tokio runtime in the drain thread.
 pub trait Sink: Send + Sync + 'static {
-    /// The record type this sink consumes (often just [`Payload`]).
-    type Record: SinkRecord;
     /// The error type this sink returns; must classify transient vs permanent.
     type Error: SinkError;
 
     /// Commit a batch of records. Returns the committed records and any
     /// permanently rejected ones. Return `Err(e)` with `e.is_transient() == true`
     /// to have the drain retry the whole segment.
-    async fn commit(
-        &self,
-        batch: Vec<Self::Record>,
-    ) -> Result<CommitResult<Self::Record>, Self::Error>;
+    ///
+    /// # Migrating from weir 1.x
+    ///
+    /// Two changes. `Sink::Record` is gone — records are always [`Payload`], as
+    /// they always were in practice — and the parameter is now a [`SinkBatch`]
+    /// carrying the batch's [`DedupToken`]. A sink that does not want the token
+    /// needs one deleted line and one added line:
+    ///
+    /// ```ignore
+    /// impl Sink for MySink {
+    ///     // type Record = Payload;          <- delete this
+    ///     type Error = MyError;
+    ///
+    ///     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MyError> {
+    ///         let batch = batch.into_records();   // <- add this
+    ///         // ... the rest of your 1.x body, unchanged
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// A sink whose downstream can deduplicate should instead read
+    /// [`SinkBatch::dedup_token`] and pass it along — see [`DedupToken`].
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, Self::Error>;
 
     /// Maximum number of records per `commit` call. The drain splits larger
     /// segments into sub-batches of this size.
@@ -525,9 +565,9 @@ mod tests {
             committed: AtomicUsize,
         }
         impl Sink for CountingSink {
-            type Record = Payload;
             type Error = Never;
-            async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, Never> {
+            async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, Never> {
+                let batch = batch.into_records();
                 let (mut ok, mut dead) = (Vec::new(), Vec::new());
                 for r in batch {
                     if r.as_ref() == b"reject" {
@@ -547,11 +587,12 @@ mod tests {
         let sink = CountingSink {
             committed: AtomicUsize::new(0),
         };
-        let batch = vec![
+        let records = vec![
             Payload::copy_from_slice(b"keep-1"),
             Payload::copy_from_slice(b"reject"),
             Payload::copy_from_slice(b"keep-2"),
         ];
+        let batch = SinkBatch::new(records.clone(), DedupToken::for_payloads(records.iter()));
         let result = block_on(sink.commit(batch)).unwrap();
         assert_eq!(result.committed.len(), 2);
         assert_eq!(result.dead_lettered.len(), 1);
@@ -583,14 +624,6 @@ mod tests {
         assert_eq!(&r.committed[0][..], b"a");
         assert_eq!(&r.dead_lettered[0].0[..], b"b");
         assert_eq!(r.dead_lettered[0].1, "rejected");
-    }
-
-    #[test]
-    fn the_payload_record_is_an_identity_round_trip() {
-        // The built-in pass-through record: from_payload/into_payload are inverses.
-        let p = Payload::from(b"weir".as_ref());
-        let recovered = <Payload as SinkRecord>::from_payload(p.clone()).into_payload();
-        assert_eq!(&recovered[..], &p[..]);
     }
 
     // ── DedupToken ────────────────────────────────────────────────────────────
@@ -693,5 +726,41 @@ mod tests {
             KNOWN_ANSWER_1_X,
             "the dedup digest changed — see the doc comment"
         );
+    }
+
+    // ── SinkBatch ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sink_batch_exposes_records_and_token() {
+        let token = DedupToken::for_payloads(&[p(b"a")]);
+        let batch = SinkBatch::new(vec![p(b"a"), p(b"b")], token);
+
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.records(), &[p(b"a"), p(b"b")][..]);
+        assert_eq!(batch.dedup_token().to_hex(), token.to_hex());
+    }
+
+    #[test]
+    fn sink_batch_into_records_is_the_migration_path() {
+        // The whole third-party migration: one line at the top of commit().
+        let batch = SinkBatch::new(vec![p(b"a")], DedupToken::for_payloads(&[p(b"a")]));
+        let records: Vec<Payload> = batch.into_records();
+        assert_eq!(records, vec![p(b"a")]);
+    }
+
+    #[test]
+    fn sink_batch_into_parts_yields_both() {
+        let token = DedupToken::for_payloads(&[p(b"a")]);
+        let (records, t) = SinkBatch::new(vec![p(b"a")], token).into_parts();
+        assert_eq!(records, vec![p(b"a")]);
+        assert_eq!(t.to_hex(), token.to_hex());
+    }
+
+    #[test]
+    fn sink_batch_empty_is_empty() {
+        let batch = SinkBatch::new(vec![], DedupToken::for_payloads(&[] as &[Payload]));
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
     }
 }
