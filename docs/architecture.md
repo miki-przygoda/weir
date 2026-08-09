@@ -102,8 +102,8 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 
 - `Sink` trait uses native async fn in trait (AFIT, stable since Rust 1.75). The drain is generic `spawn<S: Sink>` to avoid `dyn Sink` object-safety issues with AFIT.
 - `SinkError::is_transient()` classifies errors: transient errors trigger exponential backoff retry of the whole segment; permanent errors dead-letter the batch.
-- `CommitResult<R>` splits a batch into `committed` and `dead_lettered` records — partial success is a first-class outcome, not an error.
-- `SinkRecord` trait decouples the drain's `Payload` bytes from the sink's own record type; pass-through implementation (`impl SinkRecord for Payload`) is provided.
+- `CommitResult` splits a batch into `committed` and `dead_lettered` records — partial success is a first-class outcome, not an error.
+- `SinkBatch` carries the batch's records alongside a `DedupToken`, a content-derived idempotency handle (`sha256` over length-delimited payloads) that any sink can forward to a downstream capable of deduplicating on it.
 - `SinkHealth` (`Healthy / Degraded / Down`) is surfaced via the `weir_sink_health` gauge; queried per-segment by the drain and on a 30 s wall-clock interval so the gauge stays current during idle deployment and `BlockedDeadLetterFull`. Degraded / Down states log the sink-supplied reason at `warn` / `error`.
 
 **Built-in sinks** (`sink_type` config value):
@@ -272,9 +272,9 @@ A couple of deliberate choices a contributor should know:
   SemVer-additive; removing one is breaking — so the bar to *add* is "a real
   deployment would plausibly need to change this," not "someone might." See the
   [Configuration reference](operations/configuration.md).
-- **`Sink::Record` / `SinkRecord` is a known over-generalisation.** The drain is
-  generic over a record type, but the only implementation is the identity on
-  `Payload`, and every built-in sink uses `type Record = Payload`. It's wired but
-  effectively a no-op everywhere. It's part of the **frozen 1.0** `Sink` trait, so
-  it can't be removed without a major version; flagged here as a deliberate
-  candidate to drop in a hypothetical 2.0, not a bug.
+- **`Sink::Record` / `SinkRecord` was removed in 2.0.** The drain used to be
+  generic over a record type, but the only implementation was ever the identity
+  on `Payload` and every built-in sink used `type Record = Payload`, so the
+  conversion was a no-op that allocated and cloned once per batch. Being part of
+  the frozen 1.0 `Sink` trait, it could only go at a major. Records are now
+  `Payload` throughout.

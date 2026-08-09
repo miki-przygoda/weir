@@ -15,6 +15,69 @@ protocol** below.
 
 ## [Unreleased]
 
+**This is a major release.** The `Sink` trait changes shape; the wire protocol,
+`weir-core`, and `weir-client` do not, so **no producer needs recompiling** and
+no existing deployment's clients are affected.
+
+### Added
+
+- **`weir-sink-sdk` — `SinkBatch` and `DedupToken`.** Every sink now receives a
+  content-derived, batch-scoped idempotency handle alongside its records:
+  `sha256(len(p₀) ++ p₀ ++ …)` with 8-byte little-endian length prefixes, in
+  delivery order. The length prefix is load-bearing — without it `["ab","c"]`
+  and `["a","bc"]` collide, and a dedup-capable sink would drop the second as a
+  duplicate. `DedupToken::to_prefixed_hex()` yields the `sha256:<hex>` form an
+  HTTP `Idempotency-Key` wants.
+
+  The digest is byte-identical to the token 1.x's ClickHouse sink computed
+  privately, pinned by known-answer vectors in **both** crates (two deliberately
+  independent copies, so editing one alone turns the build red). **The guarantee
+  holds only while `sink_max_batch_size` is stable** — changing it across a
+  restart re-splits replayed segments into differently sized batches whose
+  tokens will not match.
+
+### Changed
+
+- **BREAKING — the `Sink` trait is reshaped.** `commit` takes a `SinkBatch`
+  instead of `Vec<Self::Record>`, and **`SinkRecord` / `Sink::Record` are
+  removed** — records are `Payload`, as every implementation that ever existed
+  already assumed. `CommitResult` loses its type parameter accordingly.
+  Migrating a sink written against 1.x is one deleted line and one added line:
+
+  ```rust
+  impl Sink for MySink {
+  -   type Record = Payload;
+      type Error = MyError;
+      async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MyError> {
+  +       let batch = batch.into_records();
+          // ... the rest of your 1.x body, unchanged
+  ```
+
+  A sink whose downstream can deduplicate should instead read
+  `batch.dedup_token()`. Dropping the associated type also removes a per-batch
+  allocation and clone in the drain: `map(S::Record::from_payload)` was the
+  identity in every implementation, and the dead-letter path's matching
+  `into_payload` is gone with it. It also removes a real footgun — the two
+  dead-letter paths recovered bytes differently, so a non-byte-preserving
+  `from_payload`/`into_payload` round-trip made them disagree.
+
+- **BREAKING (behaviour) — the HTTP sink's ndjson `Idempotency-Key` changed
+  value.** It was `sha256:<hex>` of the joined NDJSON request body; it is now
+  the batch dedup token, `sha256:<hex>` of the length-delimited payloads. The
+  header is still present and still `sha256:`-prefixed, but **an endpoint
+  deduplicating on the old key will not recognise a retry that spans the
+  upgrade** — a batch in flight across the upgrade can be delivered twice.
+  Per-record mode is unchanged: it still sends a per-record key, since a batch
+  token means nothing there.
+
+- **`ClickHouseSink` uses the shared token** instead of its own private
+  `dedup_token`. `insert_deduplication_token` is byte-for-byte unchanged, so a
+  ClickHouse deployment deduplicates correctly across the upgrade. The wire test
+  previously asserted only that the parameter was *present*; it now asserts its
+  value, so a changed digest cannot pass unnoticed.
+
+---
+
 Defects found by the chaos fault-injection harness (`chaos/`) on its first live
 run — 20 episodes, 20 `kill -9`s, 86 replayed segments. No data-loss defects;
 both are observability / behaviour-under-shutdown fixes.

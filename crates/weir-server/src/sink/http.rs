@@ -59,6 +59,7 @@ use tracing::{debug, warn};
 use weir_core::Payload;
 
 use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
+use weir_sink_sdk::DedupToken;
 
 /// How the HTTP sink frames a commit batch into HTTP requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -189,14 +190,20 @@ impl HttpSink {
     }
 
     /// Single POST of a whole batch as newline-delimited (NDJSON) bodies, with
-    /// one per-batch Idempotency-Key (sha256 of the joined body). The endpoint
+    /// one per-batch Idempotency-Key — the batch's dedup token. The endpoint
     /// returns one status for the whole batch, so the result is all-or-nothing.
-    async fn post_batch(&self, body: Vec<u8>) -> Result<(), HttpSinkError> {
+    async fn post_batch(&self, body: Vec<u8>, token: &DedupToken) -> Result<(), HttpSinkError> {
         let mut req = self
             .base_request()
             .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson");
         if self.config.send_idempotency_key {
-            req = req.header("Idempotency-Key", payload_idempotency_key(&body));
+            // The batch's dedup token, not a hash of this body. The two differ
+            // when the batch contained newline-bearing records: those are
+            // dead-lettered rather than framed, so the body is a subset. That is
+            // fine and slightly stronger — the token is stable for a given batch
+            // regardless of how the framing logic partitions it, so a replayed
+            // batch still presents the same key.
+            req = req.header("Idempotency-Key", token.to_prefixed_hex());
         }
         self.send_and_classify(req.body(body)).await
     }
@@ -418,10 +425,14 @@ impl Sink for HttpSink {
     type Error = HttpSinkError;
 
     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, HttpSinkError> {
-        let batch = batch.into_records();
         match self.config.batch_mode {
-            HttpBatchMode::PerRecord => self.commit_per_record(batch).await,
-            HttpBatchMode::Ndjson => self.commit_ndjson(batch).await,
+            // Per-record mode gives each request its own key derived from that
+            // record, so the batch token means nothing here.
+            HttpBatchMode::PerRecord => self.commit_per_record(batch.into_records()).await,
+            HttpBatchMode::Ndjson => {
+                let (records, token) = batch.into_parts();
+                self.commit_ndjson(records, &token).await
+            }
         }
     }
 
@@ -498,7 +509,11 @@ impl HttpSink {
     /// corrupt the batch they are **dead-lettered** with a clear reason and never
     /// sent. Use `sink_http_batch = "none"` (per-record mode) for payloads that
     /// may contain newlines.
-    async fn commit_ndjson(&self, batch: Vec<Payload>) -> Result<CommitResult, HttpSinkError> {
+    async fn commit_ndjson(
+        &self,
+        batch: Vec<Payload>,
+        token: &DedupToken,
+    ) -> Result<CommitResult, HttpSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult::new(vec![], vec![]));
         }
@@ -536,7 +551,7 @@ impl HttpSink {
             body.push(b'\n');
         }
 
-        match self.post_batch(body).await {
+        match self.post_batch(body, token).await {
             Ok(()) => Ok(CommitResult::new(framable, dead_lettered)),
             Err(HttpSinkError::PermanentStatus {
                 status,
@@ -1264,7 +1279,8 @@ mod tests {
     async fn ndjson_sends_newline_framed_body_and_one_idempotency_key() {
         // Verify the wire format: records joined with '\n' (each terminated by
         // one), Content-Type application/x-ndjson, and a SINGLE per-batch
-        // Idempotency-Key (sha256 of the joined body).
+        // Idempotency-Key — the batch's dedup token, NOT a hash of the joined
+        // body (that changed at 2.0; see the CHANGELOG).
         let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1339,8 +1355,9 @@ mod tests {
             "missing/incorrect Content-Type:\n{}",
             headers[0]
         );
-        // Exactly one Idempotency-Key, computed over the joined body.
-        let expected_key = payload_idempotency_key(b"alpha\nbeta\ngamma\n");
+        // Exactly one Idempotency-Key, and it is the BATCH DEDUP TOKEN.
+        let records = [p(b"alpha"), p(b"beta"), p(b"gamma")];
+        let expected_key = DedupToken::for_payloads(records.iter()).to_prefixed_hex();
         let key_lines: Vec<&str> = headers[0]
             .lines()
             .filter(|l| l.to_ascii_lowercase().starts_with("idempotency-key:"))
@@ -1348,7 +1365,19 @@ mod tests {
         assert_eq!(key_lines.len(), 1, "expected exactly one Idempotency-Key");
         assert!(
             key_lines[0].contains(&expected_key),
-            "Idempotency-Key not over the joined body: {} (want {expected_key})",
+            "Idempotency-Key is not the batch dedup token: {} (want {expected_key})",
+            key_lines[0]
+        );
+        // And it is specifically NOT the old body hash — this is the 2.0
+        // behaviour change, so assert the break rather than only the new value.
+        let old_body_key = payload_idempotency_key(b"alpha\nbeta\ngamma\n");
+        assert_ne!(
+            expected_key, old_body_key,
+            "the 2.0 key must differ from the 1.x body-derived key"
+        );
+        assert!(
+            !key_lines[0].contains(&old_body_key),
+            "still sending the 1.x body-derived key: {}",
             key_lines[0]
         );
     }

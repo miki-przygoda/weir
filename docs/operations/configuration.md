@@ -978,8 +978,17 @@ newlines, use per-record mode (`sink_http_batch = "none"`), where each record is
 its own POST body and newlines are fine.
 
 **Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
-is sent for the whole batch, computed over the joined body. Because the
-key is a hash of the exact bytes, it inherits the same batch-stability
+is sent for the whole batch — the **batch dedup token**, the same
+primitive the ClickHouse sink passes as `insert_deduplication_token`.
+
+> **Changed in 2.0.** This key was previously a hash of the joined NDJSON
+> request body. It is now derived from the length-delimited record
+> payloads instead, so **the value differs**: an endpoint deduplicating on
+> the old key will not recognise a retry that spans the upgrade, and a
+> batch in flight across the upgrade can be delivered twice. Per-record
+> mode is unaffected — it still sends a per-record key.
+
+Because the key is content-derived, it inherits the same batch-stability
 caveat as ClickHouse's dedup token — see the note under
 [`sink_max_batch_size`](#sink_max_batch_size): changing
 `sink_max_batch_size` across a restart re-splits a replayed segment into

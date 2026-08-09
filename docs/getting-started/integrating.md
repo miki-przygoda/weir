@@ -189,20 +189,19 @@ Implement the [`Sink`](https://docs.rs/weir-sink-sdk) trait from `weir-sink-sdk`
 (depends only on `weir-core` — no daemon, no tokio needed to build or test it):
 
 ```rust
-use weir_sink_sdk::{BasicSinkError, CommitResult, Payload, Sink, SinkHealth};
+use weir_sink_sdk::{BasicSinkError, CommitResult, Payload, Sink, SinkBatch, SinkHealth};
 
 struct MySink { /* a client handle, etc. */ }
 
 impl Sink for MySink {
-    type Record = Payload;          // opaque bytes (the usual choice)
     type Error = BasicSinkError;    // ready-made error; or your own SinkError
 
-    async fn commit(&self, batch: Vec<Payload>)
-        -> Result<CommitResult<Payload>, BasicSinkError>
-    {
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, BasicSinkError> {
+        // `batch.dedup_token()` is a content-derived idempotency handle for this
+        // batch — pass it downstream if your target can deduplicate on one.
         let mut committed = Vec::new();
         let mut dead_lettered = Vec::new();   // Vec<(Payload, String)>
-        for record in batch {
+        for record in batch.into_records() {
             match deliver(record.as_ref()) {  // your delivery logic
                 Ok(()) => committed.push(record),
                 // PERMANENT rejection (e.g. a 4xx): dead-letter the record paired
@@ -270,19 +269,21 @@ target with no external service. Assert on the returned `CommitResult` —
 ```rust
 // dev-dependencies: tokio = { version = "1", features = ["macros", "rt", "fs"] }
 //                   tempfile = "3"
-use weir_sink_sdk::{CommitResult, Payload, Sink, SinkHealth};
+use weir_sink_sdk::{CommitResult, Payload, Sink, SinkBatch, SinkHealth};
 
 #[tokio::test]
 async fn commits_good_records_and_dead_letters_bad_ones() {
     let dir = tempfile::tempdir().unwrap();
     let sink = FileSink::new(dir.path().join("out.log")); // your real-I/O sink
 
-    let batch = vec![
+    // `SinkBatch::from` derives the dedup token from the records, exactly as
+    // the drain does. Use `SinkBatch::new` if you need to pin a specific token.
+    let batch = SinkBatch::from(vec![
         Payload::from(&b"good"[..]),
         Payload::from(&b""[..]),       // your sink rejects empty records
         Payload::from(&b"also-good"[..]),
-    ];
-    let result: CommitResult<Payload> = sink.commit(batch).await.unwrap();
+    ]);
+    let result: CommitResult = sink.commit(batch).await.unwrap();
 
     assert_eq!(result.committed.len(), 2);
     assert_eq!(result.dead_lettered.len(), 1);
@@ -298,65 +299,53 @@ async fn commits_good_records_and_dead_letters_bad_ones() {
 > isolation. Unit-test your sink directly as above (call `commit` and assert on
 > the `CommitResult`); reach for a real daemon only for end-to-end tests.
 
-### A typed record that rejects malformed input
+### Parsing payloads and rejecting malformed input
 
-If your sink parses each payload into a struct, give it
-`type Record = MyRecord` and implement [`SinkRecord`](https://docs.rs/weir-sink-sdk)
-(`from_payload` / `into_payload`). Note that **`from_payload` returns `Self`, not
-`Result`** — it *cannot* reject bad bytes, because the drain has already committed
-to handing you every payload in the segment. So parse **leniently** and keep the
-raw `Payload` alongside the parsed fields; then dead-letter the records that
-failed to parse from inside `commit`, pairing each with a reason:
+If your sink parses each payload into a struct, do it **inside `commit`** and
+keep the original `Payload` beside the parsed value. Records that fail to parse
+are dead-lettered with a reason; retrying them would not make unparseable bytes
+parse, so the failure is permanent by definition:
 
 ```rust
-use weir_sink_sdk::{CommitResult, Payload, Sink, SinkError, SinkHealth, SinkRecord};
-
-struct MyRecord {
-    raw: Payload,             // ALWAYS keep the original bytes…
-    parsed: Option<Parsed>,   // …None means "arrived malformed"
-}
-
-impl SinkRecord for MyRecord {
-    fn from_payload(payload: Payload) -> Self {
-        // Lenient: parsing can't fail here (returns Self, not Result). Stash the
-        // failure as `None` and carry the raw bytes so we can dead-letter later.
-        let parsed = Parsed::try_from(payload.as_ref()).ok();
-        MyRecord { raw: payload, parsed }
-    }
-    fn into_payload(self) -> Payload {
-        // Byte-preserving round-trip: hand back exactly what we received, so the
-        // per-record dead-letter bytes match the whole-batch-Err bytes.
-        self.raw
-    }
-}
+use weir_sink_sdk::{CommitResult, Payload, Sink, SinkBatch, SinkError, SinkHealth};
 
 impl Sink for MySink {
-    type Record = MyRecord;
     type Error = MySinkError;
-    async fn commit(&self, batch: Vec<MyRecord>)
-        -> Result<CommitResult<MyRecord>, MySinkError>
-    {
+
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MySinkError> {
         let mut committed = Vec::new();
         let mut dead_lettered = Vec::new();
-        for record in batch {
-            match &record.parsed {
-                // Malformed on arrival: dead-letter it (permanent — retrying
-                // won't make unparseable bytes parse). The drain recovers the
-                // bytes via `into_payload`, i.e. the raw payload we kept.
-                None => dead_lettered.push((record, "unparseable payload".to_string())),
-                Some(_parsed) => { /* deliver `_parsed` … */ committed.push(record); }
+
+        for payload in batch.into_records() {
+            match Parsed::try_from(payload.as_ref()) {
+                Ok(_parsed) => {
+                    // deliver `_parsed` downstream …
+                    committed.push(payload);
+                }
+                // Malformed on arrival — permanent, so dead-letter it. The
+                // dead-letter store receives exactly the bytes weir handed you.
+                Err(e) => dead_lettered.push((payload, format!("unparseable payload: {e}"))),
             }
         }
+
         Ok(CommitResult::new(committed, dead_lettered))
     }
+
     async fn health(&self) -> SinkHealth { SinkHealth::Healthy }
 }
 ```
 
-Keeping `raw` and returning it from `into_payload` makes the round-trip
-byte-identical, so the per-record dead-letter path (which calls `into_payload`)
-writes the same bytes the whole-batch-`Err` path would — see the `SinkRecord`
-`# Footgun` in the crate docs.
+`committed` and `dead_lettered` must together account for **every** record in
+the batch — see [`CommitResult`](https://docs.rs/weir-sink-sdk) for what happens
+if they do not.
+
+> **Changed in 2.0.** weir 1.x let a sink declare `type Record = MyRecord` and
+> implement a `SinkRecord` trait with `from_payload` / `into_payload`. That is
+> gone: records are always `Payload`. The old design carried a real footgun —
+> the per-record dead-letter path recovered bytes via `into_payload` while the
+> whole-batch-`Err` path used the original payload, so a non-byte-preserving
+> round-trip made the two disagree. Parsing inside `commit` cannot drift that
+> way, because there is only ever one set of bytes.
 
 ### Wrapping a non-`Sync` handle
 
