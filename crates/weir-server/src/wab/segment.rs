@@ -12,8 +12,8 @@ use std::sync::Arc;
 use crc32fast::Hasher as CrcHasher;
 
 use super::format::{
-    EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, build_segment_footer, build_segment_header,
-    build_sentinel, unix_nanos_now,
+    Compression, EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, build_segment_footer,
+    build_segment_header, build_sentinel, unix_nanos_now,
 };
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use weir_core::MAX_PAYLOAD_HARD_CAP;
@@ -64,7 +64,7 @@ impl WabSegment {
         #[cfg(not(unix))]
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
 
-        let header = build_segment_header(shard_id);
+        let header = build_segment_header(shard_id, Compression::None);
 
         let mut hasher = CrcHasher::new();
         hasher.update(&header);

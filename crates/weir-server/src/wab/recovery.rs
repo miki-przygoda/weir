@@ -8,8 +8,9 @@ use std::{
 use tracing::{error, info, warn};
 
 use super::format::{
-    ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN,
-    SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed, unix_nanos_now,
+    ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION_MAX_SUPPORTED,
+    SEGMENT_HEADER_LEN, SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed,
+    unix_nanos_now,
 };
 use super::segment::{sealed_path_for, segment_counter_from_path, shard_id_from_path};
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
@@ -216,9 +217,9 @@ pub(crate) fn recover_segment(
         return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
-    if header_buf[4] != FORMAT_VERSION {
+    if header_buf[4] == 0 || header_buf[4] > FORMAT_VERSION_MAX_SUPPORTED {
         let reason = format!(
-            "unknown format version: expected {FORMAT_VERSION}, got {}",
+            "unknown format version: this build reads 1..={FORMAT_VERSION_MAX_SUPPORTED}, got {}",
             header_buf[4]
         );
         return Err(quarantine_and_count(path, wab_dir, metrics, &reason));

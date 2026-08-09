@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use weir_wab::SegmentReader;
-use weir_wab::format::{SENTINEL, build_segment_header, build_sentinel};
+use weir_wab::format::{Compression, SENTINEL, build_segment_header, build_sentinel};
 
 fn tmp_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -26,7 +26,8 @@ fn tmp_path(label: &str) -> PathBuf {
 /// Writes header + `[len][crc][payload]`* + sentinel + `trailer` bytes.
 fn write_segment(path: &Path, records: &[&[u8]], trailer: &[u8]) {
     let mut f = File::create(path).unwrap();
-    f.write_all(&build_segment_header(0xFFFF)).unwrap();
+    f.write_all(&build_segment_header(0xFFFF, Compression::None))
+        .unwrap();
     for r in records {
         f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
@@ -71,7 +72,8 @@ fn crc_mismatch_surfaces_at_the_offending_record() {
     // yield Ok, Err(at index 1), then stop.
     let path = tmp_path("crc_idx");
     let mut f = File::create(&path).unwrap();
-    f.write_all(&build_segment_header(0)).unwrap();
+    f.write_all(&build_segment_header(0, Compression::None))
+        .unwrap();
     // record 0 — valid
     let r0 = b"good0";
     f.write_all(&(r0.len() as u32).to_le_bytes()).unwrap();
@@ -100,7 +102,8 @@ fn truncated_mid_record_is_an_error_not_a_silent_short_read() {
     // return a short/empty record.
     let path = tmp_path("trunc");
     let mut f = File::create(&path).unwrap();
-    f.write_all(&build_segment_header(0)).unwrap();
+    f.write_all(&build_segment_header(0, Compression::None))
+        .unwrap();
     f.write_all(&100u32.to_le_bytes()).unwrap();
     f.write_all(&crc32fast::hash(b"xyz").to_le_bytes()).unwrap();
     f.write_all(b"xyz").unwrap(); // only 3 of the claimed 100 bytes
@@ -166,7 +169,7 @@ use weir_wab::{SegmentState, SegmentVerifyError, list_segment_files, verify_seal
 /// correct whole-file CRC). Returns `(path, sentinel_offset, first_payload_off)`.
 fn write_sealed_segment(label: &str, shard: u16, records: &[&[u8]]) -> (PathBuf, usize, usize) {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(&build_segment_header(shard));
+    bytes.extend_from_slice(&build_segment_header(shard, Compression::None));
     let mut data_bytes = 0u64;
     let mut first_payload_off = 0usize;
     for (i, r) in records.iter().enumerate() {

@@ -1329,8 +1329,11 @@ mod tests {
         let path = dl_dir.join(format!("dl_{counter:08}.wab.sealed"));
         let mut f = std::fs::File::create(&path).unwrap();
         // Shard ID 0xFFFF is the dead-letter marker the daemon uses.
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         for r in records {
             f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
             // Same CRC32 (IEEE) SegmentReader verifies — see weir-wab.
@@ -1361,8 +1364,11 @@ mod tests {
         std::fs::create_dir_all(&dl).unwrap();
         let path = dl.join("dl_00000001.wab.sealed");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         let payload = b"corruptme";
         f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&0xdead_beefu32.to_le_bytes()).unwrap(); // wrong CRC
@@ -1388,8 +1394,11 @@ mod tests {
         std::fs::create_dir_all(&dl).unwrap();
         let path = dl.join("dl_00000001.wab.sealed");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         let payload = b"survivor";
         f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&weir_wab::format::crc32(payload).to_le_bytes())
@@ -1414,8 +1423,11 @@ mod tests {
         // One corrupt segment (bad CRC) that must be flagged, not counted.
         let bad = dl.join("dl_00000002.wab.sealed");
         let mut f = std::fs::File::create(&bad).unwrap();
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         f.write_all(&3u32.to_le_bytes()).unwrap();
         f.write_all(&0u32.to_le_bytes()).unwrap(); // wrong CRC
         f.write_all(b"bad").unwrap();

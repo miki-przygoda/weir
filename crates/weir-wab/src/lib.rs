@@ -45,9 +45,9 @@ use std::path::{Path, PathBuf};
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
 use format::{
-    EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
-    SEGMENT_MAGIC, SegmentFooterMeta, SegmentHeaderMeta, SegmentHeaderParseError,
-    parse_segment_footer, parse_segment_header,
+    EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION_MAX_SUPPORTED, SEGMENT_FOOTER_LEN,
+    SEGMENT_HEADER_LEN, SEGMENT_MAGIC, SegmentFooterMeta, SegmentHeaderMeta,
+    SegmentHeaderParseError, parse_segment_footer, parse_segment_header,
 };
 
 /// Re-export of [`weir_core::Payload`] — the item type of the [`SegmentReader`]
@@ -140,10 +140,13 @@ impl SegmentReader {
                 format!("bad segment magic: found {ascii:?} ({found:?}), expected b\"WEIR\""),
             ));
         }
-        if header[4] != FORMAT_VERSION {
+        if header[4] == 0 || header[4] > FORMAT_VERSION_MAX_SUPPORTED {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unknown segment format version: {}", header[4]),
+                format!(
+                    "unknown segment format version: {} (this build reads 1..={})",
+                    header[4], FORMAT_VERSION_MAX_SUPPORTED
+                ),
             ));
         }
 
@@ -619,7 +622,7 @@ pub fn list_segment_files(dir: impl AsRef<Path>) -> io::Result<Vec<(PathBuf, Seg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use format::{SENTINEL, build_segment_header};
+    use format::{Compression, SENTINEL, build_segment_header};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -635,7 +638,8 @@ mod tests {
     /// (it stops at the sentinel), so this is enough to drive `SegmentReader`.
     fn write_segment(path: &Path, records: &[&[u8]]) {
         let mut f = File::create(path).unwrap();
-        f.write_all(&build_segment_header(0xFFFF)).unwrap();
+        f.write_all(&build_segment_header(0xFFFF, Compression::None))
+            .unwrap();
         for r in records {
             f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
             f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
@@ -677,7 +681,7 @@ mod tests {
     fn open_rejects_bad_magic() {
         let path = tmp_path("badmagic");
         let mut f = File::create(&path).unwrap();
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         header[0] = b'X'; // "WEIR" -> "XEIR"
         f.write_all(&header).unwrap();
         f.sync_all().unwrap();
@@ -698,7 +702,7 @@ mod tests {
     fn open_bad_magic_renders_nonprintable_bytes_as_dots() {
         let path = tmp_path("badmagic_nonprintable");
         let mut f = File::create(&path).unwrap();
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         // Fully non-printable magic: ASCII rendering should be all dots, but the
         // raw bytes must still be present for debugging.
         header[0..4].copy_from_slice(&[0x00, 0x01, 0x02, 0x03]);
@@ -716,7 +720,7 @@ mod tests {
     fn open_rejects_unknown_version() {
         let path = tmp_path("badversion");
         let mut f = File::create(&path).unwrap();
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         header[4] = 99;
         f.write_all(&header).unwrap();
         f.sync_all().unwrap();
@@ -730,7 +734,8 @@ mod tests {
         let path = tmp_path("crc");
         // Hand-write a record whose stored CRC doesn't match the payload.
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         let payload = b"corruptme";
         f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&0xdead_beefu32.to_le_bytes()).unwrap(); // wrong CRC
@@ -775,7 +780,8 @@ mod tests {
         // read. That must end cleanly (None, never Err) and stay fused.
         let path = tmp_path("torn_len");
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         let r = b"rec";
         f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
@@ -820,7 +826,8 @@ mod tests {
     fn oversized_payload_len_rejected_before_alloc() {
         let path = tmp_path("oversize");
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         // payload_len just over the hard cap; no payload bytes follow — the
         // reader must reject on the length check, not try to allocate/read it.
         let bogus_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
@@ -843,7 +850,7 @@ mod tests {
     fn into_inner_after_error_yields_usable_reader() {
         use std::io::Read;
         let path = tmp_path("into_inner_after_err");
-        let mut bytes = build_segment_header(0).to_vec();
+        let mut bytes = build_segment_header(0, Compression::None).to_vec();
         // record 0: valid.
         let r0 = b"hello";
         bytes.extend_from_slice(&(r0.len() as u32).to_le_bytes());
@@ -894,7 +901,7 @@ mod tests {
 
     fn build_sealed_segment(shard: u16, records: &[&[u8]]) -> SealedBytes {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&build_segment_header(shard));
+        bytes.extend_from_slice(&build_segment_header(shard, Compression::None));
         let mut data_bytes = 0u64;
         let mut first_payload_off = 0usize;
         for (i, r) in records.iter().enumerate() {
@@ -937,7 +944,7 @@ mod tests {
         let reader = SegmentReader::open(&path).unwrap();
         let h = reader.header();
         assert_eq!(h.shard_id, 0xFFFF); // write_segment uses 0xFFFF
-        assert_eq!(h.format_version, format::FORMAT_VERSION);
+        assert_eq!(h.format_version, format::FORMAT_VERSION_V1);
         assert!(h.created_at > 0);
         std::fs::remove_file(&path).ok();
     }
@@ -975,7 +982,8 @@ mod tests {
         // Active segment that ends right after a complete record, no sentinel.
         let path = tmp_path("term_torn");
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         let r = b"rec";
         f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
@@ -1056,7 +1064,7 @@ mod tests {
     fn verify_sealed_segment_no_sentinel_is_rejected() {
         // Active segment (header + a record, no sentinel/footer): NoSentinel.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&build_segment_header(0));
+        bytes.extend_from_slice(&build_segment_header(0, Compression::None));
         let r = b"rec";
         bytes.extend_from_slice(&(r.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
@@ -1157,7 +1165,7 @@ mod tests {
         // MAX_PAYLOAD_HARD_CAP. The verifier rejects on the length check
         // (BadRecord) before attempting to read/hash the bogus payload.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&build_segment_header(6));
+        bytes.extend_from_slice(&build_segment_header(6, Compression::None));
         let bogus_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
         bytes.extend_from_slice(&bogus_len.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
