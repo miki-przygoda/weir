@@ -288,9 +288,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 0 = idle-seal disabled (historical behaviour).
         segment_max_age: (config.wab_segment_max_age_secs > 0)
             .then(|| Duration::from_secs(config.wab_segment_max_age_secs)),
-        // Wired to config knobs in the next commit.
-        compression: weir_wab::format::Compression::None,
-        compression_level: 1,
+        // "none" (default) keeps segments at format v1, byte-identical to weir
+        // 1.x. Validated at config load, so any other string is unreachable.
+        compression: match config.wab_compression.as_str() {
+            "zstd" => weir_wab::format::Compression::Zstd,
+            _ => weir_wab::format::Compression::None,
+        },
+        compression_level: config.wab_compression_level,
     };
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),

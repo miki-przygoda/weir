@@ -199,6 +199,8 @@ pub(crate) struct PartialConfig {
     pub batch_deadline_ms: Option<u64>,
     pub wab_segment_max_bytes: Option<u64>,
     pub wab_segment_max_age_secs: Option<u64>,
+    pub wab_compression: Option<String>,
+    pub wab_compression_level: Option<i32>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
@@ -299,6 +301,27 @@ pub struct Config {
     /// segment idle for this long is sealed and drained — timely delivery for
     /// low-volume deployments.
     pub wab_segment_max_age_secs: u64,
+    /// How WAB records are stored on disk: `"none"` (default) or `"zstd"`.
+    ///
+    /// **Default off is load-bearing.** With `none`, segments are written at
+    /// on-disk format v1 and are byte-identical to weir 1.x, so upgrading and
+    /// rolling back is a non-event. Turning compression on writes format v2,
+    /// which a 1.x daemon refuses to read — it strands those segments loudly
+    /// rather than misreading them, but they stay stranded until a 2.x reads
+    /// them. Treat enabling it as a one-way door.
+    ///
+    /// The benefit is **WAB capacity**, not latency: a given compression ratio
+    /// is that much longer a sink outage absorbed in the same disk budget, plus
+    /// fewer segment seals. See `docs/operations/configuration.md`.
+    pub wab_compression: String,
+    /// zstd compression level, `1..=19`. Only read when `wab_compression` is
+    /// `"zstd"`. Not stored on disk — zstd frames are self-describing for
+    /// decompression, so changing this affects only segments written afterwards.
+    ///
+    /// Capped at 19 rather than zstd's maximum of 22: levels above 19 are the
+    /// "ultra" tier, which needs materially more memory to both compress and
+    /// decompress.
+    pub wab_compression_level: i32,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
@@ -505,6 +528,17 @@ impl Config {
         // Lower bound 4 KiB so the segment header (one page) fits;
         // upper bound 4 GiB so a single sealed segment can't exceed 32-bit
         // file-offset assumptions downstream.
+        let wab_compression = merge!(wab_compression).unwrap_or_else(|| "none".to_string());
+        if !matches!(wab_compression.as_str(), "none" | "zstd") {
+            return Err(ConfigError::InvalidValue {
+                field: "wab_compression",
+                reason: format!(
+                    "wab_compression must be \"none\" or \"zstd\", got {wab_compression:?}"
+                ),
+            });
+        }
+        let wab_compression_level = merge!(wab_compression_level).unwrap_or(1);
+        check_range("wab_compression_level", wab_compression_level, 1, 19)?;
         let wab_segment_max_bytes = merge!(wab_segment_max_bytes).unwrap_or(256 * 1024 * 1024);
         if !(4096..=4 * 1024 * 1024 * 1024).contains(&wab_segment_max_bytes) {
             return Err(ConfigError::InvalidValue {
@@ -825,6 +859,8 @@ impl Config {
             batch_deadline_ms,
             wab_segment_max_bytes,
             wab_segment_max_age_secs,
+            wab_compression,
+            wab_compression_level,
             max_connections,
             max_payload_bytes,
             metrics_port,
@@ -1879,5 +1915,79 @@ mod tests {
         assert!(err.to_string().contains("tls_key_path"), "{err}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── WAB compression ───────────────────────────────────────────────────────
+
+    #[test]
+    fn wab_compression_defaults_to_none() {
+        // Default OFF is load-bearing: it keeps segments at format v1, so a
+        // 2.0 daemon's WAB is byte-identical to 1.x and rollback is a non-event.
+        let dir = tmp_dir("compression_default");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.wab_compression, "none");
+        assert_eq!(c.wab_compression_level, 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_compression_zstd_accepted() {
+        let dir = tmp_dir("compression_zstd");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_compression: Some("zstd".into()),
+                wab_compression_level: Some(9),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.wab_compression, "zstd");
+        assert_eq!(c.wab_compression_level, 9);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_wab_compression_rejected() {
+        let dir = tmp_dir("bad_compression");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_compression: Some("lz4".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wab_compression"), "{msg}");
+        assert!(msg.contains("zstd"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_compression_level_range_is_enforced() {
+        // 1..=19. Above 19 is zstd's "ultra" tier, which needs materially more
+        // memory to both compress and decompress.
+        assert_knob_rejected("comp_level_zero", "wab_compression_level", |p| {
+            p.wab_compression_level = Some(0)
+        });
+        assert_knob_rejected("comp_level_ultra", "wab_compression_level", |p| {
+            p.wab_compression_level = Some(20)
+        });
+        assert_knob_rejected("comp_level_neg", "wab_compression_level", |p| {
+            p.wab_compression_level = Some(-1)
+        });
     }
 }

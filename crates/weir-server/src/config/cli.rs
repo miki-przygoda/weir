@@ -169,6 +169,12 @@ pub(super) fn parse_from(
         sink_http_concurrency: pargs
             .opt_value_from_str("--sink-http-concurrency")
             .map_err(pico_err)?,
+        wab_compression: pargs
+            .opt_value_from_str("--wab-compression")
+            .map_err(pico_err)?,
+        wab_compression_level: pargs
+            .opt_value_from_str("--wab-compression-level")
+            .map_err(pico_err)?,
         sink_http_batch: pargs
             .opt_value_from_str("--sink-http-batch")
             .map_err(pico_err)?,

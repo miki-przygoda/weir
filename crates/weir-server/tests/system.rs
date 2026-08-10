@@ -326,6 +326,117 @@ fn idle_seal_drains_low_volume_segment_without_shutdown() {
     );
 }
 
+#[test]
+fn wab_compression_knob_reaches_the_segment_header() {
+    // End-to-end proof that the config value actually reaches the WAB writer,
+    // not merely that the field is plumbed through Config. Runs a real daemon
+    // with compression on, then reads the on-disk header byte itself.
+    let srv = weir_server!("compression_e2e")
+        .extra_config("wab_compression = \"zstd\"\nwab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    // Compressible payload so the ratio counters move in an obvious direction.
+    let payload = vec![b'a'; 4096];
+    client.push(&payload, Durability::Sync).unwrap();
+
+    // Find any segment file the daemon created and read its 24-byte header.
+    let header = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let found = find_first_segment_header(&srv.wab_dir);
+            if let Some(h) = found {
+                break h;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no WAB segment appeared under {}",
+                srv.wab_dir.display()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    assert_eq!(
+        header[4], 2,
+        "wab_compression = zstd must write format v2, got version {}",
+        header[4]
+    );
+    assert_eq!(header[5] & 0b0000_0001, 1, "the ZSTD flag bit must be set");
+
+    // And the ratio counters must show compression actually happened.
+    let body = srv.scrape_metrics();
+    let logical = parse_metric(&body, "weir_wab_record_logical_bytes_total");
+    let stored = parse_metric(&body, "weir_wab_record_stored_bytes_total");
+    assert!(logical >= 4096, "logical bytes not counted: {logical}");
+    assert!(
+        stored > 0 && stored < logical,
+        "4 KiB of 'a' must store smaller: logical={logical} stored={stored}"
+    );
+}
+
+#[test]
+fn wab_compression_off_writes_v1_segments() {
+    // The rollback guarantee: at the default setting a 2.0 daemon's segments are
+    // format v1, so a 1.x daemon can still read them.
+    let srv = weir_server!("compression_off_e2e")
+        .extra_config("wab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    client.push(b"plain-record", Durability::Sync).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let header = loop {
+        if let Some(h) = find_first_segment_header(&srv.wab_dir) {
+            break h;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no WAB segment appeared"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(header[4], 1, "default config must stay on format v1");
+    assert_eq!(header[5], 0, "flags byte must be zero in a v1 header");
+}
+
+/// Reads the 24-byte header of the first `.wab`/`.wab.sealed` file found under
+/// `wab_dir`, searching shard subdirectories.
+fn find_first_segment_header(wab_dir: &std::path::Path) -> Option<[u8; 24]> {
+    use std::io::Read;
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if name.ends_with(".wab") || name.ends_with(".wab.sealed") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(wab_dir, &mut found);
+    found.sort();
+    for p in found {
+        let mut buf = [0u8; 24];
+        if let Ok(mut f) = std::fs::File::open(&p)
+            && f.read_exact(&mut buf).is_ok()
+        {
+            return Some(buf);
+        }
+    }
+    None
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
@@ -375,6 +486,8 @@ fn metrics_all_families_registered() {
         // WAB
         "weir_wab_segments",
         "weir_wab_bytes_on_disk",
+        "weir_wab_record_logical_bytes",
+        "weir_wab_record_stored_bytes",
         "weir_wab_fsync_duration_seconds",
         "weir_wab_flusher_panics",
         "weir_wab_fsync_failures",

@@ -574,6 +574,16 @@ impl ShardWriter {
             self.active = None;
             return Err(e);
         }
+        // Ratio accounting, bumped only after a successful write so a failed
+        // record never inflates either side. `logical` is what the producer
+        // sent, `stored` is what reached the disk; equal when compression is off.
+        self.metrics
+            .wab_record_logical_bytes
+            .inc_by(payload.len() as u64);
+        self.metrics
+            .wab_record_stored_bytes
+            .inc_by(stored.len() as u64);
+
         let should_rotate = self
             .active
             .as_ref()
@@ -1189,6 +1199,80 @@ mod tests {
             created.is_empty(),
             "a rejected empty payload must not create a segment: {created:?}"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn compression_ratio_counters_track_logical_and_stored_bytes() {
+        // A ratio you cannot see is a ratio you cannot tune. Assert both sides
+        // move, and that compression actually shrinks the stored side.
+        let dir = tmp_dir("ratio_counters");
+        std::fs::create_dir_all(&dir).unwrap();
+        let metrics = Arc::new(Metrics::new().0);
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::Zstd,
+            1,
+        );
+        let payload = vec![b'a'; 4096];
+        w.write_record(&payload).unwrap();
+
+        let logical = metrics.wab_record_logical_bytes.get();
+        let stored = metrics.wab_record_stored_bytes.get();
+        assert_eq!(logical, 4096, "logical must be what the producer sent");
+        assert!(stored > 0, "stored must be counted");
+        assert!(
+            stored < logical,
+            "4 KiB of 'a' must store smaller: logical={logical} stored={stored}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ratio_counters_are_equal_when_compression_is_off() {
+        let dir = tmp_dir("ratio_counters_off");
+        std::fs::create_dir_all(&dir).unwrap();
+        let metrics = Arc::new(Metrics::new().0);
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+        w.write_record(b"hello").unwrap();
+        assert_eq!(
+            metrics.wab_record_logical_bytes.get(),
+            metrics.wab_record_stored_bytes.get(),
+            "with compression off the two sides must be identical"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_rejected_record_moves_neither_counter() {
+        // An empty payload is refused above the codec; nothing should be counted.
+        let dir = tmp_dir("ratio_counters_rejected");
+        std::fs::create_dir_all(&dir).unwrap();
+        let metrics = Arc::new(Metrics::new().0);
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::Zstd,
+            1,
+        );
+        w.write_record(b"").unwrap_err();
+        assert_eq!(metrics.wab_record_logical_bytes.get(), 0);
+        assert_eq!(metrics.wab_record_stored_bytes.get(), 0);
         std::fs::remove_dir_all(dir).ok();
     }
 }

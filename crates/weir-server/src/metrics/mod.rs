@@ -258,6 +258,11 @@ pub(crate) struct Metrics {
     /// rather than fail open and lose them. Alertable so the stuck-on-full-disk
     /// state is visible instead of silent.
     pub recovery_quarantine_copy_failed: Counter<u64, AtomicU64>,
+    /// Cumulative record payload bytes as accepted from producers, before any
+    /// compression. Paired with [`Metrics::wab_record_stored_bytes`].
+    pub wab_record_logical_bytes: Counter<u64, AtomicU64>,
+    /// Cumulative record payload bytes as written to disk, after compression.
+    pub wab_record_stored_bytes: Counter<u64, AtomicU64>,
     /// Counts WAB segment files seen during recovery whose permissions are
     /// not 0o600. Defense-in-depth signal for tampering or operator error.
     pub wab_unexpected_mode: Counter<u64, AtomicU64>,
@@ -492,6 +497,20 @@ impl Metrics {
             "weir_recovery_segments_quarantined",
             "WAB segments quarantined due to corruption detected during crash recovery"
         );
+        let wab_record_logical_bytes = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_record_logical_bytes",
+            "Cumulative record payload bytes as accepted from producers, before any \
+             compression. Divide by weir_wab_record_stored_bytes_total for the live \
+             compression ratio; the two are equal when compression is off"
+        );
+        let wab_record_stored_bytes = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_record_stored_bytes",
+            "Cumulative record payload bytes as written to disk, after compression. \
+             Excludes the 8-byte per-record framing, the segment header and the footer, \
+             so it is not the segment file size"
+        );
         let recovery_quarantine_copy_failed = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_recovery_quarantine_copy_failed",
@@ -604,6 +623,8 @@ impl Metrics {
             recovery_records_replayed,
             recovery_segments_quarantined,
             recovery_quarantine_copy_failed,
+            wab_record_logical_bytes,
+            wab_record_stored_bytes,
             wab_unexpected_mode,
             dead_letter_bytes_on_disk,
             dead_letter_full,
