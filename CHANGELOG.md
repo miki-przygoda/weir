@@ -80,6 +80,43 @@ no existing deployment's clients are affected.
   Per-record mode is unchanged: it still sends a per-record key, since a batch
   token means nothing there.
 
+- **WAB format v2 and opt-in zstd compression.** Header byte `[5]`, reserved and
+  zero since v1, becomes a flags byte; bit 0 means every record in the segment is
+  a zstd frame. Record framing, the sentinel, the footer and the `.confirmed`
+  sidecar are byte-for-byte unchanged, and the per-record CRC still covers the
+  **stored** bytes — so recovery, `verify_sealed_segment` and the footer
+  cross-check need no compression awareness, and decompression happens in exactly
+  one place. Two new config knobs: `wab_compression` (`none` | `zstd`) and
+  `wab_compression_level` (`1..=19`).
+
+  **Off by default, and that keeps rollback free.** With `wab_compression = none`
+  a 2.0 daemon writes v1 segments byte-identical to 1.x, so upgrading and rolling
+  back is a non-event. Enabling compression is the one-way door: a 1.x reader
+  refuses a v2 segment with `InvalidData`, which the drain preserves for retry
+  and recovery quarantines — data is stranded and loud, never lost and quiet.
+
+  **The benefit is capacity, not latency — and it is smaller than it sounds.**
+  At weir's batch sizes the fsync floor is per-call rather than per-byte, and
+  zstd adds CPU *in front of* the fsync: measured `p50` ack latency rose 3.0% /
+  4.3% / 4.0% across the sync, batched and buffered load scenarios. What it buys
+  is WAB headroom during a sink outage. But each record is framed independently,
+  so there is **no cross-record dictionary** and the ratio depends entirely on
+  redundancy within a single record. Measured at level 1: a 5-byte payload
+  *expands* to 14 bytes (0.36×), a 106-byte log line is unchanged (1.00×), a
+  122-byte JSON event reaches 1.08×, and only at 691 bytes of nested JSON does it
+  reach 5.01×. **Below roughly 200 bytes per record, leave it off.**
+  `weir_wab_record_logical_bytes_total` / `weir_wab_record_stored_bytes_total`
+  gives the live ratio.
+
+- **BREAKING — `weir-wab`: `FORMAT_VERSION` is removed.** It meant both "the
+  version we write" and "the version we accept" and can no longer mean both. Use
+  `FORMAT_VERSION_V1`, `FORMAT_VERSION_V2`, or `FORMAT_VERSION_MAX_SUPPORTED`;
+  there is deliberately no "version we write" constant, because that is now a
+  function of config. `build_segment_header` takes a `Compression` argument,
+  `SegmentHeaderMeta` gains a `compression` field and is now `#[non_exhaustive]`,
+  and `SegmentFooterMeta::data_bytes` is documented as **stored** bytes
+  (post-compression in a v2 segment).
+
 - **`ClickHouseSink` uses the shared token** instead of its own private
   `dedup_token`. `insert_deduplication_token` is byte-for-byte unchanged, so a
   ClickHouse deployment deduplicates correctly across the upgrade. The wire test

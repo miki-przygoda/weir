@@ -52,3 +52,9 @@ doc = false
 # the build-edit cycle without changing what's reachable.
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "wab_segment_header"
+path = "fuzz_targets/wab_segment_header.rs"
+test = false
+doc = false

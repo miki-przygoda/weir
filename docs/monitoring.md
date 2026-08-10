@@ -277,6 +277,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_drain_panics_total` | counter | weir-drain thread panics caught and respawned by its supervisor. **Must be 0**; sustained values indicate a sink/drain logic bug, and exhausting the respawn budget stops delivery. |
 | `weir_wab_segments_total{state}` | counter | Segment lifecycle transitions: `open` → `sealed` → `confirmed`; `quarantined` on corruption. A segment is counted `sealed` whichever way it was sealed — rotation, idle-seal, shutdown-seal, **or crash recovery** (recovery finalises an unsealed `.wab` and renames it, which is a real transition and is counted). A mid-file-corrupt segment counts **both** `quarantined` (the preserved forensic copy) and `sealed` (the truncated valid prefix, which is still delivered). **Backlog caveat across a restart** — see the note below. |
 | `weir_wab_bytes_on_disk` | gauge | Bytes used by **live** WAB shard segments: the open active segment (`.wab`) **plus** sealed segments awaiting drain (`.wab.sealed`). It scans on a 5 s cadence, so it trails real-time by up to that interval. It is **not** a total-disk-usage gauge: it excludes drained-marker files (`.wab.confirmed`) and the `dead_letter/` (own gauge: `weir_dead_letter_bytes_on_disk`) and `quarantine/` subdirs, and it doesn't measure the filesystem's free space — for the "disk filling up" signal use a node/host filesystem alert on the partition holding `wab_dir` (see *Capacity*). |
+| `weir_wab_record_logical_bytes_total` | counter | Cumulative record payload bytes **as accepted from producers**, before any compression. Equal to `weir_wab_record_stored_bytes_total` when `wab_compression = "none"`. Counts payload bytes only — not the 8-byte per-record framing, the segment header, or the footer — so it is not a file-size measure. |
+| `weir_wab_record_stored_bytes_total` | counter | Cumulative record payload bytes **as written to disk**, after compression. Divide the logical counter by this one for the live compression ratio (see *Compression ratio* below). Bumped only after a successful write, so a rejected record moves neither counter. |
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
 | `weir_recovery_records_replayed_total` | counter | Records replayed from sealed-but-unconfirmed segments on startup. |
 | `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during recovery. |
@@ -320,3 +322,24 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown after the grace period. |
 | `weir_tls_handshake_failures_total` | counter | (tls) Mutual-TLS handshake failures. |
 | `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. |
+
+### Compression ratio
+
+When `wab_compression = "zstd"` is enabled, the live ratio is:
+
+```promql
+rate(weir_wab_record_logical_bytes_total[5m])
+  / rate(weir_wab_record_stored_bytes_total[5m])
+```
+
+A value of 1.0 means compression is achieving nothing on your payloads; **below
+1.0 means it is actively expanding them**, which happens when records are small
+enough that zstd's frame overhead exceeds the savings. Each record is compressed
+independently, so the ratio reflects redundancy *within a single record*, not
+across the stream — see
+[`wab_compression`](operations/configuration.md#wab_compression) for measured
+figures by payload size and the rule of thumb for when to leave it off.
+
+This is the number to watch when sizing `wab_dir` for a sink outage: it is the
+multiplier on how long an outage the same disk can absorb.
+

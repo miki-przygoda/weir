@@ -43,7 +43,7 @@ Two subdirectories of the WAB root are **not** shards and are skipped by recover
 
 ---
 
-## Segment file format (`FORMAT_VERSION = 1`)
+## Segment file format (versions 1 and 2)
 
 ### Header (24 bytes)
 
@@ -51,12 +51,71 @@ Two subdirectories of the WAB root are **not** shards and are skipped by recover
 Offset  Size  Field       Description
 ──────  ────  ──────────  ──────────────────────────────────────
  0       4    magic       b"WEIR"
- 4       1    version     FORMAT_VERSION (currently 1)
- 5       1    reserved    0x00
+ 4       1    version     1 or 2
+ 5       1    flags       v1: MUST be 0x00
+                          v2: bit 0 = ZSTD; bits 1-7 reserved, MUST be 0
  6       2    shard_id    u16 little-endian
  8       8    created_at  Unix timestamp, nanoseconds, i64 LE
 16       8    reserved    0x00 (padding to 24 bytes)
 ```
+
+### Format v2 — what changed, and what did not
+
+v2 differs from v1 in **one byte**. Byte `[5]`, reserved and zero-on-write since
+v1, is now a flags byte whose bit 0 means *every record in this segment is
+stored as a complete zstd frame*. The record framing, the end-of-records
+sentinel, the footer, and the `.confirmed` sidecar are **byte-for-byte
+identical** between the two versions.
+
+**The per-record CRC covers the STORED bytes** — the zstd frame, in a compressed
+segment — not the logical payload. That is deliberate and it is what keeps the
+change small: crash recovery's torn-tail scan, `verify_sealed_segment`'s
+whole-file CRC, and the footer's `record_count` / `data_bytes` cross-check all
+work without decompressing anything. Decompression happens in exactly one place,
+`SegmentReader::next`, after the CRC has already passed.
+
+The footer's `data_bytes` is likewise **stored** bytes, so it is the
+post-compression size in a v2 ZSTD segment. For logical byte totals, read the
+`weir_wab_record_logical_bytes_total` metric.
+
+### Which version gets written
+
+A segment is written as **v1 whenever compression is off**, and v2 only when it
+is on. With `wab_compression = "none"` — the default — a weir 2.0 daemon
+produces segments byte-identical to what 1.x wrote.
+
+That makes upgrade-then-rollback a non-event at the default setting. **Enabling
+compression is a one-way door:** a 1.x reader rejects a v2 header outright
+(`InvalidData`), which the drain treats as "preserve for retry" and recovery
+quarantines — the data is stranded and loud, never misread and silent — but it
+stays stranded until a 2.x daemon reads it.
+
+### Reader rules
+
+| Header | Behaviour |
+|---|---|
+| v1, `flags == 0` | Accept, no compression |
+| v1, `flags != 0` | **Reject** — v1 documented the byte as zero, so a set bit is corruption |
+| v2, only known flag bits | Accept |
+| v2, any unknown flag bit | **Reject** — written by a newer weir; reading it would misinterpret the records |
+| version 0, or > 2 | **Reject** — unknown format version |
+
+Rejecting an unknown flag bit rather than ignoring it is the point: a future
+weir that adds bit 1 (say, encryption) must not have its segments silently read
+as plaintext by this build.
+
+### Record size caps under compression
+
+A compressed record's **stored** length can legitimately exceed
+`MAX_PAYLOAD_HARD_CAP` (16 MiB), because zstd's worst case expands slightly.
+So a v2 ZSTD segment accepts stored lengths up to
+`compress_bound(MAX_PAYLOAD_HARD_CAP)` = `n + n/255 + 16`, while v1 keeps the
+original cap unchanged. The *plaintext* is still capped at 16 MiB, enforced on
+the decompression output — which doubles as the decompression-bomb guard, and is
+an exact bound rather than a guess because the real cap is known.
+
+Measured, on genuinely random 16 MiB input: the stored form was **394 bytes
+larger** than the input, against an allowance of 65,809 bytes.
 
 ### Records (variable, repeated)
 

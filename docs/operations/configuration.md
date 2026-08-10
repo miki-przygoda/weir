@@ -403,6 +403,106 @@ normal seal happens.
 matters more than maximal per-segment batching; leave it `0` on high-throughput
 deployments where segments fill quickly on their own.
 
+#### `wab_compression`
+
+- **Type**: string — `"none"` or `"zstd"`
+- **Default**: `"none"`
+- **CLI**: `--wab-compression <mode>`
+- **Env**: `WEIR_WAB_COMPRESSION`
+- **TOML**: `wab_compression`
+
+Compress WAB record payloads with zstd. Each record is stored as its own
+complete zstd frame; the framing, CRC, sentinel and footer are unchanged.
+
+**Read the numbers below before enabling this.** For most weir workloads the
+gain is small, and for small records it is negative.
+
+##### What it costs
+
+Compression runs on the flusher thread, **before** the group fsync, so it is on
+the ack path. Measured on the load suite (5-byte payloads, laptop, single run
+each), `p50` ack latency rose consistently across all three durability tiers:
+
+| scenario | p50 none | p50 zstd | delta |
+|---|---|---|---|
+| `latency_sync_d1ms` | 132 µs | 136 µs | +3.0% |
+| `latency_batched_d1ms` | 138 µs | 144 µs | +4.3% |
+| `latency_buffered_d1ms` | 25 µs | 26 µs | +4.0% |
+
+The `p99` and `mean` figures from the same runs swung 10–30% in *both*
+directions and are single-run noise on a non-quiesced machine; only the
+consistent `p50` rise across three independent scenarios is signal.
+
+##### What it buys — and when it does not
+
+**Nothing to do with latency.** At weir's batch sizes the fsync floor is
+dominated by per-call cost, not per-byte transfer, so fewer bytes does not mean a
+faster `fdatasync`. The benefit is **WAB capacity**: a given ratio is that much
+longer a sink outage absorbed in the same disk budget, plus proportionally fewer
+segment seals.
+
+But because each record is framed independently there is **no cross-record
+dictionary** — the ratio depends entirely on redundancy *within a single
+record*. Measured at level 1 with the same zstd the daemon uses:
+
+| payload | logical | stored | ratio |
+|---|---|---|---|
+| 5 B | 5 | 14 | **0.36×** (expands) |
+| log line, 106 B | 106 | 106 | 1.00× |
+| JSON event, 122 B | 122 | 113 | 1.08× |
+| JSON event, 285 B | 285 | 226 | 1.26× |
+| JSON, 691 B (12 nested events) | 691 | 138 | **5.01×** |
+| random 1 KiB | 1024 | 1034 | 0.99× |
+
+**Rule of thumb:** below roughly 200 bytes per record, leave it off — the frame
+overhead cancels or exceeds the gain, and tiny records expand. It pays when
+individual records are large enough to contain repeated structure, which in
+practice means batched or nested payloads of several hundred bytes and up.
+Already-compressed payloads (images, gzipped blobs) never benefit; zstd stores
+them roughly verbatim, costing CPU for nothing.
+
+##### Rollback
+
+`"none"` writes on-disk format v1, byte-identical to weir 1.x. `"zstd"` writes
+format v2, which a 1.x daemon **refuses to read** — it strands those segments
+loudly rather than misreading them, but they stay stranded until a 2.x daemon
+reads them. Treat enabling this as a one-way door for the segments written while
+it is on. Changing the setting does not rewrite existing segments; readers accept
+both versions.
+
+##### Observability
+
+`weir_wab_record_logical_bytes_total / weir_wab_record_stored_bytes_total` is the
+live ratio. The two are equal when compression is off. See
+[monitoring](../monitoring.md).
+
+---
+
+#### `wab_compression_level`
+
+- **Type**: i32
+- **Default**: `1`
+- **Range**: 1 – 19
+- **CLI**: `--wab-compression-level <n>`
+- **Env**: `WEIR_WAB_COMPRESSION_LEVEL`
+- **TOML**: `wab_compression_level`
+
+zstd compression level. Only read when `wab_compression = "zstd"`.
+
+Capped at **19 rather than zstd's maximum of 22**: levels above 19 are zstd's
+"ultra" tier, which needs materially more memory to *decompress* as well as
+compress — an unpleasant surprise on the drain's read path, and on any tooling
+reading the segment later.
+
+The default of `1` is deliberate: this codec sits on the ack path, so speed
+matters more than ratio. Raise it only if you have measured that your records
+compress meaningfully better at a higher level *and* that the added ack latency
+is acceptable.
+
+Not stored on disk — zstd frames are self-describing for decompression — so
+changing it affects only segments written afterwards, and old segments stay
+readable.
+
 ---
 
 ### Connection limits

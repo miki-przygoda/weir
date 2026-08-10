@@ -27,7 +27,22 @@ before fsync). Kept; needs a design pass when revisited (likely post-1.0).
 ## Other deferred items (detail in the exploration docs)
 - **`LazySync` durability tier** (ack after write, before fsync) — Phase 5 / API-lock.
 - **Embeddable library** (`weir-embedded`) — Phase 5.
-- **Generalized dedup token → WAB format v2** — Phase 5 (on-disk format change).
+- ~~**Generalized dedup token → WAB format v2**~~ — **DONE in 2.0**, but not as
+  described here. The dedup token turned out not to need an on-disk field at all:
+  it must be *batch*-scoped (the drain splits a segment into `max_batch_size`
+  commits, so a segment-scoped token would make a dedup-capable sink discard
+  every chunk after the first), and a batch-scoped token is derived by the drain
+  at commit time. Format v2 therefore carries only a header flags byte for
+  compression.
+
+  **Consequence worth not rediscovering: encryption-at-rest has no reserved slot
+  waiting.** The 2.0 design deliberately declined to grow the footer — reserving
+  32 bytes for a digest nothing consumed would have charged the hot path and
+  contradicted the documented "CRC32 detects accidental corruption, not malicious
+  modification" position in `weir-wab`'s format module. Encryption will need its
+  own format bump. That is cheap now: the v2 work built a version-routing reader,
+  which is the actual reusable asset — more so than reserved bytes would have
+  been.
 
 ## Observability extras (parked from thread #4 — 2026-06-13)
 
