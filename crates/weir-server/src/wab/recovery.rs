@@ -711,11 +711,28 @@ mod tests {
     }
 
     fn make_segment(dir: &Path, shard_id: u16, payloads: &[&[u8]]) -> PathBuf {
+        make_segment_with(dir, shard_id, Compression::None, payloads)
+    }
+
+    /// As `make_segment`, at a chosen compression. `WabSegment::write_record`
+    /// takes the STORED bytes, so a compressed segment is built by compressing
+    /// each payload first — the same thing `ShardWriter` does in production.
+    fn make_segment_with(
+        dir: &Path,
+        shard_id: u16,
+        compression: Compression,
+        payloads: &[&[u8]],
+    ) -> PathBuf {
         use crate::wab::segment::{WabSegment, segment_path};
         let path = segment_path(dir, 1);
-        let mut seg = WabSegment::create(&path, shard_id, Compression::None).unwrap();
+        let mut seg = WabSegment::create(&path, shard_id, compression).unwrap();
         for p in payloads {
-            seg.write_record(p).unwrap();
+            match compression {
+                Compression::None => seg.write_record(p).unwrap(),
+                Compression::Zstd => seg
+                    .write_record(&zstd::bulk::compress(p, 1).unwrap())
+                    .unwrap(),
+            }
         }
         path
     }
@@ -1851,6 +1868,121 @@ mod tests {
         audit_segment_modes(&dir, &metrics);
 
         assert_eq!(metrics.wab_unexpected_mode.get(), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Compression (format v2) ───────────────────────────────────────────────
+    //
+    // These exist to PROVE the design's central claim rather than assume it:
+    // the per-record CRC covers the STORED bytes, so recovery validates framing
+    // and checksums without ever decompressing, and needs no compression
+    // awareness at all. If any of these required a production change, the claim
+    // would be wrong.
+
+    #[test]
+    fn torn_tail_in_a_compressed_segment_truncates_at_the_last_valid_record() {
+        let dir = tmp_dir("v2_torn_tail");
+        let path = make_segment_with(
+            &dir,
+            0,
+            Compression::Zstd,
+            &[b"record1", b"record2", b"record3"],
+        );
+
+        // Lop bytes off the end so the final record is torn mid-payload. Frame
+        // sizes vary, so measure rather than hardcode an offset.
+        let len = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 5)
+            .unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            2,
+            "torn tail keeps the whole-record prefix"
+        );
+        assert_eq!(recovered[0].as_ref(), b"record1");
+        assert_eq!(recovered[1].as_ref(), b"record2");
+
+        assert!(
+            !dir.join("quarantine").exists(),
+            "a torn-tail (EOF) truncation must NOT quarantine, compressed or not"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recovery_preserves_the_compression_flag() {
+        // Recovery finalises an EXISTING file, so it never rewrites the header.
+        // If this ever failed, a recovered segment would become unreadable — its
+        // records are frames but its header would claim they are not.
+        let dir = tmp_dir("v2_flag_preserved");
+        let path = make_segment_with(&dir, 0, Compression::Zstd, &[b"one", b"two"]);
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let mut header = [0u8; crate::wab::format::SEGMENT_HEADER_LEN];
+        {
+            use std::io::Read;
+            fs::File::open(&sealed)
+                .unwrap()
+                .read_exact(&mut header)
+                .unwrap();
+        }
+        let meta = crate::wab::format::parse_segment_header(&header).unwrap();
+        assert_eq!(meta.compression, Compression::Zstd);
+        assert_eq!(meta.format_version, crate::wab::format::FORMAT_VERSION_V2);
+
+        // And the records still read back as plaintext.
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_ref(), b"one");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mid_file_corruption_in_a_compressed_segment_quarantines() {
+        // The 1.1.0 behaviour must hold under compression: a CRC mismatch in the
+        // MIDDLE quarantines rather than truncating, so acked records sitting
+        // after the corruption are preserved rather than silently dropped.
+        let dir = tmp_dir("v2_midfile");
+        let path = make_segment_with(&dir, 0, Compression::Zstd, &[b"recordA", b"recordB"]);
+
+        // Corrupt a byte inside the FIRST record's stored frame, leaving its
+        // length and CRC fields intact — the mid-file branch, since a valid
+        // record follows it.
+        let mut bytes = fs::read(&path).unwrap();
+        let first_payload_start = crate::wab::format::SEGMENT_HEADER_LEN + 8;
+        bytes[first_payload_start] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        let _ = recover_segment(&path, &dir, &metrics);
+
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "a mid-file-corrupt compressed segment must be quarantined"
+        );
         fs::remove_dir_all(dir).ok();
     }
 }

@@ -274,4 +274,32 @@ mod tests {
         assert!(dl.would_exceed_cap(101, 100));
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[test]
+    fn dead_letter_segments_are_always_uncompressed() {
+        // Deliberate, and independent of the daemon's wab_compression setting:
+        // a dead-letter segment exists to be read by a human or by tooling that
+        // may not be this daemon. It is small, and readability beats ratio.
+        let dir = tmp_dir("dl_uncompressed");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        dl.write_records(&[p(b"rejected")]).unwrap();
+
+        let path = dl.dir.join("dl_00000001.wab.sealed");
+        let mut header = [0u8; crate::wab::format::SEGMENT_HEADER_LEN];
+        {
+            use std::io::Read;
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_exact(&mut header)
+                .unwrap();
+        }
+        assert_eq!(
+            header[4],
+            crate::wab::format::FORMAT_VERSION_V1,
+            "dead-letter segments must stay format v1"
+        );
+        assert_eq!(header[5], 0, "and carry no compression flag");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

@@ -21,7 +21,8 @@
 //!
 //! Segment footer  — SEGMENT_FOOTER_LEN (32) bytes (immediately after sentinel)
 //! [0..8]   record_count    u64 LE
-//! [8..16]  data_bytes      u64 LE — total payload bytes
+//! [8..16]  data_bytes      u64 LE — total STORED payload bytes (post-compression
+//!                                   in a v2 ZSTD segment; see SegmentFooterMeta)
 //! [16..20] file_crc32      u32 LE — CRC32 of all file bytes before the sentinel
 //! [20..28] sealed_at       i64 LE — unix nanoseconds
 //! [28..32] reserved        [u8; 4] — zero on write
@@ -437,7 +438,15 @@ pub fn parse_segment_header(buf: &[u8]) -> Result<SegmentHeaderMeta, SegmentHead
 pub struct SegmentFooterMeta {
     /// Number of records in the segment, footer bytes `[0..8]` LE.
     pub record_count: u64,
-    /// Total payload bytes across all records, footer bytes `[8..16]` LE.
+    /// Total **stored** payload bytes across all records, footer bytes
+    /// `[8..16]` LE.
+    ///
+    /// "Stored" means as written to disk: in a v2 [`Compression::Zstd`] segment
+    /// this is the compressed size, not the logical size the producer sent. That
+    /// is deliberate — it keeps this field, the whole-file CRC, and
+    /// `verify_sealed_segment`'s cross-check all verifiable without
+    /// decompressing anything. For logical bytes, see the daemon's
+    /// `weir_wab_record_logical_bytes_total` metric.
     pub data_bytes: u64,
     /// CRC32 of all file bytes before the sentinel, footer bytes `[16..20]` LE.
     pub file_crc32: u32,
