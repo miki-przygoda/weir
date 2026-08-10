@@ -1,7 +1,7 @@
 # weir
 
 [![CI](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 <!-- crates.io + docs.rs badges to be added in the same commit as the first crates.io publish -->
 
@@ -215,4 +215,4 @@ go through [SECURITY.md](SECURITY.md), not public issues.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).

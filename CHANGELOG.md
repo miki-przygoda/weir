@@ -19,6 +19,16 @@ protocol** below.
 `weir-core`, and `weir-client` do not, so **no producer needs recompiling** and
 no existing deployment's clients are affected.
 
+### License
+
+- **weir is now licensed under the Apache License 2.0**, changed from MIT. The
+  `LICENSE` file carries the canonical Apache-2.0 text and every crate's
+  `license` metadata is updated. Apache-2.0 is permissive like MIT and adds an
+  explicit patent grant; the one practical consequence to know is that
+  **Apache-2.0 is incompatible with GPLv2**, so a GPLv2 project can no longer
+  vendor weir (GPLv3 is fine). Releases up to and including 1.3.1 remain
+  available under MIT — this change is not retroactive.
+
 ### Added
 
 - **`weir-sink-sdk` — `SinkBatch` and `DedupToken`.** Every sink now receives a

@@ -48,4 +48,4 @@ guides, and the wire protocol.
 
 ## License
 
-MIT
+Apache-2.0

@@ -98,13 +98,15 @@ deploy/monitoring/smoke-test.sh --teardown
 cargo +nightly fuzz run envelope_parse
 ```
 
-## What's frozen at 1.0
+## Stability and what's frozen
 
-weir is 1.0 under [Semantic Versioning](https://semver.org/). The **v1 wire
-protocol**, the **on-disk WAB segment format** (`weir-wab`, `FORMAT_VERSION = 1`),
-and the **public Rust API** (`weir-core`, `weir-client`, `weir-sink-sdk`,
-`weir-wab`) are frozen — a breaking change to any is a 2.0 change, not a PR. The
-wire format has a language-neutral conformance suite
+weir follows [Semantic Versioning](https://semver.org/). The **v1 wire
+protocol** is frozen and unchanged in 2.0. The **on-disk WAB segment format**
+(`weir-wab`) gained a version 2 in 2.0 — segments are still written as v1 unless
+compression is enabled, and readers accept both. The **public Rust API**
+(`weir-core`, `weir-client`, `weir-sink-sdk`, `weir-wab`) is under SemVer: a
+breaking change is a major, not a PR. The wire format has a language-neutral
+conformance suite
 ([`docs/conformance.md`](docs/conformance.md)); if you touch the codec, the
 vectors in `docs/conformance/wire_v1_vectors.json` must still pass unchanged.
 
@@ -143,5 +145,5 @@ the [Architecture doc](docs/architecture.md#workspace--crate-boundaries).
 
 ## License
 
-weir is MIT-licensed ([`LICENSE`](LICENSE)). By contributing, you agree your
-contributions are licensed under the same terms.
+weir is licensed under the Apache License 2.0 ([`LICENSE`](LICENSE)). By
+contributing, you agree your contributions are licensed under the same terms.

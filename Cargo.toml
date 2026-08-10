@@ -18,7 +18,7 @@ edition = "2024"
 # (stable 1.88), so 1.88 is the honest floor. Declared so a future bump is an
 # explicit, visible change rather than a silent break for downstream consumers (S39).
 rust-version = "1.88"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/miki-przygoda/weir"
 homepage = "https://github.com/miki-przygoda/weir"
 
