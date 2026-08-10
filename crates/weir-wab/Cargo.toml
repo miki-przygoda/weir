@@ -13,3 +13,8 @@ categories = ["encoding", "filesystem"]
 [dependencies]
 weir-core = { workspace = true }
 crc32fast = "1.4"
+# zstd for format-v2 payload compression. Binds to vendored libzstd, so this
+# needs a C toolchain at build time — already required by a default weir-server
+# build via ring (rustls, pulled by both reqwest and mysql_async), so it adds no
+# new class of build requirement. Resolved in the 2.0 design spec, §12.1.
+zstd = "0.13"
