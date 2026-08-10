@@ -2758,6 +2758,7 @@ dependencies = [
  "weir-sink-sdk",
  "weir-testkit",
  "weir-wab",
+ "zstd",
 ]
 
 [[package]]

@@ -693,6 +693,7 @@ pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<
 
 #[cfg(test)]
 mod tests {
+    use super::super::format::Compression;
     use super::*;
     use crate::metrics::Metrics;
     use crate::wab::format::build_confirmed;
@@ -712,7 +713,7 @@ mod tests {
     fn make_segment(dir: &Path, shard_id: u16, payloads: &[&[u8]]) -> PathBuf {
         use crate::wab::segment::{WabSegment, segment_path};
         let path = segment_path(dir, 1);
-        let mut seg = WabSegment::create(&path, shard_id).unwrap();
+        let mut seg = WabSegment::create(&path, shard_id, Compression::None).unwrap();
         for p in payloads {
             seg.write_record(p).unwrap();
         }
@@ -839,12 +840,13 @@ mod tests {
         fs::create_dir_all(&shard_dir).unwrap();
 
         // seg 1: sealed by the "previous process" — already counted there.
-        let mut seg = WabSegment::create(&segment_path(&shard_dir, 1), 0).unwrap();
+        let mut seg =
+            WabSegment::create(&segment_path(&shard_dir, 1), 0, Compression::None).unwrap();
         seg.write_record(b"old").unwrap();
         let pre_sealed = seg.seal().unwrap();
         // seg 2: still active at crash time — recovery seals this one.
         let active = segment_path(&shard_dir, 2);
-        let mut seg = WabSegment::create(&active, 0).unwrap();
+        let mut seg = WabSegment::create(&active, 0, Compression::None).unwrap();
         seg.write_record(b"new").unwrap();
         drop(seg);
 
@@ -994,7 +996,7 @@ mod tests {
         let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
         {
             use crate::wab::segment::WabSegment;
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             for p in payloads {
                 seg.write_record(p).unwrap();
             }
@@ -1092,7 +1094,7 @@ mod tests {
         let path = segment_path(&dir, 1);
         let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             for p in payloads {
                 seg.write_record(p).unwrap();
             }
@@ -1296,7 +1298,7 @@ mod tests {
 
         // Segment 1: valid then magic-corrupted → recover_segment quarantines + Errs.
         let corrupt = segment_path(&shard_dir, 1);
-        let mut s1 = WabSegment::create(&corrupt, 0).unwrap();
+        let mut s1 = WabSegment::create(&corrupt, 0, Compression::None).unwrap();
         s1.write_record(b"healthy-1").unwrap();
         drop(s1);
         {
@@ -1306,7 +1308,7 @@ mod tests {
 
         // Segment 2: healthy, left active — must still be sealed.
         let healthy = segment_path(&shard_dir, 2);
-        let mut s2 = WabSegment::create(&healthy, 0).unwrap();
+        let mut s2 = WabSegment::create(&healthy, 0, Compression::None).unwrap();
         s2.write_record(b"healthy-2").unwrap();
         drop(s2);
 
@@ -1350,7 +1352,7 @@ mod tests {
         // order deterministic (counter order) instead of OS-arbitrary.
         for (counter, payload) in [(1u64, b"seg-one" as &[u8]), (2, b"seg-two")] {
             let path = segment_path(&shard_dir, counter);
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(payload).unwrap();
             // Left active (unsealed) on purpose — recovery must seal it.
         }
@@ -1390,7 +1392,7 @@ mod tests {
         let shard_dir = wab_dir.join("shard_00");
         fs::create_dir_all(&shard_dir).unwrap();
         let shard_seg = segment_path(&shard_dir, 1);
-        WabSegment::create(&shard_seg, 0)
+        WabSegment::create(&shard_seg, 0, Compression::None)
             .unwrap()
             .write_record(b"live")
             .unwrap();
@@ -1400,7 +1402,7 @@ mod tests {
         let dl_dir = wab_dir.join("dead_letter");
         fs::create_dir_all(&dl_dir).unwrap();
         let dl_seg = dl_dir.join("dl_00000001.wab");
-        WabSegment::create(&dl_seg, 0)
+        WabSegment::create(&dl_seg, 0, Compression::None)
             .unwrap()
             .write_record(b"dead")
             .unwrap();
@@ -1448,7 +1450,7 @@ mod tests {
         let dir = tmp_dir("recover_max_payload");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(&vec![0xABu8; MAX_PAYLOAD_HARD_CAP])
                 .unwrap();
         }
@@ -1483,7 +1485,7 @@ mod tests {
         let dir = tmp_dir("recover_oversized");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"keep-me").unwrap();
         }
         // Splice an oversized length field where the next record would start.
@@ -1525,7 +1527,7 @@ mod tests {
         let dir = tmp_dir("recover_oversized_midfile");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"keep-me").unwrap();
         }
         // Splice an oversized length field, THEN trailing bytes after it so the
@@ -1588,7 +1590,7 @@ mod tests {
         let dir = tmp_dir("recover_sentinel");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"before-sentinel").unwrap();
         }
         // A sentinel is a zero-length record-length field (4 zero bytes), written

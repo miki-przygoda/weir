@@ -18,7 +18,7 @@ use weir_core::Payload;
 
 use crate::wab::{
     create_dir_private,
-    format::{SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SENTINEL},
+    format::{Compression, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SENTINEL},
     segment::WabSegment,
 };
 
@@ -102,7 +102,13 @@ impl DeadLetterWriter {
 
         let active_path = self.dir.join(format!("dl_{counter:08}.wab"));
         // Shard ID 0xFFFF is reserved as a dead-letter marker.
-        let mut seg = WabSegment::create(&active_path, 0xFFFF)?;
+        //
+        // Dead-letter segments are ALWAYS written uncompressed, regardless of
+        // the daemon's wab_compression setting. They are a small forensic
+        // artifact whose whole purpose is being readable later, possibly by
+        // tooling that is not this daemon; compressing them trades nothing for
+        // a readability risk.
+        let mut seg = WabSegment::create(&active_path, 0xFFFF, Compression::None)?;
         for payload in records {
             seg.write_record(payload)?;
         }

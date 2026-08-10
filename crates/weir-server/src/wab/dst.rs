@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use super::clock::BlockingClock;
+use super::format::Compression;
 use super::segment::{FsSegmentStore, SegmentHandle, SegmentStore, ShardWriter, WabSegment};
 use crate::metrics::Metrics;
 use crate::models::{Batch, WorkUnit};
@@ -414,8 +415,16 @@ impl SimSegmentStore {
 }
 
 impl SegmentStore for SimSegmentStore {
-    fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>> {
-        let inner = WabSegment::create(path, shard_id)?;
+    fn create(
+        &self,
+        path: &Path,
+        shard_id: u16,
+        compression: Compression,
+    ) -> io::Result<Box<dyn SegmentHandle>> {
+        // Honour the caller's compression: the harness must write the same
+        // byte stream production does, or the fault schedules stop simulating
+        // what they claim to.
+        let inner = WabSegment::create(path, shard_id, compression)?;
         Ok(Box::new(SimSegmentHandle {
             inner,
             faults: Arc::clone(&self.faults),
@@ -801,6 +810,8 @@ fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutco
             coalesce_hint,
             &clock,
             store,
+            Compression::None,
+            1,
         );
     });
     handle.join().expect("flusher thread join");
@@ -955,6 +966,8 @@ fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimRep
                     coalesce_hint,
                     &clock,
                     store,
+                    Compression::None,
+                    1,
                 );
             }
         });
@@ -1003,6 +1016,8 @@ fn run_crash_before_rename(seed: u64, faults: &[Fault], records: usize) -> SimRe
         64 * 1024 * 1024,
         Arc::clone(&env.metrics),
         store,
+        Compression::None,
+        1,
     );
 
     let mut rng = SplitMix64::new(seed);
@@ -1093,7 +1108,7 @@ fn run_mid_file_corruption(seed: u64, records: usize, corrupt_index: usize) -> S
     let mut rng = SplitMix64::new(seed);
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(records);
     {
-        let mut seg = WabSegment::create(&path, 0).expect("create segment");
+        let mut seg = WabSegment::create(&path, 0, Compression::None).expect("create segment");
         for i in 0..records {
             let payload = rng.unique_payload(i as u64);
             seg.write_record(&payload).expect("write_record");
@@ -1254,6 +1269,8 @@ fn run_interleaved_flush(
             coalesce_hint,
             &clock,
             store,
+            Compression::None,
+            1,
         );
         sched_f.finish(FLUSHER);
     });
@@ -1369,6 +1386,8 @@ mod tests {
                 coalesce_hint,
                 &clock,
                 store,
+                Compression::None,
+                1,
             );
         });
         handle.join().expect("flusher join");

@@ -43,6 +43,10 @@ name = "weir-server"
 path = "src/main.rs"
 
 [dependencies]
+# zstd for WAB format-v2 record compression. The codec lives in ShardWriter,
+# above the SegmentStore seam, so the DST harness drives real compressed byte
+# streams through its fault schedules.
+zstd = "0.13"
 weir-core = { workspace = true }
 # On-disk WAB segment format + SegmentReader. Extracted into its own crate so
 # weir-ctl can read dead-letter segments (for `dl requeue`) without depending on

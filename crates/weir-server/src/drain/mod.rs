@@ -1298,6 +1298,7 @@ fn estimated_write_bytes(payloads: &[Payload]) -> u64 {
 mod tests {
     use super::*;
     use crate::sink::SinkBatch;
+    use crate::wab::format::Compression;
     use crate::{
         metrics::Metrics,
         sink::{CommitResult, SinkHealth},
@@ -1645,7 +1646,7 @@ mod tests {
         let shard_dir = dir.join("shard_00");
         std::fs::create_dir_all(&shard_dir).unwrap();
         let path = segment_path(&shard_dir, 1);
-        let mut seg = WabSegment::create(&path, shard_id).unwrap();
+        let mut seg = WabSegment::create(&path, shard_id, Compression::None).unwrap();
         for p in payloads {
             seg.write_record(p).unwrap();
         }
@@ -2077,7 +2078,7 @@ mod tests {
         std::fs::create_dir_all(&shard_dir).unwrap();
         let mk = |counter: u64, payload: &[u8]| {
             let p = segment_path(&shard_dir, counter);
-            let mut s = WabSegment::create(&p, 0).unwrap();
+            let mut s = WabSegment::create(&p, 0, Compression::None).unwrap();
             s.write_record(payload).unwrap();
             s.seal().unwrap()
         };
@@ -2120,7 +2121,7 @@ mod tests {
         std::fs::create_dir_all(&shard_dir).unwrap();
         let mk = |counter: u64, payload: &[u8]| {
             let p = segment_path(&shard_dir, counter);
-            let mut s = WabSegment::create(&p, 0).unwrap();
+            let mut s = WabSegment::create(&p, 0, Compression::None).unwrap();
             s.write_record(payload).unwrap();
             s.seal().unwrap()
         };
@@ -2627,7 +2628,7 @@ mod tests {
         let held = make_sealed_segment(&dir, 0, &[b"held"]);
         let shard_dir = dir.join("shard_00");
         let other_active = segment_path(&shard_dir, 2);
-        let mut s = WabSegment::create(&other_active, 0).unwrap();
+        let mut s = WabSegment::create(&other_active, 0, Compression::None).unwrap();
         s.write_record(b"other").unwrap();
         let other = s.seal().unwrap();
 
@@ -2681,12 +2682,12 @@ mod tests {
         std::fs::create_dir_all(&shard_dir).unwrap();
 
         let seg1_active = segment_path(&shard_dir, 1);
-        let mut s1 = WabSegment::create(&seg1_active, 0).unwrap();
+        let mut s1 = WabSegment::create(&seg1_active, 0, Compression::None).unwrap();
         s1.write_record(b"seg1").unwrap();
         let seg1 = s1.seal().unwrap();
 
         let seg2_active = segment_path(&shard_dir, 2);
-        let mut s2 = WabSegment::create(&seg2_active, 0).unwrap();
+        let mut s2 = WabSegment::create(&seg2_active, 0, Compression::None).unwrap();
         s2.write_record(b"seg2").unwrap();
         let seg2 = s2.seal().unwrap();
 
