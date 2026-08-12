@@ -90,6 +90,28 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
     total
 }
 
+/// Number of 5 s samples the growth warning considers (60 s).
+const WAB_GROWTH_WINDOW: usize = 12;
+
+/// Whether to warn that the WAB is growing unbounded.
+///
+/// All three must hold:
+/// 1. no cap is set — with one set, the cap handles it and the warning is noise;
+/// 2. the window is full and shows net growth with no decrease;
+/// 3. the sink is unhealthy or the drain is not draining.
+///
+/// Condition 3 is the one that matters. Sustained growth under a healthy drain
+/// is just a fast producer; warning on that teaches operators to ignore the
+/// message, which defeats the purpose.
+fn should_warn_wab_growth(samples: &[u64], wab_max_bytes: u64, drain_healthy: bool) -> bool {
+    if wab_max_bytes != 0 || drain_healthy || samples.len() < WAB_GROWTH_WINDOW {
+        return false;
+    }
+    let window = &samples[samples.len() - WAB_GROWTH_WINDOW..];
+    let monotonic = window.windows(2).all(|w| w[1] >= w[0]);
+    monotonic && window[window.len() - 1] > window[0]
+}
+
 // ── TLS SIGHUP reload task ────────────────────────────────────────────────────
 
 /// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
@@ -580,9 +602,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wab_dir_bg = config.wab_dir.clone();
         let metrics_w = Arc::clone(&metrics);
         let wab_bytes_bg = Arc::clone(&wab_bytes_now);
+        // Captured before the task is spawned so the growth-warning predicate
+        // sees the operator's configured cap without reaching back into `config`.
+        let cap_for_warning = config.wab_max_bytes;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(5));
+            // Rolling window of on-disk-byte samples feeding should_warn_wab_growth,
+            // and the last time that warning actually fired (rate-limited below).
+            let mut samples: Vec<u64> = Vec::with_capacity(WAB_GROWTH_WINDOW + 1);
+            let mut last_warned: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
                 let wab_dir = wab_dir_bg.clone();
@@ -593,6 +622,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(0);
                 metrics_w.wab_bytes_on_disk.set(bytes as f64);
                 wab_bytes_bg.store(bytes, std::sync::atomic::Ordering::Relaxed);
+
+                samples.push(bytes);
+                if samples.len() > WAB_GROWTH_WINDOW {
+                    samples.remove(0);
+                }
+                // `sink_health` and `drain_state` are Gauge families with the
+                // current state's series set to 1.0, so the live value reads
+                // back without any new plumbing.
+                let sink_healthy = metrics_w
+                    .sink_health
+                    .get_or_create(&crate::metrics::SinkHealthLabel {
+                        state: crate::metrics::SinkHealthState::healthy,
+                    })
+                    .get()
+                    > 0.0;
+                let draining = metrics_w
+                    .drain_state
+                    .get_or_create(&crate::metrics::DrainStateLabel {
+                        state: crate::metrics::DrainStateValue::draining,
+                    })
+                    .get()
+                    > 0.0;
+                let drain_healthy = sink_healthy && draining;
+                let due = last_warned
+                    .map(|t| t.elapsed() >= std::time::Duration::from_secs(300))
+                    .unwrap_or(true);
+                if due && should_warn_wab_growth(&samples, cap_for_warning, drain_healthy) {
+                    warn!(
+                        wab_bytes = bytes,
+                        growth_bytes = bytes.saturating_sub(samples[0]),
+                        window_secs = WAB_GROWTH_WINDOW * 5,
+                        "WAB is growing while the sink is not healthy and no wab_max_bytes \
+                         is set — producers are still being acked into an unbounded buffer. \
+                         Set wab_max_bytes to bound it."
+                    );
+                    last_warned = Some(std::time::Instant::now());
+                }
             }
         });
 
@@ -909,5 +975,54 @@ mod wab_bytes_tests {
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_warn_wab_growth;
+
+    #[test]
+    fn growth_warning_fires_only_when_all_three_conditions_hold() {
+        // Growing + unhealthy + no cap => warn.
+        assert!(should_warn_wab_growth(
+            &[
+                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
+            ],
+            0,
+            false,
+        ));
+        // Growing + HEALTHY => no warning. This is the condition that keeps the
+        // message trustworthy: a fast producer must not trigger it.
+        assert!(!should_warn_wab_growth(
+            &[
+                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
+            ],
+            0,
+            true,
+        ));
+        // Growing + unhealthy but a cap IS set => no warning; the cap handles it.
+        assert!(!should_warn_wab_growth(
+            &[
+                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
+            ],
+            64 * 1024 * 1024,
+            false,
+        ));
+        // Flat or shrinking => no warning.
+        assert!(!should_warn_wab_growth(
+            &[500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500],
+            0,
+            false,
+        ));
+        assert!(!should_warn_wab_growth(
+            &[
+                1200, 1100, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100
+            ],
+            0,
+            false,
+        ));
+        // Not enough samples yet => no warning.
+        assert!(!should_warn_wab_growth(&[100, 200, 300], 0, false));
     }
 }
