@@ -151,7 +151,8 @@ HEALTH_MAP = [{"type": "value", "options": {
 DRAIN_MAP = [{"type": "value", "options": {
     "0": {"text": "Draining", "color": "green", "index": 0},
     "1": {"text": "Retrying", "color": "yellow", "index": 1},
-    "2": {"text": "BLOCKED", "color": "red", "index": 2}}}]
+    "2": {"text": "BLOCKED", "color": "red", "index": 2},
+    "3": {"text": "STOPPED", "color": "red", "index": 3}}}]
 UP_MAP = [{"type": "value", "options": {
     "1": {"text": "UP", "color": "green", "index": 0},
     "0": {"text": "DOWN", "color": "red", "index": 1}}}]
@@ -182,8 +183,10 @@ def build_panels(s):
                steps=[{"color": "green", "value": None}, {"color": "yellow", "value": 0.02}, {"color": "red", "value": 0.1}]), 3, 4)
     L.add(stat("Sink health", f'sum(weir_sink_health{{{s}, state="degraded"}}) + 2 * sum(weir_sink_health{{{s}, state="down"}})',
                "Active sink state (one-hot).", mappings=HEALTH_MAP, steps=TRI_STEPS), 3, 4)
-    L.add(stat("Drain state", f'sum(weir_drain_state{{{s}, state="retrying_transient"}}) + 2 * sum(weir_drain_state{{{s}, state="blocked_dead_letter_full"}})',
-               "Active drain state (one-hot).", mappings=DRAIN_MAP, steps=TRI_STEPS), 3, 4)
+    L.add(stat("Drain state", f'sum(weir_drain_state{{{s}, state="retrying_transient"}}) + 2 * sum(weir_drain_state{{{s}, state="blocked_dead_letter_full"}}) + 3 * sum(weir_drain_state{{{s}, state="stopped"}})',
+               "Active drain state (one-hot). STOPPED is terminal — the drain "
+               "supervisor has exited and nothing is delivered until restart.",
+               mappings=DRAIN_MAP, steps=TRI_STEPS), 3, 4)
     L.add(stat("Queue depth", f"max(weir_queue_depth{{{s}}})",
                "Records waiting in the work queue.", unit="short", color_mode="fixed"), 3, 4)
     L.add(stat("Sink fwd", f'sum(weir_sink_info{{{s}, sink_type="noop"}})',

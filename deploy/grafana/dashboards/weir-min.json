@@ -386,7 +386,7 @@
     {
       "type": "stat",
       "title": "Drain state",
-      "description": "Active drain state (one-hot).",
+      "description": "Active drain state (one-hot). STOPPED is terminal \u2014 the drain supervisor has exited and nothing is delivered until restart.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -414,6 +414,11 @@
                   "text": "BLOCKED",
                   "color": "red",
                   "index": 2
+                },
+                "3": {
+                  "text": "STOPPED",
+                  "color": "red",
+                  "index": 3
                 }
               }
             }
@@ -450,7 +455,7 @@
       "targets": [
         {
           "refId": "G",
-          "expr": "sum(weir_drain_state{job=\"weir-levels\", level=\"min\", state=\"retrying_transient\"}) + 2 * sum(weir_drain_state{job=\"weir-levels\", level=\"min\", state=\"blocked_dead_letter_full\"})"
+          "expr": "sum(weir_drain_state{job=\"weir-levels\", level=\"min\", state=\"retrying_transient\"}) + 2 * sum(weir_drain_state{job=\"weir-levels\", level=\"min\", state=\"blocked_dead_letter_full\"}) + 3 * sum(weir_drain_state{job=\"weir-levels\", level=\"min\", state=\"stopped\"})"
         }
       ],
       "gridPos": {

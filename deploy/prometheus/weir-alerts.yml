@@ -95,6 +95,19 @@ groups:
           description: "The dead-letter directory hit its cap; ALL drain activity is paused and the WAB will accumulate on disk. Free dead-letter space or raise dead_letter_max_bytes, then the drain resumes automatically."
           runbook: "docs/monitoring.md#weirdrainblocked"
 
+      - alert: WeirDrainStopped
+        # Terminal: the drain supervisor has exited (respawn budget exhausted,
+        # the dead-letter writer failed to open at start, or a clean shutdown).
+        # Nothing is delivered until the daemon restarts, and weir_sink_health
+        # is frozen at whatever it last read — do not trust it while this fires.
+        expr: weir_drain_state{job=~"weir", state="stopped"} == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir drain STOPPED on {{ $labels.instance }} — nothing is being delivered"
+          description: "The drain supervisor has exited and will not restart itself. Records are still acked and buffered durably, but the WAB grows until the disk fills. Restart the daemon; check the logs for a repeated drain panic or a dead-letter open failure. On a deliberate shutdown this clears when the instance stops being scraped."
+          runbook: "docs/monitoring.md#weirdrainstopped"
+
       - alert: WeirSinkDown
         # weir_sink_health is a gauge vector with exactly one of state=healthy/
         # degraded/down set to 1 (the others 0). Match the `down` series directly —

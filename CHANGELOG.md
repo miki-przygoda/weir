@@ -87,8 +87,11 @@ no existing deployment's clients are affected.
   respawn budget exhausted, and the dead-letter writer failing to open — and it
   is terminal: nothing is delivered until the daemon restarts.
   `weir_sink_health` is deliberately left where it was, because once nobody is
-  probing the sink its health is unknown rather than down. **Alert on
-  `weir_drain_state{state="stopped"} == 1`.**
+  probing the sink its health is unknown rather than down — which also means
+  **that gauge is not trustworthy while `stopped` is set.** The shipped
+  `WeirDrainStopped` alert rule, the Grafana drain-state panels, and
+  `weir-readiness.sh` all know about the new value; a dashboard pinned from an
+  earlier release will render it as an unmapped `3`.
 
 ### Changed
 

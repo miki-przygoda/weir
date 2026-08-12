@@ -91,6 +91,13 @@ is_set() { local v="${1:-}"; [[ -n "$v" && "${v%.*}" =~ ^[0-9]+$ && "${v%.*}" -g
 # ── READINESS ───────────────────────────────────────────────────────────────
 problems=()
 
+# Drain stopped == terminal. Checked before sink health because it invalidates
+# it: weir_sink_health is written only by the drain thread, so once the drain
+# has exited that gauge is frozen at its last reading, not a live signal.
+if is_set "$(mval 'weir_drain_state{state="stopped"}')"; then
+  problems+=("drain STOPPED: supervisor exited; nothing is delivered until restart")
+fi
+
 # Sink-health one-hot family: state="down" == 1 means delivery stalled
 # (records still buffer durably in the WAB, but nothing reaches the sink).
 if is_set "$(mval 'weir_sink_health{state="down"}')"; then

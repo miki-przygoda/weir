@@ -383,6 +383,11 @@
                   "text": "BLOCKED",
                   "color": "red",
                   "index": 2
+                },
+                "3": {
+                  "text": "STOPPED",
+                  "color": "red",
+                  "index": 3
                 }
               }
             }
@@ -422,7 +427,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(weir_drain_state{job=\"weir\", state=\"retrying_transient\"}) + 2 * sum(weir_drain_state{job=\"weir\", state=\"blocked_dead_letter_full\"})"
+          "expr": "sum(weir_drain_state{job=\"weir\", state=\"retrying_transient\"}) + 2 * sum(weir_drain_state{job=\"weir\", state=\"blocked_dead_letter_full\"}) + 3 * sum(weir_drain_state{job=\"weir\", state=\"stopped\"})"
         }
       ]
     },

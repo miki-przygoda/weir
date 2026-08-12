@@ -118,6 +118,25 @@ is being delivered.
 raise `dead_letter_max_bytes`. The drain re-checks the cap every
 `dead_letter_check_interval_secs` and resumes automatically once there's headroom.
 
+#### WeirDrainStopped
+The drain supervisor has exited and will not restart itself: the respawn budget
+ran out after repeated panics, the dead-letter writer failed to open at start, or
+the daemon is shutting down. This is terminal. Records are still accepted and
+still acked durably — no ack becomes false — but nothing is delivered and the WAB
+grows until the disk fills.
+
+**`weir_sink_health` is not trustworthy while this fires.** That gauge is written
+only by the drain thread, so once the drain is gone it is frozen at its last
+reading; a green sink-health panel beside a `stopped` drain means nothing is
+probing the sink, not that the sink is fine.
+
+**Respond:** restart the daemon. First check the logs for the cause —
+`weir_drain_panics_total` climbing to `max_respawns` points at a panicking sink
+implementation, and a dead-letter open failure names its path. Set
+`wab_max_bytes` if it is not already set, so the next occurrence bounds the WAB
+instead of filling the disk. On a deliberate shutdown this resolves when the
+instance stops being scraped.
+
 #### WeirSinkDown
 The configured sink reports itself unhealthy. The WAB keeps buffering durably (no
 data loss), but delivery is stalled.

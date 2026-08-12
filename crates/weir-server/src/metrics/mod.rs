@@ -115,8 +115,9 @@ pub struct DrainStateLabel {
 /// Drain state label value. `blocked_dead_letter_full` matches the state machine name.
 ///
 /// `stopped` is terminal and is not one of the state machine's states: it is set
-/// by the drain *supervisor* once it has exited for good (clean shutdown, or the
-/// respawn budget exhausted). The three running states are written only by the
+/// by the drain *supervisor* once it has exited for good — a clean shutdown, the
+/// respawn budget exhausted, or the dead-letter writer failing to open at start.
+/// All three converge on the same exit. The three running states are written only by the
 /// drain thread, so without a terminal value the family would stay frozen at its
 /// last reading — reporting `draining` while nothing drains.
 #[allow(non_camel_case_types)]
@@ -579,8 +580,9 @@ impl Metrics {
              delivery progress — a segment stranded waiting on a fully-down sink still reads \
              draining. Watch weir_sink_health{state=\"down\"} and weir_drain_segments_stranded \
              for that case, not this gauge alone. state=\"stopped\" is terminal: the drain \
-             supervisor has exited (clean shutdown, or the respawn budget exhausted) and \
-             NOTHING is being delivered until the daemon restarts — alert on it"
+             supervisor has exited (clean shutdown, the respawn budget exhausted, or the \
+             dead-letter writer failing to open at start) and NOTHING is being delivered \
+             until the daemon restarts — alert on it"
         );
         let dead_letter_blocked_duration = reg!(
             Gauge::<f64, AtomicU64>::default(),
