@@ -97,19 +97,30 @@ const WAB_GROWTH_WINDOW: usize = 12;
 ///
 /// All three must hold:
 /// 1. no cap is set — with one set, the cap handles it and the warning is noise;
-/// 2. the window is full and shows net growth with no decrease;
+/// 2. the window is full and shows net growth that never gave ground;
 /// 3. the sink is unhealthy or the drain is not draining.
 ///
 /// Condition 3 is the one that matters. Sustained growth under a healthy drain
 /// is just a fast producer; warning on that teaches operators to ignore the
 /// message, which defeats the purpose.
+///
+/// Condition 2 is deliberately NOT "every step was non-decreasing". A *degraded*
+/// sink — one delivering some batches and failing others, which the spec names as
+/// a case this must catch — deletes a confirmed segment every so often, and each
+/// deletion drops the byte count for one sample. Under a strict per-step rule a
+/// single such dip anywhere in the 12-sample window resets the whole detector, so
+/// the warning would only ever fire for a *fully* dead sink. The rule here is
+/// weaker per-step but just as strong end-to-end: the window must end above where
+/// it started and must never have fallen below where it started. A WAB that is
+/// genuinely draining dips under its own starting point and still does not warn.
 fn should_warn_wab_growth(samples: &[u64], wab_max_bytes: u64, drain_healthy: bool) -> bool {
     if wab_max_bytes != 0 || drain_healthy || samples.len() < WAB_GROWTH_WINDOW {
         return false;
     }
     let window = &samples[samples.len() - WAB_GROWTH_WINDOW..];
-    let monotonic = window.windows(2).all(|w| w[1] >= w[0]);
-    monotonic && window[window.len() - 1] > window[0]
+    let first = window[0];
+    let last = window[window.len() - 1];
+    last > first && window.iter().all(|&s| s >= first)
 }
 
 /// Reads the live `weir_sink_health` and `weir_drain_state` gauges and
@@ -1059,6 +1070,49 @@ mod tests {
         ));
         // Not enough samples yet => no warning.
         assert!(!should_warn_wab_growth(&[100, 200, 300], 0, false));
+    }
+
+    /// The shape a *degraded* sink produces: net growth interrupted by dips
+    /// wherever a batch did get delivered and its segment was confirmed and
+    /// deleted. The spec names "slow or degraded sink" as a case this must
+    /// catch, and a strict per-step non-decrease rule never fires on it — one
+    /// dip anywhere in the window resets the detector.
+    #[test]
+    fn growth_warning_fires_on_a_dipping_but_net_growing_window() {
+        assert!(should_warn_wab_growth(
+            &[
+                100, 300, 250, 500, 420, 700, 650, 900, 850, 1100, 1000, 1300
+            ],
+            0,
+            false,
+        ));
+        // A dip exactly back to the starting value is still not giving ground.
+        assert!(should_warn_wab_growth(
+            &[100, 200, 100, 300, 200, 400, 300, 500, 400, 600, 500, 700],
+            0,
+            false,
+        ));
+    }
+
+    /// The counter-case that keeps the weaker rule honest: a WAB that is really
+    /// draining goes BELOW where the window started, and must not warn however
+    /// high it ends up. Without this, "net growth" alone would fire on a sawtooth
+    /// that is comfortably keeping up.
+    #[test]
+    fn growth_warning_stays_silent_when_the_window_dips_below_its_start() {
+        assert!(!should_warn_wab_growth(
+            &[
+                1000, 1200, 900, 1400, 800, 1600, 700, 1800, 600, 2000, 500, 2200
+            ],
+            0,
+            false,
+        ));
+        // A single sample one byte under the start is enough to disqualify it.
+        assert!(!should_warn_wab_growth(
+            &[100, 200, 300, 400, 500, 99, 700, 800, 900, 1000, 1100, 1200],
+            0,
+            false,
+        ));
     }
 }
 
