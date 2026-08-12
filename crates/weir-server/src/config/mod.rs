@@ -199,6 +199,7 @@ pub(crate) struct PartialConfig {
     pub batch_deadline_ms: Option<u64>,
     pub wab_segment_max_bytes: Option<u64>,
     pub wab_segment_max_age_secs: Option<u64>,
+    pub wab_max_bytes: Option<u64>,
     pub wab_compression: Option<String>,
     pub wab_compression_level: Option<i32>,
     pub max_connections: Option<usize>,
@@ -301,6 +302,17 @@ pub struct Config {
     /// segment idle for this long is sealed and drained — timely delivery for
     /// low-volume deployments.
     pub wab_segment_max_age_secs: u64,
+    /// Soft upper bound on live WAB bytes on disk. `0` (default) disables it.
+    ///
+    /// When exceeded, pushes are Nacked with `NackReason::InternalError` rather
+    /// than acked into a WAB that cannot be drained. This closes the case where
+    /// a dead or slow drain lets the disk fill while producers keep receiving
+    /// successful acks.
+    ///
+    /// **This is a SOFT high-water mark.** The value it is checked against is
+    /// refreshed every 5 seconds, so the WAB can overshoot by up to 5 seconds of
+    /// peak ingest. Leave at least that much headroom below actual free space.
+    pub wab_max_bytes: u64,
     /// How WAB records are stored on disk: `"none"` (default) or `"zstd"`.
     ///
     /// **Default off is load-bearing.** With `none`, segments are written at
@@ -545,6 +557,18 @@ impl Config {
                 field: "wab_segment_max_bytes",
                 reason: format!(
                     "{wab_segment_max_bytes} is outside the supported range [4096, 4294967296]"
+                ),
+            });
+        }
+        // 0 = disabled. Otherwise the cap must admit at least one full segment,
+        // or ingest would be rejected before a single segment could fill.
+        let wab_max_bytes = merge!(wab_max_bytes).unwrap_or(0);
+        if wab_max_bytes != 0 && wab_max_bytes < wab_segment_max_bytes {
+            return Err(ConfigError::InvalidValue {
+                field: "wab_max_bytes",
+                reason: format!(
+                    "wab_max_bytes ({wab_max_bytes}) must be 0 (disabled) or at least \
+                     wab_segment_max_bytes ({wab_segment_max_bytes})"
                 ),
             });
         }
@@ -859,6 +883,7 @@ impl Config {
             batch_deadline_ms,
             wab_segment_max_bytes,
             wab_segment_max_age_secs,
+            wab_max_bytes,
             wab_compression,
             wab_compression_level,
             max_connections,
@@ -1989,5 +2014,64 @@ mod tests {
         assert_knob_rejected("comp_level_neg", "wab_compression_level", |p| {
             p.wab_compression_level = Some(-1)
         });
+    }
+
+    #[test]
+    fn wab_max_bytes_defaults_to_disabled() {
+        let dir = tmp_dir("cap_default");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.wab_max_bytes, 0,
+            "default must preserve existing behaviour"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_max_bytes_accepts_a_value_at_or_above_one_segment() {
+        let dir = tmp_dir("cap_ok");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_segment_max_bytes: Some(1024 * 1024),
+                wab_max_bytes: Some(64 * 1024 * 1024),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.wab_max_bytes, 64 * 1024 * 1024);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_max_bytes_below_one_segment_is_rejected() {
+        // A cap under the rotation threshold would reject before a single
+        // segment could fill — a configuration error, not a policy.
+        let dir = tmp_dir("cap_too_small");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_segment_max_bytes: Some(64 * 1024 * 1024),
+                wab_max_bytes: Some(1024),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wab_max_bytes"), "{msg}");
+        assert!(msg.contains("wab_segment_max_bytes"), "{msg}");
+        fs::remove_dir_all(dir).ok();
     }
 }

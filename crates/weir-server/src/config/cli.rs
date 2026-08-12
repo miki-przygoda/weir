@@ -23,6 +23,9 @@ OPTIONS:
                                                [default: 268435456 (256 MiB)]
     --wab-segment-max-age-secs <n>           Idle-seal threshold secs, 0=disabled (0-86400)
                                                [default: 0]
+    --wab-max-bytes <n>                      Soft cap on live WAB bytes, 0=disabled
+                                               (else must be >= wab-segment-max-bytes)
+                                               [default: 0]
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
@@ -134,6 +137,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         wab_segment_max_age_secs: pargs
             .opt_value_from_str("--wab-segment-max-age-secs")
+            .map_err(pico_err)?,
+        wab_max_bytes: pargs
+            .opt_value_from_str("--wab-max-bytes")
             .map_err(pico_err)?,
         max_connections: pargs
             .opt_value_from_str("--max-connections")
