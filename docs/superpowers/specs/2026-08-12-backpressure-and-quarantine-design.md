@@ -268,11 +268,16 @@ preserved-but-unreachable data visible and reachable*.
 
 | Knob | Type | Default | Range |
 |---|---|---|---|
-| `wab_max_bytes` | u64 (bytes) | `0` (disabled) | 0, or ≥ `wab_segment_max_bytes` |
+| `wab_max_bytes` | u64 (bytes) | `0` (disabled) | 0, or `wab_max_bytes / 10 * 9 > shard_count × wab_segment_max_bytes` |
 
-The lower bound matters: a cap below one segment's rotation threshold would
-reject before a single segment could fill, which is a configuration error
-rather than a policy. Validate it at load, like every other bounded knob.
+The lower bound matters, and it is not merely "one segment". Each shard holds one
+*open* active segment whose bytes count toward the cap, and an active segment
+seals only on a write that crosses its rotation threshold — so
+`shard_count × wab_segment_max_bytes` is a floor the daemon cannot drain away
+while the cap is rejecting (no writes ⇒ no seals ⇒ no drain). The cap must clear
+that floor by the hysteresis margin, or ingest wedges until restart with a
+healthy sink. Validate it at load, like every other bounded knob, and name the
+minimum in the error.
 
 Plumbed through CLI / env / TOML including `BASE_SERVER_KEYS`, and documented in
 `docs/operations/configuration.md` — which the config-doc drift guard in the

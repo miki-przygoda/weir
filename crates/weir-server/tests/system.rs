@@ -456,12 +456,20 @@ fn find_first_segment_header(wab_dir: &std::path::Path) -> Option<[u8; 24]> {
 #[test]
 #[cfg(feature = "http-sink")]
 fn wab_cap_nack_is_recoverable_for_a_real_client() {
-    // Smallest legal segment size, and a cap equal to it (config validation
-    // requires cap >= one segment), so a short burst crosses the cap.
+    // Smallest legal segment size, and the tightest cap validation accepts above
+    // it, so a short burst crosses the cap. The cap must clear
+    // `shard_count * wab_segment_max_bytes` with room to resume (see
+    // `Config::from_layers`) — a cap equal to one segment is refused precisely
+    // because it can never be released.
+    //
+    // `wab_segment_max_age_secs = 1` is load-bearing, not decoration: with a
+    // single shard the active segment holds up to 4096 bytes that only seal on a
+    // write crossing the threshold, and idle-sealing them is what lets sealed
+    // (stranded) segments accumulate toward the cap at 1 KiB per push.
     let srv = weir_server!("cap_recoverable")
         .extra_config(
             "wab_segment_max_bytes = 4096\n\
-             wab_max_bytes = 4096\n\
+             wab_max_bytes = 8192\n\
              wab_segment_max_age_secs = 1\n\
              sink_type = \"http\"\n\
              sink_max_retries = 0",

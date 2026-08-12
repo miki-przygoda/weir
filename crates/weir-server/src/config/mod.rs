@@ -560,17 +560,43 @@ impl Config {
                 ),
             });
         }
-        // 0 = disabled. Otherwise the cap must admit at least one full segment,
-        // or ingest would be rejected before a single segment could fill.
+        // 0 = disabled. Otherwise the cap must clear the *un-drainable floor*
+        // with room left to resume, or it wedges ingest permanently.
+        //
+        // The floor is one full active segment PER SHARD. The bytes the cap is
+        // checked against include every shard's open `.wab`, and an active
+        // segment seals only when a write crosses `wab_segment_max_bytes`
+        // (idle-seal, `wab_segment_max_age_secs`, is off by default). So once the
+        // cap starts rejecting there are no writes; nothing seals; nothing
+        // reaches the drain; and the byte total can never fall back below the
+        // resume line — ingest stays dead until a restart, with a perfectly
+        // healthy sink and drain.
+        //
+        // The resume line is written `cap / 10 * 9` so it reads identically to
+        // the hysteresis low-water mark in `socket::connection::over_wab_cap`.
+        // The two must stay in agreement: this check exists to guarantee that
+        // mark is reachable.
         let wab_max_bytes = merge!(wab_max_bytes).unwrap_or(0);
-        if wab_max_bytes != 0 && wab_max_bytes < wab_segment_max_bytes {
-            return Err(ConfigError::InvalidValue {
-                field: "wab_max_bytes",
-                reason: format!(
-                    "wab_max_bytes ({wab_max_bytes}) must be 0 (disabled) or at least \
-                     wab_segment_max_bytes ({wab_segment_max_bytes})"
-                ),
-            });
+        if wab_max_bytes != 0 {
+            let floor = wab_segment_max_bytes.saturating_mul(shard_count as u64);
+            if wab_max_bytes / 10 * 9 <= floor {
+                // Smallest cap `c` satisfying `c / 10 * 9 > floor`: integer
+                // division means only multiples of 10 raise `c / 10`, so the
+                // minimum is `(floor / 9 + 1) * 10`.
+                let minimum = (floor / 9).saturating_add(1).saturating_mul(10);
+                return Err(ConfigError::InvalidValue {
+                    field: "wab_max_bytes",
+                    reason: format!(
+                        "wab_max_bytes ({wab_max_bytes}) must be 0 (disabled) or at least \
+                         {minimum}: its resume threshold (wab_max_bytes / 10 * 9) has to \
+                         clear the bytes that cannot be drained away — one full active \
+                         segment per shard, i.e. shard_count ({shard_count}) * \
+                         wab_segment_max_bytes ({wab_segment_max_bytes}) = {floor} bytes — \
+                         because an active segment seals only when a write crosses the size \
+                         threshold, and over the cap there are no writes"
+                    ),
+                });
+            }
         }
         // Idle-seal threshold. 0 = disabled (historical behaviour); otherwise seal
         // an idle active segment after this many seconds. Capped at a day.
@@ -2036,11 +2062,14 @@ mod tests {
     }
 
     #[test]
-    fn wab_max_bytes_accepts_a_value_at_or_above_one_segment() {
+    fn wab_max_bytes_accepts_a_value_that_clears_every_shard_active_segment() {
         let dir = tmp_dir("cap_ok");
+        // 4 shards x 1 MiB active segments = 4 MiB un-drainable; a 64 MiB cap
+        // resumes at 57.6 MiB, well clear of it.
         let c = Config::from_layers(
             PartialConfig {
                 wab_dir: Some(dir.clone()),
+                shard_count: Some(4),
                 wab_segment_max_bytes: Some(1024 * 1024),
                 wab_max_bytes: Some(64 * 1024 * 1024),
                 ..PartialConfig::empty()
@@ -2072,6 +2101,92 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("wab_max_bytes"), "{msg}");
         assert!(msg.contains("wab_segment_max_bytes"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The wedge the whole-branch review reproduced: `wab_max_bytes ==
+    /// wab_segment_max_bytes` passed the old `cap >= one segment` check, but with
+    /// two shards the two active `.wab` files together sat above the cap while
+    /// each stayed below its own rotation threshold. Nothing sealed, nothing
+    /// drained, and bytes never fell back under the resume line — ingest was dead
+    /// until restart with a healthy sink. Config must refuse it up front.
+    #[test]
+    fn wab_max_bytes_sized_for_one_shard_is_rejected_when_there_are_more() {
+        let dir = tmp_dir("cap_one_shard_many");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(2),
+                wab_segment_max_bytes: Some(65536),
+                wab_max_bytes: Some(65536),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        // The operator needs all three inputs and the number to set, not just
+        // "you were wrong".
+        assert!(msg.contains("wab_max_bytes"), "{msg}");
+        assert!(msg.contains("wab_segment_max_bytes"), "{msg}");
+        assert!(msg.contains("shard_count"), "{msg}");
+        // floor = 2 * 65536 = 131072; minimum = (131072 / 9 + 1) * 10 = 145640.
+        assert!(
+            msg.contains("145640"),
+            "the error must state the minimum that would be accepted: {msg}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The stated minimum must actually be accepted, and one step below it must
+    /// not — otherwise the message sends operators to a value that still fails.
+    #[test]
+    fn wab_max_bytes_minimum_from_the_error_message_is_exactly_the_boundary() {
+        let build = |dir: &PathBuf, cap: u64| {
+            Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    shard_count: Some(2),
+                    wab_segment_max_bytes: Some(65536),
+                    wab_max_bytes: Some(cap),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+        };
+        let dir = tmp_dir("cap_boundary");
+        assert!(
+            build(&dir, 145_640).is_ok(),
+            "the minimum the error names must be accepted"
+        );
+        assert!(
+            build(&dir, 145_639).is_err(),
+            "one byte below the named minimum must still be rejected"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A single-shard cap set exactly at one segment is now rejected too: the
+    /// resume line is `cap / 10 * 9`, which is below the one active segment that
+    /// cannot seal, so that config wedges just as surely as the multi-shard one.
+    #[test]
+    fn wab_max_bytes_equal_to_one_segment_is_rejected_even_on_a_single_shard() {
+        let dir = tmp_dir("cap_equal_one_seg");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(1),
+                wab_segment_max_bytes: Some(65536),
+                wab_max_bytes: Some(65536),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wab_max_bytes"), "{err}");
         fs::remove_dir_all(dir).ok();
     }
 }

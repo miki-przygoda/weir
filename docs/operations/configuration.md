@@ -409,7 +409,8 @@ deployments where segments fill quickly on their own.
 
 - **Type**: u64 (bytes)
 - **Default**: `0` (disabled)
-- **Range**: `0`, or at least [`wab_segment_max_bytes`](#wab_segment_max_bytes)
+- **Range**: `0`, or large enough that `wab_max_bytes / 10 * 9` exceeds
+  [`shard_count`](#shard_count) × [`wab_segment_max_bytes`](#wab_segment_max_bytes)
 - **CLI**: `--wab-max-bytes <n>`
 - **Env**: `WEIR_WAB_MAX_BYTES`
 - **TOML**: `wab_max_bytes`
@@ -445,9 +446,32 @@ will still fill the disk — leave at least that much headroom below actual
 free space.
 
 `0` (default) disables the cap: the WAB is unbounded, as it always was before
-this knob existed. When set, it must be `0` or at least
-`wab_segment_max_bytes` — a tighter cap would reject ingest before a single
-segment could ever fill.
+this knob existed.
+
+**When set, the cap must be large enough to release itself.** Validation
+requires
+
+```
+wab_max_bytes / 10 * 9  >  shard_count * wab_segment_max_bytes
+```
+
+and refuses to start otherwise, naming the minimum it would accept. The reason
+is that the right-hand side is a floor the daemon cannot drain away: every
+shard holds one *open* active segment, its bytes are counted by the cap, and an
+active segment is sealed only by a write that crosses `wab_segment_max_bytes`
+(or by `wab_segment_max_age_secs`, which is off by default). Once the cap starts
+rejecting there are no writes — so nothing seals, nothing reaches the drain, and
+live bytes can never fall back below the `wab_max_bytes * 0.9` resume line.
+A cap below that bound wedges ingest until the daemon is restarted, even with a
+perfectly healthy sink and drain.
+
+The practical consequence: **size the cap against `shard_count`, not against one
+segment.** With `shard_count = 4` and the default 256 MiB segments, the floor is
+1 GiB and the smallest accepted cap is `1193046480` bytes (≈1.11 GiB) — but a cap that
+close to the floor leaves almost no working room, so prefer several times the
+floor. Setting `wab_segment_max_age_secs > 0` is also worth doing alongside the
+cap: it seals idle active segments on a timer, which lets their bytes reach the
+drain instead of sitting in the un-drainable floor.
 
 **When to tune**: set it wherever the WAB shares a disk with anything else and
 you want a producer-visible signal (Nacks) when the sink stops draining,

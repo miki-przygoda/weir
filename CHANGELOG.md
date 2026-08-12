@@ -64,6 +64,15 @@ no existing deployment's clients are affected.
   **It is a soft high-water mark.** The value is refreshed every 5 seconds, so
   the WAB can overshoot by up to 5 seconds of peak ingest — leave headroom.
 
+  **Size it against `shard_count`, not against one segment.** Validation
+  requires `wab_max_bytes / 10 * 9 > shard_count * wab_segment_max_bytes` and
+  names the minimum it would accept. Below that bound the cap can never release
+  itself: each shard's *open* active segment counts toward the cap but seals only
+  on a write that crosses `wab_segment_max_bytes`, so once the cap rejects, no
+  write happens, nothing seals, nothing drains, and live bytes never fall back
+  under the resume line — ingest stays wedged until restart even with a healthy
+  sink. `wab_segment_max_age_secs > 0` (idle-seal) is worth enabling alongside it.
+
   Because it defaults to off, the daemon also **warns when the WAB is growing
   while the sink is unhealthy and no cap is set**, rate-limited to once every 5
   minutes. That warning deliberately does not fire under a healthy drain, where
