@@ -2415,7 +2415,21 @@ mod tests {
             .collect();
         let sink = Arc::new(MockSink::with_responses(responses));
         let metrics = noop_metrics();
-        run_drain(rx, tx, sink, fast_config(dir.clone()), Arc::clone(&metrics));
+        // Push the health poll out of reach. `fast_config`'s 50 ms cadence races
+        // this assertion: stranding the segment marks the sink down, the next
+        // poll sees MockSink report healthy again, and that down→up edge is the
+        // 4a auto-resume — it rescans, re-queues this very segment, and by then
+        // the scripted responses are exhausted so the redelivery SUCCEEDS and the
+        // segment is confirmed and deleted. Whether the drain exits before the
+        // poll fires is pure timing, which made this test machine-dependent. The
+        // resume behaviour has its own test
+        // (`stranded_segment_resumes_when_sink_recovers`); this one is about what
+        // happens when the retry budget runs out.
+        let config = DrainConfig {
+            health_poll_interval: Duration::from_secs(3600),
+            ..fast_config(dir.clone())
+        };
+        run_drain(rx, tx, sink, config, Arc::clone(&metrics));
 
         assert!(
             sealed.exists(),
