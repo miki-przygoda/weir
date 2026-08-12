@@ -491,6 +491,7 @@ fn metrics_all_families_registered() {
         "weir_wab_fsync_duration_seconds",
         "weir_wab_flusher_panics",
         "weir_wab_fsync_failures",
+        "weir_wab_cap_rejections",
         // Sink / drain
         "weir_sink_commit_duration_seconds",
         "weir_sink_commit_records",

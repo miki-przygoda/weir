@@ -258,6 +258,8 @@ pub(crate) struct Metrics {
     /// rather than fail open and lose them. Alertable so the stuck-on-full-disk
     /// state is visible instead of silent.
     pub recovery_quarantine_copy_failed: Counter<u64, AtomicU64>,
+    /// Pushes rejected because live WAB bytes exceeded `wab_max_bytes`.
+    pub wab_cap_rejections: Counter<u64, AtomicU64>,
     /// Cumulative record payload bytes as accepted from producers, before any
     /// compression. Paired with [`Metrics::wab_record_stored_bytes`].
     pub wab_record_logical_bytes: Counter<u64, AtomicU64>,
@@ -519,6 +521,13 @@ impl Metrics {
              acked-durable tail records (recovery is stuck until the operator clears \
              disk space / read-only state)"
         );
+        let wab_cap_rejections = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_cap_rejections",
+            "Pushes Nacked because live WAB bytes exceeded wab_max_bytes. These \
+             surface to clients as NackReason::InternalError (the same byte as \
+             queue saturation), so this counter is how the two are told apart"
+        );
         let wab_unexpected_mode = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_wab_unexpected_mode",
@@ -623,6 +632,7 @@ impl Metrics {
             recovery_records_replayed,
             recovery_segments_quarantined,
             recovery_quarantine_copy_failed,
+            wab_cap_rejections,
             wab_record_logical_bytes,
             wab_record_stored_bytes,
             wab_unexpected_mode,

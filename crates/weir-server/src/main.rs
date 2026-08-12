@@ -565,8 +565,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The scan is synchronous I/O (read_dir + metadata per entry) so it
         // runs inside spawn_blocking — putting it directly on a tokio worker
         // would stall the runtime in proportion to the number of segments.
+        //
+        // Shared with the connection handlers so the ingest path can consult the
+        // WAB size without doing any I/O of its own — this task already walks
+        // the directory for the gauge, so the value is free.
+        let wab_bytes_now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         let wab_dir_bg = config.wab_dir.clone();
         let metrics_w = Arc::clone(&metrics);
+        let wab_bytes_bg = Arc::clone(&wab_bytes_now);
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -579,6 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
                 .unwrap_or(0);
                 metrics_w.wab_bytes_on_disk.set(bytes as f64);
+                wab_bytes_bg.store(bytes, std::sync::atomic::Ordering::Relaxed);
             }
         });
 
