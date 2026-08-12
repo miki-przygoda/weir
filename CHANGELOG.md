@@ -78,6 +78,18 @@ no existing deployment's clients are affected.
   minutes. That warning deliberately does not fire under a healthy drain, where
   sustained growth is just a fast producer.
 
+- **`weir_drain_state{state="stopped"}` — a new value in an existing one-hot
+  gauge family.** The drain supervisor previously left `weir_drain_state` and
+  `weir_sink_health` reading *draining* and *healthy* after it exited for good,
+  because both are written only by the drain thread itself. An operator scraping
+  a daemon whose drain had given up saw a green dashboard over a WAB filling the
+  disk. The supervisor now sets `stopped` on every exit path — clean shutdown,
+  respawn budget exhausted, and the dead-letter writer failing to open — and it
+  is terminal: nothing is delivered until the daemon restarts.
+  `weir_sink_health` is deliberately left where it was, because once nobody is
+  probing the sink its health is unknown rather than down. **Alert on
+  `weir_drain_state{state="stopped"} == 1`.**
+
 ### Changed
 
 - **BREAKING — the `Sink` trait is reshaped.** `commit` takes a `SinkBatch`
