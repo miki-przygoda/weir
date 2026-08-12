@@ -647,11 +647,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 let wab_dir = wab_dir_bg.clone();
-                let bytes = tokio::task::spawn_blocking(move || {
+                // A join failure must NOT be substituted with 0. Storing 0 here
+                // would read as "the WAB is empty" and lift the cap entirely
+                // until the next tick — failing open on the one feature whose
+                // job is to fail closed. Keep the last known value instead: it
+                // is stale by 5 s, which is exactly the staleness the cap is
+                // already documented to have.
+                let bytes = match tokio::task::spawn_blocking(move || {
                     compute_wab_bytes_on_disk(&wab_dir)
                 })
                 .await
-                .unwrap_or(0);
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "WAB byte scan failed to join; keeping the last known size. \
+                             The wab_max_bytes cap and weir_wab_bytes_on_disk are stale \
+                             until the next tick."
+                        );
+                        // Skip the growth sample too, deliberately: pushing a
+                        // stale duplicate would read as "not growing" and
+                        // suppress the growth warning for a whole window.
+                        continue;
+                    }
+                };
                 metrics_w.wab_bytes_on_disk.set(bytes as f64);
                 wab_bytes_bg.store(bytes, std::sync::atomic::Ordering::Relaxed);
 
