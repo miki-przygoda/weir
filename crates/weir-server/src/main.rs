@@ -112,6 +112,38 @@ fn should_warn_wab_growth(samples: &[u64], wab_max_bytes: u64, drain_healthy: bo
     monotonic && window[window.len() - 1] > window[0]
 }
 
+/// Reads the live `weir_sink_health` and `weir_drain_state` gauges and
+/// composes them into condition 3 of `should_warn_wab_growth`: is the drain
+/// healthy right now.
+///
+/// This is the OR-logic that makes the growth warning trustworthy — "sink
+/// unhealthy OR not draining" is exactly NOT(sink healthy AND draining), so
+/// the two gauge reads are ANDed here and the caller negates the result by
+/// passing it straight to `drain_healthy`. Pulled out of the background
+/// task's closure (rather than left inline) so this composition — not just
+/// the pure predicate — is unit-tested; a swapped `&&`/`||` or a wrong label
+/// variant here would previously compile and pass every existing test.
+fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
+    // `sink_health` and `drain_state` are Gauge families with the current
+    // state's series set to 1.0, so the live value reads back without any new
+    // plumbing.
+    let sink_healthy = metrics
+        .sink_health
+        .get_or_create(&crate::metrics::SinkHealthLabel {
+            state: crate::metrics::SinkHealthState::healthy,
+        })
+        .get()
+        > 0.0;
+    let draining = metrics
+        .drain_state
+        .get_or_create(&crate::metrics::DrainStateLabel {
+            state: crate::metrics::DrainStateValue::draining,
+        })
+        .get()
+        > 0.0;
+    sink_healthy && draining
+}
+
 // ── TLS SIGHUP reload task ────────────────────────────────────────────────────
 
 /// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
@@ -627,24 +659,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if samples.len() > WAB_GROWTH_WINDOW {
                     samples.remove(0);
                 }
-                // `sink_health` and `drain_state` are Gauge families with the
-                // current state's series set to 1.0, so the live value reads
-                // back without any new plumbing.
-                let sink_healthy = metrics_w
-                    .sink_health
-                    .get_or_create(&crate::metrics::SinkHealthLabel {
-                        state: crate::metrics::SinkHealthState::healthy,
-                    })
-                    .get()
-                    > 0.0;
-                let draining = metrics_w
-                    .drain_state
-                    .get_or_create(&crate::metrics::DrainStateLabel {
-                        state: crate::metrics::DrainStateValue::draining,
-                    })
-                    .get()
-                    > 0.0;
-                let drain_healthy = sink_healthy && draining;
+                let drain_healthy = drain_is_healthy(&metrics_w);
                 let due = last_warned
                     .map(|t| t.elapsed() >= std::time::Duration::from_secs(300))
                     .unwrap_or(true);
@@ -1024,5 +1039,86 @@ mod tests {
         ));
         // Not enough samples yet => no warning.
         assert!(!should_warn_wab_growth(&[100, 200, 300], 0, false));
+    }
+}
+
+#[cfg(test)]
+mod drain_is_healthy_tests {
+    use super::drain_is_healthy;
+    use crate::metrics::{
+        DrainStateLabel, DrainStateValue, Metrics, SinkHealthLabel, SinkHealthState,
+    };
+
+    /// Drives the `sink_health` gauge family exactly the way
+    /// `drain::set_sink_health` does in production: one-hot, active state at
+    /// 1.0, the rest 0.0.
+    fn set_sink_health(m: &Metrics, active: SinkHealthState) {
+        for s in [
+            SinkHealthState::healthy,
+            SinkHealthState::degraded,
+            SinkHealthState::down,
+        ] {
+            let v = if s == active { 1.0 } else { 0.0 };
+            m.sink_health
+                .get_or_create(&SinkHealthLabel { state: s })
+                .set(v);
+        }
+    }
+
+    /// Drives the `drain_state` gauge family exactly the way
+    /// `drain::set_drain_state` does in production: one-hot, active state at
+    /// 1.0, the rest 0.0.
+    fn set_drain_state(m: &Metrics, active: DrainStateValue) {
+        for s in [
+            DrainStateValue::draining,
+            DrainStateValue::retrying_transient,
+            DrainStateValue::blocked_dead_letter_full,
+        ] {
+            let v = if s == active { 1.0 } else { 0.0 };
+            m.drain_state
+                .get_or_create(&DrainStateLabel { state: s })
+                .set(v);
+        }
+    }
+
+    #[test]
+    fn sink_healthy_and_draining_is_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::healthy);
+        set_drain_state(&m, DrainStateValue::draining);
+        assert!(
+            drain_is_healthy(&m),
+            "healthy sink + actively draining must compose to healthy (no warning)"
+        );
+    }
+
+    #[test]
+    fn sink_healthy_but_not_draining_is_not_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::healthy);
+        set_drain_state(&m, DrainStateValue::retrying_transient);
+        assert!(
+            !drain_is_healthy(&m),
+            "a healthy sink that isn't actively draining must not compose to healthy"
+        );
+    }
+
+    #[test]
+    fn sink_unhealthy_but_draining_is_not_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::down);
+        set_drain_state(&m, DrainStateValue::draining);
+        assert!(
+            !drain_is_healthy(&m),
+            "an unhealthy sink must not compose to healthy even while draining"
+        );
+    }
+
+    #[test]
+    fn sink_unhealthy_and_not_draining_is_not_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::down);
+        set_drain_state(&m, DrainStateValue::blocked_dead_letter_full);
+        assert!(!drain_is_healthy(&m));
     }
 }
