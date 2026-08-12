@@ -1,4 +1,11 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -59,6 +66,17 @@ pub struct ConnectionConfig {
     /// shard_count = 1 every connection gets shard_id = 0, which matches the
     /// pre-multi-shard behaviour.
     pub shard_id: u32,
+    /// Soft cap on live WAB bytes; `0` disables the check. See
+    /// `Config::wab_max_bytes`.
+    pub wab_max_bytes: u64,
+    /// Most recent WAB byte count, refreshed every 5 s by the gauge task in
+    /// `main`. Read with `Ordering::Relaxed` — a stale read costs at most one
+    /// extra accepted record, and the cap is documented as a soft bound.
+    pub wab_bytes_now: Arc<AtomicU64>,
+    /// Whether the cap is currently rejecting. Shared across connections so all
+    /// of them agree, and so the low-water mark is honoured globally rather
+    /// than per-connection.
+    pub wab_cap_rejecting: Arc<AtomicBool>,
 }
 
 /// Handles one client connection: parses frames in a loop, queues work units,
@@ -277,6 +295,37 @@ where
         match header.message_type() {
             MessageType::Push => {
                 let tv = durability_to_tier(header.durability());
+
+                // WAB cap. Checked here — after the frame is fully read and CRC
+                // verified, before the record counts as accepted. Nacking any
+                // earlier would leave unread payload bytes in the stream that the
+                // client mis-reads as a later reply, and it poisons its connection
+                // on exactly that.
+                //
+                // All three durability tiers are rejected: Buffered still writes
+                // to the WAB, it just acks earlier.
+                if over_wab_cap(&config) {
+                    send_nack(
+                        stream.get_mut(),
+                        WireNack::InternalError,
+                        &[],
+                        config.read_timeout,
+                    )
+                    .await?;
+                    metrics.wab_cap_rejections.inc();
+                    metrics
+                        .records_nack
+                        .get_or_create(&NackLabel {
+                            tier: tv,
+                            reason: MetricNack::internal_error,
+                        })
+                        .inc();
+                    // Keep the connection: unlike the decode-level rejections
+                    // above, this is a transient condition the producer is
+                    // expected to retry through once the drain catches up.
+                    continue;
+                }
+
                 metrics
                     .records_accepted
                     .get_or_create(&TierLabel { tier: tv.clone() })
@@ -437,6 +486,37 @@ where
     }
 }
 
+/// Whether the WAB cap is currently rejecting pushes.
+///
+/// Hysteresis: once rejecting, keep rejecting until bytes fall below
+/// `cap * 9 / 10`, so ingest does not flap on and off at the boundary. `cap == 0`
+/// disables the check entirely.
+///
+/// The `rejecting` flag is shared by every connection on the daemon, so the
+/// low-water mark is global: one connection observing recovery releases all of
+/// them, and one observing the cap holds all of them.
+fn over_wab_cap(config: &ConnectionConfig) -> bool {
+    if config.wab_max_bytes == 0 {
+        return false;
+    }
+    let bytes = config.wab_bytes_now.load(Ordering::Relaxed);
+    let rejecting = config.wab_cap_rejecting.load(Ordering::Relaxed);
+    // Divide before multiplying: `cap * 9` would overflow for caps above
+    // u64::MAX / 9, and the rounding loss is at most 9 bytes.
+    let low_water = config.wab_max_bytes / 10 * 9;
+    let now_rejecting = if rejecting {
+        bytes >= low_water
+    } else {
+        bytes >= config.wab_max_bytes
+    };
+    if now_rejecting != rejecting {
+        config
+            .wab_cap_rejecting
+            .store(now_rejecting, Ordering::Relaxed);
+    }
+    now_rejecting
+}
+
 fn durability_to_tier(d: Durability) -> TierValue {
     match d {
         Durability::Sync => TierValue::sync,
@@ -575,6 +655,11 @@ mod tests {
             read_timeout: Duration::from_secs(30),
             ack_timeout: Duration::from_secs(30),
             shard_id: 0,
+            // Cap disabled by default, so every pre-existing test still
+            // exercises the un-capped ingest path.
+            wab_max_bytes: 0,
+            wab_bytes_now: Arc::new(AtomicU64::new(0)),
+            wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -593,28 +678,7 @@ mod tests {
     /// Spawns a connection handler with a queue that immediately acks every WorkUnit.
     /// Returns the client-side stream.
     async fn spawn_handler(cfg: ConnectionConfig) -> UnixStream {
-        let (client, server) = UnixStream::pair().unwrap();
-        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
-        let (m, _reg) = crate::metrics::Metrics::new();
-        let metrics = std::sync::Arc::new(m);
-
-        // Auto-acker: blocking crossbeam recv must run on an OS thread, not in a
-        // tokio task — blocking a tokio worker thread stalls the entire runtime.
-        std::thread::spawn(move || {
-            let rx = queue_rx.get(0);
-            while let Ok(unit) = rx.recv() {
-                let _ = unit.ack_tx.send(true);
-            }
-        });
-
-        tokio::spawn(handle_connection(
-            server,
-            queue_tx,
-            cfg,
-            metrics,
-            never_shutdown_rx(),
-        ));
-        client
+        spawn_handler_acking(cfg, Some(true)).await
     }
 
     /// Spawns a handler whose flusher resolves each work unit's ack oneshot with
@@ -622,11 +686,30 @@ mod tests {
     /// = drop the unit (and its sender) without responding, modelling a flusher
     /// panic. Used to exercise the non-durable → Nack(InternalError) paths (S14).
     async fn spawn_handler_acking(cfg: ConnectionConfig, ack: Option<bool>) -> UnixStream {
+        let (m, _reg) = crate::metrics::Metrics::new();
+        spawn_handler_acking_with(cfg, std::sync::Arc::new(m), ack).await
+    }
+
+    /// Auto-acking handler, with the caller keeping a handle on the `Metrics` the
+    /// handler bumps. Same shape as [`spawn_handler`] otherwise.
+    async fn spawn_handler_with(cfg: ConnectionConfig, metrics: Arc<Metrics>) -> UnixStream {
+        spawn_handler_acking_with(cfg, metrics, Some(true)).await
+    }
+
+    /// The one place a handler is actually spawned for a test. Takes the
+    /// `Arc<Metrics>` explicitly so a test can assert on the very counters the
+    /// handler increments (the counter-free variants above build their own and
+    /// drop the registry).
+    async fn spawn_handler_acking_with(
+        cfg: ConnectionConfig,
+        metrics: Arc<Metrics>,
+        ack: Option<bool>,
+    ) -> UnixStream {
         let (client, server) = UnixStream::pair().unwrap();
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
-        let (m, _reg) = crate::metrics::Metrics::new();
-        let metrics = std::sync::Arc::new(m);
 
+        // Blocking crossbeam recv must run on an OS thread, not in a tokio task
+        // — blocking a tokio worker thread stalls the entire runtime.
         std::thread::spawn(move || {
             let rx = queue_rx.get(0);
             while let Ok(unit) = rx.recv() {
@@ -794,9 +877,7 @@ mod tests {
         // Set a tight cap of 16 bytes.
         let cfg = ConnectionConfig {
             max_payload_bytes: 16,
-            read_timeout: Duration::from_secs(30),
-            ack_timeout: Duration::from_secs(30),
-            shard_id: 0,
+            ..test_cfg()
         };
         let mut client = spawn_handler(cfg).await;
 
@@ -904,9 +985,7 @@ mod tests {
         // The effective cap is min(config, MAX_PAYLOAD_HARD_CAP).
         let cfg = ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP + 1,
-            read_timeout: Duration::from_secs(30),
-            ack_timeout: Duration::from_secs(30),
-            shard_id: 0,
+            ..test_cfg()
         };
         let mut client = spawn_handler(cfg).await;
 
@@ -972,10 +1051,8 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let cfg = ConnectionConfig {
-            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
-            read_timeout: Duration::from_secs(30),
             ack_timeout: Duration::from_millis(100), // tight bound so the test is fast
-            shard_id: 0,
+            ..test_cfg()
         };
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
@@ -1048,6 +1125,146 @@ mod tests {
         assert_eq!(payload[0], NackReason::InternalError as u8);
     }
 
+    // ── WAB cap (wab_max_bytes) ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn push_over_the_wab_cap_nacks_internal_error_and_keeps_the_connection() {
+        // The cap Nack must be InternalError specifically: the client's
+        // is_recoverable() maps that to `true`, so producers back off instead of
+        // tearing down and reconnecting at the worst possible moment.
+        let bytes = Arc::new(AtomicU64::new(5_000));
+        let rejecting = Arc::new(AtomicBool::new(false));
+        let cfg = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::clone(&bytes),
+            wab_cap_rejecting: Arc::clone(&rejecting),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        let mut client = spawn_handler_with(cfg, Arc::clone(&metrics)).await;
+
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(
+            payload[0],
+            NackReason::InternalError as u8,
+            "cap rejection must reuse InternalError so clients stay connected"
+        );
+        assert_eq!(metrics.wab_cap_rejections.get(), 1);
+
+        // The connection must still be usable — send a second frame and get a
+        // reply rather than a closed socket.
+        client.write_all(&push_frame(b"again")).await.unwrap();
+        let (msg_type2, _) = read_response(&mut client).await;
+        assert_eq!(
+            msg_type2,
+            MessageType::Nack,
+            "connection must remain open after a cap Nack"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_under_the_wab_cap_is_accepted() {
+        let bytes = Arc::new(AtomicU64::new(100));
+        let rejecting = Arc::new(AtomicBool::new(false));
+        let cfg = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::clone(&bytes),
+            wab_cap_rejecting: Arc::clone(&rejecting),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        let mut client = spawn_handler_acking_with(cfg, Arc::clone(&metrics), Some(true)).await;
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+        let (msg_type, _) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Ack);
+        assert_eq!(metrics.wab_cap_rejections.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn wab_cap_disabled_never_rejects() {
+        let bytes = Arc::new(AtomicU64::new(u64::MAX));
+        let rejecting = Arc::new(AtomicBool::new(false));
+        let cfg = ConnectionConfig {
+            wab_max_bytes: 0, // disabled
+            wab_bytes_now: Arc::clone(&bytes),
+            wab_cap_rejecting: Arc::clone(&rejecting),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        let mut client = spawn_handler_acking_with(cfg, Arc::clone(&metrics), Some(true)).await;
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+        let (msg_type, _) = read_response(&mut client).await;
+        assert_eq!(
+            msg_type,
+            MessageType::Ack,
+            "cap 0 must disable the check entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn wab_cap_hysteresis_holds_until_the_low_water_mark() {
+        // Once rejecting, stay rejecting until bytes fall below cap * 0.9 —
+        // otherwise ingest flaps on and off at the boundary.
+        let bytes = Arc::new(AtomicU64::new(1_500));
+        let rejecting = Arc::new(AtomicBool::new(false));
+        let cfg = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::clone(&bytes),
+            wab_cap_rejecting: Arc::clone(&rejecting),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        let mut client = spawn_handler_acking_with(cfg, Arc::clone(&metrics), Some(true)).await;
+
+        client.write_all(&push_frame(b"a")).await.unwrap();
+        assert_eq!(read_response(&mut client).await.0, MessageType::Nack);
+
+        // Just under the cap but above the low-water mark: still rejecting.
+        bytes.store(950, Ordering::Relaxed);
+        client.write_all(&push_frame(b"b")).await.unwrap();
+        assert_eq!(
+            read_response(&mut client).await.0,
+            MessageType::Nack,
+            "must not resume until below cap * 0.9"
+        );
+
+        // Below the low-water mark: accepting again.
+        bytes.store(800, Ordering::Relaxed);
+        client.write_all(&push_frame(b"c")).await.unwrap();
+        assert_eq!(read_response(&mut client).await.0, MessageType::Ack);
+    }
+
+    /// The cap must reject every durability tier: Buffered acks earlier than
+    /// Sync but still writes to the WAB, so exempting it would leave the hole
+    /// open for the tier most likely to be driving the growth.
+    #[tokio::test]
+    async fn wab_cap_rejects_every_durability_tier() {
+        for tier in [Durability::Sync, Durability::Batched, Durability::Buffered] {
+            let cfg = ConnectionConfig {
+                wab_max_bytes: 1_000,
+                wab_bytes_now: Arc::new(AtomicU64::new(5_000)),
+                wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+                ..test_cfg()
+            };
+            let metrics = Arc::new(Metrics::new().0);
+            let mut client = spawn_handler_with(cfg, Arc::clone(&metrics)).await;
+
+            let header = Header::new(MessageType::Push, tier, 0);
+            let frame = Envelope::new(header, b"payload".to_vec()).encode();
+            client.write_all(&frame).await.unwrap();
+            let (msg_type, payload) = read_response(&mut client).await;
+            assert_eq!(
+                msg_type,
+                MessageType::Nack,
+                "tier {tier:?} must be rejected"
+            );
+            assert_eq!(payload[0], NackReason::InternalError as u8);
+            assert_eq!(metrics.wab_cap_rejections.get(), 1, "tier {tier:?}");
+        }
+    }
+
     // ── Read timeout (slowloris guard) ────────────────────────────────────────
 
     /// A client that opens a connection and never sends a byte must be
@@ -1058,10 +1275,8 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let cfg = ConnectionConfig {
-            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
-            ack_timeout: Duration::from_secs(30),
-            shard_id: 0,
+            ..test_cfg()
         };
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
@@ -1120,10 +1335,9 @@ mod tests {
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
         let cfg = ConnectionConfig {
-            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_secs(5),
             ack_timeout: Duration::from_millis(500),
-            shard_id: 0,
+            ..test_cfg()
         };
 
         // Auto-acker: blocking recv must run on an OS thread so it doesn't
@@ -1165,10 +1379,8 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let cfg = ConnectionConfig {
-            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
             read_timeout: Duration::from_millis(150),
-            ack_timeout: Duration::from_secs(30),
-            shard_id: 0,
+            ..test_cfg()
         };
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
@@ -1208,12 +1420,7 @@ mod tests {
     async fn shutdown_releases_connection_stalled_mid_payload() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
-        let cfg = ConnectionConfig {
-            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
-            read_timeout: Duration::from_secs(30),
-            ack_timeout: Duration::from_secs(30),
-            shard_id: 0,
-        };
+        let cfg = test_cfg();
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1246,12 +1453,7 @@ mod tests {
     async fn shutdown_releases_connection_stalled_mid_crc() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
-        let cfg = ConnectionConfig {
-            max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
-            read_timeout: Duration::from_secs(30),
-            ack_timeout: Duration::from_secs(30),
-            shard_id: 0,
-        };
+        let cfg = test_cfg();
         let (m, _reg) = crate::metrics::Metrics::new();
         let metrics = std::sync::Arc::new(m);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

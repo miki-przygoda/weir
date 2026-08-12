@@ -571,6 +571,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the directory for the gauge, so the value is free.
         let wab_bytes_now = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+        // Whether the WAB cap is currently rejecting pushes. Created ONCE here
+        // and cloned into every listener so the hysteresis low-water mark is
+        // daemon-wide: a per-listener flag would let the Unix and TCP sides
+        // disagree about whether ingest has resumed.
+        let wab_cap_rejecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let wab_dir_bg = config.wab_dir.clone();
         let metrics_w = Arc::clone(&metrics);
         let wab_bytes_bg = Arc::clone(&wab_bytes_now);
@@ -646,6 +652,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         shutdown_timeout_secs: config.shutdown_timeout_secs,
                         connection_read_timeout_secs: config.connection_read_timeout_secs,
                         handshake_timeout_secs: config.tls_handshake_timeout_secs,
+                        wab_max_bytes: config.wab_max_bytes,
+                        wab_bytes_now: Arc::clone(&wab_bytes_now),
+                        wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
                     };
 
                     let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -723,6 +732,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connection_read_timeout_secs: config.connection_read_timeout_secs,
                 shard_count: config.shard_count,
                 peer_uid_check: config.peer_uid_check,
+                wab_max_bytes: config.wab_max_bytes,
+                wab_bytes_now: Arc::clone(&wab_bytes_now),
+                wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
         }

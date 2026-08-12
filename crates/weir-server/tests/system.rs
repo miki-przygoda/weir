@@ -437,6 +437,73 @@ fn find_first_segment_header(wab_dir: &std::path::Path) -> Option<[u8; 24]> {
     None
 }
 
+// ── WAB size cap ──────────────────────────────────────────────────────────────
+
+/// The whole justification for spending `NackReason::InternalError` on the WAB
+/// cap — rather than a new reason byte — is how a REAL client reacts to it:
+/// `is_recoverable()` is true for `InternalError` and false for an unknown byte,
+/// so a new byte would make every deployed producer tear down and reconnect
+/// exactly when the daemon is already under strain. Assert that reaction through
+/// an actual `WeirClient`, not just the byte the daemon puts on the wire
+/// (`connection::tests` covers the byte).
+///
+/// Needs a sink that FAILS: with the noop sink the drain deletes each segment as
+/// fast as it is sealed, so live WAB bytes never climb and the cap never trips.
+/// A sink pointed at a closed port yields a connect error, which the drain
+/// classifies as TRANSIENT — with `sink_max_retries = 0` the segment is stranded
+/// on disk (not dead-lettered, which would move its bytes out of the count), so
+/// the WAB grows monotonically.
+#[test]
+#[cfg(feature = "http-sink")]
+fn wab_cap_nack_is_recoverable_for_a_real_client() {
+    // Smallest legal segment size, and a cap equal to it (config validation
+    // requires cap >= one segment), so a short burst crosses the cap.
+    let srv = weir_server!("cap_recoverable")
+        .extra_config(
+            "wab_segment_max_bytes = 4096\n\
+             wab_max_bytes = 4096\n\
+             wab_segment_max_age_secs = 1\n\
+             sink_type = \"http\"\n\
+             sink_max_retries = 0",
+        )
+        // Port 1 is privileged and never bound by an unprivileged process, so
+        // every drain attempt gets connection-refused immediately.
+        .env("WEIR_SINK_URL", "http://127.0.0.1:1/sink")
+        .start();
+    let mut client = srv.client();
+
+    // The value the cap is checked against is refreshed by a 5 s gauge task, so
+    // the cap cannot trip on the first burst however large it is — keep pushing
+    // across a couple of refresh intervals. The point is not the trip count; it
+    // is what the client reports when the Nack finally arrives.
+    let payload = vec![b'x'; 1024];
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut nack = None;
+    while Instant::now() < deadline {
+        match client.push(&payload, Durability::Sync) {
+            Ok(()) => thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                nack = Some(e);
+                break;
+            }
+        }
+    }
+
+    let err = nack.expect("expected the WAB cap to trip while the sink was down");
+    assert!(
+        err.is_recoverable(),
+        "a cap Nack must be recoverable, got {err:?}"
+    );
+    assert!(!client.is_poisoned(), "the connection must still be usable");
+    // ...and it must be the CAP that rejected, not queue saturation or a wedged
+    // flusher — those share the InternalError byte, which is exactly why the
+    // counter exists.
+    assert!(
+        parse_metric(&srv.scrape_metrics(), "weir_wab_cap_rejections") >= 1,
+        "the rejection must be attributable to the cap"
+    );
+}
+
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
