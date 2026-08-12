@@ -127,13 +127,17 @@ fn should_warn_wab_growth(samples: &[u64], wab_max_bytes: u64, drain_healthy: bo
 /// composes them into condition 3 of `should_warn_wab_growth`: is the drain
 /// healthy right now.
 ///
-/// This is the OR-logic that makes the growth warning trustworthy — "sink
-/// unhealthy OR not draining" is exactly NOT(sink healthy AND draining), so
-/// the two gauge reads are ANDed here and the caller negates the result by
-/// passing it straight to `drain_healthy`. Pulled out of the background
-/// task's closure (rather than left inline) so this composition — not just
-/// the pure predicate — is unit-tested; a swapped `&&`/`||` or a wrong label
-/// variant here would previously compile and pass every existing test.
+/// Returns `true` only when the sink is healthy AND the drain is actively
+/// draining. That `&&` is the whole point: condition 3 is "sink unhealthy OR
+/// not draining", and by De Morgan that is exactly NOT(healthy AND draining).
+/// The negation happens in the caller — `should_warn_wab_growth` takes this
+/// value as `drain_healthy` and returns `false` early when it is `true`. So a
+/// swapped `&&`/`||` here silently inverts which failures the warning covers.
+///
+/// Pulled out of the background task's closure (rather than left inline) so this
+/// composition — not just the pure predicate — is unit-tested; a swapped
+/// `&&`/`||` or a wrong label variant here would previously compile and pass
+/// every existing test.
 fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
     // `sink_health` and `drain_state` are Gauge families with the current
     // state's series set to 1.0, so the live value reads back without any new
