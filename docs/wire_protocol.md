@@ -218,7 +218,7 @@ and is also enumerated in the [producer checklist](#minimum-producer-checklist).
 | Event | Connection |
 |-------|-----------|
 | Push → Ack | open |
-| Push → Nack(InternalError) | open — covers transient daemon-side conditions: queue saturation, ack timeout, or a non-durable write (write/fsync error). The record's durable outcome is **unknown**; the producer should retry. |
+| Push → Nack(InternalError) | open — covers transient daemon-side conditions: queue saturation, ack timeout, a non-durable write (write/fsync error), or the daemon's `wab_max_bytes` cap rejecting because its write-ahead buffer is full. The record's durable outcome is **unknown** for the first three (the producer should retry); a cap rejection is definitively *not* durable, but it is not distinguishable on the wire — the daemon's `weir_wab_cap_rejections_total` metric is what separates it, so a producer treats all four the same way and retries. |
 | HealthCheck → HealthCheckResponse | open |
 
 ### When the server closes the connection
