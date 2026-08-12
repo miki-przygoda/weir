@@ -1164,6 +1164,49 @@ mod tests {
         );
     }
 
+    /// Spec §7's other half: `weir_wab_cap_rejections` must move for cap
+    /// rejections and for **nothing else**. Queue saturation emits the same
+    /// `InternalError` byte, so this counter is the only thing separating the
+    /// two — anything else bumping it would send an operator diagnosing a Nack
+    /// storm to the WAB when the real problem is a stalled worker pool.
+    ///
+    /// The cap is deliberately ENABLED here, with live bytes well under it: the
+    /// push passes the cap check and is then rejected by the queue. With the cap
+    /// disabled (`wab_max_bytes: 0`) the assertion would hold vacuously.
+    #[tokio::test]
+    async fn queue_saturation_does_not_move_the_wab_cap_counter() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        drop(queue_rx); // no receivers → Disconnected on first push
+        let cfg = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::new(AtomicU64::new(100)),
+            wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+            ..test_cfg()
+        };
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let metrics = std::sync::Arc::new(m);
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            Arc::clone(&metrics),
+            never_shutdown_rx(),
+        ));
+
+        let mut client = client;
+        client.write_all(&push_frame(b"data")).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack, "the queue must reject");
+        assert_eq!(payload[0], NackReason::InternalError as u8);
+        assert_eq!(
+            metrics.wab_cap_rejections.get(),
+            0,
+            "a queue-saturation Nack must NOT be attributed to the WAB cap — the \
+             counter is the only way to tell the two apart on the wire"
+        );
+    }
+
     #[tokio::test]
     async fn push_under_the_wab_cap_is_accepted() {
         let bytes = Arc::new(AtomicU64::new(100));

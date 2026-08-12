@@ -93,6 +93,27 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
 /// Number of 5 s samples the growth warning considers (60 s).
 const WAB_GROWTH_WINDOW: usize = 12;
 
+/// How long the WAB growth warning stays quiet after firing. The polling task
+/// evaluates the warning every 5 s, so without this it would log 60 times a
+/// minute for as long as the condition held.
+const WAB_GROWTH_WARN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Whether the growth warning is allowed to fire again at `now`.
+///
+/// Extracted from the polling task's closure for the same reason
+/// [`should_warn_wab_growth`] and [`drain_is_healthy`] were: it is the third
+/// piece of the warning's decision and the only one that was left inline, so it
+/// was the only one no test could reach. `saturating_duration_since` rather than
+/// `elapsed`/subtraction so a `now` behind `last_warned` reads as "not yet due"
+/// instead of panicking.
+fn growth_warning_is_due(last_warned: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last_warned {
+        // Never warned: the first qualifying window fires immediately.
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= WAB_GROWTH_WARN_INTERVAL,
+    }
+}
+
 /// Whether to warn that the WAB is growing unbounded.
 ///
 /// All three must hold:
@@ -695,9 +716,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     samples.remove(0);
                 }
                 let drain_healthy = drain_is_healthy(&metrics_w);
-                let due = last_warned
-                    .map(|t| t.elapsed() >= std::time::Duration::from_secs(300))
-                    .unwrap_or(true);
+                let due = growth_warning_is_due(last_warned, std::time::Instant::now());
                 if due && should_warn_wab_growth(&samples, cap_for_warning, drain_healthy) {
                     warn!(
                         wab_bytes = bytes,
@@ -1030,7 +1049,62 @@ mod wab_bytes_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::should_warn_wab_growth;
+    use super::{WAB_GROWTH_WARN_INTERVAL, growth_warning_is_due, should_warn_wab_growth};
+    use std::time::{Duration, Instant};
+
+    /// Spec §7: "rate limiting holds across repeated polls." The warning's other
+    /// two inputs were extracted for unit testing; this one stayed inline in the
+    /// polling closure and so went untested until now.
+    #[test]
+    fn growth_warning_rate_limit_gates_on_the_full_interval() {
+        let base = Instant::now();
+        assert!(
+            growth_warning_is_due(None, base),
+            "the first qualifying window must warn immediately"
+        );
+        assert!(
+            !growth_warning_is_due(Some(base), base),
+            "a warning just emitted must not repeat on the same instant"
+        );
+        assert!(
+            !growth_warning_is_due(
+                Some(base),
+                base + WAB_GROWTH_WARN_INTERVAL - Duration::from_secs(1)
+            ),
+            "one second short of the interval is not due"
+        );
+        assert!(
+            growth_warning_is_due(Some(base), base + WAB_GROWTH_WARN_INTERVAL),
+            "exactly the interval is due"
+        );
+        assert!(growth_warning_is_due(
+            Some(base),
+            base + WAB_GROWTH_WARN_INTERVAL * 10
+        ));
+    }
+
+    /// The shape the rate limit actually has to survive: the task polls every
+    /// 5 s, and the warning conditions can stay satisfied for hours. Ten minutes
+    /// of ticks with the condition permanently true must produce three warnings
+    /// (t=0, t=300, t=600), not 121.
+    #[test]
+    fn growth_warning_rate_limit_holds_across_repeated_polls() {
+        let base = Instant::now();
+        let mut last_warned: Option<Instant> = None;
+        let mut fired = 0u32;
+        for tick in 0..=120u64 {
+            let now = base + Duration::from_secs(tick * 5);
+            if growth_warning_is_due(last_warned, now) {
+                fired += 1;
+                last_warned = Some(now);
+            }
+        }
+        assert_eq!(
+            fired, 3,
+            "600 s of 5 s polls with the condition always true must warn at \
+             t=0/300/600 only"
+        );
+    }
 
     #[test]
     fn growth_warning_fires_only_when_all_three_conditions_hold() {
