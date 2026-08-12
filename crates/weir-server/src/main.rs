@@ -1073,6 +1073,7 @@ mod drain_is_healthy_tests {
             DrainStateValue::draining,
             DrainStateValue::retrying_transient,
             DrainStateValue::blocked_dead_letter_full,
+            DrainStateValue::stopped,
         ] {
             let v = if s == active { 1.0 } else { 0.0 };
             m.drain_state
@@ -1120,5 +1121,22 @@ mod drain_is_healthy_tests {
         set_sink_health(&m, SinkHealthState::down);
         set_drain_state(&m, DrainStateValue::blocked_dead_letter_full);
         assert!(!drain_is_healthy(&m));
+    }
+
+    /// The case that made the growth warning structurally unable to fire: the
+    /// drain thread is gone, so nothing updates these gauges any more. The
+    /// supervisor now publishes `stopped` on its way out, and a stopped drain
+    /// must not read as healthy however healthy the *sink* last looked — that
+    /// last reading is stale by definition once nobody is probing it.
+    #[test]
+    fn stopped_drain_is_not_healthy_even_with_a_healthy_sink() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::healthy);
+        set_drain_state(&m, DrainStateValue::stopped);
+        assert!(
+            !drain_is_healthy(&m),
+            "a drain that has exited must never compose to healthy — this is what \
+             lets the WAB growth warning fire when delivery has stopped for good"
+        );
     }
 }

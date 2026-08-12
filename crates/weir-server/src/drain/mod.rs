@@ -254,16 +254,40 @@ fn run_drain_supervised<S: Sink>(
             100u64.saturating_mul(attempts as u64),
         ));
     }
+    // EVERY exit from the loop above lands here — there is no other way out of
+    // it. The `Ok(())` arm breaks (channel closed on shutdown, or `drain_thread`
+    // returning before its own loop ever starts, as it does when the dead-letter
+    // writer will not open), and the respawn-budget arm breaks. So one
+    // assignment covers all of them.
+    //
+    // `drain_state` is written ONLY by the drain thread, and it is pre-initialised
+    // to `draining = 1`. Left untouched on exit it stays frozen there: an operator
+    // scraping /metrics sees a daemon that is draining while nothing is being
+    // delivered, and the WAB growth warning — which reads this gauge — stays
+    // silent in precisely the scenario it exists for. Publishing the terminal
+    // state is the truth on all three paths, clean shutdown included: the drain
+    // genuinely is no longer draining.
+    //
+    // `sink_health` is deliberately NOT forced here. Once nobody is probing the
+    // sink its health is *unknown*, not down — and on the clean-shutdown path the
+    // sink is usually perfectly healthy, so writing `down` would fire a false
+    // "sink is down" signal on every SIGTERM. `drain_state{stopped}` is the
+    // honest signal, and it tells the operator the health reading is stale.
+    set_drain_state(&metrics, DrainStateValue::stopped);
     info!("drain supervisor exiting");
 }
 
 // ── Drain state helper ────────────────────────────────────────────────────────
 
 fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
+    // Every label value in the family, so the one-hot invariant holds no matter
+    // which is active — omitting one here would leave it stuck at its last
+    // reading while another state claims to be active.
     let states = [
         DrainStateValue::draining,
         DrainStateValue::retrying_transient,
         DrainStateValue::blocked_dead_letter_full,
+        DrainStateValue::stopped,
     ];
     for s in states {
         let v = if s == active { 1.0 } else { 0.0 };
@@ -1635,6 +1659,30 @@ mod tests {
             == 1.0
     }
 
+    fn drain_state_of(m: &Metrics, state: DrainStateValue) -> f64 {
+        m.drain_state
+            .get_or_create(&DrainStateLabel { state })
+            .get()
+    }
+
+    /// Asserts the drain gauge reports the terminal state — i.e. the supervisor
+    /// told the truth on its way out instead of leaving `draining` frozen at 1.
+    fn assert_drain_reports_stopped(m: &Metrics, context: &str) {
+        assert_eq!(
+            drain_state_of(m, DrainStateValue::stopped),
+            1.0,
+            "{context}: weir_drain_state{{state=\"stopped\"}} must be 1 once the \
+             supervisor has exited"
+        );
+        assert_eq!(
+            drain_state_of(m, DrainStateValue::draining),
+            0.0,
+            "{context}: weir_drain_state{{state=\"draining\"}} must be 0 once the \
+             supervisor has exited — a frozen 1 tells operators (and the WAB \
+             growth warning) that delivery is still happening"
+        );
+    }
+
     fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weir_drain_{label}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2148,6 +2196,56 @@ mod tests {
             !get_confirmed_path(&sa).exists() && !get_confirmed_path(&sb).exists(),
             "after giving up, delivery stops — no segment is confirmed"
         );
+        assert_drain_reports_stopped(&metrics, "respawn budget exhausted");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The second permanent-stop path, and the one the whole-branch review
+    /// reproduced against a live daemon: `DeadLetterWriter::open` fails, so
+    /// `drain_thread` returns *cleanly* before its loop ever starts, which the
+    /// supervisor reads as `Ok(())` and breaks on. No panic, no respawn, no log
+    /// beyond one ERROR line — and, before this fix, no gauge movement either:
+    /// `drain_state` stayed pre-initialised at `draining = 1` forever while
+    /// nothing was delivered, which also kept `drain_is_healthy` (main.rs) true
+    /// and the WAB growth warning permanently silent.
+    #[test]
+    fn drain_supervisor_publishes_stopped_when_the_dead_letter_writer_cannot_open() {
+        let dir = tmp_dir("drain_dl_open_fails");
+        // A regular file where the dead-letter DIRECTORY must be: create_dir_private
+        // fails with EEXIST, exactly as the reviewer's reproduction did.
+        let blocker = dir.join("dead_letter");
+        std::fs::remove_dir_all(&blocker).ok();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+
+        assert_eq!(
+            drain_panics(&metrics),
+            0,
+            "this path returns cleanly — it is NOT a panic, which is why the \
+             supervisor never respawns and the gauge is the only signal"
+        );
+        assert_drain_reports_stopped(&metrics, "dead-letter writer would not open");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The third exit: an ordinary clean shutdown (drain channel closed). The
+    /// drain genuinely is no longer draining, so it must say so here too —
+    /// otherwise a scrape taken during shutdown still reads `draining = 1`.
+    #[test]
+    fn drain_supervisor_publishes_stopped_on_clean_shutdown() {
+        let dir = tmp_dir("drain_clean_stop");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed).unwrap();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+
+        assert_drain_reports_stopped(&metrics, "clean shutdown");
         std::fs::remove_dir_all(dir).ok();
     }
 

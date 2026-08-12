@@ -113,12 +113,19 @@ pub struct DrainStateLabel {
 }
 
 /// Drain state label value. `blocked_dead_letter_full` matches the state machine name.
+///
+/// `stopped` is terminal and is not one of the state machine's states: it is set
+/// by the drain *supervisor* once it has exited for good (clean shutdown, or the
+/// respawn budget exhausted). The three running states are written only by the
+/// drain thread, so without a terminal value the family would stay frozen at its
+/// last reading — reporting `draining` while nothing drains.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum DrainStateValue {
     draining,
     retrying_transient,
     blocked_dead_letter_full,
+    stopped,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -571,7 +578,9 @@ impl Metrics {
              is 1 at any time; the others are 0. NOTE: state=\"draining\" does NOT imply \
              delivery progress — a segment stranded waiting on a fully-down sink still reads \
              draining. Watch weir_sink_health{state=\"down\"} and weir_drain_segments_stranded \
-             for that case, not this gauge alone"
+             for that case, not this gauge alone. state=\"stopped\" is terminal: the drain \
+             supervisor has exited (clean shutdown, or the respawn budget exhausted) and \
+             NOTHING is being delivered until the daemon restarts — alert on it"
         );
         let dead_letter_blocked_duration = reg!(
             Gauge::<f64, AtomicU64>::default(),
@@ -670,6 +679,12 @@ impl Metrics {
             .drain_state
             .get_or_create(&DrainStateLabel {
                 state: DrainStateValue::blocked_dead_letter_full,
+            })
+            .set(0.0);
+        metrics
+            .drain_state
+            .get_or_create(&DrainStateLabel {
+                state: DrainStateValue::stopped,
             })
             .set(0.0);
 
@@ -808,6 +823,12 @@ mod tests {
         assert!(
             out.contains("blocked_dead_letter_full"),
             "drain_state blocked label missing"
+        );
+        // The terminal state must exist at 0 from boot too, so a scraper can
+        // baseline (and alert on) it before the drain has ever stopped.
+        assert!(
+            out.contains("weir_drain_state{state=\"stopped\"} 0"),
+            "drain_state stopped label missing or not pre-initialised to 0:\n{out}"
         );
         assert!(out.contains("healthy"), "sink_health healthy label missing");
     }

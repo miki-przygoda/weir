@@ -634,6 +634,12 @@ fn drain_state_shows_draining_and_not_blocked() {
         body.contains("weir_drain_state{state=\"blocked_dead_letter_full\"} 0"),
         "blocked_dead_letter_full should be 0 on startup"
     );
+    // The terminal state is only set once the drain supervisor exits, so a
+    // running daemon must read 0 — a 1 here would mean delivery has stopped.
+    assert!(
+        body.contains("weir_drain_state{state=\"stopped\"} 0"),
+        "stopped should be 0 while the daemon is running"
+    );
 }
 
 #[test]
