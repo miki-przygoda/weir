@@ -114,6 +114,49 @@ fn growth_warning_is_due(last_warned: Option<std::time::Instant>, now: std::time
     }
 }
 
+/// Fold one WAB-size scan into the polling task's state, returning the size on
+/// success and `None` when the scan failed to join.
+///
+/// The `Err` arm lives in here rather than at the call site on purpose. The
+/// defect this replaced was `.await.unwrap_or(0)`, which is a call-site
+/// substitution — a test of a function that already takes `Option<u64>` would
+/// pass with that bug fully reintroduced. Taking the `JoinResult` itself is what
+/// makes the test load-bearing.
+///
+/// A join failure must not be papered over in either direction. Storing 0 reads
+/// as "the WAB is empty" and lifts the cap entirely until the next tick, failing
+/// open on the one feature whose job is to fail closed; pushing the previous
+/// value again reads as "not growing" and suppresses the growth warning for a
+/// whole window. So neither the gauge, the shared atomic, nor the window moves —
+/// the last known size stands, 5 s stale, which is exactly the staleness the cap
+/// is already documented to carry.
+fn apply_wab_scan(
+    scan: Result<u64, tokio::task::JoinError>,
+    samples: &mut Vec<u64>,
+    metrics: &crate::metrics::Metrics,
+    wab_bytes_now: &std::sync::atomic::AtomicU64,
+) -> Option<u64> {
+    let bytes = match scan {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "WAB byte scan failed to join; keeping the last known size. The \
+                 wab_max_bytes cap and weir_wab_bytes_on_disk are stale until the \
+                 next tick."
+            );
+            return None;
+        }
+    };
+    metrics.wab_bytes_on_disk.set(bytes as f64);
+    wab_bytes_now.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    samples.push(bytes);
+    if samples.len() > WAB_GROWTH_WINDOW {
+        samples.remove(0);
+    }
+    Some(bytes)
+}
+
 /// Whether to warn that the WAB is growing unbounded.
 ///
 /// All three must hold:
@@ -683,38 +726,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 let wab_dir = wab_dir_bg.clone();
-                // A join failure must NOT be substituted with 0. Storing 0 here
-                // would read as "the WAB is empty" and lift the cap entirely
-                // until the next tick — failing open on the one feature whose
-                // job is to fail closed. Keep the last known value instead: it
-                // is stale by 5 s, which is exactly the staleness the cap is
-                // already documented to have.
-                let bytes = match tokio::task::spawn_blocking(move || {
+                let scan = tokio::task::spawn_blocking(move || {
                     compute_wab_bytes_on_disk(&wab_dir)
                 })
-                .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "WAB byte scan failed to join; keeping the last known size. \
-                             The wab_max_bytes cap and weir_wab_bytes_on_disk are stale \
-                             until the next tick."
-                        );
-                        // Skip the growth sample too, deliberately: pushing a
-                        // stale duplicate would read as "not growing" and
-                        // suppress the growth warning for a whole window.
-                        continue;
-                    }
+                .await;
+                // On a join failure the last known size stands and this tick
+                // contributes no sample — see `apply_wab_scan` for why neither
+                // 0 nor a repeated value is safe here.
+                let Some(bytes) =
+                    apply_wab_scan(scan, &mut samples, &metrics_w, &wab_bytes_bg)
+                else {
+                    continue;
                 };
-                metrics_w.wab_bytes_on_disk.set(bytes as f64);
-                wab_bytes_bg.store(bytes, std::sync::atomic::Ordering::Relaxed);
-
-                samples.push(bytes);
-                if samples.len() > WAB_GROWTH_WINDOW {
-                    samples.remove(0);
-                }
                 let drain_healthy = drain_is_healthy(&metrics_w);
                 let due = growth_warning_is_due(last_warned, std::time::Instant::now());
                 if due && should_warn_wab_growth(&samples, cap_for_warning, drain_healthy) {
@@ -1290,5 +1313,78 @@ mod drain_is_healthy_tests {
             "a drain that has exited must never compose to healthy — this is what \
              lets the WAB growth warning fire when delivery has stopped for good"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_wab_scan_tests {
+    use super::{WAB_GROWTH_WINDOW, apply_wab_scan};
+    use crate::metrics::Metrics;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A real `JoinError`. Aborting a task is the only way to construct one —
+    /// the type has no public constructor — and it is also the realistic cause:
+    /// the blocking scan is cancelled at runtime shutdown.
+    async fn join_error() -> tokio::task::JoinError {
+        let h = tokio::spawn(async { std::future::pending::<()>().await });
+        h.abort();
+        h.await.expect_err("an aborted task must yield a JoinError")
+    }
+
+    #[tokio::test]
+    async fn failed_scan_leaves_the_cap_reading_the_last_known_size() {
+        let m = Metrics::new().0;
+        let mut samples = vec![4_096];
+        // What the cap actually reads. If a failed scan ever writes 0 here, the
+        // cap is lifted entirely until the next tick — the fail-open this test
+        // exists to prevent.
+        let live = AtomicU64::new(4_096);
+
+        let out = apply_wab_scan(Err(join_error().await), &mut samples, &m, &live);
+
+        assert_eq!(out, None, "a failed scan yields no size");
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            4_096,
+            "a failed scan must not move the value the WAB cap is checked against"
+        );
+        assert_eq!(
+            samples,
+            vec![4_096],
+            "a failed scan must not push a sample — a repeated value reads as \
+             'not growing' and would suppress the growth warning for a window"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_scan_publishes_the_size_and_extends_the_window() {
+        let m = Metrics::new().0;
+        let mut samples = Vec::new();
+        let live = AtomicU64::new(0);
+
+        let out = apply_wab_scan(Ok(8_192), &mut samples, &m, &live);
+
+        assert_eq!(out, Some(8_192));
+        assert_eq!(live.load(Ordering::Relaxed), 8_192);
+        assert_eq!(samples, vec![8_192]);
+    }
+
+    #[tokio::test]
+    async fn the_window_is_bounded_and_drops_from_the_front() {
+        let m = Metrics::new().0;
+        let mut samples = Vec::new();
+        let live = AtomicU64::new(0);
+
+        // One more than the window holds, so the oldest must fall off.
+        for i in 0..=WAB_GROWTH_WINDOW as u64 {
+            apply_wab_scan(Ok(i), &mut samples, &m, &live);
+        }
+
+        assert_eq!(samples.len(), WAB_GROWTH_WINDOW);
+        assert_eq!(
+            samples[0], 1,
+            "the oldest sample is evicted, not the newest"
+        );
+        assert_eq!(samples[samples.len() - 1], WAB_GROWTH_WINDOW as u64);
     }
 }

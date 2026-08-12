@@ -473,6 +473,18 @@ floor. Setting `wab_segment_max_age_secs > 0` is also worth doing alongside the
 cap: it seals idle active segments on a timer, which lets their bytes reach the
 drain instead of sitting in the un-drainable floor.
 
+**Known limitation — one path can raise that floor at runtime.** When a write
+to an active segment fails, the shard abandons that segment and opens a fresh
+one. The abandoned file stays on disk, keeps counting toward the cap, and is
+never sealed or drained; only a restart reclaims it, through recovery. Each
+orphan is at most `wab_segment_max_bytes`, so a run of write failures — a disk
+going bad — can lift the un-drainable floor above whatever cap validation
+accepted at startup and wedge ingest with a healthy sink. Watch
+`weir_wab_fsync_failures_total` and `weir_wab_bytes_on_disk`: a cap rejecting
+while `weir_sink_health` reads healthy and the drain is `draining` is this,
+not sink backpressure. Sizing the cap at several times the floor gives it room
+to absorb a few orphans.
+
 **When to tune**: set it wherever the WAB shares a disk with anything else and
 you want a producer-visible signal (Nacks) when the sink stops draining,
 instead of discovering it from a full disk. Leaving it unset is not silent:
