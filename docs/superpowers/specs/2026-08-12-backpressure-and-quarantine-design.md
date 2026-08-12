@@ -164,26 +164,99 @@ the knob that would bound it.
 
 ## 5. Quarantine tooling
 
-### 5.1 `weir-ctl quarantine list | inspect | requeue`
+### 5.1 What a quarantined file actually contains
 
-Mirrors the existing `dl` subcommands. Quarantined files are already valid WAB
-segments named `<shard>__<segment>.wab.sealed`, with the origin shard in the
-name, so `SegmentReader` reads them with **no new parser** — exactly as
-`dl requeue` does today.
+This drives the whole design, and getting it wrong makes the feature useless.
 
-`requeue` re-pushes through the daemon's socket and deletes each segment once
-all of its records are accepted. It **defaults to a dry run**, with `--yes` to
-apply, and re-delivery is at-least-once if a run is interrupted — the same
-contract `dl requeue` already documents.
+`copy_to_quarantine` copies the **whole original segment**, and its doc comment
+says why: *"acked-durable records sitting after the corrupt one"*
+(`wab/recovery.rs:575-586`). Separately, the valid **prefix** is truncated,
+sealed in place, and delivered normally — which is why a mid-file corruption
+counts as both `quarantined` and `sealed` (CHANGELOG, 1.3.0).
 
-### 5.2 `weir_quarantine_bytes_on_disk`
+So a quarantined segment decomposes into three regions:
+
+| Region | Status |
+|---|---|
+| Records before the corruption | **Already delivered** via the truncated prefix |
+| The corrupt record | Unrecoverable |
+| Records **after** the corruption | Preserved *only* here — the entire point |
+
+**`SegmentReader` cannot reach the third region.** On a CRC mismatch it sets
+`done = true` and returns `Err`, ending iteration — it is a sequential reader
+and that contract is depended on by recovery and the drain.
+
+Therefore mirroring `dl requeue`, which skips a corrupt segment **wholesale**,
+would recover nothing of value: every quarantined segment is corrupt by
+definition, so it would either skip them all or re-deliver only the prefix that
+already reached the sink — manufacturing duplicates while recovering none of
+the data quarantine exists to preserve.
+
+### 5.2 `RecoveryReader` — skip-and-resync
+
+A **new** reader type in `weir-wab`, alongside `SegmentReader` rather than a
+mode flag on it. `SegmentReader`'s "stops at the first bad record" contract is
+load-bearing for recovery and the drain and must not change.
+
+`RecoveryReader` yields an item per record and **continues past failures**:
+
+```rust
+pub enum RecoveryItem {
+    /// A record whose CRC verified.
+    Record(Payload),
+    /// A record that failed verification and was stepped over.
+    Skipped { offset: u64, declared_len: u32, reason: String },
+    /// Resync became impossible; iteration ends after this item.
+    Desynced { offset: u64, reason: String },
+}
+```
+
+Resync mechanics: a record at offset `O` declaring length `L` occupies
+`[O, O + 8 + L)`, so the next candidate header is at `O + 8 + L`. On a CRC
+failure the length field is usually still intact, which is what makes this work.
+
+**Two guards, because a corrupted *length* field would otherwise walk the reader
+into garbage:**
+
+1. `O + 8 + L` must fall within the file.
+2. The four bytes at that offset must be a plausible next length — non-zero (or
+   the end-of-records sentinel) and within the segment's stored-record cap.
+
+If either fails, emit `Desynced` and stop. Guessing past an implausible header
+risks re-delivering fabricated records, which is worse than recovering nothing.
+
+### 5.3 `weir-ctl quarantine list | inspect | requeue`
+
+Quarantined files are named `<shard>__<segment>.wab.sealed`, with the origin
+shard in the name.
+
+- **`list`** — segments, bytes, origin shard. Mirrors `dl list`.
+- **`inspect <segment>`** — per-record report from `RecoveryReader`: how many
+  records verified, how many were skipped and at what offsets, and whether the
+  reader desynced. This is the diagnostic that does not exist today at all.
+- **`requeue`** — re-pushes the `Record` items through the daemon's socket and
+  deletes the segment once they are all accepted. **Defaults to a dry run**,
+  `--yes` to apply.
+
+**Duplicate delivery is expected and must be documented, not discovered.** The
+pre-corruption prefix was already delivered when recovery sealed it, so
+requeueing re-sends it. That is within weir's at-least-once contract and sinks
+dedupe on the batch token — but an operator deserves to be told before they run
+it, so the dry run prints the count that will be re-sent, and `--yes` requires
+the operator to have seen it.
+
+A segment that yields `Desynced` before any `Record` is **not** deleted after a
+requeue: there is nothing to confirm, and deleting it would destroy the only
+copy of forensic evidence.
+
+### 5.4 `weir_quarantine_bytes_on_disk`
 
 A gauge, refreshed on the drain's idle poll that already calls
 `dead_letter.rescan()` (`drain/mod.rs:486`). Closes the asymmetry in §1: today
 quarantined bytes are invisible to monitoring across a restart, while
 dead-letter and live-WAB bytes are not.
 
-### 5.3 `weir_recovery_segments_failed_total`
+### 5.5 `weir_recovery_segments_failed_total`
 
 A counter incremented in the arm at `wab/recovery.rs:128-130` that currently
 only logs. Three lines, and it belongs here: the whole batch is *make
@@ -229,11 +302,20 @@ Everything here runs on a laptop; none of it needs the i9.
 - Rate limiting holds across repeated polls.
 
 **Quarantine**
-- Round trip: corrupt a segment mid-file, let recovery quarantine it, `requeue`
-  it, and assert the records **after** the corruption point reach the sink. That
-  is the case quarantine exists for, and nothing verifies it today.
+- **The round trip that justifies the feature**: corrupt a segment mid-file, let
+  recovery quarantine it, `requeue` it, and assert the records **after** the
+  corruption point reach the sink. `SegmentReader` cannot do this (§5.1) — this
+  test is what proves `RecoveryReader` can.
+- `RecoveryReader` skips exactly the corrupt record and resumes at the next
+  valid one, emitting one `Skipped` with the right offset.
+- **A corrupted *length* field produces `Desynced`, not fabricated records.**
+  Craft a segment whose length field is corrupted (not just its payload) and
+  assert the reader stops rather than resyncing into garbage. This is the guard
+  in §5.2 and it is the difference between recovering data and inventing it.
+- A segment that desyncs before any valid record is **not deleted** by requeue.
 - `list` on an empty/absent quarantine dir is not an error.
-- Dry run by default; `--yes` applies.
+- Dry run by default and prints the count that will be re-sent, including the
+  already-delivered prefix; `--yes` applies.
 - `weir_quarantine_bytes_on_disk` tracks add and remove.
 
 **Recovery counter**
@@ -250,5 +332,7 @@ Everything here runs on a laptop; none of it needs the i9.
 | The 5 s staleness lets the WAB overshoot onto a full disk | Documented as a soft high-water mark with explicit headroom guidance (§3.4); the growth warning (§4) fires long before the cap would |
 | Reusing `InternalError` hides cap rejections from operators | `weir_wab_cap_rejections_total` (§3.5) distinguishes them; the docs state the conflation plainly |
 | The growth warning becomes noise and gets ignored | Condition 3 plus 5-minute rate limiting; a test asserts it does **not** fire under a healthy drain |
-| `quarantine requeue` re-injects genuinely corrupt records | It reads through `SegmentReader`, which CRC-checks every record, so a corrupt record errors rather than being re-pushed; the round-trip test asserts the readable suffix specifically |
+| `quarantine requeue` re-injects genuinely corrupt records | `RecoveryReader` CRC-checks every record and only ever yields `Record` for one that verified; a failure becomes `Skipped`, never a push |
+| A corrupted length field makes the reader resync into garbage and re-deliver fabricated records | Two guards in §5.2 (in-file bound + plausible next header) and a dedicated test; on failure it emits `Desynced` and stops rather than guessing |
+| Requeue re-delivers the already-delivered prefix | Inherent — the prefix and the tail live in one file. Within the at-least-once contract and deduped by the batch token; the dry run states the count up front so it is a decision, not a surprise |
 | Cap rejection desyncs the connection | §3.3 — the frame is fully consumed before the Nack, and a real-client test covers it |
