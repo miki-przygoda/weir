@@ -403,6 +403,60 @@ normal seal happens.
 matters more than maximal per-segment batching; leave it `0` on high-throughput
 deployments where segments fill quickly on their own.
 
+---
+
+#### `wab_max_bytes`
+
+- **Type**: u64 (bytes)
+- **Default**: `0` (disabled)
+- **Range**: `0`, or at least [`wab_segment_max_bytes`](#wab_segment_max_bytes)
+- **CLI**: `--wab-max-bytes <n>`
+- **Env**: `WEIR_WAB_MAX_BYTES`
+- **TOML**: `wab_max_bytes`
+
+A cap on total live WAB bytes on disk — the same footprint
+[`weir_wab_bytes_on_disk`](../monitoring.md) measures: the open active segment
+plus sealed segments awaiting drain. Once live bytes reach the cap, pushes on
+**all three durability tiers** are rejected, including `Buffered`: it still
+writes to the WAB before it acks, so it is not exempt. This closes the case
+where a dead or stalled drain lets the disk fill while producers keep
+receiving successful acks.
+
+Rejected pushes receive `NackReason::InternalError` — **the same reason byte
+queue saturation uses, not a new one.** That is deliberate: `weir-client`'s
+`ClientError::is_recoverable()` treats `InternalError` as recoverable but an
+unknown Nack reason as fatal, so a new byte would make every client built
+before this feature tear down and reconnect precisely when the daemon is
+already under strain. The cost is that a cap rejection is indistinguishable
+from queue saturation by reason byte alone —
+[`weir_wab_cap_rejections_total`](../monitoring.md) is the **only** way to
+tell the two apart.
+
+Once rejecting, ingest resumes only after live WAB bytes fall back below
+`wab_max_bytes * 0.9` (hysteresis, so ingest does not flap on and off at the
+boundary). This state is shared daemon-wide across every listener — the Unix
+socket and the TCP/mTLS listener alike — so one connection observing recovery
+releases all of them, and one observing the cap holds all of them.
+
+**This is a soft high-water mark, not a hard limit.** The value it is checked
+against is refreshed every 5 seconds, so the WAB can overshoot by up to 5
+seconds of peak ingest. An operator who sets the cap at their exact free space
+will still fill the disk — leave at least that much headroom below actual
+free space.
+
+`0` (default) disables the cap: the WAB is unbounded, as it always was before
+this knob existed. When set, it must be `0` or at least
+`wab_segment_max_bytes` — a tighter cap would reject ingest before a single
+segment could ever fill.
+
+**When to tune**: set it wherever the WAB shares a disk with anything else and
+you want a producer-visible signal (Nacks) when the sink stops draining,
+instead of discovering it from a full disk. Leaving it unset is not silent:
+the daemon separately warns when the WAB is growing while the sink is
+unhealthy and no cap is set (see the `CHANGELOG`).
+
+---
+
 #### `wab_compression`
 
 - **Type**: string — `"none"` or `"zstd"`

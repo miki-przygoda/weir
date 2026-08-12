@@ -46,6 +46,29 @@ no existing deployment's clients are affected.
   restart re-splits replayed segments into differently sized batches whose
   tokens will not match.
 
+- **`wab_max_bytes` — a soft cap on live WAB bytes, off by default.** Until now
+  the WAB was unbounded: when the drain gave up, its own log said *"delivery is
+  stopped and the WAB will accumulate on disk until restart"* — while producers
+  kept receiving successful acks. Every acked record really was on disk, so this
+  was never a false ack, but it was its nearest neighbour: a disk filling behind
+  a green light.
+
+  Over the cap, pushes are Nacked with `NackReason::InternalError` — the
+  existing byte, not a new one. That is deliberate: the client treats
+  `InternalError` as recoverable but an unknown Nack reason as fatal, so a new
+  byte would make every client built before it tear down and reconnect precisely
+  when the daemon is already under strain. The cost is that cap rejections share
+  a reason byte with queue saturation; `weir_wab_cap_rejections_total`
+  distinguishes them.
+
+  **It is a soft high-water mark.** The value is refreshed every 5 seconds, so
+  the WAB can overshoot by up to 5 seconds of peak ingest — leave headroom.
+
+  Because it defaults to off, the daemon also **warns when the WAB is growing
+  while the sink is unhealthy and no cap is set**, rate-limited to once every 5
+  minutes. That warning deliberately does not fire under a healthy drain, where
+  sustained growth is just a fast producer.
+
 ### Changed
 
 - **BREAKING — the `Sink` trait is reshaped.** `commit` takes a `SinkBatch`
