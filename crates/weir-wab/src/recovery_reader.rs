@@ -202,10 +202,20 @@ impl Iterator for RecoveryReader {
                 self.done = true;
                 // An active segment carries no sentinel — it simply stops — so
                 // running out exactly at EOF is its clean end. "Exactly" is the
-                // load-bearing word: it means every frame summed to the file
-                // length, which proves alignment held. Stray bytes mean a
-                // partial length field, which after a skip is indistinguishable
-                // from a misaligned landing.
+                // load-bearing word: every frame summed to the file length, so
+                // every byte is accounted for. Stray bytes mean a partial length
+                // field, which after a skip is indistinguishable from a
+                // misaligned landing.
+                //
+                // Accounted for is NOT the same as aligned, and the difference
+                // is what callers must report. A length corrupted to a plausible
+                // value that happens to tile to EOF also lands here: it swallows
+                // the records inside its declared range and still ends clean.
+                // Nothing is fabricated and nothing goes unreported — the
+                // `Skipped` names the exact byte range that was consumed — but a
+                // clean end means "every byte is accounted for", never "every
+                // record was recovered". Anything rendering this to an operator
+                // must say the former.
                 if record_offset == self.file_len {
                     return None;
                 }
