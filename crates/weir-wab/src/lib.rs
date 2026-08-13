@@ -57,7 +57,7 @@ use format::{
 /// without also taking a direct dependency on `weir-core`.
 pub use weir_core::Payload;
 
-pub use recovery_reader::{RecoveryItem, RecoveryReader};
+pub use recovery_reader::{MAX_CONSECUTIVE_SKIPS, RecoveryItem, RecoveryReader};
 
 /// An iterator over records in a WAB segment file.
 ///
