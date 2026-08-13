@@ -37,6 +37,7 @@
 #![deny(missing_docs)]
 
 pub mod format;
+mod recovery_reader;
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -55,6 +56,8 @@ use format::{
 /// only `weir-wab` can name the iterator item type (`weir_wab::Payload`)
 /// without also taking a direct dependency on `weir-core`.
 pub use weir_core::Payload;
+
+pub use recovery_reader::{RecoveryItem, RecoveryReader};
 
 /// An iterator over records in a WAB segment file.
 ///
