@@ -993,6 +993,50 @@ Step 4 comment and placement. §3.4 soft cap → Task 5 Step 1, stated verbatim.
 `weir_recovery_segments_failed_total`) is a separate plan — different crates,
 no shared code.
 
+## As built — where the shipped code deviates from the tasks above
+
+Completed at `7c65837` (range `2d2735e..7c65837`). Three of the code blocks
+above were **rejected during review and must not be copied from this document**;
+they are left in place as the record of what was planned.
+
+**1. Task 2 Step 4 prescribes a fail-open defect.** The plan's task body
+contains `.await.unwrap_or(0)`. A join error therefore reports the WAB as 0
+bytes, which does not just lose a sample — it *releases the cap entirely* at the
+moment the scan is failing. Shipped code extracts `apply_wab_scan`
+(`main.rs:133`), which takes the `JoinResult` rather than an `Option<u64>` and,
+on a join error, keeps the last known value and contributes no sample. Taking
+the `JoinResult` is load-bearing: the defect is a call-site substitution, so a
+helper taking `Option<u64>` cannot guard against it.
+
+**2. Task 1 Step 4's validation was too weak to be safe.** Planned:
+`wab_max_bytes >= wab_segment_max_bytes`. That admits a legal cap that wedges
+ingest permanently under a perfectly healthy sink, because the hysteresis resume
+threshold has to clear the bytes that *cannot* be drained away — one un-sealable
+active segment **per shard** — and an active segment only seals when a write
+crosses the size threshold, which over the cap never happens. Shipped
+(`config/mod.rs:580-600`): reject unless `wab_max_bytes / 10 * 9 >
+wab_segment_max_bytes * shard_count`, with the error message computing the exact
+minimum. The single test named in Step 1 became six, including
+`wab_max_bytes_sized_for_one_shard_is_rejected_when_there_are_more`.
+
+**3. Task 4 Step 3's predicate was too strict.** Planned: pairwise monotonic
+(`w[1] >= w[0]` across the window), which a single 1-byte dip anywhere in 60 s
+defeats. Shipped (`main.rs:184-187`): `last > first && all(s >= first)` — net
+growth with no sample below the window's start. Step 5's `drain_healthy` read is
+also not a bare `sink_health` lookup; it composes `sink_health` **and**
+`drain_state` in a separately unit-tested helper, because a swapped `&&`/`||`
+there silently inverts which failures the warning covers.
+
+**Also shipped under this plan but absent from it.** Review found the new
+terminal `drain_state{stopped}` was invisible to every consumer weir ships:
+no alert rule, dashboards summing it to 0 and rendering a green "Draining", and
+a readiness probe reporting ready. `11f03a9` fixed the alert rules, the five
+generated dashboards plus the hand-maintained one, the readiness probe (ordered
+before the sink-health check, which `stopped` invalidates), and the
+`monitoring.md` runbook.
+
+---
+
 **Known rough edges for the implementer.**
 - Task 3 Step 1 names `spawn_handler_with` / `spawn_handler_acking_with`, which
   do not exist yet. Read the module's existing `spawn_handler_acking` and add

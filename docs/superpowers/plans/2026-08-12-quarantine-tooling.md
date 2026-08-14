@@ -24,12 +24,50 @@ recovery-failure arm that currently only logs.
 - **Never fabricate records.** When the reader cannot establish where the next
   record begins, it must stop, not guess. Recovering nothing beats inventing
   data — this is the single most important property in this plan.
-- **The gate** for every "run the tests" step:
+- **The gate** for every "run the tests" step. Clippy and `cargo deny` are part
+  of it — an earlier version of this list omitted them, and the sibling plan
+  (`2026-08-12-wab-cap-and-growth-warning`) hit a red clippy between two of its
+  tasks for exactly that reason:
   ```bash
+  cargo fmt --check
+  cargo clippy --all-targets -- -D warnings
+  cargo clippy --all-targets --all-features -- -D warnings
+  cargo clippy --all-targets --no-default-features -- -D warnings
   cargo test --workspace --exclude weir-server
   cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener
   cargo test -p weir-server --bins -- --test-threads=1
+  cargo deny check advisories bans licenses sources
   ```
+
+---
+
+## As built: the Task 1 interfaces Tasks 3–5 must code against
+
+Task 1 shipped at `bb803a1` after a review round, and the public surface differs
+from the sketch in Task 1 below (which is preserved as written, not retrofitted).
+**These are the facts to code against:**
+
+- **`RecoveryItem` is `#[non_exhaustive]`.** Every `match` on it needs a wildcard
+  arm or it will not compile.
+- **`MAX_CONSECUTIVE_SKIPS` is public** and re-exported from `weir_wab`, so
+  operator-facing output and docs can name it.
+- **`RecoveryReader: Iterator<Item = RecoveryItem>`** — the item is the bare enum,
+  *not* `io::Result<RecoveryItem>`. It also implements `FusedIterator`.
+- **A trailing `Desynced` is always last**; its absence means the walk reached the
+  end of the segment.
+- **The failing record always gets its own `Skipped` before a `Desynced`**, so a
+  cascade reads `[Skipped, Skipped, Skipped, Desynced]` and counts are complete.
+- **The clean-end check is positional**, and deliberately accepts a sentinel at
+  either `file_len - SENTINEL - SEGMENT_FOOTER_LEN` (sealed) or `file_len -
+  SENTINEL` (footer-less) — `recovery_reader.rs:171-172`. The footer-less arm is
+  what lets the test helpers below omit the 32-byte footer.
+- **A clean end means "every byte is accounted for", never "every record was
+  recovered".** A length corrupted to a plausible value can tile exactly to EOF,
+  swallowing intact records inside its declared range; nothing is fabricated and
+  the `Skipped` names the exact byte range, but the records inside it are gone.
+  **Task 3's operator-facing output must be worded that way** — an operator who
+  reads "clean" as "everything was recovered" will delete a segment that still
+  held data.
 
 ---
 
@@ -690,8 +728,34 @@ Add to `mod tests` in `crates/weir-ctl/src/main.rs`, mirroring the existing
         let dir = tmp_dir("q_list");
         let q = dir.join("quarantine");
         std::fs::create_dir_all(&q).unwrap();
-        write_q_segment(&q, "shard_00__seg_00000001.wab.sealed", &[b"a", b"b"]);
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a", b"b"]);
         assert!(cmd_quarantine_list(&dir, false).is_ok());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_finds_both_extensions_and_collision_suffixes() {
+        // THE regression test for this command. Crash recovery quarantines
+        // ACTIVE segments, so its copies end `.wab` — and that is the mid-file
+        // corruption case, the one where acked records sit after the corruption.
+        // A `.wab.sealed`-only filter lists zero of them and reports success.
+        // The drain contributes `.wab.sealed`, and non_clobbering_dest appends
+        // `.N` to either on a name collision.
+        let dir = tmp_dir("q_list_exts");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a"]);
+        write_q_segment(&q, "shard_01__seg_00000002.wab.sealed", &[b"b"]);
+        write_q_segment(&q, "shard_00__seg_00000001.wab.1", &[b"c"]);
+        write_q_segment(&q, "shard_01__seg_00000002.wab.sealed.2", &[b"d"]);
+        std::fs::write(q.join("operator-notes.txt"), b"not a segment").unwrap();
+
+        let segs = quarantine_segments(&q).unwrap();
+        assert_eq!(
+            segs.len(),
+            4,
+            "both extensions and their collision suffixes must be listed, got {segs:?}"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -702,7 +766,7 @@ Add to `mod tests` in `crates/weir-ctl/src/main.rs`, mirroring the existing
         let dir = tmp_dir("q_inspect");
         let q = dir.join("quarantine");
         std::fs::create_dir_all(&q).unwrap();
-        let name = "shard_00__seg_00000001.wab.sealed";
+        let name = "shard_00__seg_00000001.wab";
         write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
 
         let report = quarantine_inspect_report(&q.join(name)).unwrap();
@@ -716,6 +780,19 @@ Add to `mod tests` in `crates/weir-ctl/src/main.rs`, mirroring the existing
 `write_q_segment` / `write_q_segment_with_corruption` build a segment the same
 way Task 1's test helper does — header, `len|crc|payload` per record, sentinel.
 Factor one helper rather than two if the shapes converge.
+
+**On the missing footer.** These helpers write no 32-byte segment footer, and
+that is fine *by design*: `RecoveryReader`'s clean-end check accepts a sentinel
+at `file_len - SENTINEL - SEGMENT_FOOTER_LEN` (sealed) **or** at
+`file_len - SENTINEL` (footer-less), see `recovery_reader.rs:171-172`. If that
+second arm is ever "simplified" away these tests desync instead of reporting a
+clean end. Do not add a fake footer to work around a failure here — find out
+which arm changed.
+
+**Mutation check before moving on.** Tighten `is_quarantined_segment_name` to
+`.wab.sealed` only and confirm
+`quarantine_list_finds_both_extensions_and_collision_suffixes` goes red. If it
+stays green the test is not pinning the thing it exists to pin.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -747,6 +824,9 @@ enum QuarantineCommand {
         /// Path to the daemon's WAB directory.
         #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Report what is readable in one quarantined segment: how many records
     /// verify, how many are corrupt and at what offsets, and whether the reader
@@ -757,11 +837,22 @@ enum QuarantineCommand {
         wab_dir: PathBuf,
         /// Segment file name, as printed by `quarantine list`.
         segment: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 ```
 
 Wire both into the dispatch `match` beside the `Dl` arm.
+
+**`--json` is not optional.** Every other read/inspect subcommand in weir-ctl
+carries it (`cmd_dl_list(wab_dir, json)`, `cmd_segments(wab_dir, json)`,
+`cmd_health(socket, json)`), and the test snippets above call
+`cmd_quarantine_list(&dir, false)` with that trailing argument. Keep the enum
+variants and the function signatures in agreement — the commonest way this task
+goes wrong is declaring the variant without `json` and then writing a two-arg
+call.
 
 - [ ] **Step 4: Implement the helpers and commands**
 
@@ -773,8 +864,26 @@ fn quarantine_dir(wab_dir: &Path) -> PathBuf {
 /// Every quarantined segment with its size, sorted by name.
 ///
 /// A missing directory yields an empty list, not an error: no quarantine dir is
-/// the normal, healthy state. Mirrors `dl_segments`, and matches only
-/// `.wab.sealed` — recovery writes quarantine copies under that extension.
+/// the normal, healthy state.
+///
+/// **The extension is NOT `.wab.sealed` only** — that assumption would hide
+/// exactly the segments this command exists for. Quarantine names are
+/// `{shard_name}__{original_file_name}` (`recovery.rs` `quarantine` /
+/// `copy_to_quarantine`), and there are two producers writing different
+/// extensions:
+///
+/// - **crash recovery** processes only files ending in `EXT_ACTIVE` (`.wab`),
+///   so its copies are `shard_00__seg_00000001.wab`. This is the mid-file
+///   corruption case — the one where acked records sit AFTER the corruption,
+///   which is the entire premise of this feature;
+/// - **the drain** quarantines sealed segments, so its copies end `.wab.sealed`.
+///
+/// On top of that, `non_clobbering_dest` appends `.1` … `.10000` on a name
+/// collision, to *either* form. So `shard_00__seg_00000001.wab.sealed.1` is a
+/// legal quarantined name.
+///
+/// Match the `.wab` / `.wab.sealed` stem with an optional numeric suffix. Do not
+/// tighten this to one extension.
 fn quarantine_segments(q_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     let entries = match std::fs::read_dir(q_dir) {
         Ok(e) => e,
@@ -784,11 +893,11 @@ fn quarantine_segments(q_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_sealed = path
+        let is_segment = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(".wab.sealed"));
-        if !is_sealed {
+            .is_some_and(is_quarantined_segment_name);
+        if !is_segment {
             continue;
         }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -796,6 +905,22 @@ fn quarantine_segments(q_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Whether a quarantine directory entry is a preserved WAB segment.
+///
+/// Accepts `…​.wab` and `…​.wab.sealed`, each optionally followed by the
+/// `.N` collision suffix `non_clobbering_dest` adds. Anything else in the
+/// directory (an operator's notes, a partial copy) is ignored rather than
+/// offered up for requeue.
+fn is_quarantined_segment_name(name: &str) -> bool {
+    // Strip a trailing `.<digits>` collision suffix, if any, then require one of
+    // the two segment extensions.
+    let stem = match name.rsplit_once('.') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => name,
+    };
+    stem.ends_with(".wab") || stem.ends_with(".wab.sealed")
 }
 
 /// What a forensic read of one segment found.
@@ -827,6 +952,17 @@ fn quarantine_inspect_report(path: &Path) -> Result<QuarantineReport, String> {
             weir_wab::RecoveryItem::Desynced { reason, .. } => {
                 r.desynced = true;
                 r.desync_reason = Some(reason);
+            }
+            // `RecoveryItem` is #[non_exhaustive] (it ships in a published
+            // crate), so this arm is REQUIRED to compile. Counting an unknown
+            // variant as recovered would overstate what requeue can deliver, and
+            // counting it as skipped would understate it — so it is neither.
+            other => {
+                return Err(format!(
+                    "unknown RecoveryItem variant {other:?} — weir-ctl is older \
+                     than the weir-wab it is reading; upgrade weir-ctl before \
+                     trusting this report"
+                ));
             }
         }
     }
@@ -973,6 +1109,10 @@ Extend `QuarantineCommand`:
     /// Re-delivery is at-least-once, and it WILL re-send records that already
     /// reached the sink: recovery delivered the valid prefix when it sealed it,
     /// and the prefix lives in this same file. The dry run prints the count.
+    ///
+    /// A dedup-capable sink will NOT filter those duplicates. The dedup token is
+    /// derived from a batch's contents AND its boundaries, and a requeue
+    /// re-batches, so the sink sees genuinely distinct batches and accepts both.
     Requeue {
         /// Path to the daemon's WAB directory.
         #[arg(long, env = "WEIR_WAB_DIR")]
@@ -1091,8 +1231,10 @@ nothing to confirm, and deleting it would destroy the only forensic copy.
 
 The dry run states up front that the already-delivered prefix will be re-sent —
 recovery delivered it when it sealed the valid prefix, and the prefix lives in
-this same file. Within the at-least-once contract and deduped by the batch
-token, but the operator decides rather than discovers.
+this same file. This is within the at-least-once contract, and the dedup token
+will NOT save you: DedupToken is derived from a batch's contents AND its
+boundaries, and a requeue re-batches, so a dedup-capable sink sees genuinely
+distinct batches and accepts both. The operator decides rather than discovers.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -1128,6 +1270,20 @@ Cross-reference it from `docs/wab_format.md`'s description of the quarantine
 directory, which currently explains what the directory is but not what to do
 about it.
 
+Document the **naming**, because an operator reading the directory by hand needs
+it and because getting it wrong is what this plan's own Task 3 originally did:
+entries are `{shard_name}__{original_file_name}`, ending `.wab` when crash
+recovery preserved an active segment and `.wab.sealed` when the drain preserved
+a sealed one, with a `.N` suffix appended on a name collision.
+
+- [ ] **Step 2b: Correct the stale comment in `main.rs`**
+
+`crates/weir-server/src/main.rs:70-71`, inside `compute_wab_bytes_on_disk`,
+claims *"quarantine/ holds forensic .wab.sealed copies"*. It holds both
+extensions — see above. The code is correct (it skips the whole directory
+either way); only the comment is wrong, and it is the same wrong belief that
+would have made `quarantine list` report an empty directory.
+
 - [ ] **Step 3: CHANGELOG**
 
 ```markdown
@@ -1146,8 +1302,10 @@ about it.
 
   `requeue` **does** re-send records that already reached the sink — the
   delivered prefix and the preserved tail live in the same file — so the dry run
-  prints that count before you pass `--yes`. A segment that yields no
-  recoverable records is left in place rather than deleted.
+  prints that count before you pass `--yes`. A dedup-capable sink will not filter
+  them either: the dedup token covers a batch's contents *and* its boundaries,
+  and a requeue re-batches. A segment that yields no recoverable records is left
+  in place rather than deleted.
 
   Also adds `weir_quarantine_bytes_on_disk` (a gauge, so it survives a restart)
   and `weir_recovery_segments_failed_total`, for the recovery arm that
@@ -1194,6 +1352,33 @@ failure. The plausible-next-header heuristic is replaced by a
 consecutive-failure limit, which achieves the same guarantee (never fabricate
 records) without a heuristic that could itself misjudge. Task 1's commit
 message records this.
+
+**Corrections found proofreading this plan after Tasks 1–2 shipped.** Recorded
+here because each was wrong in a way that would have shipped silently:
+
+- **Task 3's segment filter was `.wab.sealed` only.** Quarantine holds both
+  extensions, and the `.wab` half is the crash-recovery half — the mid-file
+  corruption case, the one where acked records sit after the corruption, which
+  is this plan's entire premise. `list` would have printed "empty" and `requeue`
+  recovered nothing, both reporting success. Fixed in Task 3 Step 4, with
+  `quarantine_list_finds_both_extensions_and_collision_suffixes` and a mutation
+  check to pin it.
+- **Task 3's `RecoveryItem` match had no wildcard arm**, and the enum became
+  `#[non_exhaustive]` in Task 1's fix round. It would not have compiled.
+- **Task 4's commit message claimed duplicates are "deduped by the batch
+  token".** They are not: `DedupToken` covers batch boundaries as well as
+  contents — `weir-sink-sdk/src/lib.rs` has
+  `dedup_token_distinguishes_different_batch_boundaries` to pin exactly that —
+  and a requeue re-batches. The `Requeue` help text and the dry-run wording were
+  already right; only the reassuring clause was wrong, and it is the clause that
+  would talk an operator out of the dry run.
+- **The Global Constraints gate omitted clippy and `cargo deny`.** Added.
+- **Task 1's body below is the pre-review version** and still contains the
+  defects the review found (the unconditional zero-length sentinel, the zstd
+  path feeding the consecutive-skip budget, no `#[non_exhaustive]`, no
+  `FusedIterator`, a private `MAX_CONSECUTIVE_SKIPS`, and a cascade test the
+  implementer proved vacuous). It is left as written because Task 1 is done;
+  **code against the "As built" section near the top of this plan instead.**
 
 **Known rough edges for the implementer.**
 - Task 2 Step 1's test input must actually reach the `Err(e) =>` arm at
