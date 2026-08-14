@@ -229,6 +229,8 @@ pub(crate) struct Metrics {
     // ── WAB ───────────────────────────────────────────────────────────────────
     pub wab_segments: Family<SegmentStateLabel, Counter<u64, AtomicU64>>,
     pub wab_bytes_on_disk: Gauge<f64, AtomicU64>,
+    /// Bytes currently held in the quarantine directory.
+    pub quarantine_bytes_on_disk: Gauge<f64, AtomicU64>,
     pub wab_fsync_duration: Histogram,
     /// WAB flusher thread panics. Once a flusher panics, its shard is offline
     /// (records routed to it receive Nack(InternalError)) until the daemon
@@ -259,6 +261,8 @@ pub(crate) struct Metrics {
     // ── Recovery ──────────────────────────────────────────────────────────────
     pub recovery_records_replayed: Counter<u64, AtomicU64>,
     pub recovery_segments_quarantined: Counter<u64, AtomicU64>,
+    /// Segments whose crash recovery failed and were left for manual inspection.
+    pub recovery_segments_failed: Counter<u64, AtomicU64>,
     /// Counts mid-file-corrupt WAB segments whose quarantine COPY failed during
     /// recovery (disk full / read-only mount / inode exhaustion). On this event
     /// recovery refuses to truncate the valid prefix — it leaves the segment in
@@ -507,6 +511,21 @@ impl Metrics {
             "weir_recovery_segments_quarantined",
             "WAB segments quarantined due to corruption detected during crash recovery"
         );
+        let recovery_segments_failed = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_recovery_segments_failed",
+            "WAB segments whose crash recovery returned an error and were left on \
+             disk for manual inspection. Non-zero means acked records may be \
+             unreachable — check the startup logs for the path and the cause"
+        );
+        let quarantine_bytes_on_disk = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_quarantine_bytes_on_disk",
+            "Bytes held in the quarantine/ subdirectory: forensic copies of \
+             corrupt segments preserved because acked records may sit after the \
+             corruption. Unlike the quarantine counters this survives a restart. \
+             Recover them with `weir-ctl quarantine requeue`"
+        );
         let wab_record_logical_bytes = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_wab_record_logical_bytes",
@@ -631,6 +650,7 @@ impl Metrics {
             tls_config_reloads,
             wab_segments,
             wab_bytes_on_disk,
+            quarantine_bytes_on_disk,
             wab_fsync_duration,
             wab_flusher_panics,
             drain_panics,
@@ -642,6 +662,7 @@ impl Metrics {
             queue_depth,
             recovery_records_replayed,
             recovery_segments_quarantined,
+            recovery_segments_failed,
             recovery_quarantine_copy_failed,
             wab_cap_rejections,
             wab_record_logical_bytes,

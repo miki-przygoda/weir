@@ -126,6 +126,10 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
                 info!(sealed = %sealed.display(), "recovery complete");
             }
             Err(e) => {
+                // Counted, not just logged: a segment left here holds acked
+                // records that nothing will reach, and on a read-only mount this
+                // repeats every boot. A log line is not an alertable signal.
+                metrics.recovery_segments_failed.inc();
                 error!(path = %path.display(), error = %e, "recovery failed; segment left for manual inspection");
             }
         }
@@ -1982,6 +1986,30 @@ mod tests {
                 .get(),
             1,
             "a mid-file-corrupt compressed segment must be quarantined"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_segment_whose_recovery_fails_is_counted_not_just_logged() {
+        // Today this arm only logs, so a segment left for manual inspection is
+        // invisible to monitoring. On a read-only mount it repeats every boot
+        // with nothing but a log line.
+        let dir = tmp_dir("recovery_failed_counter");
+        let shard_dir = dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // A file with a valid name but a header too short to parse: recover_segment
+        // returns Err, and recover_shard_dir swallows it.
+        let path = crate::wab::segment::segment_path(&shard_dir, 1);
+        fs::write(&path, b"nope").unwrap();
+
+        let metrics = noop_metrics();
+        recover_open_segments(&dir, &metrics).unwrap();
+        assert_eq!(
+            metrics.recovery_segments_failed.get(),
+            1,
+            "a swallowed recovery failure must still be counted"
         );
         fs::remove_dir_all(dir).ok();
     }

@@ -431,6 +431,35 @@ fn probe_and_resume_stranded<S: Sink>(
 
 // ── Drain thread ──────────────────────────────────────────────────────────────
 
+/// Total bytes currently held in `<wab_dir>/quarantine`: forensic copies of
+/// corrupt WAB segments preserved by crash recovery (see `wab::recovery`)
+/// because acked records may sit after the corruption.
+///
+/// Same shape as `dead_letter`'s directory-sizing scan and `main.rs`'s
+/// `compute_wab_bytes_on_disk`: walk the directory, sum regular-file sizes,
+/// and read a missing directory as `0` rather than an error. An absent
+/// quarantine dir is the normal, healthy case — nothing has ever been
+/// quarantined — and must not be surfaced as a scan failure.
+///
+/// Refreshed on the same wall-clock health-poll cadence as
+/// `dead_letter_bytes_on_disk` (see the call site below), so the gauge is a
+/// periodic snapshot, not a live value — same staleness bound as
+/// `weir_wab_bytes_on_disk`.
+fn quarantine_bytes_on_disk(wab_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(wab_dir.join("quarantine")) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
 fn drain_thread<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
@@ -512,6 +541,13 @@ fn drain_thread<S: Sink>(
                             .dead_letter_bytes_on_disk
                             .set(dead_letter.total_bytes() as f64);
                     }
+                    // Same idea for quarantine: an operator can run `weir-ctl
+                    // quarantine requeue` (or manually clear the dir) while the
+                    // daemon is up, and the gauge should catch up on this same
+                    // health-poll cadence rather than only at the next restart.
+                    metrics
+                        .quarantine_bytes_on_disk
+                        .set(quarantine_bytes_on_disk(&config.wab_dir) as f64);
                     last_health_poll = Instant::now();
                 }
 

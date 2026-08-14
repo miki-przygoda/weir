@@ -561,6 +561,7 @@ fn metrics_all_families_registered() {
         // WAB
         "weir_wab_segments",
         "weir_wab_bytes_on_disk",
+        "weir_quarantine_bytes_on_disk",
         "weir_wab_record_logical_bytes",
         "weir_wab_record_stored_bytes",
         "weir_wab_fsync_duration_seconds",
@@ -576,6 +577,7 @@ fn metrics_all_families_registered() {
         // Recovery
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
+        "weir_recovery_segments_failed",
         "weir_recovery_quarantine_copy_failed",
         "weir_wab_unexpected_mode",
         // Dead letter
