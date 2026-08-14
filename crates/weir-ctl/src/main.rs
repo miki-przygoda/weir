@@ -1589,8 +1589,24 @@ fn quarantine_requeue_dry_run_json(plan: &QuarantineRequeuePlan) -> serde_json::
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn quarantine_requeue_done_json(
+/// One quarantined segment's skipped records, from a REAL run — carried
+/// through to the real run's human output and its `--json` shape (review
+/// round 2, N2). The dry run already surfaced the aggregate skip count and
+/// pointed at `quarantine inspect`; the real run said nothing at all, so an
+/// operator who runs `--yes` directly (or a script that never sees the dry
+/// run) learned nothing about records that were just permanently destroyed —
+/// the same information-asymmetry class Important 1 (round 1) was about,
+/// which that round closed for desyncs but not for skips. Reuses Task 3's
+/// `SkippedRecord` (offset/declared_len/reason) rather than a parallel type.
+struct RequeueSkippedSegment {
+    segment: String,
+    records: Vec<SkippedRecord>,
+}
+
+/// Tally of one real `requeue --yes` run, built up as segments are processed.
+/// Passed to [`quarantine_requeue_done_json`] as a single unit instead of a
+/// growing positional-argument list.
+struct QuarantineRequeueOutcome {
     segments: usize,
     requeued_records: u64,
     segments_cleared: usize,
@@ -1598,17 +1614,39 @@ fn quarantine_requeue_done_json(
     segments_empty_left: usize,
     unreadable_segments: usize,
     delete_failures: usize,
+    skipped_records_total: u64,
+    skipped_segments: Vec<RequeueSkippedSegment>,
+}
+
+fn quarantine_requeue_done_json(
+    outcome: &QuarantineRequeueOutcome,
     durability: Durability,
 ) -> serde_json::Value {
+    let skipped_records: Vec<serde_json::Value> = outcome
+        .skipped_segments
+        .iter()
+        .flat_map(|s| {
+            s.records.iter().map(move |r| {
+                serde_json::json!({
+                    "segment": s.segment,
+                    "offset": r.offset,
+                    "declared_len": r.declared_len,
+                    "reason": r.reason,
+                })
+            })
+        })
+        .collect();
     serde_json::json!({
         "dry_run": false,
-        "segments": segments,
-        "requeued_records": requeued_records,
-        "segments_cleared": segments_cleared,
-        "segments_desynced_left_in_place": segments_desynced_left,
-        "segments_empty_left_in_place": segments_empty_left,
-        "unreadable_segments": unreadable_segments,
-        "delete_failures": delete_failures,
+        "segments": outcome.segments,
+        "requeued_records": outcome.requeued_records,
+        "segments_cleared": outcome.segments_cleared,
+        "segments_desynced_left_in_place": outcome.segments_desynced_left,
+        "segments_empty_left_in_place": outcome.segments_empty_left,
+        "unreadable_segments": outcome.unreadable_segments,
+        "delete_failures": outcome.delete_failures,
+        "skipped_records_total": outcome.skipped_records_total,
+        "skipped_records": skipped_records,
         "durability": format!("{durability:?}"),
     })
 }
@@ -1726,9 +1764,15 @@ fn quarantine_requeue_write(
     let mut segments_empty_left: Vec<String> = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
     let mut delete_failures: Vec<String> = Vec::new();
+    // Review round 2, N2: carried through regardless of a segment's OTHER
+    // outcome — a segment can be fully deleted (the common case: some records
+    // Skipped, the rest accepted) and still have lost real, CRC-valid data
+    // that the operator was never told about in this run's own output.
+    let mut total_skipped_records: u64 = 0;
+    let mut skipped_segments: Vec<RequeueSkippedSegment> = Vec::new();
 
     for (path, _sz) in &segs {
-        let (records, report) = match quarantine_read(path) {
+        let (records, mut report) = match quarantine_read(path) {
             Ok(v) => v,
             Err(e) => {
                 // The segment itself couldn't be opened/parsed — distinct from
@@ -1761,6 +1805,25 @@ fn quarantine_requeue_write(
                 ));
             }
             total_requeued += 1;
+        }
+
+        // Review round 2, N2: record what THIS segment's read skipped, before
+        // deciding the segment's fate below — a segment with skips can still
+        // end up fully deleted (the ordinary case: recovery quarantined it
+        // for exactly one corrupt record among several good ones), and that
+        // is precisely the run an operator most needs this information from.
+        // `report.skipped_records` is moved out here; `report.skipped` (a
+        // count) and `report.desynced` stay available below (Copy fields).
+        if report.skipped > 0 {
+            total_skipped_records += report.skipped as u64;
+            skipped_segments.push(RequeueSkippedSegment {
+                segment: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                records: std::mem::take(&mut report.skipped_records),
+            });
         }
 
         // Review round 1, Important 1: a desync means bytes past that point
@@ -1796,27 +1859,34 @@ fn quarantine_requeue_write(
 
         // Every record in this segment was ACCEPTED (the loop above would have
         // returned on the first failure) and the read reached a clean end.
-        // Only now is it safe to delete.
+        // Only now is it safe to delete. review round 2, N2: this is also the
+        // ordinary path for a segment with SOME `Skipped` records and the
+        // rest accepted — deleting it is the already-adjudicated, correct
+        // behaviour (a flag gating on `skipped > 0` would fire on every
+        // quarantined segment, since that is the whole reason each one is
+        // here); what was missing was telling the operator it happened, which
+        // the `skipped_segments` collection above now does regardless of this
+        // branch.
         match std::fs::remove_file(path) {
             Ok(()) => segments_cleared += 1,
             Err(e) => delete_failures.push(format!("{}: {e}", path.display())),
         }
     }
 
+    let outcome = QuarantineRequeueOutcome {
+        segments: segs.len(),
+        requeued_records: total_requeued,
+        segments_cleared,
+        segments_desynced_left: segments_desynced_left.len(),
+        segments_empty_left: segments_empty_left.len(),
+        unreadable_segments: unreadable.len(),
+        delete_failures: delete_failures.len(),
+        skipped_records_total: total_skipped_records,
+        skipped_segments,
+    };
+
     if json {
-        write_json_to(
-            out,
-            &quarantine_requeue_done_json(
-                segs.len(),
-                total_requeued,
-                segments_cleared,
-                segments_desynced_left.len(),
-                segments_empty_left.len(),
-                unreadable.len(),
-                delete_failures.len(),
-                durability,
-            ),
-        );
+        write_json_to(out, &quarantine_requeue_done_json(&outcome, durability));
     } else {
         let _ = writeln!(
             out,
@@ -1824,6 +1894,48 @@ fn quarantine_requeue_write(
              segment(s) through {} ({durability:?})",
             socket.display(),
         );
+        // Review round 2, N2: printed unconditionally when any record was
+        // skipped THIS run — including for segments that were otherwise fully
+        // deleted above, not only the ones left in place below. Mirrors
+        // `quarantine_inspect_lines`' per-record byte-range format so the
+        // detail an operator gets here is the same they'd get from
+        // `quarantine inspect`, just after the fact rather than before.
+        if !outcome.skipped_segments.is_empty() {
+            let lines: Vec<String> = outcome
+                .skipped_segments
+                .iter()
+                .map(|s| {
+                    let ranges: Vec<String> = s
+                        .records
+                        .iter()
+                        .map(|r| {
+                            let end = r.offset + 8 + r.declared_len as u64;
+                            format!(
+                                "offset {}, declared_len {} bytes (range {}..{end}) — {}",
+                                r.offset, r.declared_len, r.offset, r.reason
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{}: {} record(s) skipped\n      {}",
+                        s.segment,
+                        s.records.len(),
+                        ranges.join("\n      ")
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "\n⚠ {} record(s) across {} segment(s) failed verification during this run and \
+                 were NOT recovered. If a segment was otherwise fully readable it has been \
+                 deleted above, and these specific records are now permanently unrecoverable — \
+                 this is the already-decided cost of --yes on a segment with any corrupt \
+                 record, not a new failure:\n  {}",
+                outcome.skipped_records_total,
+                outcome.skipped_segments.len(),
+                lines.join("\n  ")
+            );
+        }
         if !segments_desynced_left.is_empty() {
             let _ = writeln!(
                 out,
@@ -1861,6 +1973,22 @@ fn quarantine_requeue_write(
         }
     }
 
+    // Review round 2, N2 (judgment call, stated explicitly rather than
+    // inherited): a nonzero `skipped_records_total` does NOT, on its own,
+    // turn this run into a nonzero exit. Every quarantined segment has at
+    // least one unreadable record by construction (that is why it is
+    // quarantined at all), so treating "some record was skipped somewhere"
+    // as a run-level problem would make a normal, fully-successful requeue
+    // exit non-zero in the ordinary case — indistinguishable from an actual
+    // failure, and exactly the "always fires, so it's noise" trap the
+    // decision not to gate `--yes` on `skipped > 0` already rejected once.
+    // The information asymmetry that was actually wrong is closed by the
+    // human/JSON output above, which is unconditional; a script that cares
+    // must inspect `skipped_records_total`, not the exit code, for this
+    // specific signal. `problems` below is therefore unchanged by skips —
+    // only desyncs, empty segments, unreadable segments, and delete failures
+    // (none of which are the expected/adjudicated common case) make the run
+    // exit non-zero.
     let mut problems: Vec<String> = Vec::new();
     if !delete_failures.is_empty() {
         problems.push(format!(
@@ -3663,6 +3791,60 @@ weir_sink_health{state=\"degraded\"} 0
     }
 
     #[test]
+    fn quarantine_requeue_leaves_an_all_skipped_clean_end_segment_undeleted() {
+        // Review round 2, N1: the round-1 fix reordered the delete guard to
+        // check `report.desynced` FIRST — correct behaviour, but it meant
+        // `a_segment_that_desyncs_with_no_records_is_not_deleted`'s fixture
+        // (a corrupted LENGTH field) now exits through that new branch and
+        // never reaches `records.is_empty()` at all. With
+        // `if false && records.is_empty()`, the whole suite stayed green: the
+        // "yielded nothing → never delete" guard had no test left holding it,
+        // and disabling it silently turns a zero-record segment from
+        // `Err(…left in place)` + file on disk into `Ok(())` + file deleted.
+        //
+        // This fixture reaches that branch the OTHER way: a corrupted PAYLOAD
+        // (not length) on the segment's only record. That's a CRC mismatch,
+        // which `Skipped`s and reads on to a clean end (the sentinel) rather
+        // than desyncing — recovered=0, skipped=1, desynced=false.
+        let dir = tmp_dir("q_requeue_all_skipped");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_with_corruption(&q, name, &[b"only"], 0);
+
+        let report = quarantine_inspect_report(&q.join(name)).unwrap();
+        assert_eq!(report.recovered, 0, "fixture sanity: nothing recoverable");
+        assert_eq!(
+            report.skipped, 1,
+            "fixture sanity: the one record is skipped"
+        );
+        assert!(
+            !report.desynced,
+            "fixture sanity: a CRC mismatch must NOT desync — this must reach the \
+             records.is_empty() branch, not the report.desynced one"
+        );
+
+        let socket = fake_daemon_socket("all_skipped");
+        let daemon = FakeDaemon::start(socket.clone()); // would Ack anything
+
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Batched, true, false)
+            .expect_err("a segment with nothing recoverable must be reported, not silently OK");
+        assert!(
+            err.contains("no recoverable records"),
+            "the error must name the actual reason (not a desync), got: {err}"
+        );
+        assert!(
+            q.join(name).exists(),
+            "an all-skipped, clean-end segment must survive --yes"
+        );
+        assert!(
+            daemon.into_received().is_empty(),
+            "nothing was recoverable, so nothing should have been pushed"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn quarantine_requeue_refuses_buffered_durability() {
         // Review round 1, Minor 1: `Buffered` acks before any fsync
         // (`weir-core/src/durability.rs`), and this command deletes the
@@ -3749,5 +3931,149 @@ weir_sink_health{state=\"degraded\"} 0
             vec![b"real1".to_vec(), b"real2".to_vec()]
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_real_run_reports_skipped_records_even_when_the_segment_is_deleted() {
+        // Review round 2, N2: the information asymmetry Important 1 (round 1)
+        // was about, left open for skips. The dry run already warns about
+        // skipped records; the real run said NOTHING — not even for a
+        // segment that ends up fully deleted because its one corrupt record
+        // was skipped and everything else was accepted, which is the
+        // ORDINARY case (every quarantined segment has at least one skip by
+        // construction — that is why it is quarantined at all). An operator
+        // running --yes directly, or automation reading only stdout/JSON,
+        // learned nothing about the corrupt record that is now permanently
+        // gone. This does NOT reopen the delete-on-skip decision (a segment
+        // that is otherwise fully readable is still, correctly, deleted) —
+        // it only asserts the operator is TOLD.
+        let dir = tmp_dir("q_requeue_report_skips");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+
+        let socket = fake_daemon_socket("report_skips");
+        let _daemon = FakeDaemon::start(socket.clone());
+
+        let mut out = Vec::new();
+        let result =
+            quarantine_requeue_write(&dir, &socket, Durability::Batched, true, false, &mut out);
+        assert!(
+            result.is_ok(),
+            "a skip alone must not fail the run — that would make every successful requeue \
+             non-zero, since every quarantined segment has a skip by construction: {result:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("1 record") && text.to_lowercase().contains("skip"),
+            "the real run must report the skipped record, got: {text}"
+        );
+        assert!(
+            text.contains("declared_len 6"),
+            "the real run must surface the byte range (not just a count), \"BADREC\" is 6 \
+             bytes, got: {text}"
+        );
+        assert!(
+            !q.join(name).exists(),
+            "the segment was otherwise fully recoverable and must still be deleted — this \
+             test is about being TOLD, not about changing the delete outcome"
+        );
+
+        // Same information, structured, in --json — rebuild the fixture since
+        // the run above deleted it.
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+        let socket2 = fake_daemon_socket("report_skips_json");
+        let _daemon2 = FakeDaemon::start(socket2.clone());
+        let mut json_out = Vec::new();
+        quarantine_requeue_write(
+            &dir,
+            &socket2,
+            Durability::Batched,
+            true,
+            true,
+            &mut json_out,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+        assert_eq!(v["skipped_records_total"], serde_json::json!(1));
+        assert_eq!(
+            v["skipped_records"][0]["declared_len"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            v["skipped_records"][0]["reason"],
+            serde_json::json!("CRC mismatch")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_dry_run_json_has_expected_keys() {
+        // N3: nothing pinned this shape before — renaming any key left the
+        // suite green, unlike `dl requeue`'s JSON or `quarantine list`'s.
+        let plan = QuarantineRequeuePlan {
+            segments: 3,
+            total_records: 10,
+            total_skipped: 2,
+            segments_desynced: 1,
+            unreadable: vec!["bad.wab.sealed: truncated".to_string()],
+        };
+        let v = round_trip(&quarantine_requeue_dry_run_json(&plan));
+        assert_eq!(v["dry_run"], serde_json::json!(true));
+        assert_eq!(v["segments"], serde_json::json!(3));
+        assert_eq!(v["requeuable_records"], serde_json::json!(10));
+        assert_eq!(v["skipped_records"], serde_json::json!(2));
+        assert_eq!(v["segments_desynced"], serde_json::json!(1));
+        assert_eq!(v["unreadable_segments"], serde_json::json!(1));
+        assert!(v["note"].is_string());
+    }
+
+    #[test]
+    fn quarantine_requeue_done_json_has_expected_keys() {
+        // N3: same trap for the real-run JSON shape — this also pins the new
+        // N2 `skipped_records`/`skipped_records_total` fields structurally.
+        let outcome = QuarantineRequeueOutcome {
+            segments: 5,
+            requeued_records: 12,
+            segments_cleared: 3,
+            segments_desynced_left: 1,
+            segments_empty_left: 1,
+            unreadable_segments: 1,
+            delete_failures: 1,
+            skipped_records_total: 2,
+            skipped_segments: vec![RequeueSkippedSegment {
+                segment: "seg.wab.sealed".to_string(),
+                records: vec![SkippedRecord {
+                    offset: 24,
+                    declared_len: 6,
+                    reason: "CRC mismatch".to_string(),
+                }],
+            }],
+        };
+        let v = round_trip(&quarantine_requeue_done_json(&outcome, Durability::Sync));
+        assert_eq!(v["dry_run"], serde_json::json!(false));
+        assert_eq!(v["segments"], serde_json::json!(5));
+        assert_eq!(v["requeued_records"], serde_json::json!(12));
+        assert_eq!(v["segments_cleared"], serde_json::json!(3));
+        assert_eq!(v["segments_desynced_left_in_place"], serde_json::json!(1));
+        assert_eq!(v["segments_empty_left_in_place"], serde_json::json!(1));
+        assert_eq!(v["unreadable_segments"], serde_json::json!(1));
+        assert_eq!(v["delete_failures"], serde_json::json!(1));
+        assert_eq!(v["durability"], serde_json::json!("Sync"));
+        assert_eq!(v["skipped_records_total"], serde_json::json!(2));
+        assert_eq!(
+            v["skipped_records"][0]["segment"],
+            serde_json::json!("seg.wab.sealed")
+        );
+        assert_eq!(v["skipped_records"][0]["offset"], serde_json::json!(24));
+        assert_eq!(
+            v["skipped_records"][0]["declared_len"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            v["skipped_records"][0]["reason"],
+            serde_json::json!("CRC mismatch")
+        );
     }
 }
