@@ -76,6 +76,13 @@ enum Command {
     /// Inspect and manage the dead-letter store.
     #[command(subcommand)]
     Dl(DlCommand),
+    /// Inspect and recover quarantined segments.
+    ///
+    /// Quarantine holds forensic copies of segments where recovery met
+    /// corruption. Acked records may sit AFTER the corrupt record, and those
+    /// records exist nowhere else — this is how you get them back.
+    #[command(subcommand)]
+    Quarantine(QuarantineCommand),
 }
 
 /// Subcommands under `weir-ctl dl`.
@@ -122,6 +129,27 @@ enum DlCommand {
     },
 }
 
+/// Subcommands under `weir-ctl quarantine`.
+#[derive(Subcommand)]
+enum QuarantineCommand {
+    /// List quarantined segments (count + bytes + origin shard).
+    List {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+    },
+    /// Report what is readable in one quarantined segment: how many records
+    /// verify, how many are corrupt and at what offsets, and whether the reader
+    /// lost the record framing entirely.
+    Inspect {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+        /// Segment file name, as printed by `quarantine list`.
+        segment: String,
+    },
+}
+
 fn parse_durability(s: &str) -> Result<Durability, String> {
     match s.to_ascii_lowercase().as_str() {
         "sync" => Ok(Durability::Sync),
@@ -154,6 +182,12 @@ fn main() -> ExitCode {
                 durability,
                 yes,
             } => cmd_dl_requeue(&wab_dir, &socket, durability, yes, json),
+        },
+        Command::Quarantine(q) => match q {
+            QuarantineCommand::List { wab_dir } => cmd_quarantine_list(&wab_dir, json),
+            QuarantineCommand::Inspect { wab_dir, segment } => {
+                cmd_quarantine_inspect(&wab_dir, &segment, json)
+            }
         },
     };
     match result {
@@ -1002,6 +1036,263 @@ fn cmd_dl_requeue(
     }
     if !problems.is_empty() {
         return Err(problems.join("\n"));
+    }
+    Ok(())
+}
+
+// ── Quarantine ───────────────────────────────────────────────────────────────
+
+fn quarantine_dir(wab_dir: &Path) -> PathBuf {
+    wab_dir.join("quarantine")
+}
+
+/// Every quarantined segment with its size, sorted by name.
+///
+/// A missing directory yields an empty list, not an error: no quarantine dir is
+/// the normal, healthy state.
+///
+/// **The extension is NOT `.wab.sealed` only** — that assumption would hide
+/// exactly the segments this command exists for. Quarantine names are
+/// `{shard_name}__{original_file_name}` (`recovery.rs` `quarantine` /
+/// `copy_to_quarantine`), and there are two producers writing different
+/// extensions:
+///
+/// - **crash recovery** processes only files ending in `EXT_ACTIVE` (`.wab`),
+///   so its copies are `shard_00__seg_00000001.wab`. This is the mid-file
+///   corruption case — the one where acked records sit AFTER the corruption,
+///   which is the entire premise of this feature;
+/// - **the drain** quarantines sealed segments, so its copies end `.wab.sealed`.
+///
+/// On top of that, `non_clobbering_dest` appends `.1` … `.10000` on a name
+/// collision, to *either* form. So `shard_00__seg_00000001.wab.sealed.1` is a
+/// legal quarantined name.
+///
+/// Match the `.wab` / `.wab.sealed` stem with an optional numeric suffix. Do not
+/// tighten this to one extension — see
+/// `quarantine_list_finds_both_extensions_and_collision_suffixes` in the tests.
+fn quarantine_segments(q_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
+    let entries = match std::fs::read_dir(q_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", q_dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Mirrors `dl_segments_filtered`'s `p.is_file()` guard: quarantine/ is
+        // only ever populated by `quarantine()` / `copy_to_quarantine()`, which
+        // write files, but a name-matching directory (however unlikely) must not
+        // be offered up as a segment to inspect/requeue.
+        let is_segment = path.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_quarantined_segment_name);
+        if !is_segment {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push((path, size));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Whether a quarantine directory entry is a preserved WAB segment.
+///
+/// Accepts `…wab` and `…wab.sealed`, each optionally followed by the `.N`
+/// collision suffix `non_clobbering_dest` adds. Anything else in the directory
+/// (an operator's notes, a partial copy) is ignored rather than offered up for
+/// requeue.
+fn is_quarantined_segment_name(name: &str) -> bool {
+    // Strip a trailing `.<digits>` collision suffix, if any, then require one of
+    // the two segment extensions.
+    let stem = match name.rsplit_once('.') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => name,
+    };
+    stem.ends_with(".wab") || stem.ends_with(".wab.sealed")
+}
+
+/// The `{shard_name}` prefix of a quarantine entry name
+/// (`{shard_name}__{original_file_name}`), if the `__` separator is present.
+fn origin_shard(name: &str) -> Option<&str> {
+    name.split_once("__").map(|(shard, _)| shard)
+}
+
+/// The machine-readable form of `quarantine list`: one object per segment
+/// (name, bytes, origin shard) plus a count/total rollup. Mirrors
+/// `dl_list_json`'s shape — an empty store is a valid result (empty array,
+/// zero totals), not a special case.
+fn quarantine_list_json(q_dir: &Path, segs: &[(PathBuf, u64)]) -> serde_json::Value {
+    let total: u64 = segs.iter().map(|(_, s)| *s).sum();
+    let segments: Vec<serde_json::Value> = segs
+        .iter()
+        .map(|(p, sz)| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            serde_json::json!({
+                "segment": name,
+                "bytes": sz,
+                "origin_shard": origin_shard(name),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "quarantine_dir": q_dir.display().to_string(),
+        "count": segs.len(),
+        "total_bytes": total,
+        "segments": segments,
+    })
+}
+
+fn cmd_quarantine_list(wab_dir: &Path, json: bool) -> Result<(), String> {
+    ensure_wab_dir(wab_dir)?;
+    let q_dir = quarantine_dir(wab_dir);
+    let segs = quarantine_segments(&q_dir)?;
+
+    if json {
+        print_json(&quarantine_list_json(&q_dir, &segs));
+        return Ok(());
+    }
+
+    if segs.is_empty() {
+        println!("quarantine is empty ({})", q_dir.display());
+        return Ok(());
+    }
+    println!("{:<44} {:>12}  origin shard", "segment", "bytes");
+    let mut total = 0u64;
+    for (p, sz) in &segs {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        println!(
+            "{name:<44} {:>12}  {}",
+            fmt_bytes(*sz),
+            origin_shard(name).unwrap_or("?")
+        );
+        total += sz;
+    }
+    println!(
+        "{:<44} {:>12}",
+        format!("total ({})", segs.len()),
+        fmt_bytes(total)
+    );
+    println!(
+        "run `weir-ctl quarantine inspect --wab-dir <dir> <segment>` on each before deciding \
+         whether to requeue or discard — a segment's presence here does not say how much of it \
+         is recoverable."
+    );
+    Ok(())
+}
+
+/// What a forensic read of one quarantined segment found.
+struct QuarantineReport {
+    recovered: usize,
+    skipped: usize,
+    desynced: bool,
+    skipped_offsets: Vec<u64>,
+    desync_reason: Option<String>,
+}
+
+/// Reads `path` with [`weir_wab::RecoveryReader`] and tallies what it finds.
+///
+/// Unlike `read_segment_records` (used for dead-letter segments), this never
+/// bails out on the first corrupt record: every quarantined segment is corrupt
+/// by definition (that is why it is here), so the whole point is to see what
+/// survives on both sides of the damage.
+fn quarantine_inspect_report(path: &Path) -> Result<QuarantineReport, String> {
+    let reader = weir_wab::RecoveryReader::open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut r = QuarantineReport {
+        recovered: 0,
+        skipped: 0,
+        desynced: false,
+        skipped_offsets: Vec::new(),
+        desync_reason: None,
+    };
+    for item in reader {
+        match item {
+            weir_wab::RecoveryItem::Record(_) => r.recovered += 1,
+            weir_wab::RecoveryItem::Skipped { offset, .. } => {
+                r.skipped += 1;
+                r.skipped_offsets.push(offset);
+            }
+            weir_wab::RecoveryItem::Desynced { reason, .. } => {
+                r.desynced = true;
+                r.desync_reason = Some(reason);
+            }
+            // `RecoveryItem` is #[non_exhaustive] (it ships in a published
+            // crate), so this arm is REQUIRED to compile. Counting an unknown
+            // variant as recovered would overstate what requeue can deliver, and
+            // counting it as skipped would understate it — so it is neither.
+            other => {
+                return Err(format!(
+                    "unknown RecoveryItem variant {other:?} — weir-ctl is older \
+                     than the weir-wab it is reading; upgrade weir-ctl before \
+                     trusting this report"
+                ));
+            }
+        }
+    }
+    Ok(r)
+}
+
+/// The machine-readable form of `quarantine inspect`. Carries the same
+/// clean-end caveat as the human output (see `cmd_quarantine_inspect`) inline,
+/// so a machine consumer cannot read `desynced: false` as "nothing was lost"
+/// either — the field alone does not say that, and a consumer that only checks
+/// `desynced` would make exactly the operator mistake this brief warns about.
+fn quarantine_inspect_json(segment: &str, report: &QuarantineReport) -> serde_json::Value {
+    serde_json::json!({
+        "segment": segment,
+        "recovered": report.recovered,
+        "skipped": report.skipped,
+        "skipped_offsets": report.skipped_offsets,
+        "desynced": report.desynced,
+        "desync_reason": report.desync_reason,
+        "note": "desynced=false means every byte in the segment was accounted for; it does \
+                 NOT mean every record was recovered. A length corrupted to a plausible value \
+                 can swallow intact records inside its declared byte range without desyncing \
+                 — see skipped_offsets for what verification actually caught.",
+    })
+}
+
+fn cmd_quarantine_inspect(wab_dir: &Path, segment: &str, json: bool) -> Result<(), String> {
+    ensure_wab_dir(wab_dir)?;
+    let q_dir = quarantine_dir(wab_dir);
+    let path = q_dir.join(segment);
+    let report = quarantine_inspect_report(&path)?;
+
+    if json {
+        print_json(&quarantine_inspect_json(segment, &report));
+        return Ok(());
+    }
+
+    println!("{segment}");
+    println!(
+        "  recovered: {} record(s) verified — safe to re-deliver",
+        report.recovered
+    );
+    println!(
+        "  skipped:   {} record(s) failed verification",
+        report.skipped
+    );
+    for off in &report.skipped_offsets {
+        println!("    - offset {off}");
+    }
+    if let Some(reason) = &report.desync_reason {
+        println!("  desynced: {reason}");
+        println!(
+            "  the reader could not tell where the next record began past that point. Records \
+             after it are NOT recoverable by this tool — this forensic copy is the only place \
+             they could still exist, so do not discard it on the strength of this report alone."
+        );
+    } else {
+        println!(
+            "  clean end: every byte in this segment is accounted for. That is NOT the same as \
+             \"every record was recovered\" — a length corrupted to a plausible value can tile \
+             exactly to the end of the file and swallow intact records inside its declared byte \
+             range without ever desyncing. See the skipped offsets above for what verification \
+             actually caught; a clean end alone is not license to delete this segment."
+        );
     }
     Ok(())
 }
@@ -1990,5 +2281,137 @@ weir_sink_health{state=\"degraded\"} 0
             active_label(body, "weir_sink_health", "state").as_deref(),
             Some("healthy")
         );
+    }
+
+    // ── Quarantine ───────────────────────────────────────────────────────────
+
+    /// A fresh, empty temp directory unique to this test process + label. The
+    /// quarantine tests below need both a `wab_dir` and its `quarantine/`
+    /// subdirectory per test, so — unlike the older dl tests above, which
+    /// inline a single path each — this is worth factoring once.
+    fn tmp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "weir_ctl_quarantine_{label}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Writes a quarantine-style segment fixture at `q_dir/name`: header +
+    /// `[len][crc][payload]` per record + sentinel — the same shape Task 1's
+    /// `write_segment` test helper builds. No 32-byte footer is written; that is
+    /// deliberate, see the module doc on `RecoveryReader`'s footer-less
+    /// clean-end check (`recovery_reader.rs:171-172`).
+    ///
+    /// `corrupt_payload_at`, when `Some(i)`, flips a byte in record `i`'s
+    /// payload (leaving its declared length intact) so its CRC fails to verify
+    /// — a `Skipped`, not a `Desynced`.
+    fn write_q_segment_inner(
+        q_dir: &Path,
+        name: &str,
+        records: &[&[u8]],
+        corrupt_payload_at: Option<usize>,
+    ) {
+        use std::io::Write;
+        std::fs::create_dir_all(q_dir).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&weir_wab::format::build_segment_header(
+            0,
+            weir_wab::format::Compression::None,
+        ));
+        for (i, r) in records.iter().enumerate() {
+            let len = r.len() as u32;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
+            let mut payload = r.to_vec();
+            if corrupt_payload_at == Some(i) {
+                payload[0] ^= 0xff; // CRC now mismatches; length still correct
+            }
+            buf.extend_from_slice(&payload);
+        }
+        buf.extend_from_slice(&weir_wab::format::build_sentinel());
+        std::fs::File::create(q_dir.join(name))
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+    }
+
+    fn write_q_segment(q_dir: &Path, name: &str, records: &[&[u8]]) {
+        write_q_segment_inner(q_dir, name, records, None);
+    }
+
+    fn write_q_segment_with_corruption(
+        q_dir: &Path,
+        name: &str,
+        records: &[&[u8]],
+        corrupt_payload_at: usize,
+    ) {
+        write_q_segment_inner(q_dir, name, records, Some(corrupt_payload_at));
+    }
+
+    #[test]
+    fn quarantine_list_on_a_missing_dir_is_not_an_error() {
+        // No quarantine dir is the normal, healthy case.
+        let dir = tmp_dir("q_list_missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(cmd_quarantine_list(&dir, false).is_ok());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_reports_segments_and_bytes() {
+        let dir = tmp_dir("q_list");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a", b"b"]);
+        assert!(cmd_quarantine_list(&dir, false).is_ok());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_finds_both_extensions_and_collision_suffixes() {
+        // THE regression test for this command. Crash recovery quarantines
+        // ACTIVE segments, so its copies end `.wab` — and that is the mid-file
+        // corruption case, the one where acked records sit after the corruption.
+        // A `.wab.sealed`-only filter lists zero of them and reports success.
+        // The drain contributes `.wab.sealed`, and non_clobbering_dest appends
+        // `.N` to either on a name collision.
+        let dir = tmp_dir("q_list_exts");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a"]);
+        write_q_segment(&q, "shard_01__seg_00000002.wab.sealed", &[b"b"]);
+        write_q_segment(&q, "shard_00__seg_00000001.wab.1", &[b"c"]);
+        write_q_segment(&q, "shard_01__seg_00000002.wab.sealed.2", &[b"d"]);
+        std::fs::write(q.join("operator-notes.txt"), b"not a segment").unwrap();
+
+        let segs = quarantine_segments(&q).unwrap();
+        assert_eq!(
+            segs.len(),
+            4,
+            "both extensions and their collision suffixes must be listed, got {segs:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_inspect_reports_recovered_and_skipped_counts() {
+        // The diagnostic that does not exist today: which records are readable,
+        // which are not, and where.
+        let dir = tmp_dir("q_inspect");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab";
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+
+        let report = quarantine_inspect_report(&q.join(name)).unwrap();
+        assert_eq!(report.recovered, 2, "records either side of the corruption");
+        assert_eq!(report.skipped, 1);
+        assert!(
+            !report.desynced,
+            "a payload-only corruption must not desync"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
