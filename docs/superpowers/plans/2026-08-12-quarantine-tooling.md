@@ -824,9 +824,6 @@ enum QuarantineCommand {
         /// Path to the daemon's WAB directory.
         #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
-        /// Emit machine-readable JSON.
-        #[arg(long)]
-        json: bool,
     },
     /// Report what is readable in one quarantined segment: how many records
     /// verify, how many are corrupt and at what offsets, and whether the reader
@@ -837,22 +834,19 @@ enum QuarantineCommand {
         wab_dir: PathBuf,
         /// Segment file name, as printed by `quarantine list`.
         segment: String,
-        /// Emit machine-readable JSON.
-        #[arg(long)]
-        json: bool,
     },
 }
 ```
 
 Wire both into the dispatch `match` beside the `Dl` arm.
 
-**`--json` is not optional.** Every other read/inspect subcommand in weir-ctl
-carries it (`cmd_dl_list(wab_dir, json)`, `cmd_segments(wab_dir, json)`,
-`cmd_health(socket, json)`), and the test snippets above call
-`cmd_quarantine_list(&dir, false)` with that trailing argument. Keep the enum
-variants and the function signatures in agreement — the commonest way this task
-goes wrong is declaring the variant without `json` and then writing a two-arg
-call.
+**Do NOT add a `json` field to these variants.** `--json` is declared once as a
+**global** flag on `Cli` (`#[arg(long, global = true)]`, `main.rs:35`) and
+threaded in at dispatch — `DlCommand::List { wab_dir } => cmd_dl_list(&wab_dir,
+json)` (`main.rs:149`). Declaring it per-variant would collide with the global
+one. That is why the test snippets above call `cmd_quarantine_list(&dir, false)`
+with a trailing bool the enum does not mention: it comes from `cli.json`. Follow
+the same shape — `QuarantineCommand::List { wab_dir } => cmd_quarantine_list(&wab_dir, json)`.
 
 - [ ] **Step 4: Implement the helpers and commands**
 
@@ -1373,6 +1367,11 @@ here because each was wrong in a way that would have shipped silently:
   already right; only the reassuring clause was wrong, and it is the clause that
   would talk an operator out of the dry run.
 - **The Global Constraints gate omitted clippy and `cargo deny`.** Added.
+- **Not a defect, though it reads like one:** the Task 3/4 test snippets pass a
+  trailing `bool` that the subcommand variants never declare. That is correct —
+  `--json` is a global flag on `Cli` threaded in at dispatch, exactly as `dl`
+  does it. Do not "fix" it by adding a `json` field to the variants; that would
+  collide with the global.
 - **Task 1's body below is the pre-review version** and still contains the
   defects the review found (the unconditional zero-length sentinel, the zstd
   path feeding the consecutive-skip budget, no `#[non_exhaustive]`, no
