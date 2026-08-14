@@ -2504,18 +2504,22 @@ weir_sink_health{state=\"degraded\"} 0
         let mut out = Vec::new();
         quarantine_list_write(&dir, false, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
+        // N2: the total row also prints "48 B" (there is only one segment, so
+        // the total equals it), so `text.contains("48 B")` over the whole
+        // listing was satisfied even if the per-segment column were blanked.
+        // Require the segment's own row to carry both its name and its size.
+        let row = text
+            .lines()
+            .find(|l| l.contains("shard_00__seg_00000001.wab"))
+            .unwrap_or_else(|| panic!("the segment name must appear in the listing, got: {text}"));
         assert!(
-            text.contains("shard_00__seg_00000001.wab"),
-            "the segment name must appear in the listing, got: {text}"
-        );
-        assert!(
-            text.contains("shard_00"),
-            "the origin shard must be reported, got: {text}"
+            row.contains("shard_00"),
+            "the origin shard must be on the segment's own row, got: {row}"
         );
         // header(24) + 2 records of len 2 (4+4+2 each = 10*2 = 20) + sentinel(4).
         assert!(
-            text.contains("48 B"),
-            "the segment's on-disk size must be reported, got: {text}"
+            row.contains("48 B"),
+            "the segment's on-disk size must be on its OWN row, not just the total, got: {row}"
         );
         std::fs::remove_dir_all(dir).ok();
     }
@@ -2697,15 +2701,35 @@ weir_sink_health{state=\"degraded\"} 0
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Whether `word` appears in `text` as a whole word, not merely as a
+    /// substring of some other word ("not" inside "nothing", "note",
+    /// "cannot"). Case-sensitive; callers lowercase both sides first. Exists
+    /// because a plain `.contains("not")` is satisfied by vocabulary that has
+    /// nothing to do with negation (review finding N1).
+    fn contains_word(text: &str, word: &str) -> bool {
+        text.split(|c: char| !c.is_alphabetic()).any(|w| w == word)
+    }
+
     #[test]
     fn quarantine_inspect_lines_distinguish_accounted_for_from_recovered() {
-        // I3-b: pin the SEMANTIC property the brief's wording constraint
-        // requires, not the verbatim prose, so a future wording improvement
-        // does not fail this test for no reason (review finding I3, on the
-        // wording sub-part explicitly). The property that must survive: the
-        // clean-end message denies "every record was recovered", the desync
-        // message says records past that point are not recoverable by this
-        // tool, and the two outcomes never print the same verdict.
+        // I3-b + N1: the previous version asserted `contains("not") &&
+        // contains("recovered")` over the JOINED output. Neither conjunct
+        // pinned anything: "recovered" is satisfied by the unrelated
+        // `recovered: N record(s)` COUNTER line, present in every report
+        // regardless of outcome, and "not" is satisfied by any word merely
+        // containing those letters ("nothing", "note", "cannot"). So the
+        // precise misreading this whole feature exists to prevent —
+        // "clean end: nothing is missing from this segment. It is safe to
+        // delete." — passed this test unchanged.
+        //
+        // Fixed by pinning the verdict line STRUCTURALLY (it is always the
+        // last line `quarantine_inspect_lines` pushes, in both branches) and
+        // requiring "not" to appear as a whole WORD via `contains_word`, so
+        // the assertion can tell the claim from its negation rather than just
+        // detecting related vocabulary. This still does not pin verbatim
+        // prose — a full rewording that keeps the claim intact (e.g. "the
+        // reader accounted for every byte here. That does not imply every
+        // record was recovered.") stays green.
         let clean = QuarantineReport {
             recovered: 1,
             skipped: 0,
@@ -2713,12 +2737,16 @@ weir_sink_health{state=\"degraded\"} 0
             skipped_records: Vec::new(),
             desync_reason: None,
         };
-        let clean_text = quarantine_inspect_lines("seg.wab", &clean)
-            .join("\n")
-            .to_lowercase();
+        let mut clean_lines = quarantine_inspect_lines("seg.wab", &clean);
+        let clean_verdict = clean_lines.pop().unwrap().to_lowercase();
         assert!(
-            clean_text.contains("not") && clean_text.contains("recovered"),
-            "the clean-end wording must deny 'every record recovered', got: {clean_text}"
+            clean_verdict.contains("recover"),
+            "the clean-end verdict must speak about recovery, got: {clean_verdict}"
+        );
+        assert!(
+            contains_word(&clean_verdict, "not"),
+            "the clean-end verdict must NEGATE 'every record recovered' with the word \"not\", \
+             got: {clean_verdict}"
         );
 
         let desynced = QuarantineReport {
@@ -2728,15 +2756,15 @@ weir_sink_health{state=\"degraded\"} 0
             skipped_records: Vec::new(),
             desync_reason: Some("an implausible length".to_string()),
         };
-        let desync_text = quarantine_inspect_lines("seg.wab", &desynced)
-            .join("\n")
-            .to_lowercase();
+        let mut desync_lines = quarantine_inspect_lines("seg.wab", &desynced);
+        let desync_verdict = desync_lines.pop().unwrap().to_lowercase();
         assert!(
-            desync_text.contains("not recoverable"),
-            "the desync wording must say records past that point are unreachable, got: {desync_text}"
+            contains_word(&desync_verdict, "not") && desync_verdict.contains("recoverable"),
+            "the desync verdict must say records past that point are NOT recoverable, \
+             got: {desync_verdict}"
         );
         assert_ne!(
-            clean_text, desync_text,
+            clean_verdict, desync_verdict,
             "the two outcomes must not print the same verdict"
         );
     }
@@ -2770,10 +2798,19 @@ weir_sink_health{state=\"degraded\"} 0
             v["skipped_records"][0]["reason"],
             serde_json::json!("CRC mismatch")
         );
+        // N1: same fix as the human-wording test above — "not" must be a
+        // whole word (via `contains_word`), not a substring any related word
+        // would satisfy ("nothing", "note"). Split into two assertions so
+        // each conjunct is independently meaningful.
         let clean_note = v["note"].as_str().unwrap().to_lowercase();
         assert!(
-            clean_note.contains("not") && clean_note.contains("recovered"),
-            "the clean-end note must deny 'every record recovered', got: {clean_note}"
+            clean_note.contains("recover"),
+            "the clean-end note must speak about recovery, got: {clean_note}"
+        );
+        assert!(
+            contains_word(&clean_note, "not"),
+            "the clean-end note must NEGATE 'every record recovered' with the word \"not\", \
+             got: {clean_note}"
         );
 
         let desynced = QuarantineReport {
@@ -2787,8 +2824,9 @@ weir_sink_health{state=\"degraded\"} 0
         assert_eq!(v2["desynced"], serde_json::json!(true));
         let desync_note = v2["note"].as_str().unwrap().to_lowercase();
         assert!(
-            desync_note.contains("not recoverable"),
-            "the desync note must say records past that point are unreachable, got: {desync_note}"
+            contains_word(&desync_note, "not") && desync_note.contains("recoverable"),
+            "the desync note must say records past that point are NOT recoverable, \
+             got: {desync_note}"
         );
         assert_ne!(
             clean_note, desync_note,
