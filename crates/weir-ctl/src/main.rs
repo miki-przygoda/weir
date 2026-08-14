@@ -30,9 +30,10 @@ const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9185";
 )]
 struct Cli {
     /// Emit machine-readable JSON instead of the human table, for the
-    /// read/inspect subcommands (health, metrics, segments, dl list). The human
-    /// output stays the default. Mutating commands (push, dl drop/requeue) emit
-    /// a small JSON result object under --json.
+    /// read/inspect subcommands (health, metrics, segments, dl list,
+    /// quarantine list, quarantine inspect). The human output stays the
+    /// default. Mutating commands (push, dl drop/requeue) emit a small JSON
+    /// result object under --json.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -1106,12 +1107,13 @@ fn quarantine_segments(q_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
 /// requeue.
 fn is_quarantined_segment_name(name: &str) -> bool {
     // Strip a trailing `.<digits>` collision suffix, if any, then require one of
-    // the two segment extensions.
+    // the two segment extensions. Named constants, not string literals, so a
+    // future extension change shows up here without a grep (M2).
     let stem = match name.rsplit_once('.') {
         Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
         _ => name,
     };
-    stem.ends_with(".wab") || stem.ends_with(".wab.sealed")
+    stem.ends_with(weir_wab::format::EXT_ACTIVE) || stem.ends_with(weir_wab::format::EXT_SEALED)
 }
 
 /// The `{shard_name}` prefix of a quarantine entry name
@@ -1145,50 +1147,93 @@ fn quarantine_list_json(q_dir: &Path, segs: &[(PathBuf, u64)]) -> serde_json::Va
     })
 }
 
-fn cmd_quarantine_list(wab_dir: &Path, json: bool) -> Result<(), String> {
+/// The human-readable `quarantine list` table, as printable lines. Pure — no
+/// I/O — mirrors how `summary_warnings` / `print_summary` are split, so the
+/// rendering logic is unit-testable without capturing stdout.
+fn quarantine_list_lines(q_dir: &Path, segs: &[(PathBuf, u64)]) -> Vec<String> {
+    if segs.is_empty() {
+        return vec![format!("quarantine is empty ({})", q_dir.display())];
+    }
+    let mut lines = vec![format!("{:<44} {:>12}  origin shard", "segment", "bytes")];
+    let mut total = 0u64;
+    for (p, sz) in segs {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        lines.push(format!(
+            "{name:<44} {:>12}  {}",
+            fmt_bytes(*sz),
+            origin_shard(name).unwrap_or("?")
+        ));
+        total += sz;
+    }
+    lines.push(format!(
+        "{:<44} {:>12}",
+        format!("total ({})", segs.len()),
+        fmt_bytes(total)
+    ));
+    lines.push(
+        "run `weir-ctl quarantine inspect --wab-dir <dir> <segment>` on each before deciding \
+         whether to requeue or discard — a segment's presence here does not say how much of it \
+         is recoverable."
+            .to_string(),
+    );
+    lines
+}
+
+/// Writes `value` as pretty JSON to `out`, with the same "fall back to the
+/// compact form on an impossible serialize failure" behavior as the shared
+/// `print_json` — which is hardcoded to real stdout and so isn't usable here,
+/// since quarantine's writer-injected commands (below) need every branch to go
+/// through `out` so a test can capture exactly what an operator would see.
+fn write_json_to(out: &mut impl Write, value: &serde_json::Value) {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    let _ = writeln!(out, "{text}");
+}
+
+/// `cmd_quarantine_list`'s actual logic, writing through `out` instead of
+/// directly to stdout. Split out (I3) so a test can capture exactly what an
+/// operator would see — including whether anything is printed at all — rather
+/// than only checking `.is_ok()`, which stays green even if this function is
+/// gutted to do nothing.
+fn quarantine_list_write(wab_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), String> {
     ensure_wab_dir(wab_dir)?;
     let q_dir = quarantine_dir(wab_dir);
     let segs = quarantine_segments(&q_dir)?;
 
     if json {
-        print_json(&quarantine_list_json(&q_dir, &segs));
+        write_json_to(out, &quarantine_list_json(&q_dir, &segs));
         return Ok(());
     }
-
-    if segs.is_empty() {
-        println!("quarantine is empty ({})", q_dir.display());
-        return Ok(());
+    for line in quarantine_list_lines(&q_dir, &segs) {
+        let _ = writeln!(out, "{line}");
     }
-    println!("{:<44} {:>12}  origin shard", "segment", "bytes");
-    let mut total = 0u64;
-    for (p, sz) in &segs {
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        println!(
-            "{name:<44} {:>12}  {}",
-            fmt_bytes(*sz),
-            origin_shard(name).unwrap_or("?")
-        );
-        total += sz;
-    }
-    println!(
-        "{:<44} {:>12}",
-        format!("total ({})", segs.len()),
-        fmt_bytes(total)
-    );
-    println!(
-        "run `weir-ctl quarantine inspect --wab-dir <dir> <segment>` on each before deciding \
-         whether to requeue or discard — a segment's presence here does not say how much of it \
-         is recoverable."
-    );
     Ok(())
 }
 
+fn cmd_quarantine_list(wab_dir: &Path, json: bool) -> Result<(), String> {
+    quarantine_list_write(wab_dir, json, &mut std::io::stdout())
+}
+
+/// One record `RecoveryReader` stepped over. Carries `declared_len` and
+/// `reason` alongside `offset` (I2): offsets alone cannot distinguish a
+/// 1-record loss from a corrupted length that tiled to a clean end and
+/// swallowed several intact records along the way — Task 1's As-built section
+/// is explicit that "the `Skipped` names the exact byte range", and this is the
+/// consumer that must actually surface it, not just the offset that range
+/// starts at.
+#[derive(Debug)]
+struct SkippedRecord {
+    offset: u64,
+    declared_len: u32,
+    reason: String,
+}
+
 /// What a forensic read of one quarantined segment found.
+#[derive(Debug)]
 struct QuarantineReport {
     recovered: usize,
     skipped: usize,
     desynced: bool,
-    skipped_offsets: Vec<u64>,
+    skipped_records: Vec<SkippedRecord>,
     desync_reason: Option<String>,
 }
 
@@ -1205,15 +1250,23 @@ fn quarantine_inspect_report(path: &Path) -> Result<QuarantineReport, String> {
         recovered: 0,
         skipped: 0,
         desynced: false,
-        skipped_offsets: Vec::new(),
+        skipped_records: Vec::new(),
         desync_reason: None,
     };
     for item in reader {
         match item {
             weir_wab::RecoveryItem::Record(_) => r.recovered += 1,
-            weir_wab::RecoveryItem::Skipped { offset, .. } => {
+            weir_wab::RecoveryItem::Skipped {
+                offset,
+                declared_len,
+                reason,
+            } => {
                 r.skipped += 1;
-                r.skipped_offsets.push(offset);
+                r.skipped_records.push(SkippedRecord {
+                    offset,
+                    declared_len,
+                    reason,
+                });
             }
             weir_wab::RecoveryItem::Desynced { reason, .. } => {
                 r.desynced = true;
@@ -1235,66 +1288,121 @@ fn quarantine_inspect_report(path: &Path) -> Result<QuarantineReport, String> {
     Ok(r)
 }
 
-/// The machine-readable form of `quarantine inspect`. Carries the same
-/// clean-end caveat as the human output (see `cmd_quarantine_inspect`) inline,
-/// so a machine consumer cannot read `desynced: false` as "nothing was lost"
-/// either — the field alone does not say that, and a consumer that only checks
-/// `desynced` would make exactly the operator mistake this brief warns about.
+/// The machine-readable form of `quarantine inspect`. The `note` differs by
+/// outcome (M3) — a `desynced: true` report and a `desynced: false` report do
+/// not carry the same warning, so a script reading only `desynced` is never
+/// handed a `note` that contradicts the data beside it.
 fn quarantine_inspect_json(segment: &str, report: &QuarantineReport) -> serde_json::Value {
+    let skipped_records: Vec<serde_json::Value> = report
+        .skipped_records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "offset": r.offset,
+                "declared_len": r.declared_len,
+                "reason": r.reason,
+            })
+        })
+        .collect();
+    let note = if report.desynced {
+        "desynced=true means the reader could not establish where the next record began past \
+         this point. Records after it are NOT recoverable by this tool — this forensic copy is \
+         the only place they could still exist."
+    } else {
+        "desynced=false means every byte in the segment was accounted for; it does NOT mean \
+         every record was recovered. A length corrupted to a plausible value can swallow intact \
+         records inside its declared byte range without desyncing — see skipped_records for what \
+         verification actually caught."
+    };
     serde_json::json!({
         "segment": segment,
         "recovered": report.recovered,
         "skipped": report.skipped,
-        "skipped_offsets": report.skipped_offsets,
+        "skipped_records": skipped_records,
         "desynced": report.desynced,
         "desync_reason": report.desync_reason,
-        "note": "desynced=false means every byte in the segment was accounted for; it does \
-                 NOT mean every record was recovered. A length corrupted to a plausible value \
-                 can swallow intact records inside its declared byte range without desyncing \
-                 — see skipped_offsets for what verification actually caught.",
+        "note": note,
     })
 }
 
-fn cmd_quarantine_inspect(wab_dir: &Path, segment: &str, json: bool) -> Result<(), String> {
+/// The human-readable `quarantine inspect` report, as printable lines. Pure —
+/// mirrors `quarantine_list_lines`. Each skipped record prints its byte range
+/// (I2) — `offset..offset+8+declared_len`, the 8 being the length+CRC fields —
+/// and its `reason`, so "see the skipped records above" (below) is an
+/// operator-actionable pointer instead of a bare offset that can't distinguish
+/// a 1-record loss from a range that swallowed several.
+fn quarantine_inspect_lines(segment: &str, report: &QuarantineReport) -> Vec<String> {
+    let mut lines = vec![segment.to_string()];
+    lines.push(format!(
+        "  recovered: {} record(s) verified — safe to re-deliver",
+        report.recovered
+    ));
+    lines.push(format!(
+        "  skipped:   {} record(s) failed verification",
+        report.skipped
+    ));
+    for r in &report.skipped_records {
+        let end = r.offset + 8 + r.declared_len as u64;
+        lines.push(format!(
+            "    - offset {}, declared_len {} bytes (range {}..{end}) — {}",
+            r.offset, r.declared_len, r.offset, r.reason
+        ));
+    }
+    if let Some(reason) = &report.desync_reason {
+        // I1/I3-b: this is the state an operator most needs the truth in, and
+        // the property that must survive any future rewording is this
+        // sentence's claim — "not recoverable by this tool" — not its exact
+        // phrasing. `quarantine_inspect_reports_a_desync` pins the claim, not
+        // the prose.
+        lines.push(format!("  desynced: {reason}"));
+        lines.push(
+            "  the reader could not tell where the next record began past that point. Records \
+             after it are NOT recoverable by this tool — this forensic copy is the only place \
+             they could still exist, so do not discard it on the strength of this report alone."
+                .to_string(),
+        );
+    } else {
+        // I3-b: the property that must survive rewording is that this denies
+        // "every record was recovered" — not this exact paragraph.
+        lines.push(
+            "  clean end: every byte in this segment is accounted for. That is NOT the same as \
+             \"every record was recovered\" — a length corrupted to a plausible value can tile \
+             exactly to the end of the file and swallow intact records inside its declared byte \
+             range without ever desyncing. See the skipped records above for what verification \
+             actually caught; a clean end alone is not license to delete this segment."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// `cmd_quarantine_inspect`'s actual logic, writing through `out` instead of
+/// directly to stdout — same rationale as `quarantine_list_write` (I3, I1):
+/// this is the function a test drives to observe the printed desync/clean-end
+/// verdict, rather than only the `QuarantineReport`'s fields.
+fn quarantine_inspect_write(
+    wab_dir: &Path,
+    segment: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), String> {
     ensure_wab_dir(wab_dir)?;
     let q_dir = quarantine_dir(wab_dir);
     let path = q_dir.join(segment);
     let report = quarantine_inspect_report(&path)?;
 
     if json {
-        print_json(&quarantine_inspect_json(segment, &report));
+        write_json_to(out, &quarantine_inspect_json(segment, &report));
         return Ok(());
     }
-
-    println!("{segment}");
-    println!(
-        "  recovered: {} record(s) verified — safe to re-deliver",
-        report.recovered
-    );
-    println!(
-        "  skipped:   {} record(s) failed verification",
-        report.skipped
-    );
-    for off in &report.skipped_offsets {
-        println!("    - offset {off}");
-    }
-    if let Some(reason) = &report.desync_reason {
-        println!("  desynced: {reason}");
-        println!(
-            "  the reader could not tell where the next record began past that point. Records \
-             after it are NOT recoverable by this tool — this forensic copy is the only place \
-             they could still exist, so do not discard it on the strength of this report alone."
-        );
-    } else {
-        println!(
-            "  clean end: every byte in this segment is accounted for. That is NOT the same as \
-             \"every record was recovered\" — a length corrupted to a plausible value can tile \
-             exactly to the end of the file and swallow intact records inside its declared byte \
-             range without ever desyncing. See the skipped offsets above for what verification \
-             actually caught; a clean end alone is not license to delete this segment."
-        );
+    for line in quarantine_inspect_lines(segment, &report) {
+        let _ = writeln!(out, "{line}");
     }
     Ok(())
+}
+
+fn cmd_quarantine_inspect(wab_dir: &Path, segment: &str, json: bool) -> Result<(), String> {
+    quarantine_inspect_write(wab_dir, segment, json, &mut std::io::stdout())
 }
 
 /// Minimal HTTP/1.0 GET of `/metrics` — keeps weir-ctl free of an HTTP client
@@ -2306,12 +2414,15 @@ weir_sink_health{state=\"degraded\"} 0
     ///
     /// `corrupt_payload_at`, when `Some(i)`, flips a byte in record `i`'s
     /// payload (leaving its declared length intact) so its CRC fails to verify
-    /// — a `Skipped`, not a `Desynced`.
+    /// — a `Skipped`, not a `Desynced`. `corrupt_len_at`, when `Some(i)`, wrecks
+    /// record `i`'s LENGTH field instead — unrecoverable by design, since the
+    /// reader can no longer know where the next record begins, so it desyncs.
     fn write_q_segment_inner(
         q_dir: &Path,
         name: &str,
         records: &[&[u8]],
         corrupt_payload_at: Option<usize>,
+        corrupt_len_at: Option<usize>,
     ) {
         use std::io::Write;
         std::fs::create_dir_all(q_dir).unwrap();
@@ -2321,7 +2432,12 @@ weir_sink_health{state=\"degraded\"} 0
             weir_wab::format::Compression::None,
         ));
         for (i, r) in records.iter().enumerate() {
-            let len = r.len() as u32;
+            let mut len = r.len() as u32;
+            if corrupt_len_at == Some(i) {
+                // A wildly implausible length: the reader cannot locate the
+                // next record, so it must give up rather than guess.
+                len = u32::MAX - 1;
+            }
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
             let mut payload = r.to_vec();
@@ -2338,7 +2454,7 @@ weir_sink_health{state=\"degraded\"} 0
     }
 
     fn write_q_segment(q_dir: &Path, name: &str, records: &[&[u8]]) {
-        write_q_segment_inner(q_dir, name, records, None);
+        write_q_segment_inner(q_dir, name, records, None, None);
     }
 
     fn write_q_segment_with_corruption(
@@ -2347,7 +2463,21 @@ weir_sink_health{state=\"degraded\"} 0
         records: &[&[u8]],
         corrupt_payload_at: usize,
     ) {
-        write_q_segment_inner(q_dir, name, records, Some(corrupt_payload_at));
+        write_q_segment_inner(q_dir, name, records, Some(corrupt_payload_at), None);
+    }
+
+    /// Review finding I1's fixture: a record whose LENGTH is corrupted to an
+    /// implausible value, so `RecoveryReader` desyncs rather than guessing.
+    /// The plan's Task 4 sketch names a 3-arg `write_q_segment_bad_length(&q,
+    /// name, 0)` that builds its own fixed record set; this one takes the
+    /// records explicitly instead, so Task 4 can reuse or thinly wrap it.
+    fn write_q_segment_bad_length(
+        q_dir: &Path,
+        name: &str,
+        records: &[&[u8]],
+        corrupt_len_at: usize,
+    ) {
+        write_q_segment_inner(q_dir, name, records, None, Some(corrupt_len_at));
     }
 
     #[test]
@@ -2361,12 +2491,71 @@ weir_sink_health{state=\"degraded\"} 0
 
     #[test]
     fn quarantine_list_reports_segments_and_bytes() {
+        // I3-a: previously asserted only `.is_ok()` on `cmd_quarantine_list`,
+        // so gutting it to print nothing left this test green (review finding
+        // I3, mutation M4). Drives `quarantine_list_write` directly — the
+        // function `cmd_quarantine_list` is now a one-line wrapper over — and
+        // asserts on the bytes it actually wrote.
         let dir = tmp_dir("q_list");
         let q = dir.join("quarantine");
         std::fs::create_dir_all(&q).unwrap();
-        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a", b"b"]);
-        assert!(cmd_quarantine_list(&dir, false).is_ok());
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"ab", b"cd"]);
+
+        let mut out = Vec::new();
+        quarantine_list_write(&dir, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("shard_00__seg_00000001.wab"),
+            "the segment name must appear in the listing, got: {text}"
+        );
+        assert!(
+            text.contains("shard_00"),
+            "the origin shard must be reported, got: {text}"
+        );
+        // header(24) + 2 records of len 2 (4+4+2 each = 10*2 = 20) + sentinel(4).
+        assert!(
+            text.contains("48 B"),
+            "the segment's on-disk size must be reported, got: {text}"
+        );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_json_has_expected_keys_from_tmp_wab() {
+        // I3-b: until now the quarantine JSON had no shape test at all —
+        // mirrors `dl_list_json_has_expected_keys_from_tmp_wab`. Deleting
+        // `note` / `origin_shard` / `skipped_records` (review's M8) left the
+        // suite green before this existed.
+        let dir = tmp_dir("q_list_json");
+        let q = dir.join("quarantine");
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"x"]);
+        let segs = quarantine_segments(&q).unwrap();
+
+        let v = round_trip(&quarantine_list_json(&q, &segs));
+        assert_eq!(v["count"], serde_json::json!(1));
+        assert!(v["total_bytes"].is_u64());
+        assert!(v["segments"].is_array());
+        assert_eq!(
+            v["segments"][0]["segment"],
+            serde_json::json!("shard_00__seg_00000001.wab")
+        );
+        assert_eq!(
+            v["segments"][0]["origin_shard"],
+            serde_json::json!("shard_00")
+        );
+        assert!(v["quarantine_dir"].is_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_json_empty_store_is_stable_shape() {
+        // Mirrors `dl_list_json_empty_store_is_stable_shape`: an empty store is
+        // the same shape as a populated one, not a special case.
+        let dir = tmp_dir("q_list_json_empty");
+        let v = round_trip(&quarantine_list_json(&dir, &[]));
+        assert_eq!(v["count"], serde_json::json!(0));
+        assert_eq!(v["total_bytes"], serde_json::json!(0));
+        assert_eq!(v["segments"], serde_json::json!([]));
     }
 
     #[test]
@@ -2396,6 +2585,39 @@ weir_sink_health{state=\"degraded\"} 0
     }
 
     #[test]
+    fn quarantine_segments_ignores_a_directory_with_a_segment_like_name() {
+        // I3-c: defends the `is_file()` guard added beyond the plan's snippet.
+        // quarantine/ is only ever populated with FILES by
+        // quarantine()/copy_to_quarantine(), but a same-named directory
+        // (however unlikely) must never be offered up as a segment.
+        let dir = tmp_dir("q_list_dir_decoy");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a"]);
+        std::fs::create_dir_all(q.join("shard_01__seg_00000002.wab")).unwrap();
+
+        let segs = quarantine_segments(&q).unwrap();
+        let names: Vec<String> = segs
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["shard_00__seg_00000001.wab"],
+            "a directory must never be listed as a segment, got {names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn origin_shard_parses_the_shard_prefix() {
+        // I3-c: `origin_shard` had no direct test; mutating it to always
+        // return `None` left the suite green.
+        assert_eq!(origin_shard("shard_00__seg_00000001.wab"), Some("shard_00"));
+        assert_eq!(origin_shard("no_separator.wab"), None);
+    }
+
+    #[test]
     fn quarantine_inspect_reports_recovered_and_skipped_counts() {
         // The diagnostic that does not exist today: which records are readable,
         // which are not, and where.
@@ -2412,6 +2634,165 @@ weir_sink_health{state=\"degraded\"} 0
             !report.desynced,
             "a payload-only corruption must not desync"
         );
+
+        // I2: `declared_len` and `reason` must survive, not just the offset —
+        // they are what lets an operator tell a 1-record loss from a range
+        // that swallowed several intact records.
+        assert_eq!(report.skipped_records.len(), 1);
+        let skipped = &report.skipped_records[0];
+        assert_eq!(skipped.declared_len, 6, "\"BADREC\" is 6 bytes");
+        assert_eq!(skipped.reason, "CRC mismatch");
+
+        // And it must actually reach the printed output, not stop at the struct.
+        let lines = quarantine_inspect_lines(name, &report).join("\n");
+        assert!(
+            lines.contains("declared_len 6"),
+            "the printed report must surface declared_len, got: {lines}"
+        );
+        assert!(
+            lines.contains("CRC mismatch"),
+            "the printed report must surface the reason, got: {lines}"
+        );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_inspect_reports_a_desync() {
+        // I1: nothing anywhere exercised `desynced == true` before this test.
+        // Inverting the `Desynced` arm (r.desynced = false; r.desync_reason =
+        // None;) left the suite green and made the binary print the CLEAN END
+        // paragraph, exit 0, for a segment whose framing was genuinely lost —
+        // the one output state an operator most needs the truth in.
+        let dir = tmp_dir("q_inspect_desync");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab";
+        write_q_segment_bad_length(&q, name, &[b"good1", b"BADLEN", b"unreachable"], 1);
+
+        let report = quarantine_inspect_report(&q.join(name)).unwrap();
+        assert!(
+            report.desynced,
+            "an implausible length must desync, got {report:?}"
+        );
+        assert!(
+            report.desync_reason.is_some(),
+            "the reason must be populated so the operator can act on it"
+        );
+        assert_eq!(
+            report.recovered, 1,
+            "only the record before the bad length is recovered"
+        );
+
+        let mut out = Vec::new();
+        quarantine_inspect_write(&dir, name, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap().to_lowercase();
+        assert!(
+            text.contains("not recoverable by this tool"),
+            "the printed report must say the tail past the desync is unreachable, got: {text}"
+        );
+        assert!(
+            !text.contains("clean end"),
+            "a desynced segment must NOT print the clean-end paragraph, got: {text}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_inspect_lines_distinguish_accounted_for_from_recovered() {
+        // I3-b: pin the SEMANTIC property the brief's wording constraint
+        // requires, not the verbatim prose, so a future wording improvement
+        // does not fail this test for no reason (review finding I3, on the
+        // wording sub-part explicitly). The property that must survive: the
+        // clean-end message denies "every record was recovered", the desync
+        // message says records past that point are not recoverable by this
+        // tool, and the two outcomes never print the same verdict.
+        let clean = QuarantineReport {
+            recovered: 1,
+            skipped: 0,
+            desynced: false,
+            skipped_records: Vec::new(),
+            desync_reason: None,
+        };
+        let clean_text = quarantine_inspect_lines("seg.wab", &clean)
+            .join("\n")
+            .to_lowercase();
+        assert!(
+            clean_text.contains("not") && clean_text.contains("recovered"),
+            "the clean-end wording must deny 'every record recovered', got: {clean_text}"
+        );
+
+        let desynced = QuarantineReport {
+            recovered: 1,
+            skipped: 0,
+            desynced: true,
+            skipped_records: Vec::new(),
+            desync_reason: Some("an implausible length".to_string()),
+        };
+        let desync_text = quarantine_inspect_lines("seg.wab", &desynced)
+            .join("\n")
+            .to_lowercase();
+        assert!(
+            desync_text.contains("not recoverable"),
+            "the desync wording must say records past that point are unreachable, got: {desync_text}"
+        );
+        assert_ne!(
+            clean_text, desync_text,
+            "the two outcomes must not print the same verdict"
+        );
+    }
+
+    #[test]
+    fn quarantine_inspect_json_note_differs_by_outcome() {
+        // I3-b (JSON shape) + M3: the `note` must not be the same text
+        // regardless of outcome — a script reading `desynced: true` must not
+        // be handed the clean-end reassurance beside it.
+        let clean = QuarantineReport {
+            recovered: 2,
+            skipped: 1,
+            desynced: false,
+            skipped_records: vec![SkippedRecord {
+                offset: 37,
+                declared_len: 6,
+                reason: "CRC mismatch".to_string(),
+            }],
+            desync_reason: None,
+        };
+        let v = round_trip(&quarantine_inspect_json("seg.wab", &clean));
+        assert_eq!(v["recovered"], serde_json::json!(2));
+        assert_eq!(v["skipped"], serde_json::json!(1));
+        assert_eq!(v["desynced"], serde_json::json!(false));
+        assert_eq!(v["skipped_records"][0]["offset"], serde_json::json!(37));
+        assert_eq!(
+            v["skipped_records"][0]["declared_len"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            v["skipped_records"][0]["reason"],
+            serde_json::json!("CRC mismatch")
+        );
+        let clean_note = v["note"].as_str().unwrap().to_lowercase();
+        assert!(
+            clean_note.contains("not") && clean_note.contains("recovered"),
+            "the clean-end note must deny 'every record recovered', got: {clean_note}"
+        );
+
+        let desynced = QuarantineReport {
+            recovered: 1,
+            skipped: 0,
+            desynced: true,
+            skipped_records: Vec::new(),
+            desync_reason: Some("record declares an implausible length".to_string()),
+        };
+        let v2 = round_trip(&quarantine_inspect_json("seg2.wab", &desynced));
+        assert_eq!(v2["desynced"], serde_json::json!(true));
+        let desync_note = v2["note"].as_str().unwrap().to_lowercase();
+        assert!(
+            desync_note.contains("not recoverable"),
+            "the desync note must say records past that point are unreachable, got: {desync_note}"
+        );
+        assert_ne!(
+            clean_note, desync_note,
+            "the two outcomes must not share a note"
+        );
     }
 }
