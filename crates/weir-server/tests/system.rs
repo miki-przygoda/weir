@@ -2274,6 +2274,287 @@ fn recovery_replays_records_after_crash() {
     );
 }
 
+// ── Quarantine requeue (end-to-end) ─────────────────────────────────────────
+
+/// Locates the `weir-ctl` binary, (re)building it via `cargo build` so it is
+/// never stale.
+///
+/// `weir-ctl` is a separate crate from `weir-server`, so
+/// `CARGO_BIN_EXE_weir-server` — which Cargo sets only for the CURRENT
+/// package's own `[[bin]]` targets — cannot name it directly (this is why
+/// `weir-testkit`'s harness takes that env var as an explicit parameter rather
+/// than reading it itself: it lives in a third crate and has no access to
+/// either). Binary artifact dependencies (`artifact = "bin"` in
+/// `[dev-dependencies]`) would let Cargo wire this up declaratively, but they
+/// require `-Z bindeps`, confirmed still nightly-only against this
+/// workspace's toolchain (`cargo check` on a scratch manifest using it fails
+/// with "`artifact = …` requires `-Z bindeps`") — not an option for the
+/// stable gate this gate runs under.
+///
+/// Both binaries land in the SAME workspace `target/<profile>/` directory
+/// regardless of which package built them, so the sibling path is derived
+/// from `CARGO_BIN_EXE_weir-server` and rebuilt (a fast no-op via cargo's own
+/// staleness check when nothing changed) every time this is called — this
+/// test does not silently depend on the documented gate's ordering (`cargo
+/// test -p weir-ctl` before `cargo test -p weir-server`, which produces the
+/// binary as a side effect) for a lone invocation of this test to pass.
+fn weir_ctl_binary() -> PathBuf {
+    let candidate = Path::new(env!("CARGO_BIN_EXE_weir-server")).with_file_name("weir-ctl");
+    // Always invoke `cargo build`, not just when `candidate` is missing: cargo
+    // itself is the one that knows whether it's stale (a `weir-ctl` binary can
+    // already sit at this path from an EARLIER build of an older commit — the
+    // gate's own `cargo test -p weir-ctl` step, run first, would leave exactly
+    // that behind), and `cargo build` is a fast no-op recompile when nothing
+    // changed. An existence-only check here would happily hand back a stale
+    // binary that predates whatever quarantine subcommand this test needs.
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "weir-ctl", "--bin", "weir-ctl"])
+        .status()
+        .expect("failed to invoke `cargo build -p weir-ctl`");
+    assert!(status.success(), "cargo build -p weir-ctl failed");
+    assert!(
+        candidate.exists(),
+        "weir-ctl binary still missing at {} after building it",
+        candidate.display()
+    );
+    candidate
+}
+
+/// The single active (unsealed) `.wab` file under `wab_dir` — i.e. NOT
+/// `.wab.sealed`, and not anything under `quarantine/` (which does not exist
+/// yet at the point this is called). Panics unless there is exactly one,
+/// which is the shape a fresh single-shard daemon that has not yet sealed
+/// anything is expected to have.
+fn find_active_wab_file(wab_dir: &Path) -> PathBuf {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".wab")
+                && !name.ends_with(".sealed")
+            {
+                out.push(p);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(wab_dir, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one active .wab file, found {found:?}"
+    );
+    found.into_iter().next().unwrap()
+}
+
+/// Flips one byte inside record `n`'s (0-indexed) stored payload, leaving its
+/// length and CRC fields intact. This is the mid-file-corruption shape crash
+/// recovery treats specially — mirrors
+/// `mid_file_corruption_in_a_compressed_segment_quarantines` in
+/// `crates/weir-server/src/wab/recovery.rs`: record `n`'s own CRC now fails,
+/// but every record after it is untouched and individually valid, so recovery
+/// quarantines the WHOLE original file (preserving records after the
+/// corruption) instead of truncating at it — the exact scenario `weir-ctl
+/// quarantine requeue` exists to recover from.
+fn corrupt_nth_record_payload(path: &Path, n: usize) {
+    let mut bytes = fs::read(path).unwrap();
+    let mut pos = weir_wab::format::SEGMENT_HEADER_LEN;
+    for i in 0.. {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let payload_start = pos + 8; // 4-byte length + 4-byte CRC
+        if i == n {
+            bytes[payload_start] ^= 0xff;
+            break;
+        }
+        pos = payload_start + len;
+    }
+    fs::write(path, &bytes).unwrap();
+}
+
+fn quarantine_dir_has_a_segment(wab_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(wab_dir.join("quarantine")) else {
+        return false;
+    };
+    entries.flatten().any(|e| e.path().is_file())
+}
+
+/// The round trip the whole quarantine-tooling plan exists for. `SegmentReader`
+/// (and therefore normal crash recovery) cannot reach records sitting AFTER a
+/// mid-file corruption; `RecoveryReader` can, and `weir-ctl quarantine requeue`
+/// is what actually gets them back through the daemon and into the sink. This
+/// asserts that end to end, through the REAL `weir-ctl` binary talking to a
+/// REAL running daemon — not the unit-level `cmd_quarantine_requeue` tests in
+/// `weir-ctl`, which use a hand-rolled fake daemon and never touch crash
+/// recovery at all.
+///
+/// 1. Push records, crash the daemon, corrupt one record's payload mid-file in
+///    the still-active (unsealed) segment.
+/// 2. Restart: crash recovery seals + delivers the valid PREFIX normally, and
+///    quarantines the whole original (mid-file corruption, not a torn tail).
+/// 3. `weir-ctl quarantine requeue --yes` against the running daemon.
+/// 4. Assert the sink received MORE than just the duplicate prefix — i.e.
+///    records that sat AFTER the corruption, which normal recovery could
+///    never reach, were actually delivered and confirmed. Counting is used
+///    (via `weir_sink_commit_records_total`) rather than payload inspection —
+///    this workspace has no in-process "recording" sink to capture bodies
+///    (checked: no `TcpListener`-based request-capturing test sink exists
+///    anywhere in this repo; the sink integration tests that DO inspect
+///    content — mysql/postgres/clickhouse — query a real external database,
+///    which is `#[ignore]`d and unavailable in this gate). The counts here
+///    are exact and structurally tied to the fixture (`BEFORE` records
+///    before the corruption, `AFTER` after it), not a loose ">= 1" check, so
+///    this is real, not vacuous — see the Task 4 report for the full
+///    argument.
+#[test]
+fn quarantined_records_after_a_corruption_can_be_recovered() {
+    const BEFORE: usize = 3; // recovered normally by crash recovery's sealed prefix
+    const AFTER: usize = 4; // reachable ONLY via RecoveryReader / this tool
+
+    // `wab_segment_max_age_secs = 1` is load-bearing, not decoration (same
+    // reason as `wab_cap_nack_is_recoverable_for_a_real_client`): idle-seal is
+    // OFF by default, and the handful of tiny records this test pushes — both
+    // the initial burst AND the ones `quarantine requeue` pushes back later —
+    // are nowhere near `wab_segment_max_bytes`. Without idle-seal, the active
+    // segment those pushes land in never seals, so the drain never sees it and
+    // `weir_sink_commit_records_total` never moves, no matter how long we poll.
+    let mut srv = weir_server!("quarantine_requeue_e2e")
+        .shard_count(1)
+        .extra_config("wab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    for i in 0..(BEFORE + 1 + AFTER) {
+        client
+            .push(format!("qr-{i:03}").as_bytes(), Durability::Sync)
+            .unwrap();
+    }
+    drop(client);
+    thread::sleep(Duration::from_millis(150));
+
+    srv.kill_ungracefully();
+
+    let active = find_active_wab_file(&srv.wab_dir);
+    corrupt_nth_record_payload(&active, BEFORE);
+
+    srv.restart_in_place();
+
+    // Crash recovery runs synchronously during startup — `wab::spawn`'s
+    // "Phase 1 (calling thread): crash recovery", BEFORE the socket is bound
+    // — so by the time `restart_in_place` returns (it waits for the socket to
+    // accept connections), the quarantine copy already exists on disk.
+    assert!(
+        quarantine_dir_has_a_segment(&srv.wab_dir),
+        "expected the mid-file-corrupt segment to be quarantined on restart"
+    );
+
+    // Give the drain a moment: delivery of the replayed valid prefix is async.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut committed_before_requeue;
+    loop {
+        committed_before_requeue = parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        );
+        if committed_before_requeue >= BEFORE as u64 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the valid prefix (records before the corruption) must be delivered by normal \
+             crash recovery alone; only got {committed_before_requeue}/{BEFORE}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        committed_before_requeue < (BEFORE + 1 + AFTER) as u64,
+        "records AFTER the corruption must NOT be reachable by normal recovery alone \
+         (SegmentReader stops at the first bad record) — got {committed_before_requeue} \
+         committed, which means the fixture didn't actually corrupt the segment"
+    );
+
+    let ctl = weir_ctl_binary();
+
+    // Dry run first: must not touch the segment.
+    let dry = Command::new(&ctl)
+        .args(["quarantine", "requeue", "--wab-dir"])
+        .arg(&srv.wab_dir)
+        .arg("--socket")
+        .arg(&srv.socket_path)
+        .output()
+        .expect("run weir-ctl quarantine requeue (dry run)");
+    assert!(
+        dry.status.success(),
+        "dry run failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        quarantine_dir_has_a_segment(&srv.wab_dir),
+        "a dry run must not delete the quarantined segment"
+    );
+
+    let real = Command::new(&ctl)
+        .args(["quarantine", "requeue", "--yes", "--wab-dir"])
+        .arg(&srv.wab_dir)
+        .arg("--socket")
+        .arg(&srv.socket_path)
+        .output()
+        .expect("run weir-ctl quarantine requeue --yes");
+    assert!(
+        real.status.success(),
+        "requeue --yes failed: {}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+
+    // Poll for the sink to confirm the requeued records. Every record except
+    // the corrupted one is verifiable in the quarantined copy, so requeue
+    // must deliver exactly BEFORE + AFTER of them.
+    let expected_delivered_by_requeue = (BEFORE + AFTER) as u64;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut committed_after;
+    loop {
+        committed_after = parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        );
+        if committed_after >= committed_before_requeue + expected_delivered_by_requeue {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "requeue did not deliver+confirm every recoverable record; got {committed_after}, \
+             expected >= {}",
+            committed_before_requeue + expected_delivered_by_requeue
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // THE assertion the whole feature exists for: requeue delivered MORE than
+    // just the duplicate prefix — records sitting AFTER the corruption,
+    // unreachable by any path except RecoveryReader, reached the sink and
+    // were confirmed.
+    let delivered_by_requeue = committed_after - committed_before_requeue;
+    assert_eq!(
+        delivered_by_requeue, expected_delivered_by_requeue,
+        "requeue must deliver every verifiable record in the quarantined copy — the \
+         duplicate prefix AND the tail after the corruption"
+    );
+    assert!(
+        delivered_by_requeue > BEFORE as u64,
+        "requeue must have delivered records sitting AFTER the corrupted one — the entire \
+         point of RecoveryReader — not merely re-sent the duplicate prefix"
+    );
+
+    // Every recoverable record was accepted, so the segment must be gone.
+    assert!(
+        !quarantine_dir_has_a_segment(&srv.wab_dir),
+        "the quarantined segment must be deleted once every recoverable record was accepted"
+    );
+}
+
 // ── MySQL sink integration ────────────────────────────────────────────────────
 
 /// End-to-end check that records pushed to a daemon configured with
