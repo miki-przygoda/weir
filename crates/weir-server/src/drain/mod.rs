@@ -379,7 +379,7 @@ fn probe_and_resume_stranded<S: Sink>(
     if now_ok && !prev_health_ok {
         // `None` shard_count: skip the beyond-configured-count advisory — that's
         // a startup-replay concern, not a recovery one.
-        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None) {
+        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None, metrics) {
             Ok(sealed) => {
                 // Dedup against what's already queued via a HashSet membership view
                 // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
@@ -1832,7 +1832,7 @@ mod tests {
         // Confirmed file should exist; check_confirmed should return true.
         let confirmed = get_confirmed_path(&sealed);
         assert!(confirmed.exists());
-        let _ok = crate::wab::recovery::check_confirmed(&sealed, &dir).unwrap();
+        let _ok = crate::wab::recovery::check_confirmed(&sealed, &dir, &noop_metrics()).unwrap();
         let bytes = std::fs::read(&confirmed).unwrap();
         assert!(crate::wab::format::parse_confirmed(&bytes).is_ok());
 

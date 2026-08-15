@@ -514,8 +514,11 @@ impl Metrics {
         let recovery_segments_failed = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_recovery_segments_failed",
-            "WAB segments whose crash recovery returned an error and were left on \
-             disk for manual inspection. Non-zero means acked records may be \
+            "WAB segments whose crash recovery failed AND left the segment at its \
+             original path, so nothing will ever reach it. Deliberately excludes \
+             segments that were quarantined: those are counted by \
+             weir_recovery_segments_quarantined_total and are listed by \
+             `weir-ctl quarantine`. Non-zero means acked records may be \
              unreachable — check the startup logs for the path and the cause"
         );
         let quarantine_bytes_on_disk = reg!(

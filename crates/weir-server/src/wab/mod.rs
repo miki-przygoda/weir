@@ -350,6 +350,7 @@ pub(crate) fn spawn(
 pub(crate) fn scan_unconfirmed_sealed(
     wab_dir: &Path,
     shard_count: Option<usize>,
+    metrics: &Metrics,
 ) -> io::Result<Vec<PathBuf>> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
@@ -401,7 +402,7 @@ pub(crate) fn scan_unconfirmed_sealed(
         sealed_segments.sort_by_key(|p| segment::segment_counter_from_path(p));
 
         for sealed in sealed_segments {
-            match check_confirmed(&sealed, wab_dir) {
+            match check_confirmed(&sealed, wab_dir, metrics) {
                 Ok(true) => {
                     info!(sealed = %sealed.display(), "skipping — segment already confirmed");
                 }
@@ -426,7 +427,7 @@ pub(crate) fn replay_unconfirmed(
     drain_tx: &Sender<PathBuf>,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
-    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count))? {
+    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count), metrics)? {
         // A footer-read failure here only undercounts the
         // recovery_records_replayed metric (the segment is still queued +
         // delivered); surface it rather than silently reporting 0 so the
@@ -1133,7 +1134,8 @@ mod tests {
             s.seal().unwrap()
         };
 
-        let got = scan_unconfirmed_sealed(&dir, None).unwrap();
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let got = scan_unconfirmed_sealed(&dir, None, &m).unwrap();
         assert!(
             !got.contains(&s1_confirmed),
             "the confirmed segment must be skipped by the recovery scan: {got:?}"

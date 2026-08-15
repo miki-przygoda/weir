@@ -126,31 +126,60 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
                 info!(sealed = %sealed.display(), "recovery complete");
             }
             Err(e) => {
-                // Counted, not just logged: a segment left here holds acked
-                // records that nothing will reach, and on a read-only mount this
-                // repeats every boot. A log line is not an alertable signal.
-                metrics.recovery_segments_failed.inc();
-                error!(path = %path.display(), error = %e, "recovery failed; segment left for manual inspection");
+                // An Err here does NOT imply recovery failed. `quarantine_and_count`
+                // returns Err as CONTROL FLOW *after* a successful quarantine — it
+                // has already moved the file and bumped
+                // `recovery_segments_quarantined` — so counting every Err as a
+                // failure fires this counter on a routine, fully-handled path and
+                // trains operators to ignore it.
+                //
+                // The honest discriminator is the file itself, not the error kind
+                // (several sites produce InvalidData, so the kind does not
+                // discriminate). `quarantine()` RENAMES, so a segment that is gone
+                // from `path` was handled and is already counted, and is reachable
+                // with `weir-ctl quarantine`. Only a segment still sitting at `path`
+                // was genuinely left behind, which is what this counter documents.
+                //
+                // `copy_to_quarantine()` copies rather than renames, but its callers
+                // return Ok (the mid-file path falls through to Ok(sealed)), so it
+                // does not reach this arm.
+                // symlink_metadata (lstat), not exists() (stat): exists() follows
+                // symlinks, so a DANGLING symlink left at `path` would read as
+                // "gone" and go uncounted — and a symlink is exactly what the
+                // O_NOFOLLOW open above rejects, so that is a reachable shape here.
+                if path.symlink_metadata().is_ok() {
+                    metrics.recovery_segments_failed.inc();
+                    error!(path = %path.display(), error = %e, "recovery failed; segment left in place for manual inspection");
+                } else {
+                    error!(path = %path.display(), error = %e, "segment quarantined during recovery; recover it with `weir-ctl quarantine`");
+                }
             }
         }
     }
     Ok(())
 }
 
-/// Quarantines a corrupt segment AND records it in the quarantine metrics, then
-/// returns the `InvalidData` error describing why. Every header-validation
-/// quarantine site funnels through here so the `recovery_segments_quarantined`
-/// counter and the `wab_segments{state=quarantined}` gauge are ALWAYS bumped —
-/// previously the short-header branch quarantined invisibly to operators alerting
-/// on those metrics, unlike the bad-magic and bad-version branches (L00). If the
-/// quarantine move itself fails, that error is returned as-is and the metrics are
-/// not bumped (nothing was quarantined).
-fn quarantine_and_count(
-    path: &Path,
-    wab_dir: &Path,
-    metrics: &Arc<Metrics>,
-    reason: &str,
-) -> io::Error {
+/// Quarantines a corrupt SEGMENT and records it in the quarantine metrics, then
+/// returns the `InvalidData` error describing why.
+///
+/// **Every segment-quarantine site funnels through here** so the
+/// `recovery_segments_quarantined` counter and the `wab_segments{state=quarantined}`
+/// gauge are ALWAYS bumped. Two separate sites have quarantined invisibly in the
+/// past: the short-header branch (L00, unlike bad-magic and bad-version), and
+/// `check_confirmed`, which moved BOTH a segment and its `.confirmed` sidecar
+/// while bumping neither counter. If you add a third, route it here.
+///
+/// The one deliberate exception is the `.confirmed` **sidecar** itself, which
+/// `check_confirmed` moves with the bare [`quarantine`]: it is a companion
+/// artifact travelling with its segment, not a second quarantined segment, and
+/// counting it would double-count one event.
+///
+/// The returned error is CONTROL FLOW, not a report of failure — the quarantine
+/// SUCCEEDED. `recover_shard_dir` relies on that distinction and must not treat
+/// this Err as a recovery failure. If the quarantine move itself fails, that
+/// error is returned as-is and the metrics are not bumped (nothing was
+/// quarantined).
+fn quarantine_and_count(path: &Path, wab_dir: &Path, metrics: &Metrics, reason: &str) -> io::Error {
     if let Err(qe) = quarantine(path, wab_dir, reason) {
         return qe;
     }
@@ -655,7 +684,11 @@ fn non_clobbering_dest(dir: &Path, base: &str) -> io::Result<PathBuf> {
 /// - Bad CRC or unknown version: quarantines the segment and its `.confirmed` file,
 ///   returns `Err` so the caller knows to skip this segment entirely.
 /// - Valid: returns `Ok(true)`.
-pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
+pub(crate) fn check_confirmed(
+    sealed_path: &Path,
+    wab_dir: &Path,
+    metrics: &Metrics,
+) -> io::Result<bool> {
     // Shared sealed→confirmed name mapping (the drain's write side uses the
     // same helper) — see crate::wab::format::confirmed_path_for.
     let confirmed_path = super::format::confirmed_path_for(sealed_path);
@@ -673,24 +706,42 @@ pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<
             | ConfirmedParseError::WrongLength { .. }),
         ) => {
             let reason = format!("invalid .confirmed file: {e}");
-            quarantine(sealed_path, wab_dir, &reason)?;
+            // Count the SEGMENT once (the .confirmed sidecar is a companion
+            // artifact, not a second quarantined segment), then park the sidecar
+            // beside it. Before this, both files moved and NEITHER counter did,
+            // so an operator alerting on the quarantine counters missed this case
+            // entirely — the same invisibility bug quarantine_and_count was
+            // introduced to fix, surviving in a second site.
+            let e = quarantine_and_count(sealed_path, wab_dir, metrics, &reason);
             quarantine(&confirmed_path, wab_dir, &reason)?;
-            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+            Err(e)
         }
         Err(e @ ConfirmedParseError::UnknownVersion(_)) => {
             let reason = format!("unknown .confirmed version: {e}");
-            quarantine(sealed_path, wab_dir, &reason)?;
+            // Count the SEGMENT once (the .confirmed sidecar is a companion
+            // artifact, not a second quarantined segment), then park the sidecar
+            // beside it. Before this, both files moved and NEITHER counter did,
+            // so an operator alerting on the quarantine counters missed this case
+            // entirely — the same invisibility bug quarantine_and_count was
+            // introduced to fix, surviving in a second site.
+            let e = quarantine_and_count(sealed_path, wab_dir, metrics, &reason);
             quarantine(&confirmed_path, wab_dir, &reason)?;
-            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+            Err(e)
         }
         // `ConfirmedParseError` is `#[non_exhaustive]`; any future parse failure
         // is also "cannot trust this .confirmed file", so quarantine and skip —
         // the same conservative path as a bad CRC, never a silent accept.
         Err(e) => {
             let reason = format!("unparseable .confirmed file: {e}");
-            quarantine(sealed_path, wab_dir, &reason)?;
+            // Count the SEGMENT once (the .confirmed sidecar is a companion
+            // artifact, not a second quarantined segment), then park the sidecar
+            // beside it. Before this, both files moved and NEITHER counter did,
+            // so an operator alerting on the quarantine counters missed this case
+            // entirely — the same invisibility bug quarantine_and_count was
+            // introduced to fix, surviving in a second site.
+            let e = quarantine_and_count(sealed_path, wab_dir, metrics, &reason);
             quarantine(&confirmed_path, wab_dir, &reason)?;
-            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+            Err(e)
         }
     }
 }
@@ -1774,7 +1825,48 @@ mod tests {
         let dir = tmp_dir("noconf");
         let sealed = dir.join("seg_00000001.wab.sealed");
         fs::write(&sealed, b"placeholder").unwrap();
-        assert!(!check_confirmed(&sealed, &dir).unwrap());
+        assert!(!check_confirmed(&sealed, &dir, &noop_metrics()).unwrap());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_quarantined_confirmed_sidecar_bumps_the_quarantine_metrics() {
+        // Before this, check_confirmed called the bare quarantine() twice and
+        // bumped NEITHER counter, so an operator alerting on them missed the case
+        // entirely — the identical invisibility bug quarantine_and_count exists to
+        // prevent, surviving in a second site while its doc comment claimed
+        // "every quarantine site funnels through here".
+        //
+        // The SEGMENT is counted once; the .confirmed sidecar is a companion
+        // artifact that moves with it, not a second quarantined segment.
+        let dir = tmp_dir("conf_sidecar_counted");
+        let sealed = dir.join("seg_00000001.wab.sealed");
+        let confirmed = dir.join("seg_00000001.wab.confirmed");
+        fs::write(&sealed, b"placeholder").unwrap();
+        let mut bad = build_confirmed(0, 5, 1);
+        let n = bad.len();
+        bad[n - 1] ^= 0xff; // wreck the CRC
+        fs::write(&confirmed, bad).unwrap();
+
+        let metrics = noop_metrics();
+        assert!(check_confirmed(&sealed, &dir, &metrics).is_err());
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "the quarantined segment must be counted exactly once"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "wab_segments{{quarantined}} must move too"
+        );
+        assert!(!sealed.exists(), "the segment was moved to quarantine");
+        assert!(!confirmed.exists(), "the sidecar moved with it");
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1785,7 +1877,7 @@ mod tests {
         let confirmed = dir.join("seg_00000001.wab.confirmed");
         fs::write(&sealed, b"placeholder").unwrap();
         fs::write(&confirmed, build_confirmed(0, 5, 1)).unwrap();
-        assert!(check_confirmed(&sealed, &dir).unwrap());
+        assert!(check_confirmed(&sealed, &dir, &noop_metrics()).unwrap());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1799,7 +1891,7 @@ mod tests {
         bytes[32] ^= 0xff; // corrupt CRC
         fs::write(&confirmed, bytes).unwrap();
 
-        assert!(check_confirmed(&sealed, &dir).is_err());
+        assert!(check_confirmed(&sealed, &dir, &noop_metrics()).is_err());
         assert!(!sealed.exists());
         assert!(!confirmed.exists());
         assert!(dir.join("quarantine").exists());
@@ -1819,7 +1911,7 @@ mod tests {
         bytes[32..36].copy_from_slice(&crc.to_le_bytes());
         fs::write(&confirmed, bytes).unwrap();
 
-        let err = check_confirmed(&sealed, &dir).unwrap_err();
+        let err = check_confirmed(&sealed, &dir, &noop_metrics()).unwrap_err();
         assert!(
             err.to_string().contains("99"),
             "error should mention the version byte"
@@ -1991,26 +2083,72 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_whose_recovery_fails_is_counted_not_just_logged() {
-        // Today this arm only logs, so a segment left for manual inspection is
-        // invisible to monitoring. On a read-only mount it repeats every boot
-        // with nothing but a log line.
-        let dir = tmp_dir("recovery_failed_counter");
+    fn a_quarantined_segment_is_not_counted_as_a_recovery_failure() {
+        // This fixture (a header too short to parse) was originally written for
+        // `recovery_segments_failed` — WRONGLY. It never reached a genuine
+        // failure: a short header goes to `quarantine_and_count`, which MOVES the
+        // file and bumps `recovery_segments_quarantined`, then returns Err purely
+        // as control flow. Counting that Err as a failure fires the counter on a
+        // routine, fully-handled path — the "always fires, so it's noise" trap.
+        //
+        // The segment here is quarantined and IS reachable, via
+        // `weir-ctl quarantine`. So: quarantined counter up, failed counter flat.
+        let dir = tmp_dir("recovery_quarantined_not_failed");
         let shard_dir = dir.join("shard_00");
         fs::create_dir_all(&shard_dir).unwrap();
 
-        // A file with a valid name but a header too short to parse: recover_segment
-        // returns Err, and recover_shard_dir swallows it.
         let path = crate::wab::segment::segment_path(&shard_dir, 1);
         fs::write(&path, b"nope").unwrap();
 
         let metrics = noop_metrics();
         recover_open_segments(&dir, &metrics).unwrap();
         assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "a short header is quarantined, and that is what must be counted"
+        );
+        assert_eq!(
+            metrics.recovery_segments_failed.get(),
+            0,
+            "a successfully quarantined segment is NOT a recovery failure — it was \
+             moved to quarantine/, not left on disk, and it is recoverable"
+        );
+        assert!(
+            !path.exists(),
+            "quarantine renames, so the segment must be gone from its original path"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_segment_left_in_place_by_a_failed_recovery_is_counted() {
+        // The case `recovery_segments_failed` actually documents, which had NO
+        // test until now: recovery errors WITHOUT quarantining, so the segment is
+        // still sitting at its original path and nothing will ever reach it.
+        //
+        // A directory at the segment path reaches that branch: the open succeeds,
+        // the header read fails with something other than UnexpectedEof, so
+        // recover_segment propagates it rather than routing to quarantine.
+        let dir = tmp_dir("recovery_failed_left_in_place");
+        let shard_dir = dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        let path = crate::wab::segment::segment_path(&shard_dir, 1);
+        fs::create_dir(&path).unwrap();
+
+        let metrics = noop_metrics();
+        recover_open_segments(&dir, &metrics).unwrap();
+        assert_eq!(
             metrics.recovery_segments_failed.get(),
             1,
-            "a swallowed recovery failure must still be counted"
+            "a segment left at its original path by a failed recovery must be counted"
         );
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            0,
+            "nothing was quarantined — that is precisely why this one is a failure"
+        );
+        assert!(path.exists(), "the fixture must still be in place");
         fs::remove_dir_all(dir).ok();
     }
 }
