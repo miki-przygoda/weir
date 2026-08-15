@@ -93,6 +93,35 @@ no existing deployment's clients are affected.
   `weir-readiness.sh` all know about the new value; a dashboard pinned from an
   earlier release will render it as an unmapped `3`.
 
+- **Quarantined records are reachable again.** When crash recovery meets
+  mid-file corruption it seals and delivers the valid prefix, then copies the
+  whole segment to `quarantine/` — precisely because acked records may sit
+  *after* the corrupt one. Those records exist nowhere else, and until now
+  nothing could read them: `weir-ctl` had no quarantine command at all, and the
+  only quarantine metrics were per-process counters that vanished on restart.
+
+  New `weir-ctl quarantine list | inspect | requeue`, built on a new
+  `weir-wab::RecoveryReader` that continues past a corrupt record instead of
+  stopping at it. It never fabricates records: a declared length above the
+  stored cap, or a run of consecutive verification failures, ends the read
+  (`Desynced`) rather than guessing where the next record begins — and
+  `requeue` never deletes a segment that desynced, however many records it
+  recovered first, because the unread bytes past that point might still hold
+  data.
+
+  `requeue` **does** re-send records that already reached the sink — the
+  delivered prefix and the preserved tail live in the same file — so the dry
+  run prints that count before you pass `--yes`. A dedup-capable sink will not
+  filter them either: the dedup token covers a batch's contents *and* its
+  boundaries, and a requeue re-batches. A segment that yields no recoverable
+  records is also left in place rather than deleted. See
+  `docs/operations/quarantine-recovery.md` for the full triage procedure.
+
+  Also adds `weir_quarantine_bytes_on_disk` (a gauge, so it survives a
+  restart — the one signal that moves on every quarantine event) and
+  `weir_recovery_segments_failed_total`, for the recovery arm that previously
+  only logged.
+
 ### Changed
 
 - **BREAKING — the `Sink` trait is reshaped.** `commit` takes a `SinkBatch`

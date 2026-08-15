@@ -92,11 +92,20 @@ treat it as a flusher panic. A hung daemon may need a restart.
 
 #### WeirSegmentQuarantined
 Crash recovery found a segment with bad magic, an unknown format version, or a
-CRC mismatch and moved it to `<wab_dir>/quarantine/`. A data-integrity event.
-**Respond:** inspect the quarantined file (`weir-ctl segments` shows shard
-state). CRC mismatches usually mean storage corruption (failing disk / bad RAM).
-The records up to the first bad one were already recovered; the quarantined tail
-is preserved for manual inspection, not auto-discarded.
+CRC mismatch and moved it (or, for mid-file corruption, a copy of it) to
+`<wab_dir>/quarantine/`. A data-integrity event. CRC mismatches usually mean
+storage corruption (failing disk / bad RAM).
+**Respond:** `weir-ctl quarantine list` shows every quarantined segment;
+`weir-ctl quarantine inspect <segment>` reports how much of it is actually
+recoverable, and `weir-ctl quarantine requeue` re-delivers it. Full procedure —
+including why a "clean end" is not "everything was recovered," and why
+`requeue` re-sends the already-delivered prefix — in
+[`docs/operations/quarantine-recovery.md`](operations/quarantine-recovery.md).
+For **mid-file** corruption specifically: the records up to the first bad one
+were already recovered and delivered normally; only the corrupt record and
+whatever follows it in the file went to quarantine, and quarantine's `inspect`/
+`requeue` can usually recover the good records that sit *after* the
+corruption too.
 
 #### WeirFsyncLatency
 (`WeirFsyncLatencyHigh` warning / `WeirFsyncLatencyCritical` critical.) Sustained
@@ -301,7 +310,9 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
 | `weir_wab_cap_rejections_total` | counter | Pushes Nacked because live WAB bytes exceeded [`wab_max_bytes`](operations/configuration.md#wab_max_bytes). These surface to clients as `NackReason::InternalError` — **the same byte queue saturation uses** — so this counter is the **only** way to distinguish a cap rejection from queue-saturation `InternalError` Nacks. Zero when `wab_max_bytes` is unset (the default). |
 | `weir_recovery_records_replayed_total` | counter | Records replayed from sealed-but-unconfirmed segments on startup. |
-| `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during recovery. |
+| `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during **active**-segment recovery (bad header, or mid-file corruption with a copied tail). **Does not cover every way a file ends up in `quarantine/`** — a `.confirmed` sidecar that fails verification during sealed-segment replay quarantines both it and its segment without touching this counter (only a log line and the bytes gauge move). Use `weir_quarantine_bytes_on_disk` if you need a signal that catches every case. Recover with `weir-ctl quarantine requeue` — see [the runbook](operations/quarantine-recovery.md). |
+| `weir_recovery_segments_failed_total` | counter | Segments whose active-segment recovery (`recover_segment`) returned an error. **Fires alongside `weir_recovery_segments_quarantined_total` for a header-level quarantine** (bad magic / unknown version / a too-short header) — those segments are quarantined *and* counted here, since `weir-ctl quarantine` cannot parse them either (the header is what's corrupt). **Does NOT fire for the mid-file-corruption case** this whole toolchain exists for — recovery returns `Ok` there, having sealed and delivered the valid prefix. Non-zero also covers the rarer case where the quarantine copy itself failed (see the next row) or a genuine I/O error hit the recovery scan. Check the startup logs for the path and cause either way. |
+| `weir_quarantine_bytes_on_disk` | gauge | Total bytes under `<wab_dir>/quarantine/`. **The one signal that moves on every quarantine event**, including the `.confirmed`-sidecar case neither counter above catches. Survives a restart (unlike the counters), refreshed on the same cadence as `weir_dead_letter_bytes_on_disk`. Recover with `weir-ctl quarantine requeue`. |
 | `weir_recovery_quarantine_copy_failed_total` | counter | Mid-file-corrupt segments whose quarantine copy failed (disk full / read-only / inode exhaustion); recovery left the segment un-truncated to preserve acked-durable tail records and will retry. **Non-zero means recovery is stuck on that segment — clear the disk/read-only state and restart.** |
 | `weir_ack_timeout_total` | counter | Acks that never fired within the timeout (wedged flusher). |
 | `weir_stage_{queue,bridge_wait,write,total}_seconds` | histogram | Per-stage latency decomposition (`bench-trace` builds only — diagnostic). |

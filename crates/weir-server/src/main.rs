@@ -67,8 +67,10 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
         }
         // Skip the daemon's reserved subdirs — they aren't shards. dead_letter/
         // (dl_*.wab.sealed) has its own weir_dead_letter_bytes_on_disk gauge, and
-        // quarantine/ holds forensic .wab.sealed copies; counting either here
-        // would double-count live-segment bytes (G15, mirrors recovery's skip).
+        // quarantine/ holds forensic copies (both `.wab` and `.wab.sealed`,
+        // depending on whether crash recovery or the drain preserved them; see
+        // docs/wab_format.md); counting either here would double-count
+        // live-segment bytes (G15, mirrors recovery's skip).
         let dir_name = shard_path
             .file_name()
             .and_then(|n| n.to_str())
