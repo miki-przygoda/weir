@@ -417,7 +417,14 @@ class Daemon:
             # producer pause was written to cure.
             "--wab-segment-max-age-secs", "2",
         ]
-        self.proc = subprocess.Popen(cmd, stdout=self.log_file, stderr=self.log_file)
+        # NO_COLOR: tracing-subscriber emits ANSI escapes unconditionally, even
+        # when its output is a plain FILE rather than a terminal. Measured at
+        # 28% of the daemon log here, and the escapes break naive greps when
+        # reconstructing what the daemon did around a violation.
+        self.proc = subprocess.Popen(
+            cmd, stdout=self.log_file, stderr=self.log_file,
+            env=dict(os.environ, NO_COLOR="1"),
+        )
         # Wait for the socket to appear rather than sleeping a fixed interval.
         for _ in range(200):
             if os.path.exists(self.socket_path):
@@ -469,6 +476,11 @@ def main():
     schedule_path = sys.argv[1] if len(sys.argv) > 1 else "../schedules/smoke.toml"
     sched = load_schedule(schedule_path)
     seed = sched["seed"]
+    # Optional wall-clock bound for soak schedules. A soak is bounded by TIME,
+    # not episode count: episode duration varies with quiescence and restart,
+    # so no fixed count lands on a target length. Absent from a schedule, the
+    # run is episode-bounded exactly as before.
+    max_duration_secs = sched.get("max_duration_secs")
     run_id = run_id_from_seed(seed)
 
     run_dir = os.path.join(CHAOS_ROOT, "runs", str(run_id))
@@ -565,6 +577,8 @@ def main():
         delays = kill_delays(
             seed, sched["episodes"], sched["steady_lo_secs"], sched["steady_hi_secs"]
         )
+        run_started = time.monotonic()
+        deadline = run_started + max_duration_secs if max_duration_secs else None
         # The load must outlast the episodes. Steady-state sleeps are only part
         # of the wall clock: each episode also spends time on restart,
         # quiescence polling, and verification. Budget the worst case per
@@ -604,6 +618,19 @@ def main():
 
         with open(episodes_path, "a") as ep_log:
             for i, delay in enumerate(delays):
+                # Stop BETWEEN episodes, before the sleep and before the fault,
+                # so the run always ends in a verified state and still executes
+                # the final pass and writes its report. An external timeout
+                # would instead kill it mid-episode and strand the loop/dm
+                # devices and the mount.
+                if deadline is not None and time.monotonic() >= deadline:
+                    elapsed_h = (time.monotonic() - run_started) / 3600.0
+                    print(
+                        f"soak deadline reached after {i} episodes "
+                        f"({elapsed_h:.2f}h) — stopping cleanly",
+                        flush=True,
+                    )
+                    break
                 time.sleep(delay)
 
                 # A dead load generator makes every subsequent verification
@@ -876,9 +903,25 @@ def main():
 
     v_word = "violation" if violations == 1 else "violations"
     a_word = "anomaly" if anomalies == 1 else "anomalies"
+    # COUNT WHAT RAN, not what was scheduled. `sched["episodes"]` is a ceiling
+    # the loop can exit before reaching — on the soak deadline, on a dead
+    # observer, or on an exception — and reporting it as though every episode
+    # executed overstates the run's coverage. episodes.jsonl is the same source
+    # of truth report.py renders from, so the console line and report.md agree.
+    try:
+        with open(episodes_path) as f:
+            ran = sum(
+                1 for line in f
+                if line.strip() and json.loads(line).get("episode") != "final"
+            )
+    except (OSError, ValueError):
+        ran = None
+    scope = f"{ran} episodes" if ran is not None else "an unknown number of episodes"
+    if ran is not None and ran < sched["episodes"]:
+        scope += f" (of {sched['episodes']} scheduled)"
     print(
         f"\nrun {run_id} complete: {violations} {v_word}, {anomalies} {a_word} "
-        f"across {sched['episodes']} episodes plus the final pass"
+        f"across {scope} plus the final pass"
     )
     # I5: gate on both. A violation is a durability failure; an anomaly is
     # the harness failing to observe cleanly (quiescence timeout, dead

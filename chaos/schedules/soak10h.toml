@@ -1,0 +1,55 @@
+# 10-hour Phase 1 soak — random kill -9 only, on real hardware.
+#
+# WHAT THIS IS NOT: this is NOT Phase 2. dm-flakey injection is not implemented
+# (`dm_stack.py` builds loop -> ext4 -> mount and nothing else; the episode loop
+# injects `kill_random` unconditionally). The `[faults]` table below is empty
+# for exactly the reason it is empty in smoke.toml. Do not quote a green run
+# here as evidence about power loss, torn writes, or the durability tiers.
+#
+# WHAT IT IS: the Phase 1 gate passed at 30 minutes in a privileged container on
+# virtualised storage. This runs the same fault class for 10 hours, on bare
+# metal, against the 2.0 code — the WAB cap, the growth warning, and the whole
+# quarantine path that did not exist when Phase 1 was gated. It is a soak for
+# slow leaks and rare interleavings that minutes cannot reach.
+
+seed = 0xB0A75
+# The wall clock is the real bound (see max_duration_secs); this is only a
+# ceiling. At ~78s/episode measured, 10h is ~460 episodes, so 700 leaves
+# headroom for episodes that run long without the count ever being what stops
+# the run.
+episodes = 700
+
+# Stop cleanly after 10 hours, BETWEEN episodes, then run the final pass and
+# write the report. An external timeout would kill it mid-episode and strand
+# the loop device and mount.
+max_duration_secs = 36000
+
+steady_lo_secs = 45.0
+steady_hi_secs = 90.0
+quiescence_timeout_secs = 120.0
+
+[load]
+threads = 8
+record_size = 256
+# Sync, deliberately: it is the tier Phase 1 gated on, so a 10h result stays
+# comparable to that baseline. The Buffered-vs-Sync distinction remains
+# untested and is not something this run should be read as addressing.
+tier = "S"
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+# 2 GiB rather than smoke's 512 MiB. Over 10 hours a transient drain stall that
+# would clear on its own could otherwise reach ENOSPC, and ENOSPC is a Phase 3
+# fault — hitting it by accident here produces an anomaly that says nothing
+# about what this run set out to measure.
+size_mb = 2048
+
+# Empty, as in Phase 1. See the header.
+[faults]
