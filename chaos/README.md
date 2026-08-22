@@ -58,6 +58,20 @@ does not build this project.
 > alone was wrong four times, in both directions. Treat a green run as a claim
 > that needs its reasoning checked, not as a formality.
 
+## Phase 2 — injector validated, injection NOT implemented
+
+The `dm-flakey` injector Phase 2 depends on has been validated on real hardware:
+[`docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md`](../docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md).
+`drop_writes` is a **lying disk** — it reports fsync success and discards the
+write — which is not what real power loss does, and the write-up explains why
+that difference dictates the episode protocol rather than being a footnote.
+
+**Phase 2 itself is still unwritten.** `dm_stack.py` builds loop → ext4 → mount
+and nothing else; the episode loop injects `kill_random` unconditionally; the
+`[faults]` tables are empty. Read the write-up before implementing it: it
+records three separate ways a flakey device can end up running a configuration
+you did not ask for, and all three fail towards *false violations against weir*.
+
 ## Phase 1 exit gate
 
 Phase 1 is complete when a 30-minute smoke run produces **zero violations and
