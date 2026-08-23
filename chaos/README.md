@@ -58,6 +58,23 @@ does not build this project.
 > alone was wrong four times, in both directions. Treat a green run as a claim
 > that needs its reasoning checked, not as a formality.
 
+## Long soaks — 10h and 5h on bare metal, both clean (2026-08-23)
+
+> **38.6 million acked records across 665 `kill -9`s, 0 violations, 0 anomalies.**
+> [`docs/benchmarks/chaos-soak/2026-08-23-10h-vs-5h-phase1-soak.md`](../docs/benchmarks/chaos-soak/2026-08-23-10h-vs-5h-phase1-soak.md)
+>
+> Two things the 30-minute gate could not show. Throughput is **flat across ten
+> hours** (+0.95% Q1→Q4), so there is no leak or decay signature. And recovery
+> truncated **exactly 4.000 segments per kill** — one per shard — across 665
+> crashes on two independent kill sequences.
+>
+> `i1_exempt = 0` in both runs: nothing was excused by the frontier exemption,
+> which is what makes "0 violations" stronger than it looks.
+>
+> **Still Phase 1.** `kill -9` and `Sync` only. The 2.0 quarantine path was never
+> entered (`kill -9` truncates cleanly; quarantine is for corruption), so it has
+> no coverage here.
+
 ## Phase 2 — injector validated, injection NOT implemented
 
 The `dm-flakey` injector Phase 2 depends on has been validated on real hardware:
