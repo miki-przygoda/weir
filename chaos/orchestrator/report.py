@@ -429,13 +429,41 @@ def load_episodes(run_dir):
     return episodes
 
 
+def commit_label(commit, porcelain):
+    """Labels a commit with whether the tree that ran actually WAS that commit.
+
+    A bare HEAD is a lie whenever the tree is dirty, and rsyncing a working
+    tree onto a test box while leaving its .git behind makes that the normal
+    case rather than the exception. The 2026-08-22 10h soak reported
+    `b49f341` while running six modified files on top of it — including the
+    recovery path the run was partly there to exercise. A durability result
+    attributed to code that never ran is worse than one carrying no commit at
+    all, because it looks citable.
+
+    `porcelain` is `git status --porcelain --untracked-files=no` output:
+    tracked modifications only, so ignored run output cannot flip the flag.
+    """
+    if not commit:
+        return commit
+    dirt = [ln for ln in porcelain.splitlines() if ln.strip()]
+    if not dirt:
+        return commit
+    n = len(dirt)
+    return f"{commit}-dirty ({n} tracked file{'' if n == 1 else 's'} modified)"
+
+
 def gather_meta(episodes):
     """Best-effort run metadata: the weir commit, kernel, and the run's seed."""
     meta = {}
     try:
-        meta["weir_commit"] = subprocess.run(
+        commit = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True
         ).stdout.strip()
+        porcelain = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True,
+        ).stdout
+        meta["weir_commit"] = commit_label(commit, porcelain)
         meta["kernel"] = subprocess.run(
             ["uname", "-r"], capture_output=True, text=True
         ).stdout.strip()

@@ -313,3 +313,34 @@ class TestFinalPassSection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCommitLabel(unittest.TestCase):
+    """The reported commit must not claim a clean tree that did not run.
+
+    The 2026-08-22 soak reported `b49f341` while running six modified files on
+    top of it, so a green 25M-record result pointed at code that was never
+    executed. These pin both directions.
+    """
+
+    def test_a_clean_tree_reports_the_bare_commit(self):
+        self.assertEqual(report.commit_label("b49f341", ""), "b49f341")
+
+    def test_whitespace_only_status_is_still_clean(self):
+        self.assertEqual(report.commit_label("b49f341", "\n  \n"), "b49f341")
+
+    def test_a_dirty_tree_is_marked_and_counted(self):
+        porcelain = " M crates/weir-server/src/wab/recovery.rs\n M chaos/orchestrator/run.py\n"
+        got = report.commit_label("b49f341", porcelain)
+        self.assertIn("dirty", got)
+        self.assertIn("b49f341", got)
+        self.assertIn("2 tracked files modified", got)
+
+    def test_one_modified_file_is_singular(self):
+        got = report.commit_label("b49f341", " M chaos/orchestrator/run.py\n")
+        self.assertIn("1 tracked file modified", got)
+        self.assertNotIn("files", got)
+
+    def test_a_missing_commit_is_left_alone_rather_than_labelled_dirty(self):
+        # git absent or not a repo: say nothing rather than invent "-dirty".
+        self.assertEqual(report.commit_label("", " M x.rs\n"), "")
