@@ -354,6 +354,48 @@ class DenseAccumulator:
             # Provenance has arrived for something already delivered.
             self._no_provenance.discard(seq)
 
+    def _bump_count(self, seq):
+        cell = self._cells[seq]
+        packed = cell >> _COUNT_SHIFT
+        if packed == _COUNT_OVERFLOW:
+            self._overflow[seq] += 1
+            return
+        if packed == _COUNT_MAX:
+            # Move into the overflow dict and flip the sentinel, preserving the
+            # tag bits — the count leaves the cell, the tag does not.
+            self._overflow[seq] = _COUNT_MAX + 1
+            self._cells[seq] = (_COUNT_OVERFLOW << _COUNT_SHIFT) | (cell & _TAG_MASK)
+            return
+        self._cells[seq] = ((packed + 1) << _COUNT_SHIFT) | (cell & _TAG_MASK)
+
+    def _ingest_delivered(self, seq):
+        self._grow(seq)
+        first = self._count(seq) == 0
+        self._bump_count(seq)
+        self.delivered_total += 1
+        if not first:
+            return
+        self._delivered_distinct += 1
+        tag = self._cells[seq] & _TAG_MASK
+        if tag == _TAG_ACK:
+            self._unresolved_acked.discard(seq)
+        elif tag == _TAG_NACK:
+            self._leaked.add(seq)
+        elif tag == _TAG_ABSENT:
+            self._no_provenance.add(seq)
+
+    def ingest(self, ledger_lines, delivered_lines):
+        """Folds newly-read lines into the accumulated state."""
+        for line in ledger_lines:
+            parsed = parse_ledger_line(line)
+            if not parsed:
+                continue
+            self._ingest_ledger(*parsed)
+        for line in delivered_lines:
+            seq = parse_delivered_line(line, self.run_id)
+            if seq is not None:
+                self._ingest_delivered(seq)
+
 
 #: The accumulator the harness actually runs. Flipped to DenseAccumulator in
 #: Task 7, once the differential test proves the two agree.

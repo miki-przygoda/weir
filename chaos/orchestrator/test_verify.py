@@ -386,5 +386,61 @@ class TestDenseLedgerIngest(unittest.TestCase):
         self.assertEqual(a._tag(50_000), verify._TAG_ABSENT)
 
 
+class TestDenseDeliveryIngest(unittest.TestCase):
+    def acc(self):
+        return verify.DenseAccumulator(delivered_run_id=7)
+
+    def test_first_delivery_resolves_an_acked_seq(self):
+        a = self.acc()
+        a._ingest_ledger(3, "ACK")
+        a._ingest_delivered(3)
+        self.assertEqual(a._unresolved_acked, set())
+        self.assertEqual(a._delivered_distinct, 1)
+        self.assertEqual(a.delivered_total, 1)
+
+    def test_duplicates_raise_total_but_not_distinct(self):
+        a = self.acc()
+        a._ingest_ledger(3, "ACK")
+        for _ in range(5):
+            a._ingest_delivered(3)
+        self.assertEqual(a.delivered_total, 5)
+        self.assertEqual(a._delivered_distinct, 1)
+        self.assertEqual(a._count(3), 5)
+
+    def test_delivery_before_ledger_is_no_provenance_until_the_tag_arrives(self):
+        a = self.acc()
+        a._ingest_delivered(3)
+        self.assertEqual(a._no_provenance, {3})
+        a._ingest_ledger(3, "ACK")
+        self.assertEqual(a._no_provenance, set())
+
+    def test_a_delivered_nacked_seq_leaks_in_either_order(self):
+        ledger_first = self.acc()
+        ledger_first._ingest_ledger(3, "NACK")
+        ledger_first._ingest_delivered(3)
+        self.assertEqual(ledger_first._leaked, {3})
+
+        delivery_first = self.acc()
+        delivery_first._ingest_delivered(3)
+        delivery_first._ingest_ledger(3, "NACK")
+        self.assertEqual(delivery_first._leaked, {3})
+
+    def test_count_stays_exact_past_the_literal_ceiling(self):
+        a = self.acc()
+        a._ingest_ledger(3, "ACK")
+        for _ in range(verify._COUNT_MAX + 10):
+            a._ingest_delivered(3)
+        self.assertEqual(a._count(3), verify._COUNT_MAX + 10)
+        self.assertEqual(a.delivered_total, verify._COUNT_MAX + 10)
+        # The tag must survive the overflow transition intact.
+        self.assertEqual(a._tag(3), verify._TAG_ACK)
+
+    def test_ingest_parses_lines_and_filters_other_runs(self):
+        a = self.acc()
+        a.ingest(["3 t x 256 ACK"], ["7 3", "9 3"])
+        self.assertEqual(a._acked, 1)
+        self.assertEqual(a.delivered_total, 1)  # the run_id 9 line is not ours
+
+
 if __name__ == "__main__":
     unittest.main()
