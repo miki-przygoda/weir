@@ -271,6 +271,90 @@ class ReferenceAccumulator:
         )
 
 
+class DenseAccumulator:
+    """Accumulated verification state, one byte per seq.
+
+    Same contract as `ReferenceAccumulator`, ~336x smaller. `seq` comes from a
+    single shared AtomicU64 in loadgen, so it is dense from 0 and an array
+    indexed by it needs no key storage.
+
+    The three sets below are the UNRESOLVED working set, not history: each is
+    defined by a state transition visible at ingest time, and each empties as
+    records resolve. Maintaining them here is what makes `check()` O(unresolved)
+    instead of O(everything ever seen).
+    """
+
+    def __init__(self, delivered_run_id):
+        self.run_id = delivered_run_id
+        self._cells = bytearray()
+        #: seq -> true count, for the rare seq whose count exceeds _COUNT_MAX.
+        self._overflow = {}
+        self.delivered_total = 0
+        self.ledger_hwm = 0
+        self.conflicts = []
+        self._pushed = 0
+        self._acked = 0
+        self._nacked = 0
+        self._unknown = 0
+        self._delivered_distinct = 0
+        #: acked, never delivered — this IS i1_absent.
+        self._unresolved_acked = set()
+        #: nacked and delivered anyway — this IS i2_leaked. Should stay empty.
+        self._leaked = set()
+        #: delivered with no ledger entry yet.
+        self._no_provenance = set()
+
+    def _grow(self, seq):
+        if seq < len(self._cells):
+            return
+        # Doubling keeps growth amortised O(1); the max() floor stops a long
+        # run reallocating on every new seq once the array is large.
+        new_len = max(seq + 1, len(self._cells) * 2, 1024)
+        self._cells.extend(bytes(new_len - len(self._cells)))
+
+    def _tag(self, seq):
+        if seq >= len(self._cells):
+            return _TAG_ABSENT
+        return self._cells[seq] & _TAG_MASK
+
+    def _count(self, seq):
+        if seq >= len(self._cells):
+            return 0
+        packed = self._cells[seq] >> _COUNT_SHIFT
+        return self._overflow[seq] if packed == _COUNT_OVERFLOW else packed
+
+    def _ingest_ledger(self, seq, tag):
+        self.ledger_hwm = max(self.ledger_hwm, seq)
+        self._grow(seq)
+        code = _TAG_CODE[tag]
+        prior = self._cells[seq] & _TAG_MASK
+        if prior != _TAG_ABSENT:
+            if prior != code:
+                # Two different tags for one seq. loadgen allocates seq from a
+                # single monotonic counter, so no legitimate retry reuses one.
+                # Keep the FIRST observation, exactly as the reference does —
+                # silently reclassifying an outcome is what an oracle must not do.
+                self.conflicts.append((seq, _TAG_NAME[prior], tag))
+            return
+        packed = self._cells[seq] >> _COUNT_SHIFT
+        self._cells[seq] = (packed << _COUNT_SHIFT) | code
+        self._pushed += 1
+        delivered = self._count(seq)
+        if code == _TAG_ACK:
+            self._acked += 1
+            if delivered == 0:
+                self._unresolved_acked.add(seq)
+        elif code == _TAG_NACK:
+            self._nacked += 1
+            if delivered:
+                self._leaked.add(seq)
+        else:
+            self._unknown += 1
+        if delivered:
+            # Provenance has arrived for something already delivered.
+            self._no_provenance.discard(seq)
+
+
 #: The accumulator the harness actually runs. Flipped to DenseAccumulator in
 #: Task 7, once the differential test proves the two agree.
 Accumulator = ReferenceAccumulator

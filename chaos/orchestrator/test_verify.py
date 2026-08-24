@@ -338,5 +338,53 @@ class TestBitPacking(unittest.TestCase):
         self.assertEqual(verify._COUNT_OVERFLOW, verify._COUNT_MAX + 1)
 
 
+class TestDenseLedgerIngest(unittest.TestCase):
+    def acc(self):
+        return verify.DenseAccumulator(delivered_run_id=7)
+
+    def test_records_tag_and_counts_one_push(self):
+        a = self.acc()
+        a._ingest_ledger(3, "ACK")
+        self.assertEqual(a._tag(3), verify._TAG_ACK)
+        self.assertEqual(a._pushed, 1)
+        self.assertEqual(a._acked, 1)
+        self.assertEqual(a.ledger_hwm, 3)
+
+    def test_a_repeated_identical_line_is_not_a_second_push(self):
+        # The reference overwrites the dict entry, so len(ledger) is unchanged.
+        a = self.acc()
+        a._ingest_ledger(3, "ACK")
+        a._ingest_ledger(3, "ACK")
+        self.assertEqual(a._pushed, 1)
+        self.assertEqual(a._acked, 1)
+        self.assertEqual(a.conflicts, [])
+
+    def test_conflicting_tags_keep_the_first_and_record_the_conflict(self):
+        a = self.acc()
+        a._ingest_ledger(3, "ACK")
+        a._ingest_ledger(3, "NACK")
+        self.assertEqual(a._tag(3), verify._TAG_ACK)
+        self.assertEqual(a.conflicts, [(3, "ACK", "NACK")])
+        self.assertEqual(a._pushed, 1)
+        self.assertEqual(a._nacked, 0)
+
+    def test_an_acked_seq_with_no_delivery_is_unresolved(self):
+        a = self.acc()
+        a._ingest_ledger(3, "ACK")
+        self.assertEqual(a._unresolved_acked, {3})
+
+    def test_hwm_tracks_the_maximum_not_the_latest(self):
+        a = self.acc()
+        a._ingest_ledger(9, "ACK")
+        a._ingest_ledger(2, "ACK")
+        self.assertEqual(a.ledger_hwm, 9)
+
+    def test_the_array_grows_to_cover_a_distant_seq(self):
+        a = self.acc()
+        a._ingest_ledger(100_000, "ACK")
+        self.assertEqual(a._tag(100_000), verify._TAG_ACK)
+        self.assertEqual(a._tag(50_000), verify._TAG_ABSENT)
+
+
 if __name__ == "__main__":
     unittest.main()
