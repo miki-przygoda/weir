@@ -889,7 +889,7 @@ for cls in (verify.ReferenceAccumulator, verify.DenseAccumulator):
 EOF
 ```
 
-Expected: `DenseAccumulator` at roughly 1 byte/record against `ReferenceAccumulator`'s ~336.
+Expected: `DenseAccumulator` at roughly 1 byte/record against `ReferenceAccumulator`'s ~317 (both measured at N=2,000,000).
 
 - [ ] **Step 6: Commit**
 
@@ -898,7 +898,7 @@ git add chaos/orchestrator/verify.py chaos/orchestrator/test_dense_oracle.py
 git commit -F - <<'MSG'
 feat(chaos): run the dense oracle
 
-336x less memory per record, so run length stops being a memory question:
+~302x less memory per record, so run length stops being a memory question:
 the 39h ceiling on beast becomes roughly four months. The dict implementation
 stays as the reference the differential test diffs against.
 MSG
