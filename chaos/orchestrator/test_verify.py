@@ -314,5 +314,29 @@ class TestFrontier(unittest.TestCase):
         self.assertFalse(r0.ok, "no slack means seq 2 is an unexempted miss")
 
 
+class TestBitPacking(unittest.TestCase):
+    def test_tag_codes_round_trip(self):
+        for name in ("ACK", "NACK", "UNK"):
+            code = verify._TAG_CODE[name]
+            self.assertEqual(verify._TAG_NAME[code], name)
+
+    def test_absent_is_zero_so_a_fresh_cell_means_no_tag(self):
+        # bytearray() zero-fills, so "absent" MUST be 0 or every new cell
+        # would claim a tag it was never given.
+        self.assertEqual(verify._TAG_ABSENT, 0)
+        self.assertNotIn(verify._TAG_ABSENT, verify._TAG_NAME)
+
+    def test_tag_and_count_share_a_byte_without_collision(self):
+        for tag in (verify._TAG_ACK, verify._TAG_NACK, verify._TAG_UNK):
+            for count in (0, 1, 62, verify._COUNT_OVERFLOW):
+                cell = (count << verify._COUNT_SHIFT) | tag
+                self.assertLessEqual(cell, 255)
+                self.assertEqual(cell & verify._TAG_MASK, tag)
+                self.assertEqual(cell >> verify._COUNT_SHIFT, count)
+
+    def test_overflow_sentinel_is_above_the_literal_ceiling(self):
+        self.assertEqual(verify._COUNT_OVERFLOW, verify._COUNT_MAX + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,6 +28,27 @@ lose records under simulated power loss) arrives in Phase 2 with dm-flakey.
 import os
 from dataclasses import dataclass, field
 
+# ── Dense oracle cell layout ─────────────────────────────────────────────────
+# One byte per seq: bits 0-1 the ledger tag, bits 2-7 the delivery count.
+# ABSENT must be 0 — bytearray zero-fills, so any other choice would make a
+# never-seen seq claim a tag it was never given.
+_TAG_ABSENT = 0
+_TAG_ACK = 1
+_TAG_NACK = 2
+_TAG_UNK = 3
+
+_TAG_MASK = 0b11
+_COUNT_SHIFT = 2
+#: Highest delivery count stored literally in the cell.
+_COUNT_MAX = 62
+#: Sentinel meaning "the true count lives in the overflow dict". Counts this
+#: high need a crash loop redelivering one record 63 times; the dict keeps the
+#: total exact if that ever happens rather than silently saturating.
+_COUNT_OVERFLOW = 63
+
+_TAG_CODE = {"ACK": _TAG_ACK, "NACK": _TAG_NACK, "UNK": _TAG_UNK}
+_TAG_NAME = {v: k for k, v in _TAG_CODE.items()}
+
 
 @dataclass
 class VerifyResult:
