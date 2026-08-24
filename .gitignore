@@ -22,3 +22,5 @@ todos
 
 # Local working docs (plans, scratch notes — not part of the repo)
 .workdocs/
+# Subagent-driven-development scratch (ledgers, briefs, review packages).
+.superpowers/
