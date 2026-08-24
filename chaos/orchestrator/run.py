@@ -417,6 +417,22 @@ class Daemon:
             # producer pause was written to cure.
             "--wab-segment-max-age-secs", "2",
         ]
+        # On-disk format. OMITTED ENTIRELY unless the schedule asks for it, so
+        # every schedule written before this knob existed keeps writing format
+        # v1 — byte-identical to weir 1.x — exactly as it did on the runs those
+        # schedules already produced. Do not give this a default here: a default
+        # would silently reinterpret every historical schedule.
+        #
+        # "zstd" writes format v2, which weir's own config docs call a one-way
+        # door: a 1.x daemon refuses to read those segments. That is precisely
+        # why it needs its own soak — the 10h and 5h runs on bare metal never
+        # touched the v2 write OR recovery path, because the default is "none".
+        compression = self.cfg.get("wab_compression")
+        if compression:
+            cmd += ["--wab-compression", compression]
+            level = self.cfg.get("wab_compression_level")
+            if level is not None:
+                cmd += ["--wab-compression-level", str(level)]
         # NO_COLOR: tracing-subscriber emits ANSI escapes unconditionally, even
         # when its output is a plain FILE rather than a terminal. Measured at
         # 28% of the daemon log here, and the escapes break naive greps when
