@@ -250,9 +250,9 @@ Expected: FAIL with `AttributeError: module 'verify' has no attribute 'DenseAccu
 class DenseAccumulator:
     """Accumulated verification state, one byte per seq.
 
-    Same contract as `ReferenceAccumulator`, ~336x smaller. `seq` comes from a
-    single shared AtomicU64 in loadgen, so it is dense from 0 and an array
-    indexed by it needs no key storage.
+    Same contract as `ReferenceAccumulator`, ~302x smaller (measured at N=2,000,000;
+    see the alias comment). `seq` comes from a single shared AtomicU64 in loadgen,
+    so it is dense from 0 and an array indexed by it needs no key storage.
 
     The three sets below are the UNRESOLVED working set, not history: each is
     defined by a state transition visible at ingest time, and each empties as
@@ -851,10 +851,13 @@ Expected: FAIL — `Accumulator` is still `ReferenceAccumulator`.
 In `verify.py`, replace the Task 1 alias with:
 
 ```python
-#: The accumulator the harness runs. DenseAccumulator is ~336x smaller than the
-#: reference (1.00 vs 335.9 bytes/record measured), which is what makes a soak
-#: longer than ~39h possible at all. ReferenceAccumulator stays as the
-#: differential test's oracle — see test_dense_oracle.py.
+#: The accumulator the harness runs. DenseAccumulator is ~302x smaller than the
+#: reference — 1.05 vs 316.89 bytes/record measured at N=2,000,000. The ratio is
+#: sample-size sensitive (Python dict table sizing and bytearray doubling both
+#: shift with N), so re-measuring at a different N and getting a different ratio
+#: is expected, not a regression. This is what makes a soak longer than ~39h
+#: possible at all. ReferenceAccumulator stays as the differential test's oracle
+#: — see test_dense_oracle.py.
 Accumulator = DenseAccumulator
 ```
 

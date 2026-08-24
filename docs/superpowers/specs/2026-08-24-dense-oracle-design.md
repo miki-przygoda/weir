@@ -70,8 +70,10 @@ bits 0-1 : tag    0=absent 1=ACK 2=NACK 3=UNK
 bits 2-7 : delivery count, 0..62 literal, 63 = "consult overflow dict"
 ```
 
-Measured: **1.00 byte/record, a 336x reduction.** 72h becomes 182 MB; 30 days
-becomes 1.8 GB. Run length stops being a memory question.
+Measured: **1.05 bytes/record (at N=2,000,000), a 302x reduction** vs 316.89 bytes/record
+(also at N=2,000,000). Earlier measurement at N=200,000 showed 1.00 vs 335.9 (336x);
+the ratio varies with sample size due to Python dict table sizing and bytearray doubling.
+72h becomes ~196 MB; 30 days becomes ~1.9 GB. Run length stops being a memory question.
 
 Counts above 62 spill to a small `{seq: true_count}` dict so totals stay
 exact. `delivered_total` is already a separate running integer, so only the
