@@ -167,6 +167,14 @@ class TestLedgerLineStrictness(unittest.TestCase):
         self.assertIsNone(verify.parse_ledger_line("42 S 1 2 WAT"), "unknown tag")
         self.assertIsNone(verify.parse_ledger_line("notanint S 1 2 ACK"), "bad seq")
 
+    def test_rejects_a_negative_seq(self):
+        # Finding 1: seq is a Rust u64, so negative is corruption, not merely
+        # an unusual value — and under DenseAccumulator a negative seq isn't
+        # just a wasted slot, it aliases a real array cell (see
+        # test_dense_oracle.py's negative-seq differential tests).
+        self.assertIsNone(verify.parse_ledger_line("-1 S 1 2 ACK"))
+        self.assertIsNone(verify.parse_ledger_line("-1 B 1 2 NACK reason"))
+
     def test_accepts_exactly_what_the_encoder_emits(self):
         self.assertEqual(verify.parse_ledger_line("42 S 1 2 ACK"), (42, "ACK"))
         self.assertEqual(verify.parse_ledger_line("42 U 1 2 UNK"), (42, "UNK"))
@@ -175,6 +183,18 @@ class TestLedgerLineStrictness(unittest.TestCase):
         self.assertEqual(
             verify.parse_ledger_line("42 B 1 2 NACK reason with spaces"), (42, "NACK")
         )
+
+
+class TestDeliveredLineStrictness(unittest.TestCase):
+    def test_accepts_a_matching_run_id(self):
+        self.assertEqual(verify.parse_delivered_line("7 42", run_id=7), 42)
+
+    def test_rejects_a_negative_seq_or_run_id(self):
+        # Finding 1: same hazard as the ledger side — a negative value here
+        # would index DenseAccumulator's cell array from the end, aliasing a
+        # real cell instead of erroring.
+        self.assertIsNone(verify.parse_delivered_line("7 -1", run_id=7))
+        self.assertIsNone(verify.parse_delivered_line("-7 1", run_id=7))
 
 
 class TestTailerSafety(unittest.TestCase):
@@ -336,6 +356,41 @@ class TestBitPacking(unittest.TestCase):
 
     def test_overflow_sentinel_is_above_the_literal_ceiling(self):
         self.assertEqual(verify._COUNT_OVERFLOW, verify._COUNT_MAX + 1)
+
+
+class TestGrowGuardsAgainstAbsurdSeq(unittest.TestCase):
+    """Finding 2: a spliced ledger line (two 8-digit seqs run together — the
+    exact shape a kill -9 mid-write_all produces) parses to a huge seq, and
+    _grow would otherwise allocate an array proportional to it: potentially
+    petabytes, an instant MemoryError killing the soak this branch exists to
+    enable. _grow must refuse rather than allocate proportionally to it.
+    """
+
+    def test_a_seq_over_the_limit_raises_rather_than_allocating(self):
+        a = verify.DenseAccumulator(delivered_run_id=7)
+        with self.assertRaises(RuntimeError) as ctx:
+            a._grow(verify._MAX_SEQ + 1)
+        self.assertIn(str(verify._MAX_SEQ + 1), str(ctx.exception))
+
+    def test_a_seq_just_under_the_limit_is_accepted(self):
+        # _MAX_SEQ itself (~1.1e12) is far too large to actually allocate in
+        # a unit test. Patch it down so both the accept and reject paths
+        # exercise the real comparison in _grow without a multi-terabyte
+        # allocation; restore it so other tests see the real value.
+        a = verify.DenseAccumulator(delivered_run_id=7)
+        original = verify._MAX_SEQ
+        verify._MAX_SEQ = 2000
+        try:
+            a._grow(1999)  # just under the (patched) limit: must not raise
+        finally:
+            verify._MAX_SEQ = original
+        self.assertGreaterEqual(len(a._cells), 2000)
+
+    def test_the_real_limit_is_far_above_any_observed_run(self):
+        # The largest real run observed was ~2.5e7 records; _MAX_SEQ must
+        # stay comfortably above that so this guard cannot fire on
+        # legitimate traffic.
+        self.assertGreater(verify._MAX_SEQ, 25_000_000)
 
 
 class TestDenseLedgerIngest(unittest.TestCase):

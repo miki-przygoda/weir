@@ -63,6 +63,42 @@ let my_seq = seq.fetch_add(1, Ordering::Relaxed); // loadgen.rs:280
 Every thread draws from the same `AtomicU64`, so `seq` is dense from 0 with no
 gaps. An array indexed by `seq` needs no key storage at all.
 
+### Input contract
+
+That density claim is an assumption about well-formed input, and the array
+representation changes what happens when it is violated. Under a dict,
+violation was free: an out-of-domain key is just another hash bucket. Under
+an array indexed directly by the value, it is not — it is a memory or
+correctness hazard.
+
+So the contract is now explicit: **`seq` is a `u64` drawn from a single
+monotonic counter — non-negative, and never astronomically larger than the
+run's actual record count.** Two things can violate it in practice, both from
+corrupt input rather than legitimate traffic:
+
+- **A negative `seq`.** `int("-1")` parses successfully even though the Rust
+  encoder only ever emits a `u64` (`chaos/src/lib.rs`'s `Record::seq`), so a
+  negative value is definitionally corruption. Left unchecked, Python's
+  negative-index semantics make it alias onto a real cell from the end of the
+  array instead of erroring — silently corrupting that cell's tag/count and
+  potentially hiding a genuine I1/I2 violation on the record that legitimately
+  owns it.
+- **An absurdly large `seq`.** A spliced or truncated log line (e.g. a
+  `kill -9` mid-`write_all`, which `chaos/src/lib.rs` already anticipates)
+  can parse to a seq many orders of magnitude past the ledger's high-water
+  mark. The array's cost is proportional to the largest seq it has seen, so
+  this becomes an allocation proportional to a corrupt number — multi-GB at
+  intermediate magnitudes, an instant `MemoryError` at extreme ones.
+
+Both are enforced at the boundary rather than inside the array logic: the
+parsers (`parse_ledger_line`, `parse_delivered_line`) reject a negative `seq`
+outright, and `DenseAccumulator._grow` refuses a `seq` past a fixed ceiling
+(`_MAX_SEQ = 1 << 40`, far above any observed run) rather than allocating
+proportionally to it. Both failure modes drop the offending line the same way
+for both accumulators, which is what keeps equivalence intact — this is a
+domain restriction on the shared input, not a divergence between the two
+implementations.
+
 ## Design
 
 One `bytearray` indexed by `seq`, one byte per record:
@@ -153,7 +189,13 @@ the bar.
 
 ## Out of scope
 
-- `mmap` / on-disk backing (follow-on).
+- `mmap` / on-disk backing (follow-on). Note for that follow-on: `_MAX_SEQ`
+  (the `_grow` ceiling that refuses to allocate proportionally to a corrupt
+  seq — see Input contract, above) stops being a nice-to-have and becomes
+  load-bearing the day `_cells` is file-backed via `mmap`. A sparse file
+  would hide an absurd allocation until the corresponding page is actually
+  touched, instead of failing fast the way an in-memory `bytearray.extend`
+  does today.
 - Any change to the invariant semantics. This is a representation change and
   must be observably behaviour-preserving.
 - Any change to the ledger or delivery log formats.

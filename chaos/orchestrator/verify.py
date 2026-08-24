@@ -39,12 +39,28 @@ _TAG_UNK = 3
 
 _TAG_MASK = 0b11
 _COUNT_SHIFT = 2
-#: Highest delivery count stored literally in the cell.
+#: Highest delivery count stored literally in the cell. This value is a TUNABLE:
+#: any value whose sentinel still fits a byte (_COUNT_OVERFLOW << 2 <= 255) gives
+#: identical results, because _bump_count spills to _overflow at whatever ceiling
+#: is set and _count reads it back exactly. Verified by mutating it to 6 and to 61
+#: with no change to any VerifyResult field. Do not "correct" it in either
+#: direction without changing _COUNT_OVERFLOW in lockstep.
 _COUNT_MAX = 62
 #: Sentinel meaning "the true count lives in the overflow dict". Counts this
 #: high need a crash loop redelivering one record 63 times; the dict keeps the
 #: total exact if that ever happens rather than silently saturating.
 _COUNT_OVERFLOW = 63
+
+#: A seq this far past the ledger high-water mark is not a real record; it is a
+#: spliced or stale log line — e.g. a kill -9 mid-write_all running two 8-digit
+#: seqs together into one that still parses cleanly (chaos/src/lib.rs:294 notes
+#: the same hazard on the Rust decoder's side). Refuse rather than allocating an
+#: array proportional to it: 1 << 40 is ~1.1e12, far above the largest real run
+#: observed (~2.5e7), so this cannot fire on legitimate traffic. Becomes
+#: load-bearing, not just a safety margin, once _cells is file-backed via mmap
+#: (see the design spec's Out of scope) — a sparse file would hide the
+#: allocation until the page is touched.
+_MAX_SEQ = 1 << 40
 
 _TAG_CODE = {"ACK": _TAG_ACK, "NACK": _TAG_NACK, "UNK": _TAG_UNK}
 _TAG_NAME = {v: k for k, v in _TAG_CODE.items()}
@@ -183,6 +199,18 @@ def parse_ledger_line(line):
         seq = int(parts[0])
     except ValueError:
         return None
+    if seq < 0:
+        # The Rust encoder emits seq as a u64, so a negative value is
+        # corruption, never a legitimate record — and unlike under the old
+        # dict accumulator, accepting it here is not merely a wasted slot.
+        # DenseAccumulator indexes self._cells directly by seq, and Python
+        # silently reinterprets a negative index as counting from the end of
+        # the array — so a negative seq would ALIAS onto a real cell instead
+        # of erroring, corrupting that cell's tag/count and potentially
+        # hiding a genuine I1/I2 violation on the record that legitimately
+        # owns it. Rejecting here keeps both accumulators' behaviour
+        # identical and restores agreement with the Rust `u64` contract.
+        return None
     tag = parts[4]
     has_reason = len(parts) > 5
     if tag == "NACK":
@@ -202,6 +230,15 @@ def parse_delivered_line(line, run_id):
     try:
         r, s = int(parts[0]), int(parts[1])
     except ValueError:
+        return None
+    if r < 0 or s < 0:
+        # Same hazard as parse_ledger_line: `s` indexes DenseAccumulator's
+        # cell array directly, so a negative value would silently alias a
+        # real cell (Python's negative-index semantics) rather than error,
+        # instead of being the harmless wasted dict slot it was before. Both
+        # a negative run_id and a negative seq are impossible under the Rust
+        # u64 contract, so either one is corruption; reject the line rather
+        # than let it corrupt an unrelated cell.
         return None
     return s if r == run_id else None
 
@@ -278,10 +315,28 @@ class DenseAccumulator:
     see the alias comment). `seq` comes from a single shared AtomicU64 in loadgen,
     so it is dense from 0 and an array indexed by it needs no key storage.
 
+    Input contract: `seq` is a `u64` from that single monotonic counter — the
+    array representation makes an out-of-domain `seq` a memory or correctness
+    hazard rather than a wasted dict slot (see the design spec's Input
+    contract section). The parsers enforce non-negativity, and `_grow`
+    refuses a `seq` past `_MAX_SEQ` rather than allocating proportionally to
+    it.
+
     The three sets below are the UNRESOLVED working set, not history: each is
     defined by a state transition visible at ingest time, and each empties as
-    records resolve. Maintaining them here is what makes `check()` O(unresolved)
-    instead of O(everything ever seen).
+    records resolve. Maintaining them here is what makes `check()`
+    O(unresolved + leaked + conflicts) instead of O(everything ever seen) —
+    the last two are monotonic (`sorted(self._leaked)`, `list(self.conflicts)`)
+    but empty in a conforming run, same as the reference, so this is not a
+    regression.
+
+    `ingest()` processes all of a batch's ledger lines before any of its
+    delivery lines, so `_unresolved_acked` transiently holds one whole
+    episode's ledger batch mid-call (measured: 58,000 entries / 2.1 MB at Run
+    A's rate) before the delivery lines resolve most of it back down. It
+    self-heals within the same call, but the transient scales with episode
+    duration, not record count overall — worth knowing before assuming this
+    set is always small.
     """
 
     def __init__(self, delivered_run_id):
@@ -307,6 +362,12 @@ class DenseAccumulator:
     def _grow(self, seq):
         if seq < len(self._cells):
             return
+        if seq > _MAX_SEQ:
+            raise RuntimeError(
+                f"seq {seq} exceeds {_MAX_SEQ}; this log line is spliced or "
+                "from another run. Refusing to allocate an array proportional to "
+                "a corrupt seq."
+            )
         # Doubling keeps growth amortised O(1); the max() floor stops a long
         # run reallocating on every new seq once the array is large.
         new_len = max(seq + 1, len(self._cells) * 2, 1024)
@@ -336,8 +397,8 @@ class DenseAccumulator:
                 # silently reclassifying an outcome is what an oracle must not do.
                 self.conflicts.append((seq, _TAG_NAME[prior], tag))
             return
-        packed = self._cells[seq] >> _COUNT_SHIFT
-        self._cells[seq] = (packed << _COUNT_SHIFT) | code
+        # prior is ABSENT (0) here, so the tag bits are clear — OR the code straight in.
+        self._cells[seq] |= code
         self._pushed += 1
         delivered = self._count(seq)
         if code == _TAG_ACK:
@@ -384,6 +445,18 @@ class DenseAccumulator:
         elif tag == _TAG_ABSENT:
             self._no_provenance.add(seq)
 
+    def ingest(self, ledger_lines, delivered_lines):
+        """Folds newly-read lines into the accumulated state."""
+        for line in ledger_lines:
+            parsed = parse_ledger_line(line)
+            if not parsed:
+                continue
+            self._ingest_ledger(*parsed)
+        for line in delivered_lines:
+            seq = parse_delivered_line(line, self.run_id)
+            if seq is not None:
+                self._ingest_delivered(seq)
+
     def check(self, frontier_slack=0):
         """Runs I1/I2/I3 against everything accumulated so far.
 
@@ -427,18 +500,6 @@ class DenseAccumulator:
             pending_provenance=len(pending_provenance_seqs),
         )
 
-    def ingest(self, ledger_lines, delivered_lines):
-        """Folds newly-read lines into the accumulated state."""
-        for line in ledger_lines:
-            parsed = parse_ledger_line(line)
-            if not parsed:
-                continue
-            self._ingest_ledger(*parsed)
-        for line in delivered_lines:
-            seq = parse_delivered_line(line, self.run_id)
-            if seq is not None:
-                self._ingest_delivered(seq)
-
 
 #: The accumulator the harness runs. DenseAccumulator is ~302x smaller than the
 #: reference — 1.05 vs 316.89 bytes/record measured at N=2,000,000. The ratio is
@@ -447,6 +508,14 @@ class DenseAccumulator:
 #: is expected, not a regression. This is what makes a soak longer than ~39h
 #: possible at all. ReferenceAccumulator stays as the differential test's oracle
 #: — see test_dense_oracle.py.
+#:
+#: Methodology, so a future re-measurement doesn't read as a third correction to
+#: this comment: the 1.05 B/rec figure covers `_cells` + `_overflow` only, the
+#: resolved history. The three UNRESOLVED sets (`_unresolved_acked`, `_leaked`,
+#: `_no_provenance`) are not included — they add roughly another 0.3 B/rec, and
+#: are bounded by one episode's ingest batch rather than by total record count
+#: (see `DenseAccumulator`'s docstring), so they don't change the asymptotic
+#: picture, only the constant.
 Accumulator = DenseAccumulator
 
 

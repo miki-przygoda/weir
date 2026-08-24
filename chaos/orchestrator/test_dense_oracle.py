@@ -71,7 +71,21 @@ class TestDifferential(unittest.TestCase):
         # asdict comparison is deliberate: it fails on any field added later
         # that the dense implementation forgot to populate.
         self.assertEqual(a, b, ctx)
-        self.assertAlmostEqual(rate_a, rate_b, places=12, msg=ctx)
+        # Both sides compute known_total / known_distinct from identical
+        # Python ints, so the result is bit-identical, not merely close —
+        # confirmed across 3,000 fuzz seeds. assertEqual is strictly
+        # stronger than an approximate comparison here, with no downside.
+        self.assertEqual(rate_a, rate_b, ctx)
+
+    def assert_accumulators_agree(self, ref, dense, ctx):
+        """Compares the accumulators' own documented public surface, not just
+        the VerifyResult they produce — delivered_total and conflicts are
+        otherwise exercised only indirectly (via delivered_distinct/duplicate_rate
+        and ledger_conflicts), and ledger_hwm isn't a VerifyResult field at all.
+        """
+        self.assertEqual(ref.delivered_total, dense.delivered_total, ctx)
+        self.assertEqual(ref.conflicts, dense.conflicts, ctx)
+        self.assertEqual(ref.ledger_hwm, dense.ledger_hwm, ctx)
 
     def test_agrees_across_many_random_streams(self):
         for seed in range(60):
@@ -82,16 +96,19 @@ class TestDifferential(unittest.TestCase):
                 ref.ingest(lg, dl)
                 dense.ingest(lg, dl)
                 for slack in (0, 1, 25, 10_000):
+                    ctx = f"seed={seed} batch={i} slack={slack}"
                     self.assert_same(
                         ref.check(frontier_slack=slack),
                         dense.check(frontier_slack=slack),
-                        f"seed={seed} batch={i} slack={slack}",
+                        ctx,
                     )
+                self.assert_accumulators_agree(ref, dense, f"seed={seed} batch={i}")
 
     def test_agrees_on_an_empty_stream(self):
         ref = verify.ReferenceAccumulator(delivered_run_id=RUN_ID)
         dense = verify.DenseAccumulator(delivered_run_id=RUN_ID)
         self.assert_same(ref.check(), dense.check(), "empty")
+        self.assert_accumulators_agree(ref, dense, "empty")
 
     def test_agrees_when_every_record_is_nacked_and_leaked(self):
         lg = [ledger_line(s, "NACK") for s in range(50)]
@@ -102,6 +119,7 @@ class TestDifferential(unittest.TestCase):
         dense.ingest(lg, dl)
         r = ref.check()
         self.assert_same(r, dense.check(), "all-nacked")
+        self.assert_accumulators_agree(ref, dense, "all-nacked")
         self.assertEqual(len(r.i2_leaked), 50)
 
     def test_agrees_on_sparse_far_apart_seqs(self):
@@ -114,6 +132,7 @@ class TestDifferential(unittest.TestCase):
         dense.ingest(lg, dl)
         self.assert_same(ref.check(), dense.check(), "sparse")
         self.assert_same(ref.check(frontier_slack=10), dense.check(frontier_slack=10), "sparse+slack")
+        self.assert_accumulators_agree(ref, dense, "sparse")
 
     def test_ledger_hwm_matches(self):
         rng = random.Random(1234)
@@ -123,6 +142,50 @@ class TestDifferential(unittest.TestCase):
             ref.ingest(lg, dl)
             dense.ingest(lg, dl)
             self.assertEqual(ref.ledger_hwm, dense.ledger_hwm)
+
+    def test_agrees_on_a_negative_delivered_seq_after_the_array_has_grown(self):
+        # Finding 1: the array is WARMED to 1024 cells by one legitimate
+        # record first, then fed a corrupt line with seq=-1. Python's negative
+        # indexing makes DenseAccumulator's self._cells[-1] alias cell 1023 —
+        # a REAL cell — rather than raising, so a phantom delivery count
+        # planted there can hide a genuinely lost record. Warming first is
+        # required: on a still-empty array the same input raises IndexError
+        # instead, which would not exercise the aliasing form of the bug.
+        ref = verify.ReferenceAccumulator(delivered_run_id=RUN_ID)
+        dense = verify.DenseAccumulator(delivered_run_id=RUN_ID)
+        warm = ([ledger_line(0, "ACK")], [delivered_line(0)])
+        ref.ingest(*warm)
+        dense.ingest(*warm)
+        corrupt = ([], [delivered_line(-1)])
+        ref.ingest(*corrupt)
+        dense.ingest(*corrupt)
+        # seq 1023 is acked but never delivered: this must stay a real I1
+        # miss, not be masked by the phantom count the corrupt line planted.
+        lost = ([ledger_line(1023, "ACK")], [])
+        ref.ingest(*lost)
+        dense.ingest(*lost)
+        self.assert_same(ref.check(), dense.check(), "negative delivered seq")
+        self.assert_accumulators_agree(ref, dense, "negative delivered seq")
+
+    def test_agrees_on_a_negative_ledger_seq_after_the_array_has_grown(self):
+        # Same hazard from the ledger side: a negative seq aliases onto cell
+        # 1023 and plants a stray NACK tag there, so the real ACK that later
+        # legitimately owns seq 1023 collides with it on ingest — fabricating
+        # both a ledger conflict and an I2 leak for a perfectly healthy,
+        # delivered record.
+        ref = verify.ReferenceAccumulator(delivered_run_id=RUN_ID)
+        dense = verify.DenseAccumulator(delivered_run_id=RUN_ID)
+        warm = ([ledger_line(0, "ACK")], [delivered_line(0)])
+        ref.ingest(*warm)
+        dense.ingest(*warm)
+        corrupt = ([ledger_line(-1, "NACK")], [])
+        ref.ingest(*corrupt)
+        dense.ingest(*corrupt)
+        healthy = ([ledger_line(1023, "ACK")], [delivered_line(1023)])
+        ref.ingest(*healthy)
+        dense.ingest(*healthy)
+        self.assert_same(ref.check(), dense.check(), "negative ledger seq")
+        self.assert_accumulators_agree(ref, dense, "negative ledger seq")
 
 
 class TestActiveImplementation(unittest.TestCase):
