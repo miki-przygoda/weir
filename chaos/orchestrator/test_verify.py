@@ -474,10 +474,16 @@ class TestDenseCheck(unittest.TestCase):
         self.assertEqual(r.i1_exempt, 1)
 
     def test_orphans_are_excluded_from_the_duplicate_rate(self):
+        # Counts are deliberately asymmetric: the orphan (99) is delivered
+        # three times against the real seq's two. A correct implementation
+        # excludes 99 entirely, giving known_total=2, known_distinct=1 -> 2.0.
+        # An implementation that forgot to exclude no-provenance seqs would
+        # fold 99 into both totals instead: (2+3)/2 = 2.5. Symmetric counts
+        # (2 and 2) can't tell these apart, since both give 2.0 either way.
         a = self.acc()
         a._ingest_ledger(1, "ACK")
         a._ingest_delivered(1); a._ingest_delivered(1)
-        a._ingest_delivered(99); a._ingest_delivered(99)  # no provenance
+        a._ingest_delivered(99); a._ingest_delivered(99); a._ingest_delivered(99)  # no provenance
         r = a.check()
         self.assertEqual(r.orphaned_delivered, [99])
         self.assertEqual(r.delivered_distinct, 1)
