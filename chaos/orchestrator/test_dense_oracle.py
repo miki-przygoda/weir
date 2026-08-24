@@ -59,7 +59,7 @@ def random_batches(rng, n_batches=12, universe=400):
         # Occasionally hammer one seq past the count-overflow boundary.
         if rng.random() < 0.15:
             hot = rng.randrange(universe)
-            delivered.extend(delivered_line(hot) for _ in range(rng.randint(60, 75)))
+            delivered.extend(delivered_line(hot) for _ in range(rng.randint(63, 80)))
         yield ledger, delivered
 
 
@@ -123,6 +123,11 @@ class TestDifferential(unittest.TestCase):
             ref.ingest(lg, dl)
             dense.ingest(lg, dl)
             self.assertEqual(ref.ledger_hwm, dense.ledger_hwm)
+
+
+class TestActiveImplementation(unittest.TestCase):
+    def test_the_harness_runs_the_dense_accumulator(self):
+        self.assertIs(verify.Accumulator, verify.DenseAccumulator)
 
 
 if __name__ == "__main__":

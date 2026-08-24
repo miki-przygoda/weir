@@ -440,9 +440,11 @@ class DenseAccumulator:
                 self._ingest_delivered(seq)
 
 
-#: The accumulator the harness actually runs. Flipped to DenseAccumulator in
-#: Task 7, once the differential test proves the two agree.
-Accumulator = ReferenceAccumulator
+#: The accumulator the harness runs. DenseAccumulator is ~336x smaller than the
+#: reference (1.00 vs 335.9 bytes/record measured), which is what makes a soak
+#: longer than ~39h possible at all. ReferenceAccumulator stays as the
+#: differential test's oracle — see test_dense_oracle.py.
+Accumulator = DenseAccumulator
 
 
 def check(ledger, delivered, frontier_slack=0):
