@@ -442,5 +442,57 @@ class TestDenseDeliveryIngest(unittest.TestCase):
         self.assertEqual(a.delivered_total, 1)  # the run_id 9 line is not ours
 
 
+class TestDenseCheck(unittest.TestCase):
+    def acc(self):
+        return verify.DenseAccumulator(delivered_run_id=7)
+
+    def test_clean_run_passes(self):
+        a = self.acc()
+        a._ingest_ledger(1, "ACK"); a._ingest_ledger(2, "ACK")
+        a._ingest_delivered(1); a._ingest_delivered(2)
+        r = a.check()
+        self.assertTrue(r.ok)
+        self.assertEqual(r.acked_count, 2)
+        self.assertEqual(r.pushed, 2)
+        self.assertEqual(r.delivered_distinct, 2)
+
+    def test_i1_reports_an_acked_record_that_never_arrived(self):
+        a = self.acc()
+        a._ingest_ledger(1, "ACK"); a._ingest_ledger(2, "ACK")
+        a._ingest_delivered(1)
+        r = a.check()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.i1_missing, [2])
+
+    def test_frontier_slack_exempts_rather_than_fails(self):
+        a = self.acc()
+        a._ingest_ledger(1, "ACK"); a._ingest_ledger(2, "ACK")
+        a._ingest_delivered(1)
+        r = a.check(frontier_slack=5)   # frontier = 2 - 5 = -3, so 2 is exempt
+        self.assertTrue(r.ok)
+        self.assertEqual(r.i1_missing, [])
+        self.assertEqual(r.i1_exempt, 1)
+
+    def test_orphans_are_excluded_from_the_duplicate_rate(self):
+        a = self.acc()
+        a._ingest_ledger(1, "ACK")
+        a._ingest_delivered(1); a._ingest_delivered(1)
+        a._ingest_delivered(99); a._ingest_delivered(99)  # no provenance
+        r = a.check()
+        self.assertEqual(r.orphaned_delivered, [99])
+        self.assertEqual(r.delivered_distinct, 1)
+        self.assertAlmostEqual(r.duplicate_rate, 2.0)
+
+    def test_a_conflict_fails_the_episode(self):
+        a = self.acc()
+        a._ingest_ledger(1, "ACK"); a._ingest_ledger(1, "NACK")
+        r = a.check()
+        self.assertFalse(r.ok)
+        self.assertEqual(r.ledger_conflicts, [(1, "ACK", "NACK")])
+
+    def test_duplicate_rate_is_zero_when_nothing_delivered(self):
+        self.assertEqual(self.acc().check().duplicate_rate, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

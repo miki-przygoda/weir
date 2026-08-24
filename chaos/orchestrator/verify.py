@@ -384,6 +384,49 @@ class DenseAccumulator:
         elif tag == _TAG_ABSENT:
             self._no_provenance.add(seq)
 
+    def check(self, frontier_slack=0):
+        """Runs I1/I2/I3 against everything accumulated so far.
+
+        Mirrors `check_counts` exactly. The difference is only where the sets
+        come from: maintained incrementally here, rebuilt from the whole ledger
+        there.
+        """
+        if frontier_slack:
+            frontier = self.ledger_hwm - frontier_slack
+            i1_exempt_seqs = {s for s in self._unresolved_acked if s > frontier}
+            pending_provenance_seqs = {s for s in self._no_provenance if s > frontier}
+        else:
+            i1_exempt_seqs = set()
+            pending_provenance_seqs = set()
+
+        i1_missing = sorted(self._unresolved_acked - i1_exempt_seqs)
+        i2_leaked = sorted(self._leaked)
+        orphaned = sorted(self._no_provenance - pending_provenance_seqs)
+
+        # The exclusion set is always the full no-provenance set: the frontier
+        # only changes which LABEL an excluded seq gets, never the rate.
+        known_total = self.delivered_total - sum(
+            self._count(s) for s in self._no_provenance
+        )
+        known_distinct = self._delivered_distinct - len(self._no_provenance)
+        dup_rate = (known_total / known_distinct) if known_distinct else 0.0
+
+        return VerifyResult(
+            ok=not i1_missing and not i2_leaked and not self.conflicts,
+            i1_missing=i1_missing,
+            i2_leaked=i2_leaked,
+            unknown_count=self._unknown,
+            acked_count=self._acked,
+            nacked_count=self._nacked,
+            pushed=self._pushed,
+            delivered_distinct=known_distinct,
+            duplicate_rate=dup_rate,
+            orphaned_delivered=orphaned,
+            ledger_conflicts=list(self.conflicts),
+            i1_exempt=len(i1_exempt_seqs),
+            pending_provenance=len(pending_provenance_seqs),
+        )
+
     def ingest(self, ledger_lines, delivered_lines):
         """Folds newly-read lines into the accumulated state."""
         for line in ledger_lines:
