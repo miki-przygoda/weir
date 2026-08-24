@@ -185,12 +185,13 @@ def parse_delivered_line(line, run_id):
     return s if r == run_id else None
 
 
-class Accumulator:
-    """Accumulated verification state across episodes.
+class ReferenceAccumulator:
+    """Accumulated verification state across episodes — dict-based reference.
 
-    Holds the ledger outcome per seq and the delivery count per seq, both
-    growing monotonically. `check()` runs the same pure invariants as the
-    standalone `check()` function on the accumulated state.
+    Retained as the differential test's oracle-for-the-oracle: the dense
+    implementation must prove it agrees with this before replacing it. Do not
+    optimise this class. Its value is that it is obviously correct and never
+    changes.
     """
 
     def __init__(self, delivered_run_id):
@@ -247,6 +248,11 @@ class Accumulator:
             self.ledger, self.delivered_counts, self.delivered_total,
             self.conflicts, frontier_slack, ledger_hwm=self.ledger_hwm,
         )
+
+
+#: The accumulator the harness actually runs. Flipped to DenseAccumulator in
+#: Task 7, once the differential test proves the two agree.
+Accumulator = ReferenceAccumulator
 
 
 def check(ledger, delivered, frontier_slack=0):
