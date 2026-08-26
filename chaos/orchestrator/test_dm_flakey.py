@@ -53,7 +53,15 @@ class TestTableParsing(unittest.TestCase):
         with self.assertRaises(dm_flakey.UnexpectedTable):
             dm_flakey.table_is_engaged(line)
 
-    def test_rejects_a_table_that_is_not_flakey_at_all(self):
+    def test_rejects_a_well_formed_table_that_is_not_flakey(self):
+        # Long enough to pass the length gate and with the right feature args, so
+        # `parts[2] != "flakey"` is what actually rejects it. The previous fixture
+        # was only 5 fields, so `len(parts) < 8` short-circuited and the target
+        # check was never reached — the test passed for the wrong reason.
+        with self.assertRaises(dm_flakey.UnexpectedTable):
+            dm_flakey.table_is_engaged("0 65536 linear 7:19 0 0 0 1 drop_writes")
+
+    def test_rejects_a_table_too_short_to_parse(self):
         with self.assertRaises(dm_flakey.UnexpectedTable):
             dm_flakey.table_is_engaged("0 65536 linear 7:19 0")
 
