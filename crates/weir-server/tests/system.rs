@@ -149,6 +149,78 @@ fn all_durability_tiers_behave_per_contract() {
     );
 }
 
+/// weir 1.3.1 is live on crates.io and its encoder emits the retired `0x02`
+/// (former `Batched`) durability byte for every Batched push. `0x02` is
+/// therefore a published wire contract, not an internal implementation
+/// detail: this release must keep accepting it from old producers forever.
+///
+/// `retired_batched_byte_decodes_but_never_round_trips` (weir-core) and the
+/// conformance vectors already prove the *decoder* still turns `0x02` into
+/// `Durable`, but that's unit-level coverage of `Durability::try_from`
+/// alone — it doesn't prove a live daemon, reading the byte off a real
+/// socket, actually proceeds to accept and ack the record rather than
+/// rejecting it on some other code path the unit test can't see. This test
+/// closes that gap end-to-end against the real binary.
+#[test]
+fn retired_batched_wire_byte_is_still_accepted_by_a_live_daemon() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream as RawStream,
+    };
+    use weir_core::{Envelope, HEADER_LEN, Header, MessageType};
+
+    let srv = weir_server!("retired_0x02").start();
+
+    // Build a normal Push frame (canonical durability byte 0x01), then
+    // hand-patch byte 6 — magic[0..4] + version[4] + message_type[5] +
+    // durability[6] — from 0x01 to the retired 0x02, and recompute the
+    // header CRC over bytes [0..12] so the daemon doesn't reject the frame
+    // as corrupt before it ever looks at the durability byte. Same
+    // patch-and-recompute pattern as
+    // `crates/weir-server/src/socket/connection.rs` (see e.g.
+    // `header_declaring` in its test module).
+    let mut frame = Envelope::new(
+        Header::new(MessageType::Push, Durability::Durable, 0),
+        b"retired-0x02".to_vec(),
+    )
+    .encode();
+    assert_eq!(frame[6], 0x01, "test assumes byte 6 is the durability byte");
+    frame[6] = 0x02;
+    let crc = crc32fast::hash(&frame[..12]);
+    frame[12..16].copy_from_slice(&crc.to_le_bytes());
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("raw connect");
+    stream.write_all(&frame).expect("write patched 0x02 frame");
+
+    let mut resp_header_buf = [0u8; HEADER_LEN];
+    stream
+        .read_exact(&mut resp_header_buf)
+        .expect("read response header");
+    let resp_header = Header::decode(&resp_header_buf).expect("decode response header");
+    let mut payload = vec![0u8; resp_header.payload_len() as usize];
+    if !payload.is_empty() {
+        stream
+            .read_exact(&mut payload)
+            .expect("read response payload");
+    }
+    let mut crc_buf = [0u8; 4];
+    stream.read_exact(&mut crc_buf).expect("read response crc");
+
+    assert_eq!(
+        resp_header.message_type(),
+        MessageType::Ack,
+        "a raw 0x02 (retired Batched) durability byte must still be accepted \
+         and acked by a live daemon — got {:?} instead",
+        resp_header.message_type()
+    );
+
+    // The connection must still be healthy afterward: a daemon that
+    // mishandled the retired byte shouldn't have left anything poisoned.
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after retired-0x02 push");
+}
+
 // ── Health check ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -1897,7 +1969,7 @@ fn fd_limit_exhaustion_does_not_crash_server() {
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
-fn records_accepted_counter_increments_after_sync_pushes() {
+fn records_accepted_counter_increments_after_durable_pushes() {
     const N: u32 = 10;
 
     let srv = weir_server!("metrics_accepted").start();
@@ -1917,7 +1989,7 @@ fn records_accepted_counter_increments_after_sync_pushes() {
 }
 
 #[test]
-fn records_ack_counter_increments_after_sync_pushes() {
+fn records_ack_counter_increments_after_durable_pushes() {
     const N: u32 = 7;
 
     let srv = weir_server!("metrics_ack").start();

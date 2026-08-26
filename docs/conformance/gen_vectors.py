@@ -134,9 +134,9 @@ ok("nack_reserved_reason",
 # Responses carry a durability *filler* byte: clients must not INTERPRET it (it
 # carries no meaning on a response), but it is still a valid Durability
 # discriminant (0x01-0x03) that the reference decoder range-checks like any other
-# header byte. Pin that a non-Sync filler value still decodes (Ack with Buffered).
+# header byte. Pin that a non-Durable filler value still decodes (Ack with Buffered).
 ok("ack_nonsync_durability_filler",
-   "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must "
+   "Ack response whose durability filler is non-Durable (Buffered, 0x03): clients must "
    "not interpret the durability field on responses, but it stays a valid "
    "Durability value (0x01-0x03) that the decoder range-checks.",
    frame(MT["Ack"], DUR["Buffered"], b""), "Ack", "Buffered", 0, b"")

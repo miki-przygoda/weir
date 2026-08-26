@@ -22,7 +22,7 @@ const REFERENCE_PUSH_HELLO_SYNC: &[u8; 25] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x01, // message_type = Push (0x01)
-    0x01, // durability  = Sync (0x01)
+    0x01, // durability  = Durable (0x01)
     0x00, // flags
     0x05, 0x00, 0x00, 0x00, // payload_len = 5 (LE u32)
     0x66, 0xad, 0x7d, 0x3c, // header_crc32 (LE u32)
@@ -61,7 +61,7 @@ const REFERENCE_ACK: &[u8; 20] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x02, // message_type = Ack (0x02)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x00, 0x00, 0x00, 0x00, // payload_len = 0
     0xc9, 0x47, 0x4b, 0x3a, // header_crc32
@@ -92,7 +92,7 @@ const REFERENCE_NACK_PAYLOAD_TOO_LARGE: &[u8; 21] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x03, // message_type = Nack (0x03)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x01, 0x00, 0x00, 0x00, // payload_len = 1
     0x18, 0x2b, 0x80, 0x24, // header_crc32
@@ -128,7 +128,7 @@ const REFERENCE_NACK_VERSION_MISMATCH: &[u8; 22] = &[
     0x52, // magic = "WEIR"
     0x01, // version = 1
     0x03, // message_type = Nack (0x03)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x02,
     0x00,
@@ -173,7 +173,7 @@ const REFERENCE_NACK_BAD_HEADER_CRC: &[u8; 21] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x03, // message_type = Nack (0x03)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x01, 0x00, 0x00, 0x00, // payload_len = 1
     0x18, 0x2b, 0x80, 0x24, // header_crc32 (same header as PayloadTooLarge)
@@ -204,7 +204,7 @@ const REFERENCE_HEALTHCHECK: &[u8; 20] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x04, // message_type = HealthCheck (0x04)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x00, 0x00, 0x00, 0x00, // payload_len = 0
     0xf3, 0x72, 0x9b, 0x59, // header_crc32
@@ -233,7 +233,7 @@ const REFERENCE_HEALTHCHECK_RESPONSE: &[u8; 20] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x05, // message_type = HealthCheckResponse (0x05)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x00, 0x00, 0x00, 0x00, // payload_len = 0
     0x47, 0x79, 0xec, 0xff, // header_crc32

@@ -32,8 +32,34 @@ type, needs a small source change — see Breaking below.
   same guarantee since both moved to the batch-boundary group fsync. They are
   now one tier, `Durable`. `Durability::Sync` and `Durability::Batched`
   remain as deprecated aliases, so code that *constructs* a tier keeps
-  compiling with a warning; an exhaustive `match` over three variants does
-  not.
+  compiling with a warning. An exhaustive `match` over the old three variants
+  still compiles too — associated consts are legal match patterns, and
+  `Sync`/`Batched`/`Buffered` still cover the value space, so exhaustiveness
+  passes — but the `Batched` arm becomes unreachable dead code: an
+  `unreachable_patterns` **warning**, not an error. If you dispatched on
+  `Sync` vs `Batched` differently, that distinction is now silently gone —
+  grep for it rather than relying on the compiler to catch it.
+- **The one hard compile error: importing the variant by name.**
+  `use weir_core::Durability::Sync;` was legal while `Sync` was an enum
+  variant; it is not legal for an associated const, so it is now a hard
+  error:
+  ```
+  error[E0432]: unresolved import `weir_core::Durability::Sync`
+    |
+    | use weir_core::Durability::Sync;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Sync` in `durability::Durability`
+    |
+  help: consider importing this trait instead
+    |
+  - use weir_core::Durability::Sync;
+  + use std::marker::Sync;
+  ```
+  rustc's suggestion — importing `std::marker::Sync` instead — is unrelated
+  and actively misleading; do not take it. `use Durability::{Sync, Batched,
+  Buffered};` fails the same way on two of the three names while `Buffered`
+  resolves fine, which can make the failure read as two typos rather than an
+  API change. Fix: `use weir_core::Durability;` and reference
+  `Durability::Durable` at the call site.
 - Wire compatibility is **preserved**: `0x02` still decodes to `Durable`, so
   producers built against 1.x keep working. The encoder only ever emits
   `0x01`, and `0x02` is permanently reserved.
@@ -284,6 +310,20 @@ both are observability / behaviour-under-shutdown fixes.
   `docs/benchmarks/chaos-soak/2026-08-26-three-venue-comparison.md`.
 - Known gap: **power loss remains untested.** Every fault above is a process
   kill, which does not lose the page cache.
+- Known gap: **`wab_max_bytes`, announced above, has no chaos coverage.**
+  Per the soak doc: *"The WAB cap and growth warning never fired. `nacked = 0`
+  in every run and no growth WARN appeared, so neither path executed."*
+- Known gap: **the quarantine tooling announced above has no chaos coverage
+  either.** Per the soak doc: *"The quarantine path was never entered... The
+  quarantine tooling shipped in 2.0 still has no chaos coverage."* `kill -9`
+  truncates cleanly; quarantine exists for mid-file corruption, which none of
+  these runs produced.
+- Known gap: **`Buffered` — the tier this release's headline type change is
+  named after — has zero chaos coverage.** Per the soak doc: *"Only the
+  `Sync` tier ran. `Buffered` — which by design acks before fsync and
+  explicitly does not uphold 'ack ⇒ durable' — has zero chaos coverage.
+  `Batched` is today identical to `Sync` in behaviour, so it is covered
+  transitively."*
 - **The documented pre-PR gate now passes.** `cargo test` had been failing on
   `main` with ~66 spurious `PermissionDenied` errors: `socket::bind_hardened`
   tightens the **process-global** umask to `0o177` around `bind(2)`, and any

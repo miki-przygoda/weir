@@ -54,7 +54,7 @@ enum Command {
         payload: String,
         /// Durability tier: durable | buffered (sync, batched accepted as
         /// legacy aliases for durable).
-        #[arg(long, default_value = "batched", value_parser = parse_durability)]
+        #[arg(long, default_value = "durable", value_parser = parse_durability)]
         durability: Durability,
         /// Path to the daemon's Unix socket.
         #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
@@ -124,7 +124,7 @@ enum DlCommand {
         socket: PathBuf,
         /// Durability tier for the re-pushed records: durable | buffered
         /// (sync, batched accepted as legacy aliases for durable).
-        #[arg(long, default_value = "batched", value_parser = parse_durability)]
+        #[arg(long, default_value = "durable", value_parser = parse_durability)]
         durability: Durability,
         /// Actually requeue. Without this flag, prints what would be requeued.
         #[arg(long)]
@@ -193,7 +193,7 @@ enum QuarantineCommand {
         socket: PathBuf,
         /// Durability tier for the re-pushed records: durable (sync, batched
         /// accepted as legacy aliases). NOT buffered — refused, see above.
-        #[arg(long, default_value = "batched", value_parser = parse_durability)]
+        #[arg(long, default_value = "durable", value_parser = parse_durability)]
         durability: Durability,
         /// Actually requeue. Without this flag, prints what would be requeued.
         #[arg(long)]

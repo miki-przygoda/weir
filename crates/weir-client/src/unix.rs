@@ -609,7 +609,13 @@ mod tests {
     fn set_default_durability_used_by_push_default() {
         let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut c = WeirClient::from_stream(client_end);
-        c.set_default_durability(Durability::Durable);
+        // Buffered, not Durable: Durable (0x01) is the wire byte several
+        // other code paths default to, so asserting Durable here would pass
+        // even if push_default ignored the stored default and hardcoded
+        // Durable. Buffered (0x03) is the only tier that can't leak through
+        // by accident, so it's the one that actually proves the stored
+        // default is threaded onto the wire.
+        c.set_default_durability(Durability::Buffered);
 
         let reader = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -629,11 +635,14 @@ mod tests {
             )
             .encode();
             server_end.write_all(&ack).unwrap();
-            h.durability()
+            // Byte 6 of the header is the durability byte on the wire.
+            (h.durability(), hdr[6])
         });
 
         c.push_default(b"hello").unwrap();
-        assert_eq!(reader.join().unwrap(), Durability::Durable);
+        let (durability, wire_byte) = reader.join().unwrap();
+        assert_eq!(durability, Durability::Buffered);
+        assert_eq!(wire_byte, 0x03);
     }
 
     #[test]

@@ -159,13 +159,18 @@ def build_stage_md(stage_groups: dict[str, list[dict]]) -> str:
         ]
         if not scenarios:
             continue
-        # Sort key, not a durability tier: matches the "sync"/"batched"/
-        # "buffered" substring still present in each scenario name. `sync` and
-        # `batched` are the same tier (`Durable`) since 2.0 — this dict only
-        # fixes column order (Sync-tag, Batched-tag, Buffered), it does not
-        # imply three distinct tiers. The real, current tier set is
-        # `durable`/`buffered` (see the `tier` Prometheus label).
-        tier_order = {"sync": 0, "batched": 1, "buffered": 2}
+        # Sort key, not a durability tier. Current scenario tags (see
+        # latency_stage_breakdown in crates/weir-server/tests/load.rs) are
+        # `stage_durable_d{d}ms` and `stage_buffered_d{d}ms` — there is no
+        # "sync" or "batched" substring in anything this script parses today.
+        # The `sync`/`batched` keys below are legacy: pre-2.0 results.json
+        # snapshots (see the dated docs/benchmarks/phase3-stage-*.md tables)
+        # used `stage_sync_*`/`stage_batched_*`, and this dict still needs to
+        # sort those if re-run against old data. `durable` must map to the
+        # same rank as the legacy `sync` (both are the `Durable` tier) or a
+        # current results.json sorts `durable` after `buffered` instead of
+        # before it.
+        tier_order = {"durable": 0, "sync": 0, "batched": 1, "buffered": 2}
         scenarios.sort(key=lambda x: tier_order.get(
             next((p for p in x[0].split("_") if p in tier_order), "z"), 3
         ))

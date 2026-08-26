@@ -42,7 +42,7 @@ recipes.
 ## Basic push / ack
 
 ### `smoke_single_push_ack`
-The cheapest canary: a single `Sync` push round-trips with an `Ok`. If
+The cheapest canary: a single `Durable` push round-trips with an `Ok`. If
 this fails, the binary is fundamentally broken (won't start, accept, or
 ack) and every other test would fail too.
 
@@ -70,8 +70,8 @@ a health check from an (rejected) empty push.
 ## Concurrent producers
 
 ### `concurrent_producers_all_acked`
-8 threads × 100 Batched pushes. Beyond "no thread panicked", it scrapes
-`weir_records_ack_total{tier="batched"}` and asserts it equals exactly
+8 threads × 100 Durable pushes. Beyond "no thread panicked", it scrapes
+`weir_records_ack_total{tier="durable"}` and asserts it equals exactly
 800 — a thread that silently dropped half its pushes would land here with
 a short count rather than passing.
 
@@ -193,14 +193,14 @@ per-stage latency histograms register too, for **35 families**, and the
 match. This is the most valuable metrics test — these names are public
 API. (The old doc's "19 families" count was stale.)
 
-### `records_accepted_counter_increments_after_sync_pushes`
-After 10 Sync pushes, the body contains
-`weir_records_accepted_total{tier="sync"} 10`. Catches the accepted
+### `records_accepted_counter_increments_after_durable_pushes`
+After 10 Durable pushes, the body contains
+`weir_records_accepted_total{tier="durable"} 10`. Catches the accepted
 counter being miswired (wrong tier label, wrong increment site).
 
-### `records_ack_counter_increments_after_sync_pushes`
-After 7 Sync pushes, the body contains
-`weir_records_ack_total{tier="sync"} 7`. The ack-side counterpart.
+### `records_ack_counter_increments_after_durable_pushes`
+After 7 Durable pushes, the body contains
+`weir_records_ack_total{tier="durable"} 7`. The ack-side counterpart.
 
 ### `drain_state_shows_draining_and_not_blocked`
 On startup the pre-initialised `weir_drain_state` gauge vector reads
@@ -417,3 +417,8 @@ The following names appeared in earlier revisions of this audit and are
   `metrics_internally_consistent_per_session`; the cross-restart axis is
   now covered by `metrics_reset_to_zero_after_restart` and
   `recovery_replays_records_after_crash`.
+- `records_accepted_counter_increments_after_sync_pushes` → renamed to
+  `records_accepted_counter_increments_after_durable_pushes` (the `Sync`
+  tier is gone; behaviour unchanged).
+- `records_ack_counter_increments_after_sync_pushes` → renamed to
+  `records_ack_counter_increments_after_durable_pushes` (same reason).

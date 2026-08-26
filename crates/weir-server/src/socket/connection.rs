@@ -302,7 +302,7 @@ where
                 // client mis-reads as a later reply, and it poisons its connection
                 // on exactly that.
                 //
-                // All three durability tiers are rejected: Buffered still writes
+                // Both durability tiers are rejected: Buffered still writes
                 // to the WAB, it just acks earlier.
                 if over_wab_cap(&config) {
                     send_nack(
