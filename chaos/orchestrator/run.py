@@ -9,10 +9,13 @@ drop, so today they inherit root from this process, same as the daemon under
 test. A real drop needs `setuid`/capability plumbing that is its own piece of
 work and is deferred; see README.md's Requirements section.
 
-Phase 1 injects one fault class (random SIGKILL, applied unconditionally in
-the episode loop below). The dm-flakey, dm-delay, ENOSPC, remount and
-dead-letter classes land in Phases 2-3 as additional entries in the
-`[faults]` table.
+Phase 1 injects one fault class: random SIGKILL (`kill_random`), which is
+also the default when a schedule's `[faults]` table is empty or absent —
+every Phase 1 schedule stays byte-identical. Phase 2 adds `power_loss`
+(dm-flakey `drop_writes`, protocol (a): engage, kill immediately, disengage
+before restart — see the episode loop below). `fault_kind()` dispatches
+between them and raises on anything else, rather than silently falling back.
+dm-delay, ENOSPC, remount and dead-letter classes remain for Phase 3.
 
 Usage: sudo python3 run.py schedules/smoke.toml
 """
@@ -51,6 +54,20 @@ LEDGER_FLUSH_THRESHOLD = 256
 LOADGEN_STOP_TIMEOUT_SECS = 60
 
 
+def fault_kind(sched):
+    """Which fault this schedule injects. Defaults to Phase 1's `kill_random`.
+
+    An unknown kind raises rather than falling back: silently running a Phase 1
+    episode under a Phase 2 schedule and reporting it as power loss is exactly
+    the class of harness lie this project exists to avoid.
+    """
+    kind = (sched.get("faults") or {}).get("kind", "kill_random")
+    if kind not in ("kill_random", "power_loss"):
+        raise ValueError(
+            f"unknown fault kind {kind!r}; expected 'kill_random' or 'power_loss'")
+    return kind
+
+
 def load_schedule(path):
     """Reads a schedule TOML.
 
@@ -64,9 +81,29 @@ def load_schedule(path):
     work. The unit test missed it by passing `../schedules/smoke.toml` from
     inside `orchestrator/`, which happens to resolve correctly under both rules,
     so the test pinned the bug rather than catching it.
+
+    Also refuses a schedule that pairs `fault.kind = "power_loss"` with
+    `storage.dm_target = "linear"`. `linear` is dm-flakey's pass-through
+    stand-in (dm_stack.py) — it builds a real dm layer but injects nothing, so
+    that combination would run an episode that injects nothing, loses
+    nothing, and reports green: indistinguishable from a genuine pass, and
+    outside the negative control's reach too, since that only fires on the
+    Buffered tier. Caught HERE, at load time, so it fails before an episode
+    runs rather than only once `engage_fault()` is reached mid-run.
     """
     with open(path, "rb") as f:
-        return tomllib.load(f)
+        sched = tomllib.load(f)
+    if (fault_kind(sched) == "power_loss"
+            and sched.get("storage", {}).get("dm_target") == "linear"):
+        raise ValueError(
+            "schedule pairs fault.kind='power_loss' with storage.dm_target="
+            "'linear': linear is dm-flakey's pass-through stand-in and "
+            "injects nothing, so this run would report green having tested "
+            "no power loss at all. Use dm_target='flakey' for a real "
+            "power-loss run, or fault.kind='kill_random' if this schedule is "
+            "only validating linear's plumbing."
+        )
+    return sched
 
 
 def run_id_from_seed(seed):
@@ -491,6 +528,11 @@ def main():
 
     schedule_path = sys.argv[1] if len(sys.argv) > 1 else "../schedules/smoke.toml"
     sched = load_schedule(schedule_path)
+    # Fixed for the whole run: one schedule injects exactly one fault class.
+    # load_schedule() already refused the incoherent linear+power_loss
+    # combination, and already raises on an unknown kind — this call cannot
+    # fail here.
+    kind = fault_kind(sched)
     seed = sched["seed"]
     # Optional wall-clock bound for soak schedules. A soak is bounded by TIME,
     # not episode count: episode duration varies with quiescence and restart,
@@ -531,6 +573,10 @@ def main():
         backing_file=os.path.join(run_dir, "wab.img"),
         size_mb=sched["storage"]["size_mb"],
         mount_point=mount_point,
+        # None unless the schedule names one explicitly (see StorageStack's
+        # docstring for None | "flakey" | "linear"). Absent from every Phase 1
+        # schedule, so those keep building exactly the Phase 1 stack.
+        dm_target=sched["storage"].get("dm_target"),
     )
 
     loadgen_bin = os.path.join(CHAOS_ROOT, "target", "release", "loadgen")
@@ -679,14 +725,33 @@ def main():
                     # `abort_reason` is what makes this count as an anomaly.
                     anomalies += 1
                     ep_log.write(json.dumps({
-                        "episode": i, "fault": "kill_random", "ok": True,
+                        "episode": i, "fault": kind, "ok": True,
                         "quiesced": False, "abort_reason": reason,
                         "exit_code": code, "seed": seed,
                     }) + "\n")
                     ep_log.flush()
                     break
 
-                daemon.kill9()
+                if kind == "power_loss":
+                    # PROTOCOL (a). Engage, then kill IMMEDIATELY, so the lying
+                    # window holds ~zero acks.
+                    #
+                    # drop_writes is a lying disk: it reports fsync success and
+                    # discards the write. Real power loss does not do that — a
+                    # write whose fsync returned is durable. So any ack weir
+                    # emits inside this window is an ack reality would never
+                    # have allowed, and counting it against weir is the harness
+                    # lying to weir. Keeping the window at ~zero is what makes
+                    # the Buffered result mean "Buffered acks before fsync"
+                    # rather than "the window ate the write".
+                    stack.engage_fault()
+                    daemon.kill9()
+                    # Disengage BEFORE restarting: recovery must run against an
+                    # honest disk, or the restart tests a second fault rather
+                    # than recovery from the first.
+                    stack.disengage_fault()
+                else:
+                    daemon.kill9()
                 daemon.start("http://127.0.0.1:9900/ingest")
 
                 # PAUSE THE PRODUCER before waiting for the drain.
@@ -757,7 +822,7 @@ def main():
 
                 record = {
                     "episode": i,
-                    "fault": "kill_random",
+                    "fault": kind,
                     "steady_secs": round(delay, 2),
                     "quiesced": ok,
                     "quiescence_note": reason,

@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -165,6 +166,83 @@ class TestSchedule(unittest.TestCase):
         s = run.load_schedule("../schedules/smoke.toml")
         self.assertGreater(s["load"]["min_acked_per_episode"], 0)
         self.assertGreater(s["load"]["min_delivered_per_episode"], 0)
+
+
+class TestFaultDispatch(unittest.TestCase):
+    def test_an_empty_faults_table_still_means_kill_random(self):
+        # Every Phase 1 schedule ships `[faults]` empty. They must keep doing
+        # exactly what they did before, or five banked soaks stop being
+        # comparable to anything run after this.
+        self.assertEqual(run.fault_kind({"faults": {}}), "kill_random")
+        self.assertEqual(run.fault_kind({}), "kill_random")
+
+    def test_power_loss_is_selected_explicitly(self):
+        self.assertEqual(
+            run.fault_kind({"faults": {"kind": "power_loss"}}), "power_loss")
+
+    def test_an_unknown_fault_kind_is_refused_loudly(self):
+        # Falling back to kill_random would silently run a Phase 1 episode
+        # under a Phase 2 schedule and report it as power loss.
+        with self.assertRaises(ValueError):
+            run.fault_kind({"faults": {"kind": "typo"}})
+
+
+class TestScheduleCoherence(unittest.TestCase):
+    """A `linear` dm target is dm-flakey's pass-through stand-in (see
+    dm_stack.py) — it builds a real dm layer but injects nothing. Paired with
+    `fault.kind = "power_loss"` it would run an episode that injects nothing,
+    loses nothing, and reports green: indistinguishable from a genuine pass,
+    and outside the negative control's reach too, since that only fires on
+    the Buffered tier (report.powerloss_verdict, Task 7).
+
+    Refused HERE, at schedule-load time, via `load_schedule` — the real
+    entry point every invocation goes through — rather than only once an
+    episode reaches `engage_fault()`, so a misconfigured schedule fails
+    before steady-state load even starts.
+    """
+
+    def _write(self, tmp, faults_kind=None, dm_target=None):
+        lines = []
+        if dm_target is not None:
+            lines += ["[storage]", f'dm_target = "{dm_target}"']
+        if faults_kind is not None:
+            lines += ["[faults]", f'kind = "{faults_kind}"']
+        path = os.path.join(tmp, "sched.toml")
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+
+    def test_linear_paired_with_power_loss_is_refused_at_load_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, faults_kind="power_loss", dm_target="linear")
+            with self.assertRaises(ValueError):
+                run.load_schedule(path)
+
+    def test_flakey_paired_with_power_loss_loads_fine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, faults_kind="power_loss", dm_target="flakey")
+            s = run.load_schedule(path)
+            self.assertEqual(s["faults"]["kind"], "power_loss")
+
+    def test_linear_paired_with_kill_random_loads_fine(self):
+        # linear's only legitimate use is validating plumbing on a machine
+        # without dm-flakey (the Pi), which only makes sense under
+        # kill_random — dm-flakey is what power_loss actually needs.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, faults_kind="kill_random", dm_target="linear")
+            s = run.load_schedule(path)
+            self.assertEqual(s["storage"]["dm_target"], "linear")
+
+    def test_no_dm_target_at_all_paired_with_power_loss_loads_fine(self):
+        # The guard is specifically about `linear` — a real, deliberately
+        # built pass-through. An absent dm_target is Phase 1's ordinary
+        # default and is caught elsewhere (StorageStack.engage_fault raises
+        # loudly if the flakey layer was never built); it is not this
+        # guard's job to duplicate that check.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, faults_kind="power_loss")
+            s = run.load_schedule(path)
+            self.assertEqual(s["faults"]["kind"], "power_loss")
 
 
 class TestSeededKiller(unittest.TestCase):
