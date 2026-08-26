@@ -155,7 +155,7 @@ def cumulative_deltas(result, prev):
 def final_pass(
     loadgen, daemon, recorder, acc, ledger_tail, delivered_tail, wab_dir,
     frontier_slack, seed, prev_totals=None, scrape_fn=None, residue_fn=None,
-    sleep_fn=None, stop_loadgen_fn=None, settle_secs=1.0,
+    sleep_fn=None, stop_loadgen_fn=None, settle_secs=1.0, tier=None, fault=None,
 ):
     """The verification pass that runs AFTER the last episode. D1.
 
@@ -187,7 +187,10 @@ def final_pass(
        HERE: the producer is stopped and both logs are complete, so "no
        exemption" is a true statement rather than a stricter-than-reality one.
        If any of the preconditions failed, fall back to the normal slack and
-       mark the check ADVISORY — see `advisory_reasons` below.
+       mark the check ADVISORY — see `advisory_reasons` below. `tier`/`fault`
+       are forwarded to `acc.check()` unchanged, gating the SAME tier-aware I1
+       exemption the episode loop uses — a Buffered record can still be
+       legitimately unrecovered here if the last fault ate it for good.
     5. WAB post-mortem, BEFORE teardown, while the mount still exists.
 
     Everything after that (recorder, `stack.teardown()`, report) stays with the
@@ -203,7 +206,7 @@ def final_pass(
     stop_loadgen_fn = stop_loadgen_fn or stop_loadgen
     prev_totals = prev_totals or {}
 
-    record = {"episode": "final", "fault": "none", "seed": seed}
+    record = {"episode": "final", "fault": "none", "seed": seed, "tier": tier}
     #: Conditions under which "acked but not delivered" is NOT weir's fault, so
     #: `frontier_slack=0` would manufacture a violation out of a harness or
     #: teardown artefact. Any one of them downgrades the check to advisory.
@@ -294,7 +297,7 @@ def final_pass(
     result = None
     try:
         acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
-        result = acc.check(frontier_slack=slack)
+        result = acc.check(frontier_slack=slack, tier=tier, fault=fault)
     except Exception as exc:
         # Do NOT let this skip step 5. A `LogTailer` refusal (an append-only
         # log that shrank) is a real finding, but the WAB post-mortem is the
@@ -323,6 +326,11 @@ def final_pass(
             "ledger_conflicts": result.ledger_conflicts[:50],
             "i1_exempt": result.i1_exempt,
             "pending_provenance": result.pending_provenance,
+            # Tier-aware I1 (Phase 2): non-zero only for a Buffered record
+            # (tier="U") checked under fault="power_loss" — see
+            # verify.check_counts. Always 0 for Phase 1 and for every other
+            # tier/fault combination, so this never changes a Phase 1 report.
+            "expected_loss": result.expected_loss,
         })
     else:
         # No check ran, so there is no durability claim to have passed. "ok":
@@ -745,11 +753,16 @@ def main():
                     # the Buffered result mean "Buffered acks before fsync"
                     # rather than "the window ate the write".
                     stack.engage_fault()
-                    daemon.kill9()
-                    # Disengage BEFORE restarting: recovery must run against an
-                    # honest disk, or the restart tests a second fault rather
-                    # than recovery from the first.
-                    stack.disengage_fault()
+                    try:
+                        daemon.kill9()
+                    finally:
+                        # Disengage even if kill9 raises. A device left engaged
+                        # means the NEXT episode's steady-state load runs
+                        # against a lying disk, silently corrupting the run from
+                        # that point on. Today the outer teardown would catch
+                        # it, but that guarantee should not depend on tracing
+                        # the whole file's exception flow.
+                        stack.disengage_fault()
                 else:
                     daemon.kill9()
                 daemon.start("http://127.0.0.1:9900/ingest")
@@ -781,7 +794,10 @@ def main():
                     # Give the recorder a moment to finish its final append.
                     time.sleep(1.0)
                     acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
-                    result = acc.check(frontier_slack=frontier_slack)
+                    result = acc.check(
+                        frontier_slack=frontier_slack,
+                        tier=sched["load"]["tier"], fault=kind,
+                    )
                 finally:
                     # Always resume, even if the wait or the check raised —
                     # leaving the producer stopped would silently turn every
@@ -823,6 +839,7 @@ def main():
                 record = {
                     "episode": i,
                     "fault": kind,
+                    "tier": sched["load"]["tier"],
                     "steady_secs": round(delay, 2),
                     "quiesced": ok,
                     "quiescence_note": reason,
@@ -859,6 +876,10 @@ def main():
                     # exemption stays visible.
                     "i1_exempt": result.i1_exempt,
                     "pending_provenance": result.pending_provenance,
+                    # Tier-aware I1 (Phase 2): see the matching comment in
+                    # final_pass(). This is what report.powerloss_verdict sums
+                    # across a run's Buffered power-loss episodes.
+                    "expected_loss": result.expected_loss,
                     "seed": seed,
                 }
                 if advisory:
@@ -894,6 +915,7 @@ def main():
             final_record, v, a = final_pass(
                 loadgen, daemon, recorder, acc, ledger_tail, delivered_tail,
                 daemon.wab_dir, frontier_slack, seed, prev_totals=prev_totals,
+                tier=sched["load"]["tier"], fault=kind,
             )
             violations += v
             anomalies += a

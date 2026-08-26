@@ -426,6 +426,41 @@ class TestFinalPass(unittest.TestCase):
     the drain given a real chance to finish. Every collaborator is injected,
     so the ordering and the post-mortem are testable without root."""
 
+    def test_tier_and_fault_reach_the_accumulator_and_expected_loss_lands_in_the_record(self):
+        # Folded item 1 (Task 7): without this wiring, acc.check() never
+        # learns the tier/fault, expected_loss stays 0 forever, and
+        # report.powerloss_verdict would read "inconclusive" on every real
+        # run regardless of what actually happened.
+        kwargs, _ = final_pass_fixture(
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"],
+        )
+        record, violations, anomalies = run.final_pass(
+            **kwargs, tier="U", fault="power_loss",
+        )
+        self.assertTrue(
+            record["ok"],
+            "a Buffered ack lost under power_loss is the exempted case, not "
+            "a violation",
+        )
+        self.assertEqual(record["i1_missing"], [])
+        self.assertEqual(record["expected_loss"], 1)
+        self.assertEqual(record["tier"], "U")
+        self.assertEqual((violations, anomalies), (0, 0))
+
+    def test_no_tier_or_fault_is_exactly_phase_1_behaviour(self):
+        # Defaults must reproduce the pre-Task-7 result byte for byte: the
+        # same missing seq is a violation, not an exemption, and
+        # expected_loss stays 0.
+        kwargs, _ = final_pass_fixture(
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"],
+        )
+        record, violations, anomalies = run.final_pass(**kwargs)
+        self.assertFalse(record["ok"])
+        self.assertEqual(record["i1_missing"], [2])
+        self.assertEqual(record["expected_loss"], 0)
+        self.assertIsNone(record["tier"])
+        self.assertEqual((violations, anomalies), (1, 0))
+
     def test_it_runs_its_steps_in_the_only_order_that_works(self):
         kwargs, log = final_pass_fixture()
         run.final_pass(**kwargs)

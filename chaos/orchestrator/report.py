@@ -161,6 +161,35 @@ def _yes_no(value):
     return "yes" if value else "**NO**"
 
 
+def powerloss_verdict(records):
+    """pass | inconclusive | fail for a power-loss run.
+
+    Any durable-tier loss fails outright — that is the contract: `kill -9`
+    and power loss alike hold Durable to zero loss.
+
+    A Buffered run that lost NOTHING across every power-loss episode is
+    `inconclusive`, not `pass`. Under a correct power-loss model Buffered
+    should lose something — it acks before fsync — so losing nothing
+    suggests the injector never bit. Reporting that as success is how a
+    chaos harness starts lying: a test that cannot fail proves nothing.
+
+    The suspicion rule is Buffered-only. Durable losing nothing is the
+    contract being upheld, not evidence of a dead injector.
+
+    A run with no power-loss episodes at all (e.g. a Phase 1 kill_random
+    run) is a `pass`: this rule has nothing to say about it.
+    """
+    pl = [r for r in records if r.get("fault") == "power_loss"]
+    if not pl:
+        return "pass"
+    if any(r.get("i1_missing") for r in pl):
+        return "fail"
+    buffered = [r for r in pl if r.get("tier") == "U"]
+    if buffered and sum(r.get("expected_loss", 0) for r in buffered) == 0:
+        return "inconclusive"
+    return "pass"
+
+
 def render(episodes, meta):
     """Renders episodes (list of dicts) into markdown."""
     fault_episodes = [e for e in episodes if e.get("episode") != FINAL]
@@ -255,6 +284,50 @@ def render(episodes, meta):
             "continuing would have produced passing episodes that verified an "
             "idle daemon. Every episode after this point is absent, not passing.\n"
         )
+
+    # The negative control (Task 7). Rendered only when this run actually
+    # injected power loss — a Phase 1 kill_random report has nothing to say
+    # here and must not grow a section about a rule that does not apply to it.
+    pl_records = [e for e in episodes if e.get("fault") == "power_loss"]
+    if pl_records:
+        verdict = powerloss_verdict(episodes)
+        buffered_pl = [e for e in pl_records if e.get("tier") == "U"]
+        buffered_loss = sum(e.get("expected_loss", 0) for e in buffered_pl)
+        lines.append("## Power-loss verdict\n")
+        lines.append(
+            f"**{verdict.upper()}.** Total Buffered `expected_loss` across this "
+            f"run's power-loss episodes: **{buffered_loss}**.\n"
+        )
+        if verdict == "inconclusive":
+            lines.append(
+                "Buffered lost NOTHING across every power-loss episode in this "
+                "run. Under a correct power-loss model Buffered should lose "
+                "something — it acks after the in-memory write, before any "
+                "fsync — so a result of exactly zero is read as **suspicious, "
+                "not as success**: it suggests the injector was not actually "
+                "active, not that weir is unusually durable. "
+                "See `report.powerloss_verdict`.\n"
+            )
+        elif verdict == "fail":
+            lines.append(
+                "A Durable record was lost under power loss. Durable is held "
+                "to zero loss under every fault class this harness injects, "
+                "`kill -9` and power loss alike — this is a genuine "
+                "durability violation, not the Buffered exemption.\n"
+            )
+        elif buffered_pl:
+            lines.append(
+                "Buffered lost at least one record somewhere in this run, and "
+                "no Durable record was lost — the expected shape of a "
+                "power-loss result: Buffered's documented contract paying "
+                "out, Durable's held.\n"
+            )
+        else:
+            lines.append(
+                "No Durable record was lost under power loss — the contract "
+                "held. (This run recorded no Buffered power-loss episodes, so "
+                "the negative control does not apply.)\n"
+            )
 
     # Totals as of the LAST verified episode, not a sum across episodes:
     # verify.Accumulator is cumulative, so summing would inflate every figure
@@ -406,9 +479,13 @@ def render(episodes, meta):
         "- Phase 1 injects **random SIGKILL only**. Targeted mid-fsync kills, power "
         "loss, torn writes, disk-full, slow disk, read-only remount and dead-letter "
         "exhaustion are Phases 2-3 and are **not** covered by this run.\n"
-        "- Invariant I1 is **not yet tier-aware**: all tiers are held to zero loss, "
-        "which is correct for process-crash but will need relaxing for Buffered "
-        "under power loss in Phase 2.\n"
+        "- Invariant I1 is **tier- and fault-aware** (Phase 2): a Buffered ack "
+        "(`tier=\"U\"`) is exempted from I1 ONLY under simulated power loss "
+        "(`fault=\"power_loss\"`) — `kill -9` still holds every tier to zero "
+        "loss. The exemption's size is reported as `expected_loss`, never "
+        "silently dropped, and a Buffered power-loss run losing exactly "
+        "nothing is flagged INCONCLUSIVE rather than read as a pass (see "
+        "Power-loss verdict above, when present).\n"
         "- The seed reproduces the **schedule**, not the exact interleaving. Real "
         "kernel, real timing, real I/O — full determinism is not claimed.\n"
         "- Single host, single filesystem, single hardware configuration.\n"

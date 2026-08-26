@@ -311,6 +311,132 @@ class TestFinalPassSection(unittest.TestCase):
         self.assertNotIn("**FAIL**", out, "no_progress alone must not read as a durability FAIL")
 
 
+class TestPowerLossVerdict(unittest.TestCase):
+    """Task 7's negative control. A Buffered power-loss run that lost NOTHING
+    across every episode is `inconclusive`, not `pass` — under a correct
+    power-loss model Buffered should lose something (it acks before fsync),
+    so losing nothing suggests the injector never bit. A test that cannot
+    fail proves nothing."""
+
+    def test_buffered_losing_nothing_is_INCONCLUSIVE_not_green(self):
+        recs = [{"tier": "U", "fault": "power_loss", "expected_loss": 0,
+                 "i1_missing": []} for _ in range(20)]
+        self.assertEqual(report.powerloss_verdict(recs), "inconclusive")
+
+    def test_buffered_losing_records_is_a_pass(self):
+        recs = [{"tier": "U", "fault": "power_loss", "expected_loss": n,
+                 "i1_missing": []} for n in (0, 14, 0, 31)]
+        self.assertEqual(report.powerloss_verdict(recs), "pass")
+
+    def test_any_durable_loss_is_a_fail_regardless(self):
+        recs = [{"tier": "D", "fault": "power_loss", "expected_loss": 0,
+                 "i1_missing": [7]}]
+        self.assertEqual(report.powerloss_verdict(recs), "fail")
+
+    def test_durable_losing_nothing_is_a_pass_not_inconclusive(self):
+        # The suspicion rule applies to Buffered only. Durable losing nothing
+        # is the contract being upheld, not evidence of a dead injector.
+        recs = [{"tier": "D", "fault": "power_loss", "expected_loss": 0,
+                 "i1_missing": []} for _ in range(20)]
+        self.assertEqual(report.powerloss_verdict(recs), "pass")
+
+    def test_no_power_loss_episodes_at_all_is_a_pass(self):
+        # The rule does not apply to a run that never injected power loss —
+        # a Phase 1 kill_random run must not be read as suspicious.
+        recs = [{"tier": "D", "fault": "kill_random", "expected_loss": 0,
+                 "i1_missing": []} for _ in range(20)]
+        self.assertEqual(report.powerloss_verdict(recs), "pass")
+
+    def test_an_empty_run_is_a_pass(self):
+        self.assertEqual(report.powerloss_verdict([]), "pass")
+
+    def test_a_mix_of_tiers_the_buffered_side_still_governs_when_nothing_is_lost(self):
+        # If a run somehow carries both tiers' power-loss episodes and
+        # Buffered lost nothing while Durable (correctly) lost nothing, the
+        # Buffered suspicion still fires — durable-zero alone must not mask
+        # buffered-zero being suspicious.
+        recs = (
+            [{"tier": "D", "fault": "power_loss", "expected_loss": 0,
+              "i1_missing": []} for _ in range(5)]
+            + [{"tier": "U", "fault": "power_loss", "expected_loss": 0,
+                "i1_missing": []} for _ in range(5)]
+        )
+        self.assertEqual(report.powerloss_verdict(recs), "inconclusive")
+
+    def test_non_power_loss_records_are_ignored(self):
+        # A kill_random episode losing nothing must not feed the suspicion
+        # rule — it is not measuring the same thing at all.
+        recs = (
+            [{"tier": "U", "fault": "kill_random", "expected_loss": 0,
+              "i1_missing": []} for _ in range(20)]
+            + [{"tier": "U", "fault": "power_loss", "expected_loss": 5,
+                "i1_missing": []}]
+        )
+        self.assertEqual(report.powerloss_verdict(recs), "pass")
+
+
+class TestPowerLossSection(unittest.TestCase):
+    """Task 7's negative control has to actually reach report.md, not just
+    report.powerloss_verdict() — a verdict function nothing calls would be
+    exactly the disappearing act I5 exists to stop."""
+
+    def _episode(self, n, tier, expected_loss, i1_missing=()):
+        return {
+            "episode": n, "fault": "power_loss", "tier": tier,
+            "ok": not i1_missing, "quiesced": True,
+            "acked": 1000 * (n + 1), "delivered_distinct": 1000 * (n + 1),
+            "acked_delta": 1000, "delivered_delta": 1000,
+            "no_progress": False, "duplicate_rate": 1.0, "unknown": 0,
+            "i1_missing": list(i1_missing), "i2_leaked": [],
+            "expected_loss": expected_loss, "seed": 24301,
+        }
+
+    def test_buffered_zero_loss_is_surfaced_as_inconclusive(self):
+        episodes = [self._episode(0, "U", 0), self._episode(1, "U", 0)]
+        out = report.render(episodes, {})
+        self.assertIn("Power-loss verdict", out)
+        self.assertIn("INCONCLUSIVE", out)
+        self.assertIn("suspicious", out)
+
+    def test_buffered_nonzero_loss_is_surfaced_as_pass_with_the_total(self):
+        episodes = [self._episode(0, "U", 14), self._episode(1, "U", 0)]
+        out = report.render(episodes, {})
+        self.assertIn("Power-loss verdict", out)
+        self.assertIn("PASS", out)
+        self.assertIn(
+            "**14**", out,
+            "the TOTAL across episodes, not one episode's own figure",
+        )
+
+    def test_durable_loss_is_surfaced_as_fail(self):
+        episodes = [self._episode(0, "D", 0, i1_missing=[7])]
+        out = report.render(episodes, {})
+        self.assertIn("Power-loss verdict", out)
+        self.assertIn("FAIL", out)
+
+    def test_a_kill_random_run_gets_no_power_loss_section_at_all(self):
+        # The negative control does not apply to a run that never injected
+        # power loss; the section must not appear and must not clutter a
+        # Phase 1 report.
+        episodes = [
+            {"episode": 0, "fault": "kill_random", "ok": True, "quiesced": True,
+             "acked_delta": 1000, "delivered_delta": 1000, "no_progress": False,
+             "duplicate_rate": 1.0, "unknown": 0, "i1_missing": [], "i2_leaked": [],
+             "seed": 1},
+        ]
+        out = report.render(episodes, {})
+        self.assertNotIn(
+            "## Power-loss verdict", out,
+            "the Limitations bullet may still MENTION the section by name; "
+            "only the section itself must be absent",
+        )
+
+    def test_limitations_no_longer_claims_i1_is_not_tier_aware(self):
+        out = report.render([], {})
+        self.assertNotIn("not yet tier-aware", out)
+        self.assertIn("tier- and fault-aware", out)
+
+
 if __name__ == "__main__":
     unittest.main()
 

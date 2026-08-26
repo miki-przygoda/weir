@@ -1,0 +1,42 @@
+# Power loss against the Buffered tier. THE POINT of Phase 2.
+#
+# Buffered acks after the in-memory write, before any fsync, so power loss may
+# legitimately eat an acked record. That is its documented contract and no run
+# has ever measured how much. This one does.
+#
+# A result of zero loss across every episode is INCONCLUSIVE, not green — see
+# report.powerloss_verdict(). It means the injector probably never bit.
+seed = 0x9F1A1
+episodes = 200
+max_duration_secs = 7200
+steady_lo_secs = 20.0
+steady_hi_secs = 40.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "U"
+min_acked_per_episode = 100
+# Phase 1's floor of 100 assumes nothing is lost, which is the opposite of
+# what this run expects: Buffered acks are meant to go missing here. A floor
+# that high would flag every episode that behaves exactly as documented as
+# "no progress".
+min_delivered_per_episode = 1
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 2048
+# The real fault, not the pass-through stand-in. `load_schedule()` refuses
+# `dm_target = "linear"` paired with `fault.kind = "power_loss"` for exactly
+# this reason: linear injects nothing, so that combination would report green
+# having tested no power loss at all.
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"
