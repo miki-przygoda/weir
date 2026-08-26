@@ -45,21 +45,19 @@ Total frame size: `16 + payload_len + 4` bytes.
 
 ## Durability tiers
 
-| Byte | Name      | Guarantee                                                       |
-|------|-----------|-----------------------------------------------------------------|
-| 0x01 | Sync      | Group fdatasync at the batch boundary before Ack — on stable storage |
-| 0x02 | Batched   | Group fdatasync at the batch boundary before Ack — on stable storage |
-| 0x03 | Buffered  | Ack after memory write; fsync is deferred                       |
+| Byte | Name      | Guarantee                                                            |
+|------|-----------|------------------------------------------------------------------------|
+| 0x01 | Durable   | Group fdatasync at the batch boundary before Ack — on stable storage  |
+| 0x02 | *retired* | Formerly `Batched`. Still **decodes** to `Durable`; never emitted.    |
+| 0x03 | Buffered  | Ack after memory write; fsync is deferred                             |
 
-> **Sync and Batched share the same durability guarantee.** Both fdatasync at the
-> batch boundary before acking every record in the batch — one group fsync at the
-> end of the batch covers every record written during it, so there is no
-> durability or speed distinction between the two tiers. The historical
-> "Sync = one fdatasync per record, Batched = one fdatasync per batch" distinction
-> **no longer applies** (a single-producer serial workload sees no difference
-> because the batch holds one record anyway; under concurrent producers, Sync
-> amortises into the group fsync just like Batched). See
-> [architecture.md → durability tiers](architecture.md).
+> **`0x02` is retired and permanently reserved.** It was `Batched`, which
+> fsynced once per batch while `Sync` fsynced once per record; both moved to the
+> batch-boundary group fsync and the distinction stopped existing. A daemon
+> still accepts `0x02` so producers built against weir 1.x keep working, and
+> canonicalises it to `Durable` — the encoder never emits `0x02`. It will not be
+> reassigned to a future tier, because that would silently mis-tier every 1.x
+> client.
 
 ---
 
@@ -263,7 +261,7 @@ encoder in `crates/weir-core/tests/reference_frames.rs`.
 A client implementation that produces these exact bytes is
 wire-compatible with the daemon.
 
-### Push of a 5-byte payload (`"hello"`), Sync durability
+### Push of a 5-byte payload (`"hello"`), Durable durability
 
 ```text
 Offset  Hex bytes                                          Field
@@ -271,7 +269,7 @@ Offset  Hex bytes                                          Field
  0      57 45 49 52                                        magic = "WEIR"
  4      01                                                 version = 1
  5      01                                                 message_type = Push
- 6      01                                                 durability = Sync
+ 6      01                                                 durability = Durable
  7      00                                                 flags
  8      05 00 00 00                                        payload_len = 5
 12      66 ad 7d 3c                                        header_crc32
@@ -296,7 +294,7 @@ Offset  Hex bytes                                          Field
  0      57 45 49 52                                        magic = "WEIR"
  4      01                                                 version = 1
  5      02                                                 message_type = Ack
- 6      01                                                 durability = Sync (filler)
+ 6      01                                                 durability = Durable (filler)
  7      00                                                 flags
  8      00 00 00 00                                        payload_len = 0
 12      c9 47 4b 3a                                        header_crc32
@@ -304,7 +302,7 @@ Offset  Hex bytes                                          Field
 ```
 
 Total: 20 bytes. The `durability` byte on the response is always
-`0x01` (Sync) regardless of the original request's tier — the server
+`0x01` (Durable) regardless of the original request's tier — the server
 populates it to a fixed value. Clients reading responses can ignore
 it.
 
@@ -319,7 +317,7 @@ Offset  Hex bytes                                          Field
  0      57 45 49 52                                        magic = "WEIR"
  4      01                                                 version = 1
  5      03                                                 message_type = Nack
- 6      01                                                 durability = Sync (filler)
+ 6      01                                                 durability = Durable (filler)
  7      00                                                 flags
  8      01 00 00 00                                        payload_len = 1
 12      18 2b 80 24                                        header_crc32
@@ -337,15 +335,15 @@ single-byte payload.
 
 A HealthCheck request has a zero-length payload. The daemon does not
 *act* on the `durability` field for a HealthCheck — but it still **must
-be a valid durability byte** (`0x01` Sync, `0x02` Batched, or `0x03`
-Buffered), because the daemon validates the entire header (including
-durability) before it dispatches on the message type. A HealthCheck
-carrying an out-of-range durability byte (e.g. `0x00`) is rejected with
-`UnknownDurability` → `Nack(UnknownMessage)` and the connection is
-closed, exactly as any other frame with a bad durability byte would be.
-Set it to `0x01` (Sync) by convention; the canonical `healthcheck`
-[conformance vector](conformance.md) does. The HealthCheckResponse
-mirrors the shape — zero payload, all-zero payload CRC.
+be a valid durability byte** (`0x01` Durable, `0x02` *retired* — still
+decodes to Durable, or `0x03` Buffered), because the daemon validates the
+entire header (including durability) before it dispatches on the message
+type. A HealthCheck carrying an out-of-range durability byte (e.g. `0x00`)
+is rejected with `UnknownDurability` → `Nack(UnknownMessage)` and the
+connection is closed, exactly as any other frame with a bad durability
+byte would be. Set it to `0x01` (Durable) by convention; the canonical
+`healthcheck` [conformance vector](conformance.md) does. The
+HealthCheckResponse mirrors the shape — zero payload, all-zero payload CRC.
 
 The canonical HealthCheck carries a **zero-length** payload. The daemon is
 currently **lenient** on this point: a HealthCheck frame that declares a

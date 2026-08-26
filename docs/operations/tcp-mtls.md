@@ -256,11 +256,11 @@ let mut client = WeirClient::connect_tls(
         // Must match a SAN in the server cert.
         server_name: "weir.internal.example.com",
         // Tier used by push_default(); None requires a tier per push.
-        default_durability: Some(Durability::Sync),
+        default_durability: Some(Durability::Durable),
     },
 )?;
 
-client.push(b"hello", Durability::Sync)?;
+client.push(b"hello", Durability::Durable)?;
 ```
 
 The client validates the server certificate against `ca_cert`. The

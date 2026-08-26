@@ -5,7 +5,7 @@ companion: how to wire up monitoring, what each alert means and how to respond,
 and a reference for every metric.
 
 **The one thing to internalise:** weir is **fsync-bound**. `weir_wab_fsync_duration_seconds`
-is the dominant latency signal in any durable-write deployment — Sync latency is
+is the dominant latency signal in any durable-write deployment — Durable-tier latency is
 ≈100% fsync (measured: NVMe ~150 µs, SATA SSD ~1.4 ms; see
 `docs/benchmarks/snapshot-2026-06-13-comparison.md`). Durable throughput is set
 by your disk's fsync latency, full stop. The dashboard and alerts are organised
@@ -217,7 +217,7 @@ The work queue is backing up — the WAB flushers can't keep pace with ingest
 (usually storage pressure). Producers see backpressure (slower acks).
 **Respond:** correlate with fsync latency. If fsync is the bottleneck, you're at
 the storage durability ceiling — faster disk, more shards (one flusher/disk), or
-shift latency-tolerant traffic to the `Batched`/`Buffered` tiers. `[TUNE]` the
+shift latency-tolerant traffic to the `Buffered` tier. `[TUNE]` the
 threshold to your `batch_size × shard_count` and burst profile.
 
 ### Security / connection
@@ -277,10 +277,18 @@ All metrics are prefixed `weir_`. Counters carry a `_total` suffix in the
 exposition; histograms expose `_bucket` / `_sum` / `_count`.
 
 ### Ingest
+
+> **Changed in 2.0.0 — dashboards need a one-line edit.** The `tier` label was
+> `sync`/`batched`/`buffered` and is now `durable`/`buffered`. `sync` and
+> `batched` were separate series for identical behaviour; they are one series
+> named `durable`. Any panel or alert selecting `tier="sync"` or
+> `tier="batched"` will silently return no data until updated — panels go blank
+> rather than erroring, so grep your dashboards rather than waiting to notice.
+
 | Metric | Type | Meaning |
 |---|---|---|
-| `weir_records_accepted_total{tier}` | counter | Records admitted for processing, by durability tier (`sync`/`batched`/`buffered`). |
-| `weir_records_ack_total{tier}` | counter | Records durably acked to the producer, by durability tier (`sync`/`batched`/`buffered`). The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
+| `weir_records_accepted_total{tier}` | counter | Records admitted for processing, by durability tier (`durable`/`buffered`). |
+| `weir_records_ack_total{tier}` | counter | Records durably acked to the producer, by durability tier (`durable`/`buffered`). The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
 | `weir_records_nack_total{tier,reason}` | counter | Records Nacked (not durably accepted), by durability tier and `reason`. Should be ~0. `reason` is one of `bad_magic`, `version_mismatch`, `bad_header_crc`, `payload_too_large`, `bad_payload_crc`, `internal_error`, `empty_payload`, `unknown_message`, `reserved_flags_set` (the wire `NackReason` variant names, lowercased). `internal_error` is the only *transient* reason (queue saturation / ack timeout / write-fsync error / the [`wab_max_bytes`](operations/configuration.md#wab_max_bytes) cap rejecting — connection stays open, producer retries); the rest are permanent protocol/payload errors that close the connection. The cap is the one cause with its own counter — `weir_wab_cap_rejections_total` — so subtracting it from `internal_error` separates "the WAB is full" from the other three. |
 | `weir_accept_latency_seconds` | histogram | Socket-accept → enqueue latency (independent of fsync). |
 | `weir_queue_depth` | gauge | In-flight records between the socket layer and workers. |

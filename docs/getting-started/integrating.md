@@ -34,7 +34,7 @@ use weir_client::WeirClient;
 use weir_core::Durability;
 
 let mut client = WeirClient::connect("/run/weir/weir.sock")?;
-client.push(b"hello, weir!", Durability::Batched)?;
+client.push(b"hello, weir!", Durability::Durable)?;
 ```
 
 For throughput, fan out across connections (one `WeirClient` per producer
@@ -118,7 +118,7 @@ to bound a stalled request write) right after `connect`, so a stalled reply
 surfaces as a `ClientError::Io` timeout the thread can act on. The timeout lives
 on the **socket**, so a fresh connection starts with none — you **must re-apply
 it after every reconnect**, not just at startup. Pick a value comfortably above
-the daemon's Sync ack latency (its own `ACK_TIMEOUT` is 30 s, so e.g. 45–60 s lets
+the daemon's Durable ack latency (its own `ACK_TIMEOUT` is 30 s, so e.g. 45–60 s lets
 a legitimate Nack win rather than racing it).
 
 A sketch of one producer thread (the async-side glue — channel wiring and the

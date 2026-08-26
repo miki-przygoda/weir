@@ -14,8 +14,8 @@ the producer, then drains records to your sink in batches — turning N per-reco
 commits into 1. **An ack is never a false ack:** an acked record is on disk and
 replays after a crash.
 
-`~69 µs` Buffered (non-durable) ack p50 · `~364 µs` durable Sync ack p50 ·
-`~2,550` Sync RPS · `~58,600` RPS at saturation (Buffered, ~64 threads)
+`~69 µs` Buffered (non-durable) ack p50 · `~364 µs` Durable ack p50 ·
+`~2,550` Durable RPS · `~58,600` RPS at saturation (Buffered, ~64 threads)
 *(indicative — single box, sandboxed CI runners; reproduce on your own hardware, see [benchmarks](docs/benchmarks.md))* ·
 5 built-in sinks (4 in a default build; `clickhouse` opt-in) · v1 wire + Rust API frozen under SemVer
 
@@ -68,7 +68,7 @@ mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
 > from an `async fn` (it starves the runtime; use the
 > [async bridge](docs/getting-started/integrating.md#producing-from-an-async-runtime)).
 > And `Buffered` acks *before* fsync, so it survives a process crash but **not**
-> power loss — use `Sync`/`Batched` for data you can't lose. The
+> power loss — use `Durable` for data you can't lose. The
 > [quickstart](docs/getting-started/quickstart.md#push-your-first-record) has the
 > full rundown.
 

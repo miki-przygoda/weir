@@ -203,22 +203,22 @@ throughput. Default `1` is correct for most deployments.
 
 > **`shard_count` is not a throughput dial — and it is non-monotonic under
 > concurrency.** Each connection is pinned to one shard for its lifetime, round-robin
-> at accept time (`counter % shard_count`, `socket/mod.rs`). The Sync-tier throughput
+> at accept time (`counter % shard_count`, `socket/mod.rs`). The Durable-tier throughput
 > lever is **group-fsync batching**: a shard's flusher rides every record currently in
 > its active segment on a single `fsync` (`wab/mod.rs` `flush_batch` — "one group fsync
 > covers every record still in the active segment"), so the more concurrent producers
 > land on a shard, the more records amortise each `fsync`. Spreading the *same* set of
 > connections across more shards does the opposite — it thins connections-per-shard, so
 > each group fsync covers fewer records, while adding one more contending flusher thread
-> per shard. Past the point where that trade turns over, more shards can drop Sync
+> per shard. Past the point where that trade turns over, more shards can drop Durable
 > throughput *below* a single shard. "Match your cores" is therefore a trap for this
 > knob: the optimum is governed by **connections-per-shard**, not core count. If you are
-> chasing Sync throughput, prefer concentrating concurrent producers into **few** shards
+> chasing Durable throughput, prefer concentrating concurrent producers into **few** shards
 > over fanning out into many. (This is qualitative — the turn-over point is workload- and
 > hardware-specific; measure your own.)
 
-> **The "few shards" advice is for the fsync tiers only — it inverts for `Buffered`.**
-> The amortization above exists because Sync/Batched records share a single group
+> **The "few shards" advice is for the fsync tier only — it inverts for `Buffered`.**
+> The amortization above exists because `Durable` records share a single group
 > `fsync`. `Buffered` **never fsyncs** — its records ack the moment they hit memory
 > (`wab/mod.rs`, `Durability::Buffered` acks immediately, with no group fsync), so
 > there is nothing to amortize and no benefit to piling connections onto one shard.
@@ -227,8 +227,8 @@ throughput. Default `1` is correct for most deployments.
 > parallel — in our runs this collapsed aggregate `Buffered` throughput by roughly
 > **8–12×** versus spreading the same connections across shards. So for a `Buffered`
 > workload, **spread connections across shards** (and scale `shard_count` toward your
-> parallel-write capacity); reserve the few-shards guidance for the `Sync`/`Batched`
-> tiers where the group fsync actually rewards density.
+> parallel-write capacity); reserve the few-shards guidance for the `Durable`
+> tier where the group fsync actually rewards density.
 
 The daemon emits a startup advisory if `shard_count` / `worker_count`
 looks unusual for the host's core count. See
@@ -236,7 +236,7 @@ looks unusual for the host's core count. See
 empirical sweep and the heuristic the advisory is based on; the rule
 of thumb is `max(2, cores - 2) / 2`. Treat that advisory as a thread-budget
 sanity check (don't run far more agent threads than cores), **not** a
-throughput recommendation: as the caveat above explains, the Sync-throughput
+throughput recommendation: as the caveat above explains, the Durable-throughput
 optimum follows connections-per-shard, not cores, so the cores-based heuristic
 does not predict the best `shard_count` for throughput.
 
@@ -287,7 +287,7 @@ are the sweet spot found by the empirical sweep.
 > ~6 ms") come from its **single-producer latency** sweep; they are not a guide to
 > throughput under concurrent load. The defaults `(256, 1ms)` are a good starting point
 > at any concurrency — reach for [`shard_count`](#shard_count) and connection density
-> (see its caveat) before these two when tuning concurrent Sync throughput.
+> (see its caveat) before these two when tuning concurrent Durable throughput.
 
 #### `batch_size`
 
@@ -418,7 +418,7 @@ deployments where segments fill quickly on their own.
 A cap on total live WAB bytes on disk — the same footprint
 [`weir_wab_bytes_on_disk`](../monitoring.md) measures: the open active segment
 plus sealed segments awaiting drain. Once live bytes reach the cap, pushes on
-**all three durability tiers** are rejected, including `Buffered`: it still
+**both durability tiers** are rejected, including `Buffered`: it still
 writes to the WAB before it acks, so it is not exempt. This closes the case
 where a dead or stalled drain lets the disk fill while producers keep
 receiving successful acks.
@@ -511,7 +511,12 @@ gain is small, and for small records it is negative.
 
 Compression runs on the flusher thread, **before** the group fsync, so it is on
 the ack path. Measured on the load suite (5-byte payloads, laptop, single run
-each), `p50` ack latency rose consistently across all three durability tiers:
+each), `p50` ack latency rose consistently across all three latency scenarios
+below — two of which, `latency_sync_d1ms` and `latency_batched_d1ms`, now push
+the identical `Durability::Durable` tier and are kept as separate CI scenario
+names only so `deploy/avg_benchmarks.py` and the dated `docs/benchmarks/`
+snapshots keep the columns they've always keyed off; the small gap between
+their numbers below is run-to-run noise, not a durability difference:
 
 | scenario | p50 none | p50 zstd | delta |
 |---|---|---|---|
