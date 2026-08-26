@@ -52,7 +52,8 @@ enum Command {
     Push {
         /// Payload bytes (taken as UTF-8 from the command line).
         payload: String,
-        /// Durability tier: sync | batched | buffered.
+        /// Durability tier: durable | buffered (sync, batched accepted as
+        /// legacy aliases for durable).
         #[arg(long, default_value = "batched", value_parser = parse_durability)]
         durability: Durability,
         /// Path to the daemon's Unix socket.
@@ -121,7 +122,8 @@ enum DlCommand {
         /// Daemon Unix socket to push the records back through.
         #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Durability tier for the re-pushed records: sync | batched | buffered.
+        /// Durability tier for the re-pushed records: durable | buffered
+        /// (sync, batched accepted as legacy aliases for durable).
         #[arg(long, default_value = "batched", value_parser = parse_durability)]
         durability: Durability,
         /// Actually requeue. Without this flag, prints what would be requeued.
@@ -189,8 +191,8 @@ enum QuarantineCommand {
         /// Daemon Unix socket to push the records back through.
         #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Durability tier for the re-pushed records: sync | batched. NOT
-        /// buffered — refused, see above.
+        /// Durability tier for the re-pushed records: durable (sync, batched
+        /// accepted as legacy aliases). NOT buffered — refused, see above.
         #[arg(long, default_value = "batched", value_parser = parse_durability)]
         durability: Durability,
         /// Actually requeue. Without this flag, prints what would be requeued.
@@ -201,11 +203,16 @@ enum QuarantineCommand {
 
 fn parse_durability(s: &str) -> Result<Durability, String> {
     match s.to_ascii_lowercase().as_str() {
-        "sync" => Ok(Durability::Durable),
-        "batched" => Ok(Durability::Durable),
+        // "durable" is the canonical 2.0 spelling — it's what every current
+        // doc uses and what `Durability::Display` now emits. "sync" and
+        // "batched" are kept accepted, same as the deprecated Rust consts and
+        // the retired `0x02` wire byte: scripts and runbooks in the wild use
+        // them, and breaking them buys nothing.
+        "durable" | "sync" | "batched" => Ok(Durability::Durable),
         "buffered" => Ok(Durability::Buffered),
         other => Err(format!(
-            "unknown durability {other:?} (expected sync | batched | buffered)"
+            "unknown durability {other:?} (expected durable | buffered; sync and batched \
+             are accepted as legacy aliases for durable)"
         )),
     }
 }
@@ -2941,13 +2948,21 @@ weir_sink_info{sink_type=\"http\"} 1
 
     #[test]
     fn parse_durability_is_case_insensitive_and_rejects_unknown() {
+        // "durable" is the canonical 2.0 spelling and must parse.
+        assert_eq!(parse_durability("durable").unwrap(), Durability::Durable);
+        assert_eq!(parse_durability("DURABLE").unwrap(), Durability::Durable);
+        // "sync" and "batched" are kept working as legacy aliases.
         assert_eq!(parse_durability("SYNC").unwrap(), Durability::Durable);
         assert_eq!(parse_durability("batched").unwrap(), Durability::Durable);
         assert_eq!(parse_durability("BuFfErEd").unwrap(), Durability::Buffered);
         let err = parse_durability("fast").unwrap_err();
         assert!(
-            err.contains("sync") && err.contains("batched") && err.contains("buffered"),
-            "the error must name the three valid values, got: {err}"
+            err.contains("durable")
+                && err.contains("sync")
+                && err.contains("batched")
+                && err.contains("buffered"),
+            "the error must name the canonical `durable` value and the legacy \
+             sync/batched aliases, got: {err}"
         );
     }
 

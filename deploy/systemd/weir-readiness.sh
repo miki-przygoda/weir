@@ -142,7 +142,7 @@ fi
 # match never trips `set -e` into a silent non-zero exit — we reached READY and
 # must print it. (The DEAD/no-weir-metrics guard above already rules out the
 # wrong-target case that this line previously masked.)
-accepted="$(mval 'weir_records_accepted_total{tier="batched"}')"
+accepted="$(mval 'weir_records_accepted_total{tier="durable"}')"
 sink_type="$(grep -oE 'weir_sink_info\{sink_type="[a-z]+"\} 1' <<<"$METRICS" \
   | sed -E 's/.*sink_type="([a-z]+)".*/\1/' || true)"
 echo "READY: socket ok, /metrics ok, sink=${sink_type:-?} healthy, accepted=${accepted:-0}"

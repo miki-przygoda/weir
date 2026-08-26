@@ -817,7 +817,7 @@
     {
       "type": "timeseries",
       "title": "fsync amortization (fsyncs per durable record)",
-      "description": "Group-fsync efficiency: one fsync covers a whole batch. Far below 1.0 = concurrent Sync/Batched records coalescing (good \u2014 the durable-throughput lever). A rise toward 1.0 under load = batch collapse.",
+      "description": "Group-fsync efficiency: one fsync covers a whole batch. Far below 1.0 = concurrent Durable records coalescing (good \u2014 the durable-throughput lever). A rise toward 1.0 under load = batch collapse.",
       "gridPos": {
         "h": 7,
         "w": 12,
@@ -850,7 +850,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(weir_wab_fsync_duration_seconds_count{job=\"weir\"}[$__rate_interval])) / clamp_min(sum(rate(weir_records_accepted_total{job=\"weir\", tier=~\"sync|batched\"}[$__rate_interval])), 0.001)",
+          "expr": "sum(rate(weir_wab_fsync_duration_seconds_count{job=\"weir\"}[$__rate_interval])) / clamp_min(sum(rate(weir_records_accepted_total{job=\"weir\", tier=\"durable\"}[$__rate_interval])), 0.001)",
           "legendFormat": "fsyncs / record"
         }
       ]
