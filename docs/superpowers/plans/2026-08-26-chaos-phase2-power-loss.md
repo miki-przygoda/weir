@@ -19,7 +19,9 @@
 - **Tier-aware I1 is keyed on tier AND fault, never tier alone.** Buffered stays non-exempt under `kill -9` — a process crash does not lose the page cache, and the Phase 1 contract must survive Phase 2's new exemption.
 - **Zero Buffered loss across every episode is INCONCLUSIVE, not green.**
 - `'D'` is the canonical tier char, `'S'` is accepted (historical ledgers), `'B'` is rejected, `'U'` is Buffered.
-- **beast is the only venue that can run this.** Everything here must be unit-testable without root or device-mapper, so the beast run exercises integration rather than discovering syntax errors.
+- **Two venues, different jobs.** The **Pi** validates plumbing (`dm-linear`, real kernel, real block devices — `dmsetup targets` shows `striped/linear/error`, and `dm-delay` loads for Phase 3 later). **beast** runs the real fault and every data run — it is the only machine with `dm-flakey`. Raspberry Pi OS does not ship `dm-flakey.ko` at all, and the Pi has no DNS, so it cannot be installed there.
+- **A `linear` target must never be paired with `fault = "power_loss"`.** Linear is a pass-through: such a run would inject nothing, lose nothing, and report green — a harness lie of exactly the kind the negative control exists to catch. The pairing is refused at schedule-load time, not at fault-injection time, so it fails before an episode runs rather than after.
+- Everything must still be unit-testable without root or device-mapper, so the Pi run exercises integration rather than discovering syntax errors, and the beast run exercises the *fault* rather than the plumbing.
 - Python gate: `cd chaos/orchestrator && python3 -m pytest -q`. Rust gate for the chaos crate: `cd chaos && cargo build && cargo test`.
 
 ## File Structure
@@ -314,7 +316,9 @@ MSG
 
 **Interfaces:**
 - Consumes: Task 2's `flakey_table`, `table_is_engaged`, `UnexpectedTable`.
-- Produces: `DmStack(..., with_flakey=False)`, `.engage_fault()`, `.disengage_fault()`, `.fault_device` (the path mkfs/mount target).
+- Produces: `DmStack(..., dm_target=None)` where `dm_target` is `None` | `"flakey"` | `"linear"`; `.engage_fault()`, `.disengage_fault()`, `.fault_device` (the path mkfs/mount targets).
+
+**`dm_target="linear"` exists solely to validate plumbing on a machine without `dm-flakey`** — the Pi. It builds the same stack (`losetup -> dmsetup -> mkfs -> mount`), exercises the same create/read-back/remove/suspend-reload-resume paths, and injects nothing. `engage_fault()` on a linear stack must raise, never silently no-op.
 
 - [ ] **Step 1: Write the failing tests**
 
