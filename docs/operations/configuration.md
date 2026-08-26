@@ -814,7 +814,8 @@ weir-ctl dl requeue --wab-dir /var/lib/weir/wab --socket /run/weir/weir.sock --y
   `--yes` performs the real run.
 - **Flags**: `--wab-dir` (env `WEIR_WAB_DIR`); `--socket` (alias `--socket-path`,
   default `/run/weir/weir.sock`) — the daemon socket to push back through;
-  `--durability` (`sync` | `batched` | `buffered`, default `batched`) — the
+  `--durability` (`durable` | `buffered`; `sync` and `batched` are accepted as
+  legacy aliases for `durable`; default `batched`, i.e. `durable`) — the
   durability tier for the re-pushed records; `--yes` to actually requeue.
 - **At-least-once, segment-atomic.** A segment is deleted only after **all** of
   its records are re-accepted (each `Push` is acked only once the daemon has made

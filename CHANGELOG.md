@@ -13,11 +13,30 @@ protocol** below.
 
 ---
 
-## [Unreleased]
+## [2.0.0] - 2026-08-26
 
-**This is a major release.** The `Sink` trait changes shape; the wire protocol,
-`weir-core`, and `weir-client` do not, so **no producer needs recompiling** and
-no existing deployment's clients are affected.
+**This is a major release.** The `Sink` trait changes shape and `Durability`
+collapses from three tiers to two. The wire protocol is unaffected, so **no
+producer needs recompiling** and no existing deployment's clients are
+affected; a downstream Rust crate with an exhaustive `match` over
+`Durability`'s old three variants, or over the old `Sink::Record` associated
+type, needs a small source change — see Breaking below.
+
+### Breaking
+
+- **The `tier` metric label changed** from `sync`/`batched`/`buffered` to
+  `durable`/`buffered`. A panel or alert selecting `tier="sync"` or
+  `tier="batched"` returns no data — **silently**: a blank panel, not an
+  error. See `docs/monitoring.md`.
+- **`Durability` has two tiers, not three.** `Sync` and `Batched` carried the
+  same guarantee since both moved to the batch-boundary group fsync. They are
+  now one tier, `Durable`. `Durability::Sync` and `Durability::Batched`
+  remain as deprecated aliases, so code that *constructs* a tier keeps
+  compiling with a warning; an exhaustive `match` over three variants does
+  not.
+- Wire compatibility is **preserved**: `0x02` still decodes to `Durable`, so
+  producers built against 1.x keep working. The encoder only ever emits
+  `0x01`, and `0x02` is permanently reserved.
 
 ### License
 
@@ -258,6 +277,13 @@ both are observability / behaviour-under-shutdown fixes.
 
 ### Testing
 
+- **Five chaos soaks across three venues and two architectures:
+  100,606,180 acked records over 1,226 `kill -9` crashes, zero durability
+  violations, zero records excused by the frontier exemption.** Recovery
+  truncated exactly 4.000 torn tails per kill in all 1,226. See
+  `docs/benchmarks/chaos-soak/2026-08-26-three-venue-comparison.md`.
+- Known gap: **power loss remains untested.** Every fault above is a process
+  kill, which does not lose the page cache.
 - **The documented pre-PR gate now passes.** `cargo test` had been failing on
   `main` with ~66 spurious `PermissionDenied` errors: `socket::bind_hardened`
   tightens the **process-global** umask to `0o177` around `bind(2)`, and any

@@ -139,8 +139,9 @@ the *only* surviving copy of the record, once every push is accepted. A
 crash between that ack and the next fsync would destroy the record for good
 with nothing left to recover it from. Dead-lettered records don't carry that
 same stake (dead-letter usually isn't the last copy of anything), which is
-why `dl requeue` documents the risk instead of refusing it. Use `sync` or
-`batched` (the default) for `quarantine requeue`.
+why `dl requeue` documents the risk instead of refusing it. Use `durable`
+(the canonical spelling; `sync` and `batched` are still accepted as legacy
+aliases, and remain the flag's literal default) for `quarantine requeue`.
 
 ---
 
