@@ -7,6 +7,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import time
 import unittest
 from collections import namedtuple
 from unittest import mock
@@ -372,6 +373,57 @@ class TestTeardownStackOrder(unittest.TestCase):
 
             self.assertEqual(order, ["umount", "dm_remove", "losetup"])
             self.assertIsNone(s.dm_name, "dm_name must be cleared once removed")
+
+
+class TestAsyncRemoveGuard(unittest.TestCase):
+    def test_remove_polls_until_the_mapping_is_really_gone(self):
+        # `dmsetup remove` returns before udev releases the node. If the next
+        # create runs too early it fails EBUSY, the PREVIOUS table stays
+        # installed, and the next episode measures the old mapping — a
+        # confident result about a device that was never created.
+        calls = []
+        def fake_run(cmd, check=True):
+            calls.append(cmd)
+            if cmd[:2] == ["dmsetup", "info"]:
+                # Present twice, then gone.
+                n = sum(1 for c in calls if c[:2] == ["dmsetup", "info"])
+                return _Result(0 if n <= 2 else 1, "", "")
+            return _Result(0, "", "")
+        with mock.patch.object(dm_stack, "_run", fake_run):
+            dm_stack._dm_remove("weir-chaos-flakey", timeout_s=5)
+        infos = [c for c in calls if c[:2] == ["dmsetup", "info"]]
+        self.assertGreaterEqual(len(infos), 3, "must poll, not fire once")
+
+    def test_remove_raises_if_the_mapping_never_goes_away(self):
+        def always_present(cmd, check=True):
+            return _Result(0, "", "")
+        with mock.patch.object(dm_stack, "_run", always_present):
+            with self.assertRaises(RuntimeError):
+                dm_stack._dm_remove("stuck", timeout_s=0.3)
+
+
+class TestReloadResumesEvenOnFailure(unittest.TestCase):
+    DISENGAGED = "0 65536 flakey 7:19 0 60 0 1 drop_writes"
+
+    def test_a_failed_reload_still_resumes_the_device(self):
+        # A device left suspended blocks all I/O to the filesystem, so the
+        # daemon hangs rather than crashes — and a hang surfaces as a
+        # quiescence timeout, which the harness would misattribute to weir
+        # rather than to itself.
+        calls = []
+        def fake_run(cmd, check=True):
+            calls.append(cmd[1] if cmd[0] == "dmsetup" else cmd[0])
+            if cmd[0] == "dmsetup" and cmd[1] == "reload":
+                raise RuntimeError("simulated reload failure")
+            return _Result(0, self.DISENGAGED, "")
+        s = dm_stack.StorageStack("/tmp/img", 512, "/mnt/x", dm_target="flakey")
+        s.loop_device = "/dev/loop7"
+        s.dm_name = "weir-chaos-flakey-1234"
+        s._sectors = 65536
+        with mock.patch.object(dm_stack, "_run", fake_run):
+            with self.assertRaises(RuntimeError):
+                s.engage_fault()
+        self.assertIn("resume", calls, "resume must fire even when reload fails")
 
 
 if __name__ == "__main__":

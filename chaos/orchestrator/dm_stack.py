@@ -26,6 +26,7 @@ Linux and root only.
 import os
 import subprocess
 import sys
+import time
 
 import dm_flakey
 
@@ -62,6 +63,29 @@ def _linear_table(device, sectors):
     read-back only needs to confirm the target TYPE that actually came up.
     """
     return f"0 {sectors} linear {device} 0"
+
+
+def _dm_remove(name, timeout_s=10):
+    """Removes a mapping and WAITS for it to really be gone.
+
+    `dmsetup remove` is not synchronous: it returns before udev releases the
+    node. The next `create` then fails EBUSY and — this is the dangerous part —
+    the PREVIOUS table stays installed, so the following episode measures the
+    old mapping and reports a confident result about a device it never created.
+    Found the hard way: a portable rewrite of the control script ran fast enough
+    to lose this race, which the original's per-command sudo round-trip had hidden.
+    """
+    _run(["dmsetup", "remove", name], check=False)
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _run(["dmsetup", "info", name], check=False).returncode != 0:
+            return
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"dm mapping {name!r} still present {timeout_s}s after remove. "
+        f"Refusing to continue: the next create would fail EBUSY and leave the "
+        f"stale table installed, so the next episode would measure the wrong device."
+    )
 
 
 class StorageStack:
