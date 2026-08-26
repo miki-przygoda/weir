@@ -164,7 +164,7 @@ where
                 metrics
                     .records_nack
                     .get_or_create(&NackLabel {
-                        tier: TierValue::sync,
+                        tier: TierValue::durable,
                         reason: metric,
                     })
                     .inc();
@@ -373,7 +373,7 @@ where
                 metrics
                     .records_nack
                     .get_or_create(&NackLabel {
-                        tier: TierValue::sync,
+                        tier: TierValue::durable,
                         reason: MetricNack::unknown_message,
                     })
                     .inc();
@@ -519,8 +519,7 @@ fn over_wab_cap(config: &ConnectionConfig) -> bool {
 
 fn durability_to_tier(d: Durability) -> TierValue {
     match d {
-        Durability::Sync => TierValue::sync,
-        Durability::Batched => TierValue::batched,
+        Durability::Durable => TierValue::durable,
         Durability::Buffered => TierValue::buffered,
     }
 }
@@ -1280,11 +1279,11 @@ mod tests {
     }
 
     /// The cap must reject every durability tier: Buffered acks earlier than
-    /// Sync but still writes to the WAB, so exempting it would leave the hole
+    /// Durable but still writes to the WAB, so exempting it would leave the hole
     /// open for the tier most likely to be driving the growth.
     #[tokio::test]
     async fn wab_cap_rejects_every_durability_tier() {
-        for tier in [Durability::Sync, Durability::Batched, Durability::Buffered] {
+        for tier in [Durability::Durable, Durability::Buffered] {
             let cfg = ConnectionConfig {
                 wab_max_bytes: 1_000,
                 wab_bytes_now: Arc::new(AtomicU64::new(5_000)),

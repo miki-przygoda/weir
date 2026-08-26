@@ -799,7 +799,7 @@ fn flush_batch(
             }
 
             match unit.durability {
-                Durability::Sync | Durability::Batched => {
+                Durability::Durable => {
                     // A record that triggered rotation is in the just-sealed
                     // (durable) segment; otherwise it's in the current active
                     // segment, awaiting the group fsync.

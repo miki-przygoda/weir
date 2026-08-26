@@ -80,8 +80,7 @@ fn message_type_name(mt: MessageType) -> &'static str {
 
 fn durability_name(d: Durability) -> &'static str {
     match d {
-        Durability::Sync => "Sync",
-        Durability::Batched => "Batched",
+        Durability::Durable => "Durable",
         Durability::Buffered => "Buffered",
     }
 }

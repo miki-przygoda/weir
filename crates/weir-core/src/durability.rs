@@ -12,7 +12,8 @@
 ///
 /// # Wire values
 ///
-/// `0x01` and `0x03` are fixed. **`0x02` is retired and permanently reserved**:
+/// `0x01` and `0x03` are fixed and must not change without a `WIRE_VERSION`
+/// bump. **`0x02` is retired and permanently reserved**:
 /// it was `Batched`, which fsynced once per batch while `Sync` fsynced once per
 /// record. Both moved to the batch-boundary group fsync, at which point the two
 /// tiers became the same thing. `try_from` still accepts `0x02` so producers

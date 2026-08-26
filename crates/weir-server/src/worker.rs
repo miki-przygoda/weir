@@ -23,7 +23,7 @@ use crate::{
 /// window. Kept in lockstep with the ack path in `wab::flush_*`.
 #[inline]
 fn is_fsync_tier(durability: Durability) -> bool {
-    matches!(durability, Durability::Sync | Durability::Batched)
+    matches!(durability, Durability::Durable)
 }
 
 /// Workers are pinned starting at this logical core index, leaving cores 0–1

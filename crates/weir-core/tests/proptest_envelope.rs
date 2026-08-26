@@ -34,11 +34,7 @@ fn arb_message_type() -> impl Strategy<Value = MessageType> {
 }
 
 fn arb_durability() -> impl Strategy<Value = Durability> {
-    prop_oneof![
-        Just(Durability::Sync),
-        Just(Durability::Batched),
-        Just(Durability::Buffered),
-    ]
+    prop_oneof![Just(Durability::Durable), Just(Durability::Buffered)]
 }
 
 fn arb_header() -> impl Strategy<Value = Header> {

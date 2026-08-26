@@ -26,12 +26,14 @@ pub struct TierLabel {
     pub tier: TierValue,
 }
 
-/// Durability tier label value. Lowercase to match Prometheus naming conventions.
+/// Durability tier label value. Lowercase to match Prometheus naming conventions,
+/// and kept in lockstep with `weir_core::Durability`'s two variants — this is a
+/// separate type only because `EncodeLabelValue` needs a concrete enum, but its
+/// variant names must always equal `Durability`'s `Display` output.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum TierValue {
-    sync,
-    batched,
+    durable,
     buffered,
 }
 
@@ -737,9 +739,9 @@ impl Metrics {
         // on the first scrape — without this a scraper can't baseline them until
         // the first nack actually happens (unlike the pre-initialised gauges and
         // the unlabeled weir_ack_timeout counter, which exist at 0 from boot).
-        // The decode-error reject path attributes its nack to tier=sync (the
+        // The decode-error reject path attributes its nack to tier=durable (the
         // durability tier isn't known until the header parses), so touching every
-        // reason at tier=sync covers the always-reachable label combinations; the
+        // reason at tier=durable covers the always-reachable label combinations; the
         // per-tier payload_too_large/internal_error/empty_payload series still
         // appear on first occurrence as before.
         for reason in [
@@ -756,7 +758,7 @@ impl Metrics {
             // get_or_create returns a guard; binding it to `_` is enough — the
             // series is registered at 0 by the lookup itself.
             let _ = metrics.records_nack.get_or_create(&NackLabel {
-                tier: TierValue::sync,
+                tier: TierValue::durable,
                 reason,
             });
         }
