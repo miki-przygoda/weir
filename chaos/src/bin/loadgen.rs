@@ -171,10 +171,15 @@ fn classify(err: &ClientError) -> Outcome {
     }
 }
 
+/// Maps a `--tier` char to a durability tier.
+///
+/// `'D'` is canonical. `'S'` is accepted because every existing schedule and
+/// every historical `ledger.log` uses it — rejecting it would make the oracle
+/// unable to verify runs already banked. `'B'` (Batched) is retired along with
+/// the tier it named.
 fn tier_from_char(c: char) -> Option<Durability> {
     match c {
-        'S' => Some(Durability::Sync),
-        'B' => Some(Durability::Batched),
+        'D' | 'S' => Some(Durability::Durable),
         'U' => Some(Durability::Buffered),
         _ => None,
     }
@@ -542,11 +547,14 @@ mod tests {
     }
 
     #[test]
-    fn tier_chars_map_to_durability() {
-        use weir_core::Durability;
-        assert_eq!(tier_from_char('S'), Some(Durability::Sync));
-        assert_eq!(tier_from_char('B'), Some(Durability::Batched));
+    fn tier_chars_map_to_the_two_live_tiers() {
+        assert_eq!(tier_from_char('D'), Some(Durability::Durable));
+        // 'S' still parses: every schedule and all five historical ledger.log
+        // files use it, and the oracle must stay able to verify banked runs.
+        assert_eq!(tier_from_char('S'), Some(Durability::Durable));
         assert_eq!(tier_from_char('U'), Some(Durability::Buffered));
+        // 'B' is retired with the Batched tier it named.
+        assert_eq!(tier_from_char('B'), None);
         assert_eq!(tier_from_char('x'), None);
     }
 

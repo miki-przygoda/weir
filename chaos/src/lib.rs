@@ -80,7 +80,7 @@ pub enum Outcome {
 pub struct LedgerEntry {
     /// Per-run sequence number; pairs with the run id to identify the record.
     pub seq: u64,
-    /// Durability tier: 'S' Sync, 'B' Batched, 'U' Buffered (unsynced).
+    /// Durability tier: 'D' Durable, 'S' Sync (legacy), 'U' Buffered (unsynced).
     pub tier: char,
     /// What the daemon said.
     pub outcome: Outcome,
@@ -101,8 +101,8 @@ impl LedgerEntry {
     #[must_use]
     pub fn to_line(&self) -> String {
         debug_assert!(
-            matches!(self.tier, 'S' | 'B' | 'U'),
-            "tier must be S, B or U; {:?} would collide with the field separator \
+            matches!(self.tier, 'D' | 'S' | 'U'),
+            "tier must be D, S or U; {:?} would collide with the field separator \
              and corrupt the line",
             self.tier
         );
@@ -275,7 +275,7 @@ mod tests {
     fn ledger_nack_reason_with_spaces_survives_round_trip() {
         let entry = LedgerEntry {
             seq: 1,
-            tier: 'B',
+            tier: 'D',
             outcome: Outcome::Nacked("some reason with spaces".to_string()),
             t_micros: 5,
             rtt_micros: 6,
@@ -346,7 +346,7 @@ mod tests {
         ] {
             let entry = LedgerEntry {
                 seq: 9,
-                tier: 'B',
+                tier: 'D',
                 outcome: Outcome::Nacked(reason.to_string()),
                 t_micros: 1,
                 rtt_micros: 1,
