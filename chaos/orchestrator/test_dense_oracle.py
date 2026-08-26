@@ -134,6 +134,21 @@ class TestDifferential(unittest.TestCase):
         self.assert_same(ref.check(frontier_slack=10), dense.check(frontier_slack=10), "sparse+slack")
         self.assert_accumulators_agree(ref, dense, "sparse")
 
+    def test_tier_awareness_does_not_change_phase_1_results(self):
+        # The new exemption must be reachable ONLY by Buffered + power_loss.
+        # Any Phase 1 input must produce byte-identical results with or without
+        # the new arguments, or a legitimate exemption has become a licence to
+        # weaken I1 generally.
+        rng = random.Random(99)
+        ref = verify.ReferenceAccumulator(delivered_run_id=RUN_ID)
+        dense = verify.DenseAccumulator(delivered_run_id=RUN_ID)
+        for lg, dl in random_batches(rng):
+            ref.ingest(lg, dl); dense.ingest(lg, dl)
+            plain = dense.check()
+            tiered = dense.check(tier="D", fault="kill_random")
+            self.assert_same(plain, tiered, "tier-aware must not alter Phase 1")
+            self.assert_same(ref.check(), tiered, "and must still match the reference")
+
     def test_ledger_hwm_matches(self):
         rng = random.Random(1234)
         ref = verify.ReferenceAccumulator(delivered_run_id=RUN_ID)

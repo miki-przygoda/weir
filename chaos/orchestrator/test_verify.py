@@ -555,5 +555,43 @@ class TestDenseCheck(unittest.TestCase):
         self.assertEqual(self.acc().check().duplicate_rate, 0.0)
 
 
+class TestTierAwareI1(unittest.TestCase):
+    """Phase 2: Buffered may legitimately lose an acked record to power loss —
+    that is its documented contract, not a defect. The exemption is keyed on
+    tier AND fault, never tier alone: kill -9 does not lose the page cache, so
+    a Buffered ack must still survive it.
+    """
+
+    def test_durable_loss_is_a_violation_under_power_loss(self):
+        r = verify.check(ledger(**{"1": ("ACK", "")}), [],
+                         tier="D", fault="power_loss")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.i1_missing, [1])
+
+    def test_buffered_loss_is_expected_under_power_loss(self):
+        # Buffered acks after the in-memory write, before any fsync. Losing
+        # records to power loss is its documented contract.
+        r = verify.check(ledger(**{"1": ("ACK", "")}), [],
+                         tier="U", fault="power_loss")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.i1_missing, [])
+        self.assertEqual(r.expected_loss, 1)
+
+    def test_buffered_loss_is_STILL_a_violation_under_kill9(self):
+        # THE TRAP. kill -9 does not lose the page cache, so a Buffered ack
+        # must survive it. Exempting Buffered on tier alone would silently
+        # discard the Phase 1 contract.
+        r = verify.check(ledger(**{"1": ("ACK", "")}), [],
+                         tier="U", fault="kill_random")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.i1_missing, [1])
+
+    def test_omitting_tier_and_fault_is_exactly_phase_1_behaviour(self):
+        r = verify.check(ledger(**{"1": ("ACK", "")}), [])
+        self.assertFalse(r.ok)
+        self.assertEqual(r.i1_missing, [1])
+        self.assertEqual(r.expected_loss, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

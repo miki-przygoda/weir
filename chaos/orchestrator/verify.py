@@ -22,8 +22,12 @@ ledger-flushed but not yet delivered look like I1 violations. `check_counts`'s
 exempted rather than failed (`i1_exempt`, `pending_provenance`), and both
 exemption counts are reported rather than silently absorbed.
 
-Phase 1 treats all tiers alike. Tier- and fault-aware I1 (where Buffered may
-lose records under simulated power loss) arrives in Phase 2 with dm-flakey.
+Phase 1 treats all tiers alike (`tier`/`fault` omitted, or any combination
+other than Buffered+power_loss). Phase 2 adds one tier- and fault-aware I1
+exemption: a Buffered ack, `tier="U"`, is permitted to go missing ONLY under
+simulated power loss, `fault="power_loss"` — never under `kill_random`, since
+`kill -9` does not lose the page cache. The lost count is reported as
+`expected_loss`, not silently dropped.
 """
 import os
 from dataclasses import dataclass, field
@@ -107,6 +111,14 @@ class VerifyResult:
     #: so NOT counted as orphans (their provenance may simply not have been
     #: flushed to the ledger yet).
     pending_provenance: int = 0
+    #: Acked seqs never delivered, EXEMPTED from I1 because this run is
+    #: Buffered under simulated power loss — Buffered acks after the
+    #: in-memory write, before any fsync, so power loss may legitimately eat
+    #: an acked record. Counted and reported, never silently discarded: the
+    #: whole point of Phase 2 is measuring how much, not waving it away.
+    #: Zero for every Phase 1 caller (tier/fault omitted), and zero for any
+    #: other tier/fault combination — see `check_counts`.
+    expected_loss: int = 0
 
     def summary(self):
         extra = ""
@@ -295,16 +307,18 @@ class ReferenceAccumulator:
                 self.delivered_counts[seq] = self.delivered_counts.get(seq, 0) + 1
                 self.delivered_total += 1
 
-    def check(self, frontier_slack=0):
+    def check(self, frontier_slack=0, tier=None, fault=None):
         """Runs I1/I2/I3 against everything accumulated so far.
 
         `frontier_slack` bounds the I1/orphan frontier exemption — see
         `check_counts`. Passed through, not recomputed, so the accumulator
         stays the single source of truth for the ledger high-water seq.
+        `tier`/`fault` are forwarded untouched, also to `check_counts`.
         """
         return check_counts(
             self.ledger, self.delivered_counts, self.delivered_total,
             self.conflicts, frontier_slack, ledger_hwm=self.ledger_hwm,
+            tier=tier, fault=fault,
         )
 
 
@@ -457,12 +471,13 @@ class DenseAccumulator:
             if seq is not None:
                 self._ingest_delivered(seq)
 
-    def check(self, frontier_slack=0):
+    def check(self, frontier_slack=0, tier=None, fault=None):
         """Runs I1/I2/I3 against everything accumulated so far.
 
         Mirrors `check_counts` exactly. The difference is only where the sets
         come from: maintained incrementally here, rebuilt from the whole ledger
-        there.
+        there. `tier`/`fault` gate the same Buffered-under-power_loss I1
+        exemption — see `check_counts`.
         """
         if frontier_slack:
             frontier = self.ledger_hwm - frontier_slack
@@ -472,7 +487,13 @@ class DenseAccumulator:
             i1_exempt_seqs = set()
             pending_provenance_seqs = set()
 
-        i1_missing = sorted(self._unresolved_acked - i1_exempt_seqs)
+        buffered_powerloss = (tier == "U" and fault == "power_loss")
+        if buffered_powerloss:
+            expected_loss = len(self._unresolved_acked - i1_exempt_seqs)
+            i1_missing = []
+        else:
+            expected_loss = 0
+            i1_missing = sorted(self._unresolved_acked - i1_exempt_seqs)
         i2_leaked = sorted(self._leaked)
         orphaned = sorted(self._no_provenance - pending_provenance_seqs)
 
@@ -498,6 +519,7 @@ class DenseAccumulator:
             ledger_conflicts=list(self.conflicts),
             i1_exempt=len(i1_exempt_seqs),
             pending_provenance=len(pending_provenance_seqs),
+            expected_loss=expected_loss,
         )
 
 
@@ -519,21 +541,24 @@ class DenseAccumulator:
 Accumulator = DenseAccumulator
 
 
-def check(ledger, delivered, frontier_slack=0):
+def check(ledger, delivered, frontier_slack=0, tier=None, fault=None):
     """Runs I1, I2 and I3. `ledger` is {seq: (tag, reason)}, `delivered` a list
     of seq values (duplicates intact).
 
     Convenience wrapper over [`check_counts`] for callers holding a plain list.
+    `tier`/`fault` are forwarded untouched — see `check_counts`.
     """
     counts = {}
     for s in delivered:
         counts[s] = counts.get(s, 0) + 1
-    return check_counts(ledger, counts, len(delivered), [], frontier_slack)
+    return check_counts(
+        ledger, counts, len(delivered), [], frontier_slack, tier=tier, fault=fault,
+    )
 
 
 def check_counts(
     ledger, delivered_counts, delivered_total, conflicts=(), frontier_slack=0,
-    ledger_hwm=None,
+    ledger_hwm=None, tier=None, fault=None,
 ):
     """The invariant core. `delivered_counts` is {seq: times_delivered}.
 
@@ -556,6 +581,15 @@ def check_counts(
     flushed that far yet). Both exemptions are counted and reported, never
     silently dropped — replacing one silent distortion with another would
     defeat the purpose.
+
+    `tier`/`fault` gate a SEPARATE exemption, tier-aware I1: Buffered acks
+    after the in-memory write, before any fsync, so power loss may
+    legitimately eat an acked record — that is its documented contract, not a
+    defect. The exemption is keyed on tier AND fault, never tier alone: kill
+    -9 does not lose the page cache, so a Buffered ack must still survive it.
+    Both default to `None`, under which this is exactly Phase 1 behaviour —
+    every existing caller that never heard of a tier or fault keeps its exact
+    prior result, `expected_loss` included (always 0).
     """
     delivered_set = set(delivered_counts)
 
@@ -586,7 +620,18 @@ def check_counts(
         i1_exempt_seqs = set()
         pending_provenance_seqs = set()
 
-    i1_missing = sorted(i1_absent - i1_exempt_seqs)
+    # Buffered acks after the in-memory write, before any fsync, so power loss
+    # may legitimately eat an acked record. That exemption is keyed on tier
+    # AND fault, never tier alone: `kill -9` does not lose the page cache, so
+    # a Buffered ack must survive it, and that is the Phase 1 contract this
+    # phase must not weaken.
+    buffered_powerloss = (tier == "U" and fault == "power_loss")
+    if buffered_powerloss:
+        expected_loss = len(i1_absent - i1_exempt_seqs)
+        i1_missing = []
+    else:
+        expected_loss = 0
+        i1_missing = sorted(i1_absent - i1_exempt_seqs)
     i2_leaked = sorted(nacked & delivered_set)
     orphaned = sorted(no_provenance - pending_provenance_seqs)
 
@@ -615,4 +660,5 @@ def check_counts(
         ledger_conflicts=list(conflicts),
         i1_exempt=len(i1_exempt_seqs),
         pending_provenance=len(pending_provenance_seqs),
+        expected_loss=expected_loss,
     )
