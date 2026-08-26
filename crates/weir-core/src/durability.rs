@@ -31,6 +31,13 @@ pub enum Durability {
     Buffered = 0x03,
 }
 
+// These deprecated consts are named `Sync` and `Batched` on purpose: they are
+// aliases for the old variant names, and being spelled exactly like those
+// variants is their entire reason to exist — a 1.x caller's `Durability::Sync`
+// / `Durability::Batched` must keep compiling unchanged through the
+// deprecation path. Renaming them to satisfy `non_upper_case_globals` would
+// silently break that path, so the lint is suppressed here instead.
+#[allow(non_upper_case_globals)]
 impl Durability {
     /// Former name of [`Durability::Durable`].
     #[deprecated(since = "2.0.0", note = "renamed to `Durable`")]

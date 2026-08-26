@@ -5,23 +5,24 @@
   "vectors": [
     {
       "name": "push_hello_sync",
-      "notes": "Push of \"hello\" at Sync durability.",
+      "notes": "Push of \"hello\" at Durable durability.",
       "hex": "57454952010101000500000066ad7d3c68656c6c6f86a61036",
       "decode": "ok",
       "message_type": "Push",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "68656c6c6f"
     },
     {
       "name": "push_batched",
-      "notes": "Push at Batched durability exercises durability byte 0x02.",
+      "notes": "Push at the retired Batched durability byte (0x02): a weir 1.x producer's wire byte, permissively decoded to Durable by a 2.0 daemon (see Durability::try_from). Decode-only: a conformant encoder canonicalises and never re-emits 0x02, so this vector is exempt from the byte-identical round-trip check (round_trip=False) \u2014 see retired_batched_byte_decodes_but_never_round_trips in crates/weir-core/tests/conformance.rs. The bytes below are frozen: this is the only artifact proving a 1.x producer's tier byte still decodes.",
       "hex": "57454952010102000200000071e73e277762bafd1b82",
       "decode": "ok",
       "message_type": "Push",
-      "durability": "Batched",
+      "durability": "Durable",
       "flags": 0,
-      "payload_hex": "7762"
+      "payload_hex": "7762",
+      "round_trip": false
     },
     {
       "name": "push_buffered",
@@ -39,7 +40,7 @@
       "hex": "574549520102010000000000c9474b3a00000000",
       "decode": "ok",
       "message_type": "Ack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": ""
     },
@@ -49,7 +50,7 @@
       "hex": "574549520104010000000000f3729b5900000000",
       "decode": "ok",
       "message_type": "HealthCheck",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": ""
     },
@@ -59,7 +60,7 @@
       "hex": "5745495201050100000000004779ecff00000000",
       "decode": "ok",
       "message_type": "HealthCheckResponse",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": ""
     },
@@ -69,7 +70,7 @@
       "hex": "574549520103010001000000182b8024011bdf05a5",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "01"
     },
@@ -79,7 +80,7 @@
       "hex": "574549520103010002000000f68435360201eb40e804",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "0201"
     },
@@ -89,7 +90,7 @@
       "hex": "574549520103010001000000182b80240337be0b4b",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "03"
     },
@@ -99,7 +100,7 @@
       "hex": "574549520103010001000000182b802404942b6fd5",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "04"
     },
@@ -109,7 +110,7 @@
       "hex": "574549520103010001000000182b802405021b68a2",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "05"
     },
@@ -119,7 +120,7 @@
       "hex": "574549520103010001000000182b802406b84a613b",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "06"
     },
@@ -129,7 +130,7 @@
       "hex": "574549520103010001000000182b8024072e7a664c",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "07"
     },
@@ -139,7 +140,7 @@
       "hex": "574549520103010001000000182b802408bf67d9dc",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "08"
     },
@@ -149,7 +150,7 @@
       "hex": "574549520103010001000000182b8024092957deab",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "09"
     },
@@ -159,7 +160,7 @@
       "hex": "574549520103010001000000182b80240a9306d732",
       "decode": "ok",
       "message_type": "Nack",
-      "durability": "Sync",
+      "durability": "Durable",
       "flags": 0,
       "payload_hex": "0a"
     },

@@ -27,16 +27,22 @@ Each entry in `vectors` is one test case:
 | `hex`          | always            | The input buffer, lowercase hex (no `0x`, no separators).          |
 | `decode`       | always            | `"ok"`, or the name of the rejection error (see below).            |
 | `message_type` | `decode == "ok"`  | Decoded message type: `Push` / `Ack` / `Nack` / `HealthCheck` / `HealthCheckResponse`. |
-| `durability`   | `decode == "ok"`  | Decoded durability tier: `Sync` / `Batched` / `Buffered`.          |
+| `durability`   | `decode == "ok"`  | Decoded durability tier: `Durable` / `Buffered`.                    |
 | `flags`        | `decode == "ok"`  | Decoded flags byte (always `0` in v1).                             |
 | `payload_hex`  | `decode == "ok"`  | Decoded payload bytes, lowercase hex (empty string for none).     |
+| `round_trip`   | optional, `decode == "ok"` only | Defaults to `true`. `false` marks a vector whose `hex` uses a non-canonical wire value (the retired `0x02` durability byte, permissively decoded to `Durable`) that a conformant encoder never re-emits — see below. |
 
 ### The two kinds of vector
 
 - **`decode == "ok"`** — `hex` is *exactly one valid frame*. A conformant decoder
   must accept it and produce the stated `message_type`, `durability`, `flags`, and
   payload. Encoding those fields back must reproduce `hex` byte-for-byte
-  (encode/decode are inverses).
+  (encode/decode are inverses) — **unless** the vector sets `"round_trip": false`,
+  which marks a vector that decodes a non-canonical wire value (only `push_batched`,
+  the retired `0x02` durability byte, today) to its canonical field value. Such a
+  vector's `hex` is still frozen and must still decode correctly; it is simply
+  exempt from the byte-identical re-encode check, since canonicalisation is
+  one-way by design.
 - **`decode == "<Error>"`** — `hex` must be **rejected**, and the error must be the
   named one. The rejection tags are:
 

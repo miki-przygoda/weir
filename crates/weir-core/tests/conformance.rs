@@ -140,13 +140,24 @@ fn every_vector_decodes_as_specified() {
                 v["payload_hex"].as_str().unwrap(),
                 "vector {name}: payload mismatch"
             );
-            // An "ok" vector is canonical: re-encoding the decoded frame must
-            // reproduce the exact input bytes (encode/decode are inverses).
-            assert_eq!(
-                to_hex(&env.encode()),
-                v["hex"].as_str().unwrap(),
-                "vector {name}: re-encode is not byte-identical to the vector"
-            );
+            // An "ok" vector is canonical by default: re-encoding the decoded
+            // frame must reproduce the exact input bytes (encode/decode are
+            // inverses). A vector marked "round_trip": false is the documented
+            // exception — it uses a non-canonical wire value (the retired 0x02
+            // durability byte) that decodes fine but a conformant encoder never
+            // re-emits, so its bytes cannot round-trip by design. See
+            // retired_batched_byte_decodes_but_never_round_trips below.
+            let round_trips = v
+                .get("round_trip")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if round_trips {
+                assert_eq!(
+                    to_hex(&env.encode()),
+                    v["hex"].as_str().unwrap(),
+                    "vector {name}: re-encode is not byte-identical to the vector"
+                );
+            }
         } else {
             let err =
                 result.expect_err(&format!("vector {name}: expected Err({expected}), got Ok"));
@@ -160,4 +171,14 @@ fn every_vector_decodes_as_specified() {
     }
     // Guard against a silently-empty or truncated run.
     assert_eq!(checked, vectors.len(), "did not check every vector");
+}
+
+#[test]
+fn retired_batched_byte_decodes_but_never_round_trips() {
+    // The frozen `push_batched` vector (docs/conformance/wire_v1_vectors.json,
+    // "round_trip": false) proves 0x02 still decodes. This proves we never emit
+    // it back — decode permissive, encode canonical.
+    let decoded = Durability::try_from(0x02).expect("0x02 must still decode");
+    assert_eq!(decoded, Durability::Durable);
+    assert_eq!(u8::from(decoded), 0x01, "re-encoding must canonicalise to 0x01");
 }
