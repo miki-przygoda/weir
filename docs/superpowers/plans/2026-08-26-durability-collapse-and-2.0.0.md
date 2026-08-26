@@ -19,7 +19,7 @@
 - **`WIRE_VERSION` is not bumped.** Frame layout is unchanged and `0x02` still decodes.
 - `Display` for the durable tier emits exactly `"durable"`; `Buffered` still emits `"buffered"`.
 - Deprecated consts must be `Durability::Sync` and `Durability::Batched`, both equal to `Self::Durable`.
-- Full gate before any release step: `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`.
+- **The gate is NOT `cargo test --workspace`.** weir-server's bin unit tests must run with `--test-threads=1` (process-global umask in `socket::bind_hardened`); running them in parallel yields ~75 spurious `PermissionDenied` failures. The real gate is the five commands in Task 6 Step 3, mirroring `.github/workflows/ci.yml:65-67`.
 - Publish order is fixed by internal deps: `weir-core` → `weir-wab` → `weir-sink-sdk` → `weir-client` → `weir-server` → `weir-ctl` → `weir-rs`.
 
 ## File Structure
@@ -573,10 +573,15 @@ Add at the top of `CHANGELOG.md`, under the existing header:
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+# weir-server's bin unit tests MUST run serially — socket::bind_hardened sets a
+# PROCESS-GLOBAL umask, so a parallel `cargo test --workspace` produces ~75
+# spurious PermissionDenied failures. See CONTRIBUTING.md:48 and ci.yml:65-67.
+cargo test --workspace --exclude weir-server
+cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener
+cargo test -p weir-server --bins -- --test-threads=1
 ```
 
-Expected: all three clean. **Do not proceed past this step on a failure** — every later step is harder to undo.
+Expected: all clean. **Do not proceed past this step on a failure** — every later step is harder to undo.
 
 - [ ] **Step 4: Verify the packages actually build for publish**
 
@@ -624,7 +629,14 @@ git merge --no-ff chaos/wab-v2-soak -m "Merge weir 2.0.0"
 - [ ] **Step 3: Re-run the full gate on the merged result**
 
 ```bash
-cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+# weir-server's bin unit tests MUST run serially — socket::bind_hardened sets a
+# PROCESS-GLOBAL umask, so a parallel `cargo test --workspace` produces ~75
+# spurious PermissionDenied failures. See CONTRIBUTING.md:48 and ci.yml:65-67.
+cargo test --workspace --exclude weir-server
+cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener
+cargo test -p weir-server --bins -- --test-threads=1
 ```
 
 Expected: clean. **A failure here stops everything** — nothing is pushed yet, so the merge is local and recoverable with `git reset --hard origin/main`.
