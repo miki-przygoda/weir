@@ -92,14 +92,14 @@ fn read_wab_bytes(dir: &Path) -> Vec<u8> {
 fn smoke_single_push_ack() {
     let srv = weir_server!("smoke").start();
     let mut client = srv.client();
-    client.push(b"hello weir", Durability::Sync).unwrap();
+    client.push(b"hello weir", Durability::Durable).unwrap();
 }
 
 #[test]
 fn all_durability_tiers_behave_per_contract() {
     // Strengthened from `all_durability_tiers_acked`: the original test
     // only checked that each tier returned Ok, which would still pass
-    // if Sync silently skipped fsync or Buffered silently fsynced. This
+    // if Durable silently skipped fsync or Buffered silently fsynced. This
     // version reads the `weir_wab_fsync_duration_seconds_count`
     // histogram counter, which is incremented exactly once per fsync
     // syscall — a deterministic differential between the tiers.
@@ -133,38 +133,19 @@ fn all_durability_tiers_behave_per_contract() {
         fsync_after_buffered - fsync_before
     );
 
-    // Sync: every push forces fdatasync. Counter must climb by ≥ N.
+    // Durable: every push forces fdatasync, via the batch-boundary group
+    // fsync. Counter must climb by ≥ N.
     for i in 0..N_PER_TIER {
         client
-            .push(format!("sync-{i}").as_bytes(), Durability::Sync)
-            .expect("Sync push failed");
+            .push(format!("dur-{i}").as_bytes(), Durability::Durable)
+            .expect("Durable push failed");
     }
-    let fsync_after_sync = read_fsync_count();
+    let fsync_after_durable = read_fsync_count();
     assert!(
-        fsync_after_sync - fsync_after_buffered >= u64::from(N_PER_TIER),
-        "Sync tier produced only {} fsyncs for {N_PER_TIER} pushes — \
+        fsync_after_durable - fsync_after_buffered >= u64::from(N_PER_TIER),
+        "Durable tier produced only {} fsyncs for {N_PER_TIER} pushes — \
          expected ≥ {N_PER_TIER} (one per record)",
-        fsync_after_sync - fsync_after_buffered
-    );
-
-    // Batched: group fdatasync per batch. Under *serial* push (each call
-    // waits for ack before the next) the batch only ever contains a single
-    // record, so the deadline timer fires once per record and Batched looks
-    // identical to Sync. The meaningful regression to catch here is
-    // "Batched silently skips fsync" — we'd see zero new fsyncs in that
-    // case. The records-per-fsync compression Batched provides under
-    // concurrent load is exercised by the `compression_ratio_*` load
-    // scenario, not by this test.
-    for i in 0..N_PER_TIER {
-        client
-            .push(format!("bat-{i}").as_bytes(), Durability::Batched)
-            .expect("Batched push failed");
-    }
-    thread::sleep(Duration::from_millis(150));
-    let fsync_after_batched = read_fsync_count();
-    assert!(
-        fsync_after_batched - fsync_after_sync >= 1,
-        "Batched tier produced 0 fsyncs over {N_PER_TIER} pushes — records were not durably flushed"
+        fsync_after_durable - fsync_after_buffered
     );
 }
 
@@ -196,7 +177,7 @@ fn concurrent_producers_all_acked() {
                 for i in 0..RECORDS_PER_THREAD {
                     let payload = format!("thread-{t:02}-record-{i:04}");
                     client
-                        .push(payload.as_bytes(), Durability::Batched)
+                        .push(payload.as_bytes(), Durability::Durable)
                         .unwrap_or_else(|e| panic!("thread {t} record {i}: {e}"));
                 }
             })
@@ -217,12 +198,12 @@ fn concurrent_producers_all_acked() {
     // (see send_ack call site in src/socket/connection.rs), so it's
     // synchronously consistent with what the client observed.
     let body = srv.scrape_metrics();
-    let acked = parse_metric(&body, "weir_records_ack_total{tier=\"batched\"}");
+    let acked = parse_metric(&body, "weir_records_ack_total{tier=\"durable\"}");
     let expected = (THREADS * RECORDS_PER_THREAD) as u64;
     assert_eq!(
         acked,
         expected,
-        "expected {expected} batched acks, got {acked} — \
+        "expected {expected} durable acks, got {acked} — \
          {} records appear to have been dropped silently",
         expected - acked
     );
@@ -280,7 +261,7 @@ fn records_written_to_wab_on_disk() {
 
     for i in 0..20u32 {
         client
-            .push(format!("wab-record-{i}").as_bytes(), Durability::Sync)
+            .push(format!("wab-record-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
 
@@ -307,7 +288,7 @@ fn idle_seal_drains_low_volume_segment_without_shutdown() {
         .extra_config("wab_segment_max_age_secs = 1")
         .start();
     let mut client = srv.client();
-    client.push(b"lonely-record", Durability::Batched).unwrap();
+    client.push(b"lonely-record", Durability::Durable).unwrap();
 
     let committed = || {
         parse_metric(
@@ -337,7 +318,7 @@ fn wab_compression_knob_reaches_the_segment_header() {
     let mut client = srv.client();
     // Compressible payload so the ratio counters move in an obvious direction.
     let payload = vec![b'a'; 4096];
-    client.push(&payload, Durability::Sync).unwrap();
+    client.push(&payload, Durability::Durable).unwrap();
 
     // Find any segment file the daemon created and read its 24-byte header.
     let header = {
@@ -382,7 +363,7 @@ fn wab_compression_off_writes_v1_segments() {
         .extra_config("wab_segment_max_age_secs = 1")
         .start();
     let mut client = srv.client();
-    client.push(b"plain-record", Durability::Sync).unwrap();
+    client.push(b"plain-record", Durability::Durable).unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     let header = loop {
@@ -488,7 +469,7 @@ fn wab_cap_nack_is_recoverable_for_a_real_client() {
     let deadline = Instant::now() + Duration::from_secs(45);
     let mut nack = None;
     while Instant::now() < deadline {
-        match client.push(&payload, Durability::Sync) {
+        match client.push(&payload, Durability::Durable) {
             Ok(()) => thread::sleep(Duration::from_millis(10)),
             Err(e) => {
                 nack = Some(e);
@@ -683,7 +664,9 @@ fn server_shuts_down_cleanly_on_sigterm() {
 
     let mut srv = weir_server!("shutdown").start();
     let mut client = srv.client();
-    client.push(b"before-shutdown", Durability::Sync).unwrap();
+    client
+        .push(b"before-shutdown", Durability::Durable)
+        .unwrap();
     drop(client);
 
     let elapsed = srv.sigterm();
@@ -750,7 +733,7 @@ fn empty_payload_rejected_locally_by_client() {
     // below and by connection::tests::empty_payload_rejected_at_ingest.
     let srv = weir_server!("empty_payload_client").start();
     let mut client = srv.client();
-    let err = client.push(b"", Durability::Sync).unwrap_err();
+    let err = client.push(b"", Durability::Durable).unwrap_err();
     assert!(
         matches!(err, ClientError::EmptyPayload),
         "expected local ClientError::EmptyPayload, got {err:?}"
@@ -781,7 +764,7 @@ fn empty_payload_rejected_by_daemon_for_raw_frame() {
     // zero length right after the header, before reading any body — so writing
     // just the 16-byte header is enough to draw the Nack.
     let frame = Envelope::new(
-        Header::new(MessageType::Push, Durability::Sync, 0),
+        Header::new(MessageType::Push, Durability::Durable, 0),
         Vec::new(),
     )
     .encode();
@@ -818,7 +801,7 @@ fn arbitrary_binary_payload_accepted() {
     let srv = weir_server!("binary_payload").start();
     let mut client = srv.client();
     let payload: Vec<u8> = (0u8..=255).collect();
-    client.push(&payload, Durability::Sync).unwrap();
+    client.push(&payload, Durability::Durable).unwrap();
 }
 
 #[test]
@@ -830,14 +813,13 @@ fn payload_size_boundary_enforced() {
 
     let srv = weir_server!("payload_boundary").start();
 
-    // Exactly at the cap: must succeed. Uses Batched so we don't wait for
-    // a 16 MiB fsync — the property under test is the size acceptance
-    // check, not durability.
+    // Exactly at the cap: must succeed. Uses Durable — the property under
+    // test is the size acceptance check, not durability.
     {
         let mut client = srv.client();
         let payload = vec![0xAAu8; MAX_PAYLOAD_HARD_CAP];
         client
-            .push(&payload, Durability::Batched)
+            .push(&payload, Durability::Durable)
             .expect("MAX_PAYLOAD_HARD_CAP-sized push should be accepted");
     }
 
@@ -865,7 +847,7 @@ fn payload_size_boundary_enforced() {
         // body bytes.
         let oversize = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
         let frame = Envelope::new(
-            Header::new(MessageType::Push, Durability::Batched, 0),
+            Header::new(MessageType::Push, Durability::Durable, 0),
             oversize,
         )
         .encode();
@@ -957,7 +939,7 @@ fn mixed_durability_under_concurrent_load() {
     let srv = weir_server!("mixed_load").start();
     let socket_path = srv.socket_path.clone();
 
-    let tiers = [Durability::Sync, Durability::Batched, Durability::Buffered];
+    let tiers = [Durability::Durable, Durability::Buffered];
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let path = socket_path.clone();
@@ -979,21 +961,20 @@ fn mixed_durability_under_concurrent_load() {
     }
 
     // Strengthened: assert each tier's ack counter matches the records
-    // pushed for that tier. With THREADS=6 and tiers cycling 3-wide,
-    // threads 0,3 push Sync (2 × RECORDS), threads 1,4 push Batched
-    // (2 × RECORDS), threads 2,5 push Buffered (2 × RECORDS).
+    // pushed for that tier. With THREADS=6 and tiers cycling 2-wide,
+    // threads 0,2,4 push Durable (3 × RECORDS), threads 1,3,5 push
+    // Buffered (3 × RECORDS).
     //
     // The thing this catches that the original test couldn't: a buggy
     // tier-dispatch table that silently re-routes (e.g. all Buffered
-    // counted as Sync) or drops one tier under contention. The original
+    // counted as Durable) or drops one tier under contention. The original
     // panic-on-Err pattern would still pass under such a bug because
     // the client only sees Ack/Nack, not which tier the server thinks
     // it was.
     let per_tier_expected = (THREADS / tiers.len() * RECORDS) as u64;
     let body = srv.scrape_metrics();
     for (label, _tier) in [
-        ("sync", Durability::Sync),
-        ("batched", Durability::Batched),
+        ("durable", Durability::Durable),
         ("buffered", Durability::Buffered),
     ] {
         let acked = parse_metric(
@@ -1019,7 +1000,7 @@ fn server_restarts_after_sigkill() {
 
     let mut srv = weir_server!("crash_restart").start();
     srv.client()
-        .push(b"before-crash", Durability::Sync)
+        .push(b"before-crash", Durability::Durable)
         .unwrap();
 
     srv.kill_ungracefully();
@@ -1040,7 +1021,7 @@ fn server_restarts_after_sigkill() {
     );
 
     srv.client()
-        .push(b"after-restart", Durability::Sync)
+        .push(b"after-restart", Durability::Durable)
         .unwrap();
 }
 
@@ -1057,7 +1038,7 @@ fn wab_data_preserved_across_crash_restart() {
     let mut acked: u32 = 0;
     for i in 0..N {
         if client
-            .push(format!("crash-rec-{i}").as_bytes(), Durability::Sync)
+            .push(format!("crash-rec-{i}").as_bytes(), Durability::Durable)
             .is_ok()
         {
             acked += 1;
@@ -1114,7 +1095,7 @@ fn acked_records_delivered_to_sink_and_confirmed_after_crash_restart() {
     let mut acked = 0u32;
     for i in 0..N {
         if client
-            .push(format!("c2s-{i}").as_bytes(), Durability::Sync)
+            .push(format!("c2s-{i}").as_bytes(), Durability::Durable)
             .is_ok()
         {
             acked += 1;
@@ -1265,7 +1246,7 @@ fn shard_directories_created_on_disk() {
     let srv = weir_server!("shard_dirs").shard_count(3).start();
     let mut client = srv.client();
     client
-        .push(b"trigger-shard-creation", Durability::Sync)
+        .push(b"trigger-shard-creation", Durability::Durable)
         .unwrap();
     thread::sleep(Duration::from_millis(100));
 
@@ -1309,7 +1290,7 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
                     .unwrap_or_else(|e| panic!("thread {t}: connect: {e}"));
                 for i in 0..RECORDS_PER_THREAD {
                     client
-                        .push(format!("t{t}-r{i}").as_bytes(), Durability::Sync)
+                        .push(format!("t{t}-r{i}").as_bytes(), Durability::Durable)
                         .unwrap_or_else(|e| panic!("thread {t} record {i}: {e}"));
                 }
             })
@@ -1341,9 +1322,9 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
 
 // ── Graceful shutdown under load ──────────────────────────────────────────────
 
-/// Verifies that SIGTERM under concurrent Sync load produces no silent drops.
+/// Verifies that SIGTERM under concurrent Durable load produces no silent drops.
 ///
-/// Every push that returned `Ok` must be on disk (Sync durability guarantee).
+/// Every push that returned `Ok` must be on disk (the Durable tier's guarantee).
 /// Every push that did not complete must surface as `ClientError::Io` so the
 /// producer knows it needs to retry — not a silent half-write or a panic.
 #[test]
@@ -1370,7 +1351,7 @@ fn graceful_shutdown_under_load() {
                     return; // server already gone
                 };
                 loop {
-                    match client.push(b"shutdown-load", Durability::Sync) {
+                    match client.push(b"shutdown-load", Durability::Durable) {
                         Ok(()) => {
                             ok.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1416,7 +1397,7 @@ fn graceful_shutdown_under_load() {
          producers should only see Ok or Io"
     );
 
-    // Every Ok means a Sync-flushed record. The WAB must have bytes.
+    // Every Ok means a Durable-flushed record. The WAB must have bytes.
     assert!(
         oks > 0,
         "expected successful pushes before SIGTERM; got 0 — \
@@ -1424,7 +1405,7 @@ fn graceful_shutdown_under_load() {
     );
     assert!(
         wab_bytes > 0,
-        "WAB has 0 bytes on disk after {oks} successful Sync pushes — \
+        "WAB has 0 bytes on disk after {oks} successful Durable pushes — \
          possible silent data loss"
     );
 
@@ -1520,12 +1501,12 @@ fn stalled_client_does_not_block_other_connections() {
     // Let the stall thread connect and send its frame before we proceed.
     thread::sleep(Duration::from_millis(100));
 
-    // Concurrent client: 50 Sync pushes while the stalled connection is held.
+    // Concurrent client: 50 Durable pushes while the stalled connection is held.
     let mut client = srv.client();
     let t0 = Instant::now();
     for i in 0..CONCURRENT_RECORDS {
         client
-            .push(format!("concurrent-{i}").as_bytes(), Durability::Sync)
+            .push(format!("concurrent-{i}").as_bytes(), Durability::Durable)
             .unwrap_or_else(|e| panic!("concurrent push {i} failed: {e}"));
     }
     let elapsed = t0.elapsed();
@@ -1576,7 +1557,7 @@ fn partial_frame_does_not_corrupt_next_connection() {
     // A fresh connection must work normally — the partial frame must not have
     // left the server's read state in a corrupt position.
     srv.client()
-        .push(b"after-partial-frame", Durability::Sync)
+        .push(b"after-partial-frame", Durability::Durable)
         .expect("push failed after partial frame injection");
 
     srv.client()
@@ -1614,7 +1595,7 @@ fn efbig_returns_nack_not_crash() {
     let mut client = srv.client();
 
     // With RLIMIT_FSIZE=0 the first WAB segment header write fails immediately.
-    let result = client.push(b"should-nack", Durability::Sync);
+    let result = client.push(b"should-nack", Durability::Durable);
     assert!(
         matches!(result, Err(ClientError::Nack(NackReason::InternalError))),
         "expected Nack(InternalError) from EFBIG-throttled server, got {result:?}"
@@ -1644,7 +1625,7 @@ fn efbig_returns_nack_not_crash() {
 /// ```
 ///
 /// The 64 KiB tmpfs is small enough that the first WAB segment header
-/// (16 KiB pre-allocated) plus a single Sync record fills it; subsequent
+/// (16 KiB pre-allocated) plus a single Durable record fills it; subsequent
 /// pushes must Nack rather than panic.
 #[test]
 #[ignore = "requires WEIR_TEST_ENOSPC_DIR pointing at a small pre-mounted tmpfs (see test docstring)"]
@@ -1680,7 +1661,7 @@ fn enospc_returns_nack_not_crash() {
     let mut saw_nack = false;
     for i in 0..200u32 {
         let payload = vec![0xAAu8; 1024]; // 1 KiB; tmpfs holds ~64.
-        match client.push(&payload, Durability::Sync) {
+        match client.push(&payload, Durability::Durable) {
             Ok(()) => continue,
             Err(ClientError::Nack(NackReason::InternalError)) => {
                 saw_nack = true;
@@ -1705,10 +1686,10 @@ fn enospc_returns_nack_not_crash() {
 
 // ── WAB data integrity after crash ────────────────────────────────────────────
 
-/// Every Sync push that returned `Ok` must be present on disk byte-for-byte
+/// Every Durable push that returned `Ok` must be present on disk byte-for-byte
 /// after the server is killed with SIGKILL.
 ///
-/// This tests the "Sync durability" contract at the byte level: if the client
+/// This tests the Durable-tier contract at the byte level: if the client
 /// got an `Ok`, the payload must be in the WAB file (the fsync happened before
 /// the ack was sent).
 #[test]
@@ -1721,7 +1702,7 @@ fn wab_data_integrity_after_crash() {
     let mut acked: Vec<Vec<u8>> = Vec::new();
     for i in 0..N {
         let payload = format!("integrity-{i:05}").into_bytes();
-        match client.push(&payload, Durability::Sync) {
+        match client.push(&payload, Durability::Durable) {
             Ok(()) => acked.push(payload),
             Err(_) => break, // server died mid-push
         }
@@ -1735,7 +1716,7 @@ fn wab_data_integrity_after_crash() {
     let wab_bytes = read_wab_bytes(&srv.wab_dir);
     assert!(
         !wab_bytes.is_empty(),
-        "WAB directory empty after {} acked Sync pushes",
+        "WAB directory empty after {} acked Durable pushes",
         acked.len()
     );
 
@@ -1767,7 +1748,7 @@ fn socket_takeover_does_not_corrupt_wab_data() {
 
     for i in 0..N {
         client
-            .push(format!("srv-a-{i}").as_bytes(), Durability::Sync)
+            .push(format!("srv-a-{i}").as_bytes(), Durability::Durable)
             .expect("push to server A failed");
     }
 
@@ -1905,11 +1886,11 @@ fn fd_limit_exhaustion_does_not_crash_server() {
         .health_check()
         .expect("server crashed or hung under fd pressure");
 
-    // A normal Sync push must succeed after the fd pressure is relieved.
+    // A normal Durable push must succeed after the fd pressure is relieved.
     // This is the strongest portable verification that the daemon survives
     // fd-budget exhaustion: end-to-end producer → ack works again.
     srv.client()
-        .push(b"after-fd-flood", Durability::Sync)
+        .push(b"after-fd-flood", Durability::Durable)
         .expect("push failed after fd-limit flood");
 }
 
@@ -1923,12 +1904,12 @@ fn records_accepted_counter_increments_after_sync_pushes() {
     let mut client = srv.client();
     for i in 0..N {
         client
-            .push(format!("acc-{i}").as_bytes(), Durability::Sync)
+            .push(format!("acc-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
 
     let body = srv.scrape_metrics();
-    let expected = format!("weir_records_accepted_total{{tier=\"sync\"}} {N}");
+    let expected = format!("weir_records_accepted_total{{tier=\"durable\"}} {N}");
     assert!(
         body.contains(&expected),
         "expected '{expected}' in metrics; body:\n{body:.800}"
@@ -1943,12 +1924,12 @@ fn records_ack_counter_increments_after_sync_pushes() {
     let mut client = srv.client();
     for i in 0..N {
         client
-            .push(format!("ack-{i}").as_bytes(), Durability::Sync)
+            .push(format!("ack-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
 
     let body = srv.scrape_metrics();
-    let expected = format!("weir_records_ack_total{{tier=\"sync\"}} {N}");
+    let expected = format!("weir_records_ack_total{{tier=\"durable\"}} {N}");
     assert!(
         body.contains(&expected),
         "expected '{expected}' in metrics; body:\n{body:.800}"
@@ -1973,7 +1954,7 @@ fn per_shard_records_appear_in_submission_order() {
 
     for i in 0..N {
         client
-            .push(format!("order-{i:05}").as_bytes(), Durability::Sync)
+            .push(format!("order-{i:05}").as_bytes(), Durability::Durable)
             .expect("push failed");
     }
 
@@ -2036,7 +2017,7 @@ fn concurrent_producers_to_same_shard_preserve_per_producer_order() {
                 for seq in 0..N_RECORDS {
                     let payload = format!("p{producer_id:02}-s{seq:05}").into_bytes();
                     client
-                        .push(&payload, Durability::Sync)
+                        .push(&payload, Durability::Durable)
                         .unwrap_or_else(|e| panic!("push p{producer_id} s{seq}: {e:?}"));
                 }
             })
@@ -2080,7 +2061,7 @@ fn concurrent_producers_to_same_shard_preserve_per_producer_order() {
 
 // ── Batch deadline timer accuracy ─────────────────────────────────────────────
 
-/// With `batch_deadline_ms = 20`, Sync-push latency must stay bounded: the
+/// With `batch_deadline_ms = 20`, Durable-push latency must stay bounded: the
 /// median within 2× the deadline and the p95 within 5×. A regression that
 /// starves the batch timer (e.g. a spinning accept loop) biases the common path
 /// — so the median is the primary guard — and pushes a large fraction of samples
@@ -2107,7 +2088,7 @@ fn batch_deadline_timer_keeps_latency_bounded() {
     for i in 0..SAMPLES {
         let t0 = Instant::now();
         client
-            .push(format!("timer-{i}").as_bytes(), Durability::Sync)
+            .push(format!("timer-{i}").as_bytes(), Durability::Durable)
             .expect("push failed");
         latencies.push(t0.elapsed());
     }
@@ -2163,15 +2144,15 @@ fn metrics_internally_consistent_per_session() {
             client
                 .push(
                     format!("round-{round}-rec-{i}").as_bytes(),
-                    Durability::Sync,
+                    Durability::Durable,
                 )
                 .unwrap_or_else(|e| panic!("push failed (round {round}, rec {i}): {e}"));
         }
 
         let body = srv.scrape_metrics();
 
-        let accepted = parse_metric(&body, "weir_records_accepted_total{tier=\"sync\"}");
-        let acked = parse_metric(&body, "weir_records_ack_total{tier=\"sync\"}");
+        let accepted = parse_metric(&body, "weir_records_accepted_total{tier=\"durable\"}");
+        let acked = parse_metric(&body, "weir_records_ack_total{tier=\"durable\"}");
 
         assert!(
             accepted <= u64::from(PUSHES_PER_ROUND),
@@ -2202,14 +2183,14 @@ fn metrics_reset_to_zero_after_restart() {
     let mut client = srv.client();
     for i in 0..5u32 {
         client
-            .push(format!("pre-restart-{i}").as_bytes(), Durability::Sync)
+            .push(format!("pre-restart-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
     drop(client);
 
     let before = srv.scrape_metrics();
-    let accepted_before = parse_metric(&before, "weir_records_accepted_total{tier=\"sync\"}");
-    let acked_before = parse_metric(&before, "weir_records_ack_total{tier=\"sync\"}");
+    let accepted_before = parse_metric(&before, "weir_records_accepted_total{tier=\"durable\"}");
+    let acked_before = parse_metric(&before, "weir_records_ack_total{tier=\"durable\"}");
     assert!(
         accepted_before >= 5 && acked_before >= 5,
         "expected counters to be ≥5 before restart (accepted={accepted_before}, acked={acked_before})",
@@ -2219,8 +2200,8 @@ fn metrics_reset_to_zero_after_restart() {
 
     // Immediately after restart, before any new pushes.
     let after = srv.scrape_metrics();
-    let accepted_after = parse_metric(&after, "weir_records_accepted_total{tier=\"sync\"}");
-    let acked_after = parse_metric(&after, "weir_records_ack_total{tier=\"sync\"}");
+    let accepted_after = parse_metric(&after, "weir_records_accepted_total{tier=\"durable\"}");
+    let acked_after = parse_metric(&after, "weir_records_ack_total{tier=\"durable\"}");
     assert_eq!(
         accepted_after, 0,
         "records_accepted_total should reset to 0 after restart, got {accepted_after}"
@@ -2236,7 +2217,7 @@ fn metrics_reset_to_zero_after_restart() {
 /// the audit flagged: the metric exists but no test asserted it advances.
 ///
 /// Procedure:
-/// 1. Push N Sync records — guaranteed durable in the active WAB segment.
+/// 1. Push N Durable records — guaranteed durable in the active WAB segment.
 /// 2. SIGKILL the server (active segment left as `.wab`, no footer).
 /// 3. Restart — recovery should seal the active segment and replay it.
 /// 4. Scrape metrics; assert `weir_recovery_records_replayed_total >= N`.
@@ -2248,7 +2229,7 @@ fn recovery_replays_records_after_crash() {
     let mut client = srv.client();
     for i in 0..N {
         client
-            .push(format!("recover-{i:05}").as_bytes(), Durability::Sync)
+            .push(format!("recover-{i:05}").as_bytes(), Durability::Durable)
             .unwrap();
     }
     drop(client);
@@ -2429,7 +2410,7 @@ fn quarantined_records_after_a_corruption_can_be_recovered() {
     let mut client = srv.client();
     for i in 0..(BEFORE + 1 + AFTER) {
         client
-            .push(format!("qr-{i:03}").as_bytes(), Durability::Sync)
+            .push(format!("qr-{i:03}").as_bytes(), Durability::Durable)
             .unwrap();
     }
     drop(client);
@@ -2607,7 +2588,7 @@ fn mysql_sink_end_to_end() {
     let mut client = handle.client();
     for i in 0..N {
         client
-            .push(format!("mysql-rec-{i:05}").as_bytes(), Durability::Sync)
+            .push(format!("mysql-rec-{i:05}").as_bytes(), Durability::Durable)
             .unwrap_or_else(|e| panic!("push {i}: {e}"));
     }
     drop(client);
@@ -2699,7 +2680,10 @@ fn postgres_sink_end_to_end() {
     let mut client = handle.client();
     for i in 0..N {
         client
-            .push(format!("postgres-rec-{i:05}").as_bytes(), Durability::Sync)
+            .push(
+                format!("postgres-rec-{i:05}").as_bytes(),
+                Durability::Durable,
+            )
             .unwrap_or_else(|e| panic!("push {i}: {e}"));
     }
     drop(client);
@@ -2781,7 +2765,7 @@ fn clickhouse_sink_end_to_end() {
         client
             .push(
                 format!("clickhouse-rec-{i:05}").as_bytes(),
-                Durability::Sync,
+                Durability::Durable,
             )
             .unwrap_or_else(|e| panic!("push {i}: {e}"));
     }

@@ -949,7 +949,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// for the host's core count. Advisory only — operator config wins.
 ///
 /// **Empirical basis.** A sweep on a 4-core sandbox (herd of 64 producers
-/// × Sync records, `tests/load.rs::sweep_agent_count_vs_throughput`) showed:
+/// × Durable records, `tests/load.rs::sweep_agent_count_vs_throughput`) showed:
 ///
 /// | agent_count | median RPS  | vs cores |
 /// |-------------|-------------|----------|
@@ -964,7 +964,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// thread, and on a 4-core machine those threads compete with the tokio
 /// runtime workers and the accept loop. Fewer agents also means a fatter
 /// group fsync (more concurrent producers' records share one batch),
-/// which is the dominant win on Sync workloads.
+/// which is the dominant win on Durable workloads.
 ///
 /// Heuristic: reserve ~2 cores for the tokio runtime / accept loop / OS,
 /// give each remaining core a 2-thread budget for one agent. So

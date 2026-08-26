@@ -49,7 +49,7 @@ fn connect_tls_with_valid_cert_pushes_and_acks() {
         WeirClient::connect_tls(addr, valid_cfg(&fx)).expect("connect_tls with a valid cert");
     for i in 0..16 {
         client
-            .push(format!("rec-{i}").as_bytes(), Durability::Sync)
+            .push(format!("rec-{i}").as_bytes(), Durability::Durable)
             .unwrap_or_else(|e| panic!("push {i} through connect_tls failed: {e}"));
     }
     assert!(

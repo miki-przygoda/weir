@@ -90,7 +90,8 @@ impl WabSegment {
         // Make the new file's directory entry durable. Records written here are
         // group-fsynced for their *data*, but the dirent that links this file into
         // the shard dir is only crash-durable after a parent-dir fsync — without
-        // it, a crash could orphan a file whose Sync records we acked as durable.
+        // it, a crash could orphan a file whose Durable records we acked as
+        // durable.
         fsync_parent_dir(path)?;
         Ok(seg)
     }

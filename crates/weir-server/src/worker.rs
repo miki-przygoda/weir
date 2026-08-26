@@ -72,7 +72,7 @@ impl Worker {
         // previous one. Investigation (load.rs::investigate_herd_64_ceiling)
         // showed the worker alternating between tiny "I got here first"
         // batches and large "queue-was-piling-up-during-fsync" batches in
-        // multi-producer Sync workloads. The wake-up record alone isn't
+        // multi-producer Durable workloads. The wake-up record alone isn't
         // a reliable concurrency signal — by the time the worker sees the
         // first producer's next push, the other 15 producers' acks are
         // still completing their roundtrip (~50–100 μs).
@@ -106,7 +106,7 @@ impl Worker {
                     );
 
                     // Track whether this batch contains any fsync-tier
-                    // (Sync/Batched) record. The Phase-2 coalesce window only
+                    // (`Durable`) record. The Phase-2 coalesce window only
                     // pays off by amortising a group fdatasync across more
                     // records — but Buffered acks immediately after the
                     // in-memory write (wab/mod.rs: it never rides the
@@ -479,15 +479,15 @@ mod tests {
     /// `Buffered` must NOT pay the Phase-2 coalesce window — Buffered acks
     /// immediately after the in-memory write and never rides the batch-boundary
     /// group fdatasync, so coalescing it is pure added latency. A batch with an
-    /// fsync-tier (`Sync`/`Batched`) record still coalesces, because the window
+    /// fsync-tier (`Durable`) record still coalesces, because the window
     /// amortises that record's group fsync.
     ///
     /// Both halves run the SAME sequence — a 2-record priming burst (to set the
     /// worker's `expect_concurrent` flag) followed, after that batch lands, by a
     /// single record of the tier under test — and time how long the single
     /// record takes to flush. The only difference is the single record's tier.
-    /// Buffered must flush well under the window; Sync must wait out (most of)
-    /// the window.
+    /// Buffered must flush well under the window; Durable must wait out (most
+    /// of) the window.
     fn time_single_record_flush(durability: weir_core::Durability) -> Duration {
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let (shard_txs, batch_rxs) = make_shard_channels(1);
@@ -538,39 +538,31 @@ mod tests {
         let window = Duration::from_micros(COALESCE_MAX_US);
 
         let buffered = time_single_record_flush(weir_core::Durability::Buffered);
-        let sync = time_single_record_flush(weir_core::Durability::Sync);
-        let batched = time_single_record_flush(weir_core::Durability::Batched);
+        let durable = time_single_record_flush(weir_core::Durability::Durable);
 
-        // Sync enters the window and waits out most of it before flushing. This is
-        // a real sleep, so it's a robust LOWER bound (scheduling jitter only makes
-        // it longer): 60% of the window stays clear of timer-granularity slop.
+        // Durable is an fsync tier: its group fdatasync rides the batch
+        // boundary, so the coalesce window amortises a real cost and it enters
+        // the window and waits out most of it before flushing. This is a real
+        // sleep, so it's a robust LOWER bound (scheduling jitter only makes it
+        // longer): 60% of the window stays clear of timer-granularity slop.
         assert!(
-            sync >= window * 6 / 10,
-            "Sync batch did NOT coalesce: solo record flushed in {sync:?}, \
+            durable >= window * 6 / 10,
+            "Durable batch did NOT coalesce: solo record flushed in {durable:?}, \
              expected to wait out most of the {window:?} window",
         );
 
-        // Batched is an fsync tier too: its group fdatasync rides the batch
-        // boundary, so the coalesce window amortises a real cost and Batched must
-        // coalesce just like Sync (not skip the window like Buffered). Same robust
-        // 60%-of-window lower bound.
-        assert!(
-            batched >= window * 6 / 10,
-            "Batched batch did NOT coalesce: solo record flushed in {batched:?}, \
-             expected to wait out most of the {window:?} window like Sync",
-        );
-
         // Buffered skips the window, so it flushes at least ~half a window SOONER
-        // than Sync. A RELATIVE bound (both timed on the same machine) — Sync has a
-        // deterministic full-window sleep that Buffered lacks, so `sync - buffered`
-        // ≈ one window regardless of absolute load; an absolute `buffered < window/2`
-        // bound is flaky under a contended gate, a relative one is not. If the
-        // tier-gating regressed and Buffered also paid the window, buffered ≈ sync
-        // and this assertion fails — so it still catches a real bug.
+        // than Durable. A RELATIVE bound (both timed on the same machine) —
+        // Durable has a deterministic full-window sleep that Buffered lacks, so
+        // `durable - buffered` ≈ one window regardless of absolute load; an
+        // absolute `buffered < window/2` bound is flaky under a contended gate,
+        // a relative one is not. If the tier-gating regressed and Buffered also
+        // paid the window, buffered ≈ durable and this assertion fails — so it
+        // still catches a real bug.
         assert!(
-            buffered + window / 2 <= sync,
+            buffered + window / 2 <= durable,
             "Buffered-only batch did not skip the coalesce window: buffered {buffered:?} \
-             vs sync {sync:?} (window {window:?}) — expected buffered to flush ≥ half a \
+             vs durable {durable:?} (window {window:?}) — expected buffered to flush ≥ half a \
              window sooner",
         );
     }

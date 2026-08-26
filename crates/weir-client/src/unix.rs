@@ -356,7 +356,7 @@ impl<S: Read + Write> WeirClient<S> {
     /// or responds with a Nack.
     pub fn health_check(&mut self) -> Result<(), ClientError> {
         self.ensure_usable()?;
-        let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0);
+        let header = Header::new(MessageType::HealthCheck, Durability::Durable, 0);
         let frame = Envelope::new(header, vec![]).encode();
         self.stream.write_all(&frame)?;
 
@@ -406,7 +406,7 @@ impl<S: Read + Write> WeirClient<S> {
     /// # use weir_core::Durability;
     /// # fn reconnect() -> WeirClient { unreachable!() }
     /// # let mut client = reconnect();
-    /// if let Err(e) = client.push(b"record", Durability::Sync) {
+    /// if let Err(e) = client.push(b"record", Durability::Durable) {
     ///     if !e.is_recoverable() || client.is_poisoned() {
     ///         client = reconnect(); // drop the dead client, rebuild
     ///     }
@@ -556,7 +556,7 @@ impl WeirClient<UnixStream> {
     /// a producer's hot path forever. With a read timeout set, a stalled reply
     /// surfaces as a [`ClientError::Io`] timeout instead; the producer can retry
     /// — the record may still have been durably written, which the at-least-once
-    /// contract covers. Pick a value comfortably above the daemon's Sync ack
+    /// contract covers. Pick a value comfortably above the daemon's Durable ack
     /// latency under load: the daemon's own `ACK_TIMEOUT` is 30 s, so e.g.
     /// 45–60 s lets the daemon's Nack win rather than racing it.
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -609,7 +609,7 @@ mod tests {
     fn set_default_durability_used_by_push_default() {
         let (client_end, mut server_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut c = WeirClient::from_stream(client_end);
-        c.set_default_durability(Durability::Batched);
+        c.set_default_durability(Durability::Durable);
 
         let reader = std::thread::spawn(move || {
             use std::io::{Read, Write};
@@ -620,7 +620,11 @@ mod tests {
             server_end.read_exact(&mut rest).unwrap();
             // Send back an Ack so push_default can complete.
             let ack = weir_core::Envelope::new(
-                weir_core::Header::new(weir_core::MessageType::Ack, weir_core::Durability::Sync, 0),
+                weir_core::Header::new(
+                    weir_core::MessageType::Ack,
+                    weir_core::Durability::Durable,
+                    0,
+                ),
                 vec![],
             )
             .encode();
@@ -629,7 +633,7 @@ mod tests {
         });
 
         c.push_default(b"hello").unwrap();
-        assert_eq!(reader.join().unwrap(), Durability::Batched);
+        assert_eq!(reader.join().unwrap(), Durability::Durable);
     }
 
     #[test]
@@ -671,7 +675,7 @@ mod tests {
         let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut c = WeirClient::from_stream(client_end);
         let oversized = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
-        let err = c.push(&oversized, Durability::Sync).unwrap_err();
+        let err = c.push(&oversized, Durability::Durable).unwrap_err();
         assert!(
             matches!(err, ClientError::PayloadTooLarge { len, limit }
                 if len == MAX_PAYLOAD_HARD_CAP + 1 && limit == MAX_PAYLOAD_HARD_CAP),
@@ -700,7 +704,7 @@ mod tests {
             let nack = weir_core::Envelope::new(
                 weir_core::Header::new(
                     weir_core::MessageType::Nack,
-                    weir_core::Durability::Sync,
+                    weir_core::Durability::Durable,
                     0,
                 ),
                 vec![NackReason::PayloadTooLarge as u8],
@@ -714,7 +718,7 @@ mod tests {
         // once the server stops reading and closes), but under the hard cap (so it
         // is not caught by the local pre-check).
         let payload = vec![0u8; 2 * 1024 * 1024];
-        let err = c.push(&payload, Durability::Sync).unwrap_err();
+        let err = c.push(&payload, Durability::Durable).unwrap_err();
         server.join().unwrap();
         assert!(
             matches!(err, ClientError::Nack(NackReason::PayloadTooLarge)),
@@ -736,7 +740,11 @@ mod tests {
 
     fn nack_frame(reason: NackReason) -> Vec<u8> {
         weir_core::Envelope::new(
-            weir_core::Header::new(weir_core::MessageType::Nack, weir_core::Durability::Sync, 0),
+            weir_core::Header::new(
+                weir_core::MessageType::Nack,
+                weir_core::Durability::Durable,
+                0,
+            ),
             vec![reason as u8],
         )
         .encode()
@@ -757,14 +765,14 @@ mod tests {
                 .unwrap();
             // drop server_end → connection closes, as the daemon does after a Nack.
         });
-        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        let first = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         assert!(
             matches!(first, ClientError::Nack(NackReason::EmptyPayload)),
             "first push should surface the real reason, got {first:?}"
         );
         // Second call must NOT be a broken-pipe — it must clearly say reconnect.
-        match c.push(b"y", Durability::Sync).unwrap_err() {
+        match c.push(b"y", Durability::Durable).unwrap_err() {
             ClientError::Protocol(msg) => assert!(
                 msg.contains("closed by the daemon after a Nack") && msg.contains("reconnect"),
                 "unexpected message: {msg}"
@@ -787,13 +795,17 @@ mod tests {
                 .unwrap();
             drain_one_frame(&mut server_end); // the retry
             let ack = weir_core::Envelope::new(
-                weir_core::Header::new(weir_core::MessageType::Ack, weir_core::Durability::Sync, 0),
+                weir_core::Header::new(
+                    weir_core::MessageType::Ack,
+                    weir_core::Durability::Durable,
+                    0,
+                ),
                 vec![],
             )
             .encode();
             server_end.write_all(&ack).unwrap();
         });
-        let first = c.push(b"a", Durability::Sync).unwrap_err();
+        let first = c.push(b"a", Durability::Durable).unwrap_err();
         assert!(
             matches!(first, ClientError::Nack(NackReason::InternalError)),
             "got {first:?}"
@@ -802,7 +814,7 @@ mod tests {
             !c.closed_after_nack,
             "InternalError is transient and must not close the connection"
         );
-        c.push(b"b", Durability::Sync).unwrap(); // retry on the same connection succeeds
+        c.push(b"b", Durability::Durable).unwrap(); // retry on the same connection succeeds
         server.join().unwrap();
     }
 
@@ -820,14 +832,14 @@ mod tests {
             // A valid 16-byte header whose payload_len is CAP+1, with a recomputed
             // header CRC; then EOF (no payload) — the client must refuse before it
             // would try to read/allocate the declared payload.
-            let mut hdr = Header::new(MessageType::Ack, Durability::Sync, 0).encode();
+            let mut hdr = Header::new(MessageType::Ack, Durability::Durable, 0).encode();
             let big = (MAX_PAYLOAD_HARD_CAP as u32).wrapping_add(1);
             hdr[8..12].copy_from_slice(&big.to_le_bytes());
             let crc = crc32fast::hash(&hdr[0..12]);
             hdr[12..16].copy_from_slice(&crc.to_le_bytes());
             server_end.write_all(&hdr).unwrap();
         });
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         match err {
             ClientError::Protocol(msg) => assert!(
@@ -858,11 +870,14 @@ mod tests {
         let server = std::thread::spawn(move || {
             use std::io::Write;
             drain_one_frame(&mut server_end);
-            let frame =
-                Envelope::new(Header::new(MessageType::Nack, Durability::Sync, 0), vec![]).encode();
+            let frame = Envelope::new(
+                Header::new(MessageType::Nack, Durability::Durable, 0),
+                vec![],
+            )
+            .encode();
             server_end.write_all(&frame).unwrap();
         });
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         assert!(matches!(err, ClientError::Protocol(_)), "got {err:?}");
         assert!(
@@ -889,7 +904,7 @@ mod tests {
             *frame.last_mut().unwrap() ^= 0xff;
             server_end.write_all(&frame).unwrap();
         });
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         match err {
             ClientError::Protocol(msg) => assert!(msg.contains("CRC mismatch"), "{msg}"),
@@ -916,13 +931,13 @@ mod tests {
             use std::io::Write;
             drain_one_frame(&mut server_end);
             let frame = Envelope::new(
-                Header::new(MessageType::Nack, Durability::Sync, 0),
+                Header::new(MessageType::Nack, Durability::Durable, 0),
                 vec![0x0A],
             )
             .encode();
             server_end.write_all(&frame).unwrap();
         });
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         assert!(matches!(err, ClientError::UnknownNack(0x0A)), "got {err:?}");
         assert!(
@@ -941,13 +956,13 @@ mod tests {
             use std::io::Write;
             drain_one_frame(&mut server_end);
             let frame = Envelope::new(
-                Header::new(MessageType::Nack, Durability::Sync, 0),
+                Header::new(MessageType::Nack, Durability::Durable, 0),
                 vec![NackReason::VersionMismatch as u8, 9],
             )
             .encode();
             server_end.write_all(&frame).unwrap();
         });
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         assert!(
             matches!(err, ClientError::VersionMismatch { daemon_version: 9 }),
@@ -967,8 +982,11 @@ mod tests {
             use std::io::Write;
             drain_one_frame(&mut server_end);
             // Reply to a HealthCheck with an Ack — never expected here.
-            let frame =
-                Envelope::new(Header::new(MessageType::Ack, Durability::Sync, 0), vec![]).encode();
+            let frame = Envelope::new(
+                Header::new(MessageType::Ack, Durability::Durable, 0),
+                vec![],
+            )
+            .encode();
             server_end.write_all(&frame).unwrap();
         });
         let err = c.health_check().unwrap_err();
@@ -1010,7 +1028,7 @@ mod tests {
             .unwrap();
         // push writes the (tiny) frame, then blocks reading the reply that never
         // comes → the timeout fires → an Io error rather than an indefinite hang.
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         assert!(
             matches!(err, ClientError::Io(_)),
             "expected Io timeout, got {err:?}"
@@ -1029,12 +1047,12 @@ mod tests {
             .unwrap();
 
         // First push: the peer never replies → read times out → Io error.
-        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        let first = c.push(b"x", Durability::Durable).unwrap_err();
         assert!(matches!(first, ClientError::Io(_)), "{first:?}");
 
         // Second push must fail FAST as poisoned, not block on another read.
         let started = std::time::Instant::now();
-        let second = c.push(b"y", Durability::Sync).unwrap_err();
+        let second = c.push(b"y", Durability::Durable).unwrap_err();
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "poisoned client must reject immediately, not read again"
@@ -1058,7 +1076,7 @@ mod tests {
         c.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         // Peer never replies → the response read times out → the client poisons.
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         assert!(matches!(err, ClientError::Io(_)), "{err:?}");
         assert!(
             c.is_poisoned(),
@@ -1086,7 +1104,7 @@ mod tests {
                 .unwrap();
             // drop server_end → connection closes, as the daemon does after a Nack.
         });
-        let first = c.push(b"x", Durability::Sync).unwrap_err();
+        let first = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         assert!(
             matches!(first, ClientError::Nack(NackReason::EmptyPayload)),
@@ -1125,7 +1143,7 @@ mod tests {
             let bogus = weir_core::Envelope::new(
                 weir_core::Header::new(
                     weir_core::MessageType::HealthCheck,
-                    weir_core::Durability::Sync,
+                    weir_core::Durability::Durable,
                     0,
                 ),
                 vec![],
@@ -1133,7 +1151,7 @@ mod tests {
             .encode();
             server_end.write_all(&bogus).unwrap();
         });
-        let err = c.push(b"x", Durability::Sync).unwrap_err();
+        let err = c.push(b"x", Durability::Durable).unwrap_err();
         server.join().unwrap();
         // The error is a Protocol desync, which is non-recoverable...
         assert!(
@@ -1160,7 +1178,7 @@ mod tests {
         let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut c = WeirClient::from_stream(client_end);
         let oversized = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
-        let err = c.push(&oversized, Durability::Sync).unwrap_err();
+        let err = c.push(&oversized, Durability::Durable).unwrap_err();
         assert!(
             matches!(err, ClientError::PayloadTooLarge { .. }),
             "expected a local PayloadTooLarge, got {err:?}"
@@ -1180,7 +1198,7 @@ mod tests {
         // over-cap guard.
         let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut c = WeirClient::from_stream(client_end);
-        let err = c.push(b"", Durability::Sync).unwrap_err();
+        let err = c.push(b"", Durability::Durable).unwrap_err();
         assert!(
             matches!(err, ClientError::EmptyPayload),
             "expected a local EmptyPayload, got {err:?}"

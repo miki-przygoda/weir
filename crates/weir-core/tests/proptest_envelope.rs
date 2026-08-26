@@ -208,7 +208,7 @@ proptest! {
     /// is a load-bearing invariant: the server's frame-reader relies on it.
     #[test]
     fn encoded_frame_length_is_exact(payload in arb_small_payload()) {
-        let header = Header::new(MessageType::Push, Durability::Sync, 0);
+        let header = Header::new(MessageType::Push, Durability::Durable, 0);
         let env = Envelope::new(header, payload.clone());
         let bytes = env.encode();
         prop_assert_eq!(bytes.len(), HEADER_LEN + payload.len() + 4);
@@ -286,7 +286,7 @@ proptest! {
     ) {
         // Build a valid frame with payload of `full_len` zero bytes…
         // (Envelope::new derives payload_len from the payload.)
-        let header = Header::new(MessageType::Push, Durability::Sync, 0);
+        let header = Header::new(MessageType::Push, Durability::Durable, 0);
         let env = Envelope::new(header, vec![0u8; full_len]);
         let full = env.encode();
         // …then keep only a prefix that is short of the full frame.
@@ -311,7 +311,7 @@ proptest! {
     fn bad_payload_crc_rejected(payload in proptest::collection::vec(any::<u8>(), 1..=128)) {
         let header = Header::new(
             MessageType::Push,
-            Durability::Sync,
+            Durability::Durable,
             0);
         let env = Envelope::new(header, payload.clone());
         let mut bytes = env.encode();
@@ -334,7 +334,7 @@ proptest! {
         payload in arb_small_payload(),
         suffix in proptest::collection::vec(any::<u8>(), 1..=64),
     ) {
-        let env = Envelope::new(Header::new(MessageType::Push, Durability::Sync, 0), payload);
+        let env = Envelope::new(Header::new(MessageType::Push, Durability::Durable, 0), payload);
         let mut bytes = env.encode();
         let extra = suffix.len();
         bytes.extend_from_slice(&suffix);

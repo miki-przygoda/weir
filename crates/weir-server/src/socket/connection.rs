@@ -578,7 +578,7 @@ async fn send_nack<S: AsyncWrite + Unpin>(
     nack_payload.push(reason as u8);
     nack_payload.extend_from_slice(extra);
 
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
+    let header = Header::new(MessageType::Nack, Durability::Durable, 0);
     let frame = Envelope::new(header, nack_payload).encode();
     write_all_timeout(stream, &frame, write_timeout).await
 }
@@ -612,7 +612,7 @@ async fn write_all_timeout<S: AsyncWrite + Unpin>(
 fn ack_frame_bytes() -> &'static [u8] {
     static ACK_FRAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     ACK_FRAME.get_or_init(|| {
-        let header = Header::new(MessageType::Ack, Durability::Sync, 0);
+        let header = Header::new(MessageType::Ack, Durability::Durable, 0);
         Envelope::new(header, Vec::new()).encode()
     })
 }
@@ -623,7 +623,7 @@ fn ack_frame_bytes() -> &'static [u8] {
 fn healthcheck_response_frame_bytes() -> &'static [u8] {
     static HEALTHCHECK_RESPONSE_FRAME: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     HEALTHCHECK_RESPONSE_FRAME.get_or_init(|| {
-        let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0);
+        let header = Header::new(MessageType::HealthCheckResponse, Durability::Durable, 0);
         Envelope::new(header, Vec::new()).encode()
     })
 }
@@ -759,7 +759,7 @@ mod tests {
 
     /// Encodes a complete Push frame (header + payload + payload CRC).
     fn push_frame(payload: &[u8]) -> Vec<u8> {
-        let header = Header::new(MessageType::Push, Durability::Sync, 0);
+        let header = Header::new(MessageType::Push, Durability::Durable, 0);
         let env = Envelope::new(header, payload.to_vec());
         env.encode()
     }
@@ -769,7 +769,7 @@ mod tests {
     /// daemon waits for an advertised payload that never arrives. Header::new can
     /// no longer desync the declared length (F50), so patch the field + CRC.
     fn header_declaring(payload_len: u32) -> [u8; HEADER_LEN] {
-        let mut h = Header::new(MessageType::Push, Durability::Sync, 0).encode();
+        let mut h = Header::new(MessageType::Push, Durability::Durable, 0).encode();
         h[8..12].copy_from_slice(&payload_len.to_le_bytes());
         let crc = crc32fast::hash(&h[..12]);
         h[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -992,7 +992,7 @@ mod tests {
         // no longer declare a length that disagrees with its payload (F50), so we
         // patch the encoded header's payload_len field + recompute the header CRC
         // to put the oversized declared length on the wire directly.
-        let mut frame_header = Header::new(MessageType::Push, Durability::Sync, 0).encode();
+        let mut frame_header = Header::new(MessageType::Push, Durability::Durable, 0).encode();
         frame_header[8..12].copy_from_slice(&((MAX_PAYLOAD_HARD_CAP + 1) as u32).to_le_bytes());
         let crc = crc32fast::hash(&frame_header[..12]);
         frame_header[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -1013,7 +1013,7 @@ mod tests {
         // it at ingest before it reaches the WAB rather than let it truncate a
         // segment.
         let mut client = spawn_handler(test_cfg()).await;
-        let header = Header::new(MessageType::Push, Durability::Sync, 0);
+        let header = Header::new(MessageType::Push, Durability::Durable, 0);
         client.write_all(&header.encode()).await.unwrap();
         // Dummy payload CRC — not read; the empty-payload check fires first.
         client.write_all(&[0u8; 4]).await.unwrap();

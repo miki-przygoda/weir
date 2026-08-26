@@ -67,7 +67,7 @@ mod tests {
 
     /// Writes an Ack frame (empty payload) to `stream`.
     fn write_ack(stream: &mut UnixStream) {
-        let header = Header::new(MessageType::Ack, Durability::Sync, 0).encode();
+        let header = Header::new(MessageType::Ack, Durability::Durable, 0).encode();
         let crc = crc32fast::hash(&[]).to_le_bytes();
         stream.write_all(&header).unwrap();
         stream.write_all(&crc).unwrap();
@@ -78,7 +78,7 @@ mod tests {
     /// longer takes a length — F50).
     fn write_nack(stream: &mut UnixStream, reason: NackReason) {
         let frame = Envelope::new(
-            Header::new(MessageType::Nack, Durability::Sync, 0),
+            Header::new(MessageType::Nack, Durability::Durable, 0),
             vec![reason as u8],
         )
         .encode();
@@ -87,7 +87,7 @@ mod tests {
 
     /// Writes a HealthCheckResponse frame to `stream`.
     fn write_health_check_response(stream: &mut UnixStream) {
-        let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0).encode();
+        let header = Header::new(MessageType::HealthCheckResponse, Durability::Durable, 0).encode();
         let crc = crc32fast::hash(&[]).to_le_bytes();
         stream.write_all(&header).unwrap();
         stream.write_all(&crc).unwrap();
@@ -126,7 +126,7 @@ mod tests {
         });
 
         let mut client = WeirClient::connect(&path).unwrap();
-        assert!(client.push(b"hello", Durability::Sync).is_ok());
+        assert!(client.push(b"hello", Durability::Durable).is_ok());
     }
 
     #[test]
@@ -138,7 +138,7 @@ mod tests {
         });
 
         let mut client = WeirClient::connect(&path).unwrap();
-        let err = client.push(b"hello", Durability::Sync).unwrap_err();
+        let err = client.push(b"hello", Durability::Durable).unwrap_err();
         assert!(
             matches!(err, ClientError::Nack(NackReason::InternalError)),
             "expected Nack(InternalError), got {err:?}"
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn all_durability_tiers_accepted() {
-        for durability in [Durability::Sync, Durability::Batched, Durability::Buffered] {
+        for durability in [Durability::Durable, Durability::Buffered] {
             let tag = format!("durability_{durability:?}");
             let (path, _guard) = spawn_mock_server(&tag, |mut stream| {
                 while let Some((MessageType::Push, _)) = read_frame(&mut stream) {
@@ -193,7 +193,7 @@ mod tests {
         for i in 0..10u32 {
             let payload = format!("record-{i:04}");
             assert!(
-                client.push(payload.as_bytes(), Durability::Batched).is_ok(),
+                client.push(payload.as_bytes(), Durability::Durable).is_ok(),
                 "push #{i} should succeed"
             );
         }
@@ -212,7 +212,7 @@ mod tests {
         });
 
         let mut client = WeirClient::connect(&path).unwrap();
-        client.push(&expected, Durability::Sync).unwrap();
+        client.push(&expected, Durability::Durable).unwrap();
     }
 
     // ── Health check tests ────────────────────────────────────────────────────
@@ -273,7 +273,7 @@ mod tests {
         });
 
         let mut client = WeirClient::connect(&path).unwrap();
-        let err = client.push(b"hello", Durability::Sync).unwrap_err();
+        let err = client.push(b"hello", Durability::Durable).unwrap_err();
         assert!(
             matches!(err, ClientError::Io(_)),
             "expected Io error on unexpected close, got {err:?}"

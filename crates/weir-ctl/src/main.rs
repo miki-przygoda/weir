@@ -201,8 +201,8 @@ enum QuarantineCommand {
 
 fn parse_durability(s: &str) -> Result<Durability, String> {
     match s.to_ascii_lowercase().as_str() {
-        "sync" => Ok(Durability::Sync),
-        "batched" => Ok(Durability::Batched),
+        "sync" => Ok(Durability::Durable),
+        "batched" => Ok(Durability::Durable),
         "buffered" => Ok(Durability::Buffered),
         other => Err(format!(
             "unknown durability {other:?} (expected sync | batched | buffered)"
@@ -2073,7 +2073,7 @@ fn scrape(addr: &str) -> Result<String, String> {
 }
 
 /// Sums every sample whose line starts with `prefix` (handles label sets, e.g.
-/// `weir_records_ack_total{tier="sync"} 12`).
+/// `weir_records_ack_total{tier="durable"} 12`).
 fn sum_metric(body: &str, prefix: &str) -> f64 {
     body.lines()
         .filter(|l| l.starts_with(prefix))
@@ -2258,7 +2258,7 @@ mod tests {
         // A real weir exposition has weir_ series; the wrong port / another
         // service does not.
         assert!(has_weir_metrics(
-            "# HELP weir_records_accepted ...\nweir_records_accepted_total{tier=\"sync\"} 3"
+            "# HELP weir_records_accepted ...\nweir_records_accepted_total{tier=\"durable\"} 3"
         ));
         assert!(!has_weir_metrics(
             "# HELP go_gc_duration_seconds ...\ngo_goroutines 12"
@@ -2507,7 +2507,7 @@ mod tests {
         let wab = std::env::temp_dir().join(format!("weir_ctl_rq_empty_{}", std::process::id()));
         std::fs::create_dir_all(&wab).unwrap();
         let bogus = Path::new("/nonexistent/weir.sock");
-        cmd_dl_requeue(&wab, bogus, Durability::Batched, true, false).unwrap();
+        cmd_dl_requeue(&wab, bogus, Durability::Durable, true, false).unwrap();
         std::fs::remove_dir_all(&wab).ok();
     }
 
@@ -2519,7 +2519,7 @@ mod tests {
         let dl = wab.join("dead_letter");
         write_dl_segment(&dl, 1, &[b"one", b"two"]);
         let bogus = Path::new("/nonexistent/weir.sock");
-        cmd_dl_requeue(&wab, bogus, Durability::Batched, false, false).unwrap();
+        cmd_dl_requeue(&wab, bogus, Durability::Durable, false, false).unwrap();
         // Dry run leaves the segment in place.
         assert_eq!(dl_segments(&dl).unwrap().len(), 1);
         std::fs::remove_dir_all(&wab).ok();
@@ -2534,7 +2534,7 @@ mod tests {
         let dl = wab.join("dead_letter");
         write_dl_segment(&dl, 1, &[b"rec"]);
         let bogus = Path::new("/nonexistent/weir.sock");
-        let err = cmd_dl_requeue(&wab, bogus, Durability::Batched, true, false).unwrap_err();
+        let err = cmd_dl_requeue(&wab, bogus, Durability::Durable, true, false).unwrap_err();
         assert!(err.contains("connect"), "err: {err}");
         // The segment is left in place since nothing could be requeued.
         assert_eq!(dl_segments(&dl).unwrap().len(), 1);
@@ -2697,7 +2697,7 @@ mod tests {
         std::fs::remove_file(&socket).ok();
         let daemon = FakeDaemon::start(socket.clone());
 
-        cmd_dl_requeue(&wab, &socket, Durability::Batched, true, false)
+        cmd_dl_requeue(&wab, &socket, Durability::Durable, true, false)
             .expect("requeue should succeed");
 
         let received = daemon.into_received();
@@ -2762,8 +2762,8 @@ mod tests {
     fn metrics_summary_json_has_expected_keys() {
         // A representative exposition with the series print_summary reads.
         let body = "\
-weir_records_accepted_total{tier=\"sync\"} 5
-weir_records_ack_total{tier=\"sync\"} 4
+weir_records_accepted_total{tier=\"durable\"} 5
+weir_records_ack_total{tier=\"durable\"} 4
 weir_records_nack_total{reason=\"bad_payload_crc\"} 1
 weir_wab_fsync_duration_seconds_sum 0.5
 weir_wab_fsync_duration_seconds_count 10
@@ -2864,10 +2864,10 @@ weir_sink_info{sink_type=\"http\"} 1
 
     #[test]
     fn push_json_has_expected_keys() {
-        let v = round_trip(&push_json(128, Durability::Sync));
+        let v = round_trip(&push_json(128, Durability::Durable));
         assert_eq!(v["acked"], serde_json::json!(true));
         assert_eq!(v["bytes"], serde_json::json!(128));
-        assert_eq!(v["durability"], serde_json::json!("Sync"));
+        assert_eq!(v["durability"], serde_json::json!("Durable"));
     }
 
     #[test]
@@ -2911,14 +2911,14 @@ weir_sink_info{sink_type=\"http\"} 1
         assert_eq!(dry["unreadable_segments"], serde_json::json!(2));
         assert_eq!(dry["requeuable_records"], serde_json::json!(40));
 
-        let done = round_trip(&DlRequeueJson::done(5, 40, 4, 1, 0, Durability::Batched));
+        let done = round_trip(&DlRequeueJson::done(5, 40, 4, 1, 0, Durability::Durable));
         assert_eq!(done["dry_run"], serde_json::json!(false));
         assert_eq!(done["segments"], serde_json::json!(5));
         assert_eq!(done["requeued_records"], serde_json::json!(40));
         assert_eq!(done["segments_cleared"], serde_json::json!(4));
         assert_eq!(done["skipped_segments"], serde_json::json!(1));
         assert_eq!(done["delete_failures"], serde_json::json!(0));
-        assert_eq!(done["durability"], serde_json::json!("Batched"));
+        assert_eq!(done["durability"], serde_json::json!("Durable"));
     }
 
     #[test]
@@ -2941,8 +2941,8 @@ weir_sink_info{sink_type=\"http\"} 1
 
     #[test]
     fn parse_durability_is_case_insensitive_and_rejects_unknown() {
-        assert_eq!(parse_durability("SYNC").unwrap(), Durability::Sync);
-        assert_eq!(parse_durability("batched").unwrap(), Durability::Batched);
+        assert_eq!(parse_durability("SYNC").unwrap(), Durability::Durable);
+        assert_eq!(parse_durability("batched").unwrap(), Durability::Durable);
         assert_eq!(parse_durability("BuFfErEd").unwrap(), Durability::Buffered);
         let err = parse_durability("fast").unwrap_err();
         assert!(
@@ -3042,7 +3042,7 @@ weir_sink_info{sink_type=\"http\"} 1
     #[test]
     fn metric_primitives_sum_get_and_active_label() {
         let body = "\
-weir_records_accepted_total{tier=\"sync\"} 3
+weir_records_accepted_total{tier=\"durable\"} 3
 weir_records_accepted_total{tier=\"buffered\"} 4
 weir_records_accepted_total 99
 weir_queue_depth 7
@@ -3537,7 +3537,7 @@ weir_sink_health{state=\"degraded\"} 0
         cmd_quarantine_requeue(
             &dir,
             Path::new("/nonexistent.sock"),
-            Durability::Batched,
+            Durability::Durable,
             false,
             false,
         )
@@ -3591,7 +3591,7 @@ weir_sink_health{state=\"degraded\"} 0
         quarantine_requeue_write(
             &dir,
             Path::new("/nonexistent.sock"),
-            Durability::Batched,
+            Durability::Durable,
             false,
             false,
             &mut out,
@@ -3665,7 +3665,7 @@ weir_sink_health{state=\"degraded\"} 0
         // survive.
         let socket = fake_daemon_socket("desync");
         let _daemon = FakeDaemon::start(socket.clone());
-        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Batched, true, false)
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
             .expect_err("a segment with nothing recoverable must be reported, not silently OK");
         assert!(
             err.contains("no recoverable records") || err.contains("left in place"),
@@ -3700,7 +3700,7 @@ weir_sink_health{state=\"degraded\"} 0
         let _daemon =
             FakeDaemon::start_with_nacks(socket.clone(), std::collections::HashSet::from([1]));
 
-        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Batched, true, false)
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
             .expect_err("a Nacked push must surface as an error, not a silent partial success");
         assert!(
             err.contains("push failed") || err.to_lowercase().contains("nack"),
@@ -3727,7 +3727,7 @@ weir_sink_health{state=\"degraded\"} 0
         let socket = fake_daemon_socket("success");
         let daemon = FakeDaemon::start(socket.clone());
 
-        cmd_quarantine_requeue(&dir, &socket, Durability::Batched, true, false).unwrap();
+        cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false).unwrap();
         assert!(
             !q.join(name).exists(),
             "every recoverable record was accepted; the segment must be deleted"
@@ -3782,7 +3782,7 @@ weir_sink_health{state=\"degraded\"} 0
         let socket = fake_daemon_socket("desync_with_records");
         let daemon = FakeDaemon::start(socket.clone()); // Acks everything
 
-        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Batched, true, false)
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
             .expect_err("a segment that desynced must be reported, not silently OK");
         assert!(
             err.to_lowercase().contains("desync"),
@@ -3841,7 +3841,7 @@ weir_sink_health{state=\"degraded\"} 0
         let socket = fake_daemon_socket("all_skipped");
         let daemon = FakeDaemon::start(socket.clone()); // would Ack anything
 
-        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Batched, true, false)
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
             .expect_err("a segment with nothing recoverable must be reported, not silently OK");
         assert!(
             err.contains("no recoverable records"),
@@ -3908,7 +3908,7 @@ weir_sink_health{state=\"degraded\"} 0
         quarantine_requeue_write(
             &dir,
             Path::new("/nonexistent.sock"),
-            Durability::Batched,
+            Durability::Durable,
             false,
             false,
             &mut out,
@@ -3928,7 +3928,7 @@ weir_sink_health{state=\"degraded\"} 0
         // the junk file is left in place and reported (non-zero exit).
         let socket = fake_daemon_socket("unreadable");
         let daemon = FakeDaemon::start(socket.clone());
-        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Batched, true, false)
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
             .expect_err("an unreadable segment must be reported as a problem");
         assert!(err.to_lowercase().contains("could not be read"), "{err}");
         assert!(
@@ -3972,7 +3972,7 @@ weir_sink_health{state=\"degraded\"} 0
 
         let mut out = Vec::new();
         let result =
-            quarantine_requeue_write(&dir, &socket, Durability::Batched, true, false, &mut out);
+            quarantine_requeue_write(&dir, &socket, Durability::Durable, true, false, &mut out);
         assert!(
             result.is_ok(),
             "a skip alone must not fail the run — that would make every successful requeue \
@@ -4005,7 +4005,7 @@ weir_sink_health{state=\"degraded\"} 0
         quarantine_requeue_write(
             &dir,
             &socket2,
-            Durability::Batched,
+            Durability::Durable,
             true,
             true,
             &mut json_out,
@@ -4054,7 +4054,7 @@ weir_sink_health{state=\"degraded\"} 0
         let result = quarantine_requeue_write(
             &dir,
             &socket,
-            Durability::Batched,
+            Durability::Durable,
             true,
             true,
             &mut json_out,
@@ -4143,7 +4143,7 @@ weir_sink_health{state=\"degraded\"} 0
                 }],
             }],
         };
-        let v = round_trip(&quarantine_requeue_done_json(&outcome, Durability::Sync));
+        let v = round_trip(&quarantine_requeue_done_json(&outcome, Durability::Durable));
         assert_eq!(v["dry_run"], serde_json::json!(false));
         assert_eq!(v["segments"], serde_json::json!(5));
         assert_eq!(v["requeued_records"], serde_json::json!(12));
@@ -4152,7 +4152,7 @@ weir_sink_health{state=\"degraded\"} 0
         assert_eq!(v["segments_empty_left_in_place"], serde_json::json!(1));
         assert_eq!(v["unreadable_segments"], serde_json::json!(1));
         assert_eq!(v["delete_failures"], serde_json::json!(1));
-        assert_eq!(v["durability"], serde_json::json!("Sync"));
+        assert_eq!(v["durability"], serde_json::json!("Durable"));
         assert_eq!(v["skipped_records_total"], serde_json::json!(2));
         assert_eq!(
             v["skipped_records"][0]["segment"],

@@ -555,7 +555,7 @@ impl SegmentHandle for SimSegmentHandle {
 /// What the harness drives. `serde` for seed pinning.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scenario {
-    /// Flush `records` Sync work units through the real flusher under the
+    /// Flush `records` Durable work units through the real flusher under the
     /// configured faults; collect each record's ack outcome.
     SyncFlush { records: usize },
     /// Write `records`, seal (rename injected to fail = crash), then run
@@ -813,7 +813,7 @@ fn read_sealed_payloads(shard_dir: &Path) -> Vec<Vec<u8>> {
     out
 }
 
-/// The observable result of driving the real flusher over a batch of Sync
+/// The observable result of driving the real flusher over a batch of Durable
 /// records: what was sent, how each was acked, the durability ledger, and the
 /// (not-yet-cleaned-up) environment so a caller can run recovery against it.
 struct FlushOutcome {
@@ -827,7 +827,7 @@ struct FlushOutcome {
     compression: Compression,
 }
 
-/// Sends `records` unique Sync units in one batch through the **real**
+/// Sends `records` unique Durable units in one batch through the **real**
 /// [`super::flusher_thread`] under `faults`, joins the flusher, and collects the
 /// per-record acks. Performs no invariant checks and leaves `env` un-cleaned so
 /// the caller can recover from the on-disk state.
@@ -858,7 +858,7 @@ fn drive_sync_flusher(
         let payload = rng.unique_payload(i as u64);
         let (ack_tx, ack_rx) = oneshot::channel();
         ack_rxs.push(ack_rx);
-        units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+        units.push(make_unit(payload.clone(), Durability::Durable, ack_tx));
         payloads.push(payload);
     }
     work_tx.send(make_batch(units)).expect("send batch");
@@ -891,7 +891,7 @@ fn drive_sync_flusher(
         .into_iter()
         .map(|mut rx| {
             rx.try_recv().unwrap_or_else(|e| {
-                panic!("DST: Sync record left without an ack (seed {seed:#018x}): {e}")
+                panic!("DST: Durable record left without an ack (seed {seed:#018x}): {e}")
             })
         })
         .collect();
@@ -921,7 +921,7 @@ fn assert_acked_records_durable(seed: u64, out: &FlushOutcome) {
     }
 }
 
-/// Scenario 1 — `EIO` on `fdatasync` (G-WAB-1). Sends `records` Sync units
+/// Scenario 1 — `EIO` on `fdatasync` (G-WAB-1). Sends `records` Durable units
 /// through the real flusher thread under the fault schedule; asserts that a
 /// failed durability barrier produces no `true` ack.
 fn run_sync_flush(
@@ -1010,7 +1010,7 @@ fn run_panic_during_flush(
         let payload = rng.unique_payload(i as u64);
         let (ack_tx, ack_rx) = oneshot::channel();
         ack_rxs.push(ack_rx);
-        units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+        units.push(make_unit(payload.clone(), Durability::Durable, ack_tx));
         payloads.push(payload);
     }
     work_tx.send(make_batch(units)).expect("send batch");
@@ -1316,7 +1316,7 @@ fn run_interleaved_flush(
             idx += 1;
             let (ack_tx, ack_rx) = oneshot::channel();
             ack_rxs.push(ack_rx);
-            units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+            units.push(make_unit(payload.clone(), Durability::Durable, ack_tx));
             payloads.push(payload);
         }
         batches.push(make_batch(units));
@@ -1407,7 +1407,7 @@ fn run_interleaved_flush(
 mod tests {
     use super::*;
 
-    /// Scenario 1: an `EIO` on the group fdatasync must Nack every Sync record
+    /// Scenario 1: an `EIO` on the group fdatasync must Nack every Durable record
     /// in the batch — no producer is told its record is durable when it isn't.
     #[test]
     fn eio_on_fdatasync_nacks_every_sync_record() {
@@ -1419,7 +1419,7 @@ mod tests {
         assert_eq!(report.acks.len(), 4);
         assert!(
             report.acks.iter().all(|&ok| !ok),
-            "every Sync record must be Nacked when its fsync fails, got {:?}",
+            "every Durable record must be Nacked when its fsync fails, got {:?}",
             report.acks
         );
     }
@@ -1434,7 +1434,7 @@ mod tests {
         assert!(report.acks.iter().all(|&ok| ok), "acks: {:?}", report.acks);
     }
 
-    /// Drives the REAL [`super::flusher_thread`] over one Sync batch of
+    /// Drives the REAL [`super::flusher_thread`] over one Durable batch of
     /// fixed-size payloads with a small `segment_max_bytes`, so rotation fires
     /// MID-batch. Fixed-size payloads keep the rotation split deterministic
     /// (`drive_sync_flusher` uses variable-size payloads, so no flusher-driving
@@ -1465,7 +1465,7 @@ mod tests {
         for p in &payloads {
             let (ack_tx, ack_rx) = oneshot::channel();
             ack_rxs.push(ack_rx);
-            units.push(make_unit(p.clone(), Durability::Sync, ack_tx));
+            units.push(make_unit(p.clone(), Durability::Durable, ack_tx));
         }
         work_tx.send(make_batch(units)).expect("send batch");
         drop(work_tx);
@@ -1664,7 +1664,7 @@ mod tests {
         assert_eq!(a.written, a.recovered);
     }
 
-    /// Scenario (Phase 2): a torn write on the 3rd record of a 4-record Sync
+    /// Scenario (Phase 2): a torn write on the 3rd record of a 4-record Durable
     /// batch drops the active segment mid-flush. The two records already written
     /// to that segment were never fsynced, so they MUST be Nacked, not falsely
     /// acked off a later segment's fsync (I1, checked inside `run`). The torn

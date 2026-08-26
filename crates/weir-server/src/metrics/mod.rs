@@ -288,7 +288,9 @@ pub(crate) struct Metrics {
     #[cfg(feature = "bench-trace")]
     pub stage_queue: Histogram,
     /// bridge hop + flusher recv wait: worker flush → flusher dequeue. bench-trace only.
-    /// This is where the Batched double-deadline anomaly will show up.
+    /// This is where the (historical, disproven — see
+    /// docs/benchmarks/phase3-results.md) Batched double-deadline anomaly
+    /// hypothesis would have shown up.
     #[cfg(feature = "bench-trace")]
     pub stage_bridge_wait: Histogram,
     /// record write: flusher dequeue → write_record done (pre-fsync). bench-trace only.

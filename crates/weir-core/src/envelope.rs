@@ -349,7 +349,7 @@ mod tests {
     use crate::version::WIRE_VERSION;
 
     fn push_header() -> Header {
-        Header::new(MessageType::Push, Durability::Sync, 0)
+        Header::new(MessageType::Push, Durability::Durable, 0)
     }
 
     // ── Header ──────────────────────────────────────────────────────────────
@@ -461,13 +461,13 @@ mod tests {
     /// `ReservedFlagsSet` rather than silently accepted (F52).
     #[test]
     fn header_decode_rejects_nonzero_flags() {
-        let buf = Header::new(MessageType::Push, Durability::Sync, 0x01).encode();
+        let buf = Header::new(MessageType::Push, Durability::Durable, 0x01).encode();
         assert_eq!(
             Header::decode(&buf),
             Err(DecodeError::ReservedFlagsSet { flags: 0x01 })
         );
         // The full byte is reported verbatim, not just "nonzero".
-        let buf = Header::new(MessageType::Push, Durability::Sync, 0xff).encode();
+        let buf = Header::new(MessageType::Push, Durability::Durable, 0xff).encode();
         assert_eq!(
             Header::decode(&buf),
             Err(DecodeError::ReservedFlagsSet { flags: 0xff })
@@ -480,7 +480,7 @@ mod tests {
     /// the daemon's Nack mapping).
     #[test]
     fn header_decode_flags_checked_after_durability() {
-        let mut buf = Header::new(MessageType::Push, Durability::Sync, 0x01).encode();
+        let mut buf = Header::new(MessageType::Push, Durability::Durable, 0x01).encode();
         buf[6] = 0xff; // unknown durability
         let crc = crc32fast::hash(&buf[..HEADER_CRC_COVERAGE]);
         buf[12..16].copy_from_slice(&crc.to_le_bytes());
@@ -542,7 +542,7 @@ mod tests {
 
     fn round_trip(msg_type: MessageType) {
         let payload = b"hello weir".to_vec();
-        let header = Header::new(msg_type, Durability::Sync, 0);
+        let header = Header::new(msg_type, Durability::Durable, 0);
         let env = Envelope::new(header, payload);
         let encoded = env.encode();
         let decoded = Envelope::decode(&encoded).unwrap();
@@ -699,7 +699,7 @@ mod tests {
         // payload_len field + recompute the header CRC directly to put the over-cap
         // declared length on the wire.
         let oversized_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
-        let mut header_bytes = Header::new(MessageType::Push, Durability::Sync, 0).encode();
+        let mut header_bytes = Header::new(MessageType::Push, Durability::Durable, 0).encode();
         header_bytes[8..12].copy_from_slice(&oversized_len.to_le_bytes());
         let crc = crc32fast::hash(&header_bytes[..HEADER_CRC_COVERAGE]);
         header_bytes[12..16].copy_from_slice(&crc.to_le_bytes());

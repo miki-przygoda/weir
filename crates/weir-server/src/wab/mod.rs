@@ -711,7 +711,7 @@ fn flush_batch(
     metrics: &Arc<Metrics>,
     coalesce_hint: &Arc<AtomicU64>,
 ) {
-    // Sync + Batched records both ride a single group fsync at the end of the
+    // Every Durable record rides a single group fsync at the end of the
     // flush (the per-record fsync was the herd-benchmark bottleneck). Their acks
     // are split by the FATE of the segment each record landed in:
     //
