@@ -147,10 +147,7 @@ fn every_vector_decodes_as_specified() {
             // durability byte) that decodes fine but a conformant encoder never
             // re-emits, so its bytes cannot round-trip by design. See
             // retired_batched_byte_decodes_but_never_round_trips below.
-            let round_trips = v
-                .get("round_trip")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+            let round_trips = v.get("round_trip").and_then(Value::as_bool).unwrap_or(true);
             if round_trips {
                 assert_eq!(
                     to_hex(&env.encode()),
@@ -180,5 +177,9 @@ fn retired_batched_byte_decodes_but_never_round_trips() {
     // it back — decode permissive, encode canonical.
     let decoded = Durability::try_from(0x02).expect("0x02 must still decode");
     assert_eq!(decoded, Durability::Durable);
-    assert_eq!(u8::from(decoded), 0x01, "re-encoding must canonicalise to 0x01");
+    assert_eq!(
+        u8::from(decoded),
+        0x01,
+        "re-encoding must canonicalise to 0x01"
+    );
 }

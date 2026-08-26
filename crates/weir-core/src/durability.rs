@@ -124,7 +124,10 @@ mod tests {
     fn unknown_bytes_are_still_rejected() {
         assert!(Durability::try_from(0x00).is_err());
         assert!(Durability::try_from(0x04).is_err());
-        assert_eq!(Durability::try_from(0x7f).unwrap_err(), UnknownDurability(0x7f));
+        assert_eq!(
+            Durability::try_from(0x7f).unwrap_err(),
+            UnknownDurability(0x7f)
+        );
     }
 
     #[test]
