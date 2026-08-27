@@ -28,28 +28,68 @@ So a naive protocol that engages `drop_writes` and lets weir keep acking inside
 the window produces acked-but-missing records at the durable tier, and an oracle
 that calls that an I1 violation is reporting **the harness lying to weir**.
 
-### Protocol (a), chosen
+### Protocol: kill first, then drop and remount
 
-Engage `drop_writes`, then **immediately** `kill -9`. The window holds
-approximately zero acks. This is the faithful power-loss model, and it is what
-makes the Buffered result attributable: *Buffered loses because Buffered acks
-before fsync*, not because the window ate the write.
+**Superseded 2026-08-27.** The original protocol — engage `drop_writes`, then
+`kill -9` — was wrong in two ways that only a walk through the kernel's layering
+exposes. Both were found in final review, before any hardware run.
 
-The control doc's alternatives are deliberately not built:
+**`drop_writes` sits BELOW the page cache.** A dropped write completes
+successfully, so the kernel marks the page clean — but the page is still
+resident and still correct. `kill -9` does not evict it; that is the very
+premise this phase rests on. So the daemon restarts, reads the WAB, and gets
+every byte back from cache. **The injector cannot lose a single byte.**
+
+This spec's own control experiment says so without following the implication:
+it measured *"at block level — `dd` straight onto the mapped device, no
+filesystem between the fault and the observation."* That result is about a
+**device**. Mounting a filesystem on top inherits none of it.
+
+**And `dmsetup suspend` syncs the filesystem it is about to lie to.** Without
+`--nolockfs` it freezes and flushes every dirty page to the still-honest disk
+before the fault installs, so nothing is at risk when it goes live — and weir's
+blocked writes then unblock *after* the thaw, against a lying disk,
+manufacturing exactly the false acks protocol (a) existed to prevent.
+
+The episode is therefore:
+
+```
+steady load
+  -> kill -9                     # dead FIRST: cannot ack into the window
+  -> engage drop_writes          # dmsetup suspend --nolockfs
+  -> umount                      # its writeback is discarded by the lying disk
+  -> disengage
+  -> mount                       # ext4 journal replays to the pre-fault state
+  -> restart daemon              # recovery runs against an honest disk
+  -> drain -> verify
+```
+
+Killing first makes the lying window **exactly zero by construction** — weir is
+already dead and cannot ack into it — rather than merely narrow. The earlier
+ordering left two `subprocess` round trips (`dmsetup resume` plus a table
+read-back) between engage and kill: 5–10 ms at full rate, hundreds of acks, each
+one a false Durable-tier I1 violation once the injector actually bites.
+
+It is also the more faithful model. What is lost is the data that was dirty at
+the instant of death and had never reached the platter. That is the definition
+of power loss. The only cost is that writeback in the few milliseconds between
+kill and engage shrinks the loss slightly — erring toward **under**-injecting,
+which is the safe direction for a durability claim.
+
+The umount/mount cycle is what converts "writes were dropped" into "the
+filesystem lost them", and it is what xfstests' `_flakey_drop_and_remount` does
+for the same reason. Without it there is no observable fault. It also prevents a
+second failure: once writes are dropped under a live mount, the on-disk image
+and the page cache diverge permanently for the rest of the run, so any page
+evicted under memory pressure returns stale bytes and weir sees a corrupt WAB —
+a "weir defect" that is pure harness artefact.
+
+### The alternatives, still not built
+
 (b) a wide window with post-fault exemption is "honest but weaker" and needs the
 exempt-zone size reported; (c) `error_writes` tests fail-closed nacking, which is
 real and worth measuring but is **a different fault class and must not be
 relabelled power loss**.
-
-### The episode
-
-```
-steady load  →  engage drop_writes  →  kill -9 (immediately)
-             →  disengage           →  restart daemon  →  drain  →  verify
-```
-
-Disengage before restart: recovery must run against an honest disk, or the
-restart is testing a second fault rather than recovery from the first.
 
 ## The contract being tested
 
