@@ -592,6 +592,19 @@ class TestTierAwareI1(unittest.TestCase):
         self.assertEqual(r.i1_missing, [1])
         self.assertEqual(r.expected_loss, 0)
 
+    def test_summary_surfaces_expected_loss_when_nonzero(self):
+        # I3 (final review): an episode that lost 12,000 Buffered records
+        # used to render identically to one that lost none — the exemption
+        # keeps `ok=True`, and expected_loss was in neither the episode
+        # table nor here.
+        r = verify.check(ledger(**{"1": ("ACK", "")}), [],
+                         tier="U", fault="power_loss")
+        self.assertIn("expected_loss=1", r.summary())
+
+    def test_summary_omits_expected_loss_when_zero(self):
+        r = verify.check(ledger(**{"1": ("ACK", "")}), [1])
+        self.assertNotIn("expected_loss", r.summary())
+
 
 if __name__ == "__main__":
     unittest.main()

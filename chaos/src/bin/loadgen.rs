@@ -228,7 +228,7 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
-    let durability = tier_from_char(args.tier).expect("--tier must be S, B, or U");
+    let durability = tier_from_char(args.tier).expect("--tier must be D, S, or U");
 
     // BEFORE any thread starts, so there is no window in which a stop signal
     // still has its default (fatal) disposition while records are in flight.

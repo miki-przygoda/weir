@@ -130,6 +130,12 @@ class VerifyResult:
             extra += f" i1_exempt={self.i1_exempt}"
         if self.pending_provenance:
             extra += f" pending_provenance={self.pending_provenance}"
+        if self.expected_loss:
+            # I3 (final review): without this, an episode that lost 12,000
+            # Buffered records under power loss printed identically to one
+            # that lost none — the exemption made I1 stay silent (`ok=True`)
+            # and this was the only other place the figure could have shown.
+            extra += f" expected_loss={self.expected_loss}"
         if self.ok:
             return (
                 f"PASS  pushed={self.pushed} acked={self.acked_count} "

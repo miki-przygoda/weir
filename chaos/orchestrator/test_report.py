@@ -374,6 +374,43 @@ class TestPowerLossVerdict(unittest.TestCase):
         )
         self.assertEqual(report.powerloss_verdict(recs), "pass")
 
+    def test_the_zero_loss_check_reads_the_last_record_not_a_sum(self):
+        # C4 (final review): expected_loss is a currently-still-missing
+        # count, not a per-episode delta — a record lost in episode 0 stays
+        # in it for every later check, so a naive sum would treat "lost once,
+        # 199 episodes ago" the same as "actively losing every episode".
+        # Only the LAST verified record's figure decides the verdict.
+        recs = [
+            {"tier": "U", "fault": "power_loss", "expected_loss": 14, "i1_missing": []},
+            {"tier": "U", "fault": "power_loss", "expected_loss": 0, "i1_missing": []},
+        ]
+        self.assertEqual(
+            report.powerloss_verdict(recs), "inconclusive",
+            "the LAST record lost nothing; an old sum (14) must not paper "
+            "over that",
+        )
+
+    def test_an_i2_leak_in_a_power_loss_episode_is_a_fail_not_a_silent_pass(self):
+        # MINOR (final review): powerloss_verdict used to inspect only
+        # i1_missing, so an I2 leak could render `pass` here while the run's
+        # headline violation count already disagreed.
+        recs = [{"tier": "D", "fault": "power_loss", "expected_loss": 0,
+                 "i1_missing": [], "i2_leaked": [99]}]
+        self.assertEqual(report.powerloss_verdict(recs), "fail")
+
+    def test_a_ledger_conflict_in_a_power_loss_episode_is_a_fail_not_a_silent_pass(self):
+        recs = [{"tier": "D", "fault": "power_loss", "expected_loss": 0,
+                 "i1_missing": [], "ledger_conflicts": [(5, "ACK", "NACK")]}]
+        self.assertEqual(report.powerloss_verdict(recs), "fail")
+
+    def test_an_abort_record_does_not_count_as_a_power_loss_episode(self):
+        # MINOR (final review): the pre-fault abort record carries the
+        # SCHEDULED fault kind even though the run died before ever reaching
+        # engage_fault().
+        recs = [{"episode": 0, "fault": "power_loss", "ok": True,
+                 "abort_reason": "loadgen_exited", "seed": 1}]
+        self.assertEqual(report.powerloss_verdict(recs), "pass")
+
 
 class TestPowerLossSection(unittest.TestCase):
     """Task 7's negative control has to actually reach report.md, not just
@@ -398,14 +435,23 @@ class TestPowerLossSection(unittest.TestCase):
         self.assertIn("INCONCLUSIVE", out)
         self.assertIn("suspicious", out)
 
-    def test_buffered_nonzero_loss_is_surfaced_as_pass_with_the_total(self):
-        episodes = [self._episode(0, "U", 14), self._episode(1, "U", 0)]
+    def test_buffered_nonzero_loss_is_surfaced_as_pass_with_the_last_record(self):
+        # C4 (final review): the headline used to SUM expected_loss across
+        # episodes — a cumulative "currently still missing" count, not a
+        # delta, so summing double(or more)-counts any record that stays
+        # lost. It must read the LAST verified record instead, exactly like
+        # the Totals table does.
+        episodes = [self._episode(0, "U", 14), self._episode(1, "U", 31)]
         out = report.render(episodes, {})
         self.assertIn("Power-loss verdict", out)
         self.assertIn("PASS", out)
         self.assertIn(
-            "**14**", out,
-            "the TOTAL across episodes, not one episode's own figure",
+            "**31**", out,
+            "the LAST episode's cumulative figure, not a sum across episodes",
+        )
+        self.assertNotIn(
+            "**45**", out,
+            "45 = 14+31 would be the old (buggy) summed total",
         )
 
     def test_durable_loss_is_surfaced_as_fail(self):
@@ -435,6 +481,101 @@ class TestPowerLossSection(unittest.TestCase):
         out = report.render([], {})
         self.assertNotIn("not yet tier-aware", out)
         self.assertIn("tier- and fault-aware", out)
+
+    def test_an_aborted_run_that_never_injected_gets_no_power_loss_section(self):
+        # MINOR (final review): the pre-fault abort record carries the
+        # SCHEDULED fault kind, so this used to render a Power-loss verdict
+        # section for a run that died before engage_fault() ever ran.
+        episodes = [
+            {"episode": 0, "fault": "power_loss", "ok": True, "quiesced": False,
+             "abort_reason": "loadgen_exited", "exit_code": 1, "seed": 1},
+        ]
+        out = report.render(episodes, {})
+        self.assertNotIn("## Power-loss verdict", out)
+
+    def test_a_power_loss_run_gets_a_phase_2_title_and_a_consistent_limitations_bullet(self):
+        # I2 (final review): the title used to be hardcoded "Phase 1
+        # (spine)", and the Limitations bullet said power loss was "not
+        # covered by this run" — printed directly under this run's own
+        # "## Power-loss verdict" section.
+        episodes = [self._episode(0, "U", 5)]
+        out = report.render(episodes, {})
+        self.assertIn("Phase 2", out)
+        self.assertNotIn("Phase 1 (spine)", out)
+        self.assertIn("Power-loss verdict", out)
+        self.assertNotIn("not covered by this run", out)
+
+    def test_a_kill_random_only_run_keeps_the_phase_1_title(self):
+        episodes = [
+            {"episode": 0, "fault": "kill_random", "ok": True, "quiesced": True,
+             "acked_delta": 1000, "delivered_delta": 1000, "no_progress": False,
+             "duplicate_rate": 1.0, "unknown": 0, "i1_missing": [], "i2_leaked": [],
+             "seed": 1},
+        ]
+        out = report.render(episodes, {})
+        self.assertIn("Phase 1 (spine)", out)
+        self.assertIn("are **not", out)
+        self.assertIn("covered** by this run", out)
+
+    def test_expected_loss_has_its_own_episode_table_column(self):
+        # I3 (final review): an episode that lost 12,000 Buffered records
+        # used to render identically to one that lost none — I1 stays
+        # silent (ok=True) for the exemption, and expected_loss was in
+        # neither the episode table nor VerifyResult.summary().
+        episodes = [self._episode(0, "U", 12000)]
+        out = report.render(episodes, {})
+        self.assertIn("Expected loss", out)
+        self.assertIn("| 12000 |", out)
+
+
+class TestCanarySection(unittest.TestCase):
+    """I6: a canary block written before the fault and overwritten while it
+    is engaged converts the negative control from an inference into a
+    measurement — this has to actually reach report.md."""
+
+    def _episode(self, n, canary):
+        return {
+            "episode": n, "fault": "power_loss", "tier": "U",
+            "ok": True, "quiesced": True, "acked_delta": 100,
+            "delivered_delta": 100, "no_progress": False,
+            "duplicate_rate": 1.0, "unknown": 0, "i1_missing": [],
+            "i2_leaked": [], "expected_loss": 0, "canary": canary,
+            "seed": 1,
+        }
+
+    def test_canary_summary_reports_the_bite_count(self):
+        episodes = [self._episode(0, "bit"), self._episode(1, "bit"),
+                    self._episode(2, "did_not_bite")]
+        out = report.render(episodes, {})
+        self.assertIn("Canary", out)
+        self.assertIn("2/3", out)
+
+    def test_a_did_not_bite_canary_is_flagged_in_the_episode_notes(self):
+        episodes = [self._episode(0, "did_not_bite")]
+        out = report.render(episodes, {})
+        self.assertIn("canary=did_not_bite", out)
+
+    def test_an_unexpected_canary_is_flagged_too(self):
+        episodes = [self._episode(0, "unexpected")]
+        out = report.render(episodes, {})
+        self.assertIn("canary=unexpected", out)
+
+    def test_a_bit_canary_does_not_clutter_every_row(self):
+        episodes = [self._episode(0, "bit")]
+        out = report.render(episodes, {})
+        self.assertNotIn("canary=bit", out)
+
+    def test_no_canary_recorded_at_all_renders_no_canary_line(self):
+        # kill_random episodes (and pre-canary records) carry no "canary"
+        # key at all — the summary line must simply not appear, not crash.
+        episodes = [
+            {"episode": 0, "fault": "power_loss", "tier": "U", "ok": True,
+             "quiesced": True, "acked_delta": 100, "delivered_delta": 100,
+             "no_progress": False, "duplicate_rate": 1.0, "unknown": 0,
+             "i1_missing": [], "i2_leaked": [], "expected_loss": 0, "seed": 1},
+        ]
+        out = report.render(episodes, {})
+        self.assertNotIn("Canary:", out)
 
 
 if __name__ == "__main__":

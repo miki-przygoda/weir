@@ -5,6 +5,7 @@ is still runnable on a dev machine.
 """
 import os
 import platform
+import stat
 import subprocess
 import tempfile
 import time
@@ -213,6 +214,68 @@ class TestLinearCreateVerification(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 s._dm_create(s.dm_name, "0 65536 linear 7:19 0")
 
+    # MINOR (final review): _verify_linear_target used to check only the
+    # target TYPE, not sector count or backing device — so a stale LINEAR
+    # table from an unrelated, differently-sized or differently-backed
+    # device would pass just as easily as the real one.
+
+    def test_raises_if_the_sector_count_does_not_match(self):
+        s = self._stack()
+        s._sectors = 65536
+        fake = _fake_run(
+            {("dmsetup", "table"): _Result(0, "0 32768 linear 7:19 0", "")}
+        )
+        with mock.patch.object(dm_stack, "_run", fake):
+            with self.assertRaises(RuntimeError):
+                s._dm_create(s.dm_name, "0 65536 linear 7:19 0")
+
+    def test_a_matching_sector_count_passes(self):
+        s = self._stack()
+        s._sectors = 65536
+        fake = _fake_run(
+            {("dmsetup", "table"): _Result(0, "0 65536 linear 7:19 0", "")}
+        )
+        with mock.patch.object(dm_stack, "_run", fake):
+            s._dm_create(s.dm_name, "0 65536 linear 7:19 0")  # must not raise
+
+    def test_raises_if_the_backing_device_does_not_match(self):
+        s = self._stack()
+        s._sectors = 65536
+        s.loop_device = "/dev/loop7"
+        fake = _fake_run(
+            {("dmsetup", "table"): _Result(0, "0 65536 linear 8:3 0", "")}
+        )
+        with mock.patch.object(dm_stack, "_run", fake), mock.patch.object(
+            dm_stack, "_device_major_minor", lambda p: "7:19"
+        ):
+            with self.assertRaises(RuntimeError):
+                s._dm_create(s.dm_name, "0 65536 linear 8:3 0")
+
+    def test_a_matching_backing_device_passes(self):
+        s = self._stack()
+        s._sectors = 65536
+        s.loop_device = "/dev/loop7"
+        fake = _fake_run(
+            {("dmsetup", "table"): _Result(0, "0 65536 linear 7:19 0", "")}
+        )
+        with mock.patch.object(dm_stack, "_run", fake), mock.patch.object(
+            dm_stack, "_device_major_minor", lambda p: "7:19"
+        ):
+            s._dm_create(s.dm_name, "0 65536 linear 7:19 0")  # must not raise
+
+    def test_an_unresolvable_loop_device_path_does_not_crash_verification(self):
+        # /dev/loop7 doesn't really exist on a dev/test machine. The device
+        # check must degrade to a no-op rather than raising an unrelated
+        # OSError out of a routine whose whole job is raising the RIGHT one.
+        s = self._stack()
+        s._sectors = 65536
+        s.loop_device = "/dev/loop7"
+        fake = _fake_run(
+            {("dmsetup", "table"): _Result(0, "0 65536 linear 7:19 0", "")}
+        )
+        with mock.patch.object(dm_stack, "_run", fake):
+            s._dm_create(s.dm_name, "0 65536 linear 7:19 0")  # must not raise
+
 
 class TestFlakeyEngageDisengage(unittest.TestCase):
     DISENGAGED = "0 65536 flakey 7:19 0 60 0 1 drop_writes"
@@ -374,6 +437,42 @@ class TestTeardownStackOrder(unittest.TestCase):
             self.assertEqual(order, ["umount", "dm_remove", "losetup"])
             self.assertIsNone(s.dm_name, "dm_name must be cleared once removed")
 
+    def test_teardown_continues_to_detach_even_when_dm_remove_raises(self):
+        # I5 (final review): a stuck mapping used to raise straight out of
+        # teardown(), skipping the loop-device detach entirely — leaking the
+        # loop device AND the backing image behind it, contradicting
+        # teardown's documented idempotence (which Phase 1 had).
+        with tempfile.TemporaryDirectory() as tmp:
+            img = os.path.join(tmp, "wab.img")
+            open(img, "wb").close()
+            mnt = os.path.join(tmp, "mnt")
+            os.makedirs(mnt)
+            s = dm_stack.StorageStack(img, size_mb=128, mount_point=mnt, dm_target="flakey")
+            s.loop_device = "/dev/loop7"
+            s.dm_name = "weir-chaos-flakey-1234"
+
+            order = []
+
+            def fake_run(cmd, check=True):
+                order.append(cmd[0])
+                return _Result(0, "", "")
+
+            def fake_remove(name):
+                order.append("dm_remove")
+                raise RuntimeError("mapping still present 10s after remove --retry")
+
+            with mock.patch.object(dm_stack, "_run", fake_run), mock.patch.object(
+                dm_stack, "_dm_remove", fake_remove, create=True
+            ):
+                s.teardown()  # must not raise
+
+            self.assertEqual(order, ["umount", "dm_remove", "losetup"])
+            self.assertEqual(
+                s.dm_name, "weir-chaos-flakey-1234",
+                "a mapping that failed to remove must stay visible, not be "
+                "silently forgotten",
+            )
+
 
 class TestAsyncRemoveGuard(unittest.TestCase):
     def test_remove_polls_until_the_mapping_is_really_gone(self):
@@ -401,6 +500,33 @@ class TestAsyncRemoveGuard(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 dm_stack._dm_remove("stuck", timeout_s=0.3)
 
+    # I4 (final review): _dm_remove used to fire `dmsetup remove` once with
+    # no retry and discard its stderr — so the likeliest real failure (a
+    # preceding `umount` that itself failed silently) never reached the
+    # operator.
+
+    def test_remove_calls_dmsetup_remove_with_retry(self):
+        calls = []
+        def fake_run(cmd, check=True):
+            calls.append(cmd)
+            if cmd[:2] == ["dmsetup", "info"]:
+                return _Result(1, "", "")
+            return _Result(0, "", "")
+        with mock.patch.object(dm_stack, "_run", fake_run):
+            dm_stack._dm_remove("weir-chaos-flakey")
+        self.assertIn(["dmsetup", "remove", "--retry", "weir-chaos-flakey"], calls)
+
+    def test_remove_timeout_message_includes_the_removes_stderr(self):
+        def always_present(cmd, check=True):
+            if cmd[:2] == ["dmsetup", "remove"]:
+                return _Result(1, "", "device-mapper: remove ioctl failed: "
+                                      "Device or resource busy")
+            return _Result(0, "", "")
+        with mock.patch.object(dm_stack, "_run", always_present):
+            with self.assertRaises(RuntimeError) as ctx:
+                dm_stack._dm_remove("stuck", timeout_s=0.3)
+        self.assertIn("Device or resource busy", str(ctx.exception))
+
 
 class TestReloadResumesEvenOnFailure(unittest.TestCase):
     DISENGAGED = "0 65536 flakey 7:19 0 60 0 1 drop_writes"
@@ -424,6 +550,123 @@ class TestReloadResumesEvenOnFailure(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 s.engage_fault()
         self.assertIn("resume", calls, "resume must fire even when reload fails")
+
+
+class TestDropAndRemount(unittest.TestCase):
+    """C2 (final review): converts an engaged fault into actual filesystem
+    loss. `drop_writes` sits below the page cache, so a dropped write leaves
+    a correct, resident page behind — nothing is at risk until this method's
+    umount forces writeback (discarded by the lying disk) and the following
+    mount rebuilds the filesystem from whatever the disk actually kept.
+    """
+    DISENGAGED = "0 65536 flakey 7:19 0 60 0 1 drop_writes"
+
+    def _stack(self, mount_point):
+        s = dm_stack.StorageStack("/tmp/img", 512, mount_point, dm_target="flakey")
+        s.loop_device = "/dev/loop7"
+        s.dm_name = "weir-chaos-flakey-1234"
+        s._sectors = 65536
+        return s
+
+    def test_refuses_without_a_built_flakey_layer(self):
+        s = dm_stack.StorageStack("/tmp/img", 512, "/mnt/x")
+        with self.assertRaises(RuntimeError):
+            s.drop_and_remount()
+
+    def test_umount_disengage_then_mount_run_in_that_order(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = self._stack(mnt)
+            fake = _fake_run({("dmsetup", "table"): _Result(0, self.DISENGAGED, "")})
+            with mock.patch.object(dm_stack, "_run", fake):
+                s.drop_and_remount()
+            order = [
+                c[0] if c[0] != "dmsetup" else f"dmsetup {c[1]}" for c in fake.calls
+            ]
+            self.assertEqual(
+                order,
+                ["umount", "dmsetup suspend", "dmsetup reload", "dmsetup resume",
+                 "dmsetup table", "mount"],
+            )
+
+    def test_a_failed_remount_raises_loudly_not_a_warning(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = self._stack(mnt)
+            responses = {
+                ("dmsetup", "table"): _Result(0, self.DISENGAGED, ""),
+                ("mount", "-t"): _Result(32, "", "wrong fs type, bad option, "
+                                                  "bad superblock"),
+            }
+            fake = _fake_run(responses)
+            with mock.patch.object(dm_stack, "_run", fake):
+                with self.assertRaises(RuntimeError) as ctx:
+                    s.drop_and_remount()
+            self.assertIn("wrong fs type", str(ctx.exception))
+
+    def test_wab_dir_inside_the_mount_is_recreated_with_0700_if_missing(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = self._stack(mnt)
+            wab_dir = os.path.join(mnt, "wab")  # never created — didn't survive
+            fake = _fake_run({("dmsetup", "table"): _Result(0, self.DISENGAGED, "")})
+            with mock.patch.object(dm_stack, "_run", fake):
+                s.drop_and_remount(wab_dir=wab_dir)
+            self.assertTrue(os.path.isdir(wab_dir))
+            self.assertEqual(stat.S_IMODE(os.stat(wab_dir).st_mode), 0o700)
+
+    def test_wab_dir_mode_is_reapplied_even_if_it_survived(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = self._stack(mnt)
+            wab_dir = os.path.join(mnt, "wab")
+            os.makedirs(wab_dir)
+            os.chmod(wab_dir, 0o755)  # simulate the wrong mode surviving
+            fake = _fake_run({("dmsetup", "table"): _Result(0, self.DISENGAGED, "")})
+            with mock.patch.object(dm_stack, "_run", fake):
+                s.drop_and_remount(wab_dir=wab_dir)
+            self.assertEqual(stat.S_IMODE(os.stat(wab_dir).st_mode), 0o700)
+
+    def test_wab_dir_outside_the_mount_is_left_untouched(self):
+        with tempfile.TemporaryDirectory() as outside, \
+             tempfile.TemporaryDirectory() as mnt:
+            s = self._stack(mnt)
+            not_wab = os.path.join(outside, "elsewhere")
+            fake = _fake_run({("dmsetup", "table"): _Result(0, self.DISENGAGED, "")})
+            with mock.patch.object(dm_stack, "_run", fake):
+                s.drop_and_remount(wab_dir=not_wab)
+            self.assertFalse(
+                os.path.exists(not_wab),
+                "a path outside this stack's mount point is none of "
+                "drop_and_remount's business",
+            )
+
+    def test_wab_dir_none_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = self._stack(mnt)
+            fake = _fake_run({("dmsetup", "table"): _Result(0, self.DISENGAGED, "")})
+            with mock.patch.object(dm_stack, "_run", fake):
+                s.drop_and_remount()  # wab_dir defaults to None; must not raise
+
+
+class TestCanary(unittest.TestCase):
+    """I6: a canary block, written before the fault and overwritten while
+    it's engaged, is what turns "did the injector bite" from an inference
+    into a measurement. Pure filesystem I/O — no `_run`/subprocess involved."""
+
+    def test_write_then_read_round_trips(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = dm_stack.StorageStack("/tmp/img", 512, mnt)
+            s.write_canary(b"hello")
+            self.assertEqual(s.read_canary(), b"hello")
+
+    def test_a_second_write_truncates_the_first(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = dm_stack.StorageStack("/tmp/img", 512, mnt)
+            s.write_canary(b"a much longer first value")
+            s.write_canary(b"short")
+            self.assertEqual(s.read_canary(), b"short")
+
+    def test_read_before_any_write_is_none(self):
+        with tempfile.TemporaryDirectory() as mnt:
+            s = dm_stack.StorageStack("/tmp/img", 512, mnt)
+            self.assertIsNone(s.read_canary())
 
 
 if __name__ == "__main__":

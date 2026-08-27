@@ -12,10 +12,12 @@ work and is deferred; see README.md's Requirements section.
 Phase 1 injects one fault class: random SIGKILL (`kill_random`), which is
 also the default when a schedule's `[faults]` table is empty or absent —
 every Phase 1 schedule stays byte-identical. Phase 2 adds `power_loss`
-(dm-flakey `drop_writes`, protocol (a): engage, kill immediately, disengage
-before restart — see the episode loop below). `fault_kind()` dispatches
-between them and raises on anything else, rather than silently falling back.
-dm-delay, ENOSPC, remount and dead-letter classes remain for Phase 3.
+(dm-flakey `drop_writes`, protocol: kill first, then drop and remount — see
+the episode loop below and the Phase 2 spec's "Protocol: kill first, then
+drop and remount" section for why killing first is load-bearing, not
+cosmetic). `fault_kind()` dispatches between them and raises on anything
+else, rather than silently falling back. dm-delay, ENOSPC, remount and
+dead-letter classes remain for Phase 3.
 
 Usage: sudo python3 run.py schedules/smoke.toml
 """
@@ -82,27 +84,34 @@ def load_schedule(path):
     inside `orchestrator/`, which happens to resolve correctly under both rules,
     so the test pinned the bug rather than catching it.
 
-    Also refuses a schedule that pairs `fault.kind = "power_loss"` with
-    `storage.dm_target = "linear"`. `linear` is dm-flakey's pass-through
-    stand-in (dm_stack.py) — it builds a real dm layer but injects nothing, so
-    that combination would run an episode that injects nothing, loses
-    nothing, and reports green: indistinguishable from a genuine pass, and
-    outside the negative control's reach too, since that only fires on the
-    Buffered tier. Caught HERE, at load time, so it fails before an episode
-    runs rather than only once `engage_fault()` is reached mid-run.
+    Also refuses a schedule that pairs `fault.kind = "power_loss"` with any
+    `storage.dm_target` other than `"flakey"` — `"linear"` (dm-flakey's
+    pass-through stand-in, dm_stack.py) builds a real dm layer but injects
+    nothing, and an ABSENT dm_target builds no dm layer at all. Either would
+    run every episode injecting nothing, losing nothing, and reporting green
+    (or, for the absent case, dying minutes in at the first `engage_fault()`
+    call instead of failing here before steady-state load even starts). The
+    absent-target case used to be considered "caught elsewhere" and let
+    through — the same justification as the linear guard applies to it
+    identically, so it is refused here too now.
     """
     with open(path, "rb") as f:
         sched = tomllib.load(f)
-    if (fault_kind(sched) == "power_loss"
-            and sched.get("storage", {}).get("dm_target") == "linear"):
-        raise ValueError(
-            "schedule pairs fault.kind='power_loss' with storage.dm_target="
-            "'linear': linear is dm-flakey's pass-through stand-in and "
-            "injects nothing, so this run would report green having tested "
-            "no power loss at all. Use dm_target='flakey' for a real "
-            "power-loss run, or fault.kind='kill_random' if this schedule is "
-            "only validating linear's plumbing."
-        )
+    if fault_kind(sched) == "power_loss":
+        dm_target = sched.get("storage", {}).get("dm_target")
+        if dm_target != "flakey":
+            raise ValueError(
+                f"schedule pairs fault.kind='power_loss' with "
+                f"storage.dm_target={dm_target!r}: power_loss needs a REAL "
+                f"dm-flakey layer to inject into. 'linear' is dm-flakey's "
+                f"pass-through stand-in and injects nothing; an absent "
+                f"dm_target builds no dm layer at all. Either way this run "
+                f"would report green having tested no power loss, or die "
+                f"minutes in at the first engage_fault() call. Set "
+                f"storage.dm_target = 'flakey' for a real power-loss run, or "
+                f"fault.kind = 'kill_random' if this schedule is only "
+                f"validating plumbing."
+            )
     return sched
 
 
@@ -132,6 +141,54 @@ def progress_floor_breached(delta_acked, delta_delivered, min_acked, min_deliver
     only strictly below does.
     """
     return delta_acked < min_acked or delta_delivered < min_delivered
+
+
+def canary_verdict(before, during, after):
+    """I6: classifies a canary read-back, turning "did the injector bite"
+    from an inference into a measurement.
+
+    `before` is what was written (and fsynced) before the fault engaged;
+    `during` is the overwrite made while it was engaged, still mounted —
+    under the same conditions weir's own WAB writes are under. `after` is
+    what the canary file actually contains once the remount completed.
+
+    - "bit": `after == before` — the OVERWRITE was lost. This is what a
+      correct power-loss injection does.
+    - "did_not_bite": `after == during` — the overwrite SURVIVED the
+      umount/remount cycle. The injector did not lose anything this episode,
+      independent of what weir did.
+    - "unexpected": neither — a missing file, corrupted content, or anything
+      else. A harness fault distinct from either of the above.
+
+    Pulled out as a pure function so it is testable without root, a live
+    daemon, or a device.
+    """
+    if after == before:
+        return "bit"
+    if after == during:
+        return "did_not_bite"
+    return "unexpected"
+
+
+def exit_code_for(violations, anomalies, verdict):
+    """C5 + I5: the exit code must never contradict the console line or the
+    report. `verdict` is `report.powerloss_verdict()`'s result.
+
+    A durability violation, a harness anomaly, or a `fail` power-loss verdict
+    is the worst outcome (1) — `fail` is checked independently of
+    `violations` rather than trusted to already be reflected there, since the
+    two are computed by different code paths. An `inconclusive` power-loss
+    verdict on an otherwise-clean run means Buffered lost nothing across
+    every power-loss episode — the injector may never have bitten at all.
+    That is not success, but it is a DIFFERENTLY bad outcome from a
+    violation, so it gets its own code (2) instead of either exit(0)'s false
+    "clean" or exit(1)'s "weir is broken".
+    """
+    if violations or anomalies or verdict == "fail":
+        return 1
+    if verdict == "inconclusive":
+        return 2
+    return 0
 
 
 def cumulative_deltas(result, prev):
@@ -206,7 +263,15 @@ def final_pass(
     stop_loadgen_fn = stop_loadgen_fn or stop_loadgen
     prev_totals = prev_totals or {}
 
-    record = {"episode": "final", "fault": "none", "seed": seed, "tier": tier}
+    # I1 (final review): the REAL fault, not a hardcoded "none" — a Buffered
+    # final pass under power_loss legitimately gets expected_loss > 0, and a
+    # record claiming "none" while carrying a nonzero exemption would be
+    # self-contradictory. This is also what lets report.powerloss_verdict see
+    # this record at all: it filters on fault == "power_loss", and the final
+    # pass is the run's most authoritative measurement (producer stopped,
+    # full drain, frontier_slack=0) — it must not be invisible to the verdict
+    # it should help drive.
+    record = {"episode": "final", "fault": fault, "seed": seed, "tier": tier}
     #: Conditions under which "acked but not delivered" is NOT weir's fault, so
     #: `frontier_slack=0` would manufacture a violation out of a harness or
     #: teardown artefact. Any one of them downgrades the check to advisory.
@@ -741,30 +806,64 @@ def main():
                     break
 
                 if kind == "power_loss":
-                    # PROTOCOL (a). Engage, then kill IMMEDIATELY, so the lying
-                    # window holds ~zero acks.
+                    # PROTOCOL: kill first, then drop and remount. Superseded
+                    # from the original "engage, then kill" — see the spec's
+                    # "Protocol: kill first, then drop and remount" section
+                    # for the full kernel-layering argument; summary:
                     #
-                    # drop_writes is a lying disk: it reports fsync success and
-                    # discards the write. Real power loss does not do that — a
-                    # write whose fsync returned is durable. So any ack weir
-                    # emits inside this window is an ack reality would never
-                    # have allowed, and counting it against weir is the harness
-                    # lying to weir. Keeping the window at ~zero is what makes
-                    # the Buffered result mean "Buffered acks before fsync"
-                    # rather than "the window ate the write".
+                    # drop_writes sits BELOW the page cache. A dropped write
+                    # still leaves a correct, resident page behind, and
+                    # kill -9 does not evict it — so the only way to actually
+                    # lose a byte is drop_and_remount's umount/mount cycle,
+                    # which forces the dirty page out (discarded by the lying
+                    # disk while engaged) and then rebuilds the filesystem
+                    # from whatever actually reached the platter.
+                    #
+                    # KILLING FIRST makes the lying window EXACTLY ZERO BY
+                    # CONSTRUCTION — weir is already dead and cannot ack into
+                    # it — rather than merely narrow. The superseded ordering
+                    # left two subprocess round trips (dmsetup resume plus a
+                    # table read-back) between engage and kill: 5-10ms at
+                    # full rate, hundreds of acks, each one a false
+                    # Durable-tier I1 violation once C2 made the injector
+                    # actually bite.
+                    #
+                    # I6: a canary block, written before the fault and
+                    # overwritten while it's engaged, converts the negative
+                    # control from an INFERENCE (zero Buffered loss is merely
+                    # "suspicious") into a MEASUREMENT — if the overwrite
+                    # survives the umount/remount cycle, the injector did not
+                    # bite THIS episode, independent of anything weir did.
+                    canary_before = f"weir-chaos-canary ep={i} phase=pre-fault\n".encode()
+                    canary_during = f"weir-chaos-canary ep={i} phase=engaged\n".encode()
+                    stack.write_canary(canary_before)
+
+                    daemon.kill9()
                     stack.engage_fault()
                     try:
-                        daemon.kill9()
+                        # Overwritten HERE: inside the engaged window and
+                        # still mounted, the same conditions weir's own WAB
+                        # writes are under.
+                        stack.write_canary(canary_during)
+                        stack.drop_and_remount(wab_dir=daemon.wab_dir)
                     finally:
-                        # Disengage even if kill9 raises. A device left engaged
-                        # means the NEXT episode's steady-state load runs
-                        # against a lying disk, silently corrupting the run from
-                        # that point on. Today the outer teardown would catch
-                        # it, but that guarantee should not depend on tracing
-                        # the whole file's exception flow.
+                        # Disengage even if drop_and_remount raised partway
+                        # through (e.g. its umount step failed while the
+                        # fault was still live). A device left engaged means
+                        # the NEXT episode's steady-state load runs against a
+                        # lying disk, silently corrupting the run from that
+                        # point on. Unlike the superseded protocol, weir is
+                        # already dead here, so there is no timing pressure
+                        # left on this cleanup — a redundant disengage on the
+                        # success path (drop_and_remount already disengaged)
+                        # costs one harmless extra round trip, not a false ack.
                         stack.disengage_fault()
+                    canary_result = canary_verdict(
+                        canary_before, canary_during, stack.read_canary()
+                    )
                 else:
                     daemon.kill9()
+                    canary_result = None
                 daemon.start("http://127.0.0.1:9900/ingest")
 
                 # PAUSE THE PRODUCER before waiting for the drain.
@@ -877,9 +976,17 @@ def main():
                     "i1_exempt": result.i1_exempt,
                     "pending_provenance": result.pending_provenance,
                     # Tier-aware I1 (Phase 2): see the matching comment in
-                    # final_pass(). This is what report.powerloss_verdict sums
-                    # across a run's Buffered power-loss episodes.
+                    # final_pass(). C4: report.powerloss_verdict and the
+                    # headline both read this from the LAST verified
+                    # power-loss record, not a sum — expected_loss is a
+                    # currently-still-missing count, not a per-episode delta,
+                    # so summing it double(or more)-counts any record that
+                    # stays lost for the rest of the run.
                     "expected_loss": result.expected_loss,
+                    # I6: None for kill_random (the canary only applies to
+                    # power_loss episodes — see the loop above). "bit" /
+                    # "did_not_bite" / "unexpected" for power_loss.
+                    "canary": canary_result,
                     "seed": seed,
                 }
                 if advisory:
@@ -1013,11 +1120,10 @@ def main():
     # of truth report.py renders from, so the console line and report.md agree.
     try:
         with open(episodes_path) as f:
-            ran = sum(
-                1 for line in f
-                if line.strip() and json.loads(line).get("episode") != "final"
-            )
+            episode_records = [json.loads(line) for line in f if line.strip()]
+        ran = sum(1 for e in episode_records if e.get("episode") != "final")
     except (OSError, ValueError):
+        episode_records = []
         ran = None
     scope = f"{ran} episodes" if ran is not None else "an unknown number of episodes"
     if ran is not None and ran < sched["episodes"]:
@@ -1026,11 +1132,35 @@ def main():
         f"\nrun {run_id} complete: {violations} {v_word}, {anomalies} {a_word} "
         f"across {scope} plus the final pass"
     )
-    # I5: gate on both. A violation is a durability failure; an anomaly is
-    # the harness failing to observe cleanly (quiescence timeout, dead
-    # observer, no-progress episode, a shutdown drain that had to be killed,
-    # WAB files surviving teardown) — neither is acceptable in a clean run.
-    sys.exit(1 if (violations or anomalies) else 0)
+    # C5: the power-loss verdict — same function report.md's own section
+    # renders from — gates the exit code too. Console output used to be able
+    # to say "0 violations, 0 anomalies" (exit 0) on a run report.md itself
+    # marked INCONCLUSIVE: the verdict lived only in report prose, invisible
+    # to anything scripting off the exit code.
+    verdict = report.powerloss_verdict(episode_records)
+    if verdict == "inconclusive":
+        print(
+            f"run {run_id}: POWER-LOSS VERDICT INCONCLUSIVE — Buffered lost "
+            "nothing across every power-loss episode; the injector may not "
+            "have bitten at all. See report.md's Power-loss verdict section.",
+            flush=True,
+        )
+    elif verdict == "fail":
+        print(
+            f"run {run_id}: POWER-LOSS VERDICT FAIL — a Durable record was "
+            "lost under power loss. See report.md's Power-loss verdict "
+            "section.",
+            flush=True,
+        )
+    # I5 + C5: gate on all three. A violation is a durability failure; an
+    # anomaly is the harness failing to observe cleanly (quiescence timeout,
+    # dead observer, no-progress episode, a shutdown drain that had to be
+    # killed, WAB files surviving teardown); an inconclusive power-loss
+    # verdict is neither, but is not success either — it gets its own,
+    # distinct exit code rather than either exit(0)'s false "clean" or
+    # exit(1)'s "weir is broken". None of the three is acceptable in a clean
+    # run.
+    sys.exit(exit_code_for(violations, anomalies, verdict))
 
 
 if __name__ == "__main__":

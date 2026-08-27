@@ -193,7 +193,9 @@ class TestScheduleCoherence(unittest.TestCase):
     `fault.kind = "power_loss"` it would run an episode that injects nothing,
     loses nothing, and reports green: indistinguishable from a genuine pass,
     and outside the negative control's reach too, since that only fires on
-    the Buffered tier (report.powerloss_verdict, Task 7).
+    the Buffered tier (report.powerloss_verdict, Task 7). An ABSENT dm_target
+    is the same failure by another route — no dm layer at all — and is
+    refused for the identical reason (MINOR, final review).
 
     Refused HERE, at schedule-load time, via `load_schedule` — the real
     entry point every invocation goes through — rather than only once an
@@ -233,16 +235,17 @@ class TestScheduleCoherence(unittest.TestCase):
             s = run.load_schedule(path)
             self.assertEqual(s["storage"]["dm_target"], "linear")
 
-    def test_no_dm_target_at_all_paired_with_power_loss_loads_fine(self):
-        # The guard is specifically about `linear` — a real, deliberately
-        # built pass-through. An absent dm_target is Phase 1's ordinary
-        # default and is caught elsewhere (StorageStack.engage_fault raises
-        # loudly if the flakey layer was never built); it is not this
-        # guard's job to duplicate that check.
+    def test_no_dm_target_at_all_paired_with_power_loss_is_refused_at_load_time(self):
+        # MINOR (final review): this used to load fine and die minutes later
+        # at the first engage_fault() call, instead of failing here before
+        # steady-state load even starts — the exact failure mode the
+        # `linear` guard above exists to prevent, for the identical reason:
+        # an absent dm_target builds no dm layer at all, so power_loss has
+        # nothing to inject into.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, faults_kind="power_loss")
-            s = run.load_schedule(path)
-            self.assertEqual(s["faults"]["kind"], "power_loss")
+            with self.assertRaises(ValueError):
+                run.load_schedule(path)
 
 
 class TestSeededKiller(unittest.TestCase):
@@ -445,6 +448,13 @@ class TestFinalPass(unittest.TestCase):
         self.assertEqual(record["i1_missing"], [])
         self.assertEqual(record["expected_loss"], 1)
         self.assertEqual(record["tier"], "U")
+        self.assertEqual(
+            record["fault"], "power_loss",
+            "I1 (final review): the record must carry the REAL fault, not a "
+            "hardcoded 'none' — report.powerloss_verdict filters on it, and "
+            "a final pass invisible to that filter is the run's most "
+            "authoritative measurement going unused",
+        )
         self.assertEqual((violations, anomalies), (0, 0))
 
     def test_no_tier_or_fault_is_exactly_phase_1_behaviour(self):
@@ -458,6 +468,7 @@ class TestFinalPass(unittest.TestCase):
         self.assertFalse(record["ok"])
         self.assertEqual(record["i1_missing"], [2])
         self.assertEqual(record["expected_loss"], 0)
+        self.assertIsNone(record["fault"], "no fault was passed in; it must not be invented")
         self.assertIsNone(record["tier"])
         self.assertEqual((violations, anomalies), (1, 0))
 
@@ -667,6 +678,62 @@ class TestFinalPass(unittest.TestCase):
         record, violations, anomalies = run.final_pass(**kwargs)
         self.assertGreater(len(record["anomaly_reasons"]), 3)
         self.assertEqual((violations, anomalies), (0, 1))
+
+
+class TestCanaryVerdict(unittest.TestCase):
+    """I6: a canary block written before the fault and overwritten while it
+    is engaged turns "did the injector bite" from an inference into a
+    measurement. Pure classification, testable without root or a device."""
+
+    def test_the_overwrite_being_lost_means_the_injector_bit(self):
+        self.assertEqual(run.canary_verdict(b"pre", b"during", b"pre"), "bit")
+
+    def test_the_overwrite_surviving_means_it_did_not_bite(self):
+        self.assertEqual(
+            run.canary_verdict(b"pre", b"during", b"during"), "did_not_bite"
+        )
+
+    def test_a_missing_canary_is_unexpected(self):
+        self.assertEqual(run.canary_verdict(b"pre", b"during", None), "unexpected")
+
+    def test_garbled_content_is_unexpected(self):
+        self.assertEqual(
+            run.canary_verdict(b"pre", b"during", b"neither"), "unexpected"
+        )
+
+
+class TestExitCodeForVerdict(unittest.TestCase):
+    """C5 (final review): the exit code must never contradict the console
+    line or the report — an INCONCLUSIVE run used to exit 0, indistinguishable
+    from a clean pass to anything scripting off the exit code."""
+
+    def test_a_clean_pass_exits_zero(self):
+        self.assertEqual(run.exit_code_for(0, 0, "pass"), 0)
+
+    def test_a_violation_exits_one(self):
+        self.assertEqual(run.exit_code_for(1, 0, "pass"), 1)
+
+    def test_an_anomaly_exits_one(self):
+        self.assertEqual(run.exit_code_for(0, 1, "pass"), 1)
+
+    def test_a_power_loss_fail_verdict_exits_one_even_with_zero_counted_violations(self):
+        # Defence in depth: powerloss_verdict's "fail" should already be
+        # reflected in `violations`, but the exit code must not silently
+        # trust that the two stay aligned — they are computed by different
+        # code paths.
+        self.assertEqual(run.exit_code_for(0, 0, "fail"), 1)
+
+    def test_inconclusive_is_nonzero_but_distinct_from_a_violation(self):
+        code = run.exit_code_for(0, 0, "inconclusive")
+        self.assertNotEqual(code, 0, "inconclusive must not exit clean")
+        self.assertNotEqual(
+            code, run.exit_code_for(1, 0, "pass"),
+            "inconclusive and a violation are differently bad; a distinct "
+            "code for each is welcome",
+        )
+
+    def test_inconclusive_does_not_mask_a_real_violation(self):
+        self.assertEqual(run.exit_code_for(1, 0, "inconclusive"), 1)
 
 
 if __name__ == "__main__":

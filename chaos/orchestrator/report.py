@@ -161,11 +161,34 @@ def _yes_no(value):
     return "yes" if value else "**NO**"
 
 
+def _power_loss_records(records):
+    """Episodes that actually injected power loss.
+
+    Excludes the pre-fault abort record (MINOR, final review): `run.py`
+    writes `"fault": kind` on it even though the run died BEFORE ever
+    reaching `engage_fault()` — it never actually injected anything, and
+    counting it here would render a Power-loss verdict section, and a
+    canary/expected_loss figure, for a fault that never fired. Every other
+    caller of `fault == "power_loss"` filtering in this module goes through
+    here so the exclusion cannot drift between them.
+    """
+    return [
+        r for r in records
+        if r.get("fault") == "power_loss" and not r.get("abort_reason")
+    ]
+
+
 def powerloss_verdict(records):
     """pass | inconclusive | fail for a power-loss run.
 
-    Any durable-tier loss fails outright — that is the contract: `kill -9`
-    and power loss alike hold Durable to zero loss.
+    Any durability failure among this run's power-loss episodes fails this
+    outright: an I1 miss (an acked record never delivered, outside the
+    Buffered exemption — `kill -9` and power loss alike hold Durable to zero
+    loss), an I2 leak (a nacked record delivered anyway), or a ledger
+    conflict (corrupt oracle input, so the episode's result can't be trusted
+    either way). Previously this checked `i1_missing` alone (MINOR, final
+    review), so an I2 leak or ledger conflict could render `pass` here while
+    the run's headline violation count already disagreed.
 
     A Buffered run that lost NOTHING across every power-loss episode is
     `inconclusive`, not `pass`. Under a correct power-loss model Buffered
@@ -173,25 +196,52 @@ def powerloss_verdict(records):
     suggests the injector never bit. Reporting that as success is how a
     chaos harness starts lying: a test that cannot fail proves nothing.
 
+    C4: "lost nothing" is read from the LAST verified Buffered power-loss
+    record (which — since I1's final-pass fix — includes the final pass when
+    this run had one, the most authoritative measurement there is), not a
+    sum across records. `expected_loss` is a currently-still-missing count,
+    not a per-episode delta: a record lost in episode 0 stays in it for
+    every later check, so summing would inflate the figure by roughly the
+    number of episodes remaining after the loss.
+
     The suspicion rule is Buffered-only. Durable losing nothing is the
     contract being upheld, not evidence of a dead injector.
 
     A run with no power-loss episodes at all (e.g. a Phase 1 kill_random
     run) is a `pass`: this rule has nothing to say about it.
     """
-    pl = [r for r in records if r.get("fault") == "power_loss"]
+    pl = _power_loss_records(records)
     if not pl:
         return "pass"
-    if any(r.get("i1_missing") for r in pl):
+    if any(r.get("i1_missing") or r.get("i2_leaked") or r.get("ledger_conflicts")
+           for r in pl):
         return "fail"
     buffered = [r for r in pl if r.get("tier") == "U"]
-    if buffered and sum(r.get("expected_loss", 0) for r in buffered) == 0:
+    if buffered and buffered[-1].get("expected_loss", 0) == 0:
         return "inconclusive"
     return "pass"
 
 
+def _fault_kinds(records):
+    """Which fault kind(s) this run actually injected.
+
+    Excludes the pre-fault abort record (carries the SCHEDULED kind, never
+    actually reached `engage_fault()`/`kill9()`) and the `None`/`"none"`
+    placeholder the final pass used to carry before I1's final-review fix.
+    Used to derive the report's title and its Limitations bullet (I2, final
+    review) instead of a hardcoded "Phase 1", which used to contradict a
+    Phase 2 (power-loss) run's own Power-loss verdict section two lines
+    below it.
+    """
+    return {
+        r.get("fault") for r in records
+        if r.get("fault") not in (None, "none") and not r.get("abort_reason")
+    }
+
+
 def render(episodes, meta):
     """Renders episodes (list of dicts) into markdown."""
+    fault_kinds = _fault_kinds(episodes)
     fault_episodes = [e for e in episodes if e.get("episode") != FINAL]
     final = next((e for e in episodes if e.get("episode") == FINAL), None)
     total = len(fault_episodes)
@@ -224,7 +274,13 @@ def render(episodes, meta):
     ]
 
     lines = []
-    lines.append("# weir chaos run — Phase 1 (spine)\n")
+    if fault_kinds == {"power_loss"}:
+        phase_title = "Phase 2 (power loss)"
+    elif "power_loss" in fault_kinds:
+        phase_title = "Phase 2 (mixed faults)"
+    else:
+        phase_title = "Phase 1 (spine)"
+    lines.append(f"# weir chaos run — {phase_title}\n")
 
     lines.append("## Run metadata\n")
     for key in ("weir_commit", "kernel", "hardware", "filesystem", "seed", "duration"):
@@ -288,16 +344,43 @@ def render(episodes, meta):
     # The negative control (Task 7). Rendered only when this run actually
     # injected power loss — a Phase 1 kill_random report has nothing to say
     # here and must not grow a section about a rule that does not apply to it.
-    pl_records = [e for e in episodes if e.get("fault") == "power_loss"]
+    # _power_loss_records excludes the pre-fault abort record (MINOR, final
+    # review) — an aborted run that never reached engage_fault() must not
+    # render this section at all.
+    pl_records = _power_loss_records(episodes)
     if pl_records:
         verdict = powerloss_verdict(episodes)
         buffered_pl = [e for e in pl_records if e.get("tier") == "U"]
-        buffered_loss = sum(e.get("expected_loss", 0) for e in buffered_pl)
+        # C4: the LAST verified record's expected_loss, not a sum — see
+        # powerloss_verdict's docstring for why summing inflates it.
+        buffered_loss = buffered_pl[-1].get("expected_loss", 0) if buffered_pl else 0
         lines.append("## Power-loss verdict\n")
         lines.append(
-            f"**{verdict.upper()}.** Total Buffered `expected_loss` across this "
-            f"run's power-loss episodes: **{buffered_loss}**.\n"
+            f"**{verdict.upper()}.** Buffered `expected_loss` as of the last "
+            f"verified power-loss record: **{buffered_loss}**.\n"
         )
+        # I6: the canary measurement, when this run recorded one. Converts
+        # "Buffered lost nothing" from an inference (maybe the injector never
+        # bit) into a direct per-episode measurement of whether it did.
+        canaries = [e.get("canary") for e in pl_records if e.get("canary")]
+        if canaries:
+            bit = sum(1 for c in canaries if c == "bit")
+            did_not_bite = sum(1 for c in canaries if c == "did_not_bite")
+            unexpected = sum(1 for c in canaries if c == "unexpected")
+            detail = ""
+            if did_not_bite:
+                detail += f", did not bite in {did_not_bite}"
+            if unexpected:
+                detail += f", unexpected in {unexpected}"
+            lines.append(
+                f"**Canary:** bit in {bit}/{len(canaries)} episode(s){detail}. "
+                "A known block is written before the fault and overwritten "
+                "while it's engaged, then read back after the remount: if "
+                "the OVERWRITE survived, the injector did not bite THIS "
+                "episode — independent of anything weir did. This is the "
+                "first calibration run's pass condition: every power-loss "
+                "episode's canary should read `bit`.\n"
+            )
         if verdict == "inconclusive":
             lines.append(
                 "Buffered lost NOTHING across every power-loss episode in this "
@@ -397,14 +480,18 @@ def render(episodes, meta):
         "next to deltas.) I1 exempt / Pending prov. are the frontier-exemption "
         "counts from the same check (see Provenance anomalies above): how many "
         "would-be I1/orphan hits were excused as not-yet-caught-up rather than "
-        "lost. The `final` row is the end-of-run pass, not an episode: no fault "
-        "was injected and no quiescence wait ran, hence `n/a`.\n"
+        "lost. Expected loss (I3) is the Buffered-under-power_loss exemption's "
+        "size (see the Power-loss verdict section above, when present) — 0 for "
+        "every other tier/fault combination. The `final` row is the end-of-run "
+        "pass, not an episode: no fault was injected and no quiescence wait "
+        "ran, hence `n/a`.\n"
     )
     lines.append(
         "| # | Fault | Quiesced | Verdict | Acked Δ | Delivered Δ | Dup rate | "
-        "Unknown | Nacked Δ | Pushed Δ | I1 exempt | Pending prov. | Notes |"
+        "Unknown | Nacked Δ | Pushed Δ | I1 exempt | Pending prov. | "
+        "Expected loss | Notes |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for e in episodes:
         notes = []
         if e.get("no_progress"):
@@ -422,6 +509,10 @@ def render(episodes, meta):
             notes.append(
                 "advisory: " + "; ".join(e.get("advisory_reasons", ["unspecified"]))
             )
+        # I6: only flag a SURPRISING canary result — "bit" is the expected
+        # outcome of every power-loss episode and would clutter every row.
+        if e.get("fault") == "power_loss" and e.get("canary") not in (None, "bit"):
+            notes.append(f"canary={e['canary']}")
         # Four verdicts, not two. A record with no durability violation but an
         # anomaly is NOT a clean pass — reading "PASS" beside a no-progress or
         # unquiesced row is exactly the false reassurance this report exists to
@@ -454,6 +545,7 @@ def render(episodes, meta):
             f"{e.get('duplicate_rate', 0.0):.3f} | {e.get('unknown', 0)} | "
             f"{_dash(e.get('nacked_delta'))} | {_dash(e.get('pushed_delta'))} | "
             f"{_dash(e.get('i1_exempt'))} | {_dash(e.get('pending_provenance'))} | "
+            f"{_dash(e.get('expected_loss'))} | "
             f"{', '.join(str(n) for n in notes) or '—'} |"
         )
     lines.append("")
@@ -474,11 +566,35 @@ def render(episodes, meta):
                 )
             lines.append(f"Reproducer: seed `{hex(e.get('seed', 0))}`, episode {e.get('episode')}\n")
 
+    # I2 (final review): derived from what this run actually injected, not
+    # hardcoded — a hardcoded "Phase 1 injects random SIGKILL only... power
+    # loss... not covered by this run" printed directly under this same
+    # run's own "## Power-loss verdict" section is a report contradicting
+    # itself.
+    if fault_kinds == {"power_loss"}:
+        scope_bullet = (
+            "- This run injects **simulated power loss** (`dm-flakey "
+            "drop_writes`), not random SIGKILL. Targeted mid-fsync kills, "
+            "torn writes, disk-full, slow disk, read-only remount and "
+            "dead-letter exhaustion remain **out of scope** for this run.\n"
+        )
+    elif "power_loss" in fault_kinds:
+        scope_bullet = (
+            "- This run injects **random SIGKILL and simulated power loss** "
+            "(`dm-flakey drop_writes`). Targeted mid-fsync kills, torn "
+            "writes, disk-full, slow disk, read-only remount and "
+            "dead-letter exhaustion remain **out of scope** for this run.\n"
+        )
+    else:
+        scope_bullet = (
+            "- This run injects **random SIGKILL only**. Simulated power "
+            "loss, targeted mid-fsync kills, torn writes, disk-full, slow "
+            "disk, read-only remount and dead-letter exhaustion are **not "
+            "covered** by this run.\n"
+        )
     lines.append("## Limitations\n")
     lines.append(
-        "- Phase 1 injects **random SIGKILL only**. Targeted mid-fsync kills, power "
-        "loss, torn writes, disk-full, slow disk, read-only remount and dead-letter "
-        "exhaustion are Phases 2-3 and are **not** covered by this run.\n"
+        scope_bullet +
         "- Invariant I1 is **tier- and fault-aware** (Phase 2): a Buffered ack "
         "(`tier=\"U\"`) is exempted from I1 ONLY under simulated power loss "
         "(`fault=\"power_loss\"`) — `kill -9` still holds every tier to zero "

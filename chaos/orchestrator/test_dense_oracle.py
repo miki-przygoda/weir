@@ -149,6 +149,27 @@ class TestDifferential(unittest.TestCase):
             self.assert_same(plain, tiered, "tier-aware must not alter Phase 1")
             self.assert_same(ref.check(), tiered, "and must still match the reference")
 
+    def test_agrees_on_the_buffered_power_loss_exemption(self):
+        # MINOR (final review): the differential oracle never drove the two
+        # implementations together with the exemption ACTIVE — only Phase 1
+        # coverage (tier-blind, and tier-aware-but-inert above) existed.
+        # ReferenceAccumulator.check and DenseAccumulator.check compute
+        # expected_loss/i1_missing via two separate code paths for
+        # tier="U", fault="power_loss", and neither had a cross-check.
+        for seed in range(20):
+            rng = random.Random(seed)
+            ref = verify.ReferenceAccumulator(delivered_run_id=RUN_ID)
+            dense = verify.DenseAccumulator(delivered_run_id=RUN_ID)
+            for i, (lg, dl) in enumerate(random_batches(rng)):
+                ref.ingest(lg, dl)
+                dense.ingest(lg, dl)
+                ctx = f"seed={seed} batch={i}"
+                self.assert_same(
+                    ref.check(tier="U", fault="power_loss"),
+                    dense.check(tier="U", fault="power_loss"),
+                    ctx,
+                )
+
     def test_ledger_hwm_matches(self):
         rng = random.Random(1234)
         ref = verify.ReferenceAccumulator(delivered_run_id=RUN_ID)
