@@ -24,6 +24,7 @@ Usage: sudo python3 run.py schedules/smoke.toml
 import json
 import os
 import random
+import shutil
 import signal
 import socket
 import subprocess
@@ -68,6 +69,53 @@ def fault_kind(sched):
         raise ValueError(
             f"unknown fault kind {kind!r}; expected 'kill_random' or 'power_loss'")
     return kind
+
+
+#: Free bytes the run refuses to drop below. Generous on purpose: the cost of
+#: stopping an hour early is one hour, and the cost of running out is a wrong
+#: answer (see `disk_stop_reason`). Override per schedule with
+#: `min_free_bytes`; 0 disables the guard entirely.
+DEFAULT_MIN_FREE_BYTES = 5 * 2**30
+
+
+def _gib(n):
+    return f"{n / 2**30:.1f} GiB"
+
+
+def disk_stop_reason(free, floor):
+    """Why the run must stop now, or None to continue. Pure, so it is testable
+    without filling a disk.
+
+    A FULL DISK MANUFACTURES FALSE DURABILITY VIOLATIONS, which is why this
+    is a hard stop rather than a warning. `delivered.log` is append-only and
+    is one half of the oracle's input: if a write to it fails, delivered
+    records go unrecorded while their acks are already in `ledger.log`, and
+    I1 is exactly "acked implies delivered". The oracle would then report
+    weir losing acknowledged records when the only thing that failed was the
+    harness's own disk — a confident wrong answer, which is strictly worse
+    than no answer. The same logic is why the two ledgers can never be
+    trimmed to reclaim space mid-run.
+
+    Checked BETWEEN episodes, alongside the soak deadline, so the run still
+    executes its final pass, writes its report, and tears down the loop and
+    dm devices and the mount. An external disk-full failure would instead
+    strand all three.
+
+    A floor of 0 disables the guard, for a venue where the harness does not
+    own the filesystem it is writing to.
+    """
+    if floor <= 0:
+        return None
+    if free >= floor:
+        return None
+    return (
+        f"free space {_gib(free)} is below the floor of {_gib(floor)}. Stopping "
+        f"cleanly: if delivered.log could not be appended to, its records would "
+        f"go unrecorded while their acks stayed in ledger.log, and I1 would "
+        f"report weir losing acknowledged records that were only ever lost by "
+        f"this harness. Set `min_free_bytes` to change the floor, or 0 to "
+        f"disable this check."
+    )
 
 
 def load_schedule(path):
@@ -641,6 +689,13 @@ def main():
 
     run_dir = os.path.join(CHAOS_ROOT, "runs", str(run_id))
     os.makedirs(run_dir, exist_ok=True)
+    # Refuse to start below the floor rather than discover it hours in. The
+    # between-episode check below is the one that matters for a long soak;
+    # this one just makes an already-doomed run fail in the first second.
+    min_free_bytes = sched.get("min_free_bytes", DEFAULT_MIN_FREE_BYTES)
+    preflight = disk_stop_reason(shutil.disk_usage(run_dir).free, min_free_bytes)
+    if preflight is not None:
+        sys.exit(f"refusing to start: {preflight}")
     # Observers write HERE — the host filesystem, outside the fault zone.
     ledger_path = os.path.join(run_dir, "ledger.log")
     delivered_path = os.path.join(run_dir, "delivered.log")
@@ -788,6 +843,19 @@ def main():
                     print(
                         f"soak deadline reached after {i} episodes "
                         f"({elapsed_h:.2f}h) — stopping cleanly",
+                        flush=True,
+                    )
+                    break
+                # Same break-between-episodes discipline as the deadline, and
+                # for a sharper reason: running the disk dry would not just end
+                # the run, it would corrupt the oracle's own input and report
+                # the harness's failure as weir's. See disk_stop_reason.
+                disk_reason = disk_stop_reason(
+                    shutil.disk_usage(run_dir).free, min_free_bytes
+                )
+                if disk_reason is not None:
+                    print(
+                        f"disk floor reached after {i} episodes: {disk_reason}",
                         flush=True,
                     )
                     break

@@ -129,6 +129,43 @@ def final_pass_fixture(
     ), log
 
 
+class TestDiskFloor(unittest.TestCase):
+    """The guard exists because a FULL DISK MANUFACTURES FALSE VIOLATIONS.
+
+    If `delivered.log` cannot be appended to, delivered records go unrecorded
+    while their acks are already in `ledger.log` — and I1 is exactly
+    "acked implies delivered", so the oracle reports a durability violation
+    against weir for a fault that is entirely the harness's. That is strictly
+    worse than the run dying, because it produces a confident wrong answer
+    instead of no answer.
+    """
+
+    def test_ample_free_space_does_not_stop_the_run(self):
+        self.assertIsNone(run.disk_stop_reason(free=100 * 2**30, floor=5 * 2**30))
+
+    def test_below_the_floor_stops_the_run(self):
+        reason = run.disk_stop_reason(free=2 * 2**30, floor=5 * 2**30)
+        self.assertIsNotNone(reason)
+        self.assertIn("2.0 GiB", reason)
+        self.assertIn("5.0 GiB", reason)
+
+    def test_exactly_at_the_floor_is_not_below_it(self):
+        # A boundary that stops at == would end a run that still has exactly
+        # the headroom it was told to keep.
+        self.assertIsNone(run.disk_stop_reason(free=5 * 2**30, floor=5 * 2**30))
+
+    def test_a_floor_of_zero_disables_the_guard(self):
+        # Opt-out for a venue where the harness does not own the filesystem.
+        # Must hold even at zero free, or "disabled" would not mean disabled.
+        self.assertIsNone(run.disk_stop_reason(free=0, floor=0))
+
+    def test_the_reason_names_the_consequence_not_just_the_number(self):
+        # A 3am log line saying "disk low" tells the reader nothing about why
+        # the run stopped rather than pressing on.
+        reason = run.disk_stop_reason(free=1, floor=5 * 2**30)
+        self.assertIn("delivered.log", reason)
+
+
 class TestSchedule(unittest.TestCase):
     def test_parses_the_smoke_schedule(self):
         s = run.load_schedule("../schedules/smoke.toml")
