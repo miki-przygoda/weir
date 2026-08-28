@@ -274,6 +274,23 @@ class TestFinalPassSection(unittest.TestCase):
         self.assertIn("shard_00__seg_00000018.wab", out)
         self.assertIn("1 anomaly", out)
 
+    def test_orphans_are_explained_by_flush_lag_not_by_a_stale_log(self):
+        # The old text blamed "a stale delivery log from an earlier run of this
+        # seed". That is impossible by construction — the harness refuses to
+        # start when ledger.log, delivered.log OR episodes.jsonl is non-empty —
+        # and it is contradicted by the evidence: over the 6h Buffered soak all
+        # 9 orphan episodes of 397 were back to zero on the NEXT episode, which
+        # a stale log would never do. The real cause is loadgen's buffered
+        # ledger writes briefly outrunning the frontier window.
+        final = final_record(orphaned_delivered=[11, 22, 33])
+        out = report.render([final], {})
+        self.assertIn("Provenance anomalies", out)
+        self.assertIn("3 delivered record(s)", out)
+        self.assertNotIn("stale delivery log", out)
+        self.assertIn("frontier window", out)
+        # The distinction that makes the number actionable at 3am.
+        self.assertIn("Transient is benign; persistent is not", out)
+
     def test_a_killed_shutdown_drain_is_surfaced(self):
         final = final_record(
             daemon_clean_stop=False, advisory=True, frontier_slack=2048,

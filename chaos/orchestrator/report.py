@@ -490,10 +490,17 @@ def render(episodes, meta):
         lines.append("## Provenance anomalies\n")
         if orphaned:
             lines.append(
-                f"{orphaned} delivered record(s) had no ledger entry. These are NOT "
-                "durability violations and are excluded from the duplicate rate. The "
-                "likeliest cause is a stale delivery log from an earlier run of this "
-                "seed, since the run id derives from it.\n"
+                f"{orphaned} delivered record(s) had no ledger entry at the moment "
+                "this check ran. These are NOT durability violations and are "
+                "excluded from the duplicate rate. The cause is loadgen's buffered "
+                "ledger writes briefly lagging the delivery log by more than the "
+                "frontier window, so the record falls outside the exemption until "
+                "its line lands.\n\n"
+                "**Transient is benign; persistent is not.** Over the 6h Buffered "
+                "soak of 2026-08-28, 9 episodes of 397 reported orphans and every "
+                "one was back to zero by the next episode. An orphan that survives "
+                "the following episode's ingest means the ledger line is not late "
+                "but missing, which is worth investigating.\n"
             )
         if conflicts:
             lines.append(

@@ -1054,11 +1054,22 @@ def main():
                     "pushed_delta": deltas["pushed"],
                     "i1_missing": result.i1_missing[:50],
                     "i2_leaked": result.i2_leaked[:50],
-                    # Provenance anomalies, kept distinct from I1/I2 so neither is
-                    # ever read as a durability violation by weir: an orphan is
-                    # most likely a stale log from an earlier run of this seed,
-                    # and a ledger conflict means the oracle's own input is
-                    # corrupt.
+                    # Provenance anomalies, kept distinct from I1/I2 so neither
+                    # is ever read as a durability violation by weir. An orphan
+                    # is a delivered record whose ledger line the tailer has not
+                    # seen yet: loadgen buffers up to LEDGER_FLUSH_THRESHOLD per
+                    # thread, and when that lag briefly exceeds the frontier
+                    # window (threads * threshold) the record falls outside the
+                    # exemption and is counted. It resolves as soon as the line
+                    # lands. A ledger conflict means the oracle's own input is
+                    # corrupt, which is a different and worse thing.
+                    #
+                    # TRANSIENT IS BENIGN; PERSISTENT IS NOT. Measured over the
+                    # 6h Buffered soak of 2026-08-28: 9 episodes of 397 showed
+                    # orphans and every one was back to zero on the very next
+                    # episode. An orphan that SURVIVES the next episode's
+                    # ingest is a real signal — the ledger line is not merely
+                    # late, it is never coming.
                     "orphaned_delivered": result.orphaned_delivered[:50],
                     "ledger_conflicts": result.ledger_conflicts[:50],
                     # Frontier exemption (I3): how many would-be I1/orphan hits
