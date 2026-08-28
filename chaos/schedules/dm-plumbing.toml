@@ -1,0 +1,57 @@
+# dm layer plumbing rehearsal — NOT a power-loss run.
+#
+# Everything in Phase 2 was written and unit-tested on a laptop with no
+# device-mapper. This schedule is the first time that code meets a real
+# kernel, and it deliberately injects NOTHING new: the fault is Phase 1's
+# `kill_random`, so the contract under test is Phase 1's contract — zero
+# violations at any tier — and any violation here is the dm layer's fault,
+# not weir's.
+#
+# `dm_target = "linear"` is dm-flakey's pass-through stand-in. It exercises
+# every mechanism the real run depends on:
+#
+#   dmsetup create        (with an explicit table)
+#   dmsetup table         (read-back verification, incl. major:minor identity)
+#   mkfs/mount on /dev/mapper/*   rather than the loop device
+#   teardown ordering     (umount -> dmsetup remove -> losetup detach)
+#   the async-remove race (`dmsetup remove` returns before udev releases the
+#                          node; the polling guard in dm_stack._dm_remove)
+#
+# ...while injecting exactly zero faults of its own. So a clean result means
+# "the plumbing is sound", and only the flakey schedules can then mean
+# anything about power loss.
+#
+# Run this TWICE back to back. The stack is created once per run, so a single
+# run exercises create-after-nothing; the async-remove race only appears on a
+# create that follows a remove.
+seed = 0x9111B
+episodes = 3
+steady_lo_secs = 12.0
+steady_hi_secs = 20.0
+quiescence_timeout_secs = 120.0
+
+[load]
+threads = 8
+record_size = 256
+# 'D' is the canonical durable char after the tier collapse. Phase 1's
+# schedules all say 'S', which still parses; using 'D' here means the run
+# also exercises the new char end to end through loadgen.
+tier = "D"
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 512
+dm_target = "linear"
+
+# Phase 1's fault, unchanged and explicit. `load_schedule()` would refuse
+# "power_loss" against a linear target; naming kill_random here says the
+# refusal is not what is being relied on.
+[faults]
+kind = "kill_random"
