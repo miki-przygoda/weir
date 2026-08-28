@@ -264,16 +264,30 @@ class TestLinearCreateVerification(unittest.TestCase):
             s._dm_create(s.dm_name, "0 65536 linear 7:19 0")  # must not raise
 
     def test_an_unresolvable_loop_device_path_does_not_crash_verification(self):
-        # /dev/loop7 doesn't really exist on a dev/test machine. The device
-        # check must degrade to a no-op rather than raising an unrelated
-        # OSError out of a routine whose whole job is raising the RIGHT one.
+        # When the device node can't be stat'ed, the device check must degrade
+        # to a no-op rather than raising an unrelated OSError out of a routine
+        # whose whole job is raising the RIGHT one.
+        #
+        # The OSError is INJECTED, not assumed. This test used to rely on
+        # "/dev/loop7 doesn't exist on a dev machine" — true on the macOS
+        # laptop it was written on, false on every Linux box with loop
+        # devices, i.e. exactly the machines this harness runs on. There
+        # /dev/loop7 resolves to 7:7, mismatches the fixture's 7:19, and the
+        # test exercised the raising branch while claiming to prove the
+        # opposite. Caught on beast, 2026-08-28.
         s = self._stack()
         s._sectors = 65536
         s.loop_device = "/dev/loop7"
         fake = _fake_run(
             {("dmsetup", "table"): _Result(0, "0 65536 linear 7:19 0", "")}
         )
-        with mock.patch.object(dm_stack, "_run", fake):
+
+        def _unresolvable(path):
+            raise OSError(2, "No such file or directory", path)
+
+        with mock.patch.object(dm_stack, "_run", fake), mock.patch.object(
+            dm_stack, "_device_major_minor", _unresolvable
+        ):
             s._dm_create(s.dm_name, "0 65536 linear 7:19 0")  # must not raise
 
 
@@ -381,7 +395,15 @@ class TestSetupStackOrder(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             s = self._setup_stack(tmp, "linear")
             fake = self._fake_for("linear")
-            with mock.patch.object(dm_stack, "_run", fake):
+            # _fake_for's linear table names 7:19 as the backing device, so
+            # the resolver must agree or _verify_linear_target correctly
+            # rejects the mapping. Stubbed rather than left to the host: on
+            # Linux the faked "/dev/loop7" is a REAL node resolving to 7:7,
+            # which failed this test on beast while it passed on macOS purely
+            # because macOS has no loop devices to resolve.
+            with mock.patch.object(dm_stack, "_run", fake), mock.patch.object(
+                dm_stack, "_device_major_minor", lambda p: "7:19"
+            ):
                 s.setup()
             self.assertEqual(
                 [c[0] for c in fake.calls],
