@@ -17,13 +17,22 @@
 # 7200s cap, which cannot happen: at ~75s/episode the cap stopped the run at
 # ~96, so the schedule promised a 200-episode run and delivered half that.
 #
-# Measured on beast 2026-08-28, from the calibration runs:
-#   power-loss overhead   ~45 s/episode (umount + remount + journal replay +
-#                         daemon restart + drain quiescence). kill_random pays
-#                         almost none of this — do not reuse Phase 1 timings.
+# Measured on beast 2026-08-28, over the first 9 episodes of a real run:
+#   per episode           ~30 s at an 8-15 s steady state, i.e. ~18.5 s of
+#                         power-loss overhead (umount + remount + journal
+#                         replay + daemon restart + drain quiescence).
+#                         kill_random pays almost none of it — do not reuse
+#                         Phase 1 timings.
 #   throughput            ~72,000 records/s (4 usable cores; isolcpus reserves
 #                         the other 12)
 #   log growth            58.2 B/record across ledger.log + delivered.log
+#
+# The overhead figure was first estimated at 45 s from the single-episode
+# calibrations, which was WRONG: those runs are one episode PLUS a final pass,
+# and the final pass — full drain, metrics scrape, verification, WAB scan —
+# happens once per RUN, not once per episode. Dividing by the episode count
+# charged all of it to every episode. With one episode the two are
+# inseparable; nine episodes told them apart.
 #
 # STEADY STATE IS SHORT ON PURPOSE. What is at risk when the machine dies is
 # bounded by WRITEBACK LAG — about a second of dirty pages, ~72k records — not
@@ -32,17 +41,24 @@
 # buys MORE KILLS PER HOUR at LESS DISK COST with no loss of test power, and
 # kills are what a rare-event search actually needs.
 #
-# Disk is the binding constraint, not memory: beast has ~171 GB free on the
-# only Linux filesystem, and the two ledgers ARE the oracle (I1/I2 are
-# set-containment checks over exactly them) so they can never be trimmed to
-# save space. At 58.2 B/record a 24h run costs ~74 GB. Running under
-# `taskset -c 0-15` triples throughput and would cost ~221 GB, which does NOT
-# fit — that is why these run on the default 4-core affinity, which is also
-# the operating point the injector was calibrated at.
+# DISK IS THE BINDING CONSTRAINT, not memory. beast has ~171 GB free on the
+# only Linux filesystem (the other volumes are NTFS), and the two ledgers ARE
+# the oracle — I1/I2 are set-containment checks over exactly them — so they can
+# never be trimmed to save space. At 58.2 B/record and ~828k records/episode:
+#
+#   buffered  6h   ~720 episodes    ~35 GB    comfortable
+#   durable  24h ~2,880 episodes   ~139 GB    ~32 GB headroom — THIN.
+#                                             Check free space at launch.
+#
+# Running under `taskset -c 0-15` would use the 12 idle isolated cores and
+# roughly triple throughput, but it also triples the ledger: ~417 GB for 24h,
+# which does not fit. It would also move off the operating point the injector
+# was calibrated at. Extra kills were the cheaper axis — a shorter steady state
+# buys them at no disk cost at all.
 # ---------------------------------------------------------------------------
 
 seed = 0x9F1A2
-episodes = 2000
+episodes = 3200
 max_duration_secs = 86400  # 24h
 steady_lo_secs = 8.0
 steady_hi_secs = 15.0
