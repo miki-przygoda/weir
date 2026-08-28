@@ -229,6 +229,51 @@ class TestFinalPassSection(unittest.TestCase):
         self.assertIn("1 anomaly", out)
         self.assertIn("1 more not shown", out)
 
+    def test_quarantined_segments_under_power_loss_are_not_called_anomalies(self):
+        # The report must agree with the anomaly rule in run.final_pass. Saying
+        # "each one is an anomaly" about files the harness just classified as
+        # the expected outcome is the report/exit-code contradiction C5 exists
+        # to prevent — the run exits 0 while its own report reads as a finding.
+        final = final_record(
+            fault="power_loss",
+            wab_residue={"unconfirmed_sealed": 0, "nonempty_active": 0,
+                         "quarantined": 2, "dead_letter": 0},
+            wab_survivors=[
+                {"kind": "quarantine",
+                 "path": "/mnt/weir-wab/wab/quarantine/shard_00__seg_00000018.wab",
+                 "size": 0},
+                {"kind": "quarantine",
+                 "path": "/mnt/weir-wab/wab/quarantine/shard_01__seg_00000018.wab",
+                 "size": 0},
+            ],
+            wab_survivor_count=2,
+            anomaly_reasons=[],
+        )
+        out = report.render([final], {})
+        self.assertIn("WAB post-mortem", out)
+        # Still listed — exempt from the alarm, not from the record.
+        self.assertIn("shard_00__seg_00000018.wab", out)
+        self.assertIn("shard_01__seg_00000018.wab", out)
+        self.assertIn("0 anomalies", out)
+        self.assertNotIn("Each one is an anomaly", out)
+
+    def test_quarantined_segments_under_kill_random_are_still_anomalies(self):
+        final = final_record(
+            fault="kill_random",
+            wab_residue={"unconfirmed_sealed": 0, "nonempty_active": 0,
+                         "quarantined": 1, "dead_letter": 0},
+            wab_survivors=[
+                {"kind": "quarantine",
+                 "path": "/mnt/weir-wab/wab/quarantine/shard_00__seg_00000018.wab",
+                 "size": 0},
+            ],
+            wab_survivor_count=1,
+            anomaly_reasons=["wab_survivors=1"],
+        )
+        out = report.render([final], {})
+        self.assertIn("shard_00__seg_00000018.wab", out)
+        self.assertIn("1 anomaly", out)
+
     def test_a_killed_shutdown_drain_is_surfaced(self):
         final = final_record(
             daemon_clean_stop=False, advisory=True, frontier_slack=2048,

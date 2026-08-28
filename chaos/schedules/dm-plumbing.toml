@@ -10,20 +10,34 @@
 # `dm_target = "linear"` is dm-flakey's pass-through stand-in. It exercises
 # every mechanism the real run depends on:
 #
+#   blockdev --getsz      (sector count for the table)
 #   dmsetup create        (with an explicit table)
 #   dmsetup table         (read-back verification, incl. major:minor identity)
 #   mkfs/mount on /dev/mapper/*   rather than the loop device
 #   teardown ordering     (umount -> dmsetup remove -> losetup detach)
-#   the async-remove race (`dmsetup remove` returns before udev releases the
-#                          node; the polling guard in dm_stack._dm_remove)
 #
 # ...while injecting exactly zero faults of its own. So a clean result means
 # "the plumbing is sound", and only the flakey schedules can then mean
 # anything about power loss.
 #
-# Run this TWICE back to back. The stack is created once per run, so a single
-# run exercises create-after-nothing; the async-remove race only appears on a
-# create that follows a remove.
+# What this does NOT reach, so don't read a pass as covering it:
+#
+#   engage_fault/disengage_fault — there is no flakey layer to suspend and
+#     reload; _require_flakey_layer refuses on a linear stack by design.
+#   the canary (I6) — only power-loss episodes write one.
+#   the async-remove polling guard in dm_stack._dm_remove. That guard exists
+#     for a `create` that follows a `remove` OF THE SAME NAME, and it cannot
+#     happen here: dm names are PID-keyed (weir-chaos-<target>-<pid>) and
+#     _dm_remove runs once per run at teardown, so no two creates ever
+#     contend for a name. It stays as cheap insurance against PID reuse, but
+#     it is unexercised and this schedule cannot exercise it.
+#
+# To repeat this run, bump the seed — `run_id` is derived from it and the
+# harness refuses to start on top of a previous run's directory, so re-running
+# an unchanged schedule aborts before doing any work:
+#
+#   sed 's/^seed = .*/seed = 0x9111C/' schedules/dm-plumbing.toml > /tmp/p2.toml
+#   sudo python3 orchestrator/run.py /tmp/p2.toml
 seed = 0x9111B
 episodes = 3
 steady_lo_secs = 12.0

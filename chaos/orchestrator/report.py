@@ -132,17 +132,51 @@ def render_final_pass(final):
         )
         return lines
 
-    lines.append(
-        f"**{count} file(s) survived weir's shutdown drain.** Each one is an "
-        "anomaly: a sealed segment with no `.confirmed` sidecar or a non-empty "
-        "active segment is undelivered work; `quarantine/` means weir found "
-        "corruption; `dead_letter/` means it gave up on records a healthy sink "
-        "should have taken. Counted: "
+    counted = (
+        "Counted: "
         f"unconfirmed_sealed={residue.get('unconfirmed_sealed', 0)}, "
         f"nonempty_active={residue.get('nonempty_active', 0)}, "
         f"quarantined={residue.get('quarantined', 0)}, "
         f"dead_letter={residue.get('dead_letter', 0)}.\n"
     )
+    # Mirrors run.final_pass's anomaly rule. Under power loss a quarantined
+    # segment is the documented correct outcome, so calling it an anomaly here
+    # would leave the report contradicting its own exit code — a run exiting 0
+    # whose post-mortem reads as a finding. That contradiction is exactly what
+    # C5/I5 exist to prevent, and prose counts.
+    expected_quarantine = (
+        residue.get("quarantined", 0) if final.get("fault") == "power_loss" else 0
+    )
+    unexplained = count - expected_quarantine
+
+    if not unexplained:
+        lines.append(
+            f"**{count} file(s) survived weir's shutdown drain, all of them "
+            "quarantined segments — the expected outcome of power loss, not a "
+            "finding.** The fault drops the active segment's contents; on "
+            "restart recovery finds the torn tail and parks it in "
+            "`quarantine/` rather than silently truncating it. They are listed "
+            "below because the exemption is from the alarm, not from the "
+            "record. " + counted
+        )
+    elif expected_quarantine:
+        lines.append(
+            f"**{unexplained} of {count} surviving file(s) are NOT explained "
+            f"by the fault.** {expected_quarantine} quarantined segment(s) are "
+            "the expected outcome of power loss and are exempt; the rest are "
+            "anomalies: a sealed segment with no `.confirmed` sidecar or a "
+            "non-empty active segment is undelivered work, and `dead_letter/` "
+            "means weir gave up on records a healthy sink should have taken. "
+            + counted
+        )
+    else:
+        lines.append(
+            f"**{count} file(s) survived weir's shutdown drain.** Each one is an "
+            "anomaly: a sealed segment with no `.confirmed` sidecar or a non-empty "
+            "active segment is undelivered work; `quarantine/` means weir found "
+            "corruption; `dead_letter/` means it gave up on records a healthy sink "
+            "should have taken. " + counted
+        )
     lines.append("| Kind | Path | Bytes |")
     lines.append("|---|---|---|")
     for s in survivors[:MAX_SURVIVORS_SHOWN]:

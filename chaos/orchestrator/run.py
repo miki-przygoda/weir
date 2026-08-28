@@ -419,8 +419,33 @@ def final_pass(
         survivors = list(residue.survivors)
         record["wab_survivor_count"] = len(survivors)
         record["wab_survivors"] = survivors[:50]
-        if survivors:
-            anomaly_reasons.append(f"wab_survivors={len(survivors)}")
+        # Quarantined segments are the DOCUMENTED correct outcome of power
+        # loss, not evidence against weir. The fault drops the active
+        # segment's contents; recovery finds a torn tail on restart and parks
+        # it in quarantine/ rather than silently truncating it — the v1.1.0
+        # Finding 2c hardening, working. Flagging that would put an anomaly on
+        # essentially every power-loss episode, and exit_code_for() turns any
+        # anomaly into exit 1, so a 200-episode run would report "weir is
+        # broken" for behaving exactly as designed. Observed on the first real
+        # calibration run, 2026-08-28: 4 zero-length quarantined segments, one
+        # per shard.
+        #
+        # Keyed on the FAULT, never on the kind alone — the same discipline
+        # tier-aware I1 uses. After `kill_random` the page cache survives, so
+        # a quarantined segment there still means something genuinely went
+        # wrong and stays an anomaly. And only `quarantine` is exempt: a
+        # non-empty active segment or a dead-letter file is not explained by
+        # power loss, and exempting the whole post-mortem would discard it.
+        #
+        # Exempt from the ALARM, never from the RECORD: the full list and
+        # count stay in the episode record either way, exactly as Buffered's
+        # `expected_loss` is counted rather than hidden.
+        unexplained = [
+            s for s in survivors
+            if not (fault == "power_loss" and s.get("kind") == "quarantine")
+        ]
+        if unexplained:
+            anomaly_reasons.append(f"wab_survivors={len(unexplained)}")
 
     if result is not None and not result.ok and advisory:
         anomaly_reasons.append("advisory_check_failed")

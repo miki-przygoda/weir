@@ -603,6 +603,85 @@ class TestFinalPass(unittest.TestCase):
         self.assertIn("wab_survivors=2", record["anomaly_reasons"])
         self.assertEqual((violations, anomalies), (0, 1))
 
+    def test_quarantined_segments_are_expected_under_power_loss(self):
+        # Power loss drops the active segment's contents; recovery quarantines
+        # the torn tail instead of silently truncating it. That is the
+        # DOCUMENTED correct behaviour (the v1.1.0 Finding 2c hardening), so
+        # flagging it would make every power-loss episode report an anomaly —
+        # and exit_code_for() turns any anomaly into exit 1, i.e. "weir is
+        # broken". Counted and reported, never an anomaly by itself.
+        survivors = (
+            {"kind": "quarantine",
+             "path": "/mnt/weir-wab/wab/quarantine/shard_00__seg_00000018.wab",
+             "size": 0},
+        )
+        kwargs, _ = final_pass_fixture(
+            residue=quiescence.Residue(0, 0, 1, 0, survivors)
+        )
+        record, violations, anomalies = run.final_pass(fault="power_loss", **kwargs)
+        # Still fully reported — exempt from the ALARM, not from the RECORD.
+        self.assertEqual(record["wab_survivor_count"], 1)
+        self.assertEqual(record["wab_residue"]["quarantined"], 1)
+        self.assertEqual(len(record["wab_survivors"]), 1)
+        self.assertEqual(record["anomaly_reasons"], [])
+        self.assertEqual((violations, anomalies), (0, 0))
+
+    def test_quarantined_segments_are_still_an_anomaly_under_kill_random(self):
+        # The Phase 1 contract, unweakened. `kill -9` does not lose the page
+        # cache, so a quarantined segment after one means something genuinely
+        # went wrong. The exemption is keyed on the FAULT, never on the kind
+        # alone — the same discipline tier-aware I1 uses.
+        survivors = (
+            {"kind": "quarantine",
+             "path": "/mnt/weir-wab/wab/quarantine/shard_00__seg_00000018.wab",
+             "size": 0},
+        )
+        kwargs, _ = final_pass_fixture(
+            residue=quiescence.Residue(0, 0, 1, 0, survivors)
+        )
+        record, violations, anomalies = run.final_pass(fault="kill_random", **kwargs)
+        self.assertIn("wab_survivors=1", record["anomaly_reasons"])
+        self.assertEqual((violations, anomalies), (0, 1))
+
+    def test_power_loss_does_not_exempt_non_quarantine_survivors(self):
+        # The trap: making power_loss globally exempt would silently discard
+        # the whole post-mortem. Only `quarantine` is expected under power
+        # loss. A non-empty active segment after a CLEAN final shutdown is not
+        # explained by the fault at all.
+        survivors = (
+            {"kind": "nonempty_active",
+             "path": "/mnt/weir-wab/wab/shard_00/seg_00000019.wab",
+             "size": 4096},
+        )
+        kwargs, _ = final_pass_fixture(
+            residue=quiescence.Residue(0, 1, 0, 0, survivors)
+        )
+        record, violations, anomalies = run.final_pass(fault="power_loss", **kwargs)
+        self.assertIn("wab_survivors=1", record["anomaly_reasons"])
+        self.assertEqual((violations, anomalies), (0, 1))
+
+    def test_power_loss_anomaly_counts_only_the_unexplained_survivors(self):
+        # Mixed residue: the reason line must not inflate its count with the
+        # quarantined files it just decided were expected, or the headline
+        # overstates what was actually found.
+        survivors = (
+            {"kind": "quarantine",
+             "path": "/mnt/weir-wab/wab/quarantine/shard_00__seg_00000018.wab",
+             "size": 0},
+            {"kind": "quarantine",
+             "path": "/mnt/weir-wab/wab/quarantine/shard_01__seg_00000018.wab",
+             "size": 0},
+            {"kind": "dead_letter",
+             "path": "/mnt/weir-wab/wab/dead_letter/dl_1.wab", "size": 512},
+        )
+        kwargs, _ = final_pass_fixture(
+            residue=quiescence.Residue(0, 0, 2, 1, survivors)
+        )
+        record, violations, anomalies = run.final_pass(fault="power_loss", **kwargs)
+        self.assertEqual(record["wab_survivor_count"], 3)
+        self.assertIn("wab_survivors=1", record["anomaly_reasons"])
+        self.assertEqual((violations, anomalies), (0, 1))
+
     def test_a_verification_that_blows_up_still_gets_the_post_mortem(self):
         # A LogTailer refusal is a real finding, but the WAB directory is what
         # teardown is about to destroy — losing it to an exception would be the
