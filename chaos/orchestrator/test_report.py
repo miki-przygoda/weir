@@ -137,7 +137,12 @@ class TestRender(unittest.TestCase):
         out = report.render(episodes, {})
         self.assertIn("Nacked Δ", out)
         self.assertIn("Pushed Δ", out)
-        self.assertNotIn("(cum.)", out)
+        # Neither of THESE two may be marked cumulative. The blanket
+        # assertNotIn("(cum.)") this replaces was broader than its own intent:
+        # `Expected loss (cum.)` is legitimately cumulative and says so, which
+        # is the honest labelling, not a regression of D3.
+        self.assertNotIn("Nacked (cum.)", out)
+        self.assertNotIn("Pushed (cum.)", out)
         self.assertIn("| 41 |", out)
         self.assertIn("| 5041 |", out)
         self.assertNotIn(
@@ -290,6 +295,31 @@ class TestFinalPassSection(unittest.TestCase):
         self.assertIn("frontier window", out)
         # The distinction that makes the number actionable at 3am.
         self.assertIn("Transient is benign; persistent is not", out)
+
+    def test_a_buffered_only_run_does_not_claim_the_durable_tier_held(self):
+        # A run is SINGLE-TIER: loadgen takes one --tier for the whole run. So
+        # on a tier="U" run there is not one Durable record to lose, and
+        # "no Durable record was lost" is vacuously true — it reads as evidence
+        # for precisely the claim the run cannot support. Observed on the 6h
+        # Buffered soak of 2026-08-28, whose report said "Durable's held" after
+        # 706 episodes that never pushed a Durable record.
+        recs = [final_record(episode=i, fault="power_loss", tier="U",
+                             expected_loss=100 * (i + 1))
+                for i in range(3)]
+        out = report.render(recs, {})
+        self.assertIn("Power-loss verdict", out)
+        self.assertNotIn("Durable's held", out)
+        self.assertNotIn("no Durable record was lost", out)
+        self.assertIn("NOT exercised", out)
+
+    def test_a_durable_run_says_the_durable_contract_held(self):
+        recs = [final_record(episode=i, fault="power_loss", tier="D",
+                             expected_loss=0)
+                for i in range(3)]
+        out = report.render(recs, {})
+        self.assertIn("Durable", out)
+        # And is equally explicit that the other half went untested.
+        self.assertIn("NOT exercised", out)
 
     def test_a_killed_shutdown_drain_is_surfaced(self):
         final = final_record(

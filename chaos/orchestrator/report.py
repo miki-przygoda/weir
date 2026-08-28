@@ -434,16 +434,30 @@ def render(episodes, meta):
             )
         elif buffered_pl:
             lines.append(
-                "Buffered lost at least one record somewhere in this run, and "
-                "no Durable record was lost — the expected shape of a "
-                "power-loss result: Buffered's documented contract paying "
-                "out, Durable's held.\n"
+                "Buffered lost records under power loss, which is its "
+                "documented contract paying out exactly as designed.\n"
+            )
+            lines.append(
+                "**The Durable tier was NOT exercised by this run.** A run is "
+                "single-tier — `loadgen` takes one `--tier` for the whole run — "
+                "so a `tier=\"U\"` run pushes no Durable record and cannot say "
+                "anything about whether Durable holds under power loss. Read "
+                "this section as a measurement of Buffered's exposure and of "
+                "the injector's reliability, NOT as evidence for weir's "
+                "headline durability claim. That needs a `tier=\"D\"` run.\n"
             )
         else:
             lines.append(
                 "No Durable record was lost under power loss — the contract "
-                "held. (This run recorded no Buffered power-loss episodes, so "
-                "the negative control does not apply.)\n"
+                "held across every episode.\n"
+            )
+            lines.append(
+                "**The Buffered tier was NOT exercised by this run**, so the "
+                "negative control does not apply here: there were no Buffered "
+                "acks to go missing. The injector's reliability is evidenced "
+                "by the canary count above instead, which is why the canary "
+                "exists — a Durable run cannot use \"something was lost\" as "
+                "proof the fault fired.\n"
             )
 
     # Totals as of the LAST verified episode, not a sum across episodes:
@@ -521,16 +535,21 @@ def render(episodes, meta):
         "next to deltas.) I1 exempt / Pending prov. are the frontier-exemption "
         "counts from the same check (see Provenance anomalies above): how many "
         "would-be I1/orphan hits were excused as not-yet-caught-up rather than "
-        "lost. Expected loss (I3) is the Buffered-under-power_loss exemption's "
-        "size (see the Power-loss verdict section above, when present) — 0 for "
-        "every other tier/fault combination. The `final` row is the end-of-run "
+        "lost. Expected loss (I3, CUMULATIVE) is the Buffered-under-power_loss "
+        "exemption's running total — 0 for every other tier/fault combination, "
+        "and the one column here that is NOT a per-episode delta, hence the "
+        "label. It is cumulative for the same reason the Power-loss verdict "
+        "above reads the LAST record rather than summing (C4): a record lost "
+        "in episode 3 is still lost in episode 400, so a sum would count it "
+        "once per episode and inflate the figure without bound. Subtract "
+        "adjacent rows for per-episode loss. The `final` row is the end-of-run "
         "pass, not an episode: no fault was injected and no quiescence wait "
         "ran, hence `n/a`.\n"
     )
     lines.append(
         "| # | Fault | Quiesced | Verdict | Acked Δ | Delivered Δ | Dup rate | "
         "Unknown | Nacked Δ | Pushed Δ | I1 exempt | Pending prov. | "
-        "Expected loss | Notes |"
+        "Expected loss (cum.) | Notes |"
     )
     lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for e in episodes:
