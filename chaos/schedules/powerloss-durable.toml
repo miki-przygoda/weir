@@ -8,11 +8,44 @@
 # is inconclusive" rule is Buffered-only. Any loss at all is a fail, full
 # stop: see the header of powerloss-buffered.toml for why the two tiers read
 # a zero-loss result oppositely.
+# ---------------------------------------------------------------------------
+# LENGTH IS BOUNDED BY TIME, NOT BY `episodes`.
+#
+# `episodes` is a CEILING, deliberately set well above what the time budget can
+# reach — episode duration varies with quiescence and restart, so no fixed
+# count lands on a target length. Both were previously `episodes = 200` with a
+# 7200s cap, which cannot happen: at ~75s/episode the cap stopped the run at
+# ~96, so the schedule promised a 200-episode run and delivered half that.
+#
+# Measured on beast 2026-08-28, from the calibration runs:
+#   power-loss overhead   ~45 s/episode (umount + remount + journal replay +
+#                         daemon restart + drain quiescence). kill_random pays
+#                         almost none of this — do not reuse Phase 1 timings.
+#   throughput            ~72,000 records/s (4 usable cores; isolcpus reserves
+#                         the other 12)
+#   log growth            58.2 B/record across ledger.log + delivered.log
+#
+# STEADY STATE IS SHORT ON PURPOSE. What is at risk when the machine dies is
+# bounded by WRITEBACK LAG — about a second of dirty pages, ~72k records — not
+# by how long the episode ran. A 40s steady state exposes the same data to the
+# fault as an 8s one; it just writes 5x the ledger. So a short steady state
+# buys MORE KILLS PER HOUR at LESS DISK COST with no loss of test power, and
+# kills are what a rare-event search actually needs.
+#
+# Disk is the binding constraint, not memory: beast has ~171 GB free on the
+# only Linux filesystem, and the two ledgers ARE the oracle (I1/I2 are
+# set-containment checks over exactly them) so they can never be trimmed to
+# save space. At 58.2 B/record a 24h run costs ~74 GB. Running under
+# `taskset -c 0-15` triples throughput and would cost ~221 GB, which does NOT
+# fit — that is why these run on the default 4-core affinity, which is also
+# the operating point the injector was calibrated at.
+# ---------------------------------------------------------------------------
+
 seed = 0x9F1A2
-episodes = 200
-max_duration_secs = 7200
-steady_lo_secs = 20.0
-steady_hi_secs = 40.0
+episodes = 2000
+max_duration_secs = 86400  # 24h
+steady_lo_secs = 8.0
+steady_hi_secs = 15.0
 quiescence_timeout_secs = 180.0
 
 [load]
