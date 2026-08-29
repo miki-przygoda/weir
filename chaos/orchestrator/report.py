@@ -389,10 +389,22 @@ def render(episodes, meta):
         # powerloss_verdict's docstring for why summing inflates it.
         buffered_loss = buffered_pl[-1].get("expected_loss", 0) if buffered_pl else 0
         lines.append("## Power-loss verdict\n")
-        lines.append(
-            f"**{verdict.upper()}.** Buffered `expected_loss` as of the last "
-            f"verified power-loss record: **{buffered_loss}**.\n"
-        )
+        # Report the figure that MEANS something for the tier this run used.
+        # Leading a Durable run with "Buffered expected_loss: 0" states a
+        # number that is zero because it was never measured — and worse than
+        # irrelevant, because the negative control makes zero Buffered loss a
+        # signal of a dead injector. The headline would then read as alarming
+        # until a later paragraph corrected it.
+        if buffered_pl:
+            lines.append(
+                f"**{verdict.upper()}.** Buffered `expected_loss` as of the "
+                f"last verified power-loss record: **{buffered_loss}**.\n"
+            )
+        else:
+            lines.append(
+                f"**{verdict.upper()}.** No Durable record was lost across "
+                f"**{len(pl_records)}** power-loss episode(s).\n"
+            )
         # I6: the canary measurement, when this run recorded one. Converts
         # "Buffered lost nothing" from an inference (maybe the injector never
         # bit) into a direct per-episode measurement of whether it did.

@@ -312,6 +312,28 @@ class TestFinalPassSection(unittest.TestCase):
         self.assertNotIn("no Durable record was lost", out)
         self.assertIn("NOT exercised", out)
 
+    def test_the_verdict_headline_reports_the_tier_the_run_actually_used(self):
+        # Leading a Durable run with "Buffered expected_loss: 0" is the third
+        # instance of the same shape: a figure that is zero because it was
+        # never measured. It is worse than merely irrelevant here — the
+        # negative control makes zero Buffered loss a signal of a DEAD
+        # INJECTOR, so the headline reads as alarming until the paragraph
+        # below corrects it. A headline should not need correcting.
+        durable = [final_record(episode=i, fault="power_loss", tier="D",
+                                expected_loss=0) for i in range(3)]
+        out = report.render(durable, {})
+        head = out.split("## Power-loss verdict")[1].split("\n\n")[1]
+        self.assertNotIn("Buffered", head)
+        self.assertIn("Durable", head)
+        self.assertIn("3", head)  # names the episode count it is asserting over
+
+        buffered = [final_record(episode=i, fault="power_loss", tier="U",
+                                 expected_loss=50 * (i + 1)) for i in range(3)]
+        out = report.render(buffered, {})
+        head = out.split("## Power-loss verdict")[1].split("\n\n")[1]
+        self.assertIn("Buffered", head)
+        self.assertIn("150", head)
+
     def test_a_durable_run_says_the_durable_contract_held(self):
         recs = [final_record(episode=i, fault="power_loss", tier="D",
                              expected_loss=0)
