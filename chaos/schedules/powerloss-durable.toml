@@ -9,59 +9,44 @@
 # stop: see the header of powerloss-buffered.toml for why the two tiers read
 # a zero-loss result oppositely.
 # ---------------------------------------------------------------------------
-# LENGTH IS BOUNDED BY TIME, NOT BY `episodes`.
+# LENGTH IS BOUNDED BY TIME. `episodes` is a CEILING set above what the budget
+# can reach, because episode duration varies with quiescence and restart.
 #
-# `episodes` is a CEILING, deliberately set well above what the time budget can
-# reach — episode duration varies with quiescence and restart, so no fixed
-# count lands on a target length. Both were previously `episodes = 200` with a
-# 7200s cap, which cannot happen: at ~75s/episode the cap stopped the run at
-# ~96, so the schedule promised a 200-episode run and delivered half that.
+# MEASURED FOR THIS TIER, not inherited from the Buffered schedules — every
+# disk projection made for this run before 2026-08-29 used Buffered's figures
+# and was wrong by a factor of ~50. Durable fdatasyncs at the batch boundary
+# BEFORE acking, so it is fsync-bound where Buffered is not:
 #
-# Measured on beast 2026-08-28, over the first 9 episodes of a real run:
-#   per episode           ~30 s at an 8-15 s steady state, i.e. ~18.5 s of
-#                         power-loss overhead (umount + remount + journal
-#                         replay + daemon restart + drain quiescence).
-#                         kill_random pays almost none of it — do not reuse
-#                         Phase 1 timings.
-#   throughput            ~72,000 records/s (4 usable cores; isolcpus reserves
-#                         the other 12)
-#   log growth            58.2 B/record across ledger.log + delivered.log
+#                        Durable          Buffered
+#   acked per episode      8,708           412,519      47x
+#   ledger per episode      512 KB          23.7 MB     46x
+#   seconds per episode      15.6              18.7
 #
-# The overhead figure was first estimated at 45 s from the single-episode
-# calibrations, which was WRONG: those runs are one episode PLUS a final pass,
-# and the final pass — full drain, metrics scrape, verification, WAB scan —
-# happens once per RUN, not once per episode. Dividing by the episode count
-# charged all of it to every episode. With one episode the two are
-# inseparable; nine episodes told them apart.
+# From the 30-episode calibration (run 2403588927149739, 4-8 s steady).
 #
-# STEADY STATE IS SHORT ON PURPOSE. What is at risk when the machine dies is
-# bounded by WRITEBACK LAG — about a second of dirty pages, ~72k records — not
-# by how long the episode ran. A 40s steady state exposes the same data to the
-# fault as an 8s one; it just writes 5x the ledger. So a short steady state
-# buys MORE KILLS PER HOUR at LESS DISK COST with no loss of test power, and
-# kills are what a rare-event search actually needs.
+#   24h  ->  ~5,538 episodes  ->  ~2.8 GB
 #
-# DISK IS THE BINDING CONSTRAINT, not memory. beast has ~171 GB free on the
-# only Linux filesystem (the other volumes are NTFS), and the two ledgers ARE
-# the oracle — I1/I2 are set-containment checks over exactly them — so they can
-# never be trimmed to save space. At 58.2 B/record and ~828k records/episode:
+# DISK IS NOT THE CONSTRAINT HERE. It dominated every Buffered schedule — a 24h
+# Buffered run needs ~117 GB against ~136 GB free — and it does not apply at
+# all to this one. The 5 GiB `disk_stop_reason` floor still guards the run.
 #
-#   buffered  6h   ~720 episodes    ~35 GB    comfortable
-#   durable  24h ~2,880 episodes   ~139 GB    ~32 GB headroom — THIN.
-#                                             Check free space at launch.
+# Steady state stays SHORT anyway, for a testing reason rather than a budget
+# one: kills are what a rare-event search needs, and 4-8 s yields ~5,538 of
+# them against ~4,095 at 8-15 s. The shape was validated on Buffered
+# (powerloss-shape-check.toml): halving the episode still reached the writeback
+# ceiling, 124,897 against 126,782, so nothing was given up by shortening.
 #
-# Running under `taskset -c 0-15` would use the 12 idle isolated cores and
-# roughly triple throughput, but it also triples the ledger: ~417 GB for 24h,
-# which does not fit. It would also move off the operating point the injector
-# was calibrated at. Extra kills were the cheaper axis — a shorter steady state
-# buys them at no disk cost at all.
+# Segment rotation still happens at this throughput — the calibration reached
+# seg_00000035 per shard in 30 episodes, roughly one per episode, because each
+# kill/restart cycle seals the active segment. So the seal-and-replay path is
+# exercised even though 8,708 records/episode never fill an 8 MiB segment.
 # ---------------------------------------------------------------------------
 
 seed = 0x9F1A2
-episodes = 3200
+episodes = 7000
 max_duration_secs = 86400  # 24h
-steady_lo_secs = 8.0
-steady_hi_secs = 15.0
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
 quiescence_timeout_secs = 180.0
 
 [load]
