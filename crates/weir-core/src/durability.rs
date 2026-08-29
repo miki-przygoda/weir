@@ -28,6 +28,32 @@ pub enum Durability {
     Durable = 0x01,
     /// Memory write only. ACK is sent after the record enters the in-memory
     /// queue — survives a process crash, but not power loss.
+    ///
+    /// # How much is at risk
+    ///
+    /// Measured, not estimated: 706 real power-loss episodes on ext4 over
+    /// dm-flakey, 604,485,602 acknowledged records
+    /// (`docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`).
+    ///
+    /// Loss is **uniformly distributed between zero and one writeback
+    /// interval** — a power cut lands at a random point in a periodic
+    /// writeback cycle, so what has not yet reached the platter is uniform
+    /// between "just flushed" and "about to flush". The ceiling, not the mean,
+    /// is what characterises the tier.
+    ///
+    /// On that hardware, at ~72,000 records/s, the ceiling was **1.76 seconds
+    /// of acknowledged writes** (126,782 records) with a median of 0.89 s.
+    ///
+    /// What generalises is the *shape*: the bound is one writeback interval of
+    /// whatever your throughput is, and it does not grow with uptime, queue
+    /// depth, or how long the process has been running. The specific figures
+    /// are a property of that filesystem, its mount options and that record
+    /// rate — measure your own if the number matters to you.
+    ///
+    /// [`Durable`](Self::Durable) is not exposed this way by construction: it
+    /// `fdatasync`s at the batch boundary before acking. Note the run above
+    /// was single-tier (`tier="U"`), so it measured Buffered only and is not
+    /// itself evidence about Durable.
     Buffered = 0x03,
 }
 

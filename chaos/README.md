@@ -75,19 +75,51 @@ does not build this project.
 > entered (`kill -9` truncates cleanly; quarantine is for corruption), so it has
 > no coverage here.
 
-## Phase 2 — injector validated, injection NOT implemented
+## Status — Phase 2 Buffered measured (2026-08-28)
 
-The `dm-flakey` injector Phase 2 depends on has been validated on real hardware:
+> **706 power-loss episodes, 604,485,602 acked records, 0 violations,
+> 0 anomalies. Canary `bit` in 706/706.**
+>
+> Full write-up:
+> [`docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`](../docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md).
+>
+> **Buffered's exposure is now a number, not prose.** Loss is uniformly
+> distributed between zero and one writeback interval — mean and stdev both
+> land within 2% of a uniform distribution's `max/2` and `max/√12` — with a
+> ceiling of **126,782 records (~1.76 s of acknowledged writes)** and a median
+> of 63,790 (~0.89 s). The ceiling, not the mean, is what characterises the
+> tier.
+>
+> **What it does NOT establish.** The run was `tier="U"`. A run is single-tier,
+> so **the Durable tier is still untested under power loss** — this measures
+> Buffered's exposure and the injector's reliability, and is not evidence for
+> weir's headline claim. WAB format v2 (zstd) is also uncovered: the run used
+> v1, which is 2.0.0's default.
+
+The injector itself was validated on real hardware first:
 [`docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md`](../docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md).
 `drop_writes` is a **lying disk** — it reports fsync success and discards the
-write — which is not what real power loss does, and the write-up explains why
-that difference dictates the episode protocol rather than being a footnote.
+write — which is not what real power loss does, and that difference dictates
+the episode protocol rather than being a footnote. Read it before touching
+`dm_stack.py`: it records three separate ways a flakey device can end up
+running a configuration you did not ask for, and all three fail towards *false
+violations against weir*.
 
-**Phase 2 itself is still unwritten.** `dm_stack.py` builds loop → ext4 → mount
-and nothing else; the episode loop injects `kill_random` unconditionally; the
-`[faults]` tables are empty. Read the write-up before implementing it: it
-records three separate ways a flakey device can end up running a configuration
-you did not ask for, and all three fail towards *false violations against weir*.
+**The protocol is kill-first**, and the reason is not obvious. `drop_writes`
+sits BELOW the page cache, so a dropped write leaves the page resident and
+correct, and `kill -9` does not evict it — an engage-then-kill injector cannot
+lose a single byte. `dmsetup suspend` without `--nolockfs` additionally flushes
+every dirty page to the still-honest disk before the fault installs. The
+episode therefore kills first, then engages, unmounts, disengages and remounts,
+which makes the lying window exactly zero by construction and models what power
+loss actually takes: the data that was dirty at the instant of death.
+
+**The canary (I6) is load-bearing, especially for a Durable run.** A known
+block is written before the fault, overwritten while engaged, and read back
+after the remount; `bit` means the overwrite was destroyed. A Buffered run can
+argue the injector fired because something went missing. A Durable run cannot —
+under a correct implementation nothing goes missing, so "zero loss" and "the
+fault never fired" produce identical numbers.
 
 ## Phase 1 exit gate
 
