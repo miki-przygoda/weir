@@ -50,6 +50,28 @@ pub enum Durability {
     /// are a property of that filesystem, its mount options and that record
     /// rate — measure your own if the number matters to you.
     ///
+    /// # WAB compression raises this materially
+    ///
+    /// The figures above are for the default uncompressed WAB. A 40-episode
+    /// controlled comparison — identical in every parameter except
+    /// `wab_compression` — found that enabling zstd makes the loss **bimodal**
+    /// rather than uniform, and roughly triples the ceiling: 449,876 records
+    /// (~5.7 s) against 124,897 (~1.8 s). The two modes separate cleanly, with
+    /// no episode landing between 127,711 and 307,263, and the lower mode
+    /// reproduces the uncompressed distribution almost exactly. Compression
+    /// packs far more records behind each unflushed byte, so a power cut takes
+    /// proportionally more of them.
+    ///
+    /// **Correctness is unaffected** — zero I1 and I2 violations, and recovery
+    /// quarantined torn compressed segments at the same rate as uncompressed
+    /// ones. This is a change in how much the tier can lose, not in whether it
+    /// keeps its contract.
+    ///
+    /// Treat the multiplier as indicative, not as a number to plan with: the
+    /// chaos load generator's payload is far more compressible than real data,
+    /// so the mechanism is demonstrated but its size on a realistic workload is
+    /// unmeasured.
+    ///
     /// [`Durable`](Self::Durable) is not exposed this way by construction: it
     /// `fdatasync`s at the batch boundary before acking. Note the run above
     /// was single-tier (`tier="U"`), so it measured Buffered only and is not

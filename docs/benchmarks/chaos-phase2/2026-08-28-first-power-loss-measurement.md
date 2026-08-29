@@ -152,8 +152,8 @@ the Durable contract held on a run that contained no Durable records.
   `loadgen` takes one `--tier` for the whole run — so 706 episodes at `tier="U"`
   pushed not one Durable record. This run measures Buffered's exposure and the
   injector's reliability. It is not evidence for weir's headline claim.
-- **WAB format v2 (zstd) is untested under power loss.** This run was v1, which
-  is 2.0.0's default; v2 is opt-in.
+- ~~WAB format v2 (zstd) is untested under power loss.~~ **Now covered** — see
+  the controlled comparison below.
 - `error_writes` — fail-closed nacking — is a different fault class, deferred.
 - Slow disk, `ENOSPC`, read-only remount, dead-letter exhaustion: Phase 3.
 - Single host, single filesystem, single kernel.
@@ -177,3 +177,56 @@ The pattern in the first and the last is the same one Phase 1 recorded: a
 statement that is true for a reason that makes it meaningless. A test that
 passes because the dev machine lacks a device; a contract that "held" because
 it was never exercised.
+
+
+## Addendum, 2026-08-29 — WAB v2 (zstd) under power loss
+
+A 40-episode controlled comparison against
+[`powerloss-shape-check.toml`](../../../chaos/schedules/powerloss-shape-check.toml),
+verified programmatically to differ in `weir.wab_compression` and nothing else.
+Buffered on purpose: it produces ~3.8 quarantined segments per kill where
+Durable produces zero, so it is the tier that actually stresses the recovery
+path this was written to test.
+
+**Correctness is unaffected.**
+
+| | v1 (`none`) | v2 (`zstd`) |
+|---|---|---|
+| Canary | 40/40 `bit` | 40/40 `bit` |
+| I1 / I2 / conflicts | 0 / 0 / 0 | 0 / 0 / 0 |
+| Quarantined per kill | 3.90 | 4.00 |
+| Final pass | `slack=0`, 0 anomalies | `slack=0`, 0 anomalies |
+
+Recovery parses a torn **zstd frame** exactly as reliably as a torn plain
+record, which was the specific risk: a decoder that rejects malformed input
+rather than returning short data is where a recovery bug would have lived.
+
+**But the exposure changes shape and size.**
+
+| | v1 | v2 |
+|---|---|---|
+| p50 | 70,747 | 118,146 |
+| p75 | 90,513 | 377,707 |
+| max | 124,897 (~1.8 s) | **449,876 (~5.7 s)** |
+| mean | 65,419 | 198,580 |
+| distribution | uniform | **bimodal** |
+
+The v1 loss is uniform: stdev 33,985 against `max/√12` = 36,055. The v2 loss is
+not, and the split is unambiguous — **no episode of 40 landed between 127,711
+and 307,263**, a gap of 179,552 records:
+
+| mode | episodes | mean | range |
+|---|---|---|---|
+| low | 23 | 62,999 | 2,362 – 127,711 |
+| high | 17 | 382,012 | 307,263 – 449,876 |
+
+**The low mode reproduces the uncompressed distribution almost exactly** (v1
+mean 65,419, max 124,897). Compression packs far more records behind each
+unflushed byte, so when a cut catches the larger unit it takes proportionally
+more records with it.
+
+**Do not plan with the multiplier.** The load generator's payload is
+`{"run":N,"seq":M,"pad":"aaa…"}`, which is far more compressible than real
+data — the same caveat the 2026-08-25 v2 soak recorded when it found
+compression shifts redelivery *variance*. The mechanism is demonstrated; its
+magnitude on a realistic workload is unmeasured.
