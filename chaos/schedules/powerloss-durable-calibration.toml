@@ -1,0 +1,58 @@
+# The FIRST Durable-tier power-loss episodes ever run against weir.
+#
+# Everything Phase 2 has measured so far — two calibrations and a 706-episode
+# soak, 604,485,602 acked records — was tier "U". Buffered is the tier that is
+# PERMITTED to lose, which made it the right place to prove the injector
+# works, and the wrong place to learn anything about weir's headline claim.
+# This schedule is a short, cheap first contact with the claim itself before
+# 24 hours are committed to it.
+#
+# The contract: Durable fdatasyncs at the batch boundary BEFORE acking, so an
+# acked Durable record must survive power loss. Zero loss. No exemption — I1
+# is keyed on tier AND fault, and "D" is exempt under neither.
+#
+# PASS CONDITION, and note it takes two parts:
+#
+#   canary = "bit" on every episode   AND   i1_missing = 0 everywhere
+#
+# The canary is not decoration here, it is the whole basis of the result. A
+# Buffered run can argue the injector fired because something went missing; a
+# Durable run CANNOT — under a correct implementation nothing goes missing, so
+# "zero loss" and "the fault never fired" produce identical numbers. Without a
+# per-episode measurement taken independently of weir, a Durable power-loss
+# run is unfalsifiable, and an unfalsifiable test is worth nothing. That is
+# exactly why I6 exists.
+#
+# Also measures something the 24h budget needs: throughput at tier "D". Durable
+# fsyncs before acking, so its record rate should sit below Buffered's ~72,000/s
+# and the ledger should grow more slowly — which changes the disk projection for
+# the long run. Do not assume Buffered's 58.2 B/record and 50 MB/episode carry
+# over; read them off this run.
+seed = 0xDD11B
+episodes = 30
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "D"
+# Durable is held to zero loss, so Phase 1's symmetric floors apply here in
+# full — unlike the Buffered schedules, which must allow delivered to lag
+# because their acks are MEANT to go missing.
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"
