@@ -148,10 +148,10 @@ process crash and its presence means something genuinely went wrong.
 Stated plainly, because the report's own prose once got this wrong and claimed
 the Durable contract held on a run that contained no Durable records.
 
-- **The Durable tier is untested under power loss.** A run is single-tier —
-  `loadgen` takes one `--tier` for the whole run — so 706 episodes at `tier="U"`
-  pushed not one Durable record. This run measures Buffered's exposure and the
-  injector's reliability. It is not evidence for weir's headline claim.
+- ~~The Durable tier is untested under power loss.~~ **Now covered** — 5,311
+  episodes, see the second addendum. A run is single-tier (`loadgen` takes one
+  `--tier` for the whole run), so *this* run at `tier="U"` pushed not one
+  Durable record and remains evidence only about Buffered.
 - ~~WAB format v2 (zstd) is untested under power loss.~~ **Now covered** — see
   the controlled comparison below.
 - `error_writes` — fail-closed nacking — is a different fault class, deferred.
@@ -230,3 +230,62 @@ more records with it.
 data — the same caveat the 2026-08-25 v2 soak recorded when it found
 compression shifts redelivery *variance*. The mechanism is demonstrated; its
 magnitude on a realistic workload is unmeasured.
+
+
+## Addendum, 2026-08-30 — the Durable tier, 24 hours
+
+The claim weir is built on, under the fault it had never met.
+
+- **Run id:** `1729848005600002`, schedule
+  [`powerloss-durable.toml`](../../../chaos/schedules/powerloss-durable.toml),
+  seed `0xD0AB1`
+- **24 h 0 m**, 5,311 episodes, 2.6 GB, exit 0
+
+| | |
+|---|---|
+| Acknowledged records | **42,814,591** |
+| Canary (I6) | **`bit` in 5,311/5,311** |
+| I1 violations | **0** |
+| I2 leaks | **0** |
+| Ledger conflicts | **0** |
+| `expected_loss` | **0** |
+| Episodes not OK / not quiesced / no progress | 0 / 0 / 0 |
+| Orphaned deliveries | **0** |
+| Duplicate rate | **1.000** |
+| Final pass | `slack=0`, `advisory=False`, `clean_stop=True`, 0 anomalies |
+| WAB residue | **entirely empty** — 0 quarantined, 0 unconfirmed-sealed, 0 non-empty active, 0 dead-letter |
+
+**Not one acknowledged Durable record was lost across 5,311 power cuts.**
+
+### Why the canary matters more here than for Buffered
+
+A Buffered run can argue the injector fired because records went missing. A
+Durable run cannot: under a correct implementation nothing goes missing, so
+"zero loss" and "the fault never fired" produce **identical numbers**. Without
+a measurement taken independently of weir, this result would be unfalsifiable —
+and an unfalsifiable test is worth nothing.
+
+The canary is that measurement: a known block written before the fault,
+overwritten while it was engaged, read back after the remount. It was destroyed
+in **all 5,311 episodes**. The fault fired every time, and nothing was lost
+anyway.
+
+### The empty WAB is its own result
+
+Buffered leaves 3.83 quarantined segments per kill: power loss drops the active
+segment's contents and recovery parks the torn tail. **Durable left nothing at
+all, across 5,311 kills.** It has already `fdatasync`ed everything it
+acknowledged, so a power cut finds no torn tail to quarantine. The quarantine
+constant is a direct consequence of the tier's fsync policy, not an incidental
+property.
+
+The duplicate rate of exactly **1.000** says the same thing from the delivery
+side: no segment was ever replayed, because none was ever left unconfirmed.
+
+### What it bounds
+
+Zero violations across 5,311 episodes puts the per-episode violation rate below
+roughly **0.06%** at 95% confidence (rule of three). That is not proof of
+correctness — no finite run is — and it is one machine, one filesystem, one
+kernel, at WAB v1. It is the strongest evidence behind the claim so far, and it
+is stated as a bound rather than as certainty.

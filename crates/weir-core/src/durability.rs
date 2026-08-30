@@ -25,6 +25,33 @@
 pub enum Durability {
     /// Durable before ACK: written and `fdatasync`ed via the batch-boundary
     /// group fsync before the ACK is sent.
+    ///
+    /// # Evidence under power loss
+    ///
+    /// **5,311 simulated power-loss episodes over 24 hours, 42,814,591
+    /// acknowledged records, zero lost**
+    /// (`docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`).
+    /// Zero I1 violations, zero I2 leaks, zero ledger conflicts, and the WAB
+    /// was completely empty at shutdown — nothing quarantined, nothing
+    /// unconfirmed, nothing dead-lettered.
+    ///
+    /// The fault is a `dm-flakey drop_writes` device that discards writes
+    /// while reporting fsync success, applied after the daemon is killed so
+    /// the loss window contains only data that was dirty at the instant of
+    /// death — the definition of power loss.
+    ///
+    /// Each episode carried an independent check that the fault actually
+    /// fired: a known block written before the fault, overwritten while it
+    /// was engaged, and read back after the remount. **It was destroyed in
+    /// all 5,311.** This matters more here than for
+    /// [`Buffered`](Self::Buffered): a tier that loses nothing cannot use
+    /// "something went missing" as proof the fault was real, so without that
+    /// check the result would be unfalsifiable.
+    ///
+    /// Zero violations across 5,311 episodes bounds the per-episode violation
+    /// rate at roughly 0.06% with 95% confidence. It is not proof of
+    /// correctness — no finite run is — but it is the strongest evidence
+    /// behind weir's central claim.
     Durable = 0x01,
     /// Memory write only. ACK is sent after the record enters the in-memory
     /// queue — survives a process crash, but not power loss.
