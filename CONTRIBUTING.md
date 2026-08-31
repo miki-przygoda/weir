@@ -63,6 +63,23 @@ cargo test -p weir-server --bins --all-features -- --test-threads=1
 # Dependency advisories, license, bans, and sources.
 # Install once: cargo install cargo-deny
 cargo deny check advisories bans licenses sources
+
+# Minimum supported Rust version, and that Cargo.lock is consistent.
+# --locked is what catches a lockfile edited without a matching manifest.
+rustup toolchain install 1.88 --profile minimal   # once
+rustup run 1.88 cargo check --workspace --all-features --locked
+
+# Deterministic simulation sweep, and that the load suite still compiles.
+cargo test -p weir-server --bin weir-server --features dst "wab::dst::" -- --test-threads=1
+cargo test -p weir-server --test load --no-run
+
+# The docs book, with link checking. THIS IS PART OF CI AND WAS MISSING HERE
+# until 2026-08-31, when a PR went red on two link errors no local gate could
+# have caught: a page linked from inside the book but absent from SUMMARY.md,
+# and a link escaping the book root. Both are errors, not warnings.
+# Install once (match .github/workflows/docs.yml exactly):
+#   mdbook 0.4.40 and mdbook-linkcheck 0.7.7
+mdbook build
 ```
 
 All of the above must pass. CI builds `weir-server` on all five release targets:
