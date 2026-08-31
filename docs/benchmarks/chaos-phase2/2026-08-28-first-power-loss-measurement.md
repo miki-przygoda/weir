@@ -289,3 +289,31 @@ roughly **0.06%** at 95% confidence (rule of three). That is not proof of
 correctness — no finite run is — and it is one machine, one filesystem, one
 kernel, at WAB v1. It is the strongest evidence behind the claim so far, and it
 is stated as a bound rather than as certainty.
+
+
+## Every power-loss run, so the totals reconcile
+
+`CHANGELOG.md` cites **6,129 episodes over 687,712,504 acknowledged records**
+for 2.0.0. That figure spans every power-loss run on the branch, not only the
+two soaks and the compression comparison detailed above — so it cannot be
+reconstructed from those sections alone. The full inventory, all on beast:
+
+| Run id | Purpose | Tier | Format | Episodes | Acked |
+|---|---|---|---|---|---|
+| `2197010118485675` | first calibration — is the injector real? | U | v1 | 1 | 2,240,781 |
+| `2197012772921436` | second calibration, after the anomaly fix | U | v1 | 1 | 2,174,468 |
+| `1729845351164241` | 6 h Buffered soak — the distribution | U | v1 | 706 | 604,485,602 |
+| `920510542071102` | shape check (v1 arm of the compression comparison) | U | v1 | 40 | 17,259,457 |
+| `2403588927149739` | Durable calibration — first Durable power loss | D | v1 | 30 | 249,040 |
+| `407076304999677` | zstd arm of the compression comparison | U | **v2** | 40 | 18,488,565 |
+| `1729848005600002` | 24 h Durable soak — the claim itself | D | v1 | 5,311 | 42,814,591 |
+| | | | **total** | **6,129** | **687,712,504** |
+
+**Zero I1 violations, zero I2 leaks and zero ledger conflicts in every row**,
+and the canary read `bit` in all 6,129 episodes.
+
+The four short runs are calibrations rather than results, and are reported
+separately for that reason: a single episode establishes that the injector
+bites, not how much a tier loses. They are included in the total because they
+are real power-loss episodes weir survived, and excluding them would make the
+headline figure a different, undocumented quantity.
