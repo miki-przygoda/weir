@@ -45,6 +45,12 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
 
+# The demo bundle's version banner is GENERATED from [workspace.package]
+# version. CI's lint job regenerates it and fails on any diff, so a version
+# bump that forgets this turns the whole lint job red — and every job that
+# depends on lint (test, dst, load, build, monitoring, bench) then SKIPS.
+./scripts/sync-demo-version.sh && git diff --exit-code demo/version.js
+
 # Tests. weir-server's bin unit tests MUST run serially: socket::bind_hardened
 # mutates the process-global umask around bind(2), and a directory created by
 # another thread in that window loses its execute bit. See
