@@ -64,6 +64,17 @@ type, needs a small source change — see Breaking below.
   producers built against 1.x keep working. The encoder only ever emits
   `0x01`, and `0x02` is permanently reserved.
 
+### Security
+
+- **Dependency advisories cleared before release.** `h2` updated 0.4.14 -> 0.4.19
+  for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258) —
+  the crate queued empty HTTP/2 DATA frames without limit, so an undrained
+  stream could grow memory unboundedly or panic on length overflow. Low
+  severity, and transitive: it reaches `weir-server` only through
+  `reqwest -> hyper -> h2`, so it applies to deployments using the HTTP sink.
+  `chacha20` moved 0.10.0 -> 0.10.2 off a yanked release. Lockfile only; no
+  weir source changed.
+
 ### License
 
 - **weir is now licensed under the Apache License 2.0**, changed from MIT. The
