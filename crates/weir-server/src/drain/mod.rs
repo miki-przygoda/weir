@@ -199,10 +199,11 @@ pub fn spawn<S: Sink + 'static>(
     sink: Arc<S>,
     config: DrainConfig,
     metrics: Arc<Metrics>,
+    heartbeat: DrainHeartbeat,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("weir-drain".into())
-        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics))
+        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics, heartbeat))
         .expect("failed to spawn drain thread")
 }
 
@@ -235,6 +236,7 @@ fn run_drain_supervised<S: Sink>(
     sink: Arc<S>,
     config: DrainConfig,
     metrics: Arc<Metrics>,
+    heartbeat: DrainHeartbeat,
 ) {
     let mut attempts = 0u32;
     loop {
@@ -242,13 +244,14 @@ fn run_drain_supervised<S: Sink>(
         let sink = Arc::clone(&sink);
         let cfg = config.clone();
         let m = Arc::clone(&metrics);
+        let hb = heartbeat.clone();
         // True on the first start; false on every respawn (a panic destroys
         // `pending`, so a respawn must treat its first healthy probe as a
         // recovery edge and rescan the disk — see `drain_thread`'s
         // `initial_health_ok`).
         let first_start = attempts == 0;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drain_thread(rx, sink, cfg, m, first_start)
+            drain_thread(rx, sink, cfg, m, first_start, hb)
         }));
         // A clean Ok(()) return means the channel closed (all flushers gone) — done.
         let Err(_) = result else { break };
@@ -447,6 +450,51 @@ fn probe_and_resume_stranded<S: Sink>(
     now_ok
 }
 
+// ── Heartbeat (liveness observed from outside the drain's own runtime) ────────
+
+/// A monotonic counter the drain advances once per loop iteration.
+///
+/// The drain runs on a current-thread runtime, so a sink that BLOCKS the
+/// thread (a blocking DB driver, `std::fs`, a spin loop) defeats both
+/// `tokio::time::timeout` backstops — `commit_timeout` and
+/// `health_probe_timeout` can only fire if the awaited future yields.
+/// Measured: `commit_timeout` = 50 ms against a 1.2 s blocking commit elapsed
+/// 1.214 s and still confirmed the batch; a 50 ms health-probe timeout
+/// against a 1.5 s blocking health elapsed 1.504 s and returned healthy.
+/// Liveness therefore cannot be observed from inside the drain — this counter
+/// lets a task on another runtime (see `main.rs`'s WAB-growth poll) see it.
+///
+/// Deliberately NOT a fix: the drain still wedges forever against a sink that
+/// never yields. This only makes that state visible in the logs instead of
+/// silent. `drain_state` is untouched by this — see the callers.
+#[derive(Clone, Default)]
+pub(crate) struct DrainHeartbeat(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl DrainHeartbeat {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn bump(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// True when the heartbeat has not moved between two observations.
+///
+/// A single unchanged pair is not on its own proof of a wedge — see
+/// `main.rs`'s poll task, which requires this to hold for several
+/// consecutive polls (and past the drain's own `health_poll_interval`, since
+/// an idle-but-healthy drain only bumps the heartbeat that often) before it
+/// warns.
+pub(crate) fn drain_appears_stalled(previous: u64, current: u64) -> bool {
+    previous == current
+}
+
 // ── Drain thread ──────────────────────────────────────────────────────────────
 
 /// Total bytes currently held in `<wab_dir>/quarantine`: forensic copies of
@@ -489,6 +537,10 @@ fn drain_thread<S: Sink>(
     // backlog waits for a process restart. Starting at `false` makes the
     // first healthy probe an edge, which re-queues everything still on disk.
     initial_health_ok: bool,
+    // Bumped once per outer-loop iteration below. See `DrainHeartbeat` for
+    // why this exists: it's the only liveness signal that survives a sink
+    // call that blocks this thread outright rather than yielding.
+    heartbeat: DrainHeartbeat,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -547,6 +599,11 @@ fn drain_thread<S: Sink>(
     let mut shutdown_backoff_left = SHUTDOWN_RETRY_BACKOFF_BUDGET;
 
     'outer: loop {
+        // See `DrainHeartbeat`: bumped unconditionally on every pass through
+        // this loop, whatever state does or doesn't happen below — a sink
+        // call that blocks this thread (rather than yielding) is exactly the
+        // case that stops this line from ever running again.
+        heartbeat.bump();
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
@@ -1427,6 +1484,111 @@ mod tests {
         },
     };
 
+    // ── DrainHeartbeat / drain_appears_stalled ──────────────────────────────
+
+    #[test]
+    fn a_stalled_drain_is_visible_to_an_outside_observer() {
+        // tokio::time::timeout cannot fire against a sink that blocks the drain's
+        // current-thread runtime, so liveness has to be observed from outside.
+        let hb = DrainHeartbeat::new();
+        let first = hb.get();
+        hb.bump();
+        assert!(hb.get() > first, "a live drain advances the heartbeat");
+
+        let stalled = hb.get();
+        // Simulate a wedged drain: no bumps at all.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(
+            hb.get(),
+            stalled,
+            "a wedged drain leaves the heartbeat frozen"
+        );
+        assert!(
+            drain_appears_stalled(stalled, hb.get()),
+            "an unchanged heartbeat across a poll interval must read as stalled"
+        );
+    }
+
+    /// The isolated test above only proves `DrainHeartbeat` counts correctly in
+    /// the abstract. This exercises the real `drain_thread`: an idle-but-alive
+    /// drain (nothing queued, so its only activity is waking on its own
+    /// `health_poll_interval` cadence) still advances the heartbeat over time.
+    #[test]
+    fn a_real_idle_drain_thread_advances_the_heartbeat() {
+        let dir = tmp_dir("heartbeat_idle");
+        let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let heartbeat = DrainHeartbeat::new();
+        let config = DrainConfig {
+            // Short so the idle wake cadence is observable inside a fast test.
+            health_poll_interval: Duration::from_millis(20),
+            ..fast_config(dir.clone())
+        };
+        let hb_for_thread = heartbeat.clone();
+        let handle = std::thread::spawn(move || {
+            drain_thread(rx, sink, config, metrics, true, hb_for_thread)
+        });
+
+        let before = heartbeat.get();
+        std::thread::sleep(Duration::from_millis(200));
+        let after = heartbeat.get();
+        assert!(
+            after > before,
+            "an idle-but-alive drain must still advance its heartbeat on the \
+             health-poll cadence, or a merely-idle drain would be indistinguishable \
+             from a wedged one"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The other half: a drain genuinely wedged inside a sink call that blocks
+    /// its OS thread (`std::thread::sleep`, never `.await`ed — see
+    /// `MockSink::with_blocking_commit`) must show a FROZEN heartbeat for the
+    /// duration of the block. This is deliberately bounded (300 ms), unlike the
+    /// real-world case this models, which is exactly why the heartbeat has to
+    /// exist: nothing inside the drain can time this out.
+    #[test]
+    fn a_drain_wedged_inside_a_blocking_sink_call_freezes_the_heartbeat() {
+        let dir = tmp_dir("heartbeat_wedge");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_blocking_commit(300, []));
+        let metrics = noop_metrics();
+        let heartbeat = DrainHeartbeat::new();
+        let config = DrainConfig {
+            health_poll_interval: Duration::from_millis(20),
+            commit_timeout: Duration::from_secs(30),
+            ..fast_config(dir.clone())
+        };
+        let hb_for_thread = heartbeat.clone();
+        let handle = std::thread::spawn(move || {
+            drain_thread(rx, sink, config, metrics, true, hb_for_thread)
+        });
+
+        // Give the drain a moment to pick up the segment and enter the blocking
+        // commit, then sample twice while the 300 ms block is still ongoing.
+        std::thread::sleep(Duration::from_millis(50));
+        let during_a = heartbeat.get();
+        std::thread::sleep(Duration::from_millis(100));
+        let during_b = heartbeat.get();
+        assert_eq!(
+            during_a, during_b,
+            "a sink that blocks the OS thread must freeze the heartbeat — this is \
+             exactly the case tokio::time::timeout cannot catch, since the timer \
+             never gets polled either"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     // ── next_retry_delay (Retry-After honoring) ─────────────────────────────
 
     #[test]
@@ -1518,6 +1680,15 @@ mod tests {
         /// Number of initial `commit()` calls that panic, to drive the drain's
         /// panic supervisor.
         panic_calls: u64,
+        /// Milliseconds every `commit()` call spends in a *genuine* blocking
+        /// `std::thread::sleep` — never `.await`ed, unlike `hang_calls`'s
+        /// `std::future::pending().await`. That distinction is the whole point:
+        /// a future that yields still lets `tokio::time::timeout` observe
+        /// elapsed time and fire, but a call that blocks the OS thread itself
+        /// starves the runtime's own timer, so `commit_timeout` can never fire.
+        /// Models the measured blocking-commit case documented on
+        /// `DrainHeartbeat`. Zero (the default) disables this entirely.
+        blocking_millis: u64,
         max_batch: usize,
         /// Wall-clock instant of every `commit()` call. Tests that need to
         /// measure inter-call gaps (e.g. retry-after observance) read this
@@ -1547,6 +1718,7 @@ mod tests {
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
                 panic_calls: 0,
+                blocking_millis: 0,
                 hang_on_call: None,
                 max_batch: 1000,
                 call_timestamps: Mutex::new(Vec::new()),
@@ -1576,6 +1748,7 @@ mod tests {
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
                 panic_calls: 0,
+                blocking_millis: 0,
                 hang_on_call: None,
                 max_batch,
                 call_timestamps: Mutex::new(Vec::new()),
@@ -1599,6 +1772,20 @@ mod tests {
         fn with_panic(panic_calls: u64, responses: impl IntoIterator<Item = MockResult>) -> Self {
             Self {
                 panic_calls,
+                ..Self::with_responses(responses)
+            }
+        }
+
+        /// A sink whose EVERY `commit()` call spends `millis` in a genuine
+        /// blocking `std::thread::sleep` before doing anything else — see
+        /// `blocking_millis`. Falls back to `responses` afterward (empty =
+        /// commit the whole batch).
+        fn with_blocking_commit(
+            millis: u64,
+            responses: impl IntoIterator<Item = MockResult>,
+        ) -> Self {
+            Self {
+                blocking_millis: millis,
                 ..Self::with_responses(responses)
             }
         }
@@ -1659,6 +1846,12 @@ mod tests {
             if nth <= self.hang_calls || self.hang_on_call == Some(nth) {
                 // Hang forever; the drain's backstop timeout cancels this future.
                 std::future::pending::<()>().await;
+            }
+            if self.blocking_millis > 0 {
+                // Deliberately NOT `.await`ed — a genuine OS-thread block, the
+                // one shape `tokio::time::timeout` cannot cancel (see
+                // `blocking_millis`).
+                std::thread::sleep(Duration::from_millis(self.blocking_millis));
             }
             let mut responses = self.responses.lock().unwrap();
             let response = responses
@@ -1870,7 +2063,11 @@ mod tests {
         config: DrainConfig,
         metrics: Arc<Metrics>,
     ) {
-        let handle = spawn(drain_rx, sink, config, metrics);
+        // Most tests don't care about the heartbeat, so `run_drain` builds its
+        // own throwaway one rather than making every one of its many callers
+        // thread it through. Tests that DO care (the heartbeat tests below)
+        // call `spawn`/`drain_thread` directly with their own instance.
+        let handle = spawn(drain_rx, sink, config, metrics, DrainHeartbeat::new());
         drop(drain_tx);
         handle.join().unwrap();
     }
@@ -2324,7 +2521,14 @@ mod tests {
         // enough for the thread's wall-clock health poll to fire (an
         // already-disconnected channel would make it exit before ever polling).
         let handle = std::thread::spawn(move || {
-            drain_thread(rx, sink, config, metrics_for_thread, false);
+            drain_thread(
+                rx,
+                sink,
+                config,
+                metrics_for_thread,
+                false,
+                DrainHeartbeat::new(),
+            );
         });
 
         // Bounded poll for the rescan's effect. health_poll_interval is 50 ms
@@ -2462,6 +2666,7 @@ mod tests {
                 fast_config(dir.clone()),
                 metrics.clone(),
                 true,
+                DrainHeartbeat::new(),
             )
         }));
 
@@ -2774,6 +2979,7 @@ mod tests {
             Arc::clone(&sink),
             fast_config(dir.clone()),
             Arc::clone(&metrics),
+            DrainHeartbeat::new(),
         );
         tx.send(sealed.clone()).unwrap();
 
@@ -3160,7 +3366,7 @@ mod tests {
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
 
-        let handle = spawn(rx, sink, config, metrics.clone());
+        let handle = spawn(rx, sink, config, metrics.clone(), DrainHeartbeat::new());
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -3238,7 +3444,13 @@ mod tests {
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
 
-        let handle = spawn(rx, sink.clone(), config, metrics.clone());
+        let handle = spawn(
+            rx,
+            sink.clone(),
+            config,
+            metrics.clone(),
+            DrainHeartbeat::new(),
+        );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -3286,7 +3498,13 @@ mod tests {
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
 
-        let handle = spawn(rx, sink.clone(), config, metrics.clone());
+        let handle = spawn(
+            rx,
+            sink.clone(),
+            config,
+            metrics.clone(),
+            DrainHeartbeat::new(),
+        );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -3359,7 +3577,13 @@ mod tests {
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
 
-        let handle = spawn(rx, Arc::clone(&sink), config, metrics.clone());
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            config,
+            metrics.clone(),
+            DrainHeartbeat::new(),
+        );
 
         // Park in BlockedDeadLetterFull (A done, B blocked).
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -3429,7 +3653,7 @@ mod tests {
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
-        let handle = spawn(rx, sink, config, metrics.clone());
+        let handle = spawn(rx, sink, config, metrics.clone(), DrainHeartbeat::new());
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -3472,7 +3696,7 @@ mod tests {
         ]));
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
-        let handle = spawn(rx, sink, config, metrics.clone());
+        let handle = spawn(rx, sink, config, metrics.clone(), DrainHeartbeat::new());
 
         // Wait for drain to enter blocked state.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -3745,7 +3969,13 @@ mod tests {
         // normal-operation timing path. Dropping `tx` during the wait would
         // (correctly) model a shutdown and cut the backoff; we drop it only after
         // both commit attempts have happened.
-        let handle = spawn(rx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+        let handle = spawn(
+            rx,
+            sink.clone(),
+            fast_config(dir.clone()),
+            metrics.clone(),
+            DrainHeartbeat::new(),
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             if sink.call_timestamps().len() >= 2 {
@@ -3810,7 +4040,13 @@ mod tests {
             ..MockSink::with_responses(responses)
         });
         let metrics = noop_metrics();
-        let handle = spawn(rx, sink.clone(), fast_config(dir.clone()), metrics.clone());
+        let handle = spawn(
+            rx,
+            sink.clone(),
+            fast_config(dir.clone()),
+            metrics.clone(),
+            DrainHeartbeat::new(),
+        );
 
         // Wait until the first commit attempt has happened (drain is now in backoff).
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -3907,7 +4143,13 @@ mod tests {
         let dir = tmp_dir("exit");
         let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
         let sink = Arc::new(MockSink::with_responses([]));
-        let handle = spawn(rx, sink, fast_config(dir.clone()), noop_metrics());
+        let handle = spawn(
+            rx,
+            sink,
+            fast_config(dir.clone()),
+            noop_metrics(),
+            DrainHeartbeat::new(),
+        );
         drop(tx);
         let done = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < done {
@@ -3934,7 +4176,7 @@ mod tests {
         let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
         let config = tight_dl_config(dir.clone(), 100);
         let metrics = noop_metrics();
-        let handle = spawn(rx, sink, config, metrics.clone());
+        let handle = spawn(rx, sink, config, metrics.clone(), DrainHeartbeat::new());
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {

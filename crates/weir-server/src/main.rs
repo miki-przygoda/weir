@@ -41,7 +41,7 @@ use std::{
 use tracing::{info, warn};
 
 use config::{Config, SinkType};
-use drain::DrainConfig;
+use drain::{DrainConfig, DrainHeartbeat, drain_appears_stalled};
 use models::WorkUnit;
 #[cfg(feature = "clickhouse-sink")]
 use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
@@ -99,6 +99,31 @@ const WAB_GROWTH_WINDOW: usize = 12;
 /// evaluates the warning every 5 s, so without this it would log 60 times a
 /// minute for as long as the condition held.
 const WAB_GROWTH_WARN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Consecutive 5 s polls — beyond the grace period in
+/// [`drain_heartbeat_looks_wedged`] — with no movement on
+/// [`drain::DrainHeartbeat`] before the drain is treated as possibly wedged.
+/// 3 polls = 15 s.
+const DRAIN_STALL_CONSECUTIVE_POLLS: u32 = 3;
+
+/// Whether an unchanged drain heartbeat has been frozen long enough to call
+/// it a likely wedge rather than ordinary idling.
+///
+/// A perfectly healthy but IDLE drain (nothing queued) only re-enters its own
+/// loop — and so only bumps [`drain::DrainHeartbeat`] — once per
+/// `health_poll_interval` (operator-tunable; 30 s by default): its idle wait
+/// is bounded by that interval, and nothing else wakes it. Applying the
+/// brief 3-poll/15 s rule from the moment the heartbeat froze would therefore
+/// fire on every idle window past 15 s at the default config — indistinguishable,
+/// to a poll-counter alone, from a genuine wedge (which just never recovers).
+/// So the clock only starts once `health_poll_interval` has already elapsed
+/// with no bump — the longest a healthy idle drain should ever go quiet — and
+/// [`DRAIN_STALL_CONSECUTIVE_POLLS`] more 5 s polls beyond THAT must also show
+/// no movement. A real wedge stays frozen forever and still trips this; a
+/// merely-idle drain resumes on its own cadence and never does.
+fn drain_heartbeat_looks_wedged(frozen_for: Duration, health_poll_interval: Duration) -> bool {
+    frozen_for >= health_poll_interval + Duration::from_secs(5) * DRAIN_STALL_CONSECUTIVE_POLLS
+}
 
 /// Whether the growth warning is allowed to fire again at `now`.
 ///
@@ -302,8 +327,9 @@ fn build_and_spawn_drain<S: sink::Sink + 'static>(
     drain_rx: crossbeam_channel::Receiver<std::path::PathBuf>,
     drain_config: DrainConfig,
     metrics: Arc<metrics::Metrics>,
+    heartbeat: DrainHeartbeat,
 ) -> std::thread::JoinHandle<()> {
-    drain::spawn(drain_rx, Arc::new(sink), drain_config, metrics)
+    drain::spawn(drain_rx, Arc::new(sink), drain_config, metrics, heartbeat)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -472,6 +498,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // commit_timeout: 5s, or the sink's own timeout if that's shorter.
         health_probe_timeout: Duration::from_secs(config.sink_timeout_secs.min(5)),
     };
+
+    // A counter the drain bumps once per loop iteration (see
+    // `drain::DrainHeartbeat`), observed from the WAB-growth poll task below —
+    // a *different* runtime/thread. The drain runs on a current-thread tokio
+    // runtime, so a sink that blocks that thread outright (rather than
+    // yielding) defeats both `commit_timeout` and `health_probe_timeout`; this
+    // is the only liveness signal that still moves in that case.
+    let drain_heartbeat = DrainHeartbeat::new();
+
     // Surface the configured sink type as a metric so operators (and
     // `weir-ctl metrics`) can see whether records actually go downstream or to
     // the discard-everything noop sink.
@@ -491,7 +526,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "sink: noop — records are acked and DISCARDED, not forwarded anywhere. \
                  This is for soak-testing the pipeline; set --sink-type to deliver downstream."
             );
-            build_and_spawn_drain(NoopSink, drain_rx, drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(
+                NoopSink,
+                drain_rx,
+                drain_config,
+                Arc::clone(&metrics),
+                drain_heartbeat.clone(),
+            )
         }
         #[cfg(feature = "http-sink")]
         SinkType::Http => {
@@ -552,7 +593,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = HttpSink::new(http_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
             })?;
-            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(
+                sink,
+                drain_rx,
+                drain_config,
+                Arc::clone(&metrics),
+                drain_heartbeat.clone(),
+            )
         }
         #[cfg(feature = "mysql-sink")]
         SinkType::Mysql => {
@@ -581,7 +628,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = MySqlSink::new(mysql_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build MySQL sink: {e}"))
             })?;
-            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(
+                sink,
+                drain_rx,
+                drain_config,
+                Arc::clone(&metrics),
+                drain_heartbeat.clone(),
+            )
         }
         #[cfg(feature = "postgres-sink")]
         SinkType::Postgres => {
@@ -606,7 +659,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = PostgresSink::new(pg_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
             })?;
-            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(
+                sink,
+                drain_rx,
+                drain_config,
+                Arc::clone(&metrics),
+                drain_heartbeat.clone(),
+            )
         }
         #[cfg(feature = "clickhouse-sink")]
         SinkType::ClickHouse => {
@@ -631,7 +690,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sink = ClickHouseSink::new(ch_cfg).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("failed to build ClickHouse sink: {e}"))
             })?;
-            build_and_spawn_drain(sink, drain_rx, drain_config, Arc::clone(&metrics))
+            build_and_spawn_drain(
+                sink,
+                drain_rx,
+                drain_config,
+                Arc::clone(&metrics),
+                drain_heartbeat.clone(),
+            )
         }
     };
 
@@ -718,6 +783,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Captured before the task is spawned so the growth-warning predicate
         // sees the operator's configured cap without reaching back into `config`.
         let cap_for_warning = config.wab_max_bytes;
+        // Same idea for the heartbeat-stall check below: the drain's own
+        // `health_poll_interval` sets the grace period in
+        // `drain_heartbeat_looks_wedged`.
+        let health_poll_interval_for_stall = Duration::from_secs(config.health_poll_interval_secs);
+        let drain_heartbeat_for_poll = drain_heartbeat;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -725,6 +795,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // and the last time that warning actually fired (rate-limited below).
             let mut samples: Vec<u64> = Vec::with_capacity(WAB_GROWTH_WINDOW + 1);
             let mut last_warned: Option<std::time::Instant> = None;
+            // Heartbeat-stall tracking (see `drain::DrainHeartbeat` and
+            // `drain_heartbeat_looks_wedged`): the last observed value and when
+            // it last changed, plus the usual rate-limit for the warning itself
+            // once a stall is confirmed.
+            let mut last_heartbeat: Option<u64> = None;
+            let mut heartbeat_changed_at = std::time::Instant::now();
+            let mut last_stall_warned: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
                 let wab_dir = wab_dir_bg.clone();
@@ -753,6 +830,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     last_warned = Some(std::time::Instant::now());
                 }
+
+                // Drain-heartbeat stall check. Deliberately independent of
+                // `drain_healthy` above — a wedged drain (a sink call that
+                // blocks the drain's OS thread instead of yielding) is exactly
+                // the state where `drain_state`/`sink_health` stay frozen at
+                // their last (healthy-looking) reading, which is what silences
+                // the WAB-growth warning above. This check reads the heartbeat
+                // directly instead, so it isn't fooled by the same stale
+                // gauges.
+                let now = std::time::Instant::now();
+                let heartbeat_now = drain_heartbeat_for_poll.get();
+                match last_heartbeat {
+                    Some(prev) if drain_appears_stalled(prev, heartbeat_now) => {
+                        let frozen_for = now.duration_since(heartbeat_changed_at);
+                        if drain_heartbeat_looks_wedged(frozen_for, health_poll_interval_for_stall)
+                            && growth_warning_is_due(last_stall_warned, now)
+                        {
+                            let frozen_secs = frozen_for.as_secs();
+                            warn!(
+                                frozen_secs,
+                                "drain heartbeat has not advanced in over {frozen_secs}s — the \
+                                 drain thread may be wedged inside a sink call that blocks its \
+                                 OS thread (a synchronous DB driver, std::fs, or a spin loop) \
+                                 rather than yielding. That defeats both commit_timeout and \
+                                 health_probe_timeout, which can only fire when the awaited \
+                                 future actually yields on the drain's current-thread runtime. \
+                                 drain_state is left unchanged (a wedge is not `stopped`); if \
+                                 delivery has genuinely stalled, an operator restart is the only \
+                                 recovery."
+                            );
+                            last_stall_warned = Some(now);
+                        }
+                    }
+                    _ => heartbeat_changed_at = now,
+                }
+                last_heartbeat = Some(heartbeat_now);
             }
         });
 
@@ -1388,5 +1501,71 @@ mod apply_wab_scan_tests {
             "the oldest sample is evicted, not the newest"
         );
         assert_eq!(samples[samples.len() - 1], WAB_GROWTH_WINDOW as u64);
+    }
+}
+
+#[cfg(test)]
+mod drain_heartbeat_stall_tests {
+    use super::{DRAIN_STALL_CONSECUTIVE_POLLS, drain_heartbeat_looks_wedged};
+    use std::time::Duration;
+
+    /// The false positive this function exists to prevent: at the default
+    /// `health_poll_interval` (30 s), a healthy but fully idle drain only
+    /// bumps its heartbeat once per interval (its idle wait is bounded by
+    /// that interval, and nothing else wakes it) — so a gap anywhere up to
+    /// that interval must never read as wedged, however suggestive the
+    /// brief's literal "3 polls / 15 s" figure looks in isolation.
+    #[test]
+    fn a_healthy_idle_drain_at_the_default_poll_interval_never_reads_as_wedged() {
+        let health_poll_interval = Duration::from_secs(30);
+        // 15 s (the brief's literal figure) is well within one idle cycle.
+        assert!(!drain_heartbeat_looks_wedged(
+            Duration::from_secs(15),
+            health_poll_interval
+        ));
+        // So is a gap right up to (but not past) the interval itself.
+        assert!(!drain_heartbeat_looks_wedged(
+            health_poll_interval,
+            health_poll_interval
+        ));
+    }
+
+    /// Past one full idle cycle, the brief's 3-poll/15 s rule takes over:
+    /// three more silent 5 s polls beyond the grace period reads as wedged.
+    #[test]
+    fn a_stall_past_one_full_idle_cycle_plus_three_polls_reads_as_wedged() {
+        let health_poll_interval = Duration::from_secs(30);
+        let threshold =
+            health_poll_interval + Duration::from_secs(5) * DRAIN_STALL_CONSECUTIVE_POLLS;
+        assert!(!drain_heartbeat_looks_wedged(
+            threshold - Duration::from_secs(1),
+            health_poll_interval
+        ));
+        assert!(drain_heartbeat_looks_wedged(
+            threshold,
+            health_poll_interval
+        ));
+        // A real wedge never recovers, so this must keep reading true forever,
+        // not just at the moment it first crosses the threshold.
+        assert!(drain_heartbeat_looks_wedged(
+            threshold * 10,
+            health_poll_interval
+        ));
+    }
+
+    /// A short, test-style `health_poll_interval` still gets the full
+    /// three-poll grace ON TOP of it, not just the literal 15 s figure taken
+    /// in isolation.
+    #[test]
+    fn the_grace_period_scales_with_a_short_health_poll_interval() {
+        let health_poll_interval = Duration::from_secs(5);
+        assert!(!drain_heartbeat_looks_wedged(
+            Duration::from_secs(19),
+            health_poll_interval
+        ));
+        assert!(drain_heartbeat_looks_wedged(
+            Duration::from_secs(20),
+            health_poll_interval
+        ));
     }
 }
