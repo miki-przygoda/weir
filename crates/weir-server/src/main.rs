@@ -125,6 +125,64 @@ fn drain_heartbeat_looks_wedged(frozen_for: Duration, health_poll_interval: Dura
     frozen_for >= health_poll_interval + Duration::from_secs(5) * DRAIN_STALL_CONSECUTIVE_POLLS
 }
 
+/// What a frozen drain heartbeat actually means. A freeze past the threshold is
+/// only half the diagnosis — the `drain_state` gauge supplies the other half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainStallVerdict {
+    /// The drain thread is GONE: the supervisor exhausted its respawn budget
+    /// (or the daemon is shutting down) and published `drain_state{stopped}` on
+    /// its way out. The heartbeat is frozen because nobody is left to bump it.
+    /// Nothing is wedged; delivery has ended and only a restart resumes it.
+    Stopped,
+    /// The drain still claims a live state, yet cannot reach its own loop head
+    /// — the wedge this check was written for: a sink call blocking the drain's
+    /// OS thread instead of yielding, which no timeout inside the drain can fire
+    /// against.
+    Wedged,
+}
+
+/// Composes the freeze duration and the live `drain_state` gauge into the one
+/// diagnosis the operator is shown.
+///
+/// Split out — like [`drain_is_healthy`] and [`should_warn_wab_growth`] before
+/// it — because the composition, not the duration predicate alone, is where the
+/// bug was: the warning fired the "wedged inside a sink call" text on a drain
+/// whose own gauge said `stopped`, asserting in the same breath that "a wedge is
+/// not `stopped`". That is confidently wrong in a state the daemon reaches
+/// deterministically (the dead-letter-open panic exhausts the respawn ladder
+/// before the first `heartbeat.bump()` ever runs), and it points the operator at
+/// a live wedged sink instead of a dead drain.
+///
+/// Returns `None` while the freeze is still inside the grace period.
+fn drain_stall_verdict(
+    frozen_for: Duration,
+    health_poll_interval: Duration,
+    drain_stopped: bool,
+) -> Option<DrainStallVerdict> {
+    if !drain_heartbeat_looks_wedged(frozen_for, health_poll_interval) {
+        return None;
+    }
+    Some(if drain_stopped {
+        DrainStallVerdict::Stopped
+    } else {
+        DrainStallVerdict::Wedged
+    })
+}
+
+/// Whether the drain supervisor has published its terminal `stopped` state.
+///
+/// Reads the same one-hot `weir_drain_state` family `drain::set_drain_state`
+/// writes, exactly as [`drain_is_healthy`] reads `draining`.
+fn drain_is_stopped(metrics: &crate::metrics::Metrics) -> bool {
+    metrics
+        .drain_state
+        .get_or_create(&crate::metrics::DrainStateLabel {
+            state: crate::metrics::DrainStateValue::stopped,
+        })
+        .get()
+        > 0.0
+}
+
 /// Whether the growth warning is allowed to fire again at `now`.
 ///
 /// Extracted from the polling task's closure for the same reason
@@ -785,7 +843,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cap_for_warning = config.wab_max_bytes;
         // Same idea for the heartbeat-stall check below: the drain's own
         // `health_poll_interval` sets the grace period in
-        // `drain_heartbeat_looks_wedged`.
+        // `drain_heartbeat_looks_wedged`. The grace period only has to cover an
+        // IDLE drain now — the two long deliberate waits inside the drain loop
+        // bump the heartbeat themselves (see `drain::DrainHeartbeat`), so a slow
+        // sink no longer has to be absorbed by this threshold.
         let health_poll_interval_for_stall = Duration::from_secs(config.health_poll_interval_secs);
         let drain_heartbeat_for_poll = drain_heartbeat;
         tokio::spawn(async move {
@@ -838,28 +899,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // their last (healthy-looking) reading, which is what silences
                 // the WAB-growth warning above. This check reads the heartbeat
                 // directly instead, so it isn't fooled by the same stale
-                // gauges.
+                // gauges. `drain_state` is still consulted for ONE thing — the
+                // `stopped` terminal state, the one value the supervisor writes
+                // that is never stale — because a dead drain freezes the
+                // heartbeat exactly like a wedged one and needs the opposite
+                // advice. See `drain_stall_verdict`.
                 let now = std::time::Instant::now();
                 let heartbeat_now = drain_heartbeat_for_poll.get();
                 match last_heartbeat {
                     Some(prev) if drain_appears_stalled(prev, heartbeat_now) => {
                         let frozen_for = now.duration_since(heartbeat_changed_at);
-                        if drain_heartbeat_looks_wedged(frozen_for, health_poll_interval_for_stall)
+                        // The freeze duration alone cannot tell a wedge from a
+                        // dead drain — `drain_state` supplies that half.
+                        let verdict = drain_stall_verdict(
+                            frozen_for,
+                            health_poll_interval_for_stall,
+                            drain_is_stopped(&metrics_w),
+                        );
+                        if let Some(verdict) = verdict
                             && growth_warning_is_due(last_stall_warned, now)
                         {
                             let frozen_secs = frozen_for.as_secs();
-                            warn!(
-                                frozen_secs,
-                                "drain heartbeat has not advanced in over {frozen_secs}s — the \
-                                 drain thread may be wedged inside a sink call that blocks its \
-                                 OS thread (a synchronous DB driver, std::fs, or a spin loop) \
-                                 rather than yielding. That defeats both commit_timeout and \
-                                 health_probe_timeout, which can only fire when the awaited \
-                                 future actually yields on the drain's current-thread runtime. \
-                                 drain_state is left unchanged (a wedge is not `stopped`); if \
-                                 delivery has genuinely stalled, an operator restart is the only \
-                                 recovery."
-                            );
+                            match verdict {
+                                DrainStallVerdict::Wedged => warn!(
+                                    frozen_secs,
+                                    "drain heartbeat has not advanced in over {frozen_secs}s — the \
+                                     drain thread may be wedged inside a sink call that blocks its \
+                                     OS thread (a synchronous DB driver, std::fs, or a spin loop) \
+                                     rather than yielding. That defeats both commit_timeout and \
+                                     health_probe_timeout, which can only fire when the awaited \
+                                     future actually yields on the drain's current-thread runtime. \
+                                     drain_state still reports a live state, so this is a wedge \
+                                     rather than a stopped drain; if delivery has genuinely \
+                                     stalled, an operator restart is the only recovery."
+                                ),
+                                DrainStallVerdict::Stopped => warn!(
+                                    frozen_secs,
+                                    "drain heartbeat has not advanced in over {frozen_secs}s and \
+                                     drain_state reports `stopped` — the drain thread is GONE, not \
+                                     wedged. Either the supervisor exhausted its respawn budget \
+                                     (look for the earlier \"drain thread panicked too many \
+                                     times\" ERROR) or the daemon is shutting down. Delivery has \
+                                     ended and the WAB will keep growing on disk; only a process \
+                                     restart resumes it. Do NOT go looking for a blocked sink \
+                                     call — there is no drain thread left to block."
+                                ),
+                            }
                             last_stall_warned = Some(now);
                         }
                     }
@@ -1506,8 +1591,99 @@ mod apply_wab_scan_tests {
 
 #[cfg(test)]
 mod drain_heartbeat_stall_tests {
-    use super::{DRAIN_STALL_CONSECUTIVE_POLLS, drain_heartbeat_looks_wedged};
+    use super::{
+        DRAIN_STALL_CONSECUTIVE_POLLS, DrainStallVerdict, drain_heartbeat_looks_wedged,
+        drain_is_stopped, drain_stall_verdict,
+    };
+    use crate::metrics::{DrainStateLabel, DrainStateValue, Metrics};
     use std::time::Duration;
+
+    fn set_drain_state(m: &Metrics, active: DrainStateValue) {
+        for s in [
+            DrainStateValue::draining,
+            DrainStateValue::retrying_transient,
+            DrainStateValue::blocked_dead_letter_full,
+            DrainStateValue::stopped,
+        ] {
+            let v = if s == active { 1.0 } else { 0.0 };
+            m.drain_state
+                .get_or_create(&DrainStateLabel { state: s })
+                .set(v);
+        }
+    }
+
+    /// F2(a): once the supervisor exhausts its respawn budget it publishes
+    /// `drain_state{stopped}` and the heartbeat freezes FOREVER — so the stall
+    /// check fires ~45-50 s later and, until this fix, asserted "drain_state is
+    /// left unchanged (a wedge is not `stopped`)". That is exactly backwards,
+    /// and it is the deterministic outcome of the dead-letter-open panic path:
+    /// the panic precedes the first `heartbeat.bump()`, so the heartbeat is 0
+    /// for the whole respawn ladder. The operator is then sent hunting a live
+    /// wedged sink while the drain is simply dead.
+    #[test]
+    fn a_stopped_drain_is_diagnosed_as_stopped_not_wedged() {
+        let m = Metrics::new().0;
+        set_drain_state(&m, DrainStateValue::stopped);
+        let interval = Duration::from_secs(30);
+        let frozen_for = Duration::from_secs(50); // past the 45 s threshold
+        assert!(
+            drain_heartbeat_looks_wedged(frozen_for, interval),
+            "precondition: the freeze is long enough that something is reported"
+        );
+        assert_eq!(
+            drain_stall_verdict(frozen_for, interval, drain_is_stopped(&m)),
+            Some(DrainStallVerdict::Stopped),
+            "a drain whose own gauge says `stopped` is dead, not wedged — reporting a              wedge here misdirects the operator during an incident"
+        );
+    }
+
+    /// The other half: with the drain still claiming a live state, a frozen
+    /// heartbeat IS the wedge the warning was written for, and must still fire.
+    #[test]
+    fn a_frozen_heartbeat_on_a_live_drain_state_is_still_a_wedge() {
+        let m = Metrics::new().0;
+        for live in [
+            DrainStateValue::draining,
+            DrainStateValue::retrying_transient,
+            DrainStateValue::blocked_dead_letter_full,
+        ] {
+            set_drain_state(&m, live.clone());
+            assert_eq!(
+                drain_stall_verdict(
+                    Duration::from_secs(50),
+                    Duration::from_secs(30),
+                    drain_is_stopped(&m)
+                ),
+                Some(DrainStallVerdict::Wedged),
+                "{live:?} is a live state; a frozen heartbeat under it is a real wedge"
+            );
+        }
+    }
+
+    /// Below the threshold nothing is reported at all, stopped or not — the
+    /// grace period is not bypassed by the new branch.
+    #[test]
+    fn nothing_is_reported_below_the_stall_threshold() {
+        let interval = Duration::from_secs(30);
+        for stopped in [true, false] {
+            assert_eq!(
+                drain_stall_verdict(Duration::from_secs(20), interval, stopped),
+                None
+            );
+        }
+    }
+
+    /// `drain_is_stopped` reads the same one-hot gauge family the drain
+    /// supervisor writes. A wrong label variant here would silently restore
+    /// the false diagnosis, so read it back explicitly.
+    #[test]
+    fn drain_is_stopped_reads_the_drain_state_gauge() {
+        let m = Metrics::new().0;
+        set_drain_state(&m, DrainStateValue::draining);
+        assert!(!drain_is_stopped(&m));
+        set_drain_state(&m, DrainStateValue::stopped);
+        assert!(drain_is_stopped(&m));
+    }
 
     /// The false positive this function exists to prevent: at the default
     /// `health_poll_interval` (30 s), a healthy but fully idle drain only

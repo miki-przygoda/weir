@@ -130,14 +130,20 @@ addition and one operator-facing timing change, called out separately.
   driver, `std::fs`, a spin loop) never does, which defeats *both* timeouts
   simultaneously. `drain_state` and `sink_health` freeze at their last
   healthy reading, which also silences the WAB-growth warning, since it
-  reads the same frozen gauge. A new heartbeat, bumped once per drain-loop
-  iteration and observed independently from the metrics-poll task on the
-  daemon's own multi-thread runtime, now logs a warning when the heartbeat
-  stalls past a grace period. **This does not fix the wedge** — a sink that
-  truly never yields still hangs delivery indefinitely; it only gives an
-  operator a signal where previously there was none. The real fix is moving
-  sink calls onto a multi-thread runtime, which is source-breaking and out
-  of scope for a patch release.
+  reads the same frozen gauge. A new heartbeat — bumped at the drain loop's
+  head *and* inside its two long deliberate waits (the transient-retry backoff
+  and the dead-letter-full block), so that waiting-but-alive still reads as
+  alive — is observed independently from the metrics-poll task on the daemon's
+  own multi-thread runtime, and a stall past a grace period now logs a warning.
+  The warning names what actually happened: a frozen heartbeat while
+  `drain_state` still reports a live state is reported as a wedge, while a
+  frozen heartbeat alongside `drain_state{stopped}` is reported as a drain that
+  has *exited* (respawn budget exhausted, or shutdown) — the operator is told to
+  restart rather than sent hunting a blocked sink call that does not exist.
+  **This does not fix the wedge** — a sink that truly never yields still hangs
+  delivery indefinitely; it only gives an operator a signal where previously
+  there was none. The real fix is moving sink calls onto a multi-thread runtime,
+  which is source-breaking and out of scope for a patch release.
 
 ### Behavioral change
 

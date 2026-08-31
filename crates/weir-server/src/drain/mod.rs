@@ -452,7 +452,15 @@ fn probe_and_resume_stranded<S: Sink>(
 
 // ── Heartbeat (liveness observed from outside the drain's own runtime) ────────
 
-/// A monotonic counter the drain advances once per loop iteration.
+/// A monotonic counter the drain advances whenever it is alive.
+///
+/// Bumped at the top of the outer loop AND inside every deliberate wait (the
+/// retry backoff and the dead-letter-full block), because a drain that is
+/// merely WAITING is not wedged. A single retry backoff can legitimately run to
+/// `MAX_RETRY_DELAY` (300 s), and the blocked arm parks indefinitely — both far
+/// past the stall warning's `health_poll_interval + 15 s` threshold — so
+/// bumping only at the loop head would report a slow-but-healthy sink as a
+/// blocked OS thread.
 ///
 /// The drain runs on a current-thread runtime, so a sink that BLOCKS the
 /// thread (a blocking DB driver, `std::fs`, a spin loop) defeats both
@@ -490,7 +498,9 @@ impl DrainHeartbeat {
 /// `main.rs`'s poll task, which requires this to hold for several
 /// consecutive polls (and past the drain's own `health_poll_interval`, since
 /// an idle-but-healthy drain only bumps the heartbeat that often) before it
-/// warns.
+/// warns. Nor is a long freeze on its own proof of a WEDGE specifically: a
+/// drain that has exited leaves the heartbeat frozen forever too, which is why
+/// the poll task also reads `drain_state` (`main.rs`'s `drain_stall_verdict`).
 pub(crate) fn drain_appears_stalled(previous: u64, current: u64) -> bool {
     previous == current
 }
@@ -537,9 +547,12 @@ fn drain_thread<S: Sink>(
     // backlog waits for a process restart. Starting at `false` makes the
     // first healthy probe an edge, which re-queues everything still on disk.
     initial_health_ok: bool,
-    // Bumped once per outer-loop iteration below. See `DrainHeartbeat` for
-    // why this exists: it's the only liveness signal that survives a sink
-    // call that blocks this thread outright rather than yielding.
+    // Bumped once per outer-loop iteration below, and again on every 50 ms
+    // slice of the two deliberate waits (retry backoff, dead-letter-full
+    // block) so that waiting-but-alive still reads as alive. See
+    // `DrainHeartbeat` for why this exists: it's the only liveness signal that
+    // survives a sink call that blocks this thread outright rather than
+    // yielding.
     heartbeat: DrainHeartbeat,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -602,7 +615,9 @@ fn drain_thread<S: Sink>(
         // See `DrainHeartbeat`: bumped unconditionally on every pass through
         // this loop, whatever state does or doesn't happen below — a sink
         // call that blocks this thread (rather than yielding) is exactly the
-        // case that stops this line from ever running again.
+        // case that stops this line from ever running again. The two arms that
+        // deliberately park for a long time bump it from inside their own wait
+        // loops as well, so only a genuinely blocked thread freezes it.
         heartbeat.bump();
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
@@ -735,6 +750,19 @@ fn drain_thread<S: Sink>(
                 // behaviour, which terminates.
                 let wait_end = Instant::now() + next_delay;
                 loop {
+                    // WAITING IS NOT WEDGED. `heartbeat.bump()` at the top of
+                    // `'outer` is never reached while this arm holds the thread,
+                    // and this single wait can legitimately run to
+                    // `MAX_RETRY_DELAY` (300 s) on a `Retry-After`-honouring
+                    // sink — far past the stall warning's
+                    // `health_poll_interval + 15 s` threshold (45 s at the
+                    // defaults). Without a bump here a merely-SLOW sink is
+                    // reported as a drain "wedged inside a sink call that blocks
+                    // its OS thread", which is the worst possible misdirection
+                    // during an incident. Bumping on each 50 ms slice keeps the
+                    // heartbeat meaning what it claims: only a thread that
+                    // cannot reach its own loop at all freezes it.
+                    heartbeat.bump();
                     let remaining = wait_end.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
@@ -845,6 +873,14 @@ fn drain_thread<S: Sink>(
                 let mut channel_closed = false;
                 let check_end = Instant::now() + config.dead_letter_check_interval;
                 loop {
+                    // Same reasoning as the retry-backoff wait above: this arm
+                    // parks for `dead_letter_check_interval` (30 s by default)
+                    // and can re-park indefinitely while an operator frees
+                    // headroom, all inside iterations of `'outer` whose head is
+                    // never reached. A drain that is blocked and SAYING SO via
+                    // `drain_state{blocked_dead_letter_full}` is alive; only a
+                    // thread that cannot reach its own loop is wedged.
+                    heartbeat.bump();
                     let remaining = check_end.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
@@ -1582,6 +1618,132 @@ mod tests {
             "a sink that blocks the OS thread must freeze the heartbeat — this is \
              exactly the case tokio::time::timeout cannot catch, since the timer \
              never gets polled either"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// F2(b): the drain is ALSO alive while it is deliberately waiting — and
+    /// waiting is not rare. `heartbeat.bump()` sits at the top of `'outer`, but
+    /// a single iteration of the RetryingTransient arm can park for as long as
+    /// `next_retry_delay` allows: a `Retry-After`-honouring sink can push that
+    /// to `MAX_RETRY_DELAY` (300 s), and even without a hint `commit_timeout`
+    /// defaults to 60 s. The stall warning's threshold is
+    /// `health_poll_interval + 15 s` = 45 s at the defaults, so a merely-SLOW
+    /// sink was reported to the operator as a drain "wedged inside a sink call
+    /// that blocks its OS thread" — a confident, wrong diagnosis delivered
+    /// during an incident.
+    ///
+    /// The waiting loop slices at 50 ms so it can notice a channel disconnect;
+    /// bumping there costs nothing and makes the heartbeat mean what it claims
+    /// to mean: only a thread that cannot reach its own loop head freezes it.
+    #[test]
+    fn a_drain_in_a_long_retry_backoff_keeps_advancing_the_heartbeat() {
+        let dir = tmp_dir("heartbeat_backoff");
+        let sealed = make_sealed_segment(&dir, 0, &[b"hello"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        // A Retry-After hint long enough that the whole sampling window below
+        // sits inside ONE RetryingTransient iteration — the shape of the real
+        // 60 s/300 s waits, compressed to keep the test fast.
+        const HINT: Duration = Duration::from_millis(1500);
+        let sink = Arc::new(MockSink::with_responses([
+            Err(MockError::TransientWithRetryAfter(HINT)),
+            MockSink::ok(vec![Payload::from(b"hello".as_ref())]),
+        ]));
+        let metrics = noop_metrics();
+        let heartbeat = DrainHeartbeat::new();
+        let hb_for_thread = heartbeat.clone();
+        let config = fast_config(dir.clone());
+        let sink_for_thread = Arc::clone(&sink);
+        let handle = std::thread::spawn(move || {
+            drain_thread(rx, sink_for_thread, config, metrics, true, hb_for_thread)
+        });
+
+        // Wait for the first commit to have returned its transient error: from
+        // that point the drain is inside the backoff, not still draining.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.call_count() < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the first commit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        std::thread::sleep(Duration::from_millis(150));
+        let during_a = heartbeat.get();
+        std::thread::sleep(Duration::from_millis(400));
+        let during_b = heartbeat.get();
+        assert!(
+            during_b > during_a,
+            "a drain WAITING on a retry backoff is alive and must keep advancing its \
+             heartbeat ({during_a} -> {during_b}); freezing it makes a merely-slow sink \
+             indistinguishable from a thread blocked inside a sink call"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// F2(b), the other arm: BlockedDeadLetterFull parks on the same 50 ms
+    /// slicing while it waits for an operator to free dead-letter headroom.
+    /// That wait is unbounded by design, so without a bump there it is the
+    /// single easiest way to trip the "wedged inside a sink call" warning while
+    /// the drain is in fact perfectly alive and reporting
+    /// `drain_state{blocked_dead_letter_full}`.
+    #[test]
+    fn a_drain_blocked_on_dead_letter_headroom_keeps_advancing_the_heartbeat() {
+        let dir = tmp_dir("heartbeat_dl_blocked");
+        let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
+        // Pre-fill the dead-letter dir past the cap so the first permanent
+        // rejection has nowhere to go and the drain parks in the blocked wait.
+        let dl_dir = dir.join("dead_letter");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+        std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
+        let metrics = noop_metrics();
+        let heartbeat = DrainHeartbeat::new();
+        let hb_for_thread = heartbeat.clone();
+        let config = DrainConfig {
+            // Long enough that the sampling window sits inside ONE wait.
+            dead_letter_check_interval: Duration::from_millis(1500),
+            ..tight_dl_config(dir.clone(), 100)
+        };
+        let metrics_for_thread = Arc::clone(&metrics);
+        let handle = std::thread::spawn(move || {
+            drain_thread(rx, sink, config, metrics_for_thread, true, hb_for_thread)
+        });
+
+        // Let it commit, get the reject, and enter the blocked wait.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !drain_is_blocked(&metrics) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the drain to block on dead-letter headroom"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let during_a = heartbeat.get();
+        std::thread::sleep(Duration::from_millis(400));
+        let during_b = heartbeat.get();
+        assert!(
+            drain_is_blocked(&metrics),
+            "the sampling window must sit inside ONE blocked wait, or this proves nothing"
+        );
+        assert!(
+            during_b > during_a,
+            "a drain blocked on dead-letter headroom is alive and must keep advancing \
+             its heartbeat ({during_a} -> {during_b})"
         );
 
         drop(tx);
