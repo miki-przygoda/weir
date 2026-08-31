@@ -308,7 +308,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | Metric | Type | Meaning |
 |---|---|---|
 | `weir_wab_fsync_duration_seconds` | histogram | **The dominant latency signal.** Per-fsync duration. |
-| `weir_wab_fsync_failures_total` | counter | fsync returned an error. **Must be 0.** |
+| `weir_wab_fsync_failures_total` | counter | fsync returned an error. **Must be 0.** The failing batch is nacked, and the active segment is *retired* so no later batch can be acked over the hole. Nothing at runtime rescans an unsealed `.wab`, so any already-acked records left in that segment (up to `wab_segment_max_bytes`, 256 MiB by default) are **stranded until the daemon restarts** and crash recovery seals them. Stranded, not lost — but clear the storage fault and restart to release them. |
 | `weir_wab_flusher_panics_total` | counter | Flusher thread panics. **Must be 0.** |
 | `weir_drain_panics_total` | counter | weir-drain thread panics caught and respawned by its supervisor. **Must be 0**; sustained values indicate a sink/drain logic bug, and exhausting the respawn budget stops delivery. |
 | `weir_wab_segments_total{state}` | counter | Segment lifecycle transitions: `open` → `sealed` → `confirmed`; `quarantined` on corruption. A segment is counted `sealed` whichever way it was sealed — rotation, idle-seal, shutdown-seal, **or crash recovery** (recovery finalises an unsealed `.wab` and renames it, which is a real transition and is counted). A mid-file-corrupt segment counts **both** `quarantined` (the preserved forensic copy) and `sealed` (the truncated valid prefix, which is still delivered). **Backlog caveat across a restart** — see the note below. |

@@ -607,6 +607,16 @@ impl ShardWriter {
     /// failing batch's own nack is untouched — it is decided by the `Err`
     /// this returns, which the caller (`fsync_observed` in `wab/mod.rs`)
     /// already forwards to `ack_tx` as `false`.
+    ///
+    /// COST OF RETIRING, stated plainly because nothing else surfaces it: the
+    /// retired segment stays on disk as an unsealed `.wab`, and no runtime path
+    /// scans those — only `recovery::recover_open_segments`, at startup. So the
+    /// already-acked, already-fsynced records still in it (up to
+    /// `wab_segment_max_bytes`, 256 MiB by default) are STRANDED until the
+    /// daemon restarts, where before they would have rotated into delivery.
+    /// Stranded-but-safe beats false-acked, so this is the right trade — but it
+    /// is a deferral, not a no-op, and the ERROR in `fsync_observed` tells the
+    /// operator to restart once the storage fault is cleared.
     pub(crate) fn fsync_current(&mut self) -> io::Result<()> {
         let Some(seg) = self.active.as_ref() else {
             return Ok(());

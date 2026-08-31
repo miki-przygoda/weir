@@ -70,9 +70,19 @@ addition and one operator-facing timing change, called out separately.
   acked `true` over data that was never durably written. The failing batch
   itself was, and still is, correctly nacked — this only affects the batch
   immediately after it. The segment is now retired on any fsync failure,
-  matching the daemon's existing behavior for a failed write. **Check:** this
-  requires an underlying storage fault (a real writeback error) to trigger at
-  all; if your disks and filesystem have been healthy, you were not exposed.
+  matching the daemon's existing behavior for a failed write. **Trade-off, and
+  it is a real one:** retiring the segment leaves it on disk as an unsealed
+  `.wab`, and nothing at runtime rescans those — only crash recovery, at
+  startup, does. So any already-acked, already-fsynced records still in that
+  segment (up to `wab_segment_max_bytes`, 256 MiB by default) are **stranded
+  until the daemon is restarted**, where before the fix they would have rotated
+  into delivery. Stranded is strictly better than false-acked — no ack is
+  falsified and nothing is lost, delivery is deferred — but it is a deferral,
+  not a no-op: after an fsync failure, clear the storage fault and restart the
+  daemon to release the segment. The ERROR log at the failure says so.
+  **Check:** this requires an underlying storage fault (a real writeback error)
+  to trigger at all; if your disks and filesystem have been healthy, you were
+  not exposed.
 
 - **A drain respawn after a panic could leave already-queued work stranded
   until the next process restart, while health metrics read fine.** A panic
