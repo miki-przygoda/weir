@@ -1138,7 +1138,26 @@ async fn process_segment<S: Sink>(
 fn quarantine_segment(segment: &Path, config: &DrainConfig, metrics: &Metrics, reason: &str) {
     match crate::wab::recovery::quarantine(segment, &config.wab_dir, reason) {
         Ok(()) => {
+            // BOTH series, per the invariant asserted on
+            // `wab::recovery::quarantine_and_count`: "Every segment-quarantine
+            // site funnels through here so the recovery_segments_quarantined
+            // counter and the wab_segments{state=quarantined} gauge are ALWAYS
+            // bumped ... If you add a third, route it here."
+            //
+            // This IS that third site, and it bumped only the flat counter — so
+            // a drain-time quarantine moved one series while a recovery-time
+            // quarantine moved two, and an operator reading the gap could not
+            // tell "the drain quarantined something" from "a counter is broken".
+            // It does not call quarantine_and_count itself only because that
+            // helper's contract is to RETURN an io::Error describing the
+            // quarantine, which this caller has no use for.
             metrics.recovery_segments_quarantined.inc();
+            metrics
+                .wab_segments
+                .get_or_create(&crate::metrics::SegmentStateLabel {
+                    state: crate::metrics::SegmentState::quarantined,
+                })
+                .inc();
         }
         Err(qe) => {
             error!(path = %segment.display(), error = %qe, reason, "drain: failed to quarantine segment; left on disk");
@@ -1652,6 +1671,53 @@ mod tests {
                 state: SegmentState::confirmed,
             })
             .get()
+    }
+
+    fn segments_quarantined_family(m: &Metrics) -> u64 {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        m.wab_segments
+            .get_or_create(&SegmentStateLabel {
+                state: SegmentState::quarantined,
+            })
+            .get()
+    }
+
+    #[test]
+    fn drain_quarantine_bumps_both_counters_like_every_other_site() {
+        // `wab::recovery::quarantine_and_count`'s docstring asserts the
+        // invariant: "Every segment-quarantine site funnels through here so the
+        // recovery_segments_quarantined counter and the
+        // wab_segments{state=quarantined} gauge are ALWAYS bumped ... If you
+        // add a third, route it here."
+        //
+        // `quarantine_segment` IS that third site, and it called the bare
+        // `quarantine()`, bumping only the flat counter. So a drain-time
+        // quarantine moved one series and a recovery-time quarantine moved two,
+        // and the two silently diverged — with no way to tell from the metrics
+        // whether the gap meant "drain quarantined something" or "a counter is
+        // broken".
+        let wab_dir = tmp_dir("quarantine_both_counters");
+        let seg = wab_dir.join("shard_00__seg_00000007.wab.sealed");
+        std::fs::write(&seg, b"corrupt").unwrap();
+
+        let metrics = noop_metrics();
+        let config = fast_config(wab_dir.clone());
+
+        let before_flat = metrics.recovery_segments_quarantined.get();
+        let before_family = segments_quarantined_family(&metrics);
+
+        quarantine_segment(&seg, &config, &metrics, "test");
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            before_flat + 1,
+            "the flat counter must move"
+        );
+        assert_eq!(
+            segments_quarantined_family(&metrics),
+            before_family + 1,
+            "wab_segments{{state=quarantined}} must move too, or the two series diverge"
+        );
     }
 
     fn records_committed(m: &Metrics) -> u64 {
