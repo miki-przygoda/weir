@@ -485,8 +485,17 @@ fn drain_thread<S: Sink>(
     let mut dead_letter = match DeadLetterWriter::open(&config.wab_dir) {
         Ok(dl) => dl,
         Err(e) => {
-            error!(error = %e, "drain: failed to open dead-letter writer; exiting");
-            return;
+            // NOT a bare `return`. run_drain_supervised reads a normal return
+            // as "the channel closed, delivery is finished" — so it neither
+            // respawns nor counts a panic, and the daemon goes on acking
+            // producers while nothing is ever delivered. Panicking routes this
+            // into the supervisor, which retries and, if it is persistent,
+            // exhausts max_respawns and logs the loud "delivery is stopped"
+            // error an operator can act on. A transient ENOENT inside scan_dir
+            // (a file vanishing between read_dir and stat) is enough to reach
+            // this path.
+            error!(error = %e, "drain: failed to open dead-letter writer");
+            panic!("drain: dead-letter writer unavailable: {e}");
         }
     };
 
@@ -2390,15 +2399,61 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let sink = Arc::new(MockSink::with_responses([]));
         let metrics = noop_metrics();
-        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+        // Tight max_respawns (like drain_supervisor_gives_up_after_max_respawns)
+        // so the give-up fires after a single ~100 ms backoff instead of the
+        // real ~4.5 s 10-respawn ladder — this directory never becomes
+        // openable, so every respawn panics again.
+        let config = DrainConfig {
+            max_respawns: 2,
+            ..fast_config(dir.clone())
+        };
+        run_drain(rx, tx, sink, config, metrics.clone());
 
         assert_eq!(
             drain_panics(&metrics),
-            0,
-            "this path returns cleanly — it is NOT a panic, which is why the \
-             supervisor never respawns and the gauge is the only signal"
+            2,
+            "an open failure must now panic — the supervisor sees it, \
+             respawns, and (since this directory never becomes openable) \
+             exhausts max_respawns rather than silently exiting after zero \
+             panics"
         );
         assert_drain_reports_stopped(&metrics, "dead-letter writer would not open");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Direct check, one level below the supervisor: `DeadLetterWriter::open`
+    /// failing must surface as a panic that `catch_unwind` can see, not as a
+    /// clean, normal return. `run_drain_supervised` reads `Ok(())` as "the
+    /// channel closed, delivery is finished" — a bare `return` on this path
+    /// would make it neither respawn nor count a panic, and the daemon would
+    /// boot, bind, and ack producers forever while nothing is ever delivered.
+    #[test]
+    fn a_dead_letter_open_failure_is_not_mistaken_for_a_clean_shutdown() {
+        let dir = tmp_dir("dl_open_failure_direct");
+        // Make <wab_dir>/dead_letter un-openable as a directory.
+        let dl = dir.join("dead_letter");
+        std::fs::write(&dl, b"not a directory").unwrap();
+
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        drop(tx);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drain_thread(
+                rx,
+                Arc::new(MockSink::with_responses([])),
+                fast_config(dir.clone()),
+                metrics.clone(),
+                true,
+            )
+        }));
+
+        assert!(
+            result.is_err(),
+            "an unusable dead-letter store must surface as a panic the \
+             supervisor can see, not as a clean channel-closed exit"
+        );
+
         std::fs::remove_dir_all(dir).ok();
     }
 
