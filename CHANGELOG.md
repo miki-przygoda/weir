@@ -32,17 +32,20 @@ addition and one operator-facing timing change, called out separately.
   record count to match the truncated prefix — which is exactly what let the
   drain's record-count cross-check pass over the loss without noticing, and
   the only log output was an INFO line ("found sentinel during recovery —
-  file was partially sealed") indistinguishable from the ordinary case. A
-  genuine partial seal can leave at most `4 + SEGMENT_FOOTER_LEN` bytes after
-  the sentinel; more than that can only mean lost writeback or bit-rot mid-file
-  (this process's own `seal()` consumes the segment handle, and
-  `write_record` rejects empty payloads at two layers, so nothing legitimate
-  can follow a sentinel this process wrote). Recovery now quarantines the
-  whole original segment — preserving it for forensics — instead of
-  truncating past it, whenever more trailing bytes than that follow a
-  mid-file sentinel. **Check:** if you ever saw the "found sentinel..." INFO
-  log after an unclean shutdown, on a segment that also lost acked records,
-  you were affected.
+  file was partially sealed") indistinguishable from the ordinary case.
+  Recovery now decides the question on the tail's *content*, not its size: a
+  genuine seal writes exactly the sentinel followed by a 32-byte footer whose
+  `record_count`, `data_bytes`, and `file_crc32` describe precisely the records
+  just replayed, so only two shapes are accepted as a real partial seal — no
+  trailing bytes at all (a crash between the sentinel and the footer), or
+  exactly a footer that cross-checks against the replay (a crash between the
+  seal's fsync and its rename). Every other tail — unparseable, footer-sized
+  but contradicting the replay, or too long to be a footer — is treated as
+  corruption: the whole original segment is copied to `quarantine/` for
+  forensics and logged at ERROR, and only the valid prefix in front of the
+  sentinel is sealed for delivery. Nothing is truncated away unseen. **Check:**
+  if you ever saw the "found sentinel..." INFO log after an unclean shutdown,
+  on a segment that also lost acked records, you were affected.
 
 - **`wab_compression = "zstd"` deployments only: an oversized-but-legal
   record, acked durable, could vanish on the very next crash.** The writer
