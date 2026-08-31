@@ -15,7 +15,7 @@
 //!   provider.
 //! * `tls_throughput_buffered` — sustained `Buffered` pushes over a single
 //!   established connection: bulk AES-GCM record throughput, no fsync floor.
-//! * `tls_throughput_sync` — sustained `Sync` pushes over TLS: the realistic
+//! * `tls_throughput_sync` — sustained `Durable` pushes over TLS: the realistic
 //!   durable-over-TLS rate (fsync-bound, so it reflects the pipeline, not the
 //!   cipher).
 //! * `tls_latency_buffered` — per-push latency percentiles over an established
@@ -145,7 +145,7 @@ fn tls_throughput_buffered() {
     emit_throughput("tls_throughput_buffered", RECORDS, t0.elapsed());
 }
 
-/// Sustained `Sync` throughput over one established mTLS connection: the
+/// Sustained `Durable` throughput over one established mTLS connection: the
 /// realistic durable-over-TLS rate. fsync-bound, so this is dominated by the
 /// pipeline, not the cipher — included for a realistic operating number.
 #[test]
@@ -161,11 +161,11 @@ fn tls_throughput_sync() {
     let mut client = WeirClient::connect_tls(srv.tcp_addr(), tls_cfg(&fx)).expect("connect_tls");
 
     for _ in 0..WARMUP {
-        client.push(b"warm", Durability::Sync).expect("warmup");
+        client.push(b"warm", Durability::Durable).expect("warmup");
     }
     let t0 = Instant::now();
     for _ in 0..RECORDS {
-        client.push(b"bench", Durability::Sync).expect("push");
+        client.push(b"bench", Durability::Durable).expect("push");
     }
     emit_throughput("tls_throughput_sync", RECORDS, t0.elapsed());
 }

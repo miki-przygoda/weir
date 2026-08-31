@@ -1,0 +1,47 @@
+# Phase 1 smoke schedule — ~30 minutes, random kills only.
+#
+# The Phase 1 exit criterion is ZERO FALSE VIOLATIONS, not "it ran". A chaos
+# harness that cries wolf is worse than no harness on a multi-day run, so this
+# schedule exists to prove the oracle is trustworthy before any real fault
+# class is added.
+
+seed = 0x5EED
+episodes = 20
+
+# Seconds of steady-state load between kills, sampled from this range.
+steady_lo_secs = 45.0
+steady_hi_secs = 90.0
+
+# Seconds to wait for drain quiescence after a restart before verifying.
+quiescence_timeout_secs = 120.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "S"
+# Per-episode progress floors (C2). I1/I2 are set-containment checks that
+# are vacuously satisfied when `acked` is empty, so a weir that refuses or
+# delivers nothing would otherwise pass every episode. At 8 threads / Sync
+# tier over the shortest steady state this schedule allows (45s), even a
+# pessimistic 10ms/op round trip yields ~36,000 acks (8 * 45000 / 10) — these
+# floors sit two-plus orders of magnitude below that on purpose. They exist
+# to catch NOTHING HAPPENING, not to assert throughput.
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+# Small segments so rotation actually happens inside a small volume. The
+# config range is [4096, 4 GiB]; 8 MiB gives frequent seals without thrashing.
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 512
+
+# Intentionally no keys yet. Phase 1 injects exactly one fault — random
+# SIGKILL, unconditional (see run.py's episode loop) — so there is nothing
+# here to configure. Phases 2-3 add dm-flakey, dm-delay, ENOSPC, remount and
+# dead-letter entries here.
+[faults]

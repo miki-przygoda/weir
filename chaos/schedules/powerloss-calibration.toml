@@ -1,0 +1,59 @@
+# ONE episode of real power loss. Run this before either full schedule.
+#
+# Its pass condition is not "weir behaved". It is:
+#
+#     the canary was destroyed, AND Buffered lost a non-zero,
+#     plausible number of records.
+#
+# Until that is observed, nothing about weir has been measured — a run that
+# reports zero violations while the injector was silently detached looks
+# identical to a run that proved something, and is worth nothing. This is why
+# `report.powerloss_verdict()` calls zero Buffered loss `inconclusive` rather
+# than green, and why the harness writes a canary file (I6) each episode:
+# `canary = "bit"` is a direct measurement that the injector fired, taken
+# independently of anything weir did.
+#
+# Read the result in this order:
+#
+#   canary = "did_not_bite"  -> the injector is dead. Nothing else in the
+#                               episode means anything. Fix that first.
+#   canary = "unexpected"    -> harness fault, distinct from either.
+#   canary = "bit", loss 0   -> injector fired but weir lost nothing at the
+#                               tier that is ALLOWED to lose. Suspicious:
+#                               most likely too little dirty data in flight.
+#   canary = "bit", loss > 0 -> calibrated. Proceed to the full schedules.
+#
+# A "plausible" loss is bounded by what could have been in flight: roughly
+# one batch_deadline_ms window of acks per shard, plus whatever ext4 had not
+# written back. Wildly more than that is a harness bug, not a weir finding.
+#
+# Buffered ('U') on purpose: it is the tier whose documented contract PERMITS
+# this loss, so a non-zero result here is evidence the injector works rather
+# than evidence weir is broken. Calibrating on the durable tier would conflate
+# "the injector fired" with "weir violated its guarantee".
+seed = 0xCA11B
+episodes = 1
+steady_lo_secs = 30.0
+steady_hi_secs = 30.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "U"
+min_acked_per_episode = 100
+# Buffered acks are MEANT to go missing here — see powerloss-buffered.toml.
+min_delivered_per_episode = 1
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"

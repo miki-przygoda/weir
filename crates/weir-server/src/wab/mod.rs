@@ -32,7 +32,7 @@ use clock::{BlockingClock, RealClock};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::{FsSegmentStore, SegmentStore, ShardWriter};
 use weir_core::Durability;
-use weir_wab::format::{EXT_SEALED, SEGMENT_FOOTER_LEN};
+use weir_wab::format::{Compression, EXT_SEALED, SEGMENT_FOOTER_LEN};
 
 /// Exponential moving average update, fixed-point microseconds.
 /// alpha = 1/4 (new sample weighted 25%). Pure fn so it's unit-testable.
@@ -66,6 +66,14 @@ pub(crate) struct WabConfig {
     /// to fill `segment_max_bytes` or for shutdown. `None` (default) preserves the
     /// historical behaviour. Lets low-volume deployments deliver promptly.
     pub(crate) segment_max_age: Option<Duration>,
+    /// How records are stored on disk. `None` (default) writes v1 segments
+    /// byte-identical to weir 1.x, so a rollback to 1.x is a non-event.
+    /// Enabling compression is the one-way door: a 1.x reader refuses a v2
+    /// segment.
+    pub(crate) compression: Compression,
+    /// zstd level, 1..=19. Only read when `compression` is `Zstd`. Not stored on
+    /// disk — zstd frames are self-describing for decompression.
+    pub(crate) compression_level: i32,
 }
 
 impl Default for WabConfig {
@@ -76,6 +84,8 @@ impl Default for WabConfig {
             batch_deadline: Duration::from_millis(1),
             segment_max_bytes: crate::wab::format::SEGMENT_MAX_BYTES,
             segment_max_age: None,
+            compression: Compression::None,
+            compression_level: 1,
         }
     }
 }
@@ -264,6 +274,8 @@ pub(crate) fn spawn(
         let batch_deadline = config.batch_deadline;
         let segment_max_bytes = config.segment_max_bytes;
         let segment_max_age = config.segment_max_age;
+        let compression = config.compression;
+        let compression_level = config.compression_level;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
         let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
 
@@ -301,6 +313,8 @@ pub(crate) fn spawn(
                             coalesce_hint,
                             &RealClock,
                             store,
+                            compression,
+                            compression_level,
                         );
                     }
                 });
@@ -336,6 +350,7 @@ pub(crate) fn spawn(
 pub(crate) fn scan_unconfirmed_sealed(
     wab_dir: &Path,
     shard_count: Option<usize>,
+    metrics: &Metrics,
 ) -> io::Result<Vec<PathBuf>> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
@@ -387,7 +402,7 @@ pub(crate) fn scan_unconfirmed_sealed(
         sealed_segments.sort_by_key(|p| segment::segment_counter_from_path(p));
 
         for sealed in sealed_segments {
-            match check_confirmed(&sealed, wab_dir) {
+            match check_confirmed(&sealed, wab_dir, metrics) {
                 Ok(true) => {
                     info!(sealed = %sealed.display(), "skipping — segment already confirmed");
                 }
@@ -412,7 +427,7 @@ pub(crate) fn replay_unconfirmed(
     drain_tx: &Sender<PathBuf>,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
-    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count))? {
+    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count), metrics)? {
         // A footer-read failure here only undercounts the
         // recovery_records_replayed metric (the segment is still queued +
         // delivered); surface it rather than silently reporting 0 so the
@@ -480,6 +495,8 @@ fn flusher_thread<C: BlockingClock>(
     coalesce_hint: Arc<AtomicU64>,
     clock: &C,
     store: Arc<dyn SegmentStore>,
+    compression: Compression,
+    compression_level: i32,
 ) {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
@@ -511,6 +528,8 @@ fn flusher_thread<C: BlockingClock>(
         segment_max_bytes,
         Arc::clone(&metrics),
         store,
+        compression,
+        compression_level,
     );
     // Establish the segment counter before sealing anything. A failure here is
     // NOT benign: defaulting to 1 while crash recovery has already sealed
@@ -692,7 +711,7 @@ fn flush_batch(
     metrics: &Arc<Metrics>,
     coalesce_hint: &Arc<AtomicU64>,
 ) {
-    // Sync + Batched records both ride a single group fsync at the end of the
+    // Every Durable record rides a single group fsync at the end of the
     // flush (the per-record fsync was the herd-benchmark bottleneck). Their acks
     // are split by the FATE of the segment each record landed in:
     //
@@ -780,7 +799,7 @@ fn flush_batch(
             }
 
             match unit.durability {
-                Durability::Sync | Durability::Batched => {
+                Durability::Durable => {
                     // A record that triggered rotation is in the just-sealed
                     // (durable) segment; otherwise it's in the current active
                     // segment, awaiting the group fsync.
@@ -895,7 +914,7 @@ mod tests {
         let dir = tmp_dir("rdroundtrip");
         let path = segment_path(&dir, 1);
         let payloads: Vec<&[u8]> = vec![b"alpha", b"beta", b"gamma delta"];
-        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         for p in &payloads {
             seg.write_record(p).unwrap();
         }
@@ -939,7 +958,7 @@ mod tests {
         const N: u64 = 300; // > the bounded(256) drain channel capacity
         for i in 1..=N {
             let path = segment_path(&shard_dir, i);
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"replayed").unwrap();
             seg.seal().unwrap();
         }
@@ -989,7 +1008,7 @@ mod tests {
             let shard_dir = shard_dir_path(&dir, s as usize);
             fs::create_dir_all(&shard_dir).unwrap();
             let path = segment_path(&shard_dir, 1);
-            let mut seg = WabSegment::create(&path, s).unwrap();
+            let mut seg = WabSegment::create(&path, s, Compression::None).unwrap();
             seg.write_record(b"orphaned").unwrap();
             seg.seal().unwrap();
         }
@@ -1030,14 +1049,14 @@ mod tests {
 
         // seg 1: sealed AND confirmed (delivered last run; segment not yet deleted).
         let p1 = segment_path(&shard_dir, 1);
-        let mut s1 = WabSegment::create(&p1, 0).unwrap();
+        let mut s1 = WabSegment::create(&p1, 0, Compression::None).unwrap();
         s1.write_record(b"already-delivered").unwrap();
         let sealed1 = s1.seal().unwrap();
         fs::write(confirmed_path_for(&sealed1), build_confirmed(0, 1, 1)).unwrap();
 
         // seg 2: sealed, NOT confirmed (genuinely undrained).
         let p2 = segment_path(&shard_dir, 2);
-        let mut s2 = WabSegment::create(&p2, 0).unwrap();
+        let mut s2 = WabSegment::create(&p2, 0, Compression::None).unwrap();
         s2.write_record(b"needs-delivery").unwrap();
         let sealed2 = s2.seal().unwrap();
 
@@ -1081,12 +1100,12 @@ mod tests {
         let sd0 = shard_dir_path(&dir, 0);
         fs::create_dir_all(&sd0).unwrap();
         let s0_1 = {
-            let mut s = WabSegment::create(&segment_path(&sd0, 1), 0).unwrap();
+            let mut s = WabSegment::create(&segment_path(&sd0, 1), 0, Compression::None).unwrap();
             s.write_record(b"a").unwrap();
             s.seal().unwrap()
         };
         let s0_2 = {
-            let mut s = WabSegment::create(&segment_path(&sd0, 2), 0).unwrap();
+            let mut s = WabSegment::create(&segment_path(&sd0, 2), 0, Compression::None).unwrap();
             s.write_record(b"b").unwrap();
             s.seal().unwrap()
         };
@@ -1095,13 +1114,13 @@ mod tests {
         let sd1 = shard_dir_path(&dir, 1);
         fs::create_dir_all(&sd1).unwrap();
         let s1_confirmed = {
-            let mut s = WabSegment::create(&segment_path(&sd1, 1), 1).unwrap();
+            let mut s = WabSegment::create(&segment_path(&sd1, 1), 1, Compression::None).unwrap();
             s.write_record(b"done").unwrap();
             s.seal().unwrap()
         };
         fs::write(confirmed_path_for(&s1_confirmed), build_confirmed(1, 1, 1)).unwrap();
         let s1_2 = {
-            let mut s = WabSegment::create(&segment_path(&sd1, 2), 1).unwrap();
+            let mut s = WabSegment::create(&segment_path(&sd1, 2), 1, Compression::None).unwrap();
             s.write_record(b"c").unwrap();
             s.seal().unwrap()
         };
@@ -1110,12 +1129,13 @@ mod tests {
         let sd5 = shard_dir_path(&dir, 5);
         fs::create_dir_all(&sd5).unwrap();
         let s5_1 = {
-            let mut s = WabSegment::create(&segment_path(&sd5, 1), 5).unwrap();
+            let mut s = WabSegment::create(&segment_path(&sd5, 1), 5, Compression::None).unwrap();
             s.write_record(b"orphan").unwrap();
             s.seal().unwrap()
         };
 
-        let got = scan_unconfirmed_sealed(&dir, None).unwrap();
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let got = scan_unconfirmed_sealed(&dir, None, &m).unwrap();
         assert!(
             !got.contains(&s1_confirmed),
             "the confirmed segment must be skipped by the recovery scan: {got:?}"
@@ -1137,7 +1157,7 @@ mod tests {
         let dir = tmp_dir("rd_oversized_len");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"keep-me").unwrap();
         } // drop flushes
 
@@ -1168,7 +1188,7 @@ mod tests {
     fn segment_reader_detects_crc_mismatch() {
         let dir = tmp_dir("rdcrc");
         let path = segment_path(&dir, 1);
-        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         seg.write_record(b"data").unwrap();
         let sealed = seg.seal().unwrap();
 

@@ -31,7 +31,7 @@ use std::time::Duration;
 use weir_core::Payload;
 
 use super::sql_common;
-use super::{CommitResult, Sink, SinkHealth};
+use super::{CommitResult, Sink, SinkBatch, SinkHealth};
 
 /// ClickHouse identifier length cap. ClickHouse's own limit is generous; 63 is
 /// a safe conservative bound (shared with the PG sink's `NAMEDATALEN - 1`).
@@ -64,39 +64,6 @@ fn encode_rowbinary(batch: &[Payload]) -> Vec<u8> {
         out.extend_from_slice(p);
     }
     out
-}
-
-// ── Dedup token ─────────────────────────────────────────────────────────────────
-
-/// Content-derived dedup token: `sha256(len(p₀) ++ p₀ ++ len(p₁) ++ p₁ ++ …)`,
-/// lower-hex. A crash-replayed byte-identical batch produces the same token, so
-/// a dedup-capable engine deduplicates the re-inserted block.
-///
-/// Each payload is length-prefixed before hashing so the digest is unambiguous
-/// across different batch boundaries. Concatenating payloads without delimiters
-/// would make `["ab", "c"]` and `["a", "bc"]` hash identically — ClickHouse
-/// would then drop the second, genuinely-distinct block as a duplicate, losing
-/// data. The 8-byte little-endian length restores a prefix-free framing.
-///
-/// Caveat (F35): the token covers exactly the sub-batch handed to `commit()`,
-/// which the drain sizes by `sink_max_batch_size`. If that config changes across
-/// a restart, a replayed segment re-splits into differently-sized sub-batches
-/// whose tokens differ from the originals, so ClickHouse's
-/// `insert_deduplication_token` won't recognise them as duplicates — at-least-once
-/// can then double-insert. Keep `sink_max_batch_size` stable for the dedup
-/// guarantee to hold across restarts.
-fn dedup_token(batch: &[Payload]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for p in batch {
-        hasher.update((p.len() as u64).to_le_bytes());
-        hasher.update(p);
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 // ── Config + build error ────────────────────────────────────────────────────────
@@ -309,18 +276,19 @@ fn split_credentials(url: &str) -> (String, Option<(String, String)>) {
 }
 
 impl Sink for ClickHouseSink {
-    type Record = Payload;
     type Error = sql_common::SqlSinkError;
 
-    async fn commit(
-        &self,
-        batch: Vec<Payload>,
-    ) -> Result<CommitResult<Payload>, sql_common::SqlSinkError> {
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, sql_common::SqlSinkError> {
+        let (batch, dedup_token) = batch.into_parts();
         if batch.is_empty() {
             return Ok(CommitResult::new(Vec::new(), Vec::new()));
         }
         let body = encode_rowbinary(&batch);
-        let token = dedup_token(&batch);
+        // The drain derived this from exactly the records below. It is
+        // byte-identical to the digest weir 1.x computed here privately, so a
+        // deployment upgrading mid-outage keeps deduplicating — pinned by
+        // `dedup_token_is_unchanged_from_weir_1_x`.
+        let token = dedup_token.to_hex();
 
         let mut req = self
             .client
@@ -462,38 +430,6 @@ mod tests {
     #[test]
     fn rowbinary_handles_empty_payload() {
         assert_eq!(encode_rowbinary(&[Payload::new()]), vec![0x00]);
-    }
-
-    // ── Dedup token ────────────────────────────────────────────────────────
-
-    #[test]
-    fn dedup_token_is_deterministic() {
-        let b = vec![p(b"x"), p(b"yy")];
-        assert_eq!(dedup_token(&b), dedup_token(&b));
-    }
-
-    #[test]
-    fn dedup_token_changes_on_reorder() {
-        let a = vec![p(b"x"), p(b"yy")];
-        let b = vec![p(b"yy"), p(b"x")];
-        assert_ne!(dedup_token(&a), dedup_token(&b));
-    }
-
-    #[test]
-    fn dedup_token_distinguishes_different_batch_boundaries() {
-        // ["ab","c"] and ["a","bc"] concatenate to the same bytes but are
-        // different batches — they must NOT share a dedup token, or ClickHouse
-        // would drop the second as a duplicate and lose data.
-        let a = vec![p(b"ab"), p(b"c")];
-        let b = vec![p(b"a"), p(b"bc")];
-        assert_ne!(dedup_token(&a), dedup_token(&b));
-    }
-
-    #[test]
-    fn dedup_token_is_64_hex_chars() {
-        let t = dedup_token(&[p(b"hello")]);
-        assert_eq!(t.len(), 64);
-        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     // ── Config / new ───────────────────────────────────────────────────────
@@ -754,7 +690,10 @@ mod tests {
     async fn commit_2xx_commits_batch_and_sends_query_and_dedup_token() {
         let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let result = sink.commit(vec![p(b"a"), p(b"b")]).await.unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"a"), p(b"b")]))
+            .await
+            .unwrap();
         assert_eq!(result.committed.len(), 2);
         assert!(result.dead_lettered.is_empty());
 
@@ -763,10 +702,32 @@ mod tests {
         assert_eq!(reqs.len(), 1, "expected exactly one POST");
         // The INSERT query and the dedup token must be on the wire.
         assert!(reqs[0].contains("query="), "no query param: {}", reqs[0]);
+        // Assert the VALUE, not just the presence: this task's whole claim is
+        // that the token on the wire is unchanged, so something must check it.
+        let expected = weir_sink_sdk::DedupToken::for_payloads([p(b"a"), p(b"b")].iter()).to_hex();
         assert!(
-            reqs[0].contains("insert_deduplication_token="),
-            "no dedup token on the wire: {}",
+            reqs[0].contains(&format!("insert_deduplication_token={expected}")),
+            "wrong or missing dedup token on the wire (want {expected}): {}",
             reqs[0]
+        );
+    }
+
+    /// The upgrade-safety claim: the token this sink sends at 2.0 is the same
+    /// string 1.x sent for the same batch. An operator who upgrades while a
+    /// segment is mid-retry must keep deduplicating.
+    ///
+    /// Deliberately a second, independent copy of the digest that
+    /// weir-sink-sdk's `dedup_token_matches_the_weir_1_x_digest` also pins.
+    /// Editing one without the other makes the pair disagree and the build go
+    /// red — which is the alarm you want on a compatibility constant.
+    #[test]
+    fn dedup_token_is_unchanged_from_weir_1_x() {
+        let batch = [p(b"alpha"), p(b"beta"), p(b"gamma")];
+        assert_eq!(
+            weir_sink_sdk::DedupToken::for_payloads(batch.iter()).to_hex(),
+            "5bc1fe58cc34db881c67b2acd898651311f6dfc576285c906c8f97e049b15342",
+            "insert_deduplication_token changed — every ClickHouse deployment \
+             that deduplicates on it stops recognising replays across the upgrade"
         );
     }
 
@@ -776,7 +737,7 @@ mod tests {
         // Inject userinfo into the authority: http://weiruser:s3cr3t@host/
         let cred_url = url.replacen("http://", "http://weiruser:s3cr3t@", 1);
         let sink = ClickHouseSink::new(cfg(&cred_url, "weir_records", "payload")).unwrap();
-        sink.commit(vec![p(b"a")]).await.unwrap();
+        sink.commit(SinkBatch::from(vec![p(b"a")])).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let reqs = captured.lock().unwrap();
@@ -802,7 +763,10 @@ mod tests {
         let (url, _c) =
             spawn_ch_mock("HTTP/1.1 500 Internal Server Error", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "500 must be transient: {err}");
     }
 
@@ -810,7 +774,10 @@ mod tests {
     async fn commit_429_is_transient() {
         let (url, _c) = spawn_ch_mock("HTTP/1.1 429 Too Many Requests", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "429 must be transient: {err}");
     }
 
@@ -826,7 +793,10 @@ mod tests {
         )
         .await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(!err.is_transient(), "a redirect must be permanent: {err}");
         let msg = err.to_string();
         assert!(msg.contains("302"), "{msg}");
@@ -842,7 +812,10 @@ mod tests {
         )
         .await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let err = sink.commit(vec![p(b"a")]).await.unwrap_err();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
         assert!(!err.is_transient(), "400 must be permanent: {err}");
         let msg = err.to_string();
         assert!(msg.contains("400"), "{msg}");
@@ -856,10 +829,13 @@ mod tests {
         let mut c = cfg(&url, "weir_records", "payload");
         c.timeout = Duration::from_millis(300);
         let sink = ClickHouseSink::new(c).unwrap();
-        let err = tokio::time::timeout(Duration::from_secs(2), sink.commit(vec![p(b"a")]))
-            .await
-            .expect("commit must honour its own timeout, not hang")
-            .unwrap_err();
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            sink.commit(SinkBatch::from(vec![p(b"a")])),
+        )
+        .await
+        .expect("commit must honour its own timeout, not hang")
+        .unwrap_err();
         // A timeout is classified transient (retry the segment).
         assert!(err.is_transient(), "timeout must be transient: {err}");
     }
@@ -868,7 +844,7 @@ mod tests {
     async fn commit_empty_batch_makes_no_request() {
         let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
         let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
-        let result = sink.commit(vec![]).await.unwrap();
+        let result = sink.commit(SinkBatch::from(vec![])).await.unwrap();
         assert!(result.committed.is_empty() && result.dead_lettered.is_empty());
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(

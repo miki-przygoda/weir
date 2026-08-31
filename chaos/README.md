@@ -1,0 +1,188 @@
+# chaos — real-kernel fault injection for weir
+
+A standalone cargo project (not a weir workspace member) that runs weir against
+a real device-mapper stack and verifies its durability claims from outside the
+daemon, across crash and restart.
+
+Design: [`docs/superpowers/specs/2026-07-25-chaos-fault-injection-design.md`](../docs/superpowers/specs/2026-07-25-chaos-fault-injection-design.md)
+
+## Requirements
+
+- **Linux.** Device-mapper and loopback devices. macOS is not supported and
+  never will be: `F_BARRIERFSYNC` gives no power-loss guarantee, so a
+  durability proof there would prove nothing.
+- **root**, for the orchestrator (`run.py`): it owns loopback devices, mounts,
+  and process lifecycle. The load generator and recorder are *intended* to
+  run unprivileged, as observers that must not be able to corrupt what they
+  measure — but as implemented today, `run.py` execs both as direct
+  `subprocess.Popen` children with no privilege drop, so **they currently
+  inherit root from the parent, same as the daemon under test.** A real drop
+  needs `setuid`/capability plumbing that is its own piece of work; it is
+  deferred, not landed, and "the observers are unprivileged" should be read
+  as a design goal the code does not yet enforce.
+- **Python 3** (stdlib only) and `losetup` / `dmsetup` / `mkfs.ext4`.
+
+## Running
+
+```bash
+cd chaos
+cargo build --release
+sudo python3 orchestrator/run.py schedules/smoke.toml
+```
+
+Everything runs from inside this directory. `cargo build` at the weir repo root
+does not build this project.
+
+## Status — Phase 1 gate PASSED (2026-08-01)
+
+> **The Phase 1 exit gate passes: 20/20 episodes, 0 violations, 0 anomalies.**
+> 7,383,717 records, 20 `kill -9`s, 86 unconfirmed segments replayed across
+> restarts. Every acked record was delivered (`i1_missing = 0`), no refused
+> record ever appeared downstream (`i2_leaked = 0`), and nothing was excused by
+> the frontier exemption (`i1_exempt = 0`). Report and per-episode data:
+> [`docs/benchmarks/chaos-phase1/`](../docs/benchmarks/chaos-phase1/).
+>
+> **Read the venue caveat before quoting any of it.** The run was in a
+> privileged Linux container on virtualised storage, so **no number with a unit
+> attached means anything** — this venue answers "does the harness work, and
+> does it report false violations", which is Phase 1's whole criterion, and
+> nothing about performance.
+>
+> **What it does NOT establish.** Only `kill -9` was injected. Power loss, disk
+> full, slow disk, torn writes and read-only remount are Phases 2–3, and they
+> are where the more interesting claims live — the `Buffered`-vs-`Sync` tier
+> distinction is entirely untested here (the schedule runs `Sync` only). This is
+> minutes of load, not the multi-day soak the design calls for.
+>
+> Getting here took eight defects in the harness against three in weir. Quiescence
+> alone was wrong four times, in both directions. Treat a green run as a claim
+> that needs its reasoning checked, not as a formality.
+
+## Long soaks — 10h and 5h on bare metal, both clean (2026-08-23)
+
+> **38.6 million acked records across 665 `kill -9`s, 0 violations, 0 anomalies.**
+> [`docs/benchmarks/chaos-soak/2026-08-23-10h-vs-5h-phase1-soak.md`](../docs/benchmarks/chaos-soak/2026-08-23-10h-vs-5h-phase1-soak.md)
+>
+> Two things the 30-minute gate could not show. Throughput is **flat across ten
+> hours** (+0.95% Q1→Q4), so there is no leak or decay signature. And recovery
+> truncated **exactly 4.000 segments per kill** — one per shard — across 665
+> crashes on two independent kill sequences.
+>
+> `i1_exempt = 0` in both runs: nothing was excused by the frontier exemption,
+> which is what makes "0 violations" stronger than it looks.
+>
+> **Still Phase 1.** `kill -9` and `Sync` only. The 2.0 quarantine path was never
+> entered (`kill -9` truncates cleanly; quarantine is for corruption), so it has
+> no coverage here.
+
+## Status — Phase 2 Buffered measured (2026-08-28)
+
+> **706 power-loss episodes, 604,485,602 acked records, 0 violations,
+> 0 anomalies. Canary `bit` in 706/706.**
+>
+> Full write-up:
+> [`docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`](../docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md).
+>
+> **Buffered's exposure is now a number, not prose.** Loss is uniformly
+> distributed between zero and one writeback interval — mean and stdev both
+> land within 2% of a uniform distribution's `max/2` and `max/√12` — with a
+> ceiling of **126,782 records (~1.76 s of acknowledged writes)** and a median
+> of 63,790 (~0.89 s). The ceiling, not the mean, is what characterises the
+> tier.
+>
+> **What that run alone did NOT establish** — both since closed, and left here
+> because the sequence is the point: a Buffered run measures Buffered, and
+> saying so is what made the two follow-ups obviously necessary.
+>
+> - ~~The Durable tier is untested under power loss.~~ **Closed 2026-08-30:**
+>   5,311 episodes over 24 h, 42,814,591 acked, **nothing lost**, and the WAB
+>   completely empty at shutdown.
+> - ~~WAB format v2 (zstd) is uncovered.~~ **Closed 2026-08-29:** a 40-episode
+>   controlled comparison differing only in `wab_compression`. The contract
+>   held; the exposure ceiling roughly tripled and went bimodal.
+>
+> **Phase 2 totals: 6,129 power-loss episodes, 687,712,504 acked records, zero
+> durability violations, zero weir defects.** Both tiers, both on-disk formats.
+
+The injector itself was validated on real hardware first:
+[`docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md`](../docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md).
+`drop_writes` is a **lying disk** — it reports fsync success and discards the
+write — which is not what real power loss does, and that difference dictates
+the episode protocol rather than being a footnote. Read it before touching
+`dm_stack.py`: it records three separate ways a flakey device can end up
+running a configuration you did not ask for, and all three fail towards *false
+violations against weir*.
+
+**The protocol is kill-first**, and the reason is not obvious. `drop_writes`
+sits BELOW the page cache, so a dropped write leaves the page resident and
+correct, and `kill -9` does not evict it — an engage-then-kill injector cannot
+lose a single byte. `dmsetup suspend` without `--nolockfs` additionally flushes
+every dirty page to the still-honest disk before the fault installs. The
+episode therefore kills first, then engages, unmounts, disengages and remounts,
+which makes the lying window exactly zero by construction and models what power
+loss actually takes: the data that was dirty at the instant of death.
+
+**The canary (I6) is load-bearing, especially for a Durable run.** A known
+block is written before the fault, overwritten while engaged, and read back
+after the remount; `bit` means the overwrite was destroyed. A Buffered run can
+argue the injector fired because something went missing. A Durable run cannot —
+under a correct implementation nothing goes missing, so "zero loss" and "the
+fault never fired" produce identical numbers.
+
+## Phase 1 exit gate
+
+Phase 1 is complete when a 30-minute smoke run produces **zero violations and
+zero anomalies**:
+
+```bash
+# From the weir repo root, build both sides first.
+cargo build --release -p weir-server
+cd chaos && cargo build --release
+sudo python3 orchestrator/run.py schedules/smoke.toml
+```
+
+`run.py` renders `runs/<run_id>/report.md` itself at the end of the run — no
+separate `report.py` step. Exit code 0, and `0 violations, 0 anomalies` in
+both the console summary and the report.
+
+A **violation** is a durability failure (I1/I2): weir lost or leaked a
+record. An **anomaly** is the harness failing to observe an episode cleanly —
+a quiescence timeout, a dead observer, or an episode with no measurable
+progress — and is *not*, by itself, evidence of a weir defect. The two are
+counted and gated on separately so neither can hide inside the other.
+
+### The final pass
+
+After the last episode, and before anything is torn down, the run does one
+more thing — recorded as `{"episode": "final"}` in `episodes.jsonl` and as the
+last row of the report:
+
+1. the load generator is stopped and **reaped** (it catches SIGTERM and
+   flushes its ledger, so its exit status says whether the ledger is complete);
+2. `/metrics` is scraped once more **while the daemon is still alive**;
+3. the daemon is asked to shut down — weir's SIGTERM path is a *full drain*,
+   not a seal-and-exit, so this is where the last tens of thousands of records
+   are actually delivered;
+4. verification runs at **`frontier_slack=0`**. This is the only moment in a
+   run where zero slack is a true statement rather than a stricter-than-reality
+   one: the producer is stopped and both logs are complete. If any precondition
+   failed — a dirty loadgen exit, a killed drain, a dead recorder — the check
+   falls back to the normal slack and is marked **advisory**, and an advisory
+   failure counts as an anomaly rather than a violation;
+5. the WAB directory gets a **post-mortem** — surviving sealed segments,
+   non-empty active segments, `quarantine/` and `dead_letter/` contents, with
+   paths and sizes. Any survivor is an anomaly. This evidence used to be
+   deleted, unread, by `stack.teardown()`.
+
+**The gate is zero FALSE violations, not "it ran".** Any violation at this
+stage is far more likely to be a harness bug than a weir bug — Phase 1 injects
+only random SIGKILL, which weir's existing system tests already cover. Treat a
+Phase 1 violation as an oracle defect until proven otherwise: check that the
+recorder fsynced before its 200, that quiescence really settled, and that no
+record was NDJSON-dead-lettered for containing a newline. An anomaly deserves
+the same scrutiny before it is dismissed as "just the harness": a recorder 4xx
+is permanent to weir's drain, so a refused batch is dead-lettered and looks
+identical to an acked-never-delivered weir defect — check `recorder.log`
+first.
+
+A harness that cries wolf is worse than no harness on a multi-day run.

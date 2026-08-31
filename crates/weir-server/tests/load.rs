@@ -143,7 +143,7 @@ fn thundering_herd(
                 let mut client = WeirClient::connect(&path).expect("connect");
                 b.wait();
                 for _ in 0..records_per_thread {
-                    client.push(b"bench", Durability::Sync).expect("push");
+                    client.push(b"bench", Durability::Durable).expect("push");
                 }
             })
         })
@@ -246,7 +246,7 @@ fn baseline_single_thread_throughput_buffered() {
     emit_throughput(&bench_tag("single_thread_buffered"), 1, RECORDS, elapsed);
 }
 
-/// Baseline: single producer, Sync (fsync per batch).
+/// Baseline: single producer, Durable (fsync per batch).
 #[test]
 fn baseline_single_thread_throughput_sync() {
     const RECORDS: usize = 500;
@@ -255,14 +255,14 @@ fn baseline_single_thread_throughput_sync() {
 
     let t0 = Instant::now();
     for _ in 0..RECORDS {
-        client.push(b"bench", Durability::Sync).expect("push");
+        client.push(b"bench", Durability::Durable).expect("push");
     }
     let elapsed = t0.elapsed();
 
     emit_throughput(&bench_tag("single_thread_sync"), 1, RECORDS, elapsed);
 }
 
-/// Latency percentiles: single Sync producer, every push timed individually.
+/// Latency percentiles: single Durable producer, every push timed individually.
 #[test]
 fn baseline_latency_percentiles_sync() {
     const SAMPLES: usize = 2000;
@@ -272,7 +272,7 @@ fn baseline_latency_percentiles_sync() {
     let mut us: Vec<u64> = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let t = Instant::now();
-        client.push(b"lat", Durability::Sync).expect("push");
+        client.push(b"lat", Durability::Durable).expect("push");
         us.push(t.elapsed().as_micros() as u64);
     }
     us.sort_unstable();
@@ -280,7 +280,14 @@ fn baseline_latency_percentiles_sync() {
     emit_latency(&bench_tag("latency_sync"), SAMPLES, &us);
 }
 
-/// Latency percentiles: single Batched producer.
+/// Latency percentiles: single Batched producer. `Batched` is now identical to
+/// `Durable` (both ride the batch-boundary group fsync — see `Durability`'s
+/// docs), so this pushes the same `Durability::Durable` tier as
+/// `baseline_latency_percentiles_sync` and will report the same numbers. Kept
+/// as a separate scenario, rather than deleted, only to preserve the
+/// `latency_batched` tag that `deploy/avg_benchmarks.py` and the dated
+/// `docs/benchmarks/` snapshots still key off for their Sync/Batched/Buffered
+/// columns.
 #[test]
 fn baseline_latency_percentiles_batched() {
     const SAMPLES: usize = 2000;
@@ -290,7 +297,7 @@ fn baseline_latency_percentiles_batched() {
     let mut us: Vec<u64> = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let t = Instant::now();
-        client.push(b"lat", Durability::Batched).expect("push");
+        client.push(b"lat", Durability::Durable).expect("push");
         us.push(t.elapsed().as_micros() as u64);
     }
     us.sort_unstable();
@@ -443,10 +450,10 @@ fn ramp_to_saturation() {
     }
 }
 
-/// Sync-tier saturation ramp: same as `ramp_to_saturation` but uses Sync
+/// Durable-tier saturation ramp: same as `ramp_to_saturation` but uses Durable
 /// durability to stress the group-fsync path under escalating concurrency.
 ///
-/// Confirms the server survives concurrent Sync producers hitting the fsync
+/// Confirms the server survives concurrent Durable producers hitting the fsync
 /// bottleneck and that it degrades gracefully once the connection cap is
 /// exceeded (same assertion as the Buffered ramp).
 #[test]
@@ -468,7 +475,7 @@ fn ramp_to_saturation_sync() {
     println!("{}", "-".repeat(62));
 
     for &n in LEVELS {
-        let result = run_ramp_level(&srv, n, LEVEL_DURATION, Durability::Sync);
+        let result = run_ramp_level(&srv, n, LEVEL_DURATION, Durability::Durable);
         let rps = result.acks as f64 / result.duration.as_secs_f64();
         let status = if result.io_errors > 0 {
             "SATURATED"
@@ -616,7 +623,7 @@ fn compression_ratio_records_per_commit() {
     let mut client = srv.client();
     for i in 0..N_RECORDS {
         client
-            .push(&payload, Durability::Sync)
+            .push(&payload, Durability::Durable)
             .unwrap_or_else(|e| panic!("push {i} failed: {e}"));
     }
     drop(client);
@@ -704,7 +711,7 @@ fn sweep_agent_count_vs_throughput() {
     let cores = num_cpus_avail();
     eprintln!("\n=== agent_count sweep on {} cores ===", cores);
     eprintln!(
-        "scenario: herd of {} threads × {} Sync records each",
+        "scenario: herd of {} threads × {} Durable records each",
         THREADS, RECORDS_PER_THREAD
     );
     eprintln!();
@@ -781,8 +788,7 @@ fn latency_stage_breakdown() {
     let d = bench_deadline_ms();
 
     for (tier_name, durability) in &[
-        ("sync", Durability::Sync),
-        ("batched", Durability::Batched),
+        ("durable", Durability::Durable),
         ("buffered", Durability::Buffered),
     ] {
         let srv = weir_server!(&format!("stage_{tier_name}"))

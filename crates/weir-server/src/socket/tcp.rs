@@ -27,7 +27,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -73,6 +73,15 @@ pub struct TcpConfig {
     /// How long the TLS handshake may take before the connection is dropped.
     /// Caps a client that completes the TCP handshake but stalls the TLS one.
     pub handshake_timeout_secs: u64,
+    /// Soft cap on live WAB bytes; `0` disables the check. A TLS producer fills
+    /// the same WAB as a Unix-socket one, so the cap has to be enforced on both
+    /// transports or it isn't enforced at all.
+    pub wab_max_bytes: u64,
+    /// Most recent WAB byte count — the SAME `Arc` the Unix listener gets.
+    pub wab_bytes_now: Arc<AtomicU64>,
+    /// Whether the cap is currently rejecting — the SAME `Arc` the Unix listener
+    /// gets, so the hysteresis low-water mark is daemon-wide.
+    pub wab_cap_rejecting: Arc<AtomicBool>,
 }
 
 /// Binds nothing — accepts on the already-bound `listener` (see module docs for
@@ -108,6 +117,9 @@ pub async fn run(
         read_timeout: Duration::from_secs(config.connection_read_timeout_secs),
         ack_timeout: crate::socket::connection::ACK_TIMEOUT,
         shard_id: 0, // overridden per connection below
+        wab_max_bytes: config.wab_max_bytes,
+        wab_bytes_now: Arc::clone(&config.wab_bytes_now),
+        wab_cap_rejecting: Arc::clone(&config.wab_cap_rejecting),
     };
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 

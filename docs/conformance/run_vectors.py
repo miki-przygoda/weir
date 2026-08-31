@@ -8,7 +8,10 @@ against* it. It ships a small pure-Python reference codec (stdlib only —
   * every vector's bytes are decoded and the result is compared to the
     expected `decode` outcome ("ok" or a specific rejection reason); and
   * every `decode == "ok"` vector is re-encoded and must reproduce `hex`
-    byte-for-byte (catches endianness / CRC-coverage mistakes).
+    byte-for-byte (catches endianness / CRC-coverage mistakes) — UNLESS the
+    vector is marked `"round_trip": false`, meaning its bytes use a
+    non-canonical wire value (the retired 0x02 durability byte) that decodes
+    fine but a conformant encoder never re-emits.
 
 Run it:
 
@@ -36,9 +39,17 @@ WIRE_VERSION = 1
 HEADER_LEN = 16
 
 MT = {0x01: "Push", 0x02: "Ack", 0x03: "Nack", 0x04: "HealthCheck", 0x05: "HealthCheckResponse"}
-DUR = {0x01: "Sync", 0x02: "Batched", 0x03: "Buffered"}
+# Decode-side: the wire byte's canonical tier name. 0x01 and 0x02 both
+# canonicalise to "Durable" — 0x02 is the retired `Batched` byte, permissively
+# accepted per docs/wire_protocol.md and crates/weir-core/src/durability.rs.
+DUR = {0x01: "Durable", 0x02: "Durable", 0x03: "Buffered"}
 MT_REV = {v: k for k, v in MT.items()}
-DUR_REV = {v: k for k, v in DUR.items()}
+# Encode-side: canonical tier name back to its ONE canonical wire byte. NOT
+# derived from DUR (which is many-to-one for 0x01/0x02) — a conformant encoder
+# only ever emits 0x01 for Durable, never the retired 0x02. Vectors that decode
+# from the non-canonical 0x02 byte are marked "round_trip": false and skip the
+# re-encode check below rather than routing through this map.
+DUR_REV = {"Durable": 0x01, "Buffered": 0x03}
 
 
 # ── REFERENCE CODEC (replace these two functions to test your own client) ──────
@@ -147,12 +158,17 @@ def main() -> int:
                 print(f"FAIL {name}: decoded field {mismatch}")
                 failed += 1
                 continue
-            payload = bytes.fromhex(v["payload_hex"])
-            re_encoded = encode_frame(v["message_type"], v["durability"], v["flags"], payload).hex()
-            if re_encoded != v["hex"]:
-                print(f"FAIL {name}: re-encode\n  got {re_encoded}\n  exp {v['hex']}")
-                failed += 1
-                continue
+            # A vector marked "round_trip": false decodes a non-canonical wire
+            # byte (the retired 0x02 durability tier) to its canonical field
+            # value, so re-encoding it does NOT reproduce `hex` by design — skip
+            # the byte-identical check rather than weakening it for every vector.
+            if v.get("round_trip", True):
+                payload = bytes.fromhex(v["payload_hex"])
+                re_encoded = encode_frame(v["message_type"], v["durability"], v["flags"], payload).hex()
+                if re_encoded != v["hex"]:
+                    print(f"FAIL {name}: re-encode\n  got {re_encoded}\n  exp {v['hex']}")
+                    failed += 1
+                    continue
 
         passed += 1
 

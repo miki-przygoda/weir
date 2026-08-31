@@ -19,6 +19,13 @@ book/
 .DS_Store
 PLAN.md
 todos
+__pycache__/
 
 # Local working docs (plans, scratch notes — not part of the repo)
 .workdocs/
+# Subagent-driven-development scratch (ledgers, briefs, review packages).
+.superpowers/
+
+# Schedules generated per-launch by chaos/run-docker-soak.sh — the base
+# schedule is the source of truth; these are derived and disposable.
+chaos/schedules/generated/

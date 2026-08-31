@@ -68,10 +68,9 @@ use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::{Config as PgConfig, NoTls, config::SslMode, error::SqlState};
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::{debug, info, warn};
-use weir_core::Payload;
 
 use super::sql_common::{self, SqlSinkError};
-use super::{CommitResult, Sink, SinkError, SinkHealth};
+use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
 
 /// Static driver tag used by [`SqlSinkError`] variants emitted from this
 /// module. Counterpart to `mysql::DRIVER` — keeps `"postgres sink ..."`
@@ -341,10 +340,10 @@ pub(crate) fn is_transient_sqlstate(state: &SqlState) -> bool {
 // ── Sink trait impl ───────────────────────────────────────────────────────────
 
 impl Sink for PostgresSink {
-    type Record = Payload;
     type Error = SqlSinkError;
 
-    async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, SqlSinkError> {
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, SqlSinkError> {
+        let batch = batch.into_records();
         if batch.is_empty() {
             return Ok(CommitResult::new(Vec::new(), Vec::new()));
         }

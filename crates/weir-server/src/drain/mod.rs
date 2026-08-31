@@ -46,7 +46,7 @@ use crate::{
         DrainStateLabel, DrainStateValue, Metrics, Outcome, OutcomeLabel, SinkHealthLabel,
         SinkHealthState,
     },
-    sink::{Sink, SinkError, SinkHealth, SinkRecord},
+    sink::{Sink, SinkError, SinkHealth},
     wab::{SegmentReader, read_segment_record_count},
 };
 
@@ -56,6 +56,49 @@ use dead_letter::DeadLetterWriter;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 pub const MAX_RETRIES: u32 = 3;
+
+/// Upper bound on a single transient-retry backoff once shutdown has been
+/// observed (the drain channel disconnected). The backoff is clamped rather than
+/// dropped: firing the remaining attempts back-to-back with no delay spends the
+/// whole retry budget on what is effectively one attempt, since a sink that
+/// needs milliseconds to answer fails the same way three times inside the same
+/// instant (W2).
+///
+/// Why 250 ms:
+///
+///   * It is above the default `sink_retry_base_delay_ms` (100), so at default
+///     config the shutdown schedule (100 / 200 / 250 ms) is all but identical to
+///     the normal one (100 / 200 / 400 ms) — the clamp only bites on an operator's
+///     long base delay or a server-supplied `Retry-After` (up to 5 minutes).
+///   * With the default retry budget it covers a whole episode in
+///     `(MAX_RETRIES + 1) × 250 ms` = 1 s — which is what
+///     [`SHUTDOWN_RETRY_BACKOFF_BUDGET`] (the actual bound on total added
+///     shutdown time) is sized to. 1 s is small against the per-attempt
+///     `commit_timeout` (default 30 s) that the shutdown path already tolerates,
+///     so this is never the term that decides how long shutdown takes.
+///   * It is 5× the 50 ms channel-poll slice used while the channel is live, so
+///     the wait is a real delay and not a rounding artifact of the poll loop.
+const SHUTDOWN_RETRY_BACKOFF_CAP: Duration = Duration::from_millis(250);
+
+/// Total time the drain may spend on [`SHUTDOWN_RETRY_BACKOFF_CAP`]-clamped
+/// backoffs across the whole shutdown, after which shutdown retries fire
+/// immediately again.
+///
+/// A per-retry clamp alone is not enough to bound shutdown. Stranding a segment
+/// marks the sink down, so the Draining arm's next health poll sees a down→up
+/// edge and re-queues that same segment (the 4a auto-resume), starting a fresh
+/// retry episode. Against a sink whose HEAD probe stays healthy while every POST
+/// fails transiently, that cycle is unbounded — today it is only survivable
+/// because zero-delay retries never let `health_poll_interval` elapse. Spending
+/// from one budget keeps the worst case flat: shutdown grows by at most this
+/// much in total, no matter how many segments or resume cycles are involved.
+///
+/// 1 s is `(MAX_RETRIES + 1) × SHUTDOWN_RETRY_BACKOFF_CAP` — exactly enough for
+/// one full retry episode at the default retry budget, which is the case worth
+/// buying (the segment in flight when the operator sent SIGTERM). Anything after
+/// that is a sink that has already failed four spaced-out attempts, which is not
+/// worth delaying a shutdown for.
+const SHUTDOWN_RETRY_BACKOFF_BUDGET: Duration = Duration::from_secs(1);
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -211,16 +254,40 @@ fn run_drain_supervised<S: Sink>(
             100u64.saturating_mul(attempts as u64),
         ));
     }
+    // EVERY exit from the loop above lands here — there is no other way out of
+    // it. The `Ok(())` arm breaks (channel closed on shutdown, or `drain_thread`
+    // returning before its own loop ever starts, as it does when the dead-letter
+    // writer will not open), and the respawn-budget arm breaks. So one
+    // assignment covers all of them.
+    //
+    // `drain_state` is written ONLY by the drain thread, and it is pre-initialised
+    // to `draining = 1`. Left untouched on exit it stays frozen there: an operator
+    // scraping /metrics sees a daemon that is draining while nothing is being
+    // delivered, and the WAB growth warning — which reads this gauge — stays
+    // silent in precisely the scenario it exists for. Publishing the terminal
+    // state is the truth on all three paths, clean shutdown included: the drain
+    // genuinely is no longer draining.
+    //
+    // `sink_health` is deliberately NOT forced here. Once nobody is probing the
+    // sink its health is *unknown*, not down — and on the clean-shutdown path the
+    // sink is usually perfectly healthy, so writing `down` would fire a false
+    // "sink is down" signal on every SIGTERM. `drain_state{stopped}` is the
+    // honest signal, and it tells the operator the health reading is stale.
+    set_drain_state(&metrics, DrainStateValue::stopped);
     info!("drain supervisor exiting");
 }
 
 // ── Drain state helper ────────────────────────────────────────────────────────
 
 fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
+    // Every label value in the family, so the one-hot invariant holds no matter
+    // which is active — omitting one here would leave it stuck at its last
+    // reading while another state claims to be active.
     let states = [
         DrainStateValue::draining,
         DrainStateValue::retrying_transient,
         DrainStateValue::blocked_dead_letter_full,
+        DrainStateValue::stopped,
     ];
     for s in states {
         let v = if s == active { 1.0 } else { 0.0 };
@@ -312,7 +379,7 @@ fn probe_and_resume_stranded<S: Sink>(
     if now_ok && !prev_health_ok {
         // `None` shard_count: skip the beyond-configured-count advisory — that's
         // a startup-replay concern, not a recovery one.
-        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None) {
+        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None, metrics) {
             Ok(sealed) => {
                 // Dedup against what's already queued via a HashSet membership view
                 // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
@@ -364,6 +431,35 @@ fn probe_and_resume_stranded<S: Sink>(
 
 // ── Drain thread ──────────────────────────────────────────────────────────────
 
+/// Total bytes currently held in `<wab_dir>/quarantine`: forensic copies of
+/// corrupt WAB segments preserved by crash recovery (see `wab::recovery`)
+/// because acked records may sit after the corruption.
+///
+/// Same shape as `dead_letter`'s directory-sizing scan and `main.rs`'s
+/// `compute_wab_bytes_on_disk`: walk the directory, sum regular-file sizes,
+/// and read a missing directory as `0` rather than an error. An absent
+/// quarantine dir is the normal, healthy case — nothing has ever been
+/// quarantined — and must not be surfaced as a scan failure.
+///
+/// Refreshed on the same wall-clock health-poll cadence as
+/// `dead_letter_bytes_on_disk` (see the call site below), so the gauge is a
+/// periodic snapshot, not a live value — same staleness bound as
+/// `weir_wab_bytes_on_disk`.
+fn quarantine_bytes_on_disk(wab_dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(wab_dir.join("quarantine")) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
 fn drain_thread<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
@@ -407,6 +503,13 @@ fn drain_thread<S: Sink>(
     // recv_timeout branch alone never fired while segments kept arriving).
     let mut last_health_poll = Instant::now();
 
+    // Total time the drain may still spend on clamped transient-retry backoffs
+    // after shutdown has been observed. Consumed by the `RetryingTransient` arm;
+    // once exhausted, shutdown retries revert to firing immediately. See
+    // [`SHUTDOWN_RETRY_BACKOFF_BUDGET`] for why this is bounded in aggregate and
+    // not just per-retry.
+    let mut shutdown_backoff_left = SHUTDOWN_RETRY_BACKOFF_BUDGET;
+
     'outer: loop {
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
@@ -438,6 +541,13 @@ fn drain_thread<S: Sink>(
                             .dead_letter_bytes_on_disk
                             .set(dead_letter.total_bytes() as f64);
                     }
+                    // Same idea for quarantine: an operator can run `weir-ctl
+                    // quarantine requeue` (or manually clear the dir) while the
+                    // daemon is up, and the gauge should catch up on this same
+                    // health-poll cadence rather than only at the next restart.
+                    metrics
+                        .quarantine_bytes_on_disk
+                        .set(quarantine_bytes_on_disk(&config.wab_dir) as f64);
                     last_health_poll = Instant::now();
                 }
 
@@ -501,13 +611,35 @@ fn drain_thread<S: Sink>(
                 // recv_timeout so a shutdown — which the drain only learns of as the
                 // drain channel disconnecting (all WAB flushers have exited) — cuts
                 // the wait short instead of sleeping out a multi-minute Retry-After.
-                // On disconnect we stop waiting but STILL run the retry below (its
-                // commit is bounded by commit_timeout), preserving the existing
+                // On disconnect we shorten the wait but STILL run the retry below
+                // (its commit is bounded by commit_timeout), preserving the existing
                 // "complete in-flight work on shutdown" behaviour; the Draining loop
                 // then observes the same disconnect and exits. In production the
                 // channel only closes on shutdown, so the Retry-After delay is only
                 // ever cut at shutdown, never during normal operation. Segments that
                 // arrive during the wait are buffered (S15).
+                //
+                // W2: the shutdown wait is CLAMPED, not eliminated. Breaking outright
+                // made every remaining attempt fire back-to-back with zero delay —
+                // the chaos harness measured four segments each burning all
+                // MAX_RETRIES inside 0.4 ms before being logged as stranded. Three
+                // attempts inside one instant against a sink that needs milliseconds
+                // to answer fail identically for the same reason, so that spent the
+                // whole budget on what was effectively one attempt and forced a
+                // strand a brief delay might have avoided — neither "retry properly"
+                // nor "don't retry". Sleeping the clamped remainder makes each retry
+                // an independent sample again. `thread::sleep` rather than another
+                // recv_timeout because a disconnected channel returns immediately and
+                // would spin; nothing is missed, since no further segment can arrive.
+                //
+                // The clamp is drawn from a per-process budget so the added shutdown
+                // time cannot compound: a segment that strands makes the Draining
+                // arm's health poll re-queue it (the 4a auto-resume edge), which
+                // starts another retry episode, and with an unbudgeted per-retry
+                // clamp a HEAD-healthy / POST-transient-failing sink would keep that
+                // cycle alive and shutdown would never finish. Once the budget is
+                // spent the waits go to zero and the loop degenerates to the previous
+                // behaviour, which terminates.
                 let wait_end = Instant::now() + next_delay;
                 loop {
                     let remaining = wait_end.saturating_duration_since(Instant::now());
@@ -518,8 +650,17 @@ fn drain_thread<S: Sink>(
                     match drain_rx.recv_timeout(poll) {
                         Ok(new_seg) => pending.push_back(new_seg),
                         Err(RecvTimeoutError::Timeout) => {}
-                        // Channel closed (shutdown): stop waiting, finish the retry.
-                        Err(RecvTimeoutError::Disconnected) => break,
+                        // Channel closed (shutdown): serve the clamped remainder of
+                        // the backoff, then finish the retry.
+                        Err(RecvTimeoutError::Disconnected) => {
+                            let left = wait_end
+                                .saturating_duration_since(Instant::now())
+                                .min(SHUTDOWN_RETRY_BACKOFF_CAP)
+                                .min(shutdown_backoff_left);
+                            shutdown_backoff_left -= left;
+                            std::thread::sleep(left);
+                            break;
+                        }
                     }
                 }
 
@@ -997,7 +1138,26 @@ async fn process_segment<S: Sink>(
 fn quarantine_segment(segment: &Path, config: &DrainConfig, metrics: &Metrics, reason: &str) {
     match crate::wab::recovery::quarantine(segment, &config.wab_dir, reason) {
         Ok(()) => {
+            // BOTH series, per the invariant asserted on
+            // `wab::recovery::quarantine_and_count`: "Every segment-quarantine
+            // site funnels through here so the recovery_segments_quarantined
+            // counter and the wab_segments{state=quarantined} gauge are ALWAYS
+            // bumped ... If you add a third, route it here."
+            //
+            // This IS that third site, and it bumped only the flat counter — so
+            // a drain-time quarantine moved one series while a recovery-time
+            // quarantine moved two, and an operator reading the gap could not
+            // tell "the drain quarantined something" from "a counter is broken".
+            // It does not call quarantine_and_count itself only because that
+            // helper's contract is to RETURN an io::Error describing the
+            // quarantine, which this caller has no use for.
             metrics.recovery_segments_quarantined.inc();
+            metrics
+                .wab_segments
+                .get_or_create(&crate::metrics::SegmentStateLabel {
+                    state: crate::metrics::SegmentState::quarantined,
+                })
+                .inc();
         }
         Err(qe) => {
             error!(path = %segment.display(), error = %qe, reason, "drain: failed to quarantine segment; left on disk");
@@ -1012,19 +1172,28 @@ async fn commit_batch<S: Sink>(
     metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
 ) -> BatchResult {
-    // Convert payloads to the sink's record type. Cloning here keeps the original
-    // payloads available for dead-lettering on a Permanent error.
-    let records: Vec<S::Record> = payloads
-        .iter()
-        .cloned()
-        .map(S::Record::from_payload)
-        .collect();
+    // Derive the batch's dedup token. This runs on the drain thread — off the
+    // fsync path entirely — and costs ~170 us per 256 KiB against a sink commit
+    // measured in milliseconds.
+    //
+    // Batch-scoped, not segment-scoped: `process_segment` splits a segment into
+    // `max_batch_size` chunks and calls this once per chunk, so a token shared
+    // across chunks would make a dedup-capable sink discard every chunk after
+    // the first.
+    let dedup_token = weir_sink_sdk::DedupToken::for_payloads(payloads.iter());
+
+    // Clone into an owned Vec so the caller's `payloads` stay available for
+    // dead-lettering on a Permanent error. `Payload` is `Bytes`, so each clone
+    // is a refcount bump. (weir 1.x also ran every payload through
+    // `SinkRecord::from_payload` here; that conversion was the identity in every
+    // implementation that ever existed, and 2.0 removes it.)
+    let batch = weir_sink_sdk::SinkBatch::new(payloads.to_vec(), dedup_token);
 
     let t = std::time::Instant::now();
     // Backstop timeout: a sink that hangs (e.g. a third-party sink with no
     // internal timeout) must not stall the drain forever. On elapse, treat it
     // as a transient error so the segment is retried.
-    let commit = match tokio::time::timeout(config.commit_timeout, sink.commit(records)).await {
+    let commit = match tokio::time::timeout(config.commit_timeout, sink.commit(batch)).await {
         Ok(inner) => inner,
         Err(_elapsed) => {
             metrics
@@ -1078,7 +1247,7 @@ async fn commit_batch<S: Sink>(
                 let dead_payloads: Vec<Payload> = commit_result
                     .dead_lettered
                     .into_iter()
-                    .map(|(r, _reason)| r.into_payload())
+                    .map(|(payload, _reason)| payload)
                     .collect();
                 // A failed dead-letter write (or a cap block) must NOT fall through
                 // to Ok: confirming would delete the segment with these records
@@ -1207,6 +1376,8 @@ fn estimated_write_bytes(payloads: &[Payload]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::SinkBatch;
+    use crate::wab::format::Compression;
     use crate::{
         metrics::Metrics,
         sink::{CommitResult, SinkHealth},
@@ -1294,7 +1465,7 @@ mod tests {
         }
     }
 
-    type MockResult = Result<CommitResult<Payload>, MockError>;
+    type MockResult = Result<CommitResult, MockError>;
 
     struct MockSink {
         responses: Mutex<VecDeque<MockResult>>,
@@ -1440,10 +1611,10 @@ mod tests {
     }
 
     impl crate::sink::Sink for MockSink {
-        type Record = Payload;
         type Error = MockError;
 
-        async fn commit(&self, batch: Vec<Payload>) -> MockResult {
+        async fn commit(&self, batch: SinkBatch) -> MockResult {
+            let batch = batch.into_records();
             let nth = self.call_count.fetch_add(1, Ordering::Relaxed) + 1;
             self.call_timestamps.lock().unwrap().push(Instant::now());
             if nth <= self.panic_calls {
@@ -1502,6 +1673,53 @@ mod tests {
             .get()
     }
 
+    fn segments_quarantined_family(m: &Metrics) -> u64 {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        m.wab_segments
+            .get_or_create(&SegmentStateLabel {
+                state: SegmentState::quarantined,
+            })
+            .get()
+    }
+
+    #[test]
+    fn drain_quarantine_bumps_both_counters_like_every_other_site() {
+        // `wab::recovery::quarantine_and_count`'s docstring asserts the
+        // invariant: "Every segment-quarantine site funnels through here so the
+        // recovery_segments_quarantined counter and the
+        // wab_segments{state=quarantined} gauge are ALWAYS bumped ... If you
+        // add a third, route it here."
+        //
+        // `quarantine_segment` IS that third site, and it called the bare
+        // `quarantine()`, bumping only the flat counter. So a drain-time
+        // quarantine moved one series and a recovery-time quarantine moved two,
+        // and the two silently diverged — with no way to tell from the metrics
+        // whether the gap meant "drain quarantined something" or "a counter is
+        // broken".
+        let wab_dir = tmp_dir("quarantine_both_counters");
+        let seg = wab_dir.join("shard_00__seg_00000007.wab.sealed");
+        std::fs::write(&seg, b"corrupt").unwrap();
+
+        let metrics = noop_metrics();
+        let config = fast_config(wab_dir.clone());
+
+        let before_flat = metrics.recovery_segments_quarantined.get();
+        let before_family = segments_quarantined_family(&metrics);
+
+        quarantine_segment(&seg, &config, &metrics, "test");
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            before_flat + 1,
+            "the flat counter must move"
+        );
+        assert_eq!(
+            segments_quarantined_family(&metrics),
+            before_family + 1,
+            "wab_segments{{state=quarantined}} must move too, or the two series diverge"
+        );
+    }
+
     fn records_committed(m: &Metrics) -> u64 {
         m.sink_commit_records
             .get_or_create(&OutcomeLabel {
@@ -1543,6 +1761,30 @@ mod tests {
             == 1.0
     }
 
+    fn drain_state_of(m: &Metrics, state: DrainStateValue) -> f64 {
+        m.drain_state
+            .get_or_create(&DrainStateLabel { state })
+            .get()
+    }
+
+    /// Asserts the drain gauge reports the terminal state — i.e. the supervisor
+    /// told the truth on its way out instead of leaving `draining` frozen at 1.
+    fn assert_drain_reports_stopped(m: &Metrics, context: &str) {
+        assert_eq!(
+            drain_state_of(m, DrainStateValue::stopped),
+            1.0,
+            "{context}: weir_drain_state{{state=\"stopped\"}} must be 1 once the \
+             supervisor has exited"
+        );
+        assert_eq!(
+            drain_state_of(m, DrainStateValue::draining),
+            0.0,
+            "{context}: weir_drain_state{{state=\"draining\"}} must be 0 once the \
+             supervisor has exited — a frozen 1 tells operators (and the WAB \
+             growth warning) that delivery is still happening"
+        );
+    }
+
     fn tmp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weir_drain_{label}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1554,7 +1796,7 @@ mod tests {
         let shard_dir = dir.join("shard_00");
         std::fs::create_dir_all(&shard_dir).unwrap();
         let path = segment_path(&shard_dir, 1);
-        let mut seg = WabSegment::create(&path, shard_id).unwrap();
+        let mut seg = WabSegment::create(&path, shard_id, Compression::None).unwrap();
         for p in payloads {
             seg.write_record(p).unwrap();
         }
@@ -1606,7 +1848,7 @@ mod tests {
     #[test]
     fn commit_result_separates_committed_and_dead_lettered() {
         let p: Payload = Payload::from(b"hello".as_ref());
-        let result: CommitResult<Payload> =
+        let result: CommitResult =
             CommitResult::new(vec![p.clone()], vec![(p.clone(), "reason".into())]);
         assert_eq!(result.committed.len(), 1);
         assert_eq!(result.dead_lettered.len(), 1);
@@ -1656,7 +1898,7 @@ mod tests {
         // Confirmed file should exist; check_confirmed should return true.
         let confirmed = get_confirmed_path(&sealed);
         assert!(confirmed.exists());
-        let _ok = crate::wab::recovery::check_confirmed(&sealed, &dir).unwrap();
+        let _ok = crate::wab::recovery::check_confirmed(&sealed, &dir, &noop_metrics()).unwrap();
         let bytes = std::fs::read(&confirmed).unwrap();
         assert!(crate::wab::format::parse_confirmed(&bytes).is_ok());
 
@@ -1986,7 +2228,7 @@ mod tests {
         std::fs::create_dir_all(&shard_dir).unwrap();
         let mk = |counter: u64, payload: &[u8]| {
             let p = segment_path(&shard_dir, counter);
-            let mut s = WabSegment::create(&p, 0).unwrap();
+            let mut s = WabSegment::create(&p, 0, Compression::None).unwrap();
             s.write_record(payload).unwrap();
             s.seal().unwrap()
         };
@@ -2029,7 +2271,7 @@ mod tests {
         std::fs::create_dir_all(&shard_dir).unwrap();
         let mk = |counter: u64, payload: &[u8]| {
             let p = segment_path(&shard_dir, counter);
-            let mut s = WabSegment::create(&p, 0).unwrap();
+            let mut s = WabSegment::create(&p, 0, Compression::None).unwrap();
             s.write_record(payload).unwrap();
             s.seal().unwrap()
         };
@@ -2056,6 +2298,56 @@ mod tests {
             !get_confirmed_path(&sa).exists() && !get_confirmed_path(&sb).exists(),
             "after giving up, delivery stops — no segment is confirmed"
         );
+        assert_drain_reports_stopped(&metrics, "respawn budget exhausted");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The second permanent-stop path, and the one the whole-branch review
+    /// reproduced against a live daemon: `DeadLetterWriter::open` fails, so
+    /// `drain_thread` returns *cleanly* before its loop ever starts, which the
+    /// supervisor reads as `Ok(())` and breaks on. No panic, no respawn, no log
+    /// beyond one ERROR line — and, before this fix, no gauge movement either:
+    /// `drain_state` stayed pre-initialised at `draining = 1` forever while
+    /// nothing was delivered, which also kept `drain_is_healthy` (main.rs) true
+    /// and the WAB growth warning permanently silent.
+    #[test]
+    fn drain_supervisor_publishes_stopped_when_the_dead_letter_writer_cannot_open() {
+        let dir = tmp_dir("drain_dl_open_fails");
+        // A regular file where the dead-letter DIRECTORY must be: create_dir_private
+        // fails with EEXIST, exactly as the reviewer's reproduction did.
+        let blocker = dir.join("dead_letter");
+        std::fs::remove_dir_all(&blocker).ok();
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+
+        assert_eq!(
+            drain_panics(&metrics),
+            0,
+            "this path returns cleanly — it is NOT a panic, which is why the \
+             supervisor never respawns and the gauge is the only signal"
+        );
+        assert_drain_reports_stopped(&metrics, "dead-letter writer would not open");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The third exit: an ordinary clean shutdown (drain channel closed). The
+    /// drain genuinely is no longer draining, so it must say so here too —
+    /// otherwise a scrape taken during shutdown still reads `draining = 1`.
+    #[test]
+    fn drain_supervisor_publishes_stopped_on_clean_shutdown() {
+        let dir = tmp_dir("drain_clean_stop");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed).unwrap();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        run_drain(rx, tx, sink, fast_config(dir.clone()), metrics.clone());
+
+        assert_drain_reports_stopped(&metrics, "clean shutdown");
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -2225,7 +2517,21 @@ mod tests {
             .collect();
         let sink = Arc::new(MockSink::with_responses(responses));
         let metrics = noop_metrics();
-        run_drain(rx, tx, sink, fast_config(dir.clone()), Arc::clone(&metrics));
+        // Push the health poll out of reach. `fast_config`'s 50 ms cadence races
+        // this assertion: stranding the segment marks the sink down, the next
+        // poll sees MockSink report healthy again, and that down→up edge is the
+        // 4a auto-resume — it rescans, re-queues this very segment, and by then
+        // the scripted responses are exhausted so the redelivery SUCCEEDS and the
+        // segment is confirmed and deleted. Whether the drain exits before the
+        // poll fires is pure timing, which made this test machine-dependent. The
+        // resume behaviour has its own test
+        // (`stranded_segment_resumes_when_sink_recovers`); this one is about what
+        // happens when the retry budget runs out.
+        let config = DrainConfig {
+            health_poll_interval: Duration::from_secs(3600),
+            ..fast_config(dir.clone())
+        };
+        run_drain(rx, tx, sink, config, Arc::clone(&metrics));
 
         assert!(
             sealed.exists(),
@@ -2238,6 +2544,67 @@ mod tests {
             metrics.drain_segments_stranded.get(),
             1,
             "stranding a segment must increment weir_drain_segments_stranded_total"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// W2. At shutdown the retry backoff is CLAMPED, not eliminated.
+    ///
+    /// The drain only learns of shutdown as the drain channel disconnecting, and
+    /// it used to `break` out of the interruptible backoff on that signal — so
+    /// every remaining attempt fired back-to-back with zero delay (the chaos
+    /// harness measured four segments burning all `MAX_RETRIES` in 0.4 ms). Three
+    /// attempts inside one instant against a sink that needs milliseconds to
+    /// answer fail identically for the same reason: the budget bought one
+    /// effective attempt, not three, and forced a strand a brief delay might have
+    /// avoided.
+    ///
+    /// With a 5 s base delay the unclamped schedule would be 5 + 10 + 20 + 40 s.
+    /// The two bounds below are the whole property: **not zero** (each retry is a
+    /// genuinely independent sample) and **far below one full backoff** (shutdown
+    /// stays prompt).
+    #[test]
+    fn shutdown_clamps_the_retry_backoff_instead_of_zeroing_it() {
+        let dir = tmp_dir("shutdown_backoff");
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let responses: Vec<MockResult> = (0..=MAX_RETRIES)
+            .map(|_| Err(MockError::Transient))
+            .collect();
+        let sink = Arc::new(MockSink::with_responses(responses));
+        let metrics = noop_metrics();
+        // A base delay far larger than the clamp, so an unclamped wait is
+        // unmistakable and a zeroed one equally so.
+        let config = DrainConfig {
+            base_retry_delay: Duration::from_secs(5),
+            ..fast_config(dir.clone())
+        };
+
+        // run_drain drops the channel immediately — i.e. the whole retry episode
+        // runs in the shutdown regime.
+        let started = Instant::now();
+        run_drain(rx, tx, sink, config, Arc::clone(&metrics));
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            1,
+            "the segment still strands once the budget is spent"
+        );
+        // The RetryingTransient arm is entered MAX_RETRIES + 1 times (each retry
+        // plus the final give-up pass), so the expected total is ~4 × the clamp.
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "shutdown retries must still be spaced by the clamped backoff, not fired \
+             back-to-back with zero delay (elapsed {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown must not sleep out a full base_retry_delay, let alone the \
+             5 + 10 + 20 + 40 s exponential schedule (elapsed {elapsed:?})"
         );
 
         std::fs::remove_dir_all(dir).ok();
@@ -2475,7 +2842,7 @@ mod tests {
         let held = make_sealed_segment(&dir, 0, &[b"held"]);
         let shard_dir = dir.join("shard_00");
         let other_active = segment_path(&shard_dir, 2);
-        let mut s = WabSegment::create(&other_active, 0).unwrap();
+        let mut s = WabSegment::create(&other_active, 0, Compression::None).unwrap();
         s.write_record(b"other").unwrap();
         let other = s.seal().unwrap();
 
@@ -2529,12 +2896,12 @@ mod tests {
         std::fs::create_dir_all(&shard_dir).unwrap();
 
         let seg1_active = segment_path(&shard_dir, 1);
-        let mut s1 = WabSegment::create(&seg1_active, 0).unwrap();
+        let mut s1 = WabSegment::create(&seg1_active, 0, Compression::None).unwrap();
         s1.write_record(b"seg1").unwrap();
         let seg1 = s1.seal().unwrap();
 
         let seg2_active = segment_path(&shard_dir, 2);
-        let mut s2 = WabSegment::create(&seg2_active, 0).unwrap();
+        let mut s2 = WabSegment::create(&seg2_active, 0, Compression::None).unwrap();
         s2.write_record(b"seg2").unwrap();
         let seg2 = s2.seal().unwrap();
 
@@ -2548,12 +2915,23 @@ mod tests {
         responses.push(MockSink::ok(vec![Payload::from(b"seg2".as_ref())]));
         // seg1's resume (after seg2 confirms) gets MockSink's default Ok.
         let sink = Arc::new(MockSink::with_responses(responses));
-        run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
+        // The stranded-resume rescan runs at the idle health poll. This test
+        // asserts seg1 is STILL stranded when the drain exits, so the poll must
+        // not fire during the run. fast_config's 50 ms is short enough that
+        // under parallel load the clamped shutdown backoff (d522ce2 / W2) lets
+        // the poll fire, resume seg1, and delete it — the assertion below then
+        // fails ~2 runs in 3. The resume path is covered separately by
+        // `stranded_segment_resumes_when_sink_recovers`.
+        let config = DrainConfig {
+            health_poll_interval: Duration::from_secs(3600),
+            ..fast_config(dir.clone())
+        };
+        run_drain(rx, tx, sink, config, noop_metrics());
 
         // seg2 is delivered without being blocked by seg1 exhausting its retries
-        // (a stranded segment doesn't stall the queue). seg1 stays stranded here
-        // because run_drain drops the channel, so the drain never reaches the idle
-        // poll where the sink-recovery rescan runs (that path is covered by
+        // (a stranded segment doesn't stall the queue) — that is what this test
+        // is for. seg1 stays stranded because the health poll is pinned above so
+        // the sink-recovery rescan cannot run (that path is covered by
         // stranded_segment_resumes_when_sink_recovers).
         assert!(seg1.exists(), "seg1 left on disk after exhausted retries");
         assert!(!seg2.exists(), "seg2 confirmed and deleted");
@@ -3276,7 +3654,21 @@ mod tests {
         let responses: Vec<MockResult> = (0..=MAX_RETRIES + 1)
             .map(|_| Err(MockError::TransientWithRetryAfter(LONG)))
             .collect();
-        let sink = Arc::new(MockSink::with_responses(responses));
+        // The probe reports Down for the whole test, matching the scenario: a sink
+        // that transiently fails every POST is a sink that is out. This has to be
+        // explicit now that the shutdown backoff is clamped rather than dropped
+        // (W2) — the retry episode outlives `health_poll_interval`, so a probe that
+        // answered Healthy would give the Draining arm a down→up edge, re-queue the
+        // stranded segment via the 4a auto-resume and deliver it before exit. That
+        // is a legitimate (better) outcome, but it is not the S15 property, and
+        // pinning it here would make this test about auto-resume instead of about
+        // shutdown latency.
+        let sink = Arc::new(MockSink {
+            health_script: Mutex::new(
+                std::iter::repeat_n(SinkHealth::Down("test".into()), 64).collect(),
+            ),
+            ..MockSink::with_responses(responses)
+        });
         let metrics = noop_metrics();
         let handle = spawn(rx, sink.clone(), fast_config(dir.clone()), metrics.clone());
 

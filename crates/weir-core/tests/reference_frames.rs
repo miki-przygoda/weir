@@ -22,7 +22,7 @@ const REFERENCE_PUSH_HELLO_SYNC: &[u8; 25] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x01, // message_type = Push (0x01)
-    0x01, // durability  = Sync (0x01)
+    0x01, // durability  = Durable (0x01)
     0x00, // flags
     0x05, 0x00, 0x00, 0x00, // payload_len = 5 (LE u32)
     0x66, 0xad, 0x7d, 0x3c, // header_crc32 (LE u32)
@@ -34,7 +34,7 @@ const REFERENCE_PUSH_HELLO_SYNC: &[u8; 25] = &[
 
 #[test]
 fn push_hello_sync_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::Push, Durability::Sync, 0);
+    let header = Header::new(MessageType::Push, Durability::Durable, 0);
     assert_eq!(
         header.version(),
         WIRE_VERSION,
@@ -61,7 +61,7 @@ const REFERENCE_ACK: &[u8; 20] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x02, // message_type = Ack (0x02)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x00, 0x00, 0x00, 0x00, // payload_len = 0
     0xc9, 0x47, 0x4b, 0x3a, // header_crc32
@@ -70,7 +70,7 @@ const REFERENCE_ACK: &[u8; 20] = &[
 
 #[test]
 fn ack_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::Ack, Durability::Sync, 0);
+    let header = Header::new(MessageType::Ack, Durability::Durable, 0);
     let envelope = Envelope::new(header, Vec::new());
     let encoded = envelope.encode();
     assert_eq!(
@@ -92,7 +92,7 @@ const REFERENCE_NACK_PAYLOAD_TOO_LARGE: &[u8; 21] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x03, // message_type = Nack (0x03)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x01, 0x00, 0x00, 0x00, // payload_len = 1
     0x18, 0x2b, 0x80, 0x24, // header_crc32
@@ -103,7 +103,7 @@ const REFERENCE_NACK_PAYLOAD_TOO_LARGE: &[u8; 21] = &[
 #[test]
 fn nack_payload_too_large_encodes_to_reference_bytes() {
     use weir_core::NackReason;
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
+    let header = Header::new(MessageType::Nack, Durability::Durable, 0);
     let envelope = Envelope::new(header, vec![NackReason::PayloadTooLarge as u8]);
     let encoded = envelope.encode();
     assert_eq!(
@@ -128,7 +128,7 @@ const REFERENCE_NACK_VERSION_MISMATCH: &[u8; 22] = &[
     0x52, // magic = "WEIR"
     0x01, // version = 1
     0x03, // message_type = Nack (0x03)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x02,
     0x00,
@@ -149,7 +149,7 @@ const REFERENCE_NACK_VERSION_MISMATCH: &[u8; 22] = &[
 #[test]
 fn nack_version_mismatch_encodes_to_reference_bytes() {
     use weir_core::NackReason;
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
+    let header = Header::new(MessageType::Nack, Durability::Durable, 0);
     let envelope = Envelope::new(
         header,
         vec![NackReason::VersionMismatch as u8, WIRE_VERSION],
@@ -173,7 +173,7 @@ const REFERENCE_NACK_BAD_HEADER_CRC: &[u8; 21] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x03, // message_type = Nack (0x03)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x01, 0x00, 0x00, 0x00, // payload_len = 1
     0x18, 0x2b, 0x80, 0x24, // header_crc32 (same header as PayloadTooLarge)
@@ -184,7 +184,7 @@ const REFERENCE_NACK_BAD_HEADER_CRC: &[u8; 21] = &[
 #[test]
 fn nack_bad_header_crc_encodes_to_reference_bytes() {
     use weir_core::NackReason;
-    let header = Header::new(MessageType::Nack, Durability::Sync, 0);
+    let header = Header::new(MessageType::Nack, Durability::Durable, 0);
     let envelope = Envelope::new(header, vec![NackReason::BadHeaderCrc as u8]);
     let encoded = envelope.encode();
     assert_eq!(
@@ -204,7 +204,7 @@ const REFERENCE_HEALTHCHECK: &[u8; 20] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x04, // message_type = HealthCheck (0x04)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x00, 0x00, 0x00, 0x00, // payload_len = 0
     0xf3, 0x72, 0x9b, 0x59, // header_crc32
@@ -213,7 +213,7 @@ const REFERENCE_HEALTHCHECK: &[u8; 20] = &[
 
 #[test]
 fn healthcheck_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::HealthCheck, Durability::Sync, 0);
+    let header = Header::new(MessageType::HealthCheck, Durability::Durable, 0);
     let envelope = Envelope::new(header, Vec::new());
     let encoded = envelope.encode();
     assert_eq!(
@@ -233,7 +233,7 @@ const REFERENCE_HEALTHCHECK_RESPONSE: &[u8; 20] = &[
     0x57, 0x45, 0x49, 0x52, // magic = "WEIR"
     0x01, // version = 1
     0x05, // message_type = HealthCheckResponse (0x05)
-    0x01, // durability = Sync (filler)
+    0x01, // durability = Durable (filler)
     0x00, // flags
     0x00, 0x00, 0x00, 0x00, // payload_len = 0
     0x47, 0x79, 0xec, 0xff, // header_crc32
@@ -242,7 +242,7 @@ const REFERENCE_HEALTHCHECK_RESPONSE: &[u8; 20] = &[
 
 #[test]
 fn healthcheck_response_encodes_to_reference_bytes() {
-    let header = Header::new(MessageType::HealthCheckResponse, Durability::Sync, 0);
+    let header = Header::new(MessageType::HealthCheckResponse, Durability::Durable, 0);
     let envelope = Envelope::new(header, Vec::new());
     let encoded = envelope.encode();
     assert_eq!(

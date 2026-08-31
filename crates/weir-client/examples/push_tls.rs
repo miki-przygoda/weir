@@ -107,7 +107,7 @@ fn main() {
         client_key: &key,
         ca_cert: &ca,
         server_name: &server_name,
-        default_durability: Some(Durability::Batched),
+        default_durability: Some(Durability::Durable),
     };
 
     let mut client = WeirClient::connect_tls(&addr, tls_cfg).unwrap_or_else(|e| {

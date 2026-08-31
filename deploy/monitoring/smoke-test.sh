@@ -107,6 +107,36 @@ echo "[invariants] durability + health (healthy fleet; chaos excluded)..."
 [ "$(promq 'sum(weir_sink_health{job!="weir-chaos", state="degraded"})+2*sum(weir_sink_health{job!="weir-chaos", state="down"})')" = "0" ]; check "sink health = Healthy (non-chaos)" $?
 [ "$(promq 'sum(weir_drain_state{job!="weir-chaos", state="retrying_transient"})+2*sum(weir_drain_state{job!="weir-chaos", state="blocked_dead_letter_full"})')" = "0" ]; check "drain state = Draining (non-chaos)" $?
 
+# Grafana's HTTP API comes up AFTER the container reports healthy, and the setup
+# wait above only blocks on Prometheus having scraped weir. Nothing waited on
+# Grafana, so the first two checks in this section raced its startup.
+#
+# That is how it failed in CI on 2026-08-31, and the timestamps are unambiguous:
+#
+#   19:54:22.32  FAIL  dashboard provisioned
+#   19:54:22.73  FAIL  Grafana -> Prometheus datasource healthy
+#   19:54:23.42  PASS  ingest-by-tier panel returns data   <- same Grafana
+#
+# Grafana finished starting between the second and third check. The panel
+# queries pass because by the time they run it is up; the two admin-API checks
+# are simply the ones that arrive first and eat the race. It never reproduces on
+# a developer machine, where Grafana is ready long before the ingest window
+# closes — a textbook works-on-my-machine readiness bug.
+echo "[ui] waiting for Grafana's API..."
+grafana_ready=0
+for _ in $(seq 1 60); do
+  if [ "$(curl -fsS -u "$GAUTH" "$GRAF/api/health" 2>/dev/null \
+          | python3 -c 'import sys,json;print(json.load(sys.stdin).get("database"))' 2>/dev/null)" = "ok" ]; then
+    grafana_ready=1
+    break
+  fi
+  sleep 1
+done
+if [ "$grafana_ready" -ne 1 ]; then
+  echo "  Grafana API did not become ready within 60s — the checks below would"
+  echo "  report a stack failure that is really a startup timeout."
+fi
+
 echo "[ui] UI data correct (panel queries via Grafana datasource proxy)..."
 curl -fsS -u "$GAUTH" "$GRAF/api/dashboards/uid/weir-overview" >/dev/null 2>&1; check "dashboard provisioned (uid weir-overview)" $?
 [ "$(curl -fsS -u "$GAUTH" "$GRAF/api/datasources/uid/prometheus/health" 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status"))' 2>/dev/null)" = "OK" ]; check "Grafana → Prometheus datasource healthy" $?

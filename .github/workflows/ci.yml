@@ -58,10 +58,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+      # weir-server's bin unit tests run serially: socket::bind_hardened mutates
+      # the process-global umask around bind(2), so a directory created by
+      # another thread in that window loses its execute bit (~66 spurious
+      # PermissionDenied failures). See docs/security/socket-bind.md.
+      - run: cargo test --workspace --exclude weir-server
+      - run: cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener
+      - run: cargo test -p weir-server --bins -- --test-threads=1
       # Build + run the clickhouse-sink and tls test code, which the default
       # feature set never compiles (S08). --all-features pulls in both.
-      - run: cargo test --all-features
+      - run: cargo test --workspace --exclude weir-server --all-features
+      - run: cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener --all-features
+      - run: cargo test -p weir-server --bins --all-features -- --test-threads=1
 
   dst:
     name: dst (sim sweep)

@@ -81,7 +81,7 @@ nothing to wire up:
 
 ```bash
 weir-ctl push --socket /tmp/weir-quickstart/run/weir.sock 'hello, weir!'
-# ack  12 bytes, Batched
+# ack  12 bytes, Durable
 ```
 
 **A small load — the bundled example.** From the weir checkout, in a second
@@ -93,8 +93,8 @@ cargo run --release -p weir-client --example push_simple -- \
     --socket /tmp/weir-quickstart/run/weir.sock --count 5
 ```
 
-> `push_simple` pushes `--count` records at **each** durability tier (Sync,
-> Batched, Buffered), so `--count 5` sends **15** records in total.
+> `push_simple` pushes `--count` records at **each** durability tier (Durable,
+> Buffered), so `--count 5` sends **10** records in total.
 
 > **Before you build a producer — three gotchas that compile and pass a smoke
 > test, then bite under load:**
@@ -111,7 +111,7 @@ cargo run --release -p weir-client --example push_simple -- \
 >    Details in the [Ack ≠ delivered](#what-just-happened) note below.
 > 3. **`Buffered` is not power-loss durable.** It acks *before* fsync. A process
 >    crash survives (page cache), but power loss / OS crash is a loss window — use
->    `Sync`/`Batched` for data you can't lose. (macOS is not power-safe at any
+>    `Durable` for data you can't lose. (macOS is not power-safe at any
 >    tier; see the durability-tier notes in [Internals](../architecture.md).)
 
 **From your own project.** When you're ready to push from your own code,
@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // server-assigned offset or id comes back. A dropped/ignored result hides a
     // failed push, so `push` is #[must_use]; handle it (here via `?`).
     let payload = b"hello, weir!";
-    client.push(payload, Durability::Sync)?; // Sync = fsync before ack
+    client.push(payload, Durability::Durable)?; // Durable = fsync before ack
     println!("pushed {} bytes", payload.len());
 
     // Verify the daemon is healthy.
@@ -188,10 +188,10 @@ You'll see weir's Prometheus metric families (the full catalogue is in
 ```
 # HELP weir_records_accepted Total records accepted from producers, by durability tier
 # TYPE weir_records_accepted counter
-weir_records_accepted_total{tier="sync"} 1
+weir_records_accepted_total{tier="durable"} 1
 # HELP weir_records_ack Total records acknowledged to producers, by durability tier
 # TYPE weir_records_ack counter
-weir_records_ack_total{tier="sync"} 1
+weir_records_ack_total{tier="durable"} 1
 ...
 ```
 
@@ -215,7 +215,7 @@ When you called `client.push(...)`:
 3. The record was pushed onto the bounded queue. A worker thread
    picked it up and routed it to shard 0's flusher.
 4. The shard's flusher accumulated it into a batch. Because you asked
-   for `Sync` durability, the batch was fsynced immediately (no
+   for `Durable` durability, the batch was fsynced immediately (no
    waiting for siblings).
 5. The daemon sent the Ack frame back. Your client returned.
 6. The drain thread later read the sealed WAB segment, committed it
@@ -227,7 +227,7 @@ For the full pipeline detail, see
 [architecture.md](../architecture.md).
 
 > **Ack ≠ delivered.** A successful `push` means the record is durably
-> *buffered* (fsynced for `Sync`/`Batched`), **not** that it has reached the
+> *buffered* (fsynced for `Durable`), **not** that it has reached the
 > sink. The drain forwards records only after a WAB segment *seals* — at its
 > size threshold (`segment_max_bytes`, default 256 MiB) or on shutdown. So with
 > a handful of small records the sink isn't touched until you stop the daemon,

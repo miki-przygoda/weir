@@ -67,8 +67,10 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
         }
         // Skip the daemon's reserved subdirs — they aren't shards. dead_letter/
         // (dl_*.wab.sealed) has its own weir_dead_letter_bytes_on_disk gauge, and
-        // quarantine/ holds forensic .wab.sealed copies; counting either here
-        // would double-count live-segment bytes (G15, mirrors recovery's skip).
+        // quarantine/ holds forensic copies (both `.wab` and `.wab.sealed`,
+        // depending on whether crash recovery or the drain preserved them; see
+        // docs/wab_format.md); counting either here would double-count
+        // live-segment bytes (G15, mirrors recovery's skip).
         let dir_name = shard_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -88,6 +90,139 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Number of 5 s samples the growth warning considers (60 s).
+const WAB_GROWTH_WINDOW: usize = 12;
+
+/// How long the WAB growth warning stays quiet after firing. The polling task
+/// evaluates the warning every 5 s, so without this it would log 60 times a
+/// minute for as long as the condition held.
+const WAB_GROWTH_WARN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Whether the growth warning is allowed to fire again at `now`.
+///
+/// Extracted from the polling task's closure for the same reason
+/// [`should_warn_wab_growth`] and [`drain_is_healthy`] were: it is the third
+/// piece of the warning's decision and the only one that was left inline, so it
+/// was the only one no test could reach. `saturating_duration_since` rather than
+/// `elapsed`/subtraction so a `now` behind `last_warned` reads as "not yet due"
+/// instead of panicking.
+fn growth_warning_is_due(last_warned: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match last_warned {
+        // Never warned: the first qualifying window fires immediately.
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= WAB_GROWTH_WARN_INTERVAL,
+    }
+}
+
+/// Fold one WAB-size scan into the polling task's state, returning the size on
+/// success and `None` when the scan failed to join.
+///
+/// The `Err` arm lives in here rather than at the call site on purpose. The
+/// defect this replaced was `.await.unwrap_or(0)`, which is a call-site
+/// substitution — a test of a function that already takes `Option<u64>` would
+/// pass with that bug fully reintroduced. Taking the `JoinResult` itself is what
+/// makes the test load-bearing.
+///
+/// A join failure must not be papered over in either direction. Storing 0 reads
+/// as "the WAB is empty" and lifts the cap entirely until the next tick, failing
+/// open on the one feature whose job is to fail closed; pushing the previous
+/// value again reads as "not growing" and suppresses the growth warning for a
+/// whole window. So neither the gauge, the shared atomic, nor the window moves —
+/// the last known size stands, 5 s stale, which is exactly the staleness the cap
+/// is already documented to carry.
+fn apply_wab_scan(
+    scan: Result<u64, tokio::task::JoinError>,
+    samples: &mut Vec<u64>,
+    metrics: &crate::metrics::Metrics,
+    wab_bytes_now: &std::sync::atomic::AtomicU64,
+) -> Option<u64> {
+    let bytes = match scan {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "WAB byte scan failed to join; keeping the last known size. The \
+                 wab_max_bytes cap and weir_wab_bytes_on_disk are stale until the \
+                 next tick."
+            );
+            return None;
+        }
+    };
+    metrics.wab_bytes_on_disk.set(bytes as f64);
+    wab_bytes_now.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    samples.push(bytes);
+    if samples.len() > WAB_GROWTH_WINDOW {
+        samples.remove(0);
+    }
+    Some(bytes)
+}
+
+/// Whether to warn that the WAB is growing unbounded.
+///
+/// All three must hold:
+/// 1. no cap is set — with one set, the cap handles it and the warning is noise;
+/// 2. the window is full and shows net growth that never gave ground;
+/// 3. the sink is unhealthy or the drain is not draining.
+///
+/// Condition 3 is the one that matters. Sustained growth under a healthy drain
+/// is just a fast producer; warning on that teaches operators to ignore the
+/// message, which defeats the purpose.
+///
+/// Condition 2 is deliberately NOT "every step was non-decreasing". A *degraded*
+/// sink — one delivering some batches and failing others, which the spec names as
+/// a case this must catch — deletes a confirmed segment every so often, and each
+/// deletion drops the byte count for one sample. Under a strict per-step rule a
+/// single such dip anywhere in the 12-sample window resets the whole detector, so
+/// the warning would only ever fire for a *fully* dead sink. The rule here is
+/// weaker per-step but just as strong end-to-end: the window must end above where
+/// it started and must never have fallen below where it started. A WAB that is
+/// genuinely draining dips under its own starting point and still does not warn.
+fn should_warn_wab_growth(samples: &[u64], wab_max_bytes: u64, drain_healthy: bool) -> bool {
+    if wab_max_bytes != 0 || drain_healthy || samples.len() < WAB_GROWTH_WINDOW {
+        return false;
+    }
+    let window = &samples[samples.len() - WAB_GROWTH_WINDOW..];
+    let first = window[0];
+    let last = window[window.len() - 1];
+    last > first && window.iter().all(|&s| s >= first)
+}
+
+/// Reads the live `weir_sink_health` and `weir_drain_state` gauges and
+/// composes them into condition 3 of `should_warn_wab_growth`: is the drain
+/// healthy right now.
+///
+/// Returns `true` only when the sink is healthy AND the drain is actively
+/// draining. That `&&` is the whole point: condition 3 is "sink unhealthy OR
+/// not draining", and by De Morgan that is exactly NOT(healthy AND draining).
+/// The negation happens in the caller — `should_warn_wab_growth` takes this
+/// value as `drain_healthy` and returns `false` early when it is `true`. So a
+/// swapped `&&`/`||` here silently inverts which failures the warning covers.
+///
+/// Pulled out of the background task's closure (rather than left inline) so this
+/// composition — not just the pure predicate — is unit-tested; a swapped
+/// `&&`/`||` or a wrong label variant here would previously compile and pass
+/// every existing test.
+fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
+    // `sink_health` and `drain_state` are Gauge families with the current
+    // state's series set to 1.0, so the live value reads back without any new
+    // plumbing.
+    let sink_healthy = metrics
+        .sink_health
+        .get_or_create(&crate::metrics::SinkHealthLabel {
+            state: crate::metrics::SinkHealthState::healthy,
+        })
+        .get()
+        > 0.0;
+    let draining = metrics
+        .drain_state
+        .get_or_create(&crate::metrics::DrainStateLabel {
+            state: crate::metrics::DrainStateValue::draining,
+        })
+        .get()
+        > 0.0;
+    sink_healthy && draining
 }
 
 // ── TLS SIGHUP reload task ────────────────────────────────────────────────────
@@ -288,6 +423,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 0 = idle-seal disabled (historical behaviour).
         segment_max_age: (config.wab_segment_max_age_secs > 0)
             .then(|| Duration::from_secs(config.wab_segment_max_age_secs)),
+        // "none" (default) keeps segments at format v1, byte-identical to weir
+        // 1.x. Validated at config load, so any other string is unreachable.
+        compression: match config.wab_compression.as_str() {
+            "zstd" => weir_wab::format::Compression::Zstd,
+            _ => weir_wab::format::Compression::None,
+        },
+        compression_level: config.wab_compression_level,
     };
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),
@@ -558,20 +700,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The scan is synchronous I/O (read_dir + metadata per entry) so it
         // runs inside spawn_blocking — putting it directly on a tokio worker
         // would stall the runtime in proportion to the number of segments.
+        //
+        // Shared with the connection handlers so the ingest path can consult the
+        // WAB size without doing any I/O of its own — this task already walks
+        // the directory for the gauge, so the value is free.
+        let wab_bytes_now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Whether the WAB cap is currently rejecting pushes. Created ONCE here
+        // and cloned into every listener so the hysteresis low-water mark is
+        // daemon-wide: a per-listener flag would let the Unix and TCP sides
+        // disagree about whether ingest has resumed.
+        let wab_cap_rejecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let wab_dir_bg = config.wab_dir.clone();
         let metrics_w = Arc::clone(&metrics);
+        let wab_bytes_bg = Arc::clone(&wab_bytes_now);
+        // Captured before the task is spawned so the growth-warning predicate
+        // sees the operator's configured cap without reaching back into `config`.
+        let cap_for_warning = config.wab_max_bytes;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(5));
+            // Rolling window of on-disk-byte samples feeding should_warn_wab_growth,
+            // and the last time that warning actually fired (rate-limited below).
+            let mut samples: Vec<u64> = Vec::with_capacity(WAB_GROWTH_WINDOW + 1);
+            let mut last_warned: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
                 let wab_dir = wab_dir_bg.clone();
-                let bytes = tokio::task::spawn_blocking(move || {
+                let scan = tokio::task::spawn_blocking(move || {
                     compute_wab_bytes_on_disk(&wab_dir)
                 })
-                .await
-                .unwrap_or(0);
-                metrics_w.wab_bytes_on_disk.set(bytes as f64);
+                .await;
+                // On a join failure the last known size stands and this tick
+                // contributes no sample — see `apply_wab_scan` for why neither
+                // 0 nor a repeated value is safe here.
+                let Some(bytes) =
+                    apply_wab_scan(scan, &mut samples, &metrics_w, &wab_bytes_bg)
+                else {
+                    continue;
+                };
+                let drain_healthy = drain_is_healthy(&metrics_w);
+                let due = growth_warning_is_due(last_warned, std::time::Instant::now());
+                if due && should_warn_wab_growth(&samples, cap_for_warning, drain_healthy) {
+                    warn!(
+                        wab_bytes = bytes,
+                        growth_bytes = bytes.saturating_sub(samples[0]),
+                        window_secs = WAB_GROWTH_WINDOW * 5,
+                        "WAB is growing while the sink is not healthy and no wab_max_bytes \
+                         is set — producers are still being acked into an unbounded buffer. \
+                         Set wab_max_bytes to bound it."
+                    );
+                    last_warned = Some(std::time::Instant::now());
+                }
             }
         });
 
@@ -631,6 +812,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         shutdown_timeout_secs: config.shutdown_timeout_secs,
                         connection_read_timeout_secs: config.connection_read_timeout_secs,
                         handshake_timeout_secs: config.tls_handshake_timeout_secs,
+                        wab_max_bytes: config.wab_max_bytes,
+                        wab_bytes_now: Arc::clone(&wab_bytes_now),
+                        wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
                     };
 
                     let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -708,6 +892,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 connection_read_timeout_secs: config.connection_read_timeout_secs,
                 shard_count: config.shard_count,
                 peer_uid_check: config.peer_uid_check,
+                wab_max_bytes: config.wab_max_bytes,
+                wab_bytes_now: Arc::clone(&wab_bytes_now),
+                wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
         }
@@ -762,7 +949,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// for the host's core count. Advisory only — operator config wins.
 ///
 /// **Empirical basis.** A sweep on a 4-core sandbox (herd of 64 producers
-/// × Sync records, `tests/load.rs::sweep_agent_count_vs_throughput`) showed:
+/// × Durable records, `tests/load.rs::sweep_agent_count_vs_throughput`) showed:
 ///
 /// | agent_count | median RPS  | vs cores |
 /// |-------------|-------------|----------|
@@ -777,7 +964,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// thread, and on a 4-core machine those threads compete with the tokio
 /// runtime workers and the accept loop. Fewer agents also means a fatter
 /// group fsync (more concurrent producers' records share one batch),
-/// which is the dominant win on Sync workloads.
+/// which is the dominant win on Durable workloads.
 ///
 /// Heuristic: reserve ~2 cores for the tokio runtime / accept loop / OS,
 /// give each remaining core a 2-thread budget for one agent. So
@@ -882,5 +1069,324 @@ mod wab_bytes_tests {
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WAB_GROWTH_WARN_INTERVAL, growth_warning_is_due, should_warn_wab_growth};
+    use std::time::{Duration, Instant};
+
+    /// Spec §7: "rate limiting holds across repeated polls." The warning's other
+    /// two inputs were extracted for unit testing; this one stayed inline in the
+    /// polling closure and so went untested until now.
+    #[test]
+    fn growth_warning_rate_limit_gates_on_the_full_interval() {
+        let base = Instant::now();
+        assert!(
+            growth_warning_is_due(None, base),
+            "the first qualifying window must warn immediately"
+        );
+        assert!(
+            !growth_warning_is_due(Some(base), base),
+            "a warning just emitted must not repeat on the same instant"
+        );
+        assert!(
+            !growth_warning_is_due(
+                Some(base),
+                base + WAB_GROWTH_WARN_INTERVAL - Duration::from_secs(1)
+            ),
+            "one second short of the interval is not due"
+        );
+        assert!(
+            growth_warning_is_due(Some(base), base + WAB_GROWTH_WARN_INTERVAL),
+            "exactly the interval is due"
+        );
+        assert!(growth_warning_is_due(
+            Some(base),
+            base + WAB_GROWTH_WARN_INTERVAL * 10
+        ));
+    }
+
+    /// The shape the rate limit actually has to survive: the task polls every
+    /// 5 s, and the warning conditions can stay satisfied for hours. Ten minutes
+    /// of ticks with the condition permanently true must produce three warnings
+    /// (t=0, t=300, t=600), not 121.
+    #[test]
+    fn growth_warning_rate_limit_holds_across_repeated_polls() {
+        let base = Instant::now();
+        let mut last_warned: Option<Instant> = None;
+        let mut fired = 0u32;
+        for tick in 0..=120u64 {
+            let now = base + Duration::from_secs(tick * 5);
+            if growth_warning_is_due(last_warned, now) {
+                fired += 1;
+                last_warned = Some(now);
+            }
+        }
+        assert_eq!(
+            fired, 3,
+            "600 s of 5 s polls with the condition always true must warn at \
+             t=0/300/600 only"
+        );
+    }
+
+    #[test]
+    fn growth_warning_fires_only_when_all_three_conditions_hold() {
+        // Growing + unhealthy + no cap => warn.
+        assert!(should_warn_wab_growth(
+            &[
+                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
+            ],
+            0,
+            false,
+        ));
+        // Growing + HEALTHY => no warning. This is the condition that keeps the
+        // message trustworthy: a fast producer must not trigger it.
+        assert!(!should_warn_wab_growth(
+            &[
+                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
+            ],
+            0,
+            true,
+        ));
+        // Growing + unhealthy but a cap IS set => no warning; the cap handles it.
+        assert!(!should_warn_wab_growth(
+            &[
+                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
+            ],
+            64 * 1024 * 1024,
+            false,
+        ));
+        // Flat or shrinking => no warning.
+        assert!(!should_warn_wab_growth(
+            &[500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500],
+            0,
+            false,
+        ));
+        assert!(!should_warn_wab_growth(
+            &[
+                1200, 1100, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100
+            ],
+            0,
+            false,
+        ));
+        // Not enough samples yet => no warning.
+        assert!(!should_warn_wab_growth(&[100, 200, 300], 0, false));
+    }
+
+    /// The shape a *degraded* sink produces: net growth interrupted by dips
+    /// wherever a batch did get delivered and its segment was confirmed and
+    /// deleted. The spec names "slow or degraded sink" as a case this must
+    /// catch, and a strict per-step non-decrease rule never fires on it — one
+    /// dip anywhere in the window resets the detector.
+    #[test]
+    fn growth_warning_fires_on_a_dipping_but_net_growing_window() {
+        assert!(should_warn_wab_growth(
+            &[
+                100, 300, 250, 500, 420, 700, 650, 900, 850, 1100, 1000, 1300
+            ],
+            0,
+            false,
+        ));
+        // A dip exactly back to the starting value is still not giving ground.
+        assert!(should_warn_wab_growth(
+            &[100, 200, 100, 300, 200, 400, 300, 500, 400, 600, 500, 700],
+            0,
+            false,
+        ));
+    }
+
+    /// The counter-case that keeps the weaker rule honest: a WAB that is really
+    /// draining goes BELOW where the window started, and must not warn however
+    /// high it ends up. Without this, "net growth" alone would fire on a sawtooth
+    /// that is comfortably keeping up.
+    #[test]
+    fn growth_warning_stays_silent_when_the_window_dips_below_its_start() {
+        assert!(!should_warn_wab_growth(
+            &[
+                1000, 1200, 900, 1400, 800, 1600, 700, 1800, 600, 2000, 500, 2200
+            ],
+            0,
+            false,
+        ));
+        // A single sample one byte under the start is enough to disqualify it.
+        assert!(!should_warn_wab_growth(
+            &[100, 200, 300, 400, 500, 99, 700, 800, 900, 1000, 1100, 1200],
+            0,
+            false,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod drain_is_healthy_tests {
+    use super::drain_is_healthy;
+    use crate::metrics::{
+        DrainStateLabel, DrainStateValue, Metrics, SinkHealthLabel, SinkHealthState,
+    };
+
+    /// Drives the `sink_health` gauge family exactly the way
+    /// `drain::set_sink_health` does in production: one-hot, active state at
+    /// 1.0, the rest 0.0.
+    fn set_sink_health(m: &Metrics, active: SinkHealthState) {
+        for s in [
+            SinkHealthState::healthy,
+            SinkHealthState::degraded,
+            SinkHealthState::down,
+        ] {
+            let v = if s == active { 1.0 } else { 0.0 };
+            m.sink_health
+                .get_or_create(&SinkHealthLabel { state: s })
+                .set(v);
+        }
+    }
+
+    /// Drives the `drain_state` gauge family exactly the way
+    /// `drain::set_drain_state` does in production: one-hot, active state at
+    /// 1.0, the rest 0.0.
+    fn set_drain_state(m: &Metrics, active: DrainStateValue) {
+        for s in [
+            DrainStateValue::draining,
+            DrainStateValue::retrying_transient,
+            DrainStateValue::blocked_dead_letter_full,
+            DrainStateValue::stopped,
+        ] {
+            let v = if s == active { 1.0 } else { 0.0 };
+            m.drain_state
+                .get_or_create(&DrainStateLabel { state: s })
+                .set(v);
+        }
+    }
+
+    #[test]
+    fn sink_healthy_and_draining_is_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::healthy);
+        set_drain_state(&m, DrainStateValue::draining);
+        assert!(
+            drain_is_healthy(&m),
+            "healthy sink + actively draining must compose to healthy (no warning)"
+        );
+    }
+
+    #[test]
+    fn sink_healthy_but_not_draining_is_not_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::healthy);
+        set_drain_state(&m, DrainStateValue::retrying_transient);
+        assert!(
+            !drain_is_healthy(&m),
+            "a healthy sink that isn't actively draining must not compose to healthy"
+        );
+    }
+
+    #[test]
+    fn sink_unhealthy_but_draining_is_not_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::down);
+        set_drain_state(&m, DrainStateValue::draining);
+        assert!(
+            !drain_is_healthy(&m),
+            "an unhealthy sink must not compose to healthy even while draining"
+        );
+    }
+
+    #[test]
+    fn sink_unhealthy_and_not_draining_is_not_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::down);
+        set_drain_state(&m, DrainStateValue::blocked_dead_letter_full);
+        assert!(!drain_is_healthy(&m));
+    }
+
+    /// The case that made the growth warning structurally unable to fire: the
+    /// drain thread is gone, so nothing updates these gauges any more. The
+    /// supervisor now publishes `stopped` on its way out, and a stopped drain
+    /// must not read as healthy however healthy the *sink* last looked — that
+    /// last reading is stale by definition once nobody is probing it.
+    #[test]
+    fn stopped_drain_is_not_healthy_even_with_a_healthy_sink() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::healthy);
+        set_drain_state(&m, DrainStateValue::stopped);
+        assert!(
+            !drain_is_healthy(&m),
+            "a drain that has exited must never compose to healthy — this is what \
+             lets the WAB growth warning fire when delivery has stopped for good"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_wab_scan_tests {
+    use super::{WAB_GROWTH_WINDOW, apply_wab_scan};
+    use crate::metrics::Metrics;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A real `JoinError`. Aborting a task is the only way to construct one —
+    /// the type has no public constructor — and it is also the realistic cause:
+    /// the blocking scan is cancelled at runtime shutdown.
+    async fn join_error() -> tokio::task::JoinError {
+        let h = tokio::spawn(async { std::future::pending::<()>().await });
+        h.abort();
+        h.await.expect_err("an aborted task must yield a JoinError")
+    }
+
+    #[tokio::test]
+    async fn failed_scan_leaves_the_cap_reading_the_last_known_size() {
+        let m = Metrics::new().0;
+        let mut samples = vec![4_096];
+        // What the cap actually reads. If a failed scan ever writes 0 here, the
+        // cap is lifted entirely until the next tick — the fail-open this test
+        // exists to prevent.
+        let live = AtomicU64::new(4_096);
+
+        let out = apply_wab_scan(Err(join_error().await), &mut samples, &m, &live);
+
+        assert_eq!(out, None, "a failed scan yields no size");
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            4_096,
+            "a failed scan must not move the value the WAB cap is checked against"
+        );
+        assert_eq!(
+            samples,
+            vec![4_096],
+            "a failed scan must not push a sample — a repeated value reads as \
+             'not growing' and would suppress the growth warning for a window"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_scan_publishes_the_size_and_extends_the_window() {
+        let m = Metrics::new().0;
+        let mut samples = Vec::new();
+        let live = AtomicU64::new(0);
+
+        let out = apply_wab_scan(Ok(8_192), &mut samples, &m, &live);
+
+        assert_eq!(out, Some(8_192));
+        assert_eq!(live.load(Ordering::Relaxed), 8_192);
+        assert_eq!(samples, vec![8_192]);
+    }
+
+    #[tokio::test]
+    async fn the_window_is_bounded_and_drops_from_the_front() {
+        let m = Metrics::new().0;
+        let mut samples = Vec::new();
+        let live = AtomicU64::new(0);
+
+        // One more than the window holds, so the oldest must fall off.
+        for i in 0..=WAB_GROWTH_WINDOW as u64 {
+            apply_wab_scan(Ok(i), &mut samples, &m, &live);
+        }
+
+        assert_eq!(samples.len(), WAB_GROWTH_WINDOW);
+        assert_eq!(
+            samples[0], 1,
+            "the oldest sample is evicted, not the newest"
+        );
+        assert_eq!(samples[samples.len() - 1], WAB_GROWTH_WINDOW as u64);
     }
 }

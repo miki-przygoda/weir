@@ -54,7 +54,7 @@ proptest! {
     ) {
         let mut client = paired_client(response_bytes);
         // Result is irrelevant; the assertion is "did not panic".
-        let _: Result<(), ClientError> = client.push(b"hi", Durability::Sync);
+        let _: Result<(), ClientError> = client.push(b"hi", Durability::Durable);
     }
 
     /// Same property for the HealthCheck path. Same surface (read header,
@@ -80,7 +80,7 @@ proptest! {
         let mut bytes = vec![0x57, 0x45, 0x49, 0x52];
         bytes.extend_from_slice(&post_magic);
         let mut client = paired_client(bytes);
-        let _ = client.push(b"hi", Durability::Sync);
+        let _ = client.push(b"hi", Durability::Durable);
     }
 }
 
@@ -89,7 +89,7 @@ proptest! {
 #[test]
 fn push_on_empty_response_returns_err_not_panic() {
     let mut client = paired_client(Vec::new());
-    let result = client.push(b"hi", Durability::Sync);
+    let result = client.push(b"hi", Durability::Durable);
     assert!(
         matches!(
             result,
@@ -105,7 +105,7 @@ fn push_on_empty_response_returns_err_not_panic() {
 fn push_on_truncated_header_returns_err_not_panic() {
     let truncated = vec![0x57, 0x45, 0x49, 0x52, 0x01]; // magic + version, nothing else
     let mut client = paired_client(truncated);
-    let result = client.push(b"hi", Durability::Sync);
+    let result = client.push(b"hi", Durability::Durable);
     assert!(
         matches!(
             result,

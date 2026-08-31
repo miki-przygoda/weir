@@ -37,6 +37,7 @@
 #![deny(missing_docs)]
 
 pub mod format;
+mod recovery_reader;
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -45,9 +46,9 @@ use std::path::{Path, PathBuf};
 use weir_core::MAX_PAYLOAD_HARD_CAP;
 
 use format::{
-    EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN,
-    SEGMENT_MAGIC, SegmentFooterMeta, SegmentHeaderMeta, SegmentHeaderParseError,
-    parse_segment_footer, parse_segment_header,
+    Compression, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION_MAX_SUPPORTED,
+    SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SEGMENT_MAGIC, SegmentFooterMeta, SegmentHeaderMeta,
+    SegmentHeaderParseError, max_stored_record_bytes, parse_segment_footer, parse_segment_header,
 };
 
 /// Re-export of [`weir_core::Payload`] — the item type of the [`SegmentReader`]
@@ -55,6 +56,8 @@ use format::{
 /// only `weir-wab` can name the iterator item type (`weir_wab::Payload`)
 /// without also taking a direct dependency on `weir-core`.
 pub use weir_core::Payload;
+
+pub use recovery_reader::{MAX_CONSECUTIVE_SKIPS, RecoveryItem, RecoveryReader};
 
 /// An iterator over records in a WAB segment file.
 ///
@@ -91,6 +94,8 @@ pub struct SegmentReader {
     reader: BufReader<File>,
     done: bool,
     header: SegmentHeaderMeta,
+    /// Cached from `header.compression` so `next` does not re-match per record.
+    compression: Compression,
     /// Set in `next`'s terminal branches: `Some(true)` once a `payload_len == 0`
     /// sentinel is consumed, `Some(false)` if a torn `payload_len` EOF ended
     /// iteration, `None` while iteration has not yet ended. See
@@ -140,10 +145,13 @@ impl SegmentReader {
                 format!("bad segment magic: found {ascii:?} ({found:?}), expected b\"WEIR\""),
             ));
         }
-        if header[4] != FORMAT_VERSION {
+        if header[4] == 0 || header[4] > FORMAT_VERSION_MAX_SUPPORTED {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unknown segment format version: {}", header[4]),
+                format!(
+                    "unknown segment format version: {} (this build reads 1..={})",
+                    header[4], FORMAT_VERSION_MAX_SUPPORTED
+                ),
             ));
         }
 
@@ -162,6 +170,7 @@ impl SegmentReader {
         Ok(SegmentReader {
             reader,
             done: false,
+            compression: header.compression,
             header,
             terminated_cleanly: None,
         })
@@ -261,14 +270,31 @@ impl Iterator for SegmentReader {
             return None; // sentinel
         }
 
-        // Cap check before allocation — MAX_PAYLOAD_HARD_CAP from weir-core.
-        if payload_len > MAX_PAYLOAD_HARD_CAP {
+        // Cap check before allocation. A compressed record's STORED length can
+        // legitimately exceed the plaintext cap — zstd's worst case is
+        // n + n/255 + 16 — so v2/ZSTD segments get the wider bound. The
+        // plaintext is still capped at MAX_PAYLOAD_HARD_CAP, enforced on the
+        // decompression output below.
+        let stored_cap = match self.compression {
+            Compression::None => MAX_PAYLOAD_HARD_CAP,
+            Compression::Zstd => max_stored_record_bytes(),
+        };
+        if payload_len > stored_cap {
             self.done = true;
+            // Uncompressed segments keep weir 1.x's exact wording: their cap did
+            // not move, so neither should what an operator reads in the log.
+            let detail = match self.compression {
+                Compression::None => {
+                    format!("exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}")
+                }
+                Compression::Zstd => format!(
+                    "exceeds the v2 stored-record cap {stored_cap} \
+                     (compress_bound of MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP})"
+                ),
+            };
             return Some(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "record payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"
-                ),
+                format!("record payload_len {payload_len} {detail}"),
             )));
         }
 
@@ -295,6 +321,33 @@ impl Iterator for SegmentReader {
                 ),
             )));
         }
+
+        // The CRC covers the STORED bytes, so integrity is established before
+        // anything is decompressed — that is what lets recovery and
+        // verify_sealed_segment stay compression-unaware. This is the only
+        // decompression site in the codebase.
+        let payload_buf = match self.compression {
+            Compression::None => payload_buf,
+            Compression::Zstd => {
+                // Bounded output: a frame declaring more than the plaintext cap
+                // is refused here rather than allocated. This is the
+                // decompression-bomb guard, and the bound is exact rather than a
+                // guess because the real cap is known.
+                match zstd::bulk::decompress(&payload_buf, MAX_PAYLOAD_HARD_CAP) {
+                    Ok(plain) => plain,
+                    Err(e) => {
+                        self.done = true;
+                        return Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "failed to decompress a {payload_len}-byte zstd record \
+                                 (output limit {MAX_PAYLOAD_HARD_CAP}): {e}"
+                            ),
+                        )));
+                    }
+                }
+            }
+        };
 
         // Freeze: O(1) ownership transfer from Vec allocation to Bytes.
         Some(Ok(Payload::from(payload_buf)))
@@ -619,7 +672,7 @@ pub fn list_segment_files(dir: impl AsRef<Path>) -> io::Result<Vec<(PathBuf, Seg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use format::{SENTINEL, build_segment_header};
+    use format::{Compression, SENTINEL, build_segment_header, max_stored_record_bytes};
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -634,15 +687,33 @@ mod tests {
     /// per record, then the sentinel. The footer is not required by the reader
     /// (it stops at the sentinel), so this is enough to drive `SegmentReader`.
     fn write_segment(path: &Path, records: &[&[u8]]) {
+        write_segment_with(path, Compression::None, records);
+    }
+
+    /// As `write_segment`, but at a chosen compression. Each record's stored
+    /// bytes are what lands on disk, and the CRC covers those stored bytes —
+    /// which is exactly the property that lets recovery stay compression-blind.
+    fn write_segment_with(path: &Path, compression: Compression, records: &[&[u8]]) {
         let mut f = File::create(path).unwrap();
-        f.write_all(&build_segment_header(0xFFFF)).unwrap();
+        f.write_all(&build_segment_header(0xFFFF, compression))
+            .unwrap();
         for r in records {
-            f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
-            f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
-            f.write_all(r).unwrap();
+            let stored = match compression {
+                Compression::None => r.to_vec(),
+                Compression::Zstd => zstd::bulk::compress(r, 1).unwrap(),
+            };
+            write_stored_record(&mut f, &stored);
         }
         f.write_all(&SENTINEL).unwrap();
         f.sync_all().unwrap();
+    }
+
+    /// Writes one record from bytes that are ALREADY in stored form — used to
+    /// plant a hand-crafted frame the writer would never produce.
+    fn write_stored_record(f: &mut File, stored: &[u8]) {
+        f.write_all(&(stored.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&crc32fast::hash(stored).to_le_bytes()).unwrap();
+        f.write_all(stored).unwrap();
     }
 
     #[test]
@@ -677,7 +748,7 @@ mod tests {
     fn open_rejects_bad_magic() {
         let path = tmp_path("badmagic");
         let mut f = File::create(&path).unwrap();
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         header[0] = b'X'; // "WEIR" -> "XEIR"
         f.write_all(&header).unwrap();
         f.sync_all().unwrap();
@@ -698,7 +769,7 @@ mod tests {
     fn open_bad_magic_renders_nonprintable_bytes_as_dots() {
         let path = tmp_path("badmagic_nonprintable");
         let mut f = File::create(&path).unwrap();
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         // Fully non-printable magic: ASCII rendering should be all dots, but the
         // raw bytes must still be present for debugging.
         header[0..4].copy_from_slice(&[0x00, 0x01, 0x02, 0x03]);
@@ -716,7 +787,7 @@ mod tests {
     fn open_rejects_unknown_version() {
         let path = tmp_path("badversion");
         let mut f = File::create(&path).unwrap();
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         header[4] = 99;
         f.write_all(&header).unwrap();
         f.sync_all().unwrap();
@@ -730,7 +801,8 @@ mod tests {
         let path = tmp_path("crc");
         // Hand-write a record whose stored CRC doesn't match the payload.
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         let payload = b"corruptme";
         f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&0xdead_beefu32.to_le_bytes()).unwrap(); // wrong CRC
@@ -775,7 +847,8 @@ mod tests {
         // read. That must end cleanly (None, never Err) and stay fused.
         let path = tmp_path("torn_len");
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         let r = b"rec";
         f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
@@ -820,7 +893,8 @@ mod tests {
     fn oversized_payload_len_rejected_before_alloc() {
         let path = tmp_path("oversize");
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         // payload_len just over the hard cap; no payload bytes follow — the
         // reader must reject on the length check, not try to allocate/read it.
         let bogus_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
@@ -843,7 +917,7 @@ mod tests {
     fn into_inner_after_error_yields_usable_reader() {
         use std::io::Read;
         let path = tmp_path("into_inner_after_err");
-        let mut bytes = build_segment_header(0).to_vec();
+        let mut bytes = build_segment_header(0, Compression::None).to_vec();
         // record 0: valid.
         let r0 = b"hello";
         bytes.extend_from_slice(&(r0.len() as u32).to_le_bytes());
@@ -894,7 +968,7 @@ mod tests {
 
     fn build_sealed_segment(shard: u16, records: &[&[u8]]) -> SealedBytes {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&build_segment_header(shard));
+        bytes.extend_from_slice(&build_segment_header(shard, Compression::None));
         let mut data_bytes = 0u64;
         let mut first_payload_off = 0usize;
         for (i, r) in records.iter().enumerate() {
@@ -937,7 +1011,7 @@ mod tests {
         let reader = SegmentReader::open(&path).unwrap();
         let h = reader.header();
         assert_eq!(h.shard_id, 0xFFFF); // write_segment uses 0xFFFF
-        assert_eq!(h.format_version, format::FORMAT_VERSION);
+        assert_eq!(h.format_version, format::FORMAT_VERSION_V1);
         assert!(h.created_at > 0);
         std::fs::remove_file(&path).ok();
     }
@@ -975,7 +1049,8 @@ mod tests {
         // Active segment that ends right after a complete record, no sentinel.
         let path = tmp_path("term_torn");
         let mut f = File::create(&path).unwrap();
-        f.write_all(&build_segment_header(0)).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
         let r = b"rec";
         f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
@@ -1056,7 +1131,7 @@ mod tests {
     fn verify_sealed_segment_no_sentinel_is_rejected() {
         // Active segment (header + a record, no sentinel/footer): NoSentinel.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&build_segment_header(0));
+        bytes.extend_from_slice(&build_segment_header(0, Compression::None));
         let r = b"rec";
         bytes.extend_from_slice(&(r.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
@@ -1157,7 +1232,7 @@ mod tests {
         // MAX_PAYLOAD_HARD_CAP. The verifier rejects on the length check
         // (BadRecord) before attempting to read/hash the bogus payload.
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&build_segment_header(6));
+        bytes.extend_from_slice(&build_segment_header(6, Compression::None));
         let bogus_len = (MAX_PAYLOAD_HARD_CAP + 1) as u32;
         bytes.extend_from_slice(&bogus_len.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
@@ -1202,5 +1277,124 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── v2 / compressed segments ──────────────────────────────────────────────
+
+    #[test]
+    fn reader_round_trips_a_compressed_segment() {
+        let path = tmp_path("v2_round_trip");
+        write_segment_with(&path, Compression::Zstd, &[b"alpha", b"beta", b"gamma"]);
+
+        let got: Vec<Payload> = SegmentReader::open(&path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref(), b"alpha");
+        assert_eq!(got[1].as_ref(), b"beta");
+        assert_eq!(got[2].as_ref(), b"gamma");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reader_round_trips_incompressible_payloads() {
+        // zstd emits stored blocks for data it cannot shrink; the record must
+        // still survive the round trip byte-for-byte.
+        let path = tmp_path("v2_incompressible");
+        let noise: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        write_segment_with(&path, Compression::Zstd, &[&noise]);
+
+        let got: Vec<Payload> = SegmentReader::open(&path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref(), &noise[..]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reader_still_reads_a_v1_segment() {
+        let path = tmp_path("v1_still_works");
+        write_segment_with(&path, Compression::None, &[b"plain"]);
+        let got: Vec<Payload> = SegmentReader::open(&path)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got[0].as_ref(), b"plain");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reader_rejects_a_decompression_bomb() {
+        // A frame whose decompressed size exceeds MAX_PAYLOAD_HARD_CAP must be
+        // refused at the OUTPUT limit, not allocated. A run of zeros compresses
+        // small enough to sail past the stored-length check and reach the
+        // decompressor, which is exactly the case the guard exists for.
+        let path = tmp_path("v2_bomb");
+        let bomb = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        let frame = zstd::bulk::compress(&bomb, 1).unwrap();
+        assert!(
+            frame.len() < max_stored_record_bytes(),
+            "the frame must pass the stored-length check to test the output limit"
+        );
+
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&build_segment_header(0, Compression::Zstd))
+            .unwrap();
+        write_stored_record(&mut f, &frame);
+        f.write_all(&SENTINEL).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let err = SegmentReader::open(&path)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("decompress"),
+            "error should name decompression: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn v2_accepts_a_stored_record_larger_than_the_plaintext_cap() {
+        // zstd's worst case is n + n/255 + 16, so a maximal incompressible
+        // payload legitimately stores larger than MAX_PAYLOAD_HARD_CAP. The v2
+        // cap must allow that; the v1 cap must not move.
+        assert!(max_stored_record_bytes() > MAX_PAYLOAD_HARD_CAP);
+        assert_eq!(
+            max_stored_record_bytes(),
+            MAX_PAYLOAD_HARD_CAP + MAX_PAYLOAD_HARD_CAP / 255 + 16
+        );
+    }
+
+    #[test]
+    fn v1_stored_length_cap_is_unchanged() {
+        // A v1 segment declaring more than the plaintext cap is still rejected
+        // before allocation — the wider bound applies only to v2/ZSTD.
+        let path = tmp_path("v1_cap_unchanged");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(&build_segment_header(0, Compression::None))
+            .unwrap();
+        f.write_all(&((MAX_PAYLOAD_HARD_CAP + 1) as u32).to_le_bytes())
+            .unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let err = SegmentReader::open(&path)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        std::fs::remove_file(&path).ok();
     }
 }

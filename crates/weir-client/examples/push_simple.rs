@@ -1,4 +1,4 @@
-//! Push records to a running weir daemon across all three durability tiers.
+//! Push records to a running weir daemon across both durability tiers.
 //!
 //! Usage:
 //!   cargo run -p weir-client --example push_simple -- [--socket <path>] [--count <n>]
@@ -55,8 +55,7 @@ fn main() {
     });
 
     let tiers = [
-        ("Sync", Durability::Sync),
-        ("Batched", Durability::Batched),
+        ("Durable", Durability::Durable),
         ("Buffered", Durability::Buffered),
     ];
 

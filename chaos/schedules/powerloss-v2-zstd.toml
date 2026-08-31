@@ -1,0 +1,67 @@
+# WAB format v2 (zstd) under power loss. The last untested surface in 2.0.0.
+#
+# `soak8h-zstd.toml` states the gap plainly: weir 2.0's WAB v2 work has had
+# ZERO coverage from a real fault, because `wab_compression` defaults to "none"
+# and no schedule overrode it. The 706-episode Buffered soak and both Durable
+# calibrations were all v1. So the v2 RECOVERY path has never once been handed
+# a torn tail.
+#
+# WHY BUFFERED, AND WHY THIS IS THE RIGHT PLACE TO LOOK
+#
+# Recovery's job after power loss is to parse an active segment whose end was
+# never written. The 6h soak measured how often that happens: **3.83 quarantined
+# segments per kill** at tier "U". Durable produced ZERO across 30 episodes —
+# it fdatasyncs at the batch boundary before acking, so there is no torn tail
+# to find. Buffered is therefore the tier that stresses this path, by a wide
+# margin, and Durable would barely exercise it at all.
+#
+# Under v1 that torn tail is a truncated plain record. Under v2 it is a
+# truncated ZSTD FRAME — a different parsing problem against a decoder that
+# will reject malformed input rather than return short data. That is exactly
+# the shape of bug this schedule exists to find, and 706 episodes of v1
+# evidence say nothing about it.
+#
+# DELIBERATELY A CONTROLLED COMPARISON. Every parameter matches
+# powerloss-shape-check.toml — tier, steady range, episode count, volume,
+# shard count, segment size — so the only variable is the on-disk format. The
+# seed differs only because `run_id` derives from it and the harness refuses to
+# start on a previous run's directory.
+#
+# Reference (v1, run 920510542071102, 40 episodes):
+#   canary bit 40/40 · I1 0 · I2 0
+#   loss min 1,802 · p50 70,747 · MAX 124,897 · acked/ep p50 412,519
+#
+# (p50 is the statistical median — at n=40 that is the mean of the two middle
+# samples. An index-based q[20] gives 71,160 for the same data; the report in
+# docs/benchmarks/ uses the median, so this does too.)
+#
+# A v2 result that matches on canary, I1 and I2 clears the format. Loss
+# magnitude may legitimately differ: zstd changes how many records fit a
+# segment, and the 2026-08-25 v2 soak already found it changes redelivery
+# VARIANCE. Compare the invariants strictly and the volumes loosely.
+seed = 0x2570D
+episodes = 40
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "U"
+min_acked_per_episode = 100
+min_delivered_per_episode = 1
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+wab_compression = "zstd"
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"

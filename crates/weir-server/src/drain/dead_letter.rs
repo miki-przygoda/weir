@@ -18,7 +18,7 @@ use weir_core::Payload;
 
 use crate::wab::{
     create_dir_private,
-    format::{SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SENTINEL},
+    format::{Compression, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SENTINEL},
     segment::WabSegment,
 };
 
@@ -102,7 +102,13 @@ impl DeadLetterWriter {
 
         let active_path = self.dir.join(format!("dl_{counter:08}.wab"));
         // Shard ID 0xFFFF is reserved as a dead-letter marker.
-        let mut seg = WabSegment::create(&active_path, 0xFFFF)?;
+        //
+        // Dead-letter segments are ALWAYS written uncompressed, regardless of
+        // the daemon's wab_compression setting. They are a small forensic
+        // artifact whose whole purpose is being readable later, possibly by
+        // tooling that is not this daemon; compressing them trades nothing for
+        // a readability risk.
+        let mut seg = WabSegment::create(&active_path, 0xFFFF, Compression::None)?;
         for payload in records {
             seg.write_record(payload)?;
         }
@@ -266,6 +272,34 @@ mod tests {
         let dl = DeadLetterWriter::open(&dir).unwrap();
         assert!(!dl.would_exceed_cap(100, 100));
         assert!(dl.would_exceed_cap(101, 100));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dead_letter_segments_are_always_uncompressed() {
+        // Deliberate, and independent of the daemon's wab_compression setting:
+        // a dead-letter segment exists to be read by a human or by tooling that
+        // may not be this daemon. It is small, and readability beats ratio.
+        let dir = tmp_dir("dl_uncompressed");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        dl.write_records(&[p(b"rejected")]).unwrap();
+
+        let path = dl.dir.join("dl_00000001.wab.sealed");
+        let mut header = [0u8; crate::wab::format::SEGMENT_HEADER_LEN];
+        {
+            use std::io::Read;
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_exact(&mut header)
+                .unwrap();
+        }
+        assert_eq!(
+            header[4],
+            crate::wab::format::FORMAT_VERSION_V1,
+            "dead-letter segments must stay format v1"
+        );
+        assert_eq!(header[5], 0, "and carry no compression flag");
+
         std::fs::remove_dir_all(dir).ok();
     }
 }

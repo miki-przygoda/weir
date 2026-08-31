@@ -5,8 +5,9 @@
 //! ```text
 //! Segment header  — SEGMENT_HEADER_LEN (24) bytes
 //! [0..4]   SEGMENT_MAGIC   b"WEIR"
-//! [4]      FORMAT_VERSION  u8 = 1
-//! [5]      reserved        u8 — zero on write
+//! [4]      format_version  u8 ∈ {1, 2}
+//! [5]      flags           u8 — v1: MUST be 0
+//!                               v2: bit 0 = ZSTD; bits 1-7 reserved, MUST be 0
 //! [6..8]   shard_id        u16 LE
 //! [8..16]  created_at      i64 LE — unix nanoseconds
 //! [16..24] reserved        [u8; 8] — zero on write
@@ -20,7 +21,8 @@
 //!
 //! Segment footer  — SEGMENT_FOOTER_LEN (32) bytes (immediately after sentinel)
 //! [0..8]   record_count    u64 LE
-//! [8..16]  data_bytes      u64 LE — total payload bytes
+//! [8..16]  data_bytes      u64 LE — total STORED payload bytes (post-compression
+//!                                   in a v2 ZSTD segment; see SegmentFooterMeta)
 //! [16..20] file_crc32      u32 LE — CRC32 of all file bytes before the sentinel
 //! [20..28] sealed_at       i64 LE — unix nanoseconds
 //! [28..32] reserved        [u8; 4] — zero on write
@@ -60,17 +62,89 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Identifies a WAB segment file. Distinct from `weir-core`'s wire magic `b"WEIR"` —
 /// they share the same bytes intentionally, since this is the weir project's namespace,
-/// but the FORMAT_VERSION byte distinguishes segment files from wire frames.
+/// but the format-version byte distinguishes segment files from wire frames.
 pub const SEGMENT_MAGIC: [u8; 4] = *b"WEIR";
 
-/// On-disk segment format version, byte `[4]` of the header. A reader rejects
-/// any header whose version byte is not this value.
-pub const FORMAT_VERSION: u8 = 1;
+/// Format v1: the original layout. Header byte `[5]` is reserved and MUST be
+/// zero.
+pub const FORMAT_VERSION_V1: u8 = 1;
 
-/// Segment header size in bytes. Fixed for the lifetime of FORMAT_VERSION = 1.
+/// Format v2: identical to v1 except header byte `[5]` is a flags byte. Record
+/// framing, the sentinel, the footer, and the `.confirmed` sidecar are
+/// byte-for-byte unchanged.
+pub const FORMAT_VERSION_V2: u8 = 2;
+
+/// The highest version this build can *read*. Deliberately not "the version we
+/// write": the writer picks the lowest version that can express the segment's
+/// features (v1 when compression is off, v2 when it is on), so that value is a
+/// function of config, not a constant.
+pub const FORMAT_VERSION_MAX_SUPPORTED: u8 = FORMAT_VERSION_V2;
+
+/// Header flags bit 0 — every record in this segment is stored as a zstd frame.
+pub const FLAG_ZSTD: u8 = 0b0000_0001;
+
+/// Mask of every flags bit this build understands. A set bit outside it means
+/// the segment was written by a newer weir, and reading it would misinterpret
+/// the records — so the parse refuses.
+const KNOWN_FLAGS: u8 = FLAG_ZSTD;
+
+/// How a segment's records are stored on disk. Carried in header byte `[5]`.
+///
+/// Segment-scoped, not per-record: the record framing has no spare bit, and
+/// compression is a deployment setting rather than a per-record decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compression {
+    /// Records are stored verbatim. Written as a v1 header.
+    #[default]
+    None,
+    /// Every record is a complete zstd frame. Written as a v2 header with
+    /// [`FLAG_ZSTD`] set.
+    Zstd,
+}
+
+impl Compression {
+    /// The header flags byte for this mode.
+    pub fn flags(self) -> u8 {
+        match self {
+            Compression::None => 0,
+            Compression::Zstd => FLAG_ZSTD,
+        }
+    }
+
+    /// The lowest format version that can express this mode. v1 has no flags
+    /// byte, so anything other than `None` needs v2 — this is what makes
+    /// "upgrade with compression off, then roll back" a non-event.
+    pub fn format_version(self) -> u8 {
+        match self {
+            Compression::None => FORMAT_VERSION_V1,
+            Compression::Zstd => FORMAT_VERSION_V2,
+        }
+    }
+}
+
+/// zstd's worst-case compressed size for `n` input bytes: `n + n/255 + 16`.
+///
+/// Spelled out here rather than taken from the zstd crate so the on-disk
+/// contract does not move if the dependency does — this value bounds what a
+/// reader will accept, and it must be stable across builds.
+pub const fn compress_bound(n: usize) -> usize {
+    n + n / 255 + 16
+}
+
+/// The largest `payload_len` a **v2 ZSTD** segment may legitimately declare.
+///
+/// A maximal incompressible payload stores larger than it started, so the v1 cap
+/// of `MAX_PAYLOAD_HARD_CAP` would reject a valid record. The plaintext is still
+/// capped at `MAX_PAYLOAD_HARD_CAP` — enforced on the decompression *output*,
+/// which is also the decompression-bomb guard.
+pub const fn max_stored_record_bytes() -> usize {
+    compress_bound(weir_core::MAX_PAYLOAD_HARD_CAP)
+}
+
+/// Segment header size in bytes. Unchanged between v1 and v2.
 pub const SEGMENT_HEADER_LEN: usize = 24;
 
-/// Segment footer size in bytes. Fixed for the lifetime of FORMAT_VERSION = 1.
+/// Segment footer size in bytes. Unchanged between v1 and v2.
 pub const SEGMENT_FOOTER_LEN: usize = 32;
 
 /// End-of-records sentinel. A payload_len field of zero signals the footer follows.
@@ -118,11 +192,11 @@ pub fn unix_nanos_now() -> i64 {
 }
 
 /// Builds the 24-byte segment file header.
-pub fn build_segment_header(shard_id: u16) -> [u8; SEGMENT_HEADER_LEN] {
+pub fn build_segment_header(shard_id: u16, compression: Compression) -> [u8; SEGMENT_HEADER_LEN] {
     let mut buf = [0u8; SEGMENT_HEADER_LEN];
     buf[0..4].copy_from_slice(&SEGMENT_MAGIC);
-    buf[4] = FORMAT_VERSION;
-    // buf[5] = 0  (reserved)
+    buf[4] = compression.format_version();
+    buf[5] = compression.flags();
     buf[6..8].copy_from_slice(&shard_id.to_le_bytes());
     buf[8..16].copy_from_slice(&unix_nanos_now().to_le_bytes());
     // buf[16..24] = 0  (reserved)
@@ -255,9 +329,14 @@ pub fn parse_confirmed(buf: &[u8]) -> Result<ConfirmedMeta, ConfirmedParseError>
 /// [`build_segment_header`], for forensics tools that need the header metadata
 /// without re-deriving the byte offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SegmentHeaderMeta {
-    /// The on-disk [`FORMAT_VERSION`] byte (always `1` for a parse to succeed).
+    /// The on-disk format version byte — [`FORMAT_VERSION_V1`] or
+    /// [`FORMAT_VERSION_V2`].
     pub format_version: u8,
+    /// How this segment's records are stored, decoded from the v2 flags byte.
+    /// Always [`Compression::None`] for a v1 segment.
+    pub compression: Compression,
     /// Owning shard id, header bytes `[6..8]` LE.
     pub shard_id: u16,
     /// Creation timestamp, header bytes `[8..16]` LE — unix nanoseconds.
@@ -276,8 +355,18 @@ pub enum SegmentHeaderParseError {
     },
     /// First four bytes are not [`SEGMENT_MAGIC`] (`b"WEIR"`).
     BadMagic,
-    /// Version byte is not [`FORMAT_VERSION`].
+    /// Version byte is above [`FORMAT_VERSION_MAX_SUPPORTED`] (or zero).
     UnknownVersion(u8),
+    /// The flags byte carried a bit this build does not understand: either any
+    /// bit at all in a v1 header (which reserved the byte as zero), or a bit
+    /// outside the known set in a v2 header. Reading the records anyway would
+    /// misinterpret them, so the parse refuses.
+    ReservedFlagsSet {
+        /// The header's format-version byte.
+        version: u8,
+        /// The flags byte as found on disk.
+        flags: u8,
+    },
 }
 
 impl std::fmt::Display for SegmentHeaderParseError {
@@ -289,6 +378,11 @@ impl std::fmt::Display for SegmentHeaderParseError {
             ),
             Self::BadMagic => write!(f, "segment header has bad magic (expected b\"WEIR\")"),
             Self::UnknownVersion(v) => write!(f, "unknown segment format version {v}"),
+            Self::ReservedFlagsSet { version, flags } => write!(
+                f,
+                "segment header (v{version}) has reserved flag bits set: {flags:#010b}; \
+                 written by a newer weir, or corrupt"
+            ),
         }
     }
 }
@@ -307,11 +401,32 @@ pub fn parse_segment_header(buf: &[u8]) -> Result<SegmentHeaderMeta, SegmentHead
     if buf[0..4] != SEGMENT_MAGIC {
         return Err(SegmentHeaderParseError::BadMagic);
     }
-    if buf[4] != FORMAT_VERSION {
-        return Err(SegmentHeaderParseError::UnknownVersion(buf[4]));
-    }
+    let flags = buf[5];
+    let compression = match buf[4] {
+        // v1 predates the flags byte and documented it as zero-on-write, so a
+        // set bit is corruption, not a feature.
+        FORMAT_VERSION_V1 if flags == 0 => Compression::None,
+        FORMAT_VERSION_V1 => {
+            return Err(SegmentHeaderParseError::ReservedFlagsSet {
+                version: FORMAT_VERSION_V1,
+                flags,
+            });
+        }
+        // v2: refuse any bit we do not understand rather than read the records
+        // under the wrong assumption.
+        FORMAT_VERSION_V2 if flags & !KNOWN_FLAGS != 0 => {
+            return Err(SegmentHeaderParseError::ReservedFlagsSet {
+                version: FORMAT_VERSION_V2,
+                flags,
+            });
+        }
+        FORMAT_VERSION_V2 if flags & FLAG_ZSTD != 0 => Compression::Zstd,
+        FORMAT_VERSION_V2 => Compression::None,
+        other => return Err(SegmentHeaderParseError::UnknownVersion(other)),
+    };
     Ok(SegmentHeaderMeta {
         format_version: buf[4],
+        compression,
         shard_id: u16::from_le_bytes(buf[6..8].try_into().unwrap()),
         created_at: i64::from_le_bytes(buf[8..16].try_into().unwrap()),
     })
@@ -323,7 +438,15 @@ pub fn parse_segment_header(buf: &[u8]) -> Result<SegmentHeaderMeta, SegmentHead
 pub struct SegmentFooterMeta {
     /// Number of records in the segment, footer bytes `[0..8]` LE.
     pub record_count: u64,
-    /// Total payload bytes across all records, footer bytes `[8..16]` LE.
+    /// Total **stored** payload bytes across all records, footer bytes
+    /// `[8..16]` LE.
+    ///
+    /// "Stored" means as written to disk: in a v2 [`Compression::Zstd`] segment
+    /// this is the compressed size, not the logical size the producer sent. That
+    /// is deliberate — it keeps this field, the whole-file CRC, and
+    /// `verify_sealed_segment`'s cross-check all verifiable without
+    /// decompressing anything. For logical bytes, see the daemon's
+    /// `weir_wab_record_logical_bytes_total` metric.
     pub data_bytes: u64,
     /// CRC32 of all file bytes before the sentinel, footer bytes `[16..20]` LE.
     pub file_crc32: u32,
@@ -446,9 +569,9 @@ mod tests {
 
     #[test]
     fn segment_header_has_correct_magic_and_version() {
-        let header = build_segment_header(3);
+        let header = build_segment_header(3, Compression::None);
         assert_eq!(&header[0..4], b"WEIR");
-        assert_eq!(header[4], FORMAT_VERSION);
+        assert_eq!(header[4], FORMAT_VERSION_V1);
         assert_eq!(header[5], 0); // reserved
         assert_eq!(&header[6..8], &3u16.to_le_bytes());
     }
@@ -474,9 +597,9 @@ mod tests {
 
     #[test]
     fn segment_header_parse_round_trip() {
-        let header = build_segment_header(0x1234);
+        let header = build_segment_header(0x1234, Compression::None);
         let meta = parse_segment_header(&header).unwrap();
-        assert_eq!(meta.format_version, FORMAT_VERSION);
+        assert_eq!(meta.format_version, FORMAT_VERSION_V1);
         assert_eq!(meta.shard_id, 0x1234);
         // created_at is stamped from unix_nanos_now() at build time.
         assert!(meta.created_at > 0);
@@ -497,7 +620,7 @@ mod tests {
 
     #[test]
     fn segment_header_parse_rejects_bad_magic() {
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         header[0] = b'X';
         assert!(matches!(
             parse_segment_header(&header),
@@ -507,7 +630,7 @@ mod tests {
 
     #[test]
     fn segment_header_parse_rejects_unknown_version() {
-        let mut header = build_segment_header(0);
+        let mut header = build_segment_header(0, Compression::None);
         header[4] = 99;
         match parse_segment_header(&header) {
             Err(SegmentHeaderParseError::UnknownVersion(99)) => {}
@@ -537,5 +660,78 @@ mod tests {
     fn crc32_matches_underlying_hash() {
         let data = b"the quick brown fox";
         assert_eq!(crc32(data), crc32fast::hash(data));
+    }
+
+    // ── Format v2 header ──────────────────────────────────────────────────────
+
+    #[test]
+    fn v1_header_is_written_when_compression_is_off() {
+        let h = build_segment_header(7, Compression::None);
+        assert_eq!(h[4], FORMAT_VERSION_V1, "compression off must stay v1");
+        assert_eq!(h[5], 0, "flags byte must be zero in a v1 header");
+    }
+
+    #[test]
+    fn v2_header_is_written_when_compression_is_on() {
+        let h = build_segment_header(7, Compression::Zstd);
+        assert_eq!(h[4], FORMAT_VERSION_V2);
+        assert_eq!(h[5], FLAG_ZSTD);
+    }
+
+    #[test]
+    fn parse_accepts_v1_and_reports_no_compression() {
+        let meta = parse_segment_header(&build_segment_header(3, Compression::None)).unwrap();
+        assert_eq!(meta.format_version, FORMAT_VERSION_V1);
+        assert_eq!(meta.compression, Compression::None);
+        assert_eq!(meta.shard_id, 3);
+    }
+
+    #[test]
+    fn parse_accepts_v2_and_reports_zstd() {
+        let meta = parse_segment_header(&build_segment_header(3, Compression::Zstd)).unwrap();
+        assert_eq!(meta.format_version, FORMAT_VERSION_V2);
+        assert_eq!(meta.compression, Compression::Zstd);
+        assert_eq!(meta.shard_id, 3);
+    }
+
+    #[test]
+    fn parse_rejects_v1_with_a_nonzero_flags_byte() {
+        // weir has only ever written zero there, so a set bit is corruption.
+        let mut h = build_segment_header(0, Compression::None);
+        h[5] = FLAG_ZSTD;
+        assert!(matches!(
+            parse_segment_header(&h),
+            Err(SegmentHeaderParseError::ReservedFlagsSet { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_v2_with_an_unknown_flag_bit() {
+        // Refuse rather than risk misreading a segment written by a newer weir.
+        let mut h = build_segment_header(0, Compression::Zstd);
+        h[5] |= 0b0000_0010;
+        assert!(matches!(
+            parse_segment_header(&h),
+            Err(SegmentHeaderParseError::ReservedFlagsSet { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_still_rejects_an_unknown_version() {
+        let mut h = build_segment_header(0, Compression::None);
+        h[4] = 3;
+        assert!(matches!(
+            parse_segment_header(&h),
+            Err(SegmentHeaderParseError::UnknownVersion(3))
+        ));
+    }
+
+    #[test]
+    fn compress_bound_is_the_documented_formula() {
+        // Spelled out in weir-wab rather than taken from the zstd crate so the
+        // on-disk contract cannot move if the dependency does.
+        assert_eq!(compress_bound(0), 16);
+        assert_eq!(compress_bound(255), 255 + 1 + 16);
+        assert!(max_stored_record_bytes() > weir_core::MAX_PAYLOAD_HARD_CAP);
     }
 }

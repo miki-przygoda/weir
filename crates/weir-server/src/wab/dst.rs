@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use super::clock::BlockingClock;
+use super::format::Compression;
 use super::segment::{FsSegmentStore, SegmentHandle, SegmentStore, ShardWriter, WabSegment};
 use crate::metrics::Metrics;
 use crate::models::{Batch, WorkUnit};
@@ -88,6 +89,17 @@ impl SplitMix64 {
 /// its fsync (a mid-batch write error) never marks its records durable. The
 /// oracle then checks the core durability invariant: **no record is acked
 /// `true` unless it is in this set.**
+///
+/// # Key: STORED bytes, not logical ones
+///
+/// The set is keyed on the bytes that crossed the `SegmentHandle` seam, which
+/// since format v2 are the *stored* bytes — compressed, when the segment is.
+/// The oracle holds logical payloads, so it must translate before looking up;
+/// use [`Ledger::is_durable_logical`] rather than [`Ledger::is_durable`].
+///
+/// Getting this wrong is not a hypothetical: keying the lookup on logical bytes
+/// made every compressed DST run report a false `i1_acked_true_is_durable`
+/// violation, because the lookup could never hit.
 #[derive(Clone, Default)]
 struct Ledger {
     durable: Arc<Mutex<HashSet<Vec<u8>>>>,
@@ -98,8 +110,24 @@ impl Ledger {
         self.durable.lock().unwrap().extend(payloads);
     }
 
-    fn is_durable(&self, payload: &[u8]) -> bool {
-        self.durable.lock().unwrap().contains(payload)
+    /// Membership by STORED bytes — what the seam actually saw.
+    fn is_durable(&self, stored: &[u8]) -> bool {
+        self.durable.lock().unwrap().contains(stored)
+    }
+
+    /// Membership by LOGICAL bytes: translates through `compression` first, so
+    /// the oracle can ask "is this record the producer sent durable?" without
+    /// knowing how it was stored.
+    fn is_durable_logical(&self, payload: &[u8], compression: Compression) -> bool {
+        match compression {
+            Compression::None => self.is_durable(payload),
+            Compression::Zstd => match zstd::bulk::compress(payload, 1) {
+                Ok(stored) => self.is_durable(&stored),
+                // A payload that will not compress cannot have been stored, so it
+                // cannot be durable. Returning false keeps the oracle strict.
+                Err(_) => false,
+            },
+        }
     }
 }
 
@@ -414,8 +442,16 @@ impl SimSegmentStore {
 }
 
 impl SegmentStore for SimSegmentStore {
-    fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>> {
-        let inner = WabSegment::create(path, shard_id)?;
+    fn create(
+        &self,
+        path: &Path,
+        shard_id: u16,
+        compression: Compression,
+    ) -> io::Result<Box<dyn SegmentHandle>> {
+        // Honour the caller's compression: the harness must write the same
+        // byte stream production does, or the fault schedules stop simulating
+        // what they claim to.
+        let inner = WabSegment::create(path, shard_id, compression)?;
         Ok(Box::new(SimSegmentHandle {
             inner,
             faults: Arc::clone(&self.faults),
@@ -519,7 +555,7 @@ impl SegmentHandle for SimSegmentHandle {
 /// What the harness drives. `serde` for seed pinning.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scenario {
-    /// Flush `records` Sync work units through the real flusher under the
+    /// Flush `records` Durable work units through the real flusher under the
     /// configured faults; collect each record's ack outcome.
     SyncFlush { records: usize },
     /// Write `records`, seal (rename injected to fail = crash), then run
@@ -562,27 +598,52 @@ pub struct SimSpec {
     pub scenario: Scenario,
     #[serde(default)]
     pub faults: Vec<Fault>,
+    /// Run this simulation against a format-v2 ZSTD segment. `#[serde(default)]`
+    /// (false) so every pinned seed in `tests/dst_seeds/` — all written before
+    /// compression existed — still deserialises and still means what it meant.
+    ///
+    /// A bool rather than `Compression` because `weir-wab` carries no serde
+    /// dependency and this harness must not add one to it.
+    #[serde(default)]
+    pub compressed: bool,
 }
 
 impl SimSpec {
+    /// The segment compression this run writes with.
+    fn compression(&self) -> Compression {
+        if self.compressed {
+            Compression::Zstd
+        } else {
+            Compression::None
+        }
+    }
+
     /// Execute the run. Checks all relevant invariants in-harness (panicking
     /// with a seed repro on violation) and returns the observed outcome.
     pub fn run(&self) -> SimReport {
         match &self.scenario {
-            Scenario::SyncFlush { records } => run_sync_flush(self.seed, &self.faults, *records),
+            Scenario::SyncFlush { records } => {
+                run_sync_flush(self.seed, &self.faults, *records, self.compression())
+            }
             Scenario::CrashBeforeRename { records } => {
-                run_crash_before_rename(self.seed, &self.faults, *records)
+                run_crash_before_rename(self.seed, &self.faults, *records, self.compression())
             }
             Scenario::SealFailsAtShutdown { records } => {
-                run_seal_fails_at_shutdown(self.seed, &self.faults, *records)
+                run_seal_fails_at_shutdown(self.seed, &self.faults, *records, self.compression())
             }
             Scenario::PanicDuringFlush { records } => {
-                run_panic_during_flush(self.seed, &self.faults, *records)
+                run_panic_during_flush(self.seed, &self.faults, *records, self.compression())
             }
             Scenario::InterleavedFlush {
                 batches,
                 records_per_batch,
-            } => run_interleaved_flush(self.seed, &self.faults, *batches, *records_per_batch),
+            } => run_interleaved_flush(
+                self.seed,
+                &self.faults,
+                *batches,
+                *records_per_batch,
+                self.compression(),
+            ),
             Scenario::PanicSupervisor => run_panic_supervisor(self.seed),
             Scenario::MidFileCorruption {
                 records,
@@ -597,6 +658,7 @@ pub struct Sim {
     seed: u64,
     faults: Vec<Fault>,
     scenario: Option<Scenario>,
+    compressed: bool,
 }
 
 impl Sim {
@@ -605,6 +667,7 @@ impl Sim {
             seed,
             faults: Vec::new(),
             scenario: None,
+            compressed: false,
         }
     }
 
@@ -618,12 +681,21 @@ impl Sim {
         self
     }
 
+    /// Write format-v2 ZSTD segments for this run. The codec sits above the
+    /// `SegmentStore` seam this harness swaps, so the fault schedules act on the
+    /// real compressed byte stream rather than a plaintext stand-in.
+    pub fn compressed(mut self, compressed: bool) -> Self {
+        self.compressed = compressed;
+        self
+    }
+
     pub fn run(self) -> SimReport {
         let scenario = self.scenario.expect("Sim::run requires a scenario");
         SimSpec {
             seed: self.seed,
             scenario,
             faults: self.faults,
+            compressed: self.compressed,
         }
         .run()
     }
@@ -741,7 +813,7 @@ fn read_sealed_payloads(shard_dir: &Path) -> Vec<Vec<u8>> {
     out
 }
 
-/// The observable result of driving the real flusher over a batch of Sync
+/// The observable result of driving the real flusher over a batch of Durable
 /// records: what was sent, how each was acked, the durability ledger, and the
 /// (not-yet-cleaned-up) environment so a caller can run recovery against it.
 struct FlushOutcome {
@@ -750,13 +822,21 @@ struct FlushOutcome {
     ledger: Ledger,
     fsync_failed: bool,
     env: SimEnv,
+    /// The codec this run wrote with — the oracle needs it to translate its
+    /// logical payloads into the stored bytes the [`Ledger`] is keyed on.
+    compression: Compression,
 }
 
-/// Sends `records` unique Sync units in one batch through the **real**
+/// Sends `records` unique Durable units in one batch through the **real**
 /// [`super::flusher_thread`] under `faults`, joins the flusher, and collects the
 /// per-record acks. Performs no invariant checks and leaves `env` un-cleaned so
 /// the caller can recover from the on-disk state.
-fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutcome {
+fn drive_sync_flusher(
+    seed: u64,
+    faults: &[Fault],
+    records: usize,
+    compression: Compression,
+) -> FlushOutcome {
     let env = SimEnv::new("sync_flush");
     let sim_faults = SimFaults::from_faults(faults);
     let ledger = Ledger::default();
@@ -778,7 +858,7 @@ fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutco
         let payload = rng.unique_payload(i as u64);
         let (ack_tx, ack_rx) = oneshot::channel();
         ack_rxs.push(ack_rx);
-        units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+        units.push(make_unit(payload.clone(), Durability::Durable, ack_tx));
         payloads.push(payload);
     }
     work_tx.send(make_batch(units)).expect("send batch");
@@ -801,6 +881,8 @@ fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutco
             coalesce_hint,
             &clock,
             store,
+            compression,
+            1,
         );
     });
     handle.join().expect("flusher thread join");
@@ -809,7 +891,7 @@ fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutco
         .into_iter()
         .map(|mut rx| {
             rx.try_recv().unwrap_or_else(|e| {
-                panic!("DST: Sync record left without an ack (seed {seed:#018x}): {e}")
+                panic!("DST: Durable record left without an ack (seed {seed:#018x}): {e}")
             })
         })
         .collect();
@@ -820,6 +902,7 @@ fn drive_sync_flusher(seed: u64, faults: &[Fault], records: usize) -> FlushOutco
         ledger,
         fsync_failed: sim_faults.any_fsync_failed(),
         env,
+        compression,
     }
 }
 
@@ -832,17 +915,22 @@ fn assert_acked_records_durable(seed: u64, out: &FlushOutcome) {
             assert_invariant(
                 seed,
                 "i1_acked_true_is_durable",
-                out.ledger.is_durable(payload),
+                out.ledger.is_durable_logical(payload, out.compression),
             );
         }
     }
 }
 
-/// Scenario 1 — `EIO` on `fdatasync` (G-WAB-1). Sends `records` Sync units
+/// Scenario 1 — `EIO` on `fdatasync` (G-WAB-1). Sends `records` Durable units
 /// through the real flusher thread under the fault schedule; asserts that a
 /// failed durability barrier produces no `true` ack.
-fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
-    let out = drive_sync_flusher(seed, faults, records);
+fn run_sync_flush(
+    seed: u64,
+    faults: &[Fault],
+    records: usize,
+    compression: Compression,
+) -> SimReport {
+    let out = drive_sync_flusher(seed, faults, records, compression);
     assert_acked_records_durable(seed, &out);
     out.env.cleanup();
     SimReport {
@@ -857,8 +945,13 @@ fn run_sync_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
 /// and group-fsynced (acked `true` + durable), then the flusher's shutdown seal
 /// fails, leaving an un-sealed `.wab`. Recovery must still recover every acked
 /// record: a durable ack survives a failed seal.
-fn run_seal_fails_at_shutdown(seed: u64, faults: &[Fault], records: usize) -> SimReport {
-    let out = drive_sync_flusher(seed, faults, records);
+fn run_seal_fails_at_shutdown(
+    seed: u64,
+    faults: &[Fault],
+    records: usize,
+    compression: Compression,
+) -> SimReport {
+    let out = drive_sync_flusher(seed, faults, records, compression);
     // The group fsync succeeded, so the records are durable and acked despite
     // the later seal failure.
     assert_acked_records_durable(seed, &out);
@@ -895,7 +988,12 @@ fn run_seal_fails_at_shutdown(seed: u64, faults: &[Fault], records: usize) -> Si
 /// fsync barrier. The panic unwinds through `flush_batch`, dropping the pending
 /// ack senders (→ producers Nack), and the supervisor respawns the flusher.
 /// Asserts no record is falsely acked `true` and the supervisor recovers.
-fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimReport {
+fn run_panic_during_flush(
+    seed: u64,
+    faults: &[Fault],
+    records: usize,
+    compression: Compression,
+) -> SimReport {
     let env = SimEnv::new("panic_flush");
     let sim_faults = SimFaults::from_faults(faults);
     let ledger = Ledger::default();
@@ -912,7 +1010,7 @@ fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimRep
         let payload = rng.unique_payload(i as u64);
         let (ack_tx, ack_rx) = oneshot::channel();
         ack_rxs.push(ack_rx);
-        units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+        units.push(make_unit(payload.clone(), Durability::Durable, ack_tx));
         payloads.push(payload);
     }
     work_tx.send(make_batch(units)).expect("send batch");
@@ -955,6 +1053,8 @@ fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimRep
                     coalesce_hint,
                     &clock,
                     store,
+                    compression,
+                    1,
                 );
             }
         });
@@ -972,7 +1072,11 @@ fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimRep
     // (the panic unwinds before the ack loop).
     for (payload, &acked) in payloads.iter().zip(&acks) {
         if acked {
-            assert_invariant(seed, "i1_acked_true_is_durable", ledger.is_durable(payload));
+            assert_invariant(
+                seed,
+                "i1_acked_true_is_durable",
+                ledger.is_durable_logical(payload, compression),
+            );
         }
     }
 
@@ -989,7 +1093,12 @@ fn run_panic_during_flush(seed: u64, faults: &[Fault], records: usize) -> SimRep
 /// Scenario 2 — crash between `sync_all` and `rename` in `seal()` (G-WAB-3).
 /// Writes `records`, seals (rename injected to fail), then recovers; asserts
 /// every synced record comes back intact and in order.
-fn run_crash_before_rename(seed: u64, faults: &[Fault], records: usize) -> SimReport {
+fn run_crash_before_rename(
+    seed: u64,
+    faults: &[Fault],
+    records: usize,
+    compression: Compression,
+) -> SimReport {
     let env = SimEnv::new("crash_rename");
     let sim_faults = SimFaults::from_faults(faults);
     let ledger = Ledger::default();
@@ -1003,6 +1112,8 @@ fn run_crash_before_rename(seed: u64, faults: &[Fault], records: usize) -> SimRe
         64 * 1024 * 1024,
         Arc::clone(&env.metrics),
         store,
+        compression,
+        1,
     );
 
     let mut rng = SplitMix64::new(seed);
@@ -1093,7 +1204,7 @@ fn run_mid_file_corruption(seed: u64, records: usize, corrupt_index: usize) -> S
     let mut rng = SplitMix64::new(seed);
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(records);
     {
-        let mut seg = WabSegment::create(&path, 0).expect("create segment");
+        let mut seg = WabSegment::create(&path, 0, Compression::None).expect("create segment");
         for i in 0..records {
             let payload = rng.unique_payload(i as u64);
             seg.write_record(&payload).expect("write_record");
@@ -1176,6 +1287,7 @@ fn run_interleaved_flush(
     faults: &[Fault],
     batches_count: usize,
     records_per_batch: usize,
+    compression: Compression,
 ) -> SimReport {
     let env = SimEnv::new("interleaved");
     let sim_faults = SimFaults::from_faults(faults);
@@ -1204,7 +1316,7 @@ fn run_interleaved_flush(
             idx += 1;
             let (ack_tx, ack_rx) = oneshot::channel();
             ack_rxs.push(ack_rx);
-            units.push(make_unit(payload.clone(), Durability::Sync, ack_tx));
+            units.push(make_unit(payload.clone(), Durability::Durable, ack_tx));
             payloads.push(payload);
         }
         batches.push(make_batch(units));
@@ -1254,6 +1366,8 @@ fn run_interleaved_flush(
             coalesce_hint,
             &clock,
             store,
+            compression,
+            1,
         );
         sched_f.finish(FLUSHER);
     });
@@ -1270,7 +1384,11 @@ fn run_interleaved_flush(
     // I1 — acked ⟹ durable holds regardless of how the sends interleaved.
     for (payload, &acked) in payloads.iter().zip(&acks) {
         if acked {
-            assert_invariant(seed, "i1_acked_true_is_durable", ledger.is_durable(payload));
+            assert_invariant(
+                seed,
+                "i1_acked_true_is_durable",
+                ledger.is_durable_logical(payload, compression),
+            );
         }
     }
 
@@ -1289,7 +1407,7 @@ fn run_interleaved_flush(
 mod tests {
     use super::*;
 
-    /// Scenario 1: an `EIO` on the group fdatasync must Nack every Sync record
+    /// Scenario 1: an `EIO` on the group fdatasync must Nack every Durable record
     /// in the batch — no producer is told its record is durable when it isn't.
     #[test]
     fn eio_on_fdatasync_nacks_every_sync_record() {
@@ -1301,7 +1419,7 @@ mod tests {
         assert_eq!(report.acks.len(), 4);
         assert!(
             report.acks.iter().all(|&ok| !ok),
-            "every Sync record must be Nacked when its fsync fails, got {:?}",
+            "every Durable record must be Nacked when its fsync fails, got {:?}",
             report.acks
         );
     }
@@ -1316,7 +1434,7 @@ mod tests {
         assert!(report.acks.iter().all(|&ok| ok), "acks: {:?}", report.acks);
     }
 
-    /// Drives the REAL [`super::flusher_thread`] over one Sync batch of
+    /// Drives the REAL [`super::flusher_thread`] over one Durable batch of
     /// fixed-size payloads with a small `segment_max_bytes`, so rotation fires
     /// MID-batch. Fixed-size payloads keep the rotation split deterministic
     /// (`drive_sync_flusher` uses variable-size payloads, so no flusher-driving
@@ -1347,7 +1465,7 @@ mod tests {
         for p in &payloads {
             let (ack_tx, ack_rx) = oneshot::channel();
             ack_rxs.push(ack_rx);
-            units.push(make_unit(p.clone(), Durability::Sync, ack_tx));
+            units.push(make_unit(p.clone(), Durability::Durable, ack_tx));
         }
         work_tx.send(make_batch(units)).expect("send batch");
         drop(work_tx);
@@ -1369,6 +1487,8 @@ mod tests {
                 coalesce_hint,
                 &clock,
                 store,
+                Compression::None,
+                1,
             );
         });
         handle.join().expect("flusher join");
@@ -1535,6 +1655,7 @@ mod tests {
             seed: 0x1234_5678_9ABC_DEF0,
             scenario: Scenario::CrashBeforeRename { records: 8 },
             faults: vec![Fault::RenameFails],
+            compressed: false,
         };
         let a = spec.run();
         let b = spec.run();
@@ -1543,7 +1664,7 @@ mod tests {
         assert_eq!(a.written, a.recovered);
     }
 
-    /// Scenario (Phase 2): a torn write on the 3rd record of a 4-record Sync
+    /// Scenario (Phase 2): a torn write on the 3rd record of a 4-record Durable
     /// batch drops the active segment mid-flush. The two records already written
     /// to that segment were never fsynced, so they MUST be Nacked, not falsely
     /// acked off a later segment's fsync (I1, checked inside `run`). The torn
@@ -1637,6 +1758,7 @@ mod tests {
                 records_per_batch: 4,
             },
             faults: vec![],
+            compressed: false,
         };
         let a = spec.run();
         let b = spec.run();
@@ -1687,10 +1809,16 @@ mod tests {
         for _ in 0..n {
             let seed = rng.next_u64();
             let records = 1 + (seed % 8) as usize;
+            // Alternate the segment codec on a seed bit rather than running every
+            // scenario twice: each scenario still meets compression across the
+            // sweep, without doubling wall-clock. A failing seed carries its own
+            // `compressed` flag into the pinned spec, so repros are exact.
+            let compressed = (seed >> 32) & 1 == 1;
             // EIO on the durability barrier ⇒ no false ack.
             Sim::new(seed)
                 .fault(Fault::FsyncReturns { nth: 1 })
                 .scenario(Scenario::SyncFlush { records })
+                .compressed(compressed)
                 .run();
             // Torn write somewhere in the batch ⇒ no false ack on the records in
             // the dropped segment.
@@ -1698,16 +1826,19 @@ mod tests {
             Sim::new(seed)
                 .fault(Fault::ShortWriteOn { nth: torn_nth })
                 .scenario(Scenario::SyncFlush { records })
+                .compressed(compressed)
                 .run();
             // Crash between sync_all and rename ⇒ recovery replays everything.
             Sim::new(seed)
                 .fault(Fault::RenameFails)
                 .scenario(Scenario::CrashBeforeRename { records })
+                .compressed(compressed)
                 .run();
             // ENOSPC at the shutdown seal ⇒ every acked record stays recoverable.
             Sim::new(seed)
                 .fault(Fault::SealFails)
                 .scenario(Scenario::SealFailsAtShutdown { records })
+                .compressed(compressed)
                 .run();
             // Cooperatively-scheduled producer/flusher interleaving ⇒ FIFO +
             // durability hold; also exercises the scheduler for deadlocks across
@@ -1718,6 +1849,7 @@ mod tests {
                     batches: records,
                     records_per_batch: rpb as usize,
                 })
+                .compressed(compressed)
                 .run();
         }
     }
@@ -1770,6 +1902,7 @@ mod tests {
                     seed,
                     scenario: Scenario::SyncFlush { records },
                     faults,
+                    compressed: false,
                 }
                 .run();
             }

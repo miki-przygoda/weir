@@ -94,7 +94,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary format and recovery algorithm.
 
 - One flusher thread per shard; each holds an active `WabSegment`.
-- Three durability tiers. `Sync` and `Batched` uphold "ack ⇒ durable": both group-fdatasync at the batch boundary before acking every record in the batch. `Buffered` trades durability for latency — it acks after the in-memory write, before any fsync, so it does **not** uphold "ack ⇒ durable" (a Buffered ack survives a process crash but not power loss). (The historical distinction was "Sync = one fdatasync per record, Batched = one fdatasync per batch" — both now share the batch-boundary fsync, since one fsync at the end of the batch covers every record written during it. Single-producer serial workloads see no difference because the batch holds one record anyway; under concurrent producers, Sync amortises into the group fsync just like Batched.)
+- Two durability tiers. `Durable` upholds "ack ⇒ durable": it group-fdatasyncs at the batch boundary before acking every record in the batch. `Buffered` trades durability for latency — it acks after the in-memory write, before any fsync, so it does **not** uphold "ack ⇒ durable" (a Buffered ack survives a process crash but not power loss). (Historically there was a third tier: `Sync` fsynced once per record while `Batched` fsynced once per batch, until both moved onto the same batch-boundary group fsync and the distinction between them stopped existing — one fsync at the end of the batch already covered every record written during it, so a single-producer serial workload saw no difference, and under concurrent producers `Sync` amortised into the group fsync just like `Batched`. weir 2.0 removed the now-redundant tier: wire byte `0x02` is retired and permanently reserved, still decodes to `Durable` for old producers, and is never emitted by the encoder. See [wire_protocol.md → Durability tiers](wire_protocol.md#durability-tiers).)
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
 - Path validation (`validate_path`) is consolidated in `src/config/mod.rs` and used for `wab_dir` and `socket_path` at config-load time. The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
 
@@ -102,8 +102,8 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 
 - `Sink` trait uses native async fn in trait (AFIT, stable since Rust 1.75). The drain is generic `spawn<S: Sink>` to avoid `dyn Sink` object-safety issues with AFIT.
 - `SinkError::is_transient()` classifies errors: transient errors trigger exponential backoff retry of the whole segment; permanent errors dead-letter the batch.
-- `CommitResult<R>` splits a batch into `committed` and `dead_lettered` records — partial success is a first-class outcome, not an error.
-- `SinkRecord` trait decouples the drain's `Payload` bytes from the sink's own record type; pass-through implementation (`impl SinkRecord for Payload`) is provided.
+- `CommitResult` splits a batch into `committed` and `dead_lettered` records — partial success is a first-class outcome, not an error.
+- `SinkBatch` carries the batch's records alongside a `DedupToken`, a content-derived idempotency handle (`sha256` over length-delimited payloads) that any sink can forward to a downstream capable of deduplicating on it.
 - `SinkHealth` (`Healthy / Degraded / Down`) is surfaced via the `weir_sink_health` gauge; queried per-segment by the drain and on a 30 s wall-clock interval so the gauge stays current during idle deployment and `BlockedDeadLetterFull`. Degraded / Down states log the sink-supplied reason at `warn` / `error`.
 
 **Built-in sinks** (`sink_type` config value):
@@ -194,7 +194,7 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 
 Each test spawns a real `weir-server` binary via `env!("CARGO_BIN_EXE_weir-server")` with its own temp directory, socket path, WAB directory, and metrics port. A global process mutex serialises server spawning so the suite runs safely with any `--test-threads` value. Tests are written against the client library (`weir-client`) and the raw wire protocol where needed.
 
-Coverage includes: basic push/ack round-trips, all three durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, socket takeover data safety, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
+Coverage includes: basic push/ack round-trips, both durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, socket takeover data safety, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
 
 **Load tests** (`crates/weir-server/tests/load.rs`):
 
@@ -272,9 +272,9 @@ A couple of deliberate choices a contributor should know:
   SemVer-additive; removing one is breaking — so the bar to *add* is "a real
   deployment would plausibly need to change this," not "someone might." See the
   [Configuration reference](operations/configuration.md).
-- **`Sink::Record` / `SinkRecord` is a known over-generalisation.** The drain is
-  generic over a record type, but the only implementation is the identity on
-  `Payload`, and every built-in sink uses `type Record = Payload`. It's wired but
-  effectively a no-op everywhere. It's part of the **frozen 1.0** `Sink` trait, so
-  it can't be removed without a major version; flagged here as a deliberate
-  candidate to drop in a hypothetical 2.0, not a bug.
+- **`Sink::Record` / `SinkRecord` was removed in 2.0.** The drain used to be
+  generic over a record type, but the only implementation was ever the identity
+  on `Payload` and every built-in sink used `type Record = Payload`, so the
+  conversion was a no-op that allocated and cloned once per batch. Being part of
+  the frozen 1.0 `Sink` trait, it could only go at a major. Records are now
+  `Payload` throughout.

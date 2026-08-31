@@ -1,0 +1,6 @@
+{
+  "seed": 9825417659918081595,
+  "scenario": { "SyncFlush": { "records": 4 } },
+  "faults": [{ "FsyncReturns": { "nth": 1 } }],
+  "compressed": true
+}

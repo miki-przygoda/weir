@@ -68,6 +68,17 @@ pub struct SocketConfig {
     /// uid (via SO_PEERCRED / getpeereid) does not match the daemon's. See
     /// [`Config::peer_uid_check`] for the rationale.
     pub peer_uid_check: bool,
+    /// Soft cap on live WAB bytes; `0` disables the check. See
+    /// [`Config::wab_max_bytes`](crate::config::Config::wab_max_bytes).
+    pub wab_max_bytes: u64,
+    /// Most recent WAB byte count, refreshed every 5 s by the gauge task in
+    /// `main`. Handed to every connection so the ingest path can consult the
+    /// WAB size without doing I/O of its own.
+    pub wab_bytes_now: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether the cap is currently rejecting. Shared with every other listener
+    /// so the hysteresis low-water mark is honoured daemon-wide rather than
+    /// per-transport.
+    pub wab_cap_rejecting: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Binds a Unix socket, accepts connections, and drives the frame-parsing layer.
@@ -111,6 +122,9 @@ pub async fn run(
         read_timeout: Duration::from_secs(config.connection_read_timeout_secs),
         ack_timeout: crate::socket::connection::ACK_TIMEOUT,
         shard_id: 0, // overridden per connection below
+        wab_max_bytes: config.wab_max_bytes,
+        wab_bytes_now: std::sync::Arc::clone(&config.wab_bytes_now),
+        wab_cap_rejecting: std::sync::Arc::clone(&config.wab_cap_rejecting),
     };
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown_rx);
@@ -402,10 +416,18 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
     // the sockfs object, not the bound filesystem inode, and may not
     // propagate to the bind path's mode bits).
     //
-    // umask is process-global and applies to other threads briefly. Every
-    // other file-creation path in weir specifies its mode bits explicitly
-    // (WAB segments 0o600, dirs 0o700), so the temporary tightening is
-    // invisible to those paths. A tighter umask is also a safer default.
+    // umask is process-global and applies to other threads for the duration of
+    // the bind(2) below. Specifying mode bits explicitly does NOT escape it:
+    // mkdir(2) and open(2) both mask the requested mode, so a directory created
+    // by another thread in this window lands at 0o700 & !0o177 = 0o600 — no
+    // execute bit, nothing can be created inside it — and a segment file at
+    // 0o600 & !0o177 = 0o400. In the daemon nothing is created here because no
+    // producer can connect before the socket exists, so the process is idle
+    // (not single-threaded: the WAB flushers spawned at main.rs:292 and the
+    // workers at main.rs:306 are already running). Under `cargo test` the
+    // window is real and hit constantly, which is why weir-server's bin unit
+    // tests run with --test-threads=1 — see CONTRIBUTING.md and
+    // docs/security/socket-bind.md.
     //
     // The restore is RAII-guarded so an unwind (or the `?` below) between
     // tightening and restoring cannot leak umask 0o177 process-wide, silently
@@ -695,6 +717,11 @@ mod tests {
             // check always passes. Leaving the check enabled exercises the
             // production code path.
             peer_uid_check: true,
+            // WAB cap disabled: these tests exercise the accept loop, not
+            // ingest admission (connection.rs covers the cap directly).
+            wab_max_bytes: 0,
+            wab_bytes_now: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wab_cap_rejecting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -745,11 +772,15 @@ mod tests {
 
     // ── Hardened bind ─────────────────────────────────────────────────────────
 
-    // bind_hardened internally mutates the process umask. That makes
-    // concurrent calls (e.g. parallel test execution) interleave their
-    // save/restore and leak a tightened umask globally. The lock below
-    // serialises the tests; in production, bind_hardened is called once
-    // during single-threaded startup so the issue does not arise.
+    // bind_hardened internally mutates the process umask. The lock below
+    // serialises these tests against each other, but it CANNOT protect the
+    // ~300 other tests in this binary: any thread creating a directory while a
+    // bind_hardened call holds umask 0o177 gets mode 0o600 and fails with
+    // PermissionDenied. That is why the documented gate runs this target with
+    // --test-threads=1 (CONTRIBUTING.md). In the daemon the window is harmless
+    // because no producer can connect before the socket exists — but "called
+    // once during single-threaded startup" is not the reason: the WAB flushers
+    // (main.rs:292) and workers (main.rs:306) are already running by then.
 
     #[tokio::test]
     #[cfg(unix)]
@@ -1172,13 +1203,9 @@ mod tests {
     async fn connection_over_cap_is_refused() {
         let path = tmp_socket_path("connlimit");
         let cfg = SocketConfig {
-            socket_path: path.clone(),
             max_connections: 1,
-            max_payload_bytes: weir_core::MAX_PAYLOAD_HARD_CAP,
             shutdown_timeout_secs: 2,
-            connection_read_timeout_secs: 30,
-            shard_count: 1,
-            peer_uid_check: true,
+            ..default_config(path.clone())
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);

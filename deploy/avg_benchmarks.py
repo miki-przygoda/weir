@@ -35,9 +35,16 @@ BASE_THROUGHPUT_SCENARIOS = [
     "fire_and_forget_overload",
 ]
 
+# Scenario keys (first element) are unchanged from 1.x for tag continuity with
+# the dated docs/benchmarks/ snapshots and this file's own history table — see
+# baseline_latency_percentiles_batched in crates/weir-server/tests/load.rs.
+# `latency_sync` and `latency_batched` both push `Durability::Durable` and
+# report identical numbers since the 2.0 durability collapse: `Sync` and
+# `Batched` are one tier now, `Durable`. Labels (second element) reflect that;
+# the `durable`/`buffered` Prometheus `tier` label reality has only two values.
 BASE_LATENCY_SCENARIOS = [
-    ("latency_sync", "Sync"),
-    ("latency_batched", "Batched"),
+    ("latency_sync", "Durable"),
+    ("latency_batched", "Durable (batched)"),
     ("latency_buffered", "Buffered"),
 ]
 BASE_LATENCY_SCENARIO = "latency_sync"  # kept for single-deadline fallback
@@ -143,7 +150,8 @@ def build_stage_md(stage_groups: dict[str, list[dict]]) -> str:
     ]
 
     for d in deadlines_seen:
-        # Find scenarios for this deadline (sorted by tier: sync, batched, buffered).
+        # Find scenarios for this deadline (sorted by legacy scenario tag:
+        # sync, batched, buffered — see BASE_LATENCY_SCENARIOS above).
         scenarios = [
             (s, grp)
             for s, grp in stage_groups.items()
@@ -151,8 +159,18 @@ def build_stage_md(stage_groups: dict[str, list[dict]]) -> str:
         ]
         if not scenarios:
             continue
-        # Sort: sync before batched before buffered.
-        tier_order = {"sync": 0, "batched": 1, "buffered": 2}
+        # Sort key, not a durability tier. Current scenario tags (see
+        # latency_stage_breakdown in crates/weir-server/tests/load.rs) are
+        # `stage_durable_d{d}ms` and `stage_buffered_d{d}ms` — there is no
+        # "sync" or "batched" substring in anything this script parses today.
+        # The `sync`/`batched` keys below are legacy: pre-2.0 results.json
+        # snapshots (see the dated docs/benchmarks/phase3-stage-*.md tables)
+        # used `stage_sync_*`/`stage_batched_*`, and this dict still needs to
+        # sort those if re-run against old data. `durable` must map to the
+        # same rank as the legacy `sync` (both are the `Durable` tier) or a
+        # current results.json sorts `durable` after `buffered` instead of
+        # before it.
+        tier_order = {"durable": 0, "sync": 0, "batched": 1, "buffered": 2}
         scenarios.sort(key=lambda x: tier_order.get(
             next((p for p in x[0].split("_") if p in tier_order), "z"), 3
         ))

@@ -203,22 +203,22 @@ throughput. Default `1` is correct for most deployments.
 
 > **`shard_count` is not a throughput dial — and it is non-monotonic under
 > concurrency.** Each connection is pinned to one shard for its lifetime, round-robin
-> at accept time (`counter % shard_count`, `socket/mod.rs`). The Sync-tier throughput
+> at accept time (`counter % shard_count`, `socket/mod.rs`). The Durable-tier throughput
 > lever is **group-fsync batching**: a shard's flusher rides every record currently in
 > its active segment on a single `fsync` (`wab/mod.rs` `flush_batch` — "one group fsync
 > covers every record still in the active segment"), so the more concurrent producers
 > land on a shard, the more records amortise each `fsync`. Spreading the *same* set of
 > connections across more shards does the opposite — it thins connections-per-shard, so
 > each group fsync covers fewer records, while adding one more contending flusher thread
-> per shard. Past the point where that trade turns over, more shards can drop Sync
+> per shard. Past the point where that trade turns over, more shards can drop Durable
 > throughput *below* a single shard. "Match your cores" is therefore a trap for this
 > knob: the optimum is governed by **connections-per-shard**, not core count. If you are
-> chasing Sync throughput, prefer concentrating concurrent producers into **few** shards
+> chasing Durable throughput, prefer concentrating concurrent producers into **few** shards
 > over fanning out into many. (This is qualitative — the turn-over point is workload- and
 > hardware-specific; measure your own.)
 
-> **The "few shards" advice is for the fsync tiers only — it inverts for `Buffered`.**
-> The amortization above exists because Sync/Batched records share a single group
+> **The "few shards" advice is for the fsync tier only — it inverts for `Buffered`.**
+> The amortization above exists because `Durable` records share a single group
 > `fsync`. `Buffered` **never fsyncs** — its records ack the moment they hit memory
 > (`wab/mod.rs`, `Durability::Buffered` acks immediately, with no group fsync), so
 > there is nothing to amortize and no benefit to piling connections onto one shard.
@@ -227,8 +227,8 @@ throughput. Default `1` is correct for most deployments.
 > parallel — in our runs this collapsed aggregate `Buffered` throughput by roughly
 > **8–12×** versus spreading the same connections across shards. So for a `Buffered`
 > workload, **spread connections across shards** (and scale `shard_count` toward your
-> parallel-write capacity); reserve the few-shards guidance for the `Sync`/`Batched`
-> tiers where the group fsync actually rewards density.
+> parallel-write capacity); reserve the few-shards guidance for the `Durable`
+> tier where the group fsync actually rewards density.
 
 The daemon emits a startup advisory if `shard_count` / `worker_count`
 looks unusual for the host's core count. See
@@ -236,7 +236,7 @@ looks unusual for the host's core count. See
 empirical sweep and the heuristic the advisory is based on; the rule
 of thumb is `max(2, cores - 2) / 2`. Treat that advisory as a thread-budget
 sanity check (don't run far more agent threads than cores), **not** a
-throughput recommendation: as the caveat above explains, the Sync-throughput
+throughput recommendation: as the caveat above explains, the Durable-throughput
 optimum follows connections-per-shard, not cores, so the cores-based heuristic
 does not predict the best `shard_count` for throughput.
 
@@ -287,7 +287,7 @@ are the sweet spot found by the empirical sweep.
 > ~6 ms") come from its **single-producer latency** sweep; they are not a guide to
 > throughput under concurrent load. The defaults `(256, 1ms)` are a good starting point
 > at any concurrency — reach for [`shard_count`](#shard_count) and connection density
-> (see its caveat) before these two when tuning concurrent Sync throughput.
+> (see its caveat) before these two when tuning concurrent Durable throughput.
 
 #### `batch_size`
 
@@ -402,6 +402,201 @@ normal seal happens.
 **When to tune**: set it on edge/low-throughput deployments where timely delivery
 matters more than maximal per-segment batching; leave it `0` on high-throughput
 deployments where segments fill quickly on their own.
+
+---
+
+#### `wab_max_bytes`
+
+- **Type**: u64 (bytes)
+- **Default**: `0` (disabled)
+- **Range**: `0`, or large enough that `wab_max_bytes / 10 * 9` exceeds
+  [`shard_count`](#shard_count) × [`wab_segment_max_bytes`](#wab_segment_max_bytes)
+- **CLI**: `--wab-max-bytes <n>`
+- **Env**: `WEIR_WAB_MAX_BYTES`
+- **TOML**: `wab_max_bytes`
+
+A cap on total live WAB bytes on disk — the same footprint
+[`weir_wab_bytes_on_disk`](../monitoring.md) measures: the open active segment
+plus sealed segments awaiting drain. Once live bytes reach the cap, pushes on
+**both durability tiers** are rejected, including `Buffered`: it still
+writes to the WAB before it acks, so it is not exempt. This closes the case
+where a dead or stalled drain lets the disk fill while producers keep
+receiving successful acks.
+
+Rejected pushes receive `NackReason::InternalError` — **the same reason byte
+queue saturation uses, not a new one.** That is deliberate: `weir-client`'s
+`ClientError::is_recoverable()` treats `InternalError` as recoverable but an
+unknown Nack reason as fatal, so a new byte would make every client built
+before this feature tear down and reconnect precisely when the daemon is
+already under strain. The cost is that a cap rejection is indistinguishable
+from queue saturation by reason byte alone —
+[`weir_wab_cap_rejections_total`](../monitoring.md) is the **only** way to
+tell the two apart.
+
+Once rejecting, ingest resumes only after live WAB bytes fall back below
+`wab_max_bytes * 0.9` (hysteresis, so ingest does not flap on and off at the
+boundary). This state is shared daemon-wide across every listener — the Unix
+socket and the TCP/mTLS listener alike — so one connection observing recovery
+releases all of them, and one observing the cap holds all of them.
+
+**This is a soft high-water mark, not a hard limit.** The value it is checked
+against is refreshed every 5 seconds, so the WAB can overshoot by up to 5
+seconds of peak ingest. An operator who sets the cap at their exact free space
+will still fill the disk — leave at least that much headroom below actual
+free space.
+
+`0` (default) disables the cap: the WAB is unbounded, as it always was before
+this knob existed.
+
+**When set, the cap must be large enough to release itself.** Validation
+requires
+
+```
+wab_max_bytes / 10 * 9  >  shard_count * wab_segment_max_bytes
+```
+
+and refuses to start otherwise, naming the minimum it would accept. The reason
+is that the right-hand side is a floor the daemon cannot drain away: every
+shard holds one *open* active segment, its bytes are counted by the cap, and an
+active segment is sealed only by a write that crosses `wab_segment_max_bytes`
+(or by `wab_segment_max_age_secs`, which is off by default). Once the cap starts
+rejecting there are no writes — so nothing seals, nothing reaches the drain, and
+live bytes can never fall back below the `wab_max_bytes * 0.9` resume line.
+A cap below that bound wedges ingest until the daemon is restarted, even with a
+perfectly healthy sink and drain.
+
+The practical consequence: **size the cap against `shard_count`, not against one
+segment.** With `shard_count = 4` and the default 256 MiB segments, the floor is
+1 GiB and the smallest accepted cap is `1193046480` bytes (≈1.11 GiB) — but a cap that
+close to the floor leaves almost no working room, so prefer several times the
+floor. Setting `wab_segment_max_age_secs > 0` is also worth doing alongside the
+cap: it seals idle active segments on a timer, which lets their bytes reach the
+drain instead of sitting in the un-drainable floor.
+
+**Known limitation — one path can raise that floor at runtime.** When a write
+to an active segment fails, the shard abandons that segment and opens a fresh
+one. The abandoned file stays on disk, keeps counting toward the cap, and is
+never sealed or drained; only a restart reclaims it, through recovery. Each
+orphan is at most `wab_segment_max_bytes`, so a run of write failures — a disk
+going bad — can lift the un-drainable floor above whatever cap validation
+accepted at startup and wedge ingest with a healthy sink. Watch
+`weir_wab_fsync_failures_total` and `weir_wab_bytes_on_disk`: a cap rejecting
+while `weir_sink_health` reads healthy and the drain is `draining` is this,
+not sink backpressure. Sizing the cap at several times the floor gives it room
+to absorb a few orphans.
+
+**When to tune**: set it wherever the WAB shares a disk with anything else and
+you want a producer-visible signal (Nacks) when the sink stops draining,
+instead of discovering it from a full disk. Leaving it unset is not silent:
+the daemon separately warns when the WAB is growing while the sink is
+unhealthy and no cap is set (see the `CHANGELOG`).
+
+---
+
+#### `wab_compression`
+
+- **Type**: string — `"none"` or `"zstd"`
+- **Default**: `"none"`
+- **CLI**: `--wab-compression <mode>`
+- **Env**: `WEIR_WAB_COMPRESSION`
+- **TOML**: `wab_compression`
+
+Compress WAB record payloads with zstd. Each record is stored as its own
+complete zstd frame; the framing, CRC, sentinel and footer are unchanged.
+
+**Read the numbers below before enabling this.** For most weir workloads the
+gain is small, and for small records it is negative.
+
+##### What it costs
+
+Compression runs on the flusher thread, **before** the group fsync, so it is on
+the ack path. Measured on the load suite (5-byte payloads, laptop, single run
+each), `p50` ack latency rose consistently across all three latency scenarios
+below — two of which, `latency_sync_d1ms` and `latency_batched_d1ms`, now push
+the identical `Durability::Durable` tier and are kept as separate CI scenario
+names only so `deploy/avg_benchmarks.py` and the dated `docs/benchmarks/`
+snapshots keep the columns they've always keyed off; the small gap between
+their numbers below is run-to-run noise, not a durability difference:
+
+| scenario | p50 none | p50 zstd | delta |
+|---|---|---|---|
+| `latency_sync_d1ms` | 132 µs | 136 µs | +3.0% |
+| `latency_batched_d1ms` | 138 µs | 144 µs | +4.3% |
+| `latency_buffered_d1ms` | 25 µs | 26 µs | +4.0% |
+
+The `p99` and `mean` figures from the same runs swung 10–30% in *both*
+directions and are single-run noise on a non-quiesced machine; only the
+consistent `p50` rise across three independent scenarios is signal.
+
+##### What it buys — and when it does not
+
+**Nothing to do with latency.** At weir's batch sizes the fsync floor is
+dominated by per-call cost, not per-byte transfer, so fewer bytes does not mean a
+faster `fdatasync`. The benefit is **WAB capacity**: a given ratio is that much
+longer a sink outage absorbed in the same disk budget, plus proportionally fewer
+segment seals.
+
+But because each record is framed independently there is **no cross-record
+dictionary** — the ratio depends entirely on redundancy *within a single
+record*. Measured at level 1 with the same zstd the daemon uses:
+
+| payload | logical | stored | ratio |
+|---|---|---|---|
+| 5 B | 5 | 14 | **0.36×** (expands) |
+| log line, 106 B | 106 | 106 | 1.00× |
+| JSON event, 122 B | 122 | 113 | 1.08× |
+| JSON event, 285 B | 285 | 226 | 1.26× |
+| JSON, 691 B (12 nested events) | 691 | 138 | **5.01×** |
+| random 1 KiB | 1024 | 1034 | 0.99× |
+
+**Rule of thumb:** below roughly 200 bytes per record, leave it off — the frame
+overhead cancels or exceeds the gain, and tiny records expand. It pays when
+individual records are large enough to contain repeated structure, which in
+practice means batched or nested payloads of several hundred bytes and up.
+Already-compressed payloads (images, gzipped blobs) never benefit; zstd stores
+them roughly verbatim, costing CPU for nothing.
+
+##### Rollback
+
+`"none"` writes on-disk format v1, byte-identical to weir 1.x. `"zstd"` writes
+format v2, which a 1.x daemon **refuses to read** — it strands those segments
+loudly rather than misreading them, but they stay stranded until a 2.x daemon
+reads them. Treat enabling this as a one-way door for the segments written while
+it is on. Changing the setting does not rewrite existing segments; readers accept
+both versions.
+
+##### Observability
+
+`weir_wab_record_logical_bytes_total / weir_wab_record_stored_bytes_total` is the
+live ratio. The two are equal when compression is off. See
+[monitoring](../monitoring.md).
+
+---
+
+#### `wab_compression_level`
+
+- **Type**: i32
+- **Default**: `1`
+- **Range**: 1 – 19
+- **CLI**: `--wab-compression-level <n>`
+- **Env**: `WEIR_WAB_COMPRESSION_LEVEL`
+- **TOML**: `wab_compression_level`
+
+zstd compression level. Only read when `wab_compression = "zstd"`.
+
+Capped at **19 rather than zstd's maximum of 22**: levels above 19 are zstd's
+"ultra" tier, which needs materially more memory to *decompress* as well as
+compress — an unpleasant surprise on the drain's read path, and on any tooling
+reading the segment later.
+
+The default of `1` is deliberate: this codec sits on the ack path, so speed
+matters more than ratio. Raise it only if you have measured that your records
+compress meaningfully better at a higher level *and* that the added ack latency
+is acceptable.
+
+Not stored on disk — zstd frames are self-describing for decompression — so
+changing it affects only segments written afterwards, and old segments stay
+readable.
 
 ---
 
@@ -619,7 +814,8 @@ weir-ctl dl requeue --wab-dir /var/lib/weir/wab --socket /run/weir/weir.sock --y
   `--yes` performs the real run.
 - **Flags**: `--wab-dir` (env `WEIR_WAB_DIR`); `--socket` (alias `--socket-path`,
   default `/run/weir/weir.sock`) — the daemon socket to push back through;
-  `--durability` (`sync` | `batched` | `buffered`, default `batched`) — the
+  `--durability` (`durable` | `buffered`; `sync` and `batched` are accepted as
+  legacy aliases for `durable`; default `batched`, i.e. `durable`) — the
   durability tier for the re-pushed records; `--yes` to actually requeue.
 - **At-least-once, segment-atomic.** A segment is deleted only after **all** of
   its records are re-accepted (each `Push` is acked only once the daemon has made
@@ -978,8 +1174,17 @@ newlines, use per-record mode (`sink_http_batch = "none"`), where each record is
 its own POST body and newlines are fine.
 
 **Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
-is sent for the whole batch, computed over the joined body. Because the
-key is a hash of the exact bytes, it inherits the same batch-stability
+is sent for the whole batch — the **batch dedup token**, the same
+primitive the ClickHouse sink passes as `insert_deduplication_token`.
+
+> **Changed in 2.0.** This key was previously a hash of the joined NDJSON
+> request body. It is now derived from the length-delimited record
+> payloads instead, so **the value differs**: an endpoint deduplicating on
+> the old key will not recognise a retry that spans the upgrade, and a
+> batch in flight across the upgrade can be delivered twice. Per-record
+> mode is unaffected — it still sends a per-record key.
+
+Because the key is content-derived, it inherits the same batch-stability
 caveat as ClickHouse's dedup token — see the note under
 [`sink_max_batch_size`](#sink_max_batch_size): changing
 `sink_max_batch_size` across a restart re-splits a replayed segment into
@@ -1022,6 +1227,12 @@ it if you'd rather strand quickly and rely on the recovery rescan / restart.
 The first transient-retry backoff delay; it doubles on each subsequent retry
 (capped at 5 minutes), and a downstream `Retry-After` header overrides it when
 present. With the defaults the retry delays are 100 ms → 200 ms → 400 ms.
+
+**During shutdown** each remaining backoff is clamped to 250 ms, drawn from a
+1 s total budget, so a long delay (a big base, or a downstream `Retry-After`)
+can't hold the daemon open — while the retries still get real spacing rather
+than firing back-to-back. With the defaults the clamp is barely visible
+(100 ms → 200 ms → 250 ms).
 
 ---
 

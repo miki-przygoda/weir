@@ -8,8 +8,9 @@ use std::{
 use tracing::{error, info, warn};
 
 use super::format::{
-    ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION, SEGMENT_HEADER_LEN,
-    SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed, unix_nanos_now,
+    ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION_MAX_SUPPORTED,
+    SEGMENT_HEADER_LEN, SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed,
+    unix_nanos_now,
 };
 use super::segment::{sealed_path_for, segment_counter_from_path, shard_id_from_path};
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
@@ -125,27 +126,60 @@ fn recover_shard_dir(shard_dir: &Path, wab_dir: &Path, metrics: &Arc<Metrics>) -
                 info!(sealed = %sealed.display(), "recovery complete");
             }
             Err(e) => {
-                error!(path = %path.display(), error = %e, "recovery failed; segment left for manual inspection");
+                // An Err here does NOT imply recovery failed. `quarantine_and_count`
+                // returns Err as CONTROL FLOW *after* a successful quarantine — it
+                // has already moved the file and bumped
+                // `recovery_segments_quarantined` — so counting every Err as a
+                // failure fires this counter on a routine, fully-handled path and
+                // trains operators to ignore it.
+                //
+                // The honest discriminator is the file itself, not the error kind
+                // (several sites produce InvalidData, so the kind does not
+                // discriminate). `quarantine()` RENAMES, so a segment that is gone
+                // from `path` was handled and is already counted, and is reachable
+                // with `weir-ctl quarantine`. Only a segment still sitting at `path`
+                // was genuinely left behind, which is what this counter documents.
+                //
+                // `copy_to_quarantine()` copies rather than renames, but its callers
+                // return Ok (the mid-file path falls through to Ok(sealed)), so it
+                // does not reach this arm.
+                // symlink_metadata (lstat), not exists() (stat): exists() follows
+                // symlinks, so a DANGLING symlink left at `path` would read as
+                // "gone" and go uncounted — and a symlink is exactly what the
+                // O_NOFOLLOW open above rejects, so that is a reachable shape here.
+                if path.symlink_metadata().is_ok() {
+                    metrics.recovery_segments_failed.inc();
+                    error!(path = %path.display(), error = %e, "recovery failed; segment left in place for manual inspection");
+                } else {
+                    error!(path = %path.display(), error = %e, "segment quarantined during recovery; recover it with `weir-ctl quarantine`");
+                }
             }
         }
     }
     Ok(())
 }
 
-/// Quarantines a corrupt segment AND records it in the quarantine metrics, then
-/// returns the `InvalidData` error describing why. Every header-validation
-/// quarantine site funnels through here so the `recovery_segments_quarantined`
-/// counter and the `wab_segments{state=quarantined}` gauge are ALWAYS bumped —
-/// previously the short-header branch quarantined invisibly to operators alerting
-/// on those metrics, unlike the bad-magic and bad-version branches (L00). If the
-/// quarantine move itself fails, that error is returned as-is and the metrics are
-/// not bumped (nothing was quarantined).
-fn quarantine_and_count(
-    path: &Path,
-    wab_dir: &Path,
-    metrics: &Arc<Metrics>,
-    reason: &str,
-) -> io::Error {
+/// Quarantines a corrupt SEGMENT and records it in the quarantine metrics, then
+/// returns the `InvalidData` error describing why.
+///
+/// **Every segment-quarantine site funnels through here** so the
+/// `recovery_segments_quarantined` counter and the `wab_segments{state=quarantined}`
+/// gauge are ALWAYS bumped. Two separate sites have quarantined invisibly in the
+/// past: the short-header branch (L00, unlike bad-magic and bad-version), and
+/// `check_confirmed`, which moved BOTH a segment and its `.confirmed` sidecar
+/// while bumping neither counter. If you add a third, route it here.
+///
+/// The one deliberate exception is the `.confirmed` **sidecar** itself, which
+/// `check_confirmed` moves with the bare [`quarantine`]: it is a companion
+/// artifact travelling with its segment, not a second quarantined segment, and
+/// counting it would double-count one event.
+///
+/// The returned error is CONTROL FLOW, not a report of failure — the quarantine
+/// SUCCEEDED. `recover_shard_dir` relies on that distinction and must not treat
+/// this Err as a recovery failure. If the quarantine move itself fails, that
+/// error is returned as-is and the metrics are not bumped (nothing was
+/// quarantined).
+fn quarantine_and_count(path: &Path, wab_dir: &Path, metrics: &Metrics, reason: &str) -> io::Error {
     if let Err(qe) = quarantine(path, wab_dir, reason) {
         return qe;
     }
@@ -216,9 +250,9 @@ pub(crate) fn recover_segment(
         return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
-    if header_buf[4] != FORMAT_VERSION {
+    if header_buf[4] == 0 || header_buf[4] > FORMAT_VERSION_MAX_SUPPORTED {
         let reason = format!(
-            "unknown format version: expected {FORMAT_VERSION}, got {}",
+            "unknown format version: this build reads 1..={FORMAT_VERSION_MAX_SUPPORTED}, got {}",
             header_buf[4]
         );
         return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
@@ -496,6 +530,38 @@ pub(crate) fn recover_segment(
     // recovered seal as durable as a live one (F14).
     super::segment::fsync_parent_dir(&sealed)?;
 
+    // Count the open → sealed transition, exactly as the three live seal sites do
+    // (rotation, idle-seal, shutdown-seal in wab/mod.rs). A recovery seal IS a
+    // real transition — this process wrote the sentinel + footer and published the
+    // .wab.sealed dirent — and the drain will later count the matching
+    // `confirmed`. Omitting it left `weir_wab_segments` non-conserving after every
+    // restart: `confirmed` ran permanently ahead of `sealed` by one segment per
+    // shard, so "sealed − confirmed is growing ⇒ the drain is behind" read wrong
+    // for the whole life of the process (W1, found by the chaos harness over 20
+    // kill -9 episodes).
+    //
+    // Placement: AFTER the rename+fsync, so only a segment that actually became a
+    // .wab.sealed is counted. The earlier returns (header quarantine, failed
+    // quarantine copy) produce no sealed file and so are correctly uncounted; the
+    // mid-file-corruption path falls through to here and is counted BOTH
+    // `quarantined` (the preserved forensic copy) and `sealed` (the truncated
+    // prefix, which the drain will confirm) — both transitions really happened.
+    //
+    // Not double-counted anywhere: `replay_unconfirmed` only *queues* pre-existing
+    // .wab.sealed files, which were counted by whichever process sealed them; a
+    // replay is not a transition, so it must not bump this counter. Idempotency:
+    // recovery runs once per process (wab::spawn) and only ever sees unsealed
+    // .wab files, so within a process each seal is counted exactly once. If a
+    // crash between the rename and the parent fsync lost the dirent, the next
+    // process re-seals and re-counts — but that is a different process with a
+    // freshly-zeroed counter, so the per-process totals stay consistent.
+    metrics
+        .wab_segments
+        .get_or_create(&SegmentStateLabel {
+            state: SegmentState::sealed,
+        })
+        .inc();
+
     info!(
         sealed = %sealed.display(),
         records = record_count,
@@ -618,7 +684,11 @@ fn non_clobbering_dest(dir: &Path, base: &str) -> io::Result<PathBuf> {
 /// - Bad CRC or unknown version: quarantines the segment and its `.confirmed` file,
 ///   returns `Err` so the caller knows to skip this segment entirely.
 /// - Valid: returns `Ok(true)`.
-pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<bool> {
+pub(crate) fn check_confirmed(
+    sealed_path: &Path,
+    wab_dir: &Path,
+    metrics: &Metrics,
+) -> io::Result<bool> {
     // Shared sealed→confirmed name mapping (the drain's write side uses the
     // same helper) — see crate::wab::format::confirmed_path_for.
     let confirmed_path = super::format::confirmed_path_for(sealed_path);
@@ -636,30 +706,49 @@ pub(crate) fn check_confirmed(sealed_path: &Path, wab_dir: &Path) -> io::Result<
             | ConfirmedParseError::WrongLength { .. }),
         ) => {
             let reason = format!("invalid .confirmed file: {e}");
-            quarantine(sealed_path, wab_dir, &reason)?;
+            // Count the SEGMENT once (the .confirmed sidecar is a companion
+            // artifact, not a second quarantined segment), then park the sidecar
+            // beside it. Before this, both files moved and NEITHER counter did,
+            // so an operator alerting on the quarantine counters missed this case
+            // entirely — the same invisibility bug quarantine_and_count was
+            // introduced to fix, surviving in a second site.
+            let e = quarantine_and_count(sealed_path, wab_dir, metrics, &reason);
             quarantine(&confirmed_path, wab_dir, &reason)?;
-            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+            Err(e)
         }
         Err(e @ ConfirmedParseError::UnknownVersion(_)) => {
             let reason = format!("unknown .confirmed version: {e}");
-            quarantine(sealed_path, wab_dir, &reason)?;
+            // Count the SEGMENT once (the .confirmed sidecar is a companion
+            // artifact, not a second quarantined segment), then park the sidecar
+            // beside it. Before this, both files moved and NEITHER counter did,
+            // so an operator alerting on the quarantine counters missed this case
+            // entirely — the same invisibility bug quarantine_and_count was
+            // introduced to fix, surviving in a second site.
+            let e = quarantine_and_count(sealed_path, wab_dir, metrics, &reason);
             quarantine(&confirmed_path, wab_dir, &reason)?;
-            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+            Err(e)
         }
         // `ConfirmedParseError` is `#[non_exhaustive]`; any future parse failure
         // is also "cannot trust this .confirmed file", so quarantine and skip —
         // the same conservative path as a bad CRC, never a silent accept.
         Err(e) => {
             let reason = format!("unparseable .confirmed file: {e}");
-            quarantine(sealed_path, wab_dir, &reason)?;
+            // Count the SEGMENT once (the .confirmed sidecar is a companion
+            // artifact, not a second quarantined segment), then park the sidecar
+            // beside it. Before this, both files moved and NEITHER counter did,
+            // so an operator alerting on the quarantine counters missed this case
+            // entirely — the same invisibility bug quarantine_and_count was
+            // introduced to fix, surviving in a second site.
+            let e = quarantine_and_count(sealed_path, wab_dir, metrics, &reason);
             quarantine(&confirmed_path, wab_dir, &reason)?;
-            Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+            Err(e)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::format::Compression;
     use super::*;
     use crate::metrics::Metrics;
     use crate::wab::format::build_confirmed;
@@ -677,13 +766,40 @@ mod tests {
     }
 
     fn make_segment(dir: &Path, shard_id: u16, payloads: &[&[u8]]) -> PathBuf {
+        make_segment_with(dir, shard_id, Compression::None, payloads)
+    }
+
+    /// As `make_segment`, at a chosen compression. `WabSegment::write_record`
+    /// takes the STORED bytes, so a compressed segment is built by compressing
+    /// each payload first — the same thing `ShardWriter` does in production.
+    fn make_segment_with(
+        dir: &Path,
+        shard_id: u16,
+        compression: Compression,
+        payloads: &[&[u8]],
+    ) -> PathBuf {
         use crate::wab::segment::{WabSegment, segment_path};
         let path = segment_path(dir, 1);
-        let mut seg = WabSegment::create(&path, shard_id).unwrap();
+        let mut seg = WabSegment::create(&path, shard_id, compression).unwrap();
         for p in payloads {
-            seg.write_record(p).unwrap();
+            match compression {
+                Compression::None => seg.write_record(p).unwrap(),
+                Compression::Zstd => seg
+                    .write_record(&zstd::bulk::compress(p, 1).unwrap())
+                    .unwrap(),
+            }
         }
         path
+    }
+
+    /// Current `weir_wab_segments{state="sealed"}` value.
+    fn sealed_count(metrics: &Metrics) -> u64 {
+        metrics
+            .wab_segments
+            .get_or_create(&SegmentStateLabel {
+                state: SegmentState::sealed,
+            })
+            .get()
     }
 
     #[test]
@@ -694,6 +810,135 @@ mod tests {
         assert!(sealed.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
         assert!(!path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── W1: the recovery seal is a counted open → sealed transition ───────────
+
+    /// W1. Recovery renames an unsealed `.wab` to `.wab.sealed` and hands it to
+    /// the drain, which later bumps `weir_wab_segments{state="confirmed"}`. If the
+    /// seal itself isn't counted, `confirmed` runs permanently ahead of `sealed`
+    /// after every restart (one segment per shard) and the counter family stops
+    /// conserving — the chaos harness measured exactly that over 20 `kill -9`
+    /// episodes.
+    #[test]
+    fn recovery_seal_counts_the_sealed_transition() {
+        let dir = tmp_dir("seal_counter");
+        let path = make_segment(&dir, 0, &[b"alpha", b"beta"]);
+        let metrics = noop_metrics();
+        assert_eq!(sealed_count(&metrics), 0, "counter starts at zero");
+
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert!(sealed.exists());
+        assert_eq!(
+            sealed_count(&metrics),
+            1,
+            "recovery sealing a segment must bump weir_wab_segments{{state=\"sealed\"}} — \
+             the drain will bump the matching confirmed"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// W1. A segment that never becomes a `.wab.sealed` must not be counted as
+    /// sealed. The header-quarantine branches return before the rename, so the
+    /// increment's placement after the rename+fsync is what makes this hold.
+    #[test]
+    fn quarantined_segment_counts_no_sealed_transition() {
+        let dir = tmp_dir("seal_counter_quarantine");
+        let path = crate::wab::segment::segment_path(&dir, 1);
+        // Fewer than SEGMENT_HEADER_LEN bytes — quarantined, never sealed.
+        fs::write(&path, b"WEI").unwrap();
+
+        let metrics = noop_metrics();
+        assert!(recover_segment(&path, &dir, &metrics).is_err());
+
+        assert_eq!(
+            sealed_count(&metrics),
+            0,
+            "a quarantined segment produced no .wab.sealed and must not be counted as sealed"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// W1. Mid-file corruption preserves a forensic COPY in quarantine and still
+    /// seals the valid prefix for delivery. Both transitions really happen, so
+    /// both are counted — otherwise the drain's `confirmed` for the sealed prefix
+    /// would again have no matching `sealed`.
+    #[test]
+    fn mid_file_corruption_counts_both_sealed_and_quarantined() {
+        let dir = tmp_dir("seal_counter_midfile");
+        let path = make_segment(&dir, 0, &[b"recordA", b"recordB"]);
+        // Flip a byte inside record B's payload (offset 24 + 15 + 8 = 47) so its
+        // CRC fails with its length + CRC fields intact — the mid-file branch.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[47] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert!(sealed.exists());
+        assert_eq!(
+            sealed_count(&metrics),
+            1,
+            "the truncated-but-sealed prefix is a real open → sealed transition"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "the preserved forensic copy is still counted as quarantined"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// W1. A `.wab.sealed` left by a previous process was already counted as
+    /// sealed by whichever process sealed it. Startup must NOT re-count it: the
+    /// replay path (`wab::replay_unconfirmed`) only *queues* it for the drain, and
+    /// `recover_open_segments` only touches unsealed `.wab` files. Exactly one
+    /// sealed transition is counted here — for the active segment recovery
+    /// actually seals.
+    #[test]
+    fn already_sealed_segments_are_not_recounted_on_startup() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("seal_counter_replay");
+        let shard_dir = dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // seg 1: sealed by the "previous process" — already counted there.
+        let mut seg =
+            WabSegment::create(&segment_path(&shard_dir, 1), 0, Compression::None).unwrap();
+        seg.write_record(b"old").unwrap();
+        let pre_sealed = seg.seal().unwrap();
+        // seg 2: still active at crash time — recovery seals this one.
+        let active = segment_path(&shard_dir, 2);
+        let mut seg = WabSegment::create(&active, 0, Compression::None).unwrap();
+        seg.write_record(b"new").unwrap();
+        drop(seg);
+
+        let metrics = noop_metrics();
+        recover_open_segments(&dir, &metrics).unwrap();
+
+        assert!(
+            pre_sealed.exists(),
+            "the pre-sealed segment is left untouched"
+        );
+        assert!(
+            sealed_path_for(&active).exists(),
+            "the active one was sealed"
+        );
+        assert_eq!(
+            sealed_count(&metrics),
+            1,
+            "only the segment recovery actually sealed is counted; a segment sealed by an \
+             earlier process must not be re-counted when it is replayed"
+        );
         fs::remove_dir_all(dir).ok();
     }
 
@@ -823,7 +1068,7 @@ mod tests {
         let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
         {
             use crate::wab::segment::WabSegment;
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             for p in payloads {
                 seg.write_record(p).unwrap();
             }
@@ -921,7 +1166,7 @@ mod tests {
         let path = segment_path(&dir, 1);
         let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             for p in payloads {
                 seg.write_record(p).unwrap();
             }
@@ -1125,7 +1370,7 @@ mod tests {
 
         // Segment 1: valid then magic-corrupted → recover_segment quarantines + Errs.
         let corrupt = segment_path(&shard_dir, 1);
-        let mut s1 = WabSegment::create(&corrupt, 0).unwrap();
+        let mut s1 = WabSegment::create(&corrupt, 0, Compression::None).unwrap();
         s1.write_record(b"healthy-1").unwrap();
         drop(s1);
         {
@@ -1135,7 +1380,7 @@ mod tests {
 
         // Segment 2: healthy, left active — must still be sealed.
         let healthy = segment_path(&shard_dir, 2);
-        let mut s2 = WabSegment::create(&healthy, 0).unwrap();
+        let mut s2 = WabSegment::create(&healthy, 0, Compression::None).unwrap();
         s2.write_record(b"healthy-2").unwrap();
         drop(s2);
 
@@ -1179,7 +1424,7 @@ mod tests {
         // order deterministic (counter order) instead of OS-arbitrary.
         for (counter, payload) in [(1u64, b"seg-one" as &[u8]), (2, b"seg-two")] {
             let path = segment_path(&shard_dir, counter);
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(payload).unwrap();
             // Left active (unsealed) on purpose — recovery must seal it.
         }
@@ -1219,7 +1464,7 @@ mod tests {
         let shard_dir = wab_dir.join("shard_00");
         fs::create_dir_all(&shard_dir).unwrap();
         let shard_seg = segment_path(&shard_dir, 1);
-        WabSegment::create(&shard_seg, 0)
+        WabSegment::create(&shard_seg, 0, Compression::None)
             .unwrap()
             .write_record(b"live")
             .unwrap();
@@ -1229,7 +1474,7 @@ mod tests {
         let dl_dir = wab_dir.join("dead_letter");
         fs::create_dir_all(&dl_dir).unwrap();
         let dl_seg = dl_dir.join("dl_00000001.wab");
-        WabSegment::create(&dl_seg, 0)
+        WabSegment::create(&dl_seg, 0, Compression::None)
             .unwrap()
             .write_record(b"dead")
             .unwrap();
@@ -1277,7 +1522,7 @@ mod tests {
         let dir = tmp_dir("recover_max_payload");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(&vec![0xABu8; MAX_PAYLOAD_HARD_CAP])
                 .unwrap();
         }
@@ -1312,7 +1557,7 @@ mod tests {
         let dir = tmp_dir("recover_oversized");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"keep-me").unwrap();
         }
         // Splice an oversized length field where the next record would start.
@@ -1354,7 +1599,7 @@ mod tests {
         let dir = tmp_dir("recover_oversized_midfile");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"keep-me").unwrap();
         }
         // Splice an oversized length field, THEN trailing bytes after it so the
@@ -1417,7 +1662,7 @@ mod tests {
         let dir = tmp_dir("recover_sentinel");
         let path = segment_path(&dir, 1);
         {
-            let mut seg = WabSegment::create(&path, 0).unwrap();
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
             seg.write_record(b"before-sentinel").unwrap();
         }
         // A sentinel is a zero-length record-length field (4 zero bytes), written
@@ -1580,7 +1825,48 @@ mod tests {
         let dir = tmp_dir("noconf");
         let sealed = dir.join("seg_00000001.wab.sealed");
         fs::write(&sealed, b"placeholder").unwrap();
-        assert!(!check_confirmed(&sealed, &dir).unwrap());
+        assert!(!check_confirmed(&sealed, &dir, &noop_metrics()).unwrap());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_quarantined_confirmed_sidecar_bumps_the_quarantine_metrics() {
+        // Before this, check_confirmed called the bare quarantine() twice and
+        // bumped NEITHER counter, so an operator alerting on them missed the case
+        // entirely — the identical invisibility bug quarantine_and_count exists to
+        // prevent, surviving in a second site while its doc comment claimed
+        // "every quarantine site funnels through here".
+        //
+        // The SEGMENT is counted once; the .confirmed sidecar is a companion
+        // artifact that moves with it, not a second quarantined segment.
+        let dir = tmp_dir("conf_sidecar_counted");
+        let sealed = dir.join("seg_00000001.wab.sealed");
+        let confirmed = dir.join("seg_00000001.wab.confirmed");
+        fs::write(&sealed, b"placeholder").unwrap();
+        let mut bad = build_confirmed(0, 5, 1);
+        let n = bad.len();
+        bad[n - 1] ^= 0xff; // wreck the CRC
+        fs::write(&confirmed, bad).unwrap();
+
+        let metrics = noop_metrics();
+        assert!(check_confirmed(&sealed, &dir, &metrics).is_err());
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "the quarantined segment must be counted exactly once"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "wab_segments{{quarantined}} must move too"
+        );
+        assert!(!sealed.exists(), "the segment was moved to quarantine");
+        assert!(!confirmed.exists(), "the sidecar moved with it");
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1591,7 +1877,7 @@ mod tests {
         let confirmed = dir.join("seg_00000001.wab.confirmed");
         fs::write(&sealed, b"placeholder").unwrap();
         fs::write(&confirmed, build_confirmed(0, 5, 1)).unwrap();
-        assert!(check_confirmed(&sealed, &dir).unwrap());
+        assert!(check_confirmed(&sealed, &dir, &noop_metrics()).unwrap());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1605,7 +1891,7 @@ mod tests {
         bytes[32] ^= 0xff; // corrupt CRC
         fs::write(&confirmed, bytes).unwrap();
 
-        assert!(check_confirmed(&sealed, &dir).is_err());
+        assert!(check_confirmed(&sealed, &dir, &noop_metrics()).is_err());
         assert!(!sealed.exists());
         assert!(!confirmed.exists());
         assert!(dir.join("quarantine").exists());
@@ -1625,7 +1911,7 @@ mod tests {
         bytes[32..36].copy_from_slice(&crc.to_le_bytes());
         fs::write(&confirmed, bytes).unwrap();
 
-        let err = check_confirmed(&sealed, &dir).unwrap_err();
+        let err = check_confirmed(&sealed, &dir, &noop_metrics()).unwrap_err();
         assert!(
             err.to_string().contains("99"),
             "error should mention the version byte"
@@ -1678,6 +1964,191 @@ mod tests {
         audit_segment_modes(&dir, &metrics);
 
         assert_eq!(metrics.wab_unexpected_mode.get(), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Compression (format v2) ───────────────────────────────────────────────
+    //
+    // These exist to PROVE the design's central claim rather than assume it:
+    // the per-record CRC covers the STORED bytes, so recovery validates framing
+    // and checksums without ever decompressing, and needs no compression
+    // awareness at all. If any of these required a production change, the claim
+    // would be wrong.
+
+    #[test]
+    fn torn_tail_in_a_compressed_segment_truncates_at_the_last_valid_record() {
+        let dir = tmp_dir("v2_torn_tail");
+        let path = make_segment_with(
+            &dir,
+            0,
+            Compression::Zstd,
+            &[b"record1", b"record2", b"record3"],
+        );
+
+        // Lop bytes off the end so the final record is torn mid-payload. Frame
+        // sizes vary, so measure rather than hardcode an offset.
+        let len = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 5)
+            .unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            2,
+            "torn tail keeps the whole-record prefix"
+        );
+        assert_eq!(recovered[0].as_ref(), b"record1");
+        assert_eq!(recovered[1].as_ref(), b"record2");
+
+        assert!(
+            !dir.join("quarantine").exists(),
+            "a torn-tail (EOF) truncation must NOT quarantine, compressed or not"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recovery_preserves_the_compression_flag() {
+        // Recovery finalises an EXISTING file, so it never rewrites the header.
+        // If this ever failed, a recovered segment would become unreadable — its
+        // records are frames but its header would claim they are not.
+        let dir = tmp_dir("v2_flag_preserved");
+        let path = make_segment_with(&dir, 0, Compression::Zstd, &[b"one", b"two"]);
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let mut header = [0u8; crate::wab::format::SEGMENT_HEADER_LEN];
+        {
+            use std::io::Read;
+            fs::File::open(&sealed)
+                .unwrap()
+                .read_exact(&mut header)
+                .unwrap();
+        }
+        let meta = crate::wab::format::parse_segment_header(&header).unwrap();
+        assert_eq!(meta.compression, Compression::Zstd);
+        assert_eq!(meta.format_version, crate::wab::format::FORMAT_VERSION_V2);
+
+        // And the records still read back as plaintext.
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].as_ref(), b"one");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mid_file_corruption_in_a_compressed_segment_quarantines() {
+        // The 1.1.0 behaviour must hold under compression: a CRC mismatch in the
+        // MIDDLE quarantines rather than truncating, so acked records sitting
+        // after the corruption are preserved rather than silently dropped.
+        let dir = tmp_dir("v2_midfile");
+        let path = make_segment_with(&dir, 0, Compression::Zstd, &[b"recordA", b"recordB"]);
+
+        // Corrupt a byte inside the FIRST record's stored frame, leaving its
+        // length and CRC fields intact — the mid-file branch, since a valid
+        // record follows it.
+        let mut bytes = fs::read(&path).unwrap();
+        let first_payload_start = crate::wab::format::SEGMENT_HEADER_LEN + 8;
+        bytes[first_payload_start] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        let _ = recover_segment(&path, &dir, &metrics);
+
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1,
+            "a mid-file-corrupt compressed segment must be quarantined"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_quarantined_segment_is_not_counted_as_a_recovery_failure() {
+        // This fixture (a header too short to parse) was originally written for
+        // `recovery_segments_failed` — WRONGLY. It never reached a genuine
+        // failure: a short header goes to `quarantine_and_count`, which MOVES the
+        // file and bumps `recovery_segments_quarantined`, then returns Err purely
+        // as control flow. Counting that Err as a failure fires the counter on a
+        // routine, fully-handled path — the "always fires, so it's noise" trap.
+        //
+        // The segment here is quarantined and IS reachable, via
+        // `weir-ctl quarantine`. So: quarantined counter up, failed counter flat.
+        let dir = tmp_dir("recovery_quarantined_not_failed");
+        let shard_dir = dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        let path = crate::wab::segment::segment_path(&shard_dir, 1);
+        fs::write(&path, b"nope").unwrap();
+
+        let metrics = noop_metrics();
+        recover_open_segments(&dir, &metrics).unwrap();
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "a short header is quarantined, and that is what must be counted"
+        );
+        assert_eq!(
+            metrics.recovery_segments_failed.get(),
+            0,
+            "a successfully quarantined segment is NOT a recovery failure — it was \
+             moved to quarantine/, not left on disk, and it is recoverable"
+        );
+        assert!(
+            !path.exists(),
+            "quarantine renames, so the segment must be gone from its original path"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_segment_left_in_place_by_a_failed_recovery_is_counted() {
+        // The case `recovery_segments_failed` actually documents, which had NO
+        // test until now: recovery errors WITHOUT quarantining, so the segment is
+        // still sitting at its original path and nothing will ever reach it.
+        //
+        // A directory at the segment path reaches that branch: the open succeeds,
+        // the header read fails with something other than UnexpectedEof, so
+        // recover_segment propagates it rather than routing to quarantine.
+        let dir = tmp_dir("recovery_failed_left_in_place");
+        let shard_dir = dir.join("shard_00");
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        let path = crate::wab::segment::segment_path(&shard_dir, 1);
+        fs::create_dir(&path).unwrap();
+
+        let metrics = noop_metrics();
+        recover_open_segments(&dir, &metrics).unwrap();
+        assert_eq!(
+            metrics.recovery_segments_failed.get(),
+            1,
+            "a segment left at its original path by a failed recovery must be counted"
+        );
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            0,
+            "nothing was quarantined — that is precisely why this one is a failure"
+        );
+        assert!(path.exists(), "the fixture must still be in place");
         fs::remove_dir_all(dir).ok();
     }
 }

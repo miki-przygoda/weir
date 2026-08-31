@@ -13,6 +13,392 @@ protocol** below.
 
 ---
 
+## [2.0.0] - 2026-08-31
+
+**This is a major release.** The `Sink` trait changes shape and `Durability`
+collapses from three tiers to two. The wire protocol is unaffected, so **no
+producer needs recompiling** and no existing deployment's clients are
+affected; a downstream Rust crate with an exhaustive `match` over
+`Durability`'s old three variants, or over the old `Sink::Record` associated
+type, needs a small source change — see Breaking below.
+
+### Breaking
+
+- **The `tier` metric label changed** from `sync`/`batched`/`buffered` to
+  `durable`/`buffered`. A panel or alert selecting `tier="sync"` or
+  `tier="batched"` returns no data — **silently**: a blank panel, not an
+  error. See `docs/monitoring.md`.
+- **`Durability` has two tiers, not three.** `Sync` and `Batched` carried the
+  same guarantee since both moved to the batch-boundary group fsync. They are
+  now one tier, `Durable`. `Durability::Sync` and `Durability::Batched`
+  remain as deprecated aliases, so code that *constructs* a tier keeps
+  compiling with a warning. An exhaustive `match` over the old three variants
+  still compiles too — associated consts are legal match patterns, and
+  `Sync`/`Batched`/`Buffered` still cover the value space, so exhaustiveness
+  passes — but the `Batched` arm becomes unreachable dead code: an
+  `unreachable_patterns` **warning**, not an error. If you dispatched on
+  `Sync` vs `Batched` differently, that distinction is now silently gone —
+  grep for it rather than relying on the compiler to catch it.
+- **The one hard compile error: importing the variant by name.**
+  `use weir_core::Durability::Sync;` was legal while `Sync` was an enum
+  variant; it is not legal for an associated const, so it is now a hard
+  error:
+  ```
+  error[E0432]: unresolved import `weir_core::Durability::Sync`
+    |
+    | use weir_core::Durability::Sync;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Sync` in `durability::Durability`
+    |
+  help: consider importing this trait instead
+    |
+  - use weir_core::Durability::Sync;
+  + use std::marker::Sync;
+  ```
+  rustc's suggestion — importing `std::marker::Sync` instead — is unrelated
+  and actively misleading; do not take it. `use Durability::{Sync, Batched,
+  Buffered};` fails the same way on two of the three names while `Buffered`
+  resolves fine, which can make the failure read as two typos rather than an
+  API change. Fix: `use weir_core::Durability;` and reference
+  `Durability::Durable` at the call site.
+- Wire compatibility is **preserved**: `0x02` still decodes to `Durable`, so
+  producers built against 1.x keep working. The encoder only ever emits
+  `0x01`, and `0x02` is permanently reserved.
+
+### Security
+
+- **Dependency advisories cleared before release.** `h2` updated 0.4.14 -> 0.4.19
+  for [RUSTSEC-2026-0258](https://rustsec.org/advisories/RUSTSEC-2026-0258) —
+  the crate queued empty HTTP/2 DATA frames without limit, so an undrained
+  stream could grow memory unboundedly or panic on length overflow. Low
+  severity, and transitive: it reaches `weir-server` only through
+  `reqwest -> hyper -> h2`, so it applies to deployments using the HTTP sink.
+  `chacha20` moved 0.10.0 -> 0.10.2 off a yanked release. Lockfile only; no
+  weir source changed.
+
+### License
+
+- **weir is now licensed under the Apache License 2.0**, changed from MIT. The
+  `LICENSE` file carries the canonical Apache-2.0 text and every crate's
+  `license` metadata is updated. Apache-2.0 is permissive like MIT and adds an
+  explicit patent grant; the one practical consequence to know is that
+  **Apache-2.0 is incompatible with GPLv2**, so a GPLv2 project can no longer
+  vendor weir (GPLv3 is fine). Releases up to and including 1.3.1 remain
+  available under MIT — this change is not retroactive.
+
+### Added
+
+- **The durability tiers are now measured against real power loss, not just
+  described.** Every prior durability result came from `kill -9`, which does
+  **not** lose the page cache — so the central claim had never met the fault it
+  is written for. 6,129 simulated power-loss episodes over 687,712,504
+  acknowledged records, injected with `dm-flakey drop_writes` on ext4, with a
+  per-episode canary confirming the fault actually fired in every one. Full
+  method and results:
+  `docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`.
+
+  - **`Durable` lost nothing across 5,311 power cuts** (42,814,591 acked
+    records, 24 hours). No I1 violation, no I2 leak, and the WAB was completely
+    empty at shutdown — nothing quarantined, unconfirmed, or dead-lettered,
+    because it has already `fdatasync`ed everything it acknowledged. Stated as
+    a bound rather than proof: this puts the per-episode violation rate under
+    ~0.06% at 95% confidence, on one machine, one filesystem, one kernel.
+
+  - **`Buffered`'s exposure now has a number.** Loss is *uniformly distributed*
+    between zero and one writeback interval — mean and standard deviation both
+    land within 2% of a uniform distribution's `max/2` and `max/√12`. On the
+    reference hardware at ~72,000 records/s that is a **ceiling of 1.76 seconds
+    of acknowledged writes**, median 0.89 s. The ceiling, not the median, is
+    the number to size risk against. What generalises is the shape: one
+    writeback interval of your throughput, which does not grow with uptime or
+    queue depth.
+
+- **`wab_compression = "zstd"` roughly triples `Buffered`'s power-loss
+  exposure.** Correctness is unaffected — zero violations, and recovery parses
+  a torn zstd frame as reliably as a torn plain record — but the loss
+  distribution stops being uniform and becomes **bimodal**, with the ceiling
+  rising from 124,897 records (~1.8 s) to 449,876 (~5.7 s) in a 40-episode
+  controlled comparison. Compression packs more records behind each unflushed
+  byte, so a cut that catches the larger unit takes proportionally more with
+  it. Treat the multiplier as indicative: the load generator's payload is far
+  more compressible than real data, so the mechanism is demonstrated and its
+  magnitude on a realistic workload is not. `Durable` is unaffected either way.
+
+- **`weir-sink-sdk` — `SinkBatch` and `DedupToken`.** Every sink now receives a
+  content-derived, batch-scoped idempotency handle alongside its records:
+  `sha256(len(p₀) ++ p₀ ++ …)` with 8-byte little-endian length prefixes, in
+  delivery order. The length prefix is load-bearing — without it `["ab","c"]`
+  and `["a","bc"]` collide, and a dedup-capable sink would drop the second as a
+  duplicate. `DedupToken::to_prefixed_hex()` yields the `sha256:<hex>` form an
+  HTTP `Idempotency-Key` wants.
+
+  The digest is byte-identical to the token 1.x's ClickHouse sink computed
+  privately, pinned by known-answer vectors in **both** crates (two deliberately
+  independent copies, so editing one alone turns the build red). **The guarantee
+  holds only while `sink_max_batch_size` is stable** — changing it across a
+  restart re-splits replayed segments into differently sized batches whose
+  tokens will not match.
+
+- **`wab_max_bytes` — a soft cap on live WAB bytes, off by default.** Until now
+  the WAB was unbounded: when the drain gave up, its own log said *"delivery is
+  stopped and the WAB will accumulate on disk until restart"* — while producers
+  kept receiving successful acks. Every acked record really was on disk, so this
+  was never a false ack, but it was its nearest neighbour: a disk filling behind
+  a green light.
+
+  Over the cap, pushes are Nacked with `NackReason::InternalError` — the
+  existing byte, not a new one. That is deliberate: the client treats
+  `InternalError` as recoverable but an unknown Nack reason as fatal, so a new
+  byte would make every client built before it tear down and reconnect precisely
+  when the daemon is already under strain. The cost is that cap rejections share
+  a reason byte with queue saturation; `weir_wab_cap_rejections_total`
+  distinguishes them.
+
+  **It is a soft high-water mark.** The value is refreshed every 5 seconds, so
+  the WAB can overshoot by up to 5 seconds of peak ingest — leave headroom.
+
+  **Size it against `shard_count`, not against one segment.** Validation
+  requires `wab_max_bytes / 10 * 9 > shard_count * wab_segment_max_bytes` and
+  names the minimum it would accept. Below that bound the cap can never release
+  itself: each shard's *open* active segment counts toward the cap but seals only
+  on a write that crosses `wab_segment_max_bytes`, so once the cap rejects, no
+  write happens, nothing seals, nothing drains, and live bytes never fall back
+  under the resume line — ingest stays wedged until restart even with a healthy
+  sink. `wab_segment_max_age_secs > 0` (idle-seal) is worth enabling alongside it.
+
+  Because it defaults to off, the daemon also **warns when the WAB is growing
+  while the sink is unhealthy and no cap is set**, rate-limited to once every 5
+  minutes. That warning deliberately does not fire under a healthy drain, where
+  sustained growth is just a fast producer.
+
+- **`weir_drain_state{state="stopped"}` — a new value in an existing one-hot
+  gauge family.** The drain supervisor previously left `weir_drain_state` and
+  `weir_sink_health` reading *draining* and *healthy* after it exited for good,
+  because both are written only by the drain thread itself. An operator scraping
+  a daemon whose drain had given up saw a green dashboard over a WAB filling the
+  disk. The supervisor now sets `stopped` on every exit path — clean shutdown,
+  respawn budget exhausted, and the dead-letter writer failing to open — and it
+  is terminal: nothing is delivered until the daemon restarts.
+  `weir_sink_health` is deliberately left where it was, because once nobody is
+  probing the sink its health is unknown rather than down — which also means
+  **that gauge is not trustworthy while `stopped` is set.** The shipped
+  `WeirDrainStopped` alert rule, the Grafana drain-state panels, and
+  `weir-readiness.sh` all know about the new value; a dashboard pinned from an
+  earlier release will render it as an unmapped `3`.
+
+- **Quarantined records are reachable again.** When crash recovery meets
+  mid-file corruption it seals and delivers the valid prefix, then copies the
+  whole segment to `quarantine/` — precisely because acked records may sit
+  *after* the corrupt one. Those records exist nowhere else, and until now
+  nothing could read them: `weir-ctl` had no quarantine command at all, and the
+  only quarantine metrics were per-process counters that vanished on restart.
+
+  New `weir-ctl quarantine list | inspect | requeue`, built on a new
+  `weir-wab::RecoveryReader` that continues past a corrupt record instead of
+  stopping at it. It never fabricates records: a declared length above the
+  stored cap, or a run of consecutive verification failures, ends the read
+  (`Desynced`) rather than guessing where the next record begins — and
+  `requeue` never deletes a segment that desynced, however many records it
+  recovered first, because the unread bytes past that point might still hold
+  data.
+
+  `requeue` **does** re-send records that already reached the sink — the
+  delivered prefix and the preserved tail live in the same file — so the dry
+  run prints that count before you pass `--yes`. A dedup-capable sink will not
+  filter them either: the dedup token covers a batch's contents *and* its
+  boundaries, and a requeue re-batches. A segment that yields no recoverable
+  records is also left in place rather than deleted. See
+  `docs/operations/quarantine-recovery.md` for the full triage procedure.
+
+  Also adds `weir_quarantine_bytes_on_disk` (a gauge, so it survives a
+  restart — the one signal that moves on every quarantine event) and
+  `weir_recovery_segments_failed_total`, for the recovery arm that previously
+  only logged.
+
+### Changed
+
+- **BREAKING — the `Sink` trait is reshaped.** `commit` takes a `SinkBatch`
+  instead of `Vec<Self::Record>`, and **`SinkRecord` / `Sink::Record` are
+  removed** — records are `Payload`, as every implementation that ever existed
+  already assumed. `CommitResult` loses its type parameter accordingly.
+  Migrating a sink written against 1.x is one deleted line and one added line:
+
+  ```rust
+  impl Sink for MySink {
+  -   type Record = Payload;
+      type Error = MyError;
+      async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MyError> {
+  +       let batch = batch.into_records();
+          // ... the rest of your 1.x body, unchanged
+  ```
+
+  A sink whose downstream can deduplicate should instead read
+  `batch.dedup_token()`. Dropping the associated type also removes a per-batch
+  allocation and clone in the drain: `map(S::Record::from_payload)` was the
+  identity in every implementation, and the dead-letter path's matching
+  `into_payload` is gone with it. It also removes a real footgun — the two
+  dead-letter paths recovered bytes differently, so a non-byte-preserving
+  `from_payload`/`into_payload` round-trip made them disagree.
+
+- **BREAKING (behaviour) — the HTTP sink's ndjson `Idempotency-Key` changed
+  value.** It was `sha256:<hex>` of the joined NDJSON request body; it is now
+  the batch dedup token, `sha256:<hex>` of the length-delimited payloads. The
+  header is still present and still `sha256:`-prefixed, but **an endpoint
+  deduplicating on the old key will not recognise a retry that spans the
+  upgrade** — a batch in flight across the upgrade can be delivered twice.
+  Per-record mode is unchanged: it still sends a per-record key, since a batch
+  token means nothing there.
+
+- **WAB format v2 and opt-in zstd compression.** Header byte `[5]`, reserved and
+  zero since v1, becomes a flags byte; bit 0 means every record in the segment is
+  a zstd frame. Record framing, the sentinel, the footer and the `.confirmed`
+  sidecar are byte-for-byte unchanged, and the per-record CRC still covers the
+  **stored** bytes — so recovery, `verify_sealed_segment` and the footer
+  cross-check need no compression awareness, and decompression happens in exactly
+  one place. Two new config knobs: `wab_compression` (`none` | `zstd`) and
+  `wab_compression_level` (`1..=19`).
+
+  **Off by default, and that keeps rollback free.** With `wab_compression = none`
+  a 2.0 daemon writes v1 segments byte-identical to 1.x, so upgrading and rolling
+  back is a non-event. Enabling compression is the one-way door: a 1.x reader
+  refuses a v2 segment with `InvalidData`, which the drain preserves for retry
+  and recovery quarantines — data is stranded and loud, never lost and quiet.
+
+  **The benefit is capacity, not latency — and it is smaller than it sounds.**
+  At weir's batch sizes the fsync floor is per-call rather than per-byte, and
+  zstd adds CPU *in front of* the fsync: measured `p50` ack latency rose 3.0% /
+  4.3% / 4.0% across the sync, batched and buffered load scenarios. What it buys
+  is WAB headroom during a sink outage. But each record is framed independently,
+  so there is **no cross-record dictionary** and the ratio depends entirely on
+  redundancy within a single record. Measured at level 1: a 5-byte payload
+  *expands* to 14 bytes (0.36×), a 106-byte log line is unchanged (1.00×), a
+  122-byte JSON event reaches 1.08×, and only at 691 bytes of nested JSON does it
+  reach 5.01×. **Below roughly 200 bytes per record, leave it off.**
+  `weir_wab_record_logical_bytes_total` / `weir_wab_record_stored_bytes_total`
+  gives the live ratio.
+
+- **BREAKING — `weir-wab`: `FORMAT_VERSION` is removed.** It meant both "the
+  version we write" and "the version we accept" and can no longer mean both. Use
+  `FORMAT_VERSION_V1`, `FORMAT_VERSION_V2`, or `FORMAT_VERSION_MAX_SUPPORTED`;
+  there is deliberately no "version we write" constant, because that is now a
+  function of config. `build_segment_header` takes a `Compression` argument,
+  `SegmentHeaderMeta` gains a `compression` field and is now `#[non_exhaustive]`,
+  and `SegmentFooterMeta::data_bytes` is documented as **stored** bytes
+  (post-compression in a v2 segment).
+
+- **`ClickHouseSink` uses the shared token** instead of its own private
+  `dedup_token`. `insert_deduplication_token` is byte-for-byte unchanged, so a
+  ClickHouse deployment deduplicates correctly across the upgrade. The wire test
+  previously asserted only that the parameter was *present*; it now asserts its
+  value, so a changed digest cannot pass unnoticed.
+
+---
+
+Defects found by the chaos fault-injection harness (`chaos/`) on its first live
+run — 20 episodes, 20 `kill -9`s, 86 replayed segments. No data-loss defects;
+both are observability / behaviour-under-shutdown fixes.
+
+### Fixed
+
+- **`weir_wab_segments_total{state="sealed"}` now counts crash-recovery seals.**
+  Recovery finalises an unsealed `.wab` (sentinel + footer + fsync), renames it
+  to `.wab.sealed` and hands it to the drain — a real `open → sealed` transition
+  — but never incremented the counter, while the drain's confirm always
+  incremented `state="confirmed"`. The family was therefore **non-conserving
+  across a restart**: `confirmed` ran permanently ahead of `sealed` by one
+  segment per shard for the whole life of the process, so the obvious backlog
+  alert ("`sealed − confirmed` is growing ⇒ the drain is falling behind") gave a
+  permanently wrong answer after the first crash. The increment sits after the
+  rename + parent fsync, so only a segment that really became a `.wab.sealed` is
+  counted: a quarantined segment (bad header, failed quarantine copy) is not,
+  and a mid-file-corrupt segment counts **both** `quarantined` (the preserved
+  forensic copy) and `sealed` (the truncated valid prefix, which is still
+  delivered). Segments sealed by an *earlier* process and merely replayed at
+  startup are still **not** counted — a replay is not a transition — so the
+  family remains per-process; `docs/monitoring.md` now states that caveat
+  explicitly and points at `weir_wab_bytes_on_disk` / `weir-ctl segments` for
+  the live backlog.
+
+### Reliability
+
+- **Shutdown no longer burns the whole sink-retry budget with zero delay.**
+  During a transient-error retry the drain consumes its backoff by polling the
+  drain channel, and on `Disconnected` — which is how it learns of shutdown — it
+  stopped waiting entirely. The effect the harness measured: at shutdown all
+  `sink_max_retries` attempts for a segment fired back-to-back and the segment
+  was then logged as stranded — four segments burned their whole budget in
+  **0.4 ms** between them. A unit test reproduces it independently: with a 5 s
+  base delay the entire retry episode took **3.2 ms**. Attempts that close
+  together against a sink needing milliseconds to answer fail identically for
+  the same reason, so the budget bought one effective attempt, not three, and
+  forced a strand a brief delay might have avoided.
+
+  The shutdown wait is now **clamped to 250 ms** rather than eliminated, so each
+  retry is an independent sample, drawn from a **1 s total budget** per process
+  so the added time cannot compound across segments or resume cycles. Worst case
+  this adds 1 s to shutdown — small against the per-attempt
+  `sink_commit_timeout_secs` (default 30 s) the shutdown path already tolerates
+  — and at the default `sink_retry_base_delay_ms` of 100 the clamp barely bites
+  (100/200/400 ms → 100/200/250 ms). Not a data-loss fix either way: a stranded
+  segment stays on disk and is replayed on the next start.
+
+  **Side effect worth knowing:** because a shutdown retry episode can now outlast
+  `health_poll_interval`, a segment that strands during shutdown may be picked up
+  by the stranded-segment auto-resume and *delivered* before the daemon exits,
+  where previously it was always left for the next start. That is a better
+  outcome (fewer segments deferred to restart) and it is bounded — once the
+  1 s budget is spent, retries fire immediately again exactly as before.
+
+### Testing
+
+- **Five chaos soaks across three venues and two architectures:
+  100,606,180 acked records over 1,226 `kill -9` crashes, zero durability
+  violations, zero records excused by the frontier exemption.** Recovery
+  truncated exactly 4.000 torn tails per kill in all 1,226. See
+  `docs/benchmarks/chaos-soak/2026-08-26-three-venue-comparison.md`.
+- Known gap: **power loss remains untested.** Every fault above is a process
+  kill, which does not lose the page cache.
+- Known gap: **`wab_max_bytes`, announced above, has no chaos coverage.**
+  Per the soak doc: *"The WAB cap and growth warning never fired. `nacked = 0`
+  in every run and no growth WARN appeared, so neither path executed."*
+- Known gap: **the quarantine tooling announced above has no chaos coverage
+  either.** Per the soak doc: *"The quarantine path was never entered... The
+  quarantine tooling shipped in 2.0 still has no chaos coverage."* `kill -9`
+  truncates cleanly; quarantine exists for mid-file corruption, which none of
+  these runs produced.
+- Known gap: **`Buffered` — the tier this release's headline type change is
+  named after — has zero chaos coverage.** Per the soak doc: *"Only the
+  `Sync` tier ran. `Buffered` — which by design acks before fsync and
+  explicitly does not uphold 'ack ⇒ durable' — has zero chaos coverage.
+  `Batched` is today identical to `Sync` in behaviour, so it is covered
+  transitively."*
+- **The documented pre-PR gate now passes.** `cargo test` had been failing on
+  `main` with ~66 spurious `PermissionDenied` errors: `socket::bind_hardened`
+  tightens the **process-global** umask to `0o177` around `bind(2)`, and any
+  other thread creating a directory in that window gets mode `0o600` — no
+  execute bit, so nothing can be created inside it. Explicit mode bits do not
+  help; `mkdir(2)` and `open(2)` both mask the requested mode, so
+  `WabSegment::create`'s `.mode(0o600)` would land at `0o400`. It also left
+  `proptest-regressions/` unwritable, so proptest could not record failing
+  seeds. `CONTRIBUTING.md` and CI now run `weir-server`'s bin unit tests with
+  `--test-threads=1` (~13 s versus ~1.5 s; the debug load tests dominate the job
+  either way). Two source comments claiming the window was harmless — one
+  asserting explicit modes escape umask, one asserting startup is
+  single-threaded — are corrected, and `docs/security/socket-bind.md` records
+  the limitation and what a real fix would have to analyse. No daemon behaviour
+  change: the window is unreachable in production because no producer can
+  connect before the socket exists.
+- **A drain test made flaky by the shutdown-backoff clamp above is now
+  deterministic.** `multiple_segments_second_processed_after_first_exhausts_retries`
+  asserts a stranded segment is still on disk when the drain exits, justified by
+  "the drain never reaches the idle poll" — which the clamp made untrue. Under
+  parallel load the retry sleeps overshot the 50 ms health poll, the
+  stranded-segment auto-resume delivered the segment, and the assertion failed
+  in roughly two runs out of three. The test now pins `health_poll_interval` for
+  its own run rather than asserting the pre-clamp outcome; the resume path stays
+  covered by `stranded_segment_resumes_when_sink_recovers`.
+
+---
+
 ## [1.3.1] - 2026-06-23
 
 Test/CI-robustness patch. **No functional change to any published crate** — the

@@ -30,9 +30,10 @@ const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9185";
 )]
 struct Cli {
     /// Emit machine-readable JSON instead of the human table, for the
-    /// read/inspect subcommands (health, metrics, segments, dl list). The human
-    /// output stays the default. Mutating commands (push, dl drop/requeue) emit
-    /// a small JSON result object under --json.
+    /// read/inspect subcommands (health, metrics, segments, dl list,
+    /// quarantine list, quarantine inspect). The human output stays the
+    /// default. Mutating commands (push, dl drop/requeue) emit a small JSON
+    /// result object under --json.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -51,8 +52,9 @@ enum Command {
     Push {
         /// Payload bytes (taken as UTF-8 from the command line).
         payload: String,
-        /// Durability tier: sync | batched | buffered.
-        #[arg(long, default_value = "batched", value_parser = parse_durability)]
+        /// Durability tier: durable | buffered (sync, batched accepted as
+        /// legacy aliases for durable).
+        #[arg(long, default_value = "durable", value_parser = parse_durability)]
         durability: Durability,
         /// Path to the daemon's Unix socket.
         #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
@@ -76,6 +78,13 @@ enum Command {
     /// Inspect and manage the dead-letter store.
     #[command(subcommand)]
     Dl(DlCommand),
+    /// Inspect and recover quarantined segments.
+    ///
+    /// Quarantine holds forensic copies of segments where recovery met
+    /// corruption. Acked records may sit AFTER the corrupt record, and those
+    /// records exist nowhere else — this is how you get them back.
+    #[command(subcommand)]
+    Quarantine(QuarantineCommand),
 }
 
 /// Subcommands under `weir-ctl dl`.
@@ -113,8 +122,78 @@ enum DlCommand {
         /// Daemon Unix socket to push the records back through.
         #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
         socket: PathBuf,
-        /// Durability tier for the re-pushed records: sync | batched | buffered.
-        #[arg(long, default_value = "batched", value_parser = parse_durability)]
+        /// Durability tier for the re-pushed records: durable | buffered
+        /// (sync, batched accepted as legacy aliases for durable).
+        #[arg(long, default_value = "durable", value_parser = parse_durability)]
+        durability: Durability,
+        /// Actually requeue. Without this flag, prints what would be requeued.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Subcommands under `weir-ctl quarantine`.
+#[derive(Subcommand)]
+enum QuarantineCommand {
+    /// List quarantined segments (count + bytes + origin shard).
+    List {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+    },
+    /// Report what is readable in one quarantined segment: how many records
+    /// verify, how many are corrupt and at what offsets, and whether the reader
+    /// lost the record framing entirely.
+    Inspect {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+        /// Segment file name, as printed by `quarantine list`.
+        segment: String,
+    },
+    /// Re-submit recoverable records from quarantined segments through the
+    /// daemon's socket, then delete each segment once all of them are accepted.
+    /// Defaults to a dry run.
+    ///
+    /// Records that fail verification are SKIPPED, not re-sent — unlike
+    /// `dl requeue`, which skips a corrupt segment wholesale. Every quarantined
+    /// segment is corrupt by definition, so that rule would recover nothing;
+    /// here the corrupt RECORD is skipped and the rest of the segment is
+    /// recovered.
+    ///
+    /// Re-delivery is at-least-once, and it WILL re-send records that already
+    /// reached the sink: recovery delivered the valid prefix when it sealed it,
+    /// and that prefix lives in this same file as the preserved tail. The dry
+    /// run prints the count before you pass --yes.
+    ///
+    /// A dedup-capable sink will NOT filter those duplicates. The dedup token
+    /// is derived from a batch's contents AND its boundaries, and a requeue
+    /// re-batches — so the sink sees genuinely distinct batches and accepts
+    /// both.
+    ///
+    /// A segment is deleted only once EVERY one of its recoverable records has
+    /// been ACCEPTED, not merely pushed — if a push fails or is Nacked partway
+    /// through, the segment stays on disk. A segment that yields no recoverable
+    /// records at all, OR that desyncs at any point (however many records were
+    /// recovered before the desync), is also left in place: bytes past a
+    /// desync were never reached, so no report can substitute for records
+    /// nobody has read. The recoverable prefix is still requeued in that case
+    /// — only the delete is withheld.
+    ///
+    /// --durability buffered is refused: its ack means only "entered the
+    /// in-memory queue", not durably written, and this command deletes what is
+    /// often the only surviving copy of the record once every push is
+    /// accepted. Use sync or batched (the default).
+    Requeue {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+        /// Daemon Unix socket to push the records back through.
+        #[arg(long, visible_alias = "socket-path", default_value = DEFAULT_SOCKET)]
+        socket: PathBuf,
+        /// Durability tier for the re-pushed records: durable (sync, batched
+        /// accepted as legacy aliases). NOT buffered — refused, see above.
+        #[arg(long, default_value = "durable", value_parser = parse_durability)]
         durability: Durability,
         /// Actually requeue. Without this flag, prints what would be requeued.
         #[arg(long)]
@@ -124,11 +203,16 @@ enum DlCommand {
 
 fn parse_durability(s: &str) -> Result<Durability, String> {
     match s.to_ascii_lowercase().as_str() {
-        "sync" => Ok(Durability::Sync),
-        "batched" => Ok(Durability::Batched),
+        // "durable" is the canonical 2.0 spelling — it's what every current
+        // doc uses and what `Durability::Display` now emits. "sync" and
+        // "batched" are kept accepted, same as the deprecated Rust consts and
+        // the retired `0x02` wire byte: scripts and runbooks in the wild use
+        // them, and breaking them buys nothing.
+        "durable" | "sync" | "batched" => Ok(Durability::Durable),
         "buffered" => Ok(Durability::Buffered),
         other => Err(format!(
-            "unknown durability {other:?} (expected sync | batched | buffered)"
+            "unknown durability {other:?} (expected durable | buffered; sync and batched \
+             are accepted as legacy aliases for durable)"
         )),
     }
 }
@@ -154,6 +238,18 @@ fn main() -> ExitCode {
                 durability,
                 yes,
             } => cmd_dl_requeue(&wab_dir, &socket, durability, yes, json),
+        },
+        Command::Quarantine(q) => match q {
+            QuarantineCommand::List { wab_dir } => cmd_quarantine_list(&wab_dir, json),
+            QuarantineCommand::Inspect { wab_dir, segment } => {
+                cmd_quarantine_inspect(&wab_dir, &segment, json)
+            }
+            QuarantineCommand::Requeue {
+                wab_dir,
+                socket,
+                durability,
+                yes,
+            } => cmd_quarantine_requeue(&wab_dir, &socket, durability, yes, json),
         },
     };
     match result {
@@ -1006,6 +1102,963 @@ fn cmd_dl_requeue(
     Ok(())
 }
 
+// ── Quarantine ───────────────────────────────────────────────────────────────
+
+fn quarantine_dir(wab_dir: &Path) -> PathBuf {
+    wab_dir.join("quarantine")
+}
+
+/// Every quarantined segment with its size, sorted by name.
+///
+/// A missing directory yields an empty list, not an error: no quarantine dir is
+/// the normal, healthy state.
+///
+/// **The extension is NOT `.wab.sealed` only** — that assumption would hide
+/// exactly the segments this command exists for. Quarantine names are
+/// `{shard_name}__{original_file_name}` (`recovery.rs` `quarantine` /
+/// `copy_to_quarantine`), and there are two producers writing different
+/// extensions:
+///
+/// - **crash recovery** processes only files ending in `EXT_ACTIVE` (`.wab`),
+///   so its copies are `shard_00__seg_00000001.wab`. This is the mid-file
+///   corruption case — the one where acked records sit AFTER the corruption,
+///   which is the entire premise of this feature;
+/// - **the drain** quarantines sealed segments, so its copies end `.wab.sealed`.
+///
+/// On top of that, `non_clobbering_dest` appends `.1` … `.10000` on a name
+/// collision, to *either* form. So `shard_00__seg_00000001.wab.sealed.1` is a
+/// legal quarantined name.
+///
+/// Match the `.wab` / `.wab.sealed` stem with an optional numeric suffix. Do not
+/// tighten this to one extension — see
+/// `quarantine_list_finds_both_extensions_and_collision_suffixes` in the tests.
+fn quarantine_segments(q_dir: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
+    let entries = match std::fs::read_dir(q_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", q_dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Mirrors `dl_segments_filtered`'s `p.is_file()` guard: quarantine/ is
+        // only ever populated by `quarantine()` / `copy_to_quarantine()`, which
+        // write files, but a name-matching directory (however unlikely) must not
+        // be offered up as a segment to inspect/requeue.
+        let is_segment = path.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_quarantined_segment_name);
+        if !is_segment {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push((path, size));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Whether a quarantine directory entry is a preserved WAB segment.
+///
+/// Accepts `…wab` and `…wab.sealed`, each optionally followed by the `.N`
+/// collision suffix `non_clobbering_dest` adds. Anything else in the directory
+/// (an operator's notes, a partial copy) is ignored rather than offered up for
+/// requeue.
+fn is_quarantined_segment_name(name: &str) -> bool {
+    // Strip a trailing `.<digits>` collision suffix, if any, then require one of
+    // the two segment extensions. Named constants, not string literals, so a
+    // future extension change shows up here without a grep (M2).
+    let stem = match name.rsplit_once('.') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => name,
+    };
+    stem.ends_with(weir_wab::format::EXT_ACTIVE) || stem.ends_with(weir_wab::format::EXT_SEALED)
+}
+
+/// The `{shard_name}` prefix of a quarantine entry name
+/// (`{shard_name}__{original_file_name}`), if the `__` separator is present.
+fn origin_shard(name: &str) -> Option<&str> {
+    name.split_once("__").map(|(shard, _)| shard)
+}
+
+/// The machine-readable form of `quarantine list`: one object per segment
+/// (name, bytes, origin shard) plus a count/total rollup. Mirrors
+/// `dl_list_json`'s shape — an empty store is a valid result (empty array,
+/// zero totals), not a special case.
+fn quarantine_list_json(q_dir: &Path, segs: &[(PathBuf, u64)]) -> serde_json::Value {
+    let total: u64 = segs.iter().map(|(_, s)| *s).sum();
+    let segments: Vec<serde_json::Value> = segs
+        .iter()
+        .map(|(p, sz)| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            serde_json::json!({
+                "segment": name,
+                "bytes": sz,
+                "origin_shard": origin_shard(name),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "quarantine_dir": q_dir.display().to_string(),
+        "count": segs.len(),
+        "total_bytes": total,
+        "segments": segments,
+    })
+}
+
+/// The human-readable `quarantine list` table, as printable lines. Pure — no
+/// I/O — mirrors how `summary_warnings` / `print_summary` are split, so the
+/// rendering logic is unit-testable without capturing stdout.
+fn quarantine_list_lines(q_dir: &Path, segs: &[(PathBuf, u64)]) -> Vec<String> {
+    if segs.is_empty() {
+        return vec![format!("quarantine is empty ({})", q_dir.display())];
+    }
+    let mut lines = vec![format!("{:<44} {:>12}  origin shard", "segment", "bytes")];
+    let mut total = 0u64;
+    for (p, sz) in segs {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        lines.push(format!(
+            "{name:<44} {:>12}  {}",
+            fmt_bytes(*sz),
+            origin_shard(name).unwrap_or("?")
+        ));
+        total += sz;
+    }
+    lines.push(format!(
+        "{:<44} {:>12}",
+        format!("total ({})", segs.len()),
+        fmt_bytes(total)
+    ));
+    lines.push(
+        "run `weir-ctl quarantine inspect --wab-dir <dir> <segment>` on each before deciding \
+         whether to requeue or discard — a segment's presence here does not say how much of it \
+         is recoverable."
+            .to_string(),
+    );
+    lines
+}
+
+/// Writes `value` as pretty JSON to `out`, with the same "fall back to the
+/// compact form on an impossible serialize failure" behavior as the shared
+/// `print_json` — which is hardcoded to real stdout and so isn't usable here,
+/// since quarantine's writer-injected commands (below) need every branch to go
+/// through `out` so a test can capture exactly what an operator would see.
+fn write_json_to(out: &mut impl Write, value: &serde_json::Value) {
+    let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    let _ = writeln!(out, "{text}");
+}
+
+/// `cmd_quarantine_list`'s actual logic, writing through `out` instead of
+/// directly to stdout. Split out (I3) so a test can capture exactly what an
+/// operator would see — including whether anything is printed at all — rather
+/// than only checking `.is_ok()`, which stays green even if this function is
+/// gutted to do nothing.
+fn quarantine_list_write(wab_dir: &Path, json: bool, out: &mut impl Write) -> Result<(), String> {
+    ensure_wab_dir(wab_dir)?;
+    let q_dir = quarantine_dir(wab_dir);
+    let segs = quarantine_segments(&q_dir)?;
+
+    if json {
+        write_json_to(out, &quarantine_list_json(&q_dir, &segs));
+        return Ok(());
+    }
+    for line in quarantine_list_lines(&q_dir, &segs) {
+        let _ = writeln!(out, "{line}");
+    }
+    Ok(())
+}
+
+fn cmd_quarantine_list(wab_dir: &Path, json: bool) -> Result<(), String> {
+    quarantine_list_write(wab_dir, json, &mut std::io::stdout())
+}
+
+/// One record `RecoveryReader` stepped over. Carries `declared_len` and
+/// `reason` alongside `offset` (I2): offsets alone cannot distinguish a
+/// 1-record loss from a corrupted length that tiled to a clean end and
+/// swallowed several intact records along the way — Task 1's As-built section
+/// is explicit that "the `Skipped` names the exact byte range", and this is the
+/// consumer that must actually surface it, not just the offset that range
+/// starts at.
+#[derive(Debug)]
+struct SkippedRecord {
+    offset: u64,
+    declared_len: u32,
+    reason: String,
+}
+
+/// What a forensic read of one quarantined segment found.
+#[derive(Debug)]
+struct QuarantineReport {
+    recovered: usize,
+    skipped: usize,
+    desynced: bool,
+    skipped_records: Vec<SkippedRecord>,
+    desync_reason: Option<String>,
+}
+
+/// One full forensic pass over a quarantined segment: every payload that
+/// verified (in submission order) plus the same tallies
+/// [`quarantine_inspect_report`] exposes.
+///
+/// `inspect` only needs the tallies; `requeue` additionally needs the actual
+/// payloads to push. Both read through the SAME match arms — in particular the
+/// `#[non_exhaustive]` wildcard arm below — rather than two copies that could
+/// silently drift apart (an unknown future `RecoveryItem` variant counted as
+/// recovered by one path and skipped by the other would make `list`/`inspect`
+/// and `requeue` disagree about what is recoverable).
+///
+/// Unlike `read_segment_records` (used for dead-letter segments), this never
+/// bails out on the first corrupt record: every quarantined segment is corrupt
+/// by definition (that is why it is here), so the whole point is to see what
+/// survives on both sides of the damage.
+fn quarantine_read(path: &Path) -> Result<(Vec<Payload>, QuarantineReport), String> {
+    let reader = weir_wab::RecoveryReader::open(path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut records = Vec::new();
+    let mut r = QuarantineReport {
+        recovered: 0,
+        skipped: 0,
+        desynced: false,
+        skipped_records: Vec::new(),
+        desync_reason: None,
+    };
+    for item in reader {
+        match item {
+            weir_wab::RecoveryItem::Record(payload) => {
+                r.recovered += 1;
+                records.push(payload);
+            }
+            weir_wab::RecoveryItem::Skipped {
+                offset,
+                declared_len,
+                reason,
+            } => {
+                r.skipped += 1;
+                r.skipped_records.push(SkippedRecord {
+                    offset,
+                    declared_len,
+                    reason,
+                });
+            }
+            weir_wab::RecoveryItem::Desynced { reason, .. } => {
+                r.desynced = true;
+                r.desync_reason = Some(reason);
+            }
+            // `RecoveryItem` is #[non_exhaustive] (it ships in a published
+            // crate), so this arm is REQUIRED to compile. Counting an unknown
+            // variant as recovered would overstate what requeue can deliver, and
+            // counting it as skipped would understate it — so it is neither.
+            other => {
+                return Err(format!(
+                    "unknown RecoveryItem variant {other:?} — weir-ctl is older \
+                     than the weir-wab it is reading; upgrade weir-ctl before \
+                     trusting this report"
+                ));
+            }
+        }
+    }
+    Ok((records, r))
+}
+
+/// Reads `path` with [`weir_wab::RecoveryReader`] and tallies what it finds,
+/// discarding the payloads. See [`quarantine_read`] for the shared pass.
+fn quarantine_inspect_report(path: &Path) -> Result<QuarantineReport, String> {
+    quarantine_read(path).map(|(_records, report)| report)
+}
+
+/// The machine-readable form of `quarantine inspect`. The `note` differs by
+/// outcome (M3) — a `desynced: true` report and a `desynced: false` report do
+/// not carry the same warning, so a script reading only `desynced` is never
+/// handed a `note` that contradicts the data beside it.
+fn quarantine_inspect_json(segment: &str, report: &QuarantineReport) -> serde_json::Value {
+    let skipped_records: Vec<serde_json::Value> = report
+        .skipped_records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "offset": r.offset,
+                "declared_len": r.declared_len,
+                "reason": r.reason,
+            })
+        })
+        .collect();
+    let note = if report.desynced {
+        "desynced=true means the reader could not establish where the next record began past \
+         this point. Records after it are NOT recoverable by this tool — this forensic copy is \
+         the only place they could still exist."
+    } else {
+        "desynced=false means every byte in the segment was accounted for; it does NOT mean \
+         every record was recovered. A length corrupted to a plausible value can swallow intact \
+         records inside its declared byte range without desyncing — see skipped_records for what \
+         verification actually caught."
+    };
+    serde_json::json!({
+        "segment": segment,
+        "recovered": report.recovered,
+        "skipped": report.skipped,
+        "skipped_records": skipped_records,
+        "desynced": report.desynced,
+        "desync_reason": report.desync_reason,
+        "note": note,
+    })
+}
+
+/// The human-readable `quarantine inspect` report, as printable lines. Pure —
+/// mirrors `quarantine_list_lines`. Each skipped record prints its byte range
+/// (I2) — `offset..offset+8+declared_len`, the 8 being the length+CRC fields —
+/// and its `reason`, so "see the skipped records above" (below) is an
+/// operator-actionable pointer instead of a bare offset that can't distinguish
+/// a 1-record loss from a range that swallowed several.
+fn quarantine_inspect_lines(segment: &str, report: &QuarantineReport) -> Vec<String> {
+    let mut lines = vec![segment.to_string()];
+    lines.push(format!(
+        "  recovered: {} record(s) verified — safe to re-deliver",
+        report.recovered
+    ));
+    lines.push(format!(
+        "  skipped:   {} record(s) failed verification",
+        report.skipped
+    ));
+    for r in &report.skipped_records {
+        let end = r.offset + 8 + r.declared_len as u64;
+        lines.push(format!(
+            "    - offset {}, declared_len {} bytes (range {}..{end}) — {}",
+            r.offset, r.declared_len, r.offset, r.reason
+        ));
+    }
+    if let Some(reason) = &report.desync_reason {
+        // I1/I3-b: this is the state an operator most needs the truth in, and
+        // the property that must survive any future rewording is this
+        // sentence's claim — "not recoverable by this tool" — not its exact
+        // phrasing. `quarantine_inspect_reports_a_desync` pins the claim, not
+        // the prose.
+        lines.push(format!("  desynced: {reason}"));
+        lines.push(
+            "  the reader could not tell where the next record began past that point. Records \
+             after it are NOT recoverable by this tool — this forensic copy is the only place \
+             they could still exist, so do not discard it on the strength of this report alone."
+                .to_string(),
+        );
+    } else {
+        // I3-b: the property that must survive rewording is that this denies
+        // "every record was recovered" — not this exact paragraph.
+        lines.push(
+            "  clean end: every byte in this segment is accounted for. That is NOT the same as \
+             \"every record was recovered\" — a length corrupted to a plausible value can tile \
+             exactly to the end of the file and swallow intact records inside its declared byte \
+             range without ever desyncing. See the skipped records above for what verification \
+             actually caught; a clean end alone is not license to delete this segment."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// `cmd_quarantine_inspect`'s actual logic, writing through `out` instead of
+/// directly to stdout — same rationale as `quarantine_list_write` (I3, I1):
+/// this is the function a test drives to observe the printed desync/clean-end
+/// verdict, rather than only the `QuarantineReport`'s fields.
+fn quarantine_inspect_write(
+    wab_dir: &Path,
+    segment: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    ensure_wab_dir(wab_dir)?;
+    let q_dir = quarantine_dir(wab_dir);
+    let path = q_dir.join(segment);
+    let report = quarantine_inspect_report(&path)?;
+
+    if json {
+        write_json_to(out, &quarantine_inspect_json(segment, &report));
+        return Ok(());
+    }
+    for line in quarantine_inspect_lines(segment, &report) {
+        let _ = writeln!(out, "{line}");
+    }
+    Ok(())
+}
+
+fn cmd_quarantine_inspect(wab_dir: &Path, segment: &str, json: bool) -> Result<(), String> {
+    quarantine_inspect_write(wab_dir, segment, json, &mut std::io::stdout())
+}
+
+// ── Quarantine: requeue ──────────────────────────────────────────────────────
+//
+// THE DESTRUCTIVE ONE. `requeue` reads quarantined segments, pushes their
+// recoverable records back through the daemon's socket, and deletes each
+// segment only once every one of its records has been ACCEPTED — not merely
+// pushed. A quarantined segment is often the ONLY surviving copy of
+// acked-durable records, so the ordering rule is absolute: if any push fails,
+// is Nacked, or the connection drops, the segment stays on disk. Weir's crown
+// invariant is that an ack is never a false ack; this command is the same
+// promise pointed the other way.
+//
+// Two deliberate inversions of `dl requeue`, not bugs to "fix" into
+// consistency:
+//
+// 1. `dl requeue` skips a corrupt segment WHOLESALE so a corrupt segment is
+//    never partially delivered. Every quarantined segment is corrupt by
+//    definition, so that rule would recover nothing here — the corrupt
+//    RECORD is skipped instead (via `RecoveryReader`) and the rest of the
+//    segment is recovered. That inversion is the entire point of this
+//    command.
+// 2. A segment that desyncs is not deleted, even with `--yes`, however many
+//    records were recovered before the desync point. Bytes past that point
+//    were never reached — recovery quarantined the WHOLE file precisely
+//    because it could not rule out a trailing tail — and no report can
+//    substitute for records nobody has read. The recoverable prefix IS still
+//    requeued; only the delete is withheld. (Review round 1, Important 1: the
+//    original guard only checked `records.is_empty()`, which protected a
+//    desync before the first record but deleted the file — with unread bytes
+//    still inside it — the moment even one good record preceded the
+//    corruption. Crash recovery's two mid-file quarantine reasons are a CRC
+//    mismatch, which `Skipped`s and reads on, and an oversized `payload_len`,
+//    which desyncs — and a good record before an oversized-length corruption
+//    is not an edge case.)
+
+/// What a requeue would do, computed without connecting or mutating anything.
+struct QuarantineRequeuePlan {
+    segments: usize,
+    total_records: usize,
+    total_skipped: usize,
+    segments_desynced: usize,
+    /// Segments whose forensic read itself failed (open error, unparseable
+    /// header) — distinct from `segments_desynced`, which read fine but lost
+    /// the record framing partway through. Collected rather than aborting the
+    /// whole plan (review round 1, Minor 2): `quarantine/` is exactly the
+    /// directory most likely to contain an operator-dropped junk file, and
+    /// one such file must not hide every other segment's plan.
+    unreadable: Vec<String>,
+}
+
+/// Computes [`QuarantineRequeuePlan`] by forensically reading (never mutating)
+/// every quarantined segment under `q_dir`. Shared by the dry-run printout and
+/// its `--json` twin, so the two can never disagree about the numbers.
+fn quarantine_requeue_plan(q_dir: &Path) -> Result<QuarantineRequeuePlan, String> {
+    let mut plan = QuarantineRequeuePlan {
+        segments: 0,
+        total_records: 0,
+        total_skipped: 0,
+        segments_desynced: 0,
+        unreadable: Vec::new(),
+    };
+    for (path, _sz) in quarantine_segments(q_dir)? {
+        plan.segments += 1;
+        match quarantine_inspect_report(&path) {
+            Ok(r) => {
+                plan.total_records += r.recovered;
+                plan.total_skipped += r.skipped;
+                if r.desynced {
+                    plan.segments_desynced += 1;
+                }
+            }
+            Err(e) => plan.unreadable.push(e),
+        }
+    }
+    Ok(plan)
+}
+
+/// The sentence this dry run exists to make explicit: requeueing WILL re-send
+/// records that already reached the sink, and a dedup-capable sink will NOT
+/// filter them. Shared verbatim between the human and `--json` (`note`)
+/// output so the two can't drift into saying different things about the same
+/// run — the exact drift class Task 4's own brief warns against (the plan's
+/// first commit-message draft claimed the dedup token *would* save you; it
+/// does not, because the token covers a batch's boundaries as well as its
+/// contents, and a requeue re-batches).
+const QUARANTINE_REQUEUE_DUPLICATE_WARNING: &str = "requeueing WILL re-send records that already reached the sink: recovery delivered the \
+     valid prefix when it sealed it, and that prefix lives in the same file as the preserved \
+     tail. A dedup-capable sink will NOT filter these duplicates — the dedup token is derived \
+     from a batch's contents AND its boundaries, and a requeue re-batches, so the sink sees \
+     genuinely distinct batches and accepts both.";
+
+fn quarantine_requeue_empty_json(dry_run: bool) -> serde_json::Value {
+    serde_json::json!({
+        "dry_run": dry_run,
+        "segments": 0,
+        "requeued_records": 0,
+        "segments_cleared": 0,
+    })
+}
+
+fn quarantine_requeue_dry_run_json(plan: &QuarantineRequeuePlan) -> serde_json::Value {
+    serde_json::json!({
+        "dry_run": true,
+        "segments": plan.segments,
+        "requeuable_records": plan.total_records,
+        // Named `_total` (review round 3, item 3), matching `done`-JSON's own
+        // scalar `skipped_records_total`: `done` also has a `skipped_records`
+        // key, but that one is an ARRAY of per-record entries. Same command,
+        // same-looking key, two incompatible types was a wart for anything
+        // parsing both — there is no array to name here (a dry run never
+        // reads far enough to build per-record entries; it only tallies
+        // `QuarantineReport.skipped`), so the scalar took the rename instead
+        // of the array.
+        "skipped_records_total": plan.total_skipped,
+        "segments_desynced": plan.segments_desynced,
+        "unreadable_segments": plan.unreadable.len(),
+        "note": QUARANTINE_REQUEUE_DUPLICATE_WARNING,
+    })
+}
+
+/// One quarantined segment's skipped records, from a REAL run — carried
+/// through to the real run's human output and its `--json` shape (review
+/// round 2, N2). The dry run already surfaced the aggregate skip count and
+/// pointed at `quarantine inspect`; the real run said nothing at all, so an
+/// operator who runs `--yes` directly (or a script that never sees the dry
+/// run) learned nothing about records that were just permanently destroyed —
+/// the same information-asymmetry class Important 1 (round 1) was about,
+/// which that round closed for desyncs but not for skips. Reuses Task 3's
+/// `SkippedRecord` (offset/declared_len/reason) rather than a parallel type.
+struct RequeueSkippedSegment {
+    segment: String,
+    records: Vec<SkippedRecord>,
+}
+
+/// Tally of one real `requeue --yes` run, built up as segments are processed.
+/// Passed to [`quarantine_requeue_done_json`] as a single unit instead of a
+/// growing positional-argument list.
+struct QuarantineRequeueOutcome {
+    segments: usize,
+    requeued_records: u64,
+    segments_cleared: usize,
+    segments_desynced_left: usize,
+    segments_empty_left: usize,
+    unreadable_segments: usize,
+    delete_failures: usize,
+    skipped_records_total: u64,
+    skipped_segments: Vec<RequeueSkippedSegment>,
+}
+
+fn quarantine_requeue_done_json(
+    outcome: &QuarantineRequeueOutcome,
+    durability: Durability,
+) -> serde_json::Value {
+    let skipped_records: Vec<serde_json::Value> = outcome
+        .skipped_segments
+        .iter()
+        .flat_map(|s| {
+            s.records.iter().map(move |r| {
+                serde_json::json!({
+                    "segment": s.segment,
+                    "offset": r.offset,
+                    "declared_len": r.declared_len,
+                    "reason": r.reason,
+                })
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "dry_run": false,
+        "segments": outcome.segments,
+        "requeued_records": outcome.requeued_records,
+        "segments_cleared": outcome.segments_cleared,
+        "segments_desynced_left_in_place": outcome.segments_desynced_left,
+        "segments_empty_left_in_place": outcome.segments_empty_left,
+        "unreadable_segments": outcome.unreadable_segments,
+        "delete_failures": outcome.delete_failures,
+        "skipped_records_total": outcome.skipped_records_total,
+        "skipped_records": skipped_records,
+        "durability": format!("{durability:?}"),
+    })
+}
+
+/// `cmd_quarantine_requeue`'s actual logic, writing through `out` instead of
+/// directly to stdout — same rationale as `quarantine_list_write` /
+/// `quarantine_inspect_write` (I3, I1): the dry run's duplicate-count warning
+/// must actually reach the operator, not merely exist in a struct, and only a
+/// test that captures the printed text can pin that.
+fn quarantine_requeue_write(
+    wab_dir: &Path,
+    socket: &Path,
+    durability: Durability,
+    yes: bool,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), String> {
+    // Refused unconditionally, before touching the filesystem or the socket,
+    // for both the dry run and the real run (review round 1, Minor 1): a
+    // `Buffered` ack means only "entered the daemon's in-memory queue", not
+    // durably written (`weir-core/src/durability.rs`), and this command
+    // deletes the quarantined segment — often the only surviving copy of the
+    // record — once every push is "accepted". A crash between that ack and
+    // the next fsync would lose the record for good with nothing left to
+    // recover it from. `dl requeue` accepts this risk for dead-lettered
+    // records and documents it in a comment; quarantine's stakes are strictly
+    // higher (dead-letter usually isn't the LAST copy of anything — that is
+    // this whole feature's premise), so this command refuses rather than
+    // merely documents. `sync`/`batched` both fsync before acking and are
+    // unaffected.
+    if durability == Durability::Buffered {
+        return Err(
+            "quarantine requeue refuses --durability buffered: its ack means only \"entered \
+             the in-memory queue\", not durably written, and this command deletes the \
+             quarantined segment — often the only surviving copy of the record — once every \
+             push is accepted. A crash between that ack and the next fsync would lose the \
+             record for good. Use sync or batched (the default)."
+                .to_string(),
+        );
+    }
+
+    ensure_wab_dir(wab_dir)?;
+    let q_dir = quarantine_dir(wab_dir);
+    let segs = quarantine_segments(&q_dir)?;
+
+    if segs.is_empty() {
+        if json {
+            write_json_to(out, &quarantine_requeue_empty_json(!yes));
+        } else {
+            let _ = writeln!(out, "quarantine is empty; nothing to requeue");
+        }
+        return Ok(());
+    }
+
+    // Dry run: forensically read every segment (no connect, no mutation) and
+    // report what WOULD be requeued.
+    if !yes {
+        let plan = quarantine_requeue_plan(&q_dir)?;
+        if json {
+            write_json_to(out, &quarantine_requeue_dry_run_json(&plan));
+            return Ok(());
+        }
+        let _ = writeln!(
+            out,
+            "would requeue {} record(s) from {} quarantined segment(s) under {} through {}",
+            plan.total_records,
+            plan.segments,
+            q_dir.display(),
+            socket.display(),
+        );
+        let _ = writeln!(out, "{QUARANTINE_REQUEUE_DUPLICATE_WARNING}");
+        if plan.total_skipped > 0 {
+            let _ = writeln!(
+                out,
+                "\n⚠ {} record(s) across these segments failed verification and will be \
+                 SKIPPED — run `weir-ctl quarantine inspect` on each segment for the byte \
+                 ranges.",
+                plan.total_skipped
+            );
+        }
+        if plan.segments_desynced > 0 {
+            let _ = writeln!(
+                out,
+                "\n⚠ {} segment(s) desynced during this read; records past the desync point \
+                 are not recoverable by this tool. EVERY segment that desyncs is left in place \
+                 with --yes, however many records were recovered before the desync point — \
+                 those records ARE still requeued, but the file itself is kept, because \
+                 deleting it would destroy the unread bytes recovery quarantined it to \
+                 preserve.",
+                plan.segments_desynced
+            );
+        }
+        if !plan.unreadable.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n⚠ {} segment(s) could not be read at all and would be SKIPPED:\n  {}",
+                plan.unreadable.len(),
+                plan.unreadable.join("\n  ")
+            );
+        }
+        let _ = writeln!(out, "\nre-run with --yes to confirm.");
+        return Ok(());
+    }
+
+    // Real run. Connect once, then requeue segment-by-segment. Push every
+    // recoverable record from a segment BEFORE touching its file, and delete
+    // the segment only if every one of those pushes was accepted AND the read
+    // reached a clean end (no desync) — see the module-level comment above
+    // for why both halves of that rule are non-negotiable.
+    let mut client = connect_client(socket)?;
+
+    let mut total_requeued: u64 = 0;
+    let mut segments_cleared: usize = 0;
+    let mut segments_desynced_left: Vec<String> = Vec::new();
+    let mut segments_empty_left: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    let mut delete_failures: Vec<String> = Vec::new();
+    // Review round 2, N2: carried through regardless of a segment's OTHER
+    // outcome — a segment can be fully deleted (the common case: some records
+    // Skipped, the rest accepted) and still have lost real, CRC-valid data
+    // that the operator was never told about in this run's own output.
+    let mut total_skipped_records: u64 = 0;
+    let mut skipped_segments: Vec<RequeueSkippedSegment> = Vec::new();
+
+    for (path, _sz) in &segs {
+        let (records, mut report) = match quarantine_read(path) {
+            Ok(v) => v,
+            Err(e) => {
+                // The segment itself couldn't be opened/parsed — distinct from
+                // a desync (which reads fine and then loses framing partway
+                // through). Collect and move on (review round 1, Minor 2):
+                // `quarantine/` is exactly the directory most likely to hold
+                // an operator-dropped junk file, and one such file must not
+                // block every other segment from being requeued.
+                unreadable.push(e);
+                continue;
+            }
+        };
+
+        for (i, rec) in records.iter().enumerate() {
+            if let Err(e) = client.push(rec.as_ref(), durability) {
+                // A push failure or Nack is operational (daemon down / rejecting
+                // the record). Abort the whole run rather than hammering a
+                // failing daemon. THE data-loss guard: this segment — and every
+                // segment not yet reached — stays on disk. The records pushed
+                // from THIS segment so far (i of them) may duplicate on the
+                // next run, which is within the at-least-once contract; losing
+                // the remaining unpushed records because we deleted the file
+                // anyway would not be.
+                return Err(format!(
+                    "push failed after requeuing {total_requeued} record(s) from \
+                     {segments_cleared} segment(s); {} left in place \
+                     ({i}/{} of it pushed — those may duplicate on the next run): {e}",
+                    path.display(),
+                    records.len(),
+                ));
+            }
+            total_requeued += 1;
+        }
+
+        // Review round 2, N2: record what THIS segment's read skipped, before
+        // deciding the segment's fate below — a segment with skips can still
+        // end up fully deleted (the ordinary case: recovery quarantined it
+        // for exactly one corrupt record among several good ones), and that
+        // is precisely the run an operator most needs this information from.
+        // `report.skipped_records` is moved out here; `report.skipped` (a
+        // count) and `report.desynced` stay available below (Copy fields).
+        if report.skipped > 0 {
+            total_skipped_records += report.skipped as u64;
+            skipped_segments.push(RequeueSkippedSegment {
+                segment: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                records: std::mem::take(&mut report.skipped_records),
+            });
+        }
+
+        // Review round 1, Important 1: a desync means bytes past that point
+        // were never reached, REGARDLESS of how many records were recovered
+        // (and just pushed, above) before it. The file is the only place
+        // those unread bytes exist; deleting it destroys them with nothing to
+        // show for what was lost. This check comes FIRST and is independent
+        // of `records.is_empty()` — the original bug was gating it on that.
+        if report.desynced {
+            segments_desynced_left.push(format!(
+                "{}: desynced after {} record(s) recovered and requeued above ({} skipped) — \
+                 unread bytes remain past the desync point and were NOT deleted",
+                path.display(),
+                records.len(),
+                report.skipped
+            ));
+            continue;
+        }
+
+        if records.is_empty() {
+            // A clean end with nothing recovered — every record in the
+            // segment was individually corrupt (Skipped), but the reader
+            // never lost the framing. Deleting a segment that yielded
+            // nothing destroys the only forensic copy with nothing to show
+            // for it: leave it in place and report it.
+            segments_empty_left.push(format!(
+                "{}: no recoverable records ({} skipped, clean end)",
+                path.display(),
+                report.skipped
+            ));
+            continue;
+        }
+
+        // Every record in this segment was ACCEPTED (the loop above would have
+        // returned on the first failure) and the read reached a clean end.
+        // Only now is it safe to delete. review round 2, N2: this is also the
+        // ordinary path for a segment with SOME `Skipped` records and the
+        // rest accepted — deleting it is the already-adjudicated, correct
+        // behaviour (a flag gating on `skipped > 0` would fire on every
+        // quarantined segment, since that is the whole reason each one is
+        // here); what was missing was telling the operator it happened, which
+        // the `skipped_segments` collection above now does regardless of this
+        // branch.
+        match std::fs::remove_file(path) {
+            Ok(()) => segments_cleared += 1,
+            Err(e) => delete_failures.push(format!("{}: {e}", path.display())),
+        }
+    }
+
+    let outcome = QuarantineRequeueOutcome {
+        segments: segs.len(),
+        requeued_records: total_requeued,
+        segments_cleared,
+        segments_desynced_left: segments_desynced_left.len(),
+        segments_empty_left: segments_empty_left.len(),
+        unreadable_segments: unreadable.len(),
+        delete_failures: delete_failures.len(),
+        skipped_records_total: total_skipped_records,
+        skipped_segments,
+    };
+
+    if json {
+        write_json_to(out, &quarantine_requeue_done_json(&outcome, durability));
+    } else {
+        let _ = writeln!(
+            out,
+            "requeued {total_requeued} record(s) from {segments_cleared} quarantined \
+             segment(s) through {} ({durability:?})",
+            socket.display(),
+        );
+        // Review round 2, N2: printed unconditionally when any record was
+        // skipped THIS run — including for segments that were otherwise fully
+        // deleted above, not only the ones left in place below. Mirrors
+        // `quarantine_inspect_lines`' per-record byte-range format so the
+        // detail an operator gets here is the same they'd get from
+        // `quarantine inspect`, just after the fact rather than before.
+        if !outcome.skipped_segments.is_empty() {
+            let lines: Vec<String> = outcome
+                .skipped_segments
+                .iter()
+                .map(|s| {
+                    let ranges: Vec<String> = s
+                        .records
+                        .iter()
+                        .map(|r| {
+                            let end = r.offset + 8 + r.declared_len as u64;
+                            format!(
+                                "offset {}, declared_len {} bytes (range {}..{end}) — {}",
+                                r.offset, r.declared_len, r.offset, r.reason
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{}: {} record(s) skipped\n      {}",
+                        s.segment,
+                        s.records.len(),
+                        ranges.join("\n      ")
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "\n⚠ {} record(s) across {} segment(s) failed verification during this run and \
+                 were NOT recovered. If a segment was otherwise fully readable it has been \
+                 deleted above, and these specific records are now permanently unrecoverable — \
+                 this is the already-decided cost of --yes on a segment with any corrupt \
+                 record, not a new failure:\n  {}",
+                outcome.skipped_records_total,
+                outcome.skipped_segments.len(),
+                lines.join("\n  ")
+            );
+        }
+        if !segments_desynced_left.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n⚠ {} segment(s) DESYNCED and were left in place — their recovered records \
+                 (if any) were requeued above, but unread bytes past the desync point remain on \
+                 disk and were NOT deleted:\n  {}",
+                segments_desynced_left.len(),
+                segments_desynced_left.join("\n  ")
+            );
+        }
+        if !segments_empty_left.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n⚠ {} segment(s) yielded no recoverable records and were left in place:\n  {}",
+                segments_empty_left.len(),
+                segments_empty_left.join("\n  ")
+            );
+        }
+        if !unreadable.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n⚠ {} segment(s) could not be read at all and were SKIPPED:\n  {}",
+                unreadable.len(),
+                unreadable.join("\n  ")
+            );
+        }
+        if !delete_failures.is_empty() {
+            let _ = writeln!(
+                out,
+                "\n⚠ {} segment(s) were requeued but could not be deleted (they will requeue \
+                 again next run — remove them manually):\n  {}",
+                delete_failures.len(),
+                delete_failures.join("\n  ")
+            );
+        }
+    }
+
+    // Review round 2, N2 (judgment call, stated explicitly rather than
+    // inherited): a nonzero `skipped_records_total` does NOT, on its own,
+    // turn this run into a nonzero exit.
+    //
+    // The operative population is every segment this command DELETES, not
+    // every quarantined segment. (Not all quarantined segments carry a skip:
+    // an oversized `payload_len` quarantines with `skipped = 0, desynced =
+    // true`.) But a delete requires a clean end, and a clean-ended segment can
+    // only have been quarantined for a CRC mismatch — which is precisely the
+    // thing that surfaces as a skip. So every successful delete carries at
+    // least one skip, and treating "some record was skipped somewhere" as a
+    // run-level problem would make a normal, fully-successful requeue exit
+    // non-zero in the ordinary case — indistinguishable from an actual
+    // failure, and exactly the "always fires, so it's noise" trap the
+    // decision not to gate `--yes` on `skipped > 0` already rejected once.
+    // The information asymmetry that was actually wrong is closed by the
+    // human/JSON output above, which is unconditional; a script that cares
+    // must inspect `skipped_records_total`, not the exit code, for this
+    // specific signal. `problems` below is therefore unchanged by skips —
+    // only desyncs, empty segments, unreadable segments, and delete failures
+    // (none of which are the expected/adjudicated common case) make the run
+    // exit non-zero.
+    let mut problems: Vec<String> = Vec::new();
+    if !delete_failures.is_empty() {
+        problems.push(format!(
+            "{} segment(s) were requeued but could not be deleted",
+            delete_failures.len()
+        ));
+    }
+    if !segments_desynced_left.is_empty() {
+        problems.push(format!(
+            "{} quarantined segment(s) desynced and were left in place with unread bytes \
+             remaining",
+            segments_desynced_left.len()
+        ));
+    }
+    if !segments_empty_left.is_empty() {
+        problems.push(format!(
+            "{} quarantined segment(s) yielded no recoverable records and were left in place",
+            segments_empty_left.len()
+        ));
+    }
+    if !unreadable.is_empty() {
+        problems.push(format!(
+            "{} quarantined segment(s) could not be read and were left in place",
+            unreadable.len()
+        ));
+    }
+    if !problems.is_empty() {
+        return Err(problems.join("\n"));
+    }
+    Ok(())
+}
+
+fn cmd_quarantine_requeue(
+    wab_dir: &Path,
+    socket: &Path,
+    durability: Durability,
+    yes: bool,
+    json: bool,
+) -> Result<(), String> {
+    quarantine_requeue_write(
+        wab_dir,
+        socket,
+        durability,
+        yes,
+        json,
+        &mut std::io::stdout(),
+    )
+}
+
 /// Minimal HTTP/1.0 GET of `/metrics` — keeps weir-ctl free of an HTTP client
 /// dependency (the daemon's metrics server speaks plain HTTP/1.0).
 fn scrape(addr: &str) -> Result<String, String> {
@@ -1027,7 +2080,7 @@ fn scrape(addr: &str) -> Result<String, String> {
 }
 
 /// Sums every sample whose line starts with `prefix` (handles label sets, e.g.
-/// `weir_records_ack_total{tier="sync"} 12`).
+/// `weir_records_ack_total{tier="durable"} 12`).
 fn sum_metric(body: &str, prefix: &str) -> f64 {
     body.lines()
         .filter(|l| l.starts_with(prefix))
@@ -1212,7 +2265,7 @@ mod tests {
         // A real weir exposition has weir_ series; the wrong port / another
         // service does not.
         assert!(has_weir_metrics(
-            "# HELP weir_records_accepted ...\nweir_records_accepted_total{tier=\"sync\"} 3"
+            "# HELP weir_records_accepted ...\nweir_records_accepted_total{tier=\"durable\"} 3"
         ));
         assert!(!has_weir_metrics(
             "# HELP go_gc_duration_seconds ...\ngo_goroutines 12"
@@ -1329,8 +2382,11 @@ mod tests {
         let path = dl_dir.join(format!("dl_{counter:08}.wab.sealed"));
         let mut f = std::fs::File::create(&path).unwrap();
         // Shard ID 0xFFFF is the dead-letter marker the daemon uses.
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         for r in records {
             f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
             // Same CRC32 (IEEE) SegmentReader verifies — see weir-wab.
@@ -1361,8 +2417,11 @@ mod tests {
         std::fs::create_dir_all(&dl).unwrap();
         let path = dl.join("dl_00000001.wab.sealed");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         let payload = b"corruptme";
         f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&0xdead_beefu32.to_le_bytes()).unwrap(); // wrong CRC
@@ -1388,8 +2447,11 @@ mod tests {
         std::fs::create_dir_all(&dl).unwrap();
         let path = dl.join("dl_00000001.wab.sealed");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         let payload = b"survivor";
         f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&weir_wab::format::crc32(payload).to_le_bytes())
@@ -1414,8 +2476,11 @@ mod tests {
         // One corrupt segment (bad CRC) that must be flagged, not counted.
         let bad = dl.join("dl_00000002.wab.sealed");
         let mut f = std::fs::File::create(&bad).unwrap();
-        f.write_all(&weir_wab::format::build_segment_header(0xFFFF))
-            .unwrap();
+        f.write_all(&weir_wab::format::build_segment_header(
+            0xFFFF,
+            weir_wab::format::Compression::None,
+        ))
+        .unwrap();
         f.write_all(&3u32.to_le_bytes()).unwrap();
         f.write_all(&0u32.to_le_bytes()).unwrap(); // wrong CRC
         f.write_all(b"bad").unwrap();
@@ -1449,7 +2514,7 @@ mod tests {
         let wab = std::env::temp_dir().join(format!("weir_ctl_rq_empty_{}", std::process::id()));
         std::fs::create_dir_all(&wab).unwrap();
         let bogus = Path::new("/nonexistent/weir.sock");
-        cmd_dl_requeue(&wab, bogus, Durability::Batched, true, false).unwrap();
+        cmd_dl_requeue(&wab, bogus, Durability::Durable, true, false).unwrap();
         std::fs::remove_dir_all(&wab).ok();
     }
 
@@ -1461,7 +2526,7 @@ mod tests {
         let dl = wab.join("dead_letter");
         write_dl_segment(&dl, 1, &[b"one", b"two"]);
         let bogus = Path::new("/nonexistent/weir.sock");
-        cmd_dl_requeue(&wab, bogus, Durability::Batched, false, false).unwrap();
+        cmd_dl_requeue(&wab, bogus, Durability::Durable, false, false).unwrap();
         // Dry run leaves the segment in place.
         assert_eq!(dl_segments(&dl).unwrap().len(), 1);
         std::fs::remove_dir_all(&wab).ok();
@@ -1476,7 +2541,7 @@ mod tests {
         let dl = wab.join("dead_letter");
         write_dl_segment(&dl, 1, &[b"rec"]);
         let bogus = Path::new("/nonexistent/weir.sock");
-        let err = cmd_dl_requeue(&wab, bogus, Durability::Batched, true, false).unwrap_err();
+        let err = cmd_dl_requeue(&wab, bogus, Durability::Durable, true, false).unwrap_err();
         assert!(err.contains("connect"), "err: {err}");
         // The segment is left in place since nothing could be requeued.
         assert_eq!(dl_segments(&dl).unwrap().len(), 1);
@@ -1528,7 +2593,18 @@ mod tests {
     }
 
     impl FakeDaemon {
+        /// Acks every push.
         fn start(socket: PathBuf) -> Self {
+            Self::start_with_nacks(socket, std::collections::HashSet::new())
+        }
+
+        /// `nack_at` names the 0-indexed pushes (in arrival order across the
+        /// single connection this fake accepts) that get Nacked instead of
+        /// Acked — used by the quarantine `requeue` guard tests that need a
+        /// real accept/push/Nack round trip, not merely a connect failure
+        /// (`/nonexistent.sock` already covers that, and cannot exercise "the
+        /// daemon accepted the connection then Nacked a push").
+        fn start_with_nacks(socket: PathBuf, nack_at: std::collections::HashSet<usize>) -> Self {
             use std::os::unix::net::UnixListener;
             let listener = UnixListener::bind(&socket).expect("bind fake daemon socket");
             let handle = std::thread::spawn(move || {
@@ -1537,7 +2613,10 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => return received,
                 };
-                // Read frames until the client disconnects (EOF on the header read).
+                let mut n = 0usize;
+                // Read frames until the client disconnects (EOF on the header
+                // read) or this fake sends a Nack (which, like the real daemon,
+                // ends the connection — see `note_nack` in weir-client).
                 loop {
                     let mut header_buf = [0u8; weir_core::HEADER_LEN];
                     if std::io::Read::read_exact(&mut stream, &mut header_buf).is_err() {
@@ -1554,17 +2633,31 @@ mod tests {
                     std::io::Read::read_exact(&mut stream, &mut crc).expect("read req crc");
                     received.push(payload);
 
-                    // Reply with a well-formed Ack frame (empty payload).
-                    let ack = weir_core::Envelope::new(
-                        weir_core::Header::new(
-                            weir_core::MessageType::Ack,
-                            weir_core::Durability::Sync,
-                            0,
-                        ),
-                        Vec::new(),
-                    )
-                    .encode();
-                    std::io::Write::write_all(&mut stream, &ack).expect("write ack");
+                    let nacked = nack_at.contains(&n);
+                    let reply = if nacked {
+                        weir_core::Envelope::new(
+                            weir_core::Header::new(
+                                weir_core::MessageType::Nack,
+                                header.durability(),
+                                0,
+                            ),
+                            vec![weir_core::NackReason::PayloadTooLarge as u8],
+                        )
+                    } else {
+                        weir_core::Envelope::new(
+                            weir_core::Header::new(
+                                weir_core::MessageType::Ack,
+                                header.durability(),
+                                0,
+                            ),
+                            Vec::new(),
+                        )
+                    };
+                    n += 1;
+                    std::io::Write::write_all(&mut stream, &reply.encode()).expect("write reply");
+                    if nacked {
+                        break;
+                    }
                 }
                 received
             });
@@ -1611,7 +2704,7 @@ mod tests {
         std::fs::remove_file(&socket).ok();
         let daemon = FakeDaemon::start(socket.clone());
 
-        cmd_dl_requeue(&wab, &socket, Durability::Batched, true, false)
+        cmd_dl_requeue(&wab, &socket, Durability::Durable, true, false)
             .expect("requeue should succeed");
 
         let received = daemon.into_received();
@@ -1676,8 +2769,8 @@ mod tests {
     fn metrics_summary_json_has_expected_keys() {
         // A representative exposition with the series print_summary reads.
         let body = "\
-weir_records_accepted_total{tier=\"sync\"} 5
-weir_records_ack_total{tier=\"sync\"} 4
+weir_records_accepted_total{tier=\"durable\"} 5
+weir_records_ack_total{tier=\"durable\"} 4
 weir_records_nack_total{reason=\"bad_payload_crc\"} 1
 weir_wab_fsync_duration_seconds_sum 0.5
 weir_wab_fsync_duration_seconds_count 10
@@ -1778,10 +2871,10 @@ weir_sink_info{sink_type=\"http\"} 1
 
     #[test]
     fn push_json_has_expected_keys() {
-        let v = round_trip(&push_json(128, Durability::Sync));
+        let v = round_trip(&push_json(128, Durability::Durable));
         assert_eq!(v["acked"], serde_json::json!(true));
         assert_eq!(v["bytes"], serde_json::json!(128));
-        assert_eq!(v["durability"], serde_json::json!("Sync"));
+        assert_eq!(v["durability"], serde_json::json!("Durable"));
     }
 
     #[test]
@@ -1825,14 +2918,14 @@ weir_sink_info{sink_type=\"http\"} 1
         assert_eq!(dry["unreadable_segments"], serde_json::json!(2));
         assert_eq!(dry["requeuable_records"], serde_json::json!(40));
 
-        let done = round_trip(&DlRequeueJson::done(5, 40, 4, 1, 0, Durability::Batched));
+        let done = round_trip(&DlRequeueJson::done(5, 40, 4, 1, 0, Durability::Durable));
         assert_eq!(done["dry_run"], serde_json::json!(false));
         assert_eq!(done["segments"], serde_json::json!(5));
         assert_eq!(done["requeued_records"], serde_json::json!(40));
         assert_eq!(done["segments_cleared"], serde_json::json!(4));
         assert_eq!(done["skipped_segments"], serde_json::json!(1));
         assert_eq!(done["delete_failures"], serde_json::json!(0));
-        assert_eq!(done["durability"], serde_json::json!("Batched"));
+        assert_eq!(done["durability"], serde_json::json!("Durable"));
     }
 
     #[test]
@@ -1855,13 +2948,21 @@ weir_sink_info{sink_type=\"http\"} 1
 
     #[test]
     fn parse_durability_is_case_insensitive_and_rejects_unknown() {
-        assert_eq!(parse_durability("SYNC").unwrap(), Durability::Sync);
-        assert_eq!(parse_durability("batched").unwrap(), Durability::Batched);
+        // "durable" is the canonical 2.0 spelling and must parse.
+        assert_eq!(parse_durability("durable").unwrap(), Durability::Durable);
+        assert_eq!(parse_durability("DURABLE").unwrap(), Durability::Durable);
+        // "sync" and "batched" are kept working as legacy aliases.
+        assert_eq!(parse_durability("SYNC").unwrap(), Durability::Durable);
+        assert_eq!(parse_durability("batched").unwrap(), Durability::Durable);
         assert_eq!(parse_durability("BuFfErEd").unwrap(), Durability::Buffered);
         let err = parse_durability("fast").unwrap_err();
         assert!(
-            err.contains("sync") && err.contains("batched") && err.contains("buffered"),
-            "the error must name the three valid values, got: {err}"
+            err.contains("durable")
+                && err.contains("sync")
+                && err.contains("batched")
+                && err.contains("buffered"),
+            "the error must name the canonical `durable` value and the legacy \
+             sync/batched aliases, got: {err}"
         );
     }
 
@@ -1956,7 +3057,7 @@ weir_sink_info{sink_type=\"http\"} 1
     #[test]
     fn metric_primitives_sum_get_and_active_label() {
         let body = "\
-weir_records_accepted_total{tier=\"sync\"} 3
+weir_records_accepted_total{tier=\"durable\"} 3
 weir_records_accepted_total{tier=\"buffered\"} 4
 weir_records_accepted_total 99
 weir_queue_depth 7
@@ -1977,6 +3078,1109 @@ weir_sink_health{state=\"degraded\"} 0
         assert_eq!(
             active_label(body, "weir_sink_health", "state").as_deref(),
             Some("healthy")
+        );
+    }
+
+    // ── Quarantine ───────────────────────────────────────────────────────────
+
+    /// A fresh, empty temp directory unique to this test process + label. The
+    /// quarantine tests below need both a `wab_dir` and its `quarantine/`
+    /// subdirectory per test, so — unlike the older dl tests above, which
+    /// inline a single path each — this is worth factoring once.
+    fn tmp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "weir_ctl_quarantine_{label}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Writes a quarantine-style segment fixture at `q_dir/name`: header +
+    /// `[len][crc][payload]` per record + sentinel — the same shape Task 1's
+    /// `write_segment` test helper builds. No 32-byte footer is written; that is
+    /// deliberate, see the module doc on `RecoveryReader`'s footer-less
+    /// clean-end check (`recovery_reader.rs:171-172`).
+    ///
+    /// `corrupt_payload_at`, when `Some(i)`, flips a byte in record `i`'s
+    /// payload (leaving its declared length intact) so its CRC fails to verify
+    /// — a `Skipped`, not a `Desynced`. `corrupt_len_at`, when `Some(i)`, wrecks
+    /// record `i`'s LENGTH field instead — unrecoverable by design, since the
+    /// reader can no longer know where the next record begins, so it desyncs.
+    fn write_q_segment_inner(
+        q_dir: &Path,
+        name: &str,
+        records: &[&[u8]],
+        corrupt_payload_at: Option<usize>,
+        corrupt_len_at: Option<usize>,
+    ) {
+        use std::io::Write;
+        std::fs::create_dir_all(q_dir).unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&weir_wab::format::build_segment_header(
+            0,
+            weir_wab::format::Compression::None,
+        ));
+        for (i, r) in records.iter().enumerate() {
+            let mut len = r.len() as u32;
+            if corrupt_len_at == Some(i) {
+                // A wildly implausible length: the reader cannot locate the
+                // next record, so it must give up rather than guess.
+                len = u32::MAX - 1;
+            }
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
+            let mut payload = r.to_vec();
+            if corrupt_payload_at == Some(i) {
+                payload[0] ^= 0xff; // CRC now mismatches; length still correct
+            }
+            buf.extend_from_slice(&payload);
+        }
+        buf.extend_from_slice(&weir_wab::format::build_sentinel());
+        std::fs::File::create(q_dir.join(name))
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+    }
+
+    fn write_q_segment(q_dir: &Path, name: &str, records: &[&[u8]]) {
+        write_q_segment_inner(q_dir, name, records, None, None);
+    }
+
+    fn write_q_segment_with_corruption(
+        q_dir: &Path,
+        name: &str,
+        records: &[&[u8]],
+        corrupt_payload_at: usize,
+    ) {
+        write_q_segment_inner(q_dir, name, records, Some(corrupt_payload_at), None);
+    }
+
+    /// Review finding I1's fixture: a record whose LENGTH is corrupted to an
+    /// implausible value, so `RecoveryReader` desyncs rather than guessing.
+    /// The plan's Task 4 sketch names a 3-arg `write_q_segment_bad_length(&q,
+    /// name, 0)` that builds its own fixed record set; this one takes the
+    /// records explicitly instead, so Task 4 can reuse or thinly wrap it.
+    fn write_q_segment_bad_length(
+        q_dir: &Path,
+        name: &str,
+        records: &[&[u8]],
+        corrupt_len_at: usize,
+    ) {
+        write_q_segment_inner(q_dir, name, records, None, Some(corrupt_len_at));
+    }
+
+    #[test]
+    fn quarantine_list_on_a_missing_dir_is_not_an_error() {
+        // No quarantine dir is the normal, healthy case.
+        let dir = tmp_dir("q_list_missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(cmd_quarantine_list(&dir, false).is_ok());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_reports_segments_and_bytes() {
+        // I3-a: previously asserted only `.is_ok()` on `cmd_quarantine_list`,
+        // so gutting it to print nothing left this test green (review finding
+        // I3, mutation M4). Drives `quarantine_list_write` directly — the
+        // function `cmd_quarantine_list` is now a one-line wrapper over — and
+        // asserts on the bytes it actually wrote.
+        let dir = tmp_dir("q_list");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"ab", b"cd"]);
+
+        let mut out = Vec::new();
+        quarantine_list_write(&dir, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        // N2: the total row also prints "48 B" (there is only one segment, so
+        // the total equals it), so `text.contains("48 B")` over the whole
+        // listing was satisfied even if the per-segment column were blanked.
+        // Require the segment's own row to carry both its name and its size.
+        let row = text
+            .lines()
+            .find(|l| l.contains("shard_00__seg_00000001.wab"))
+            .unwrap_or_else(|| panic!("the segment name must appear in the listing, got: {text}"));
+        assert!(
+            row.contains("shard_00"),
+            "the origin shard must be on the segment's own row, got: {row}"
+        );
+        // header(24) + 2 records of len 2 (4+4+2 each = 10*2 = 20) + sentinel(4).
+        assert!(
+            row.contains("48 B"),
+            "the segment's on-disk size must be on its OWN row, not just the total, got: {row}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_json_has_expected_keys_from_tmp_wab() {
+        // I3-b: until now the quarantine JSON had no shape test at all —
+        // mirrors `dl_list_json_has_expected_keys_from_tmp_wab`. Deleting
+        // `note` / `origin_shard` / `skipped_records` (review's M8) left the
+        // suite green before this existed.
+        let dir = tmp_dir("q_list_json");
+        let q = dir.join("quarantine");
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"x"]);
+        let segs = quarantine_segments(&q).unwrap();
+
+        let v = round_trip(&quarantine_list_json(&q, &segs));
+        assert_eq!(v["count"], serde_json::json!(1));
+        assert!(v["total_bytes"].is_u64());
+        assert!(v["segments"].is_array());
+        assert_eq!(
+            v["segments"][0]["segment"],
+            serde_json::json!("shard_00__seg_00000001.wab")
+        );
+        assert_eq!(
+            v["segments"][0]["origin_shard"],
+            serde_json::json!("shard_00")
+        );
+        assert!(v["quarantine_dir"].is_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn quarantine_list_json_empty_store_is_stable_shape() {
+        // Mirrors `dl_list_json_empty_store_is_stable_shape`: an empty store is
+        // the same shape as a populated one, not a special case.
+        let dir = tmp_dir("q_list_json_empty");
+        let v = round_trip(&quarantine_list_json(&dir, &[]));
+        assert_eq!(v["count"], serde_json::json!(0));
+        assert_eq!(v["total_bytes"], serde_json::json!(0));
+        assert_eq!(v["segments"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn quarantine_list_finds_both_extensions_and_collision_suffixes() {
+        // THE regression test for this command. Crash recovery quarantines
+        // ACTIVE segments, so its copies end `.wab` — and that is the mid-file
+        // corruption case, the one where acked records sit after the corruption.
+        // A `.wab.sealed`-only filter lists zero of them and reports success.
+        // The drain contributes `.wab.sealed`, and non_clobbering_dest appends
+        // `.N` to either on a name collision.
+        let dir = tmp_dir("q_list_exts");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a"]);
+        write_q_segment(&q, "shard_01__seg_00000002.wab.sealed", &[b"b"]);
+        write_q_segment(&q, "shard_00__seg_00000001.wab.1", &[b"c"]);
+        write_q_segment(&q, "shard_01__seg_00000002.wab.sealed.2", &[b"d"]);
+        std::fs::write(q.join("operator-notes.txt"), b"not a segment").unwrap();
+
+        let segs = quarantine_segments(&q).unwrap();
+        assert_eq!(
+            segs.len(),
+            4,
+            "both extensions and their collision suffixes must be listed, got {segs:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_segments_ignores_a_directory_with_a_segment_like_name() {
+        // I3-c: defends the `is_file()` guard added beyond the plan's snippet.
+        // quarantine/ is only ever populated with FILES by
+        // quarantine()/copy_to_quarantine(), but a same-named directory
+        // (however unlikely) must never be offered up as a segment.
+        let dir = tmp_dir("q_list_dir_decoy");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab", &[b"a"]);
+        std::fs::create_dir_all(q.join("shard_01__seg_00000002.wab")).unwrap();
+
+        let segs = quarantine_segments(&q).unwrap();
+        let names: Vec<String> = segs
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["shard_00__seg_00000001.wab"],
+            "a directory must never be listed as a segment, got {names:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn origin_shard_parses_the_shard_prefix() {
+        // I3-c: `origin_shard` had no direct test; mutating it to always
+        // return `None` left the suite green.
+        assert_eq!(origin_shard("shard_00__seg_00000001.wab"), Some("shard_00"));
+        assert_eq!(origin_shard("no_separator.wab"), None);
+    }
+
+    #[test]
+    fn quarantine_inspect_reports_recovered_and_skipped_counts() {
+        // The diagnostic that does not exist today: which records are readable,
+        // which are not, and where.
+        let dir = tmp_dir("q_inspect");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab";
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+
+        let report = quarantine_inspect_report(&q.join(name)).unwrap();
+        assert_eq!(report.recovered, 2, "records either side of the corruption");
+        assert_eq!(report.skipped, 1);
+        assert!(
+            !report.desynced,
+            "a payload-only corruption must not desync"
+        );
+
+        // I2: `declared_len` and `reason` must survive, not just the offset —
+        // they are what lets an operator tell a 1-record loss from a range
+        // that swallowed several intact records.
+        assert_eq!(report.skipped_records.len(), 1);
+        let skipped = &report.skipped_records[0];
+        assert_eq!(skipped.declared_len, 6, "\"BADREC\" is 6 bytes");
+        assert_eq!(skipped.reason, "CRC mismatch");
+
+        // And it must actually reach the printed output, not stop at the struct.
+        let lines = quarantine_inspect_lines(name, &report).join("\n");
+        assert!(
+            lines.contains("declared_len 6"),
+            "the printed report must surface declared_len, got: {lines}"
+        );
+        assert!(
+            lines.contains("CRC mismatch"),
+            "the printed report must surface the reason, got: {lines}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_inspect_reports_a_desync() {
+        // I1: nothing anywhere exercised `desynced == true` before this test.
+        // Inverting the `Desynced` arm (r.desynced = false; r.desync_reason =
+        // None;) left the suite green and made the binary print the CLEAN END
+        // paragraph, exit 0, for a segment whose framing was genuinely lost —
+        // the one output state an operator most needs the truth in.
+        let dir = tmp_dir("q_inspect_desync");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab";
+        write_q_segment_bad_length(&q, name, &[b"good1", b"BADLEN", b"unreachable"], 1);
+
+        let report = quarantine_inspect_report(&q.join(name)).unwrap();
+        assert!(
+            report.desynced,
+            "an implausible length must desync, got {report:?}"
+        );
+        assert!(
+            report.desync_reason.is_some(),
+            "the reason must be populated so the operator can act on it"
+        );
+        assert_eq!(
+            report.recovered, 1,
+            "only the record before the bad length is recovered"
+        );
+
+        let mut out = Vec::new();
+        quarantine_inspect_write(&dir, name, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap().to_lowercase();
+        assert!(
+            text.contains("not recoverable by this tool"),
+            "the printed report must say the tail past the desync is unreachable, got: {text}"
+        );
+        assert!(
+            !text.contains("clean end"),
+            "a desynced segment must NOT print the clean-end paragraph, got: {text}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Whether `word` appears in `text` as a whole word, not merely as a
+    /// substring of some other word ("not" inside "nothing", "note",
+    /// "cannot"). Case-sensitive; callers lowercase both sides first. Exists
+    /// because a plain `.contains("not")` is satisfied by vocabulary that has
+    /// nothing to do with negation (review finding N1).
+    fn contains_word(text: &str, word: &str) -> bool {
+        text.split(|c: char| !c.is_alphabetic()).any(|w| w == word)
+    }
+
+    #[test]
+    fn quarantine_inspect_lines_distinguish_accounted_for_from_recovered() {
+        // I3-b + N1: the previous version asserted `contains("not") &&
+        // contains("recovered")` over the JOINED output. Neither conjunct
+        // pinned anything: "recovered" is satisfied by the unrelated
+        // `recovered: N record(s)` COUNTER line, present in every report
+        // regardless of outcome, and "not" is satisfied by any word merely
+        // containing those letters ("nothing", "note", "cannot"). So the
+        // precise misreading this whole feature exists to prevent —
+        // "clean end: nothing is missing from this segment. It is safe to
+        // delete." — passed this test unchanged.
+        //
+        // Fixed by pinning the verdict line STRUCTURALLY (it is always the
+        // last line `quarantine_inspect_lines` pushes, in both branches) and
+        // requiring "not" to appear as a whole WORD via `contains_word`, so
+        // the assertion can tell the claim from its negation rather than just
+        // detecting related vocabulary. This still does not pin verbatim
+        // prose — a full rewording that keeps the claim intact (e.g. "the
+        // reader accounted for every byte here. That does not imply every
+        // record was recovered.") stays green.
+        let clean = QuarantineReport {
+            recovered: 1,
+            skipped: 0,
+            desynced: false,
+            skipped_records: Vec::new(),
+            desync_reason: None,
+        };
+        let mut clean_lines = quarantine_inspect_lines("seg.wab", &clean);
+        let clean_verdict = clean_lines.pop().unwrap().to_lowercase();
+        assert!(
+            clean_verdict.contains("recover"),
+            "the clean-end verdict must speak about recovery, got: {clean_verdict}"
+        );
+        assert!(
+            contains_word(&clean_verdict, "not"),
+            "the clean-end verdict must NEGATE 'every record recovered' with the word \"not\", \
+             got: {clean_verdict}"
+        );
+
+        let desynced = QuarantineReport {
+            recovered: 1,
+            skipped: 0,
+            desynced: true,
+            skipped_records: Vec::new(),
+            desync_reason: Some("an implausible length".to_string()),
+        };
+        let mut desync_lines = quarantine_inspect_lines("seg.wab", &desynced);
+        let desync_verdict = desync_lines.pop().unwrap().to_lowercase();
+        assert!(
+            contains_word(&desync_verdict, "not") && desync_verdict.contains("recoverable"),
+            "the desync verdict must say records past that point are NOT recoverable, \
+             got: {desync_verdict}"
+        );
+        assert_ne!(
+            clean_verdict, desync_verdict,
+            "the two outcomes must not print the same verdict"
+        );
+    }
+
+    #[test]
+    fn quarantine_inspect_json_note_differs_by_outcome() {
+        // I3-b (JSON shape) + M3: the `note` must not be the same text
+        // regardless of outcome — a script reading `desynced: true` must not
+        // be handed the clean-end reassurance beside it.
+        let clean = QuarantineReport {
+            recovered: 2,
+            skipped: 1,
+            desynced: false,
+            skipped_records: vec![SkippedRecord {
+                offset: 37,
+                declared_len: 6,
+                reason: "CRC mismatch".to_string(),
+            }],
+            desync_reason: None,
+        };
+        let v = round_trip(&quarantine_inspect_json("seg.wab", &clean));
+        assert_eq!(v["recovered"], serde_json::json!(2));
+        assert_eq!(v["skipped"], serde_json::json!(1));
+        assert_eq!(v["desynced"], serde_json::json!(false));
+        assert_eq!(v["skipped_records"][0]["offset"], serde_json::json!(37));
+        assert_eq!(
+            v["skipped_records"][0]["declared_len"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            v["skipped_records"][0]["reason"],
+            serde_json::json!("CRC mismatch")
+        );
+        // N1: same fix as the human-wording test above — "not" must be a
+        // whole word (via `contains_word`), not a substring any related word
+        // would satisfy ("nothing", "note"). Split into two assertions so
+        // each conjunct is independently meaningful.
+        let clean_note = v["note"].as_str().unwrap().to_lowercase();
+        assert!(
+            clean_note.contains("recover"),
+            "the clean-end note must speak about recovery, got: {clean_note}"
+        );
+        assert!(
+            contains_word(&clean_note, "not"),
+            "the clean-end note must NEGATE 'every record recovered' with the word \"not\", \
+             got: {clean_note}"
+        );
+
+        let desynced = QuarantineReport {
+            recovered: 1,
+            skipped: 0,
+            desynced: true,
+            skipped_records: Vec::new(),
+            desync_reason: Some("record declares an implausible length".to_string()),
+        };
+        let v2 = round_trip(&quarantine_inspect_json("seg2.wab", &desynced));
+        assert_eq!(v2["desynced"], serde_json::json!(true));
+        let desync_note = v2["note"].as_str().unwrap().to_lowercase();
+        assert!(
+            contains_word(&desync_note, "not") && desync_note.contains("recoverable"),
+            "the desync note must say records past that point are NOT recoverable, \
+             got: {desync_note}"
+        );
+        assert_ne!(
+            clean_note, desync_note,
+            "the two outcomes must not share a note"
+        );
+    }
+
+    // ── Requeue ──────────────────────────────────────────────────────────────
+    //
+    // Reuses `FakeDaemon` (defined above, alongside `dl requeue`'s tests) rather
+    // than a second copy: `start_with_nacks` was added to it specifically for
+    // the guard tests below, which need a real accept/push/Nack round trip — not
+    // merely a connect failure (`/nonexistent.sock` already covers that, and
+    // cannot exercise "the daemon accepted the connection then Nacked a push").
+
+    fn fake_daemon_socket(label: &str) -> PathBuf {
+        // Short prefix, matching `requeue_deletes_sealed_segments_only_after_acks`'s
+        // `wctl_rq_*.sock` above: Unix socket paths are length-limited
+        // (SUN_LEN, ~104 bytes on macOS), and `std::env::temp_dir()` alone can
+        // already eat half that budget.
+        std::env::temp_dir().join(format!("wctl_qrq_{label}_{}.sock", std::process::id()))
+    }
+
+    #[test]
+    fn quarantine_requeue_defaults_to_a_dry_run() {
+        let dir = tmp_dir("q_requeue_dry");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+
+        // No socket needed: a dry run must not connect.
+        cmd_quarantine_requeue(
+            &dir,
+            Path::new("/nonexistent.sock"),
+            Durability::Durable,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(q.join(name).exists(), "a dry run must not delete anything");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_reports_the_already_delivered_prefix() {
+        // Requeueing re-sends records that already reached the sink when
+        // recovery sealed the valid prefix. That is within the at-least-once
+        // contract, but the operator is told the count BEFORE they pass --yes.
+        let dir = tmp_dir("q_requeue_dupes");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment_with_corruption(
+            &q,
+            "shard_00__seg_00000001.wab.sealed",
+            &[b"pre1", b"pre2", b"BADREC", b"post1"],
+            2,
+        );
+        let plan = quarantine_requeue_plan(&q).unwrap();
+        assert_eq!(
+            plan.total_records, 3,
+            "3 verifiable records across the corruption"
+        );
+        assert_eq!(plan.segments_desynced, 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_dry_run_prints_the_duplicate_count() {
+        // The brief's own load-bearing requirement: "the dry run must print
+        // the duplicate count explicitly, so the operator decides rather than
+        // discovers." Pinned against `quarantine_requeue_write`'s actual
+        // output — not merely the plan struct — the same I3 lesson Task 3
+        // already learned: a struct-level assertion stays green even if the
+        // printed text is gutted.
+        let dir = tmp_dir("q_requeue_print_count");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment_with_corruption(
+            &q,
+            "shard_00__seg_00000001.wab.sealed",
+            &[b"pre1", b"pre2", b"BADREC", b"post1"],
+            2,
+        );
+
+        let mut out = Vec::new();
+        quarantine_requeue_write(
+            &dir,
+            Path::new("/nonexistent.sock"),
+            Durability::Durable,
+            false,
+            false,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("3 record"),
+            "the dry run must print the exact requeuable-record count (3), got: {text}"
+        );
+        // I2 (review round 1): `contains("already") || contains("duplicate")`
+        // cannot distinguish this claim from its exact WRONG negation — "a
+        // dedup-capable sink WILL filter these duplicates for you" also
+        // contains "duplicate" and would leave this assertion green. Require
+        // the specific negated claim as a whole word ("NOT" next to "filter"),
+        // and separately require the wrong reassurance form is absent.
+        let lower = text.to_lowercase();
+        assert!(
+            contains_word(&lower, "not") && lower.contains("filter"),
+            "the dry run must state the sink will NOT filter the duplicates, got: {text}"
+        );
+        assert!(
+            !lower.contains("will filter") && !lower.contains("filter these duplicates for you"),
+            "the dry run must not contain the wrong reassurance form, got: {text}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_duplicate_warning_states_the_corrected_dedup_claim() {
+        // I2 (review round 1): a direct, structural pin on the CONSTANT itself
+        // (not just that it got printed) — the plan's original commit-message
+        // draft claimed a dedup-capable sink WOULD filter requeue's
+        // duplicates; it was proofread-corrected to the opposite, and this is
+        // the wording the operator actually reads before passing --yes. This
+        // is the same trap class Task 3's round-2 review already fixed once
+        // (`contains("not")` matching `"nothing"`) — reusing `contains_word`.
+        let w = QUARANTINE_REQUEUE_DUPLICATE_WARNING.to_lowercase();
+        assert!(
+            contains_word(&w, "not") && w.contains("filter"),
+            "must state the sink will NOT filter the duplicates, got: {w}"
+        );
+        assert!(
+            !w.contains("will filter") && !w.contains("filter these duplicates for you"),
+            "must not contain the wrong reassurance form, got: {w}"
+        );
+    }
+
+    #[test]
+    fn a_segment_that_desyncs_with_no_records_is_not_deleted() {
+        // Nothing to confirm, and deleting it destroys the only forensic copy.
+        // (The plan's Task 4 sketch calls `write_q_segment_bad_length(&q, name,
+        // 0)` — 3 args — but the helper Task 3 actually built takes an explicit
+        // record list too; corrupting record 0's length with nothing before it
+        // is the equivalent fixture: zero records recovered before the desync.)
+        let dir = tmp_dir("q_requeue_desync");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_bad_length(&q, name, &[b"unreachable"], 0);
+
+        let plan = quarantine_requeue_plan(&q).unwrap();
+        assert_eq!(plan.total_records, 0);
+        assert_eq!(plan.segments_desynced, 1);
+
+        // Not deleted even WITH --yes: connect to a fake daemon that would Ack
+        // anything (there is nothing to push, so it never gets the chance).
+        // The overall run still reports non-zero (a segment needing manual
+        // attention was left behind — this mirrors `dl requeue`'s aggregated
+        // "problems" exit for unreadable segments), but the file itself must
+        // survive.
+        let socket = fake_daemon_socket("desync");
+        let _daemon = FakeDaemon::start(socket.clone());
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
+            .expect_err("a segment with nothing recoverable must be reported, not silently OK");
+        assert!(
+            err.contains("no recoverable records") || err.contains("left in place"),
+            "{err}"
+        );
+        assert!(
+            q.join(name).exists(),
+            "a segment that desyncs before yielding any record must survive --yes"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_does_not_delete_a_segment_when_a_push_is_nacked() {
+        // THE data-loss guard: a segment is deleted only after EVERY one of its
+        // records has been ACCEPTED, not merely pushed. A quarantined segment
+        // is often the only surviving copy of acked-durable records, so a
+        // false "requeued" that then deletes the file is unrecoverable data
+        // loss. This is worth more than every other test in this task
+        // combined (brief, "This is the destructive one").
+        let dir = tmp_dir("q_requeue_nack");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2", b"good3"], 1);
+
+        // 3 recoverable records (good1, good2, good3); Nack the SECOND push
+        // (index 1) so the segment is left with some records already pushed
+        // and some not — the exact partial-progress case the ordering rule
+        // exists for.
+        let socket = fake_daemon_socket("nack");
+        let _daemon =
+            FakeDaemon::start_with_nacks(socket.clone(), std::collections::HashSet::from([1]));
+
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
+            .expect_err("a Nacked push must surface as an error, not a silent partial success");
+        assert!(
+            err.contains("push failed") || err.to_lowercase().contains("nack"),
+            "{err}"
+        );
+        assert!(
+            q.join(name).exists(),
+            "the segment must NOT be deleted when a push failed/was Nacked partway through"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_yes_deletes_a_segment_once_every_record_is_accepted() {
+        // The positive path the guard tests above are guarding: when every
+        // recoverable record IS accepted, the segment IS deleted, and the
+        // corrupt record itself was correctly excluded from what got pushed.
+        let dir = tmp_dir("q_requeue_success");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+
+        let socket = fake_daemon_socket("success");
+        let daemon = FakeDaemon::start(socket.clone());
+
+        cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false).unwrap();
+        assert!(
+            !q.join(name).exists(),
+            "every recoverable record was accepted; the segment must be deleted"
+        );
+        // The corrupt record ("BADREC") must be EXCLUDED from what got pushed —
+        // only the two verified records either side of it.
+        assert_eq!(
+            daemon.into_received(),
+            vec![b"good1".to_vec(), b"good2".to_vec()],
+            "requeue must push exactly the verified records, in order, and skip the corrupt one"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_never_deletes_a_segment_that_desynced_even_with_records_recovered_first()
+    {
+        // Review round 1, Important 1 — the finding that mattered: the
+        // original guard was `records.is_empty()`, which only protected a
+        // desync BEFORE the first record. Crash recovery's OTHER mid-file
+        // quarantine reason (an oversized `payload_len` field, as opposed to
+        // a CRC mismatch) makes RecoveryReader desync, and it is entirely
+        // ordinary for one or more good records to precede that corruption —
+        // reproduced live in the review against a real daemon: 4 records sat
+        // untouched past the corruption, requeue delivered only the
+        // 3-record duplicate prefix, deleted the segment, and exited 0.
+        //
+        // good1/good2 precede the corrupted length; whatever follows it must
+        // never be silently discarded by treating "some records recovered"
+        // as "safe to delete".
+        let dir = tmp_dir("q_requeue_desync_with_records");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_bad_length(
+            &q,
+            name,
+            &[b"good1", b"good2", b"BADLEN", b"unreachable"],
+            2,
+        );
+
+        let report = quarantine_inspect_report(&q.join(name)).unwrap();
+        assert_eq!(
+            report.recovered, 2,
+            "the two records before the bad length are genuinely recoverable"
+        );
+        assert!(
+            report.desynced,
+            "fixture sanity: the bad length must desync"
+        );
+
+        let socket = fake_daemon_socket("desync_with_records");
+        let daemon = FakeDaemon::start(socket.clone()); // Acks everything
+
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
+            .expect_err("a segment that desynced must be reported, not silently OK");
+        assert!(
+            err.to_lowercase().contains("desync"),
+            "the error must name the desync, got: {err}"
+        );
+        assert!(
+            q.join(name).exists(),
+            "a segment that desynced must survive --yes, however many records were recovered \
+             before the desync point"
+        );
+        // The recoverable prefix IS still requeued — only the delete is
+        // withheld.
+        assert_eq!(
+            daemon.into_received(),
+            vec![b"good1".to_vec(), b"good2".to_vec()],
+            "the records recovered before the desync must still be pushed even though the \
+             file itself is kept"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_leaves_an_all_skipped_clean_end_segment_undeleted() {
+        // Review round 2, N1: the round-1 fix reordered the delete guard to
+        // check `report.desynced` FIRST — correct behaviour, but it meant
+        // `a_segment_that_desyncs_with_no_records_is_not_deleted`'s fixture
+        // (a corrupted LENGTH field) now exits through that new branch and
+        // never reaches `records.is_empty()` at all. With
+        // `if false && records.is_empty()`, the whole suite stayed green: the
+        // "yielded nothing → never delete" guard had no test left holding it,
+        // and disabling it silently turns a zero-record segment from
+        // `Err(…left in place)` + file on disk into `Ok(())` + file deleted.
+        //
+        // This fixture reaches that branch the OTHER way: a corrupted PAYLOAD
+        // (not length) on the segment's only record. That's a CRC mismatch,
+        // which `Skipped`s and reads on to a clean end (the sentinel) rather
+        // than desyncing — recovered=0, skipped=1, desynced=false.
+        let dir = tmp_dir("q_requeue_all_skipped");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_with_corruption(&q, name, &[b"only"], 0);
+
+        let report = quarantine_inspect_report(&q.join(name)).unwrap();
+        assert_eq!(report.recovered, 0, "fixture sanity: nothing recoverable");
+        assert_eq!(
+            report.skipped, 1,
+            "fixture sanity: the one record is skipped"
+        );
+        assert!(
+            !report.desynced,
+            "fixture sanity: a CRC mismatch must NOT desync — this must reach the \
+             records.is_empty() branch, not the report.desynced one"
+        );
+
+        let socket = fake_daemon_socket("all_skipped");
+        let daemon = FakeDaemon::start(socket.clone()); // would Ack anything
+
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
+            .expect_err("a segment with nothing recoverable must be reported, not silently OK");
+        assert!(
+            err.contains("no recoverable records"),
+            "the error must name the actual reason (not a desync), got: {err}"
+        );
+        assert!(
+            q.join(name).exists(),
+            "an all-skipped, clean-end segment must survive --yes"
+        );
+        assert!(
+            daemon.into_received().is_empty(),
+            "nothing was recoverable, so nothing should have been pushed"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_refuses_buffered_durability() {
+        // Review round 1, Minor 1: `Buffered` acks before any fsync
+        // (`weir-core/src/durability.rs`), and this command deletes the
+        // quarantined segment — often the only surviving copy — once every
+        // push is "accepted". Refused unconditionally: before connecting
+        // (bogus socket proves it), and even for a dry run, which never
+        // connects anyway but must not imply buffered is fine to pass with
+        // `--yes` next.
+        let dir = tmp_dir("q_requeue_buffered");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        write_q_segment(&q, "shard_00__seg_00000001.wab.sealed", &[b"a"]);
+        let bogus = Path::new("/nonexistent.sock");
+
+        let dry_err = cmd_quarantine_requeue(&dir, bogus, Durability::Buffered, false, false)
+            .expect_err("buffered must be refused even as a dry run");
+        assert!(dry_err.to_lowercase().contains("buffered"), "{dry_err}");
+
+        let real_err = cmd_quarantine_requeue(&dir, bogus, Durability::Buffered, true, false)
+            .expect_err("buffered must be refused for the real run");
+        assert!(real_err.to_lowercase().contains("buffered"), "{real_err}");
+
+        // Refused before anything was touched.
+        assert!(q.join("shard_00__seg_00000001.wab.sealed").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_skips_an_unreadable_segment_but_still_processes_the_rest() {
+        // Review round 1, Minor 2: a single unopenable entry (an operator's
+        // truncated/junk file — `quarantine/` accepts hand-dropped files same
+        // as `dl_requeue`'s dead-letter dir) must not abort the whole plan or
+        // the whole real run. `dl requeue` already collects such segments and
+        // continues; this mirrors it.
+        let dir = tmp_dir("q_requeue_unreadable");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        // Sorts before the good one (`0000000` < `0000001`), so if the loop
+        // aborted at the first bad entry the good one would never be reached.
+        std::fs::write(q.join("shard_00__seg_00000000.wab.sealed"), b"junk").unwrap();
+        let good_name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment(&q, good_name, &[b"real1", b"real2"]);
+
+        // Dry run: must still report the good segment's plan, not abort with
+        // nothing printed.
+        let mut out = Vec::new();
+        quarantine_requeue_write(
+            &dir,
+            Path::new("/nonexistent.sock"),
+            Durability::Durable,
+            false,
+            false,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("2 record"),
+            "the readable segment's plan must still be printed, got: {text}"
+        );
+        assert!(
+            text.to_lowercase().contains("could not be read"),
+            "the unreadable segment must be reported, not silently swallowed, got: {text}"
+        );
+
+        // Real run: the readable segment is still fully requeued + deleted;
+        // the junk file is left in place and reported (non-zero exit).
+        let socket = fake_daemon_socket("unreadable");
+        let daemon = FakeDaemon::start(socket.clone());
+        let err = cmd_quarantine_requeue(&dir, &socket, Durability::Durable, true, false)
+            .expect_err("an unreadable segment must be reported as a problem");
+        assert!(err.to_lowercase().contains("could not be read"), "{err}");
+        assert!(
+            !q.join(good_name).exists(),
+            "the readable segment must still be fully requeued and deleted"
+        );
+        assert!(
+            q.join("shard_00__seg_00000000.wab.sealed").exists(),
+            "the unreadable junk file must be left in place, not silently deleted or skipped \
+             without a trace"
+        );
+        assert_eq!(
+            daemon.into_received(),
+            vec![b"real1".to_vec(), b"real2".to_vec()]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_real_run_reports_skipped_records_even_when_the_segment_is_deleted() {
+        // Review round 2, N2: the information asymmetry Important 1 (round 1)
+        // was about, left open for skips. The dry run already warns about
+        // skipped records; the real run said NOTHING — not even for a
+        // segment that ends up fully deleted because its one corrupt record
+        // was skipped and everything else was accepted, which is the
+        // ORDINARY case (every quarantined segment has at least one skip by
+        // construction — that is why it is quarantined at all). An operator
+        // running --yes directly, or automation reading only stdout/JSON,
+        // learned nothing about the corrupt record that is now permanently
+        // gone. This does NOT reopen the delete-on-skip decision (a segment
+        // that is otherwise fully readable is still, correctly, deleted) —
+        // it only asserts the operator is TOLD.
+        let dir = tmp_dir("q_requeue_report_skips");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let name = "shard_00__seg_00000001.wab.sealed";
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+
+        let socket = fake_daemon_socket("report_skips");
+        let _daemon = FakeDaemon::start(socket.clone());
+
+        let mut out = Vec::new();
+        let result =
+            quarantine_requeue_write(&dir, &socket, Durability::Durable, true, false, &mut out);
+        assert!(
+            result.is_ok(),
+            "a skip alone must not fail the run — that would make every successful requeue \
+             non-zero, since every segment this command DELETES carries a skip by construction \
+             (a delete needs a clean end, and a clean end implies a CRC-mismatch quarantine): \
+             {result:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("1 record") && text.to_lowercase().contains("skip"),
+            "the real run must report the skipped record, got: {text}"
+        );
+        assert!(
+            text.contains("declared_len 6"),
+            "the real run must surface the byte range (not just a count), \"BADREC\" is 6 \
+             bytes, got: {text}"
+        );
+        assert!(
+            !q.join(name).exists(),
+            "the segment was otherwise fully recoverable and must still be deleted — this \
+             test is about being TOLD, not about changing the delete outcome"
+        );
+
+        // Same information, structured, in --json — rebuild the fixture since
+        // the run above deleted it.
+        write_q_segment_with_corruption(&q, name, &[b"good1", b"BADREC", b"good2"], 1);
+        let socket2 = fake_daemon_socket("report_skips_json");
+        let _daemon2 = FakeDaemon::start(socket2.clone());
+        let mut json_out = Vec::new();
+        quarantine_requeue_write(
+            &dir,
+            &socket2,
+            Durability::Durable,
+            true,
+            true,
+            &mut json_out,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+        assert_eq!(v["skipped_records_total"], serde_json::json!(1));
+        assert_eq!(
+            v["skipped_records"][0]["declared_len"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            v["skipped_records"][0]["reason"],
+            serde_json::json!("CRC mismatch")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_counts_skips_from_segments_it_does_not_delete() {
+        // Review round 3, item 1. The N2 collection sits BEFORE the
+        // desynced/empty/delete branching precisely so it fires regardless of a
+        // segment's eventual fate — but nothing held that property, and moving
+        // the collection down beside `remove_file` (the likeliest refactor here)
+        // left every test green while `skipped_records_total` under-reported.
+        //
+        // Two segments with different fates, each contributing one skip:
+        //   seg 1: good / BADREC(payload) / good   -> clean end, DELETED
+        //   seg 2: good / BADREC(payload) / BADLEN -> skip then DESYNC, KEPT
+        // The total is 2 only if skips are counted for the kept segment too.
+        let dir = tmp_dir("q_requeue_skips_across_fates");
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        let deleted = "shard_00__seg_00000001.wab.sealed";
+        let kept = "shard_00__seg_00000002.wab.sealed";
+        write_q_segment_with_corruption(&q, deleted, &[b"good1", b"BADREC", b"good2"], 1);
+        write_q_segment_inner(&q, kept, &[b"good3", b"BADREC", b"good4"], Some(1), Some(2));
+
+        let socket = fake_daemon_socket("skips_across_fates");
+        let _daemon = FakeDaemon::start(socket.clone());
+
+        let mut json_out = Vec::new();
+        // A desynced segment makes the run exit non-zero by design, so the
+        // result is deliberately not unwrapped — the JSON is still emitted and
+        // is what this test is about.
+        let result = quarantine_requeue_write(
+            &dir,
+            &socket,
+            Durability::Durable,
+            true,
+            true,
+            &mut json_out,
+        );
+        assert!(
+            result.is_err(),
+            "a desynced segment must still make the run exit non-zero: {result:?}"
+        );
+
+        let v: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+        assert_eq!(
+            v["skipped_records_total"],
+            serde_json::json!(2),
+            "one skip from the deleted segment and one from the KEPT desynced segment; \
+             counting only deleted segments gives 1. JSON: {v}"
+        );
+        assert_eq!(
+            v["skipped_records"].as_array().map(Vec::len),
+            Some(2),
+            "both per-record entries must survive, not just the deleted segment's: {v}"
+        );
+
+        // The fates really did differ — otherwise this test could pass while
+        // pinning nothing about "regardless of fate".
+        assert!(
+            !q.join(deleted).exists(),
+            "the clean-ended segment must have been deleted"
+        );
+        assert!(
+            q.join(kept).exists(),
+            "the desynced segment must have been left in place"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn quarantine_requeue_dry_run_json_has_expected_keys() {
+        // N3: nothing pinned this shape before — renaming any key left the
+        // suite green, unlike `dl requeue`'s JSON or `quarantine list`'s.
+        let plan = QuarantineRequeuePlan {
+            segments: 3,
+            total_records: 10,
+            total_skipped: 2,
+            segments_desynced: 1,
+            unreadable: vec!["bad.wab.sealed: truncated".to_string()],
+        };
+        let v = round_trip(&quarantine_requeue_dry_run_json(&plan));
+        assert_eq!(v["dry_run"], serde_json::json!(true));
+        assert_eq!(v["segments"], serde_json::json!(3));
+        assert_eq!(v["requeuable_records"], serde_json::json!(10));
+        // Review round 3, item 3: `skipped_records_total`, a scalar —
+        // matching `done`-JSON's own scalar of the same name, since `done`
+        // separately has an ARRAY under the bare `skipped_records` key. Same
+        // command, same-looking key with two incompatible types was the wart;
+        // this pins the rename so it can't silently drift back.
+        assert_eq!(v["skipped_records_total"], serde_json::json!(2));
+        assert!(
+            v.get("skipped_records").is_none(),
+            "the dry-run JSON must not resurrect a bare `skipped_records` key — that name is \
+             reserved for `done`-JSON's ARRAY, and a dry run never builds per-record entries"
+        );
+        assert_eq!(v["segments_desynced"], serde_json::json!(1));
+        assert_eq!(v["unreadable_segments"], serde_json::json!(1));
+        assert!(v["note"].is_string());
+    }
+
+    #[test]
+    fn quarantine_requeue_done_json_has_expected_keys() {
+        // N3: same trap for the real-run JSON shape — this also pins the new
+        // N2 `skipped_records`/`skipped_records_total` fields structurally.
+        let outcome = QuarantineRequeueOutcome {
+            segments: 5,
+            requeued_records: 12,
+            segments_cleared: 3,
+            segments_desynced_left: 1,
+            segments_empty_left: 1,
+            unreadable_segments: 1,
+            delete_failures: 1,
+            skipped_records_total: 2,
+            skipped_segments: vec![RequeueSkippedSegment {
+                segment: "seg.wab.sealed".to_string(),
+                records: vec![SkippedRecord {
+                    offset: 24,
+                    declared_len: 6,
+                    reason: "CRC mismatch".to_string(),
+                }],
+            }],
+        };
+        let v = round_trip(&quarantine_requeue_done_json(&outcome, Durability::Durable));
+        assert_eq!(v["dry_run"], serde_json::json!(false));
+        assert_eq!(v["segments"], serde_json::json!(5));
+        assert_eq!(v["requeued_records"], serde_json::json!(12));
+        assert_eq!(v["segments_cleared"], serde_json::json!(3));
+        assert_eq!(v["segments_desynced_left_in_place"], serde_json::json!(1));
+        assert_eq!(v["segments_empty_left_in_place"], serde_json::json!(1));
+        assert_eq!(v["unreadable_segments"], serde_json::json!(1));
+        assert_eq!(v["delete_failures"], serde_json::json!(1));
+        assert_eq!(v["durability"], serde_json::json!("Durable"));
+        assert_eq!(v["skipped_records_total"], serde_json::json!(2));
+        assert_eq!(
+            v["skipped_records"][0]["segment"],
+            serde_json::json!("seg.wab.sealed")
+        );
+        assert_eq!(v["skipped_records"][0]["offset"], serde_json::json!(24));
+        assert_eq!(
+            v["skipped_records"][0]["declared_len"],
+            serde_json::json!(6)
+        );
+        assert_eq!(
+            v["skipped_records"][0]["reason"],
+            serde_json::json!("CRC mismatch")
         );
     }
 }

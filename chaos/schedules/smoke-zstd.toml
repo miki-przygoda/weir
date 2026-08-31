@@ -1,0 +1,44 @@
+# Pre-flight for soak8h-zstd.toml. Three episodes, a few minutes.
+#
+# Its only job is to prove the WAB v2 (zstd) path works end to end before an
+# 8-hour unattended run is committed to it: the daemon accepts the flag, writes
+# format v2, survives kill -9, recovers a torn tail out of a COMPRESSED segment,
+# and drains. A soak that dies at minute five because a flag was misspelled
+# wastes the whole night, and nobody is awake to notice.
+#
+# Every parameter is the soak's, except duration. Deliberately: a pre-flight
+# that tests a different configuration than the thing it clears has cleared
+# nothing.
+
+seed = 0x2B5D1
+episodes = 3
+max_duration_secs = 900
+
+# Short but not trivial — the daemon still has to fill and seal segments, and
+# `--wab-segment-max-age-secs 2` (set by run.py) means rotation happens on age
+# regardless of how well the payload compresses.
+steady_lo_secs = 20.0
+steady_hi_secs = 30.0
+quiescence_timeout_secs = 120.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "S"
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+wab_compression = "zstd"
+wab_compression_level = 3
+
+[storage]
+# Smaller than the soak's 2 GiB: three episodes cannot fill it, and a smaller
+# loop file means a faster mkfs on virtualised storage.
+size_mb = 512
+
+[faults]

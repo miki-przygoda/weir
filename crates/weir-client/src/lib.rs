@@ -11,7 +11,7 @@
 //! the ack before returning. So a **single** client's throughput is bounded by
 //! the round-trip time — roughly `1 / RTT` records/sec on one connection
 //! (e.g. a ~50 µs Unix-socket RTT caps a single client near ~20k rec/s; a
-//! `Sync`-tier push also waits on the daemon's fsync). To go faster, **fan out
+//! `Durable`-tier push also waits on the daemon's fsync). To go faster, **fan out
 //! across connections**: create one `WeirClient` per producer thread (they're
 //! independent and the daemon handles many concurrently). Ordering is only
 //! guaranteed within a single connection's sequential pushes, not across
@@ -26,7 +26,7 @@
 //! use weir_client::{WeirClient, Durability}; // Durability is re-exported from weir-core
 //!
 //! let mut client = WeirClient::connect("/run/weir/weir.sock").unwrap();
-//! client.push(b"hello world", Durability::Batched).unwrap();
+//! client.push(b"hello world", Durability::Durable).unwrap();
 //! # }
 //! ```
 //!
@@ -34,7 +34,7 @@
 //!
 //! A successful [`push`](WeirClient::push) means the record is **durably buffered
 //! at the requested [`Durability`] tier** — fsync'd to the write-ahead buffer for
-//! [`Sync`](Durability::Sync)/[`Batched`](Durability::Batched), in memory for
+//! [`Durable`](Durability::Durable), in memory for
 //! [`Buffered`](Durability::Buffered). It does **not** mean the record has reached
 //! your downstream sink yet: the daemon drains buffered records to the sink in
 //! batches, only once a WAB segment seals (its size threshold, or daemon
@@ -59,9 +59,9 @@
 //!
 //! The daemon serves Prometheus metrics at `127.0.0.1:9185/metrics` by default.
 //! The counters a producer cares about are labelled by tier/reason, e.g.
-//! `weir_records_accepted_total{tier="sync"}`,
-//! `weir_records_ack_total{tier="sync"}`, and
-//! `weir_records_nack_total{tier="sync",reason="empty_payload"}`.
+//! `weir_records_accepted_total{tier="durable"}`,
+//! `weir_records_ack_total{tier="durable"}`, and
+//! `weir_records_nack_total{tier="durable",reason="empty_payload"}`.
 #![deny(missing_docs)]
 
 #[cfg(unix)]

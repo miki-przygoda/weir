@@ -3,9 +3,7 @@
 //! Used as the default `sink_type = "noop"` to make the daemon runnable
 //! without a downstream and as a known-good sink in test scenarios.
 
-use weir_core::Payload;
-
-use super::{CommitResult, Sink, SinkError, SinkHealth};
+use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
 
 pub struct NoopSink;
 
@@ -25,10 +23,10 @@ impl SinkError for NoopError {
 }
 
 impl Sink for NoopSink {
-    type Record = Payload;
     type Error = NoopError;
 
-    async fn commit(&self, batch: Vec<Payload>) -> Result<CommitResult<Payload>, NoopError> {
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, NoopError> {
+        let batch = batch.into_records();
         Ok(CommitResult::new(batch, vec![]))
     }
 

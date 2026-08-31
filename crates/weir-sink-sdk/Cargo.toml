@@ -14,7 +14,14 @@ categories = ["database", "asynchronous"]
 all-features = true
 
 [dependencies]
-# The only dependency: weir-core, for the `Payload` type — a newtype wrapper over
-# `bytes::Bytes` (not a re-export; see the R1 newtype rationale). Sink authors
-# implement these traits without pulling in the daemon.
+# weir-core, for the `Payload` type — a newtype wrapper over `bytes::Bytes` (not
+# a re-export; see the R1 newtype rationale). Sink authors implement these traits
+# without pulling in the daemon.
 weir-core = { workspace = true }
+# sha2, for DedupToken. The SDK's second dependency, added deliberately at 2.0:
+# the token is part of the Sink contract, so its derivation belongs in the
+# contract crate where a sink author can construct a real one in their own tests
+# and where the known-answer vector can live beside the code. weir-server already
+# depended on sha2 for the http and clickhouse sinks, so this adds nothing to the
+# daemon's tree — only to a third-party sink's.
+sha2 = "0.10"

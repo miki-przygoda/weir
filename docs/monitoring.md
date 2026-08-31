@@ -5,7 +5,7 @@ companion: how to wire up monitoring, what each alert means and how to respond,
 and a reference for every metric.
 
 **The one thing to internalise:** weir is **fsync-bound**. `weir_wab_fsync_duration_seconds`
-is the dominant latency signal in any durable-write deployment — Sync latency is
+is the dominant latency signal in any durable-write deployment — Durable-tier latency is
 ≈100% fsync (measured: NVMe ~150 µs, SATA SSD ~1.4 ms; see
 `docs/benchmarks/snapshot-2026-06-13-comparison.md`). Durable throughput is set
 by your disk's fsync latency, full stop. The dashboard and alerts are organised
@@ -92,11 +92,20 @@ treat it as a flusher panic. A hung daemon may need a restart.
 
 #### WeirSegmentQuarantined
 Crash recovery found a segment with bad magic, an unknown format version, or a
-CRC mismatch and moved it to `<wab_dir>/quarantine/`. A data-integrity event.
-**Respond:** inspect the quarantined file (`weir-ctl segments` shows shard
-state). CRC mismatches usually mean storage corruption (failing disk / bad RAM).
-The records up to the first bad one were already recovered; the quarantined tail
-is preserved for manual inspection, not auto-discarded.
+CRC mismatch and moved it (or, for mid-file corruption, a copy of it) to
+`<wab_dir>/quarantine/`. A data-integrity event. CRC mismatches usually mean
+storage corruption (failing disk / bad RAM).
+**Respond:** `weir-ctl quarantine list` shows every quarantined segment;
+`weir-ctl quarantine inspect <segment>` reports how much of it is actually
+recoverable, and `weir-ctl quarantine requeue` re-delivers it. Full procedure —
+including why a "clean end" is not "everything was recovered," and why
+`requeue` re-sends the already-delivered prefix — in
+[`docs/operations/quarantine-recovery.md`](operations/quarantine-recovery.md).
+For **mid-file** corruption specifically: the records up to the first bad one
+were already recovered and delivered normally; only the corrupt record and
+whatever follows it in the file went to quarantine, and quarantine's `inspect`/
+`requeue` can usually recover the good records that sit *after* the
+corruption too.
 
 #### WeirFsyncLatency
 (`WeirFsyncLatencyHigh` warning / `WeirFsyncLatencyCritical` critical.) Sustained
@@ -117,6 +126,25 @@ is being delivered.
 **Respond:** free dead-letter space (`weir-ctl dl list` / `weir-ctl dl drop`) or
 raise `dead_letter_max_bytes`. The drain re-checks the cap every
 `dead_letter_check_interval_secs` and resumes automatically once there's headroom.
+
+#### WeirDrainStopped
+The drain supervisor has exited and will not restart itself: the respawn budget
+ran out after repeated panics, the dead-letter writer failed to open at start, or
+the daemon is shutting down. This is terminal. Records are still accepted and
+still acked durably — no ack becomes false — but nothing is delivered and the WAB
+grows until the disk fills.
+
+**`weir_sink_health` is not trustworthy while this fires.** That gauge is written
+only by the drain thread, so once the drain is gone it is frozen at its last
+reading; a green sink-health panel beside a `stopped` drain means nothing is
+probing the sink, not that the sink is fine.
+
+**Respond:** restart the daemon. First check the logs for the cause —
+`weir_drain_panics_total` climbing to `max_respawns` points at a panicking sink
+implementation, and a dead-letter open failure names its path. Set
+`wab_max_bytes` if it is not already set, so the next occurrence bounds the WAB
+instead of filling the disk. On a deliberate shutdown this resolves when the
+instance stops being scraped.
 
 #### WeirSinkDown
 The configured sink reports itself unhealthy. The WAB keeps buffering durably (no
@@ -189,7 +217,7 @@ The work queue is backing up — the WAB flushers can't keep pace with ingest
 (usually storage pressure). Producers see backpressure (slower acks).
 **Respond:** correlate with fsync latency. If fsync is the bottleneck, you're at
 the storage durability ceiling — faster disk, more shards (one flusher/disk), or
-shift latency-tolerant traffic to the `Batched`/`Buffered` tiers. `[TUNE]` the
+shift latency-tolerant traffic to the `Buffered` tier. `[TUNE]` the
 threshold to your `batch_size × shard_count` and burst profile.
 
 ### Security / connection
@@ -249,12 +277,20 @@ All metrics are prefixed `weir_`. Counters carry a `_total` suffix in the
 exposition; histograms expose `_bucket` / `_sum` / `_count`.
 
 ### Ingest
+
+> **Changed in 2.0.0 — dashboards need a one-line edit.** The `tier` label was
+> `sync`/`batched`/`buffered` and is now `durable`/`buffered`. `sync` and
+> `batched` were separate series for identical behaviour; they are one series
+> named `durable`. Any panel or alert selecting `tier="sync"` or
+> `tier="batched"` will silently return no data until updated — panels go blank
+> rather than erroring, so grep your dashboards rather than waiting to notice.
+
 | Metric | Type | Meaning |
 |---|---|---|
-| `weir_records_accepted_total{tier}` | counter | Records admitted for processing, by durability tier (`sync`/`batched`/`buffered`). |
-| `weir_records_ack_total{tier}` | counter | Records durably acked to the producer, by durability tier (`sync`/`batched`/`buffered`). The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
-| `weir_records_nack_total{tier,reason}` | counter | Records Nacked (not durably accepted), by durability tier and `reason`. Should be ~0. `reason` is one of `bad_magic`, `version_mismatch`, `bad_header_crc`, `payload_too_large`, `bad_payload_crc`, `internal_error`, `empty_payload`, `unknown_message`, `reserved_flags_set` (the wire `NackReason` variant names, lowercased). `internal_error` is the only *transient* reason (queue saturation / ack timeout / write-fsync error — connection stays open, producer retries); the rest are permanent protocol/payload errors that close the connection. |
-| `weir_accept_latency_seconds` | histogram | Socket-accept → enqueue latency (independent of fsync). |
+| `weir_records_accepted_total{tier}` | counter | Records admitted for processing, by durability tier (`durable`/`buffered`). |
+| `weir_records_ack_total{tier}` | counter | Records durably acked to the producer, by durability tier (`durable`/`buffered`). The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
+| `weir_records_nack_total{tier,reason}` | counter | Records Nacked (not durably accepted), by durability tier and `reason`. Should be ~0. `reason` is one of `bad_magic`, `version_mismatch`, `bad_header_crc`, `payload_too_large`, `bad_payload_crc`, `internal_error`, `empty_payload`, `unknown_message`, `reserved_flags_set` (the wire `NackReason` variant names, lowercased). `internal_error` is the only *transient* reason (queue saturation / ack timeout / write-fsync error / the [`wab_max_bytes`](operations/configuration.md#wab_max_bytes) cap rejecting — connection stays open, producer retries); the rest are permanent protocol/payload errors that close the connection. The cap is the one cause with its own counter — `weir_wab_cap_rejections_total` — so subtracting it from `internal_error` separates "the WAB is full" from the other three. |
+| `weir_accept_latency_seconds` | histogram | Socket-accept → connection-handler spawn latency (independent of fsync). |
 | `weir_queue_depth` | gauge | In-flight records between the socket layer and workers. |
 
 > **These counters are per-process and reset to 0 on every restart** (they are
@@ -275,19 +311,37 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_wab_fsync_failures_total` | counter | fsync returned an error. **Must be 0.** |
 | `weir_wab_flusher_panics_total` | counter | Flusher thread panics. **Must be 0.** |
 | `weir_drain_panics_total` | counter | weir-drain thread panics caught and respawned by its supervisor. **Must be 0**; sustained values indicate a sink/drain logic bug, and exhausting the respawn budget stops delivery. |
-| `weir_wab_segments_total{state}` | counter | Lifecycle: `open` → `sealed` → `confirmed`; `quarantined` on corruption. |
+| `weir_wab_segments_total{state}` | counter | Segment lifecycle transitions: `open` → `sealed` → `confirmed`; `quarantined` on corruption. A segment is counted `sealed` whichever way it was sealed — rotation, idle-seal, shutdown-seal, **or crash recovery** (recovery finalises an unsealed `.wab` and renames it, which is a real transition and is counted). A mid-file-corrupt segment counts **both** `quarantined` (the preserved forensic copy) and `sealed` (the truncated valid prefix, which is still delivered). **Backlog caveat across a restart** — see the note below. |
 | `weir_wab_bytes_on_disk` | gauge | Bytes used by **live** WAB shard segments: the open active segment (`.wab`) **plus** sealed segments awaiting drain (`.wab.sealed`). It scans on a 5 s cadence, so it trails real-time by up to that interval. It is **not** a total-disk-usage gauge: it excludes drained-marker files (`.wab.confirmed`) and the `dead_letter/` (own gauge: `weir_dead_letter_bytes_on_disk`) and `quarantine/` subdirs, and it doesn't measure the filesystem's free space — for the "disk filling up" signal use a node/host filesystem alert on the partition holding `wab_dir` (see *Capacity*). |
+| `weir_wab_record_logical_bytes_total` | counter | Cumulative record payload bytes **as accepted from producers**, before any compression. Equal to `weir_wab_record_stored_bytes_total` when `wab_compression = "none"`. Counts payload bytes only — not the 8-byte per-record framing, the segment header, or the footer — so it is not a file-size measure. |
+| `weir_wab_record_stored_bytes_total` | counter | Cumulative record payload bytes **as written to disk**, after compression. Divide the logical counter by this one for the live compression ratio (see *Compression ratio* below). Bumped only after a successful write, so a rejected record moves neither counter. |
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
+| `weir_wab_cap_rejections_total` | counter | Pushes Nacked because live WAB bytes exceeded [`wab_max_bytes`](operations/configuration.md#wab_max_bytes). These surface to clients as `NackReason::InternalError` — **the same byte queue saturation uses** — so this counter is the **only** way to distinguish a cap rejection from queue-saturation `InternalError` Nacks. Zero when `wab_max_bytes` is unset (the default). |
 | `weir_recovery_records_replayed_total` | counter | Records replayed from sealed-but-unconfirmed segments on startup. |
-| `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during recovery. |
+| `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during **active**-segment recovery (bad header, or mid-file corruption with a copied tail). Covers every segment quarantine: active-segment recovery (bad header, or mid-file corruption with a copied tail), sealed-segment replay when a `.confirmed` sidecar fails verification, and drain-time quarantine. It moves in lockstep with `weir_wab_segments{state="quarantined"}`. The one thing it deliberately does **not** count is the `.confirmed` **sidecar file** itself when it is quarantined alongside its segment — that would double-count a single incident. `weir_quarantine_bytes_on_disk` is the signal for how much is sitting there. Recover with `weir-ctl quarantine requeue` — see [the runbook](operations/quarantine-recovery.md). |
+| `weir_recovery_segments_failed_total` | counter | Segments whose active-segment recovery (`recover_segment`) failed **and left the segment at its original path**, so nothing will ever reach it. **Deliberately excludes quarantined segments** — a header-level quarantine (bad magic / unknown version / too-short header) moves the file and is counted by `weir_recovery_segments_quarantined_total` instead, because it is handled, not abandoned. (Such a segment is listed by `weir-ctl quarantine list`, though `inspect` cannot parse it — the header is what's corrupt.) **Does NOT fire for the mid-file-corruption case** this toolchain exists for: recovery returns `Ok` there, having sealed and delivered the valid prefix. Non-zero therefore means a genuine I/O failure left a segment stranded — check the startup logs for the path and cause. |
+| `weir_quarantine_bytes_on_disk` | gauge | Total bytes under `<wab_dir>/quarantine/`. **The one signal that moves on every quarantine event**, including the `.confirmed`-sidecar case neither counter above catches. Survives a restart (unlike the counters), refreshed on the same cadence as `weir_dead_letter_bytes_on_disk`. Recover with `weir-ctl quarantine requeue`. |
 | `weir_recovery_quarantine_copy_failed_total` | counter | Mid-file-corrupt segments whose quarantine copy failed (disk full / read-only / inode exhaustion); recovery left the segment un-truncated to preserve acked-durable tail records and will retry. **Non-zero means recovery is stuck on that segment — clear the disk/read-only state and restart.** |
 | `weir_ack_timeout_total` | counter | Acks that never fired within the timeout (wedged flusher). |
 | `weir_stage_{queue,bridge_wait,write,total}_seconds` | histogram | Per-stage latency decomposition (`bench-trace` builds only — diagnostic). |
 
+> **Using `weir_wab_segments_total` for drain backlog.** Within a single process
+> run the family conserves: every segment counted `sealed` is later counted
+> `confirmed` (or `quarantined`), so a growing `sealed − confirmed` really does
+> mean the drain is falling behind. **It does not survive a restart.** Like every
+> other counter here it is a per-process in-memory atomic, and segments that were
+> sealed by the *previous* process and replayed on startup are counted
+> `confirmed` by this one with no matching `sealed` — a replay is not a
+> transition, so it is deliberately not re-counted (`weir_recovery_records_replayed_total`
+> is the signal for that backlog). So after a restart the raw difference can go
+> negative and stay negative. For the live backlog use
+> `weir_wab_bytes_on_disk`, or list the files with `weir-ctl segments`; use
+> `rate(...)`/`increase(...)` over a window for the trend.
+
 ### Drain / sink
 | Metric | Type | Meaning |
 |---|---|---|
-| `weir_drain_state{state}` | gauge | One of `draining` / `retrying_transient` / `blocked_dead_letter_full` is 1. |
+| `weir_drain_state{state}` | gauge | One of `draining` / `retrying_transient` / `blocked_dead_letter_full` / `stopped` is 1. `stopped` is **terminal**: the drain supervisor has exited (clean shutdown, the respawn budget exhausted, or the dead-letter writer failing to open at start) and nothing will be delivered until the daemon restarts — the WAB grows until then. Alert on `weir_drain_state{state="stopped"} == 1` on a daemon you expect to be running. |
 | `weir_sink_commit_records_total{outcome}` | counter | `committed` / `retried` / `dead_lettered` per record. |
 | `weir_sink_commit_duration_seconds` | histogram | Sink `commit()` call duration. |
 | `weir_sink_health{state}` | gauge | Current sink health: exactly one of `state=healthy` / `degraded` / `down` is 1. Alert on `weir_sink_health{state="down"} == 1` (`WeirSinkDown`); `degraded` is an early warning (`WeirSinkDegraded`). **This gauge is driven solely by the periodic HEAD health probe, not by commit failures** — see the lag note below. **It is not a delivery-success signal.** A sink that answers `HEAD` with 2xx (or with 401/403/405/501, which read as healthy) but then 4xx-es every `POST` reads `healthy` here while **dead-lettering all traffic** — the only metric that rises is `weir_sink_commit_records_total{outcome="dead_lettered"}`. **Alert on the dead-lettered outcome rate** (`rate(weir_sink_commit_records_total{outcome="dead_lettered"}[5m]) > 0`, the shipped `WeirDeadLettered` rule) in addition to `weir_sink_health` — health alone will not catch a HEAD-healthy / POST-rejecting endpoint. |
@@ -307,3 +361,24 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown after the grace period. |
 | `weir_tls_handshake_failures_total` | counter | (tls) Mutual-TLS handshake failures. |
 | `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. |
+
+### Compression ratio
+
+When `wab_compression = "zstd"` is enabled, the live ratio is:
+
+```promql
+rate(weir_wab_record_logical_bytes_total[5m])
+  / rate(weir_wab_record_stored_bytes_total[5m])
+```
+
+A value of 1.0 means compression is achieving nothing on your payloads; **below
+1.0 means it is actively expanding them**, which happens when records are small
+enough that zstd's frame overhead exceeds the savings. Each record is compressed
+independently, so the ratio reflects redundancy *within a single record*, not
+across the stream — see
+[`wab_compression`](operations/configuration.md#wab_compression) for measured
+figures by payload size and the rule of thumb for when to leave it off.
+
+This is the number to watch when sizing `wab_dir` for a sink outage: it is the
+multiplier on how long an outage the same disk can absorb.
+

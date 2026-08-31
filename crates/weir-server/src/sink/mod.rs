@@ -28,7 +28,7 @@ pub mod postgres;
 #[cfg(feature = "_sql-sink")]
 mod sql_common;
 
-pub use weir_sink_sdk::{CommitResult, Sink, SinkError, SinkHealth, SinkRecord};
+pub use weir_sink_sdk::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
 
 /// Redacts credentials from a URL for `Debug`/log output. Scrubs BOTH the
 /// userinfo password (`scheme://user:<redacted>@host…`) AND the values of

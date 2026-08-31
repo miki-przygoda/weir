@@ -258,6 +258,7 @@ the lines may appear in any order):
 weir_drain_state{state="draining"} 1.0
 weir_drain_state{state="retrying_transient"} 0.0
 weir_drain_state{state="blocked_dead_letter_full"} 0.0
+weir_drain_state{state="stopped"} 0.0
 ```
 
 That confirms the daemon started and the metrics endpoint is live. (Counter

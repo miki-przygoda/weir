@@ -199,6 +199,9 @@ pub(crate) struct PartialConfig {
     pub batch_deadline_ms: Option<u64>,
     pub wab_segment_max_bytes: Option<u64>,
     pub wab_segment_max_age_secs: Option<u64>,
+    pub wab_max_bytes: Option<u64>,
+    pub wab_compression: Option<String>,
+    pub wab_compression_level: Option<i32>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub metrics_port: Option<u16>,
@@ -299,6 +302,38 @@ pub struct Config {
     /// segment idle for this long is sealed and drained — timely delivery for
     /// low-volume deployments.
     pub wab_segment_max_age_secs: u64,
+    /// Soft upper bound on live WAB bytes on disk. `0` (default) disables it.
+    ///
+    /// When exceeded, pushes are Nacked with `NackReason::InternalError` rather
+    /// than acked into a WAB that cannot be drained. This closes the case where
+    /// a dead or slow drain lets the disk fill while producers keep receiving
+    /// successful acks.
+    ///
+    /// **This is a SOFT high-water mark.** The value it is checked against is
+    /// refreshed every 5 seconds, so the WAB can overshoot by up to 5 seconds of
+    /// peak ingest. Leave at least that much headroom below actual free space.
+    pub wab_max_bytes: u64,
+    /// How WAB records are stored on disk: `"none"` (default) or `"zstd"`.
+    ///
+    /// **Default off is load-bearing.** With `none`, segments are written at
+    /// on-disk format v1 and are byte-identical to weir 1.x, so upgrading and
+    /// rolling back is a non-event. Turning compression on writes format v2,
+    /// which a 1.x daemon refuses to read — it strands those segments loudly
+    /// rather than misreading them, but they stay stranded until a 2.x reads
+    /// them. Treat enabling it as a one-way door.
+    ///
+    /// The benefit is **WAB capacity**, not latency: a given compression ratio
+    /// is that much longer a sink outage absorbed in the same disk budget, plus
+    /// fewer segment seals. See `docs/operations/configuration.md`.
+    pub wab_compression: String,
+    /// zstd compression level, `1..=19`. Only read when `wab_compression` is
+    /// `"zstd"`. Not stored on disk — zstd frames are self-describing for
+    /// decompression, so changing this affects only segments written afterwards.
+    ///
+    /// Capped at 19 rather than zstd's maximum of 22: levels above 19 are the
+    /// "ultra" tier, which needs materially more memory to both compress and
+    /// decompress.
+    pub wab_compression_level: i32,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub metrics_port: u16,
@@ -505,6 +540,17 @@ impl Config {
         // Lower bound 4 KiB so the segment header (one page) fits;
         // upper bound 4 GiB so a single sealed segment can't exceed 32-bit
         // file-offset assumptions downstream.
+        let wab_compression = merge!(wab_compression).unwrap_or_else(|| "none".to_string());
+        if !matches!(wab_compression.as_str(), "none" | "zstd") {
+            return Err(ConfigError::InvalidValue {
+                field: "wab_compression",
+                reason: format!(
+                    "wab_compression must be \"none\" or \"zstd\", got {wab_compression:?}"
+                ),
+            });
+        }
+        let wab_compression_level = merge!(wab_compression_level).unwrap_or(1);
+        check_range("wab_compression_level", wab_compression_level, 1, 19)?;
         let wab_segment_max_bytes = merge!(wab_segment_max_bytes).unwrap_or(256 * 1024 * 1024);
         if !(4096..=4 * 1024 * 1024 * 1024).contains(&wab_segment_max_bytes) {
             return Err(ConfigError::InvalidValue {
@@ -513,6 +559,44 @@ impl Config {
                     "{wab_segment_max_bytes} is outside the supported range [4096, 4294967296]"
                 ),
             });
+        }
+        // 0 = disabled. Otherwise the cap must clear the *un-drainable floor*
+        // with room left to resume, or it wedges ingest permanently.
+        //
+        // The floor is one full active segment PER SHARD. The bytes the cap is
+        // checked against include every shard's open `.wab`, and an active
+        // segment seals only when a write crosses `wab_segment_max_bytes`
+        // (idle-seal, `wab_segment_max_age_secs`, is off by default). So once the
+        // cap starts rejecting there are no writes; nothing seals; nothing
+        // reaches the drain; and the byte total can never fall back below the
+        // resume line — ingest stays dead until a restart, with a perfectly
+        // healthy sink and drain.
+        //
+        // The resume line is written `cap / 10 * 9` so it reads identically to
+        // the hysteresis low-water mark in `socket::connection::over_wab_cap`.
+        // The two must stay in agreement: this check exists to guarantee that
+        // mark is reachable.
+        let wab_max_bytes = merge!(wab_max_bytes).unwrap_or(0);
+        if wab_max_bytes != 0 {
+            let floor = wab_segment_max_bytes.saturating_mul(shard_count as u64);
+            if wab_max_bytes / 10 * 9 <= floor {
+                // Smallest cap `c` satisfying `c / 10 * 9 > floor`: integer
+                // division means only multiples of 10 raise `c / 10`, so the
+                // minimum is `(floor / 9 + 1) * 10`.
+                let minimum = (floor / 9).saturating_add(1).saturating_mul(10);
+                return Err(ConfigError::InvalidValue {
+                    field: "wab_max_bytes",
+                    reason: format!(
+                        "wab_max_bytes ({wab_max_bytes}) must be 0 (disabled) or at least \
+                         {minimum}: its resume threshold (wab_max_bytes / 10 * 9) has to \
+                         clear the bytes that cannot be drained away — one full active \
+                         segment per shard, i.e. shard_count ({shard_count}) * \
+                         wab_segment_max_bytes ({wab_segment_max_bytes}) = {floor} bytes — \
+                         because an active segment seals only when a write crosses the size \
+                         threshold, and over the cap there are no writes"
+                    ),
+                });
+            }
         }
         // Idle-seal threshold. 0 = disabled (historical behaviour); otherwise seal
         // an idle active segment after this many seconds. Capped at a day.
@@ -825,6 +909,9 @@ impl Config {
             batch_deadline_ms,
             wab_segment_max_bytes,
             wab_segment_max_age_secs,
+            wab_max_bytes,
+            wab_compression,
+            wab_compression_level,
             max_connections,
             max_payload_bytes,
             metrics_port,
@@ -1879,5 +1966,227 @@ mod tests {
         assert!(err.to_string().contains("tls_key_path"), "{err}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── WAB compression ───────────────────────────────────────────────────────
+
+    #[test]
+    fn wab_compression_defaults_to_none() {
+        // Default OFF is load-bearing: it keeps segments at format v1, so a
+        // 2.0 daemon's WAB is byte-identical to 1.x and rollback is a non-event.
+        let dir = tmp_dir("compression_default");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.wab_compression, "none");
+        assert_eq!(c.wab_compression_level, 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_compression_zstd_accepted() {
+        let dir = tmp_dir("compression_zstd");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_compression: Some("zstd".into()),
+                wab_compression_level: Some(9),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.wab_compression, "zstd");
+        assert_eq!(c.wab_compression_level, 9);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_wab_compression_rejected() {
+        let dir = tmp_dir("bad_compression");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_compression: Some("lz4".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wab_compression"), "{msg}");
+        assert!(msg.contains("zstd"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_compression_level_range_is_enforced() {
+        // 1..=19. Above 19 is zstd's "ultra" tier, which needs materially more
+        // memory to both compress and decompress.
+        assert_knob_rejected("comp_level_zero", "wab_compression_level", |p| {
+            p.wab_compression_level = Some(0)
+        });
+        assert_knob_rejected("comp_level_ultra", "wab_compression_level", |p| {
+            p.wab_compression_level = Some(20)
+        });
+        assert_knob_rejected("comp_level_neg", "wab_compression_level", |p| {
+            p.wab_compression_level = Some(-1)
+        });
+    }
+
+    #[test]
+    fn wab_max_bytes_defaults_to_disabled() {
+        let dir = tmp_dir("cap_default");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.wab_max_bytes, 0,
+            "default must preserve existing behaviour"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_max_bytes_accepts_a_value_that_clears_every_shard_active_segment() {
+        let dir = tmp_dir("cap_ok");
+        // 4 shards x 1 MiB active segments = 4 MiB un-drainable; a 64 MiB cap
+        // resumes at 57.6 MiB, well clear of it.
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(4),
+                wab_segment_max_bytes: Some(1024 * 1024),
+                wab_max_bytes: Some(64 * 1024 * 1024),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(c.wab_max_bytes, 64 * 1024 * 1024);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_max_bytes_below_one_segment_is_rejected() {
+        // A cap under the rotation threshold would reject before a single
+        // segment could fill — a configuration error, not a policy.
+        let dir = tmp_dir("cap_too_small");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_segment_max_bytes: Some(64 * 1024 * 1024),
+                wab_max_bytes: Some(1024),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wab_max_bytes"), "{msg}");
+        assert!(msg.contains("wab_segment_max_bytes"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The wedge the whole-branch review reproduced: `wab_max_bytes ==
+    /// wab_segment_max_bytes` passed the old `cap >= one segment` check, but with
+    /// two shards the two active `.wab` files together sat above the cap while
+    /// each stayed below its own rotation threshold. Nothing sealed, nothing
+    /// drained, and bytes never fell back under the resume line — ingest was dead
+    /// until restart with a healthy sink. Config must refuse it up front.
+    #[test]
+    fn wab_max_bytes_sized_for_one_shard_is_rejected_when_there_are_more() {
+        let dir = tmp_dir("cap_one_shard_many");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(2),
+                wab_segment_max_bytes: Some(65536),
+                wab_max_bytes: Some(65536),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        // The operator needs all three inputs and the number to set, not just
+        // "you were wrong".
+        assert!(msg.contains("wab_max_bytes"), "{msg}");
+        assert!(msg.contains("wab_segment_max_bytes"), "{msg}");
+        assert!(msg.contains("shard_count"), "{msg}");
+        // floor = 2 * 65536 = 131072; minimum = (131072 / 9 + 1) * 10 = 145640.
+        assert!(
+            msg.contains("145640"),
+            "the error must state the minimum that would be accepted: {msg}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The stated minimum must actually be accepted, and one step below it must
+    /// not — otherwise the message sends operators to a value that still fails.
+    #[test]
+    fn wab_max_bytes_minimum_from_the_error_message_is_exactly_the_boundary() {
+        let build = |dir: &PathBuf, cap: u64| {
+            Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    shard_count: Some(2),
+                    wab_segment_max_bytes: Some(65536),
+                    wab_max_bytes: Some(cap),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+        };
+        let dir = tmp_dir("cap_boundary");
+        assert!(
+            build(&dir, 145_640).is_ok(),
+            "the minimum the error names must be accepted"
+        );
+        assert!(
+            build(&dir, 145_639).is_err(),
+            "one byte below the named minimum must still be rejected"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A single-shard cap set exactly at one segment is now rejected too: the
+    /// resume line is `cap / 10 * 9`, which is below the one active segment that
+    /// cannot seal, so that config wedges just as surely as the multi-shard one.
+    #[test]
+    fn wab_max_bytes_equal_to_one_segment_is_rejected_even_on_a_single_shard() {
+        let dir = tmp_dir("cap_equal_one_seg");
+        let err = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                shard_count: Some(1),
+                wab_segment_max_bytes: Some(65536),
+                wab_max_bytes: Some(65536),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wab_max_bytes"), "{err}");
+        fs::remove_dir_all(dir).ok();
     }
 }

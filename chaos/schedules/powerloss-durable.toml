@@ -1,0 +1,74 @@
+# Power loss against the Durable tier. The comparison run for
+# powerloss-buffered.toml — same fault, same episode count, same everything
+# except the tier and the seed.
+#
+# Durable fsyncs before acking, so power loss must NOT be able to eat an acked
+# record: zero loss here is the PASS condition, not a suspicion. There is no
+# negative control on this schedule — report.powerloss_verdict()'s "zero loss
+# is inconclusive" rule is Buffered-only. Any loss at all is a fail, full
+# stop: see the header of powerloss-buffered.toml for why the two tiers read
+# a zero-loss result oppositely.
+# ---------------------------------------------------------------------------
+# LENGTH IS BOUNDED BY TIME. `episodes` is a CEILING set above what the budget
+# can reach, because episode duration varies with quiescence and restart.
+#
+# MEASURED FOR THIS TIER, not inherited from the Buffered schedules — every
+# disk projection made for this run before 2026-08-29 used Buffered's figures
+# and was wrong by a factor of ~50. Durable fdatasyncs at the batch boundary
+# BEFORE acking, so it is fsync-bound where Buffered is not:
+#
+#                        Durable          Buffered
+#   acked per episode      8,708           412,519      47x
+#   ledger per episode      512 KB          23.7 MB     46x
+#   seconds per episode      15.6              18.7
+#
+# From the 30-episode calibration (run 2403588927149739, 4-8 s steady).
+#
+#   24h  ->  ~5,538 episodes  ->  ~2.8 GB
+#
+# DISK IS NOT THE CONSTRAINT HERE. It dominated every Buffered schedule — a 24h
+# Buffered run needs ~117 GB against ~136 GB free — and it does not apply at
+# all to this one. The 5 GiB `disk_stop_reason` floor still guards the run.
+#
+# Steady state stays SHORT anyway, for a testing reason rather than a budget
+# one: kills are what a rare-event search needs, and 4-8 s yields ~5,538 of
+# them against ~4,095 at 8-15 s. The shape was validated on Buffered
+# (powerloss-shape-check.toml): halving the episode still reached the writeback
+# ceiling, 124,897 against 126,782, so nothing was given up by shortening.
+#
+# Segment rotation still happens at this throughput — the calibration reached
+# seg_00000035 per shard in 30 episodes, roughly one per episode, because each
+# kill/restart cycle seals the active segment. So the seal-and-replay path is
+# exercised even though 8,708 records/episode never fill an 8 MiB segment.
+# ---------------------------------------------------------------------------
+
+seed = 0x9F1A2
+episodes = 7000
+max_duration_secs = 86400  # 24h
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "D"
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 2048
+# The real fault, not the pass-through stand-in. `load_schedule()` refuses
+# `dm_target = "linear"` paired with `fault.kind = "power_loss"` for exactly
+# this reason: linear injects nothing, so that combination would report green
+# having tested no power loss at all.
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"

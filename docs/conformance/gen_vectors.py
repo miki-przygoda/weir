@@ -48,8 +48,8 @@ def hx(b: bytes) -> str:
 vectors = []
 
 
-def ok(name, notes, raw, mt_name, dur_name, flags, payload):
-    vectors.append({
+def ok(name, notes, raw, mt_name, dur_name, flags, payload, round_trip=True):
+    vector = {
         "name": name,
         "notes": notes,
         "hex": hx(raw),
@@ -58,7 +58,14 @@ def ok(name, notes, raw, mt_name, dur_name, flags, payload):
         "durability": dur_name,
         "flags": flags,
         "payload_hex": hx(payload),
-    })
+    }
+    if not round_trip:
+        # Marks a vector whose bytes use a non-canonical (but still decodable)
+        # wire value: it decodes correctly but re-encoding it does NOT reproduce
+        # `hex`, so the runner must skip the byte-identical round-trip check for
+        # this vector specifically. See push_batched below.
+        vector["round_trip"] = False
+    vectors.append(vector)
 
 
 def err(name, notes, raw, tag):
@@ -71,19 +78,28 @@ def err(name, notes, raw, tag):
 
 
 # ── Valid message frames (decode ok + encode round-trip) ──────────────────────
-ok("push_hello_sync", "Push of \"hello\" at Sync durability.",
-   frame(MT["Push"], DUR["Sync"], b"hello"), "Push", "Sync", 0, b"hello")
-ok("push_batched", "Push at Batched durability exercises durability byte 0x02.",
-   frame(MT["Push"], DUR["Batched"], b"wb"), "Push", "Batched", 0, b"wb")
+ok("push_hello_sync", "Push of \"hello\" at Durable durability.",
+   frame(MT["Push"], DUR["Sync"], b"hello"), "Push", "Durable", 0, b"hello")
+ok("push_batched",
+   "Push at the retired Batched durability byte (0x02): a weir 1.x producer's "
+   "wire byte, permissively decoded to Durable by a 2.0 daemon (see "
+   "Durability::try_from). Decode-only: a conformant encoder canonicalises and "
+   "never re-emits 0x02, so this vector is exempt from the byte-identical "
+   "round-trip check (round_trip=False) — see "
+   "retired_batched_byte_decodes_but_never_round_trips in "
+   "crates/weir-core/tests/conformance.rs. The bytes below are frozen: this is "
+   "the only artifact proving a 1.x producer's tier byte still decodes.",
+   frame(MT["Push"], DUR["Batched"], b"wb"), "Push", "Durable", 0, b"wb",
+   round_trip=False)
 ok("push_buffered", "Push at Buffered durability exercises durability byte 0x03.",
    frame(MT["Push"], DUR["Buffered"], b"x"), "Push", "Buffered", 0, b"x")
 ok("ack", "Ack response: empty payload, payload CRC of zero bytes is 0x00000000.",
-   frame(MT["Ack"], DUR["Sync"], b""), "Ack", "Sync", 0, b"")
+   frame(MT["Ack"], DUR["Sync"], b""), "Ack", "Durable", 0, b"")
 ok("healthcheck", "HealthCheck request: empty payload.",
-   frame(MT["HealthCheck"], DUR["Sync"], b""), "HealthCheck", "Sync", 0, b"")
+   frame(MT["HealthCheck"], DUR["Sync"], b""), "HealthCheck", "Durable", 0, b"")
 ok("healthcheck_response", "HealthCheckResponse: empty payload.",
    frame(MT["HealthCheckResponse"], DUR["Sync"], b""),
-   "HealthCheckResponse", "Sync", 0, b"")
+   "HealthCheckResponse", "Durable", 0, b"")
 
 # ── Nack frames, one per reason byte (all decode ok as Nack messages) ─────────
 NACK_REASONS = [
@@ -104,7 +120,7 @@ for byte, slug, desc in NACK_REASONS:
     else:
         payload = bytes([byte])
     ok(f"nack_{slug}", f"Nack reason {desc}.",
-       frame(MT["Nack"], DUR["Sync"], payload), "Nack", "Sync", 0, payload)
+       frame(MT["Nack"], DUR["Sync"], payload), "Nack", "Durable", 0, payload)
 
 # ── Forward-compat / response-filler coverage (decode ok) ─────────────────────
 # A Nack carrying a reserved reason byte still decodes as a Nack frame — the
@@ -114,13 +130,13 @@ for byte, slug, desc in NACK_REASONS:
 ok("nack_reserved_reason",
    "Nack with a reserved reason byte (0x0A): decodes as a Nack frame; the reason's "
    "meaning is forward-compatible and clients surface the raw byte.",
-   frame(MT["Nack"], DUR["Sync"], bytes([0x0A])), "Nack", "Sync", 0, bytes([0x0A]))
+   frame(MT["Nack"], DUR["Sync"], bytes([0x0A])), "Nack", "Durable", 0, bytes([0x0A]))
 # Responses carry a durability *filler* byte: clients must not INTERPRET it (it
 # carries no meaning on a response), but it is still a valid Durability
 # discriminant (0x01-0x03) that the reference decoder range-checks like any other
-# header byte. Pin that a non-Sync filler value still decodes (Ack with Buffered).
+# header byte. Pin that a non-Durable filler value still decodes (Ack with Buffered).
 ok("ack_nonsync_durability_filler",
-   "Ack response whose durability filler is non-Sync (Buffered, 0x03): clients must "
+   "Ack response whose durability filler is non-Durable (Buffered, 0x03): clients must "
    "not interpret the durability field on responses, but it stays a valid "
    "Durability value (0x01-0x03) that the decoder range-checks.",
    frame(MT["Ack"], DUR["Buffered"], b""), "Ack", "Buffered", 0, b"")

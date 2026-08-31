@@ -7,13 +7,14 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crc32fast::Hasher as CrcHasher;
 
 use super::format::{
-    EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, build_segment_footer, build_segment_header,
-    build_sentinel, unix_nanos_now,
+    Compression, EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, build_segment_footer,
+    build_segment_header, build_sentinel, max_stored_record_bytes, unix_nanos_now,
 };
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use weir_core::MAX_PAYLOAD_HARD_CAP;
@@ -32,6 +33,11 @@ pub(crate) struct WabSegment {
     data_bytes: u64,
     /// CRC32 accumulator over all file bytes written before the sentinel.
     file_crc_hasher: CrcHasher,
+    /// How this segment stores records. Only used to size the stored-record cap
+    /// in `write_record`: a compressed record's stored form can legitimately
+    /// exceed the plaintext cap, and the bound must match what `SegmentReader`
+    /// accepts or the WAB could write a record it cannot read back.
+    compression: Compression,
     /// Set when a `write_record` call returned an error after partially writing
     /// to the underlying file. The OS file offset has advanced past stray bytes
     /// that the in-memory `bytes_written` / `file_crc_hasher` accounting did not
@@ -50,7 +56,7 @@ impl WabSegment {
     /// `path` already exists the call returns [`io::ErrorKind::AlreadyExists`]
     /// rather than truncating or appending, so the caller never has to check
     /// first (and a racing creator can't be silently clobbered).
-    pub(crate) fn create(path: &Path, shard_id: u16) -> io::Result<Self> {
+    pub(crate) fn create(path: &Path, shard_id: u16, compression: Compression) -> io::Result<Self> {
         // O_NOFOLLOW: reject symlinks at the target path (prevents TOCTOU redirect).
         // mode 0o600: segment files are private to the daemon; no group/other read.
         #[cfg(unix)]
@@ -64,7 +70,7 @@ impl WabSegment {
         #[cfg(not(unix))]
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
 
-        let header = build_segment_header(shard_id);
+        let header = build_segment_header(shard_id, compression);
 
         let mut hasher = CrcHasher::new();
         hasher.update(&header);
@@ -76,6 +82,7 @@ impl WabSegment {
             record_count: 0,
             data_bytes: 0,
             file_crc_hasher: hasher,
+            compression,
             poisoned: false,
         };
 
@@ -83,7 +90,8 @@ impl WabSegment {
         // Make the new file's directory entry durable. Records written here are
         // group-fsynced for their *data*, but the dirent that links this file into
         // the shard dir is only crash-durable after a parent-dir fsync — without
-        // it, a crash could orphan a file whose Sync records we acked as durable.
+        // it, a crash could orphan a file whose Durable records we acked as
+        // durable.
         fsync_parent_dir(path)?;
         Ok(seg)
     }
@@ -122,16 +130,23 @@ impl WabSegment {
             )
         })?;
 
-        // Belt-and-suspenders: MAX_PAYLOAD_HARD_CAP is already enforced at the socket
-        // layer, but we re-check here so the WAB can never be fed oversized records
-        // regardless of the call path.
-        if payload.len() > MAX_PAYLOAD_HARD_CAP {
+        // Belt-and-suspenders: the cap is already enforced at the socket layer,
+        // but we re-check here so the WAB can never be fed oversized records
+        // regardless of the call path. `payload` is the STORED form, so a
+        // compressed segment uses the wider bound — zstd's worst case expands by
+        // n/255 + 16 — and it must match SegmentReader's cap exactly, or the WAB
+        // could write a record it refuses to read back.
+        let stored_cap = match self.compression {
+            Compression::None => MAX_PAYLOAD_HARD_CAP,
+            Compression::Zstd => max_stored_record_bytes(),
+        };
+        if payload.len() > stored_cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "payload length {} exceeds MAX_PAYLOAD_HARD_CAP {}",
+                    "stored record length {} exceeds the cap {}",
                     payload.len(),
-                    MAX_PAYLOAD_HARD_CAP
+                    stored_cap
                 ),
             ));
         }
@@ -354,8 +369,10 @@ pub(crate) fn segment_path(shard_dir: &Path, counter: u64) -> PathBuf {
 /// so `ShardWriter`'s rotate/seal lifecycle is backend-agnostic. The single
 /// vtable hop per write/fsync is negligible against the real syscall it guards.
 pub(crate) trait SegmentHandle: Send {
-    /// Append one record. Mirrors [`WabSegment::write_record`].
-    fn write_record(&mut self, payload: &[u8]) -> io::Result<()>;
+    /// Append one record's **stored** bytes — already compressed if the segment
+    /// is compressed. The codec lives in [`ShardWriter`], above this seam, so
+    /// the DST harness sees the same byte stream production does.
+    fn write_record(&mut self, stored: &[u8]) -> io::Result<()>;
     /// Sync the segment to stable storage. Mirrors [`WabSegment::fsync`].
     fn fsync(&self) -> io::Result<()>;
     /// True once the segment has reached the rotation threshold. Mirrors
@@ -372,8 +389,15 @@ pub(crate) trait SegmentHandle: Send {
 /// `Arc<dyn SegmentStore>` so the generic stays out of the public
 /// [`super::spawn`] signature.
 pub(crate) trait SegmentStore: Send + Sync {
-    /// Create a fresh active segment at `path` for `shard_id`.
-    fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>>;
+    /// Create a fresh active segment at `path` for `shard_id`, writing a header
+    /// that declares `compression`. The store owns the header, so it owns the
+    /// format version; the codec itself lives above this seam in `ShardWriter`.
+    fn create(
+        &self,
+        path: &Path,
+        shard_id: u16,
+        compression: Compression,
+    ) -> io::Result<Box<dyn SegmentHandle>>;
     /// Counter values of every segment file in `dir` — active (`.wab`), sealed
     /// (`.wab.sealed`), AND confirmed (`.wab.confirmed`). All lifecycle states
     /// must be counted so [`ShardWriter::scan_and_advance_counter`] advances past
@@ -388,8 +412,13 @@ pub(crate) trait SegmentStore: Send + Sync {
 pub(crate) struct FsSegmentStore;
 
 impl SegmentStore for FsSegmentStore {
-    fn create(&self, path: &Path, shard_id: u16) -> io::Result<Box<dyn SegmentHandle>> {
-        Ok(Box::new(WabSegment::create(path, shard_id)?))
+    fn create(
+        &self,
+        path: &Path,
+        shard_id: u16,
+        compression: Compression,
+    ) -> io::Result<Box<dyn SegmentHandle>> {
+        Ok(Box::new(WabSegment::create(path, shard_id, compression)?))
     }
 
     fn segment_counters(&self, dir: &Path) -> io::Result<Vec<u64>> {
@@ -442,6 +471,13 @@ pub(crate) struct ShardWriter {
     /// this field closes that gap so operators get a complete
     /// open → sealed → confirmed / quarantined transition count.
     metrics: Arc<Metrics>,
+    /// How records are stored on disk. Decides the header's format version, and
+    /// whether `write_record` compresses before delegating.
+    compression: Compression,
+    /// zstd level, only read when `compression` is `Zstd`. Never stored on
+    /// disk — zstd frames are self-describing for decompression — so it lives
+    /// here and never reaches `SegmentStore`.
+    compression_level: i32,
 }
 
 impl ShardWriter {
@@ -456,6 +492,8 @@ impl ShardWriter {
         segment_max_bytes: u64,
         metrics: Arc<Metrics>,
         store: Arc<dyn SegmentStore>,
+        compression: Compression,
+        compression_level: i32,
     ) -> Self {
         ShardWriter {
             shard_id,
@@ -465,6 +503,8 @@ impl ShardWriter {
             active: None,
             store,
             metrics,
+            compression,
+            compression_level,
         }
     }
 
@@ -495,18 +535,56 @@ impl ShardWriter {
     /// reader stops at the first invalid record — records written successfully
     /// before the failure remain drainable.
     pub(crate) fn write_record(&mut self, payload: &[u8]) -> io::Result<Option<PathBuf>> {
+        // The plaintext-empty check MUST happen here, above the codec: an empty
+        // payload compresses to a ~9-byte frame that writes and reads back
+        // cleanly, which would silently defeat the guard in WabSegment (a zero
+        // payload_len IS the end-of-records sentinel). Empty payloads are
+        // already rejected at ingest (NackReason::EmptyPayload); this is the
+        // WAB's own boundary check, and WabSegment keeps its copy as defence in
+        // depth for any caller that bypasses ShardWriter.
+        if payload.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty payload cannot be represented in a WAB segment",
+            ));
+        }
+
+        // Compress before the write so fewer bytes reach the media. A failure
+        // here returns before anything is written and before any accounting
+        // moves, so the segment stays clean and the producer gets a Nack. There
+        // is no per-record flag, so silently storing plaintext is not an option
+        // — and failing the ack is the correct outcome anyway.
+        let stored: Cow<'_, [u8]> = match self.compression {
+            Compression::None => Cow::Borrowed(payload),
+            Compression::Zstd => Cow::Owned(
+                zstd::bulk::compress(payload, self.compression_level).map_err(|e| {
+                    io::Error::other(format!("failed to compress a WAB record: {e}"))
+                })?,
+            ),
+        };
+
         self.ensure_open()?;
         if let Err(e) = self
             .active
             .as_mut()
             .expect("ensure_open guarantees Some")
-            .write_record(payload)
+            .write_record(&stored)
         {
             // The segment is poisoned (or its create() left it half-headered).
             // Drop it so the next write opens a fresh segment.
             self.active = None;
             return Err(e);
         }
+        // Ratio accounting, bumped only after a successful write so a failed
+        // record never inflates either side. `logical` is what the producer
+        // sent, `stored` is what reached the disk; equal when compression is off.
+        self.metrics
+            .wab_record_logical_bytes
+            .inc_by(payload.len() as u64);
+        self.metrics
+            .wab_record_stored_bytes
+            .inc_by(stored.len() as u64);
+
         let should_rotate = self
             .active
             .as_ref()
@@ -551,7 +629,7 @@ impl ShardWriter {
                 .next_counter
                 .checked_add(1)
                 .expect("segment counter overflow");
-            self.active = Some(self.store.create(&path, self.shard_id)?);
+            self.active = Some(self.store.create(&path, self.shard_id, self.compression)?);
             // Newly opened segment — bump the `open` state counter so the
             // open → sealed → confirmed/quarantined transition story is
             // observable end to end via `weir_wab_segments_total{state="..."}`.
@@ -641,7 +719,7 @@ mod tests {
         // leaves the existing bytes untouched.
         let existing = dir.join("seg_00000001.wab");
         fs::write(&existing, b"pre-existing").unwrap();
-        let err = match WabSegment::create(&existing, 0) {
+        let err = match WabSegment::create(&existing, 0, Compression::None) {
             Ok(_) => panic!("create over an existing file must fail (O_EXCL)"),
             Err(e) => e,
         };
@@ -653,7 +731,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let fresh = dir.join("seg_00000002.wab");
-            let _seg = WabSegment::create(&fresh, 0).unwrap();
+            let _seg = WabSegment::create(&fresh, 0, Compression::None).unwrap();
             let mode = fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "segment files must be private (0o600)");
         }
@@ -667,7 +745,7 @@ mod tests {
             let link = dir.join("seg_00000003.wab");
             std::os::unix::fs::symlink(&target, &link).unwrap();
             assert!(
-                WabSegment::create(&link, 0).is_err(),
+                WabSegment::create(&link, 0, Compression::None).is_err(),
                 "create must refuse a symlinked target path"
             );
             assert!(!target.exists(), "the symlink target must not be created");
@@ -680,7 +758,7 @@ mod tests {
     fn wab_segment_tracks_record_count() {
         let dir = tmp_dir("count");
         let path = dir.join("seg_00000001.wab");
-        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         assert_eq!(seg.record_count(), 0);
         seg.write_record(b"a").unwrap();
         seg.write_record(b"bb").unwrap();
@@ -693,7 +771,7 @@ mod tests {
     fn wab_segment_seals_and_renames() {
         let dir = tmp_dir("seal");
         let path = dir.join("seg_00000001.wab");
-        let seg = WabSegment::create(&path, 0).unwrap();
+        let seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         let sealed = seg.seal().unwrap();
         assert!(sealed.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
@@ -721,7 +799,7 @@ mod tests {
         // the ingest-layer NackReason::EmptyPayload check).
         let dir = tmp_dir("emptyrec");
         let path = dir.join("seg_00000001.wab");
-        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         let err = seg.write_record(b"").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         fs::remove_dir_all(dir).ok();
@@ -732,7 +810,7 @@ mod tests {
         const TEST_THRESHOLD: u64 = 1024;
         let dir = tmp_dir("rotate");
         let path = dir.join("seg_00000001.wab");
-        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         assert!(!seg.should_rotate(TEST_THRESHOLD));
         seg.bytes_written = TEST_THRESHOLD;
         assert!(seg.should_rotate(TEST_THRESHOLD));
@@ -760,7 +838,7 @@ mod tests {
         // variant).
         let dir = tmp_dir("poison_refuse");
         let path = dir.join("seg_00000001.wab");
-        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         seg.write_record(b"valid").unwrap();
         seg.poisoned = true;
         let err = seg
@@ -794,6 +872,8 @@ mod tests {
             1024 * 1024,
             metrics,
             Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
         );
 
         writer.write_record(b"first").unwrap();
@@ -855,7 +935,7 @@ mod tests {
         // the recovered, undrained sealed segment and loses those records.
         let dir = tmp_dir("scan_past_sealed");
         let active = segment_path(&dir, 1);
-        let mut seg = WabSegment::create(&active, 0).unwrap();
+        let mut seg = WabSegment::create(&active, 0, Compression::None).unwrap();
         seg.write_record(b"recovered-record").unwrap();
         let sealed = seg.seal().unwrap();
         assert!(
@@ -873,6 +953,8 @@ mod tests {
             1024 * 1024,
             metrics,
             Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
         );
         writer.scan_and_advance_counter().unwrap();
 
@@ -905,7 +987,7 @@ mod tests {
     fn seal_refuses_to_overwrite_an_existing_sealed_segment() {
         let dir = tmp_dir("seal_no_clobber");
         let active = segment_path(&dir, 1);
-        let mut seg = WabSegment::create(&active, 0).unwrap();
+        let mut seg = WabSegment::create(&active, 0, Compression::None).unwrap();
         seg.write_record(b"would-clobber").unwrap();
 
         // Pre-place the sealed target (as a recovered, undrained sealed segment).
@@ -935,8 +1017,15 @@ mod tests {
         let missing =
             std::env::temp_dir().join(format!("weir_g02_no_such_shard_dir_{}", std::process::id()));
         let _ = fs::remove_dir_all(&missing);
-        let mut writer =
-            ShardWriter::new_with_store(0, missing, 1024 * 1024, metrics, Arc::new(FsSegmentStore));
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            missing,
+            1024 * 1024,
+            metrics,
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
         let err = writer.scan_and_advance_counter().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
         assert_eq!(
@@ -949,7 +1038,7 @@ mod tests {
     fn wab_segment_rejects_oversized_payload() {
         let dir = tmp_dir("oversize");
         let path = dir.join("seg_00000001.wab");
-        let mut seg = WabSegment::create(&path, 0).unwrap();
+        let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         let too_large = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
         assert!(seg.write_record(&too_large).is_err());
         let _ = seg.seal();
@@ -974,6 +1063,8 @@ mod tests {
             32,
             Arc::clone(&metrics),
             Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
         );
 
         let open_counter = || -> u64 {
@@ -1006,5 +1097,183 @@ mod tests {
         );
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Compression (format v2) ───────────────────────────────────────────────
+
+    /// Reads a segment file's 24-byte header.
+    fn read_header(path: &Path) -> [u8; SEGMENT_HEADER_LEN] {
+        use std::io::Read;
+        let mut buf = [0u8; SEGMENT_HEADER_LEN];
+        std::fs::File::open(path)
+            .unwrap()
+            .read_exact(&mut buf)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn shard_writer_compresses_records_and_they_read_back() {
+        let dir = tmp_dir("shard_writer_zstd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::new(Metrics::new().0),
+            Arc::new(FsSegmentStore),
+            Compression::Zstd,
+            1,
+        );
+        // Highly compressible, so the stored form is unambiguously smaller.
+        let payload = vec![b'a'; 4096];
+        w.write_record(&payload).unwrap();
+        let sealed = w.seal_current().unwrap().expect("a sealed path");
+
+        let meta = weir_wab::format::parse_segment_header(&read_header(&sealed)).unwrap();
+        assert_eq!(meta.compression, Compression::Zstd);
+        assert_eq!(meta.format_version, weir_wab::format::FORMAT_VERSION_V2);
+
+        let got: Vec<_> = weir_wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref(), &payload[..], "plaintext must round-trip");
+
+        let on_disk = std::fs::metadata(&sealed).unwrap().len();
+        assert!(
+            on_disk < payload.len() as u64,
+            "4 KiB of 'a' must store smaller than 4 KiB, got {on_disk}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn shard_writer_without_compression_writes_a_v1_header() {
+        let dir = tmp_dir("shard_writer_v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::new(Metrics::new().0),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+        w.write_record(b"plain").unwrap();
+        let sealed = w.seal_current().unwrap().expect("a sealed path");
+
+        let header = read_header(&sealed);
+        assert_eq!(
+            header[4],
+            weir_wab::format::FORMAT_VERSION_V1,
+            "compression off must stay v1 so rollback to 1.x is a non-event"
+        );
+        assert_eq!(header[5], 0, "flags byte must be zero");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn empty_payload_is_rejected_before_the_codec() {
+        // Compressing an empty payload yields a ~9-byte frame that writes and
+        // reads back fine — silently defeating the sentinel-collision guard,
+        // since a zero payload_len IS the end-of-records sentinel. The check
+        // must therefore happen on the PLAINTEXT, above the codec.
+        let dir = tmp_dir("empty_before_codec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::new(Metrics::new().0),
+            Arc::new(FsSegmentStore),
+            Compression::Zstd,
+            1,
+        );
+        let err = w.write_record(b"").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // And nothing was written: no segment file should exist at all.
+        let created: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert!(
+            created.is_empty(),
+            "a rejected empty payload must not create a segment: {created:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn compression_ratio_counters_track_logical_and_stored_bytes() {
+        // A ratio you cannot see is a ratio you cannot tune. Assert both sides
+        // move, and that compression actually shrinks the stored side.
+        let dir = tmp_dir("ratio_counters");
+        std::fs::create_dir_all(&dir).unwrap();
+        let metrics = Arc::new(Metrics::new().0);
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::Zstd,
+            1,
+        );
+        let payload = vec![b'a'; 4096];
+        w.write_record(&payload).unwrap();
+
+        let logical = metrics.wab_record_logical_bytes.get();
+        let stored = metrics.wab_record_stored_bytes.get();
+        assert_eq!(logical, 4096, "logical must be what the producer sent");
+        assert!(stored > 0, "stored must be counted");
+        assert!(
+            stored < logical,
+            "4 KiB of 'a' must store smaller: logical={logical} stored={stored}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ratio_counters_are_equal_when_compression_is_off() {
+        let dir = tmp_dir("ratio_counters_off");
+        std::fs::create_dir_all(&dir).unwrap();
+        let metrics = Arc::new(Metrics::new().0);
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+        w.write_record(b"hello").unwrap();
+        assert_eq!(
+            metrics.wab_record_logical_bytes.get(),
+            metrics.wab_record_stored_bytes.get(),
+            "with compression off the two sides must be identical"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_rejected_record_moves_neither_counter() {
+        // An empty payload is refused above the codec; nothing should be counted.
+        let dir = tmp_dir("ratio_counters_rejected");
+        std::fs::create_dir_all(&dir).unwrap();
+        let metrics = Arc::new(Metrics::new().0);
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::Zstd,
+            1,
+        );
+        w.write_record(b"").unwrap_err();
+        assert_eq!(metrics.wab_record_logical_bytes.get(), 0);
+        assert_eq!(metrics.wab_record_stored_bytes.get(), 0);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

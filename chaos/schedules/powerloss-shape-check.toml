@@ -1,0 +1,54 @@
+# Does a SHORTER steady state still expose the full writeback window?
+#
+# Methodological validation, not a durability result. The 24h Durable run
+# wants an 8-15s steady state cut to 4-8s, because disk cost scales with
+# episode length while EXPOSURE does not: what a power loss can take is
+# bounded by writeback lag, so a long episode writes more ledger without
+# putting more at risk. Shortening therefore buys more kills per hour at less
+# disk — IF the premise holds.
+#
+# The 6h Buffered soak of 2026-08-28 (706 episodes, 8-15s steady) measured
+# that bound directly. Loss was UNIFORM between zero and a hard ceiling:
+#
+#   p25 31,870   p50 63,790   p75 93,122   max 126,782   (~1.76 s)
+#   mean 62,335 vs uniform's max/2 = 63,391   (1.7% off)
+#   stdev 36,178 vs uniform's max/sqrt(12) = 36,599   (1.2% off)
+#
+# A uniform distribution is what a kill landing at a random point in a
+# periodic writeback cycle produces, and its ceiling is one full cycle.
+#
+# SO THE CHECK IS THE CEILING, NOT THE MEAN. If 4-8s still reaches ~127k, the
+# episode outlives the writeback cycle and shortening cost nothing. If the
+# ceiling drops, episodes are now shorter than the cycle, the kill can no
+# longer land at its worst moment, and the shortening is quietly buying
+# cheaper disk by making the test weaker — which is the failure this schedule
+# exists to catch before 24h is spent on it.
+#
+# TIER "U" IS LOAD-BEARING. Only Buffered is permitted to lose anything, so
+# only Buffered can show the ceiling. Running this at tier "D" would produce
+# zero loss by contract and answer nothing at all.
+seed = 0x54A9E
+episodes = 40
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "U"
+min_acked_per_episode = 100
+min_delivered_per_episode = 1
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"

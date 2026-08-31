@@ -25,7 +25,8 @@ mkdir -p /path/to/wab && chmod 700 /path/to/wab
 ├── dead_letter/
 │   └── dl_00000001.wab.sealed      ← permanently-rejected records
 └── quarantine/
-    └── shard_00__seg_00000004.wab.sealed  ← corrupt segments moved here on recovery
+    ├── shard_00__seg_00000004.wab         ← mid-file-corrupt ACTIVE segment (crash recovery)
+    └── shard_01__seg_00000002.wab.sealed  ← corrupt SEALED segment (the drain, or a rejected .confirmed)
 ```
 
 Shard directories, the `dead_letter/` directory, and the `quarantine/` directory are created with mode `0o700`. Segment files (including `.confirmed` sidecars and dead-letter segments) are created with mode `0o600`. Permissions are set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode` — there is no post-creation `chmod`.
@@ -37,13 +38,15 @@ Shard directories, the `dead_letter/` directory, and the `quarantine/` directory
 Two subdirectories of the WAB root are **not** shards and are skipped by recovery's shard scan:
 
 - **`dead_letter/`** — records the sink **permanently** rejected. **"Permanent" means the sink returned a non-retryable rejection** (e.g. an HTTP sink replying 4xx other than 408/429) — *not* that the sink was unreachable. A **transient** failure (sink down/unreachable, 5xx, timeout, transport error) is **not** dead-lettered: the whole segment is retried and, once its retry budget is exhausted, left on disk as **stranded** (it stays in its shard dir as `seg_*.wab.sealed`, surfaces via `weir_drain_segments_stranded_total`, and auto-resumes when the sink recovers). So a recovery tool looking for un-delivered data after a sink *outage* should look at stranded sealed segments in the shard dirs, not `dead_letter/`. Files are named `dl_NNNNNNNN.wab.sealed` (zero-padded `u64` counter starting at 1), written by `DeadLetterWriter` (`crates/weir-server/src/drain/dead_letter.rs`). A crash mid-write can leave an orphan active partial `dl_NNNNNNNN.wab` (no `.sealed`), which recovery does not touch and the next `DeadLetterWriter::open` accounts for. Dead-letter files use the **same WEIR segment format** as the main WAB (header + records + sentinel + footer), so they are readable by the shared `weir-wab` `SegmentReader` with no separate parser — except their header carries the reserved shard id `0xFFFF` as a dead-letter marker. `weir-ctl dl requeue` reads them this way.
-- **`quarantine/`** — segments recovery could not safely recover (bad magic, unknown version, CRC mismatch). The original file is **renamed** here with a *flattened* name that prefixes the source shard directory and joins it with the original file name by a **double underscore**: `<shard_name>__<file_name>`, e.g. `shard_00__seg_00000004.wab.sealed` (see `quarantine()` in `crates/weir-server/src/wab/recovery.rs`). The shard prefix prevents same-named segments from different shards clobbering each other once flattened into one directory; an exact-name collision appends `.1`, `.2`, … Quarantined files retain whatever extension they had (`.wab` or `.wab.sealed`).
+- **`quarantine/`** — segments recovery could not safely recover (bad magic, unknown version, CRC mismatch), plus a `.confirmed` sidecar that fails its own verification during sealed-segment replay. The original file is **renamed** (mid-file-corrupt active segments are *copied*, so the valid prefix can still be truncated+sealed in place) here with a *flattened* name that prefixes the source shard directory and joins it with the original file name by a **double underscore**: `<shard_name>__<file_name>`, e.g. `shard_00__seg_00000004.wab.sealed` (see `quarantine()` / `copy_to_quarantine()` in `crates/weir-server/src/wab/recovery.rs`). The shard prefix prevents same-named segments from different shards clobbering each other once flattened into one directory; an exact-name collision appends `.1`, `.2`, … Quarantined files retain whatever extension they had: `.wab` when crash recovery preserved an **active** segment (the mid-file-corruption case — the one where acked records sit after the corruption), `.wab.sealed` when the drain (or a rejected `.confirmed` sidecar) preserved a **sealed** one, or `.wab.confirmed` for a sidecar that failed verification — the corresponding `.wab.sealed` copy sits beside it.
 
-  **Reading a quarantined segment.** A quarantined segment preserves the corrupt record **and** the (valid) records *after* it — the whole file is moved untouched, nothing is truncated. But `weir-wab`'s `SegmentReader` stops at the **first** CRC error by contract: it yields every good record up to the corruption, then a single `Err` (for a CRC mismatch, `io::ErrorKind::InvalidData`), and every subsequent call returns `None` (see the iteration contract in `crates/weir-wab/src/lib.rs`). So a plain `SegmentReader` recovers only the prefix before the bad record. To recover the records *after* the corruption you must **skip past the bad record's framing** — each record on disk is `[u32 len][u32 crc][len bytes payload]` (little-endian; see [Records](#records-variable-repeated)), so advance the file cursor by `4 + 4 + len` past the corrupt record and resume scanning for the next valid `[len][crc][payload]` — there is no helper for this today; it is manual byte-level work against the format above. A `SegmentReader::resync()` / skip-corrupt iteration mode is a candidate future API.
+  **Reading a quarantined segment.** A quarantined segment preserves the corrupt record **and** the (valid) records *after* it — the whole file is moved (or copied) untouched, nothing is truncated. `weir-wab`'s `SegmentReader` stops at the **first** CRC error by contract: it yields every good record up to the corruption, then a single `Err` (for a CRC mismatch, `io::ErrorKind::InvalidData`), and every subsequent call returns `None` (see the iteration contract in `crates/weir-wab/src/lib.rs`) — so a plain `SegmentReader` recovers only the prefix before the bad record, by design (recovery and the drain depend on that stop-at-first-error contract).
+
+  To reach the records *after* the corruption, use `weir_wab::RecoveryReader` instead — a separate, forensic iterator built for exactly this file. It continues past a corrupt record (resync is free: `SegmentReader::next` already reads the full payload before verifying the CRC, so a failure leaves the reader positioned at the next record's boundary with no seek needed) and never fabricates data: an implausible declared length, or a run of consecutive verification failures, ends iteration with `Desynced` rather than guessing. `weir-ctl quarantine list | inspect | requeue` is built on it and is the operator-facing way to do this — see [the quarantine recovery runbook](operations/quarantine-recovery.md) for the triage procedure, including how to read `RecoveryReader`'s "clean end" (every byte accounted for, *not* every record recovered) and why `requeue` re-sends the already-delivered prefix.
 
 ---
 
-## Segment file format (`FORMAT_VERSION = 1`)
+## Segment file format (versions 1 and 2)
 
 ### Header (24 bytes)
 
@@ -51,12 +54,71 @@ Two subdirectories of the WAB root are **not** shards and are skipped by recover
 Offset  Size  Field       Description
 ──────  ────  ──────────  ──────────────────────────────────────
  0       4    magic       b"WEIR"
- 4       1    version     FORMAT_VERSION (currently 1)
- 5       1    reserved    0x00
+ 4       1    version     1 or 2
+ 5       1    flags       v1: MUST be 0x00
+                          v2: bit 0 = ZSTD; bits 1-7 reserved, MUST be 0
  6       2    shard_id    u16 little-endian
  8       8    created_at  Unix timestamp, nanoseconds, i64 LE
 16       8    reserved    0x00 (padding to 24 bytes)
 ```
+
+### Format v2 — what changed, and what did not
+
+v2 differs from v1 in **one byte**. Byte `[5]`, reserved and zero-on-write since
+v1, is now a flags byte whose bit 0 means *every record in this segment is
+stored as a complete zstd frame*. The record framing, the end-of-records
+sentinel, the footer, and the `.confirmed` sidecar are **byte-for-byte
+identical** between the two versions.
+
+**The per-record CRC covers the STORED bytes** — the zstd frame, in a compressed
+segment — not the logical payload. That is deliberate and it is what keeps the
+change small: crash recovery's torn-tail scan, `verify_sealed_segment`'s
+whole-file CRC, and the footer's `record_count` / `data_bytes` cross-check all
+work without decompressing anything. Decompression happens in exactly one place,
+`SegmentReader::next`, after the CRC has already passed.
+
+The footer's `data_bytes` is likewise **stored** bytes, so it is the
+post-compression size in a v2 ZSTD segment. For logical byte totals, read the
+`weir_wab_record_logical_bytes_total` metric.
+
+### Which version gets written
+
+A segment is written as **v1 whenever compression is off**, and v2 only when it
+is on. With `wab_compression = "none"` — the default — a weir 2.0 daemon
+produces segments byte-identical to what 1.x wrote.
+
+That makes upgrade-then-rollback a non-event at the default setting. **Enabling
+compression is a one-way door:** a 1.x reader rejects a v2 header outright
+(`InvalidData`), which the drain treats as "preserve for retry" and recovery
+quarantines — the data is stranded and loud, never misread and silent — but it
+stays stranded until a 2.x daemon reads it.
+
+### Reader rules
+
+| Header | Behaviour |
+|---|---|
+| v1, `flags == 0` | Accept, no compression |
+| v1, `flags != 0` | **Reject** — v1 documented the byte as zero, so a set bit is corruption |
+| v2, only known flag bits | Accept |
+| v2, any unknown flag bit | **Reject** — written by a newer weir; reading it would misinterpret the records |
+| version 0, or > 2 | **Reject** — unknown format version |
+
+Rejecting an unknown flag bit rather than ignoring it is the point: a future
+weir that adds bit 1 (say, encryption) must not have its segments silently read
+as plaintext by this build.
+
+### Record size caps under compression
+
+A compressed record's **stored** length can legitimately exceed
+`MAX_PAYLOAD_HARD_CAP` (16 MiB), because zstd's worst case expands slightly.
+So a v2 ZSTD segment accepts stored lengths up to
+`compress_bound(MAX_PAYLOAD_HARD_CAP)` = `n + n/255 + 16`, while v1 keeps the
+original cap unchanged. The *plaintext* is still capped at 16 MiB, enforced on
+the decompression output — which doubles as the decompression-bomb guard, and is
+an exact bound rather than a guess because the real cap is known.
+
+Measured, on genuinely random 16 MiB input: the stored form was **394 bytes
+larger** than the input, against an allowance of 65,809 bytes.
 
 ### Records (variable, repeated)
 
@@ -82,7 +144,8 @@ A `payload_len` of `0` is the end-of-records sentinel (not a valid record).
 Offset  Size  Field         Description
 ──────  ────  ────────────  ──────────────────────────────────────
  0       8    record_count  u64 little-endian
- 8       8    data_bytes    u64 LE — total payload bytes (no overhead)
+ 8       8    data_bytes    u64 LE — total STORED payload bytes, post-compression,
+                            excluding per-record overhead (see below)
 16       4    file_crc32    CRC32 of all bytes before sentinel, u32 LE
 20       8    sealed_at     Unix timestamp, nanoseconds, i64 LE
 28       4    reserved      0x00

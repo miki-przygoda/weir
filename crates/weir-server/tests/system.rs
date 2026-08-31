@@ -92,14 +92,14 @@ fn read_wab_bytes(dir: &Path) -> Vec<u8> {
 fn smoke_single_push_ack() {
     let srv = weir_server!("smoke").start();
     let mut client = srv.client();
-    client.push(b"hello weir", Durability::Sync).unwrap();
+    client.push(b"hello weir", Durability::Durable).unwrap();
 }
 
 #[test]
 fn all_durability_tiers_behave_per_contract() {
     // Strengthened from `all_durability_tiers_acked`: the original test
     // only checked that each tier returned Ok, which would still pass
-    // if Sync silently skipped fsync or Buffered silently fsynced. This
+    // if Durable silently skipped fsync or Buffered silently fsynced. This
     // version reads the `weir_wab_fsync_duration_seconds_count`
     // histogram counter, which is incremented exactly once per fsync
     // syscall — a deterministic differential between the tiers.
@@ -133,39 +133,92 @@ fn all_durability_tiers_behave_per_contract() {
         fsync_after_buffered - fsync_before
     );
 
-    // Sync: every push forces fdatasync. Counter must climb by ≥ N.
+    // Durable: every push forces fdatasync, via the batch-boundary group
+    // fsync. Counter must climb by ≥ N.
     for i in 0..N_PER_TIER {
         client
-            .push(format!("sync-{i}").as_bytes(), Durability::Sync)
-            .expect("Sync push failed");
+            .push(format!("dur-{i}").as_bytes(), Durability::Durable)
+            .expect("Durable push failed");
     }
-    let fsync_after_sync = read_fsync_count();
+    let fsync_after_durable = read_fsync_count();
     assert!(
-        fsync_after_sync - fsync_after_buffered >= u64::from(N_PER_TIER),
-        "Sync tier produced only {} fsyncs for {N_PER_TIER} pushes — \
+        fsync_after_durable - fsync_after_buffered >= u64::from(N_PER_TIER),
+        "Durable tier produced only {} fsyncs for {N_PER_TIER} pushes — \
          expected ≥ {N_PER_TIER} (one per record)",
-        fsync_after_sync - fsync_after_buffered
+        fsync_after_durable - fsync_after_buffered
+    );
+}
+
+/// weir 1.3.1 is live on crates.io and its encoder emits the retired `0x02`
+/// (former `Batched`) durability byte for every Batched push. `0x02` is
+/// therefore a published wire contract, not an internal implementation
+/// detail: this release must keep accepting it from old producers forever.
+///
+/// `retired_batched_byte_decodes_but_never_round_trips` (weir-core) and the
+/// conformance vectors already prove the *decoder* still turns `0x02` into
+/// `Durable`, but that's unit-level coverage of `Durability::try_from`
+/// alone — it doesn't prove a live daemon, reading the byte off a real
+/// socket, actually proceeds to accept and ack the record rather than
+/// rejecting it on some other code path the unit test can't see. This test
+/// closes that gap end-to-end against the real binary.
+#[test]
+fn retired_batched_wire_byte_is_still_accepted_by_a_live_daemon() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream as RawStream,
+    };
+    use weir_core::{Envelope, HEADER_LEN, Header, MessageType};
+
+    let srv = weir_server!("retired_0x02").start();
+
+    // Build a normal Push frame (canonical durability byte 0x01), then
+    // hand-patch byte 6 — magic[0..4] + version[4] + message_type[5] +
+    // durability[6] — from 0x01 to the retired 0x02, and recompute the
+    // header CRC over bytes [0..12] so the daemon doesn't reject the frame
+    // as corrupt before it ever looks at the durability byte. Same
+    // patch-and-recompute pattern as
+    // `crates/weir-server/src/socket/connection.rs` (see e.g.
+    // `header_declaring` in its test module).
+    let mut frame = Envelope::new(
+        Header::new(MessageType::Push, Durability::Durable, 0),
+        b"retired-0x02".to_vec(),
+    )
+    .encode();
+    assert_eq!(frame[6], 0x01, "test assumes byte 6 is the durability byte");
+    frame[6] = 0x02;
+    let crc = crc32fast::hash(&frame[..12]);
+    frame[12..16].copy_from_slice(&crc.to_le_bytes());
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("raw connect");
+    stream.write_all(&frame).expect("write patched 0x02 frame");
+
+    let mut resp_header_buf = [0u8; HEADER_LEN];
+    stream
+        .read_exact(&mut resp_header_buf)
+        .expect("read response header");
+    let resp_header = Header::decode(&resp_header_buf).expect("decode response header");
+    let mut payload = vec![0u8; resp_header.payload_len() as usize];
+    if !payload.is_empty() {
+        stream
+            .read_exact(&mut payload)
+            .expect("read response payload");
+    }
+    let mut crc_buf = [0u8; 4];
+    stream.read_exact(&mut crc_buf).expect("read response crc");
+
+    assert_eq!(
+        resp_header.message_type(),
+        MessageType::Ack,
+        "a raw 0x02 (retired Batched) durability byte must still be accepted \
+         and acked by a live daemon — got {:?} instead",
+        resp_header.message_type()
     );
 
-    // Batched: group fdatasync per batch. Under *serial* push (each call
-    // waits for ack before the next) the batch only ever contains a single
-    // record, so the deadline timer fires once per record and Batched looks
-    // identical to Sync. The meaningful regression to catch here is
-    // "Batched silently skips fsync" — we'd see zero new fsyncs in that
-    // case. The records-per-fsync compression Batched provides under
-    // concurrent load is exercised by the `compression_ratio_*` load
-    // scenario, not by this test.
-    for i in 0..N_PER_TIER {
-        client
-            .push(format!("bat-{i}").as_bytes(), Durability::Batched)
-            .expect("Batched push failed");
-    }
-    thread::sleep(Duration::from_millis(150));
-    let fsync_after_batched = read_fsync_count();
-    assert!(
-        fsync_after_batched - fsync_after_sync >= 1,
-        "Batched tier produced 0 fsyncs over {N_PER_TIER} pushes — records were not durably flushed"
-    );
+    // The connection must still be healthy afterward: a daemon that
+    // mishandled the retired byte shouldn't have left anything poisoned.
+    srv.client()
+        .health_check()
+        .expect("server unresponsive after retired-0x02 push");
 }
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -196,7 +249,7 @@ fn concurrent_producers_all_acked() {
                 for i in 0..RECORDS_PER_THREAD {
                     let payload = format!("thread-{t:02}-record-{i:04}");
                     client
-                        .push(payload.as_bytes(), Durability::Batched)
+                        .push(payload.as_bytes(), Durability::Durable)
                         .unwrap_or_else(|e| panic!("thread {t} record {i}: {e}"));
                 }
             })
@@ -217,12 +270,12 @@ fn concurrent_producers_all_acked() {
     // (see send_ack call site in src/socket/connection.rs), so it's
     // synchronously consistent with what the client observed.
     let body = srv.scrape_metrics();
-    let acked = parse_metric(&body, "weir_records_ack_total{tier=\"batched\"}");
+    let acked = parse_metric(&body, "weir_records_ack_total{tier=\"durable\"}");
     let expected = (THREADS * RECORDS_PER_THREAD) as u64;
     assert_eq!(
         acked,
         expected,
-        "expected {expected} batched acks, got {acked} — \
+        "expected {expected} durable acks, got {acked} — \
          {} records appear to have been dropped silently",
         expected - acked
     );
@@ -280,7 +333,7 @@ fn records_written_to_wab_on_disk() {
 
     for i in 0..20u32 {
         client
-            .push(format!("wab-record-{i}").as_bytes(), Durability::Sync)
+            .push(format!("wab-record-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
 
@@ -307,7 +360,7 @@ fn idle_seal_drains_low_volume_segment_without_shutdown() {
         .extra_config("wab_segment_max_age_secs = 1")
         .start();
     let mut client = srv.client();
-    client.push(b"lonely-record", Durability::Batched).unwrap();
+    client.push(b"lonely-record", Durability::Durable).unwrap();
 
     let committed = || {
         parse_metric(
@@ -323,6 +376,192 @@ fn idle_seal_drains_low_volume_segment_without_shutdown() {
     assert!(
         committed() >= 1,
         "idle-seal should have sealed + drained the lone record (committed stayed 0)"
+    );
+}
+
+#[test]
+fn wab_compression_knob_reaches_the_segment_header() {
+    // End-to-end proof that the config value actually reaches the WAB writer,
+    // not merely that the field is plumbed through Config. Runs a real daemon
+    // with compression on, then reads the on-disk header byte itself.
+    let srv = weir_server!("compression_e2e")
+        .extra_config("wab_compression = \"zstd\"\nwab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    // Compressible payload so the ratio counters move in an obvious direction.
+    let payload = vec![b'a'; 4096];
+    client.push(&payload, Durability::Durable).unwrap();
+
+    // Find any segment file the daemon created and read its 24-byte header.
+    let header = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let found = find_first_segment_header(&srv.wab_dir);
+            if let Some(h) = found {
+                break h;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no WAB segment appeared under {}",
+                srv.wab_dir.display()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    assert_eq!(
+        header[4], 2,
+        "wab_compression = zstd must write format v2, got version {}",
+        header[4]
+    );
+    assert_eq!(header[5] & 0b0000_0001, 1, "the ZSTD flag bit must be set");
+
+    // And the ratio counters must show compression actually happened.
+    let body = srv.scrape_metrics();
+    let logical = parse_metric(&body, "weir_wab_record_logical_bytes_total");
+    let stored = parse_metric(&body, "weir_wab_record_stored_bytes_total");
+    assert!(logical >= 4096, "logical bytes not counted: {logical}");
+    assert!(
+        stored > 0 && stored < logical,
+        "4 KiB of 'a' must store smaller: logical={logical} stored={stored}"
+    );
+}
+
+#[test]
+fn wab_compression_off_writes_v1_segments() {
+    // The rollback guarantee: at the default setting a 2.0 daemon's segments are
+    // format v1, so a 1.x daemon can still read them.
+    let srv = weir_server!("compression_off_e2e")
+        .extra_config("wab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    client.push(b"plain-record", Durability::Durable).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let header = loop {
+        if let Some(h) = find_first_segment_header(&srv.wab_dir) {
+            break h;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no WAB segment appeared"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(header[4], 1, "default config must stay on format v1");
+    assert_eq!(header[5], 0, "flags byte must be zero in a v1 header");
+}
+
+/// Reads the 24-byte header of the first `.wab`/`.wab.sealed` file found under
+/// `wab_dir`, searching shard subdirectories.
+fn find_first_segment_header(wab_dir: &std::path::Path) -> Option<[u8; 24]> {
+    use std::io::Read;
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if name.ends_with(".wab") || name.ends_with(".wab.sealed") {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(wab_dir, &mut found);
+    found.sort();
+    for p in found {
+        let mut buf = [0u8; 24];
+        if let Ok(mut f) = std::fs::File::open(&p)
+            && f.read_exact(&mut buf).is_ok()
+        {
+            return Some(buf);
+        }
+    }
+    None
+}
+
+// ── WAB size cap ──────────────────────────────────────────────────────────────
+
+/// The whole justification for spending `NackReason::InternalError` on the WAB
+/// cap — rather than a new reason byte — is how a REAL client reacts to it:
+/// `is_recoverable()` is true for `InternalError` and false for an unknown byte,
+/// so a new byte would make every deployed producer tear down and reconnect
+/// exactly when the daemon is already under strain. Assert that reaction through
+/// an actual `WeirClient`, not just the byte the daemon puts on the wire
+/// (`connection::tests` covers the byte).
+///
+/// Needs a sink that FAILS: with the noop sink the drain deletes each segment as
+/// fast as it is sealed, so live WAB bytes never climb and the cap never trips.
+/// A sink pointed at a closed port yields a connect error, which the drain
+/// classifies as TRANSIENT — with `sink_max_retries = 0` the segment is stranded
+/// on disk (not dead-lettered, which would move its bytes out of the count), so
+/// the WAB grows monotonically.
+#[test]
+#[cfg(feature = "http-sink")]
+fn wab_cap_nack_is_recoverable_for_a_real_client() {
+    // Smallest legal segment size, and the tightest cap validation accepts above
+    // it, so a short burst crosses the cap. The cap must clear
+    // `shard_count * wab_segment_max_bytes` with room to resume (see
+    // `Config::from_layers`) — a cap equal to one segment is refused precisely
+    // because it can never be released.
+    //
+    // `wab_segment_max_age_secs = 1` is load-bearing, not decoration: with a
+    // single shard the active segment holds up to 4096 bytes that only seal on a
+    // write crossing the threshold, and idle-sealing them is what lets sealed
+    // (stranded) segments accumulate toward the cap at 1 KiB per push.
+    let srv = weir_server!("cap_recoverable")
+        .extra_config(
+            "wab_segment_max_bytes = 4096\n\
+             wab_max_bytes = 8192\n\
+             wab_segment_max_age_secs = 1\n\
+             sink_type = \"http\"\n\
+             sink_max_retries = 0",
+        )
+        // Port 1 is privileged and never bound by an unprivileged process, so
+        // every drain attempt gets connection-refused immediately.
+        .env("WEIR_SINK_URL", "http://127.0.0.1:1/sink")
+        .start();
+    let mut client = srv.client();
+
+    // The value the cap is checked against is refreshed by a 5 s gauge task, so
+    // the cap cannot trip on the first burst however large it is — keep pushing
+    // across a couple of refresh intervals. The point is not the trip count; it
+    // is what the client reports when the Nack finally arrives.
+    let payload = vec![b'x'; 1024];
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut nack = None;
+    while Instant::now() < deadline {
+        match client.push(&payload, Durability::Durable) {
+            Ok(()) => thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                nack = Some(e);
+                break;
+            }
+        }
+    }
+
+    let err = nack.expect("expected the WAB cap to trip while the sink was down");
+    assert!(
+        err.is_recoverable(),
+        "a cap Nack must be recoverable, got {err:?}"
+    );
+    assert!(!client.is_poisoned(), "the connection must still be usable");
+    // ...and it must be the CAP that rejected, not queue saturation or a wedged
+    // flusher — those share the InternalError byte, which is exactly why the
+    // counter exists.
+    assert!(
+        parse_metric(&srv.scrape_metrics(), "weir_wab_cap_rejections") >= 1,
+        "the rejection must be attributable to the cap"
     );
 }
 
@@ -375,9 +614,13 @@ fn metrics_all_families_registered() {
         // WAB
         "weir_wab_segments",
         "weir_wab_bytes_on_disk",
+        "weir_quarantine_bytes_on_disk",
+        "weir_wab_record_logical_bytes",
+        "weir_wab_record_stored_bytes",
         "weir_wab_fsync_duration_seconds",
         "weir_wab_flusher_panics",
         "weir_wab_fsync_failures",
+        "weir_wab_cap_rejections",
         // Sink / drain
         "weir_sink_commit_duration_seconds",
         "weir_sink_commit_records",
@@ -387,6 +630,7 @@ fn metrics_all_families_registered() {
         // Recovery
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
+        "weir_recovery_segments_failed",
         "weir_recovery_quarantine_copy_failed",
         "weir_wab_unexpected_mode",
         // Dead letter
@@ -453,6 +697,12 @@ fn drain_state_shows_draining_and_not_blocked() {
         body.contains("weir_drain_state{state=\"blocked_dead_letter_full\"} 0"),
         "blocked_dead_letter_full should be 0 on startup"
     );
+    // The terminal state is only set once the drain supervisor exits, so a
+    // running daemon must read 0 — a 1 here would mean delivery has stopped.
+    assert!(
+        body.contains("weir_drain_state{state=\"stopped\"} 0"),
+        "stopped should be 0 while the daemon is running"
+    );
 }
 
 #[test]
@@ -486,7 +736,9 @@ fn server_shuts_down_cleanly_on_sigterm() {
 
     let mut srv = weir_server!("shutdown").start();
     let mut client = srv.client();
-    client.push(b"before-shutdown", Durability::Sync).unwrap();
+    client
+        .push(b"before-shutdown", Durability::Durable)
+        .unwrap();
     drop(client);
 
     let elapsed = srv.sigterm();
@@ -553,7 +805,7 @@ fn empty_payload_rejected_locally_by_client() {
     // below and by connection::tests::empty_payload_rejected_at_ingest.
     let srv = weir_server!("empty_payload_client").start();
     let mut client = srv.client();
-    let err = client.push(b"", Durability::Sync).unwrap_err();
+    let err = client.push(b"", Durability::Durable).unwrap_err();
     assert!(
         matches!(err, ClientError::EmptyPayload),
         "expected local ClientError::EmptyPayload, got {err:?}"
@@ -584,7 +836,7 @@ fn empty_payload_rejected_by_daemon_for_raw_frame() {
     // zero length right after the header, before reading any body — so writing
     // just the 16-byte header is enough to draw the Nack.
     let frame = Envelope::new(
-        Header::new(MessageType::Push, Durability::Sync, 0),
+        Header::new(MessageType::Push, Durability::Durable, 0),
         Vec::new(),
     )
     .encode();
@@ -621,7 +873,7 @@ fn arbitrary_binary_payload_accepted() {
     let srv = weir_server!("binary_payload").start();
     let mut client = srv.client();
     let payload: Vec<u8> = (0u8..=255).collect();
-    client.push(&payload, Durability::Sync).unwrap();
+    client.push(&payload, Durability::Durable).unwrap();
 }
 
 #[test]
@@ -633,14 +885,13 @@ fn payload_size_boundary_enforced() {
 
     let srv = weir_server!("payload_boundary").start();
 
-    // Exactly at the cap: must succeed. Uses Batched so we don't wait for
-    // a 16 MiB fsync — the property under test is the size acceptance
-    // check, not durability.
+    // Exactly at the cap: must succeed. Uses Durable — the property under
+    // test is the size acceptance check, not durability.
     {
         let mut client = srv.client();
         let payload = vec![0xAAu8; MAX_PAYLOAD_HARD_CAP];
         client
-            .push(&payload, Durability::Batched)
+            .push(&payload, Durability::Durable)
             .expect("MAX_PAYLOAD_HARD_CAP-sized push should be accepted");
     }
 
@@ -668,7 +919,7 @@ fn payload_size_boundary_enforced() {
         // body bytes.
         let oversize = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
         let frame = Envelope::new(
-            Header::new(MessageType::Push, Durability::Batched, 0),
+            Header::new(MessageType::Push, Durability::Durable, 0),
             oversize,
         )
         .encode();
@@ -760,7 +1011,7 @@ fn mixed_durability_under_concurrent_load() {
     let srv = weir_server!("mixed_load").start();
     let socket_path = srv.socket_path.clone();
 
-    let tiers = [Durability::Sync, Durability::Batched, Durability::Buffered];
+    let tiers = [Durability::Durable, Durability::Buffered];
     let handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let path = socket_path.clone();
@@ -782,21 +1033,20 @@ fn mixed_durability_under_concurrent_load() {
     }
 
     // Strengthened: assert each tier's ack counter matches the records
-    // pushed for that tier. With THREADS=6 and tiers cycling 3-wide,
-    // threads 0,3 push Sync (2 × RECORDS), threads 1,4 push Batched
-    // (2 × RECORDS), threads 2,5 push Buffered (2 × RECORDS).
+    // pushed for that tier. With THREADS=6 and tiers cycling 2-wide,
+    // threads 0,2,4 push Durable (3 × RECORDS), threads 1,3,5 push
+    // Buffered (3 × RECORDS).
     //
     // The thing this catches that the original test couldn't: a buggy
     // tier-dispatch table that silently re-routes (e.g. all Buffered
-    // counted as Sync) or drops one tier under contention. The original
+    // counted as Durable) or drops one tier under contention. The original
     // panic-on-Err pattern would still pass under such a bug because
     // the client only sees Ack/Nack, not which tier the server thinks
     // it was.
     let per_tier_expected = (THREADS / tiers.len() * RECORDS) as u64;
     let body = srv.scrape_metrics();
     for (label, _tier) in [
-        ("sync", Durability::Sync),
-        ("batched", Durability::Batched),
+        ("durable", Durability::Durable),
         ("buffered", Durability::Buffered),
     ] {
         let acked = parse_metric(
@@ -822,7 +1072,7 @@ fn server_restarts_after_sigkill() {
 
     let mut srv = weir_server!("crash_restart").start();
     srv.client()
-        .push(b"before-crash", Durability::Sync)
+        .push(b"before-crash", Durability::Durable)
         .unwrap();
 
     srv.kill_ungracefully();
@@ -843,7 +1093,7 @@ fn server_restarts_after_sigkill() {
     );
 
     srv.client()
-        .push(b"after-restart", Durability::Sync)
+        .push(b"after-restart", Durability::Durable)
         .unwrap();
 }
 
@@ -860,7 +1110,7 @@ fn wab_data_preserved_across_crash_restart() {
     let mut acked: u32 = 0;
     for i in 0..N {
         if client
-            .push(format!("crash-rec-{i}").as_bytes(), Durability::Sync)
+            .push(format!("crash-rec-{i}").as_bytes(), Durability::Durable)
             .is_ok()
         {
             acked += 1;
@@ -917,7 +1167,7 @@ fn acked_records_delivered_to_sink_and_confirmed_after_crash_restart() {
     let mut acked = 0u32;
     for i in 0..N {
         if client
-            .push(format!("c2s-{i}").as_bytes(), Durability::Sync)
+            .push(format!("c2s-{i}").as_bytes(), Durability::Durable)
             .is_ok()
         {
             acked += 1;
@@ -1068,7 +1318,7 @@ fn shard_directories_created_on_disk() {
     let srv = weir_server!("shard_dirs").shard_count(3).start();
     let mut client = srv.client();
     client
-        .push(b"trigger-shard-creation", Durability::Sync)
+        .push(b"trigger-shard-creation", Durability::Durable)
         .unwrap();
     thread::sleep(Duration::from_millis(100));
 
@@ -1112,7 +1362,7 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
                     .unwrap_or_else(|e| panic!("thread {t}: connect: {e}"));
                 for i in 0..RECORDS_PER_THREAD {
                     client
-                        .push(format!("t{t}-r{i}").as_bytes(), Durability::Sync)
+                        .push(format!("t{t}-r{i}").as_bytes(), Durability::Durable)
                         .unwrap_or_else(|e| panic!("thread {t} record {i}: {e}"));
                 }
             })
@@ -1144,9 +1394,9 @@ fn concurrent_producers_all_acked_with_multiple_shards() {
 
 // ── Graceful shutdown under load ──────────────────────────────────────────────
 
-/// Verifies that SIGTERM under concurrent Sync load produces no silent drops.
+/// Verifies that SIGTERM under concurrent Durable load produces no silent drops.
 ///
-/// Every push that returned `Ok` must be on disk (Sync durability guarantee).
+/// Every push that returned `Ok` must be on disk (the Durable tier's guarantee).
 /// Every push that did not complete must surface as `ClientError::Io` so the
 /// producer knows it needs to retry — not a silent half-write or a panic.
 #[test]
@@ -1173,7 +1423,7 @@ fn graceful_shutdown_under_load() {
                     return; // server already gone
                 };
                 loop {
-                    match client.push(b"shutdown-load", Durability::Sync) {
+                    match client.push(b"shutdown-load", Durability::Durable) {
                         Ok(()) => {
                             ok.fetch_add(1, Ordering::Relaxed);
                         }
@@ -1219,7 +1469,7 @@ fn graceful_shutdown_under_load() {
          producers should only see Ok or Io"
     );
 
-    // Every Ok means a Sync-flushed record. The WAB must have bytes.
+    // Every Ok means a Durable-flushed record. The WAB must have bytes.
     assert!(
         oks > 0,
         "expected successful pushes before SIGTERM; got 0 — \
@@ -1227,7 +1477,7 @@ fn graceful_shutdown_under_load() {
     );
     assert!(
         wab_bytes > 0,
-        "WAB has 0 bytes on disk after {oks} successful Sync pushes — \
+        "WAB has 0 bytes on disk after {oks} successful Durable pushes — \
          possible silent data loss"
     );
 
@@ -1323,12 +1573,12 @@ fn stalled_client_does_not_block_other_connections() {
     // Let the stall thread connect and send its frame before we proceed.
     thread::sleep(Duration::from_millis(100));
 
-    // Concurrent client: 50 Sync pushes while the stalled connection is held.
+    // Concurrent client: 50 Durable pushes while the stalled connection is held.
     let mut client = srv.client();
     let t0 = Instant::now();
     for i in 0..CONCURRENT_RECORDS {
         client
-            .push(format!("concurrent-{i}").as_bytes(), Durability::Sync)
+            .push(format!("concurrent-{i}").as_bytes(), Durability::Durable)
             .unwrap_or_else(|e| panic!("concurrent push {i} failed: {e}"));
     }
     let elapsed = t0.elapsed();
@@ -1379,7 +1629,7 @@ fn partial_frame_does_not_corrupt_next_connection() {
     // A fresh connection must work normally — the partial frame must not have
     // left the server's read state in a corrupt position.
     srv.client()
-        .push(b"after-partial-frame", Durability::Sync)
+        .push(b"after-partial-frame", Durability::Durable)
         .expect("push failed after partial frame injection");
 
     srv.client()
@@ -1417,7 +1667,7 @@ fn efbig_returns_nack_not_crash() {
     let mut client = srv.client();
 
     // With RLIMIT_FSIZE=0 the first WAB segment header write fails immediately.
-    let result = client.push(b"should-nack", Durability::Sync);
+    let result = client.push(b"should-nack", Durability::Durable);
     assert!(
         matches!(result, Err(ClientError::Nack(NackReason::InternalError))),
         "expected Nack(InternalError) from EFBIG-throttled server, got {result:?}"
@@ -1447,7 +1697,7 @@ fn efbig_returns_nack_not_crash() {
 /// ```
 ///
 /// The 64 KiB tmpfs is small enough that the first WAB segment header
-/// (16 KiB pre-allocated) plus a single Sync record fills it; subsequent
+/// (16 KiB pre-allocated) plus a single Durable record fills it; subsequent
 /// pushes must Nack rather than panic.
 #[test]
 #[ignore = "requires WEIR_TEST_ENOSPC_DIR pointing at a small pre-mounted tmpfs (see test docstring)"]
@@ -1483,7 +1733,7 @@ fn enospc_returns_nack_not_crash() {
     let mut saw_nack = false;
     for i in 0..200u32 {
         let payload = vec![0xAAu8; 1024]; // 1 KiB; tmpfs holds ~64.
-        match client.push(&payload, Durability::Sync) {
+        match client.push(&payload, Durability::Durable) {
             Ok(()) => continue,
             Err(ClientError::Nack(NackReason::InternalError)) => {
                 saw_nack = true;
@@ -1508,10 +1758,10 @@ fn enospc_returns_nack_not_crash() {
 
 // ── WAB data integrity after crash ────────────────────────────────────────────
 
-/// Every Sync push that returned `Ok` must be present on disk byte-for-byte
+/// Every Durable push that returned `Ok` must be present on disk byte-for-byte
 /// after the server is killed with SIGKILL.
 ///
-/// This tests the "Sync durability" contract at the byte level: if the client
+/// This tests the Durable-tier contract at the byte level: if the client
 /// got an `Ok`, the payload must be in the WAB file (the fsync happened before
 /// the ack was sent).
 #[test]
@@ -1524,7 +1774,7 @@ fn wab_data_integrity_after_crash() {
     let mut acked: Vec<Vec<u8>> = Vec::new();
     for i in 0..N {
         let payload = format!("integrity-{i:05}").into_bytes();
-        match client.push(&payload, Durability::Sync) {
+        match client.push(&payload, Durability::Durable) {
             Ok(()) => acked.push(payload),
             Err(_) => break, // server died mid-push
         }
@@ -1538,7 +1788,7 @@ fn wab_data_integrity_after_crash() {
     let wab_bytes = read_wab_bytes(&srv.wab_dir);
     assert!(
         !wab_bytes.is_empty(),
-        "WAB directory empty after {} acked Sync pushes",
+        "WAB directory empty after {} acked Durable pushes",
         acked.len()
     );
 
@@ -1570,7 +1820,7 @@ fn socket_takeover_does_not_corrupt_wab_data() {
 
     for i in 0..N {
         client
-            .push(format!("srv-a-{i}").as_bytes(), Durability::Sync)
+            .push(format!("srv-a-{i}").as_bytes(), Durability::Durable)
             .expect("push to server A failed");
     }
 
@@ -1708,30 +1958,30 @@ fn fd_limit_exhaustion_does_not_crash_server() {
         .health_check()
         .expect("server crashed or hung under fd pressure");
 
-    // A normal Sync push must succeed after the fd pressure is relieved.
+    // A normal Durable push must succeed after the fd pressure is relieved.
     // This is the strongest portable verification that the daemon survives
     // fd-budget exhaustion: end-to-end producer → ack works again.
     srv.client()
-        .push(b"after-fd-flood", Durability::Sync)
+        .push(b"after-fd-flood", Durability::Durable)
         .expect("push failed after fd-limit flood");
 }
 
 // ── Metrics accuracy ──────────────────────────────────────────────────────────
 
 #[test]
-fn records_accepted_counter_increments_after_sync_pushes() {
+fn records_accepted_counter_increments_after_durable_pushes() {
     const N: u32 = 10;
 
     let srv = weir_server!("metrics_accepted").start();
     let mut client = srv.client();
     for i in 0..N {
         client
-            .push(format!("acc-{i}").as_bytes(), Durability::Sync)
+            .push(format!("acc-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
 
     let body = srv.scrape_metrics();
-    let expected = format!("weir_records_accepted_total{{tier=\"sync\"}} {N}");
+    let expected = format!("weir_records_accepted_total{{tier=\"durable\"}} {N}");
     assert!(
         body.contains(&expected),
         "expected '{expected}' in metrics; body:\n{body:.800}"
@@ -1739,19 +1989,19 @@ fn records_accepted_counter_increments_after_sync_pushes() {
 }
 
 #[test]
-fn records_ack_counter_increments_after_sync_pushes() {
+fn records_ack_counter_increments_after_durable_pushes() {
     const N: u32 = 7;
 
     let srv = weir_server!("metrics_ack").start();
     let mut client = srv.client();
     for i in 0..N {
         client
-            .push(format!("ack-{i}").as_bytes(), Durability::Sync)
+            .push(format!("ack-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
 
     let body = srv.scrape_metrics();
-    let expected = format!("weir_records_ack_total{{tier=\"sync\"}} {N}");
+    let expected = format!("weir_records_ack_total{{tier=\"durable\"}} {N}");
     assert!(
         body.contains(&expected),
         "expected '{expected}' in metrics; body:\n{body:.800}"
@@ -1776,7 +2026,7 @@ fn per_shard_records_appear_in_submission_order() {
 
     for i in 0..N {
         client
-            .push(format!("order-{i:05}").as_bytes(), Durability::Sync)
+            .push(format!("order-{i:05}").as_bytes(), Durability::Durable)
             .expect("push failed");
     }
 
@@ -1839,7 +2089,7 @@ fn concurrent_producers_to_same_shard_preserve_per_producer_order() {
                 for seq in 0..N_RECORDS {
                     let payload = format!("p{producer_id:02}-s{seq:05}").into_bytes();
                     client
-                        .push(&payload, Durability::Sync)
+                        .push(&payload, Durability::Durable)
                         .unwrap_or_else(|e| panic!("push p{producer_id} s{seq}: {e:?}"));
                 }
             })
@@ -1883,7 +2133,7 @@ fn concurrent_producers_to_same_shard_preserve_per_producer_order() {
 
 // ── Batch deadline timer accuracy ─────────────────────────────────────────────
 
-/// With `batch_deadline_ms = 20`, Sync-push latency must stay bounded: the
+/// With `batch_deadline_ms = 20`, Durable-push latency must stay bounded: the
 /// median within 2× the deadline and the p95 within 5×. A regression that
 /// starves the batch timer (e.g. a spinning accept loop) biases the common path
 /// — so the median is the primary guard — and pushes a large fraction of samples
@@ -1902,44 +2152,67 @@ fn batch_deadline_timer_keeps_latency_bounded() {
     // pauses) don't flake the test. The starvation regressions this catches
     // are order-of-magnitude, not 10% drift.
     const TAIL_CEILING: Duration = Duration::from_millis(DEADLINE_MS * 5); // 100 ms
+    // Attempts before the test fails. NEITHER CEILING IS RELAXED by this — a
+    // genuinely starved timer misses them on every attempt, because starvation
+    // is a property of the daemon and persists across sampling rounds. What a
+    // retry removes is the one thing a single round cannot distinguish from a
+    // regression: a transient scheduling window on a shared runner.
+    //
+    // This test has now flaked twice on GitHub's 2-vCPU runners. The first fix
+    // (e58f91c) moved the tail guard from per-sample to p95 — the right
+    // direction, and not sufficient: at SAMPLES = 100 the p95 is sorted[94], so
+    // only five samples sit above it and one burst of six slow pushes carries
+    // it over. The observed failure was 127.97 ms against a 100 ms ceiling —
+    // 28% over, nowhere near the order-of-magnitude signal the bound exists to
+    // catch, and the median passed in the same run.
+    //
+    // Raising the ceiling instead would have been the wrong repair: it buys
+    // green runs by weakening the assertion against real regressions too, and
+    // this test's whole value is that a starved batch timer cannot slip past it.
+    const ATTEMPTS: usize = 3;
 
     let srv = weir_server!("deadline_accuracy").start();
     let mut client = srv.client();
-    let mut latencies: Vec<Duration> = Vec::with_capacity(SAMPLES);
 
-    for i in 0..SAMPLES {
-        let t0 = Instant::now();
-        client
-            .push(format!("timer-{i}").as_bytes(), Durability::Sync)
-            .expect("push failed");
-        latencies.push(t0.elapsed());
+    // (median, p95) for one sampling round.
+    let mut sample_round = || -> (Duration, Duration) {
+        let mut latencies: Vec<Duration> = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES {
+            let t0 = Instant::now();
+            client
+                .push(format!("timer-{i}").as_bytes(), Durability::Durable)
+                .expect("push failed");
+            latencies.push(t0.elapsed());
+        }
+        latencies.sort();
+        // The middle of the distribution is where the batch timer does its job;
+        // a starvation regression biases the common path. The p95 — NOT every
+        // sample — guards the tail: a real regression pushes a large fraction of
+        // pushes over the bound, while a per-sample check trips on one hiccup.
+        (latencies[SAMPLES / 2], latencies[(SAMPLES * 95) / 100 - 1])
+    };
+
+    let mut rounds: Vec<(Duration, Duration)> = Vec::with_capacity(ATTEMPTS);
+    for _ in 0..ATTEMPTS {
+        let (median, p95) = sample_round();
+        if median <= MEDIAN_CEILING && p95 <= TAIL_CEILING {
+            return;
+        }
+        rounds.push((median, p95));
     }
 
-    let mut sorted = latencies.clone();
-    sorted.sort();
-
-    // The middle of the distribution must be tight — that is where the batch
-    // timer does its job. A starvation regression biases the common path, so the
-    // median is the primary guard, and (unlike a per-sample check) a few tail
-    // outliers cannot fool it.
-    let median = sorted[SAMPLES / 2];
-    assert!(
-        median <= MEDIAN_CEILING,
-        "median latency {median:?} exceeded 2 × batch_deadline_ms ({MEDIAN_CEILING:?}) — \
-         the batch timer is being starved on the common path"
-    );
-
-    // Tail guard at the p95 — NOT every sample. A per-sample assertion is too
-    // brittle: a single scheduling hiccup on a loaded shared CI runner trips it
-    // (it did, on a busy post-merge runner). A real starvation regression pushes a
-    // large fraction of pushes over the bound (and biases the median above), so a
-    // p95 still catches it while tolerating the handful of jitter outliers a
-    // shared runner produces.
-    let p95 = sorted[(SAMPLES * 95) / 100 - 1]; // sorted[94] for SAMPLES = 100
-    assert!(
-        p95 <= TAIL_CEILING,
-        "p95 latency {p95:?} exceeded 5 × batch_deadline_ms ({TAIL_CEILING:?}) — \
-         more than 5% of pushes are slow; the batch timer is being starved"
+    // Report the BEST round — the one closest to passing — so the failure
+    // describes the daemon's actual behaviour rather than whichever round
+    // happened to be noisiest.
+    let (median, p95) = rounds
+        .iter()
+        .min_by_key(|(median, p95)| (*median, *p95))
+        .copied()
+        .expect("ATTEMPTS >= 1");
+    panic!(
+        "batch timer starved across all {ATTEMPTS} rounds of {SAMPLES} pushes. \
+         Best round: median {median:?} (ceiling {MEDIAN_CEILING:?}), \
+         p95 {p95:?} (ceiling {TAIL_CEILING:?}). All rounds: {rounds:?}"
     );
 }
 
@@ -1966,15 +2239,15 @@ fn metrics_internally_consistent_per_session() {
             client
                 .push(
                     format!("round-{round}-rec-{i}").as_bytes(),
-                    Durability::Sync,
+                    Durability::Durable,
                 )
                 .unwrap_or_else(|e| panic!("push failed (round {round}, rec {i}): {e}"));
         }
 
         let body = srv.scrape_metrics();
 
-        let accepted = parse_metric(&body, "weir_records_accepted_total{tier=\"sync\"}");
-        let acked = parse_metric(&body, "weir_records_ack_total{tier=\"sync\"}");
+        let accepted = parse_metric(&body, "weir_records_accepted_total{tier=\"durable\"}");
+        let acked = parse_metric(&body, "weir_records_ack_total{tier=\"durable\"}");
 
         assert!(
             accepted <= u64::from(PUSHES_PER_ROUND),
@@ -2005,14 +2278,14 @@ fn metrics_reset_to_zero_after_restart() {
     let mut client = srv.client();
     for i in 0..5u32 {
         client
-            .push(format!("pre-restart-{i}").as_bytes(), Durability::Sync)
+            .push(format!("pre-restart-{i}").as_bytes(), Durability::Durable)
             .unwrap();
     }
     drop(client);
 
     let before = srv.scrape_metrics();
-    let accepted_before = parse_metric(&before, "weir_records_accepted_total{tier=\"sync\"}");
-    let acked_before = parse_metric(&before, "weir_records_ack_total{tier=\"sync\"}");
+    let accepted_before = parse_metric(&before, "weir_records_accepted_total{tier=\"durable\"}");
+    let acked_before = parse_metric(&before, "weir_records_ack_total{tier=\"durable\"}");
     assert!(
         accepted_before >= 5 && acked_before >= 5,
         "expected counters to be ≥5 before restart (accepted={accepted_before}, acked={acked_before})",
@@ -2022,8 +2295,8 @@ fn metrics_reset_to_zero_after_restart() {
 
     // Immediately after restart, before any new pushes.
     let after = srv.scrape_metrics();
-    let accepted_after = parse_metric(&after, "weir_records_accepted_total{tier=\"sync\"}");
-    let acked_after = parse_metric(&after, "weir_records_ack_total{tier=\"sync\"}");
+    let accepted_after = parse_metric(&after, "weir_records_accepted_total{tier=\"durable\"}");
+    let acked_after = parse_metric(&after, "weir_records_ack_total{tier=\"durable\"}");
     assert_eq!(
         accepted_after, 0,
         "records_accepted_total should reset to 0 after restart, got {accepted_after}"
@@ -2039,7 +2312,7 @@ fn metrics_reset_to_zero_after_restart() {
 /// the audit flagged: the metric exists but no test asserted it advances.
 ///
 /// Procedure:
-/// 1. Push N Sync records — guaranteed durable in the active WAB segment.
+/// 1. Push N Durable records — guaranteed durable in the active WAB segment.
 /// 2. SIGKILL the server (active segment left as `.wab`, no footer).
 /// 3. Restart — recovery should seal the active segment and replay it.
 /// 4. Scrape metrics; assert `weir_recovery_records_replayed_total >= N`.
@@ -2051,7 +2324,7 @@ fn recovery_replays_records_after_crash() {
     let mut client = srv.client();
     for i in 0..N {
         client
-            .push(format!("recover-{i:05}").as_bytes(), Durability::Sync)
+            .push(format!("recover-{i:05}").as_bytes(), Durability::Durable)
             .unwrap();
     }
     drop(client);
@@ -2074,6 +2347,287 @@ fn recovery_replays_records_after_crash() {
             .filter(|l| l.starts_with("weir_recovery") || l.starts_with("weir_wab_segments"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+// ── Quarantine requeue (end-to-end) ─────────────────────────────────────────
+
+/// Locates the `weir-ctl` binary, (re)building it via `cargo build` so it is
+/// never stale.
+///
+/// `weir-ctl` is a separate crate from `weir-server`, so
+/// `CARGO_BIN_EXE_weir-server` — which Cargo sets only for the CURRENT
+/// package's own `[[bin]]` targets — cannot name it directly (this is why
+/// `weir-testkit`'s harness takes that env var as an explicit parameter rather
+/// than reading it itself: it lives in a third crate and has no access to
+/// either). Binary artifact dependencies (`artifact = "bin"` in
+/// `[dev-dependencies]`) would let Cargo wire this up declaratively, but they
+/// require `-Z bindeps`, confirmed still nightly-only against this
+/// workspace's toolchain (`cargo check` on a scratch manifest using it fails
+/// with "`artifact = …` requires `-Z bindeps`") — not an option for the
+/// stable gate this gate runs under.
+///
+/// Both binaries land in the SAME workspace `target/<profile>/` directory
+/// regardless of which package built them, so the sibling path is derived
+/// from `CARGO_BIN_EXE_weir-server` and rebuilt (a fast no-op via cargo's own
+/// staleness check when nothing changed) every time this is called — this
+/// test does not silently depend on the documented gate's ordering (`cargo
+/// test -p weir-ctl` before `cargo test -p weir-server`, which produces the
+/// binary as a side effect) for a lone invocation of this test to pass.
+fn weir_ctl_binary() -> PathBuf {
+    let candidate = Path::new(env!("CARGO_BIN_EXE_weir-server")).with_file_name("weir-ctl");
+    // Always invoke `cargo build`, not just when `candidate` is missing: cargo
+    // itself is the one that knows whether it's stale (a `weir-ctl` binary can
+    // already sit at this path from an EARLIER build of an older commit — the
+    // gate's own `cargo test -p weir-ctl` step, run first, would leave exactly
+    // that behind), and `cargo build` is a fast no-op recompile when nothing
+    // changed. An existence-only check here would happily hand back a stale
+    // binary that predates whatever quarantine subcommand this test needs.
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "weir-ctl", "--bin", "weir-ctl"])
+        .status()
+        .expect("failed to invoke `cargo build -p weir-ctl`");
+    assert!(status.success(), "cargo build -p weir-ctl failed");
+    assert!(
+        candidate.exists(),
+        "weir-ctl binary still missing at {} after building it",
+        candidate.display()
+    );
+    candidate
+}
+
+/// The single active (unsealed) `.wab` file under `wab_dir` — i.e. NOT
+/// `.wab.sealed`, and not anything under `quarantine/` (which does not exist
+/// yet at the point this is called). Panics unless there is exactly one,
+/// which is the shape a fresh single-shard daemon that has not yet sealed
+/// anything is expected to have.
+fn find_active_wab_file(wab_dir: &Path) -> PathBuf {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && name.ends_with(".wab")
+                && !name.ends_with(".sealed")
+            {
+                out.push(p);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(wab_dir, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one active .wab file, found {found:?}"
+    );
+    found.into_iter().next().unwrap()
+}
+
+/// Flips one byte inside record `n`'s (0-indexed) stored payload, leaving its
+/// length and CRC fields intact. This is the mid-file-corruption shape crash
+/// recovery treats specially — mirrors
+/// `mid_file_corruption_in_a_compressed_segment_quarantines` in
+/// `crates/weir-server/src/wab/recovery.rs`: record `n`'s own CRC now fails,
+/// but every record after it is untouched and individually valid, so recovery
+/// quarantines the WHOLE original file (preserving records after the
+/// corruption) instead of truncating at it — the exact scenario `weir-ctl
+/// quarantine requeue` exists to recover from.
+fn corrupt_nth_record_payload(path: &Path, n: usize) {
+    let mut bytes = fs::read(path).unwrap();
+    let mut pos = weir_wab::format::SEGMENT_HEADER_LEN;
+    for i in 0.. {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let payload_start = pos + 8; // 4-byte length + 4-byte CRC
+        if i == n {
+            bytes[payload_start] ^= 0xff;
+            break;
+        }
+        pos = payload_start + len;
+    }
+    fs::write(path, &bytes).unwrap();
+}
+
+fn quarantine_dir_has_a_segment(wab_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(wab_dir.join("quarantine")) else {
+        return false;
+    };
+    entries.flatten().any(|e| e.path().is_file())
+}
+
+/// The round trip the whole quarantine-tooling plan exists for. `SegmentReader`
+/// (and therefore normal crash recovery) cannot reach records sitting AFTER a
+/// mid-file corruption; `RecoveryReader` can, and `weir-ctl quarantine requeue`
+/// is what actually gets them back through the daemon and into the sink. This
+/// asserts that end to end, through the REAL `weir-ctl` binary talking to a
+/// REAL running daemon — not the unit-level `cmd_quarantine_requeue` tests in
+/// `weir-ctl`, which use a hand-rolled fake daemon and never touch crash
+/// recovery at all.
+///
+/// 1. Push records, crash the daemon, corrupt one record's payload mid-file in
+///    the still-active (unsealed) segment.
+/// 2. Restart: crash recovery seals + delivers the valid PREFIX normally, and
+///    quarantines the whole original (mid-file corruption, not a torn tail).
+/// 3. `weir-ctl quarantine requeue --yes` against the running daemon.
+/// 4. Assert the sink received MORE than just the duplicate prefix — i.e.
+///    records that sat AFTER the corruption, which normal recovery could
+///    never reach, were actually delivered and confirmed. Counting is used
+///    (via `weir_sink_commit_records_total`) rather than payload inspection —
+///    this workspace has no in-process "recording" sink to capture bodies
+///    (checked: no `TcpListener`-based request-capturing test sink exists
+///    anywhere in this repo; the sink integration tests that DO inspect
+///    content — mysql/postgres/clickhouse — query a real external database,
+///    which is `#[ignore]`d and unavailable in this gate). The counts here
+///    are exact and structurally tied to the fixture (`BEFORE` records
+///    before the corruption, `AFTER` after it), not a loose ">= 1" check, so
+///    this is real, not vacuous — see the Task 4 report for the full
+///    argument.
+#[test]
+fn quarantined_records_after_a_corruption_can_be_recovered() {
+    const BEFORE: usize = 3; // recovered normally by crash recovery's sealed prefix
+    const AFTER: usize = 4; // reachable ONLY via RecoveryReader / this tool
+
+    // `wab_segment_max_age_secs = 1` is load-bearing, not decoration (same
+    // reason as `wab_cap_nack_is_recoverable_for_a_real_client`): idle-seal is
+    // OFF by default, and the handful of tiny records this test pushes — both
+    // the initial burst AND the ones `quarantine requeue` pushes back later —
+    // are nowhere near `wab_segment_max_bytes`. Without idle-seal, the active
+    // segment those pushes land in never seals, so the drain never sees it and
+    // `weir_sink_commit_records_total` never moves, no matter how long we poll.
+    let mut srv = weir_server!("quarantine_requeue_e2e")
+        .shard_count(1)
+        .extra_config("wab_segment_max_age_secs = 1")
+        .start();
+    let mut client = srv.client();
+    for i in 0..(BEFORE + 1 + AFTER) {
+        client
+            .push(format!("qr-{i:03}").as_bytes(), Durability::Durable)
+            .unwrap();
+    }
+    drop(client);
+    thread::sleep(Duration::from_millis(150));
+
+    srv.kill_ungracefully();
+
+    let active = find_active_wab_file(&srv.wab_dir);
+    corrupt_nth_record_payload(&active, BEFORE);
+
+    srv.restart_in_place();
+
+    // Crash recovery runs synchronously during startup — `wab::spawn`'s
+    // "Phase 1 (calling thread): crash recovery", BEFORE the socket is bound
+    // — so by the time `restart_in_place` returns (it waits for the socket to
+    // accept connections), the quarantine copy already exists on disk.
+    assert!(
+        quarantine_dir_has_a_segment(&srv.wab_dir),
+        "expected the mid-file-corrupt segment to be quarantined on restart"
+    );
+
+    // Give the drain a moment: delivery of the replayed valid prefix is async.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut committed_before_requeue;
+    loop {
+        committed_before_requeue = parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        );
+        if committed_before_requeue >= BEFORE as u64 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the valid prefix (records before the corruption) must be delivered by normal \
+             crash recovery alone; only got {committed_before_requeue}/{BEFORE}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        committed_before_requeue < (BEFORE + 1 + AFTER) as u64,
+        "records AFTER the corruption must NOT be reachable by normal recovery alone \
+         (SegmentReader stops at the first bad record) — got {committed_before_requeue} \
+         committed, which means the fixture didn't actually corrupt the segment"
+    );
+
+    let ctl = weir_ctl_binary();
+
+    // Dry run first: must not touch the segment.
+    let dry = Command::new(&ctl)
+        .args(["quarantine", "requeue", "--wab-dir"])
+        .arg(&srv.wab_dir)
+        .arg("--socket")
+        .arg(&srv.socket_path)
+        .output()
+        .expect("run weir-ctl quarantine requeue (dry run)");
+    assert!(
+        dry.status.success(),
+        "dry run failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        quarantine_dir_has_a_segment(&srv.wab_dir),
+        "a dry run must not delete the quarantined segment"
+    );
+
+    let real = Command::new(&ctl)
+        .args(["quarantine", "requeue", "--yes", "--wab-dir"])
+        .arg(&srv.wab_dir)
+        .arg("--socket")
+        .arg(&srv.socket_path)
+        .output()
+        .expect("run weir-ctl quarantine requeue --yes");
+    assert!(
+        real.status.success(),
+        "requeue --yes failed: {}",
+        String::from_utf8_lossy(&real.stderr)
+    );
+
+    // Poll for the sink to confirm the requeued records. Every record except
+    // the corrupted one is verifiable in the quarantined copy, so requeue
+    // must deliver exactly BEFORE + AFTER of them.
+    let expected_delivered_by_requeue = (BEFORE + AFTER) as u64;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut committed_after;
+    loop {
+        committed_after = parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        );
+        if committed_after >= committed_before_requeue + expected_delivered_by_requeue {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "requeue did not deliver+confirm every recoverable record; got {committed_after}, \
+             expected >= {}",
+            committed_before_requeue + expected_delivered_by_requeue
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // THE assertion the whole feature exists for: requeue delivered MORE than
+    // just the duplicate prefix — records sitting AFTER the corruption,
+    // unreachable by any path except RecoveryReader, reached the sink and
+    // were confirmed.
+    let delivered_by_requeue = committed_after - committed_before_requeue;
+    assert_eq!(
+        delivered_by_requeue, expected_delivered_by_requeue,
+        "requeue must deliver every verifiable record in the quarantined copy — the \
+         duplicate prefix AND the tail after the corruption"
+    );
+    assert!(
+        delivered_by_requeue > BEFORE as u64,
+        "requeue must have delivered records sitting AFTER the corrupted one — the entire \
+         point of RecoveryReader — not merely re-sent the duplicate prefix"
+    );
+
+    // Every recoverable record was accepted, so the segment must be gone.
+    assert!(
+        !quarantine_dir_has_a_segment(&srv.wab_dir),
+        "the quarantined segment must be deleted once every recoverable record was accepted"
     );
 }
 
@@ -2129,7 +2683,7 @@ fn mysql_sink_end_to_end() {
     let mut client = handle.client();
     for i in 0..N {
         client
-            .push(format!("mysql-rec-{i:05}").as_bytes(), Durability::Sync)
+            .push(format!("mysql-rec-{i:05}").as_bytes(), Durability::Durable)
             .unwrap_or_else(|e| panic!("push {i}: {e}"));
     }
     drop(client);
@@ -2221,7 +2775,10 @@ fn postgres_sink_end_to_end() {
     let mut client = handle.client();
     for i in 0..N {
         client
-            .push(format!("postgres-rec-{i:05}").as_bytes(), Durability::Sync)
+            .push(
+                format!("postgres-rec-{i:05}").as_bytes(),
+                Durability::Durable,
+            )
             .unwrap_or_else(|e| panic!("push {i}: {e}"));
     }
     drop(client);
@@ -2303,7 +2860,7 @@ fn clickhouse_sink_end_to_end() {
         client
             .push(
                 format!("clickhouse-rec-{i:05}").as_bytes(),
-                Durability::Sync,
+                Durability::Durable,
             )
             .unwrap_or_else(|e| panic!("push {i}: {e}"));
     }

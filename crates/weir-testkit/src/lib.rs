@@ -12,7 +12,7 @@
 //!
 //! let srv = WeirServer::builder("my_test").start();
 //! let mut client = srv.client();
-//! client.push(b"hello", weir_core::Durability::Sync).unwrap();
+//! client.push(b"hello", weir_core::Durability::Durable).unwrap();
 //! // Drop cleans up the child process and temp directory.
 //! ```
 //!

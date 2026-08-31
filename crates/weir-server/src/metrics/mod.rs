@@ -26,12 +26,14 @@ pub struct TierLabel {
     pub tier: TierValue,
 }
 
-/// Durability tier label value. Lowercase to match Prometheus naming conventions.
+/// Durability tier label value. Lowercase to match Prometheus naming conventions,
+/// and kept in lockstep with `weir_core::Durability`'s two variants — this is a
+/// separate type only because `EncodeLabelValue` needs a concrete enum, but its
+/// variant names must always equal `Durability`'s `Display` output.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum TierValue {
-    sync,
-    batched,
+    durable,
     buffered,
 }
 
@@ -113,12 +115,20 @@ pub struct DrainStateLabel {
 }
 
 /// Drain state label value. `blocked_dead_letter_full` matches the state machine name.
+///
+/// `stopped` is terminal and is not one of the state machine's states: it is set
+/// by the drain *supervisor* once it has exited for good — a clean shutdown, the
+/// respawn budget exhausted, or the dead-letter writer failing to open at start.
+/// All three converge on the same exit. The three running states are written only by the
+/// drain thread, so without a terminal value the family would stay frozen at its
+/// last reading — reporting `draining` while nothing drains.
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
 pub enum DrainStateValue {
     draining,
     retrying_transient,
     blocked_dead_letter_full,
+    stopped,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -221,6 +231,8 @@ pub(crate) struct Metrics {
     // ── WAB ───────────────────────────────────────────────────────────────────
     pub wab_segments: Family<SegmentStateLabel, Counter<u64, AtomicU64>>,
     pub wab_bytes_on_disk: Gauge<f64, AtomicU64>,
+    /// Bytes currently held in the quarantine directory.
+    pub quarantine_bytes_on_disk: Gauge<f64, AtomicU64>,
     pub wab_fsync_duration: Histogram,
     /// WAB flusher thread panics. Once a flusher panics, its shard is offline
     /// (records routed to it receive Nack(InternalError)) until the daemon
@@ -251,6 +263,8 @@ pub(crate) struct Metrics {
     // ── Recovery ──────────────────────────────────────────────────────────────
     pub recovery_records_replayed: Counter<u64, AtomicU64>,
     pub recovery_segments_quarantined: Counter<u64, AtomicU64>,
+    /// Segments whose crash recovery failed and were left for manual inspection.
+    pub recovery_segments_failed: Counter<u64, AtomicU64>,
     /// Counts mid-file-corrupt WAB segments whose quarantine COPY failed during
     /// recovery (disk full / read-only mount / inode exhaustion). On this event
     /// recovery refuses to truncate the valid prefix — it leaves the segment in
@@ -258,6 +272,13 @@ pub(crate) struct Metrics {
     /// rather than fail open and lose them. Alertable so the stuck-on-full-disk
     /// state is visible instead of silent.
     pub recovery_quarantine_copy_failed: Counter<u64, AtomicU64>,
+    /// Pushes rejected because live WAB bytes exceeded `wab_max_bytes`.
+    pub wab_cap_rejections: Counter<u64, AtomicU64>,
+    /// Cumulative record payload bytes as accepted from producers, before any
+    /// compression. Paired with [`Metrics::wab_record_stored_bytes`].
+    pub wab_record_logical_bytes: Counter<u64, AtomicU64>,
+    /// Cumulative record payload bytes as written to disk, after compression.
+    pub wab_record_stored_bytes: Counter<u64, AtomicU64>,
     /// Counts WAB segment files seen during recovery whose permissions are
     /// not 0o600. Defense-in-depth signal for tampering or operator error.
     pub wab_unexpected_mode: Counter<u64, AtomicU64>,
@@ -267,7 +288,9 @@ pub(crate) struct Metrics {
     #[cfg(feature = "bench-trace")]
     pub stage_queue: Histogram,
     /// bridge hop + flusher recv wait: worker flush → flusher dequeue. bench-trace only.
-    /// This is where the Batched double-deadline anomaly will show up.
+    /// This is where the (historical, disproven — see
+    /// docs/benchmarks/phase3-results.md) Batched double-deadline anomaly
+    /// hypothesis would have shown up.
     #[cfg(feature = "bench-trace")]
     pub stage_bridge_wait: Histogram,
     /// record write: flusher dequeue → write_record done (pre-fsync). bench-trace only.
@@ -492,6 +515,38 @@ impl Metrics {
             "weir_recovery_segments_quarantined",
             "WAB segments quarantined due to corruption detected during crash recovery"
         );
+        let recovery_segments_failed = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_recovery_segments_failed",
+            "WAB segments whose crash recovery failed AND left the segment at its \
+             original path, so nothing will ever reach it. Deliberately excludes \
+             segments that were quarantined: those are counted by \
+             weir_recovery_segments_quarantined_total and are listed by \
+             `weir-ctl quarantine`. Non-zero means acked records may be \
+             unreachable — check the startup logs for the path and the cause"
+        );
+        let quarantine_bytes_on_disk = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_quarantine_bytes_on_disk",
+            "Bytes held in the quarantine/ subdirectory: forensic copies of \
+             corrupt segments preserved because acked records may sit after the \
+             corruption. Unlike the quarantine counters this survives a restart. \
+             Recover them with `weir-ctl quarantine requeue`"
+        );
+        let wab_record_logical_bytes = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_record_logical_bytes",
+            "Cumulative record payload bytes as accepted from producers, before any \
+             compression. Divide by weir_wab_record_stored_bytes_total for the live \
+             compression ratio; the two are equal when compression is off"
+        );
+        let wab_record_stored_bytes = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_record_stored_bytes",
+            "Cumulative record payload bytes as written to disk, after compression. \
+             Excludes the 8-byte per-record framing, the segment header and the footer, \
+             so it is not the segment file size"
+        );
         let recovery_quarantine_copy_failed = reg!(
             Counter::<u64, AtomicU64>::default(),
             "weir_recovery_quarantine_copy_failed",
@@ -499,6 +554,13 @@ impl Metrics {
              recovery; the valid prefix was left un-truncated to preserve any \
              acked-durable tail records (recovery is stuck until the operator clears \
              disk space / read-only state)"
+        );
+        let wab_cap_rejections = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_cap_rejections",
+            "Pushes Nacked because live WAB bytes exceeded wab_max_bytes. These \
+             surface to clients as NackReason::InternalError (the same byte as \
+             queue saturation), so this counter is how the two are told apart"
         );
         let wab_unexpected_mode = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -543,7 +605,10 @@ impl Metrics {
              is 1 at any time; the others are 0. NOTE: state=\"draining\" does NOT imply \
              delivery progress — a segment stranded waiting on a fully-down sink still reads \
              draining. Watch weir_sink_health{state=\"down\"} and weir_drain_segments_stranded \
-             for that case, not this gauge alone"
+             for that case, not this gauge alone. state=\"stopped\" is terminal: the drain \
+             supervisor has exited (clean shutdown, the respawn budget exhausted, or the \
+             dead-letter writer failing to open at start) and NOTHING is being delivered \
+             until the daemon restarts — alert on it"
         );
         let dead_letter_blocked_duration = reg!(
             Gauge::<f64, AtomicU64>::default(),
@@ -592,6 +657,7 @@ impl Metrics {
             tls_config_reloads,
             wab_segments,
             wab_bytes_on_disk,
+            quarantine_bytes_on_disk,
             wab_fsync_duration,
             wab_flusher_panics,
             drain_panics,
@@ -603,7 +669,11 @@ impl Metrics {
             queue_depth,
             recovery_records_replayed,
             recovery_segments_quarantined,
+            recovery_segments_failed,
             recovery_quarantine_copy_failed,
+            wab_cap_rejections,
+            wab_record_logical_bytes,
+            wab_record_stored_bytes,
             wab_unexpected_mode,
             dead_letter_bytes_on_disk,
             dead_letter_full,
@@ -641,6 +711,12 @@ impl Metrics {
                 state: DrainStateValue::blocked_dead_letter_full,
             })
             .set(0.0);
+        metrics
+            .drain_state
+            .get_or_create(&DrainStateLabel {
+                state: DrainStateValue::stopped,
+            })
+            .set(0.0);
 
         metrics
             .sink_health
@@ -665,9 +741,9 @@ impl Metrics {
         // on the first scrape — without this a scraper can't baseline them until
         // the first nack actually happens (unlike the pre-initialised gauges and
         // the unlabeled weir_ack_timeout counter, which exist at 0 from boot).
-        // The decode-error reject path attributes its nack to tier=sync (the
+        // The decode-error reject path attributes its nack to tier=durable (the
         // durability tier isn't known until the header parses), so touching every
-        // reason at tier=sync covers the always-reachable label combinations; the
+        // reason at tier=durable covers the always-reachable label combinations; the
         // per-tier payload_too_large/internal_error/empty_payload series still
         // appear on first occurrence as before.
         for reason in [
@@ -684,7 +760,7 @@ impl Metrics {
             // get_or_create returns a guard; binding it to `_` is enough — the
             // series is registered at 0 by the lookup itself.
             let _ = metrics.records_nack.get_or_create(&NackLabel {
-                tier: TierValue::sync,
+                tier: TierValue::durable,
                 reason,
             });
         }
@@ -777,6 +853,12 @@ mod tests {
         assert!(
             out.contains("blocked_dead_letter_full"),
             "drain_state blocked label missing"
+        );
+        // The terminal state must exist at 0 from boot too, so a scraper can
+        // baseline (and alert on) it before the drain has ever stopped.
+        assert!(
+            out.contains("weir_drain_state{state=\"stopped\"} 0"),
+            "drain_state stopped label missing or not pre-initialised to 0:\n{out}"
         );
         assert!(out.contains("healthy"), "sink_health healthy label missing");
     }
