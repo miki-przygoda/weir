@@ -1,9 +1,9 @@
 /**
  * Live end-to-end smoke test against a running daemon.
  *
- * 1. Direct client checks: healthcheck, a Sync push, a Batched push, a Buffered
- *    push, and that an empty Push is rejected with Nack(EmptyPayload) and the
- *    connection is closed (per spec).
+ * 1. Direct client checks: healthcheck, a Durable push, a Batched push, a
+ *    Buffered push, and that an empty Push is rejected with Nack(EmptyPayload)
+ *    and the connection is closed (per spec).
  * 2. Scrapes the daemon's Prometheus metrics and asserts the accepted-record
  *    counter advanced by the number of pushes we sent.
  *
@@ -68,8 +68,8 @@ const acceptedBefore = counterName ? metricSum(before, counterName) : NaN;
   await c.connect();
   await c.healthCheck();
   check(true, "healthcheck answered");
-  await c.push("sync-event", Durability.Sync);
-  check(true, "Sync push acked");
+  await c.push("durable-event", Durability.Durable);
+  check(true, "Durable push acked");
   await c.push("batched-event", Durability.Batched);
   check(true, "Batched push acked");
   await c.push(Buffer.from("buffered-event"), Durability.Buffered);
@@ -82,7 +82,7 @@ const acceptedBefore = counterName ? metricSum(before, counterName) : NaN;
   const c = new WeirClient({ socketPath, timeoutMs: 5000 });
   await c.connect();
   try {
-    await c.push(Buffer.alloc(0), Durability.Sync);
+    await c.push(Buffer.alloc(0), Durability.Durable);
     check(false, "empty Push should be rejected");
   } catch (e) {
     const isEmpty = e instanceof NackError && e.reason === NackReason.EmptyPayload;
@@ -92,8 +92,8 @@ const acceptedBefore = counterName ? metricSum(before, counterName) : NaN;
   c.close();
 }
 
-// 3 ACCEPTED pushes (sync + batched + buffered). The empty Push is Nacked, not
-// accepted, and the HealthCheck does not count as a record.
+// 3 ACCEPTED pushes (durable + batched + buffered). The empty Push is Nacked,
+// not accepted, and the HealthCheck does not count as a record.
 const PUSHES = 3;
 
 // give the daemon a beat to update counters, then re-scrape

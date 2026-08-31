@@ -47,12 +47,20 @@ MT_NAME = {
     MessageType.HEALTH_CHECK_RESPONSE: "HealthCheckResponse",
 }
 MT_FROM_NAME = {v: k for k, v in MT_NAME.items()}
+# Decode-side: the wire byte's canonical tier name. 0x01 and the retired 0x02
+# (Batched) both canonicalise to "Durable" — permissively accepted per
+# docs/wire_protocol.md and crates/weir-core/src/durability.rs.
 DUR_NAME = {
-    Durability.SYNC: "Sync",
-    Durability.BATCHED: "Batched",
+    Durability.DURABLE: "Durable",
+    Durability.BATCHED: "Durable",
     Durability.BUFFERED: "Buffered",
 }
-DUR_FROM_NAME = {v: k for k, v in DUR_NAME.items()}
+# Encode-side: canonical tier name back to its ONE canonical wire byte. NOT
+# derived from DUR_NAME (which is many-to-one for 0x01/0x02) — a conformant
+# encoder only ever emits 0x01 for Durable, never the retired 0x02. Vectors
+# that decode from the non-canonical 0x02 byte are marked "round_trip": false
+# and skip the re-encode check below rather than routing through this map.
+DUR_FROM_NAME = {"Durable": Durability.DURABLE, "Buffered": Durability.BUFFERED}
 
 
 def run() -> int:
@@ -93,16 +101,22 @@ def run() -> int:
                 failed += 1
                 continue
 
-            re_encoded = encode_frame(
-                MT_FROM_NAME[v["message_type"]],
-                DUR_FROM_NAME[v["durability"]],
-                bytes.fromhex(v["payload_hex"]),
-                flags=v["flags"],
-            ).hex()
-            if re_encoded != v["hex"]:
-                print(f"FAIL {name}: re-encode\n  got {re_encoded}\n  exp {v['hex']}")
-                failed += 1
-                continue
+            # A vector marked "round_trip": false decodes a non-canonical wire
+            # byte (the retired 0x02 durability tier) to its canonical field
+            # value, so re-encoding it does NOT reproduce `hex` by design —
+            # skip the byte-identical check rather than weakening it for
+            # every vector. See docs/conformance.md.
+            if v.get("round_trip", True):
+                re_encoded = encode_frame(
+                    MT_FROM_NAME[v["message_type"]],
+                    DUR_FROM_NAME[v["durability"]],
+                    bytes.fromhex(v["payload_hex"]),
+                    flags=v["flags"],
+                ).hex()
+                if re_encoded != v["hex"]:
+                    print(f"FAIL {name}: re-encode\n  got {re_encoded}\n  exp {v['hex']}")
+                    failed += 1
+                    continue
 
         passed += 1
 

@@ -40,7 +40,10 @@ export const MessageType = {
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
 
 export const Durability = {
-  Sync: 0x01,
+  Durable: 0x01,
+  // Retired: still a valid wire byte that permissively decodes to Durable
+  // (see durabilityName's override below), but a conformant encoder never
+  // emits it. See docs/wire_protocol.md "Durability tiers".
   Batched: 0x02,
   Buffered: 0x03,
 } as const;
@@ -65,6 +68,10 @@ const MESSAGE_TYPE_NAMES = new Map<number, string>(
 const DURABILITY_NAMES = new Map<number, string>(
   Object.entries(Durability).map(([k, v]) => [v, k]),
 );
+// 0x02 (retired Batched) permissively decodes to the same canonical label as
+// 0x01 — see docs/wire_protocol.md "Durability tiers" and
+// crates/weir-core/src/durability.rs's permissive TryFrom.
+DURABILITY_NAMES.set(Durability.Batched, "Durable");
 const NACK_REASON_NAMES = new Map<number, string>(
   Object.entries(NackReason).map(([k, v]) => [v, k]),
 );
@@ -98,14 +105,14 @@ export interface EncodeOpts {
 }
 
 /**
- * Encode a frame. Defaults to a Push at Sync durability.
+ * Encode a frame. Defaults to a Push at Durable durability.
  *
  * Does NOT enforce a non-empty payload — that is a daemon policy (EmptyPayload
  * Nack), and tests need to be able to encode a zero-length Push to exercise it.
  */
 export function encodeFrame(payload: Buffer, opts: EncodeOpts = {}): Buffer {
   const messageType = opts.messageType ?? MessageType.Push;
-  const durability = opts.durability ?? Durability.Sync;
+  const durability = opts.durability ?? Durability.Durable;
   const flags = opts.flags ?? 0;
 
   const frame = Buffer.allocUnsafe(HEADER_LEN + payload.length + 4);
@@ -171,7 +178,7 @@ const VALID_MESSAGE_TYPES = new Set<number>([
 ]);
 
 const VALID_DURABILITY = new Set<number>([
-  Durability.Sync,
+  Durability.Durable,
   Durability.Batched,
   Durability.Buffered,
 ]);

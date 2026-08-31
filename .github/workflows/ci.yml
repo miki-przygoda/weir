@@ -50,6 +50,38 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+  conformance:
+    name: conformance (wire vectors + polyglot clients)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "21" }
+      - uses: actions/setup-node@v4
+        with: { node-version: ">=22.6" }
+      # The Rust decoder is already covered by crates/weir-core/tests/conformance.rs
+      # in the `test` job. What had NO coverage were the five from-spec clients —
+      # which is how the Sync -> Durable durability-tier rename in
+      # docs/conformance/wire_v1_vectors.json broke all five of them (reported as
+      # only three; verifying rather than assuming caught that Java and TypeScript
+      # were broken too) and shipped in 2.0.0 unnoticed. C and Go need no extra
+      # setup: ubuntu-latest ships a C toolchain and `make`, and the Go client has
+      # no external deps.
+      - run: python3 docs/conformance/run_vectors.py
+      - run: python3 demos/py-wire-client/tests/test_conformance.py
+      - run: cd demos/go-wire-client && go test ./...
+      - run: cd demos/c-wire-client && make check
+      - name: Java demo client conformance
+        run: |
+          cd demos/java-wire-client
+          javac -d out $(find src -name '*.java')
+          java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
+      - name: TypeScript demo client conformance
+        run: cd demos/ts-wire-client && node src/conformance.ts
+
   test:
     runs-on: ubuntu-latest
     needs: lint

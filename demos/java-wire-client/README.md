@@ -15,7 +15,7 @@ without pulling in a Rust toolchain.
 
 The demo (`AuditEventProducer`) demonstrates **enterprise audit logging**: it
 streams structured JSON audit events (logins, RBAC grants, data exports) to weir
-at **Sync** durability — so an `Ack` means "on stable storage", the guarantee a
+at **Durable** durability — so an `Ack` means "on stable storage", the guarantee a
 compliance auditor cares about. weir is the durable write-ahead buffer in front
 of a downstream SIEM / audit store.
 
@@ -32,7 +32,7 @@ Offset  Size  Field          Value
  0       4    magic          "WEIR"
  4       1    version        WIRE_VERSION = 1
  5       1    message_type    PUSH=0x01 / ACK=0x02 / NACK=0x03 / HEALTH_CHECK=0x04 / HEALTH_CHECK_RESPONSE=0x05
- 6       1    durability      SYNC=0x01 / BATCHED=0x02 / BUFFERED=0x03
+ 6       1    durability      DURABLE=0x01 / BATCHED=0x02 (retired, decodes to Durable) / BUFFERED=0x03
  7       1    flags          reserved; must be 0 on write (encode() rejects nonzero)
  8       4    payload_len    u32 little-endian
 12       4    header_crc32   CRC32 over bytes [0..12], little-endian
@@ -124,7 +124,7 @@ JDK standard library only (`UnixDomainSocketAddress`, `java.util.zip.CRC32`,
 | `Wire.java`              | Frozen v1 constants + the `MessageType` / `Durability` / `NackReason` enums (each with a `code` byte and `fromByte`). |
 | `Frame.java`            | Single-frame `encode()` / `decode(byte[])` (CRC32 IEEE, little-endian `ByteBuffer`) plus the `DecodeError` verdict enum with vector-name strings. |
 | `WeirClient.java`       | Synchronous `AutoCloseable` producer over an `AF_UNIX` `SocketChannel`: `connect` / `push` / `healthCheck`; does its own stream framing and caps response payloads at 2 bytes. |
-| `AuditEventProducer.java` | The demo: streams JSON audit events at Sync durability. CLI: `<socket> [event-count]`. |
+| `AuditEventProducer.java` | The demo: streams JSON audit events at Durable durability. CLI: `<socket> [event-count]`. |
 | `ConformanceRunner.java`| Offline validator running the codec against the 30 vectors (decode + fields for all, byte-exact re-encode for the 4 client-emittable frames). |
 | `LiveSmokeTest.java`    | Live happy + rejection paths against a running daemon. CLI: `<socket>`. |
 | `ProtocolException.java`| Unchecked wire exception carrying the `DecodeError` / `NackReason` / raw byte, with `isRetryable()`. |

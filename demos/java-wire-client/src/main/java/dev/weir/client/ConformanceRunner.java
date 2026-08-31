@@ -138,8 +138,12 @@ public final class ConformanceRunner {
 
     private static String toSpecName(Wire.Durability d) {
         switch (d) {
-            case SYNC: return "Sync";
-            case BATCHED: return "Batched";
+            // 0x02 (retired BATCHED) permissively decodes to the same
+            // canonical label as 0x01 — see docs/wire_protocol.md
+            // "Durability tiers" and crates/weir-core/src/durability.rs's
+            // permissive TryFrom.
+            case DURABLE:
+            case BATCHED: return "Durable";
             case BUFFERED: return "Buffered";
             default: return d.name();
         }

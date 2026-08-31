@@ -117,7 +117,7 @@ class WeirClient:
         return self._read_response_frame()
 
     def push(
-        self, payload: bytes, durability: Durability = Durability.SYNC
+        self, payload: bytes, durability: Durability = Durability.DURABLE
     ) -> PushResult:
         if not payload:
             raise ValueError("weir rejects zero-length Push payloads (EmptyPayload)")
@@ -135,6 +135,6 @@ class WeirClient:
         raise WeirError(f"unexpected response message_type {resp.message_type!r}")
 
     def health_check(self) -> bool:
-        frame = encode_frame(MessageType.HEALTH_CHECK, Durability.SYNC, b"")
+        frame = encode_frame(MessageType.HEALTH_CHECK, Durability.DURABLE, b"")
         resp = self._request(frame)
         return resp.message_type == MessageType.HEALTH_CHECK_RESPONSE

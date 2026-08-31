@@ -13,7 +13,7 @@ import java.util.List;
  * <p>Domain framing: weir is the durable write-ahead buffer in front of a
  * downstream SIEM / audit store. The producer is the application emitting
  * security-relevant events (logins, privilege changes, data exports). Each
- * event is pushed at {@code Sync} durability so the Ack means "on stable
+ * event is pushed at {@code Durable} durability so the Ack means "on stable
  * storage" — the contract a compliance auditor cares about.
  *
  * <p>Usage:
@@ -41,7 +41,7 @@ public final class AuditEventProducer {
             Frame hcr = client.healthCheck();
             System.out.println("[health] " + hcr + " -> daemon is live");
 
-            // 2. Stream audit events at Sync durability.
+            // 2. Stream audit events at Durable durability.
             List<String> events = List.of(
                 auditJson("auth.login", "user=alice", "result=success", "src=10.0.0.5"),
                 auditJson("auth.login", "user=bob", "result=failure", "reason=bad_password"),
@@ -55,7 +55,7 @@ public final class AuditEventProducer {
                 String event = events.get(i % events.size());
                 byte[] payload = event.getBytes(StandardCharsets.UTF_8);
                 try {
-                    Frame ack = client.push(payload, Wire.Durability.SYNC);
+                    Frame ack = client.push(payload, Wire.Durability.DURABLE);
                     acked++;
                     System.out.printf("[push #%d] ACK (durable) %dB  %s%n",
                         i + 1, payload.length, event);
@@ -69,7 +69,7 @@ public final class AuditEventProducer {
                 }
             }
             System.out.println();
-            System.out.printf("Durably acked %d/%d audit events at Sync durability.%n", acked, count);
+            System.out.printf("Durably acked %d/%d audit events at Durable durability.%n", acked, count);
         }
     }
 

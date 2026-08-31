@@ -10,7 +10,7 @@
  * and connection-close per the spec.
  *
  * Usage:
- *   telemetry <socket_path> [count] [durability: sync|batched|buffered]
+ *   telemetry <socket_path> [count] [durability: durable|batched|buffered]
  *
  * Payload format (16 bytes, little-endian — a deliberately MCU-friendly
  * fixed record, not JSON):
@@ -54,7 +54,7 @@ static void build_record(uint8_t *rec, uint32_t node_id, uint32_t seq) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s <socket_path> [count] [sync|batched|buffered]\n",
+            "usage: %s <socket_path> [count] [durable|batched|buffered]\n",
             argv[0]);
         return 2;
     }
@@ -62,12 +62,14 @@ int main(int argc, char **argv) {
     int count = (argc >= 3) ? atoi(argv[2]) : 8;
     if (count <= 0) count = 8;
 
-    weir_durability dur = WEIR_DUR_SYNC;
-    const char *dur_name = "Sync";
+    weir_durability dur = WEIR_DUR_DURABLE;
+    const char *dur_name = "Durable";
     if (argc >= 4) {
-        if (strcmp(argv[3], "batched") == 0)      { dur = WEIR_DUR_BATCHED;  dur_name = "Batched"; }
-        else if (strcmp(argv[3], "buffered") == 0){ dur = WEIR_DUR_BUFFERED; dur_name = "Buffered"; }
-        else if (strcmp(argv[3], "sync") == 0)    { dur = WEIR_DUR_SYNC;     dur_name = "Sync"; }
+        /* "batched" still sends the retired 0x02 byte, to demo that a 2.0
+         * daemon permissively decodes it to Durable — see wire_protocol.md. */
+        if (strcmp(argv[3], "batched") == 0)       { dur = WEIR_DUR_BATCHED;  dur_name = "Batched (retired 0x02)"; }
+        else if (strcmp(argv[3], "buffered") == 0) { dur = WEIR_DUR_BUFFERED; dur_name = "Buffered"; }
+        else if (strcmp(argv[3], "durable") == 0)  { dur = WEIR_DUR_DURABLE;  dur_name = "Durable"; }
         else { fprintf(stderr, "unknown durability '%s'\n", argv[3]); return 2; }
     }
 

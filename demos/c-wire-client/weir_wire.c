@@ -85,8 +85,8 @@ weir_result weir_encode_healthcheck(uint8_t *out, size_t out_cap,
     size_t total = WEIR_HEADER_LEN + 0 + WEIR_CRC_LEN;
     if (out_cap < total) return WEIR_ERR_BUF_TOO_SMALL;
     /* Durability must still be a valid byte even though it is unused; the
-     * daemon validates the whole header before dispatching. Use Sync. */
-    write_header(out, WEIR_MSG_HEALTHCHECK, WEIR_DUR_SYNC, 0);
+     * daemon validates the whole header before dispatching. Use Durable. */
+    write_header(out, WEIR_MSG_HEALTHCHECK, WEIR_DUR_DURABLE, 0);
     /* CRC over zero payload bytes == 0x00000000. */
     put_u32_le(out + WEIR_HEADER_LEN, weir_crc32(NULL, 0));
     if (out_len) *out_len = total;

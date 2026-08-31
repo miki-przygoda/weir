@@ -30,7 +30,7 @@ Offset  Size  Field          Value
  0       4    magic          'W' 'E' 'I' 'R'
  4       1    version        WEIR_WIRE_VERSION = 1
  5       1    message_type    WEIR_MSG_PUSH=0x01 / ACK=0x02 / NACK=0x03 / HEALTHCHECK=0x04 / HEALTHCHECK_RESPONSE=0x05
- 6       1    durability      WEIR_DUR_SYNC=0x01 / BATCHED=0x02 / BUFFERED=0x03
+ 6       1    durability      WEIR_DUR_DURABLE=0x01 / BATCHED=0x02 (retired, decodes to Durable) / BUFFERED=0x03
  7       1    flags          hardcoded 0x00 (reserved; must be zero on write)
  8       4    payload_len    u32 little-endian (put_u32_le)
 12       4    header_crc32   CRC32 over bytes [0..12], little-endian
@@ -104,7 +104,7 @@ weir-server --socket-path /tmp/weir-demo/weir.sock \
             --wab-dir /tmp/weir-demo/wab --metrics-port 19102 &
 
 # Stream telemetry: HealthCheck probe, then N records at a durability tier
-./telemetry /tmp/weir-demo/weir.sock 8 sync
+./telemetry /tmp/weir-demo/weir.sock 8 durable
 ./telemetry /tmp/weir-demo/weir.sock 5 batched
 
 # Exercise the error paths against the live daemon (5 PASS)
@@ -127,7 +127,7 @@ compiler · tested with clang 21.**
 |------|---------------|
 | `weir_wire.h` / `weir_wire.c` | The wire codec: `#define` constants, the `weir_msg_type` / `weir_durability` / `weir_nack_reason` / `weir_result` enums, the lazily-built CRC-32 table, `weir_encode_push` / `weir_encode_healthcheck` / `weir_decode_resp_header`, and the `*_str` diagnostics. |
 | `weir_conn.h` / `weir_conn.c` | Blocking POSIX `AF_UNIX` / `SOCK_STREAM` transport: `weir_connect` (with `sun_path` guard), `weir_send_all`, and the read-exact framed `weir_recv_response` with payload-CRC verification. |
-| `telemetry.c`  | The demo producer: HealthCheck probe then a stream of 16-byte little-endian sensor records at a chosen durability tier. CLI: `telemetry <socket> [count] [sync\|batched\|buffered]`. |
+| `telemetry.c`  | The demo producer: HealthCheck probe then a stream of 16-byte little-endian sensor records at a chosen durability tier. CLI: `telemetry <socket> [count] [durable\|batched\|buffered]`. |
 | `conformance.c`| Offline self-test: byte-exact re-encode of every `"ok"` Push/HealthCheck vector, decode of response vectors, and rejection assertions. |
 | `negative.c`   | Live error-path coverage: hand-crafted malformed frames asserting the daemon's Nack reason. |
 | `Makefile`     | Targets `conformance` (codec only), `telemetry`, `negative`, and `check` (runs the offline conformance suite). |

@@ -38,9 +38,11 @@ typedef enum {
     WEIR_MSG_HEALTHCHECK_RESPONSE = 0x05  /* daemon -> client */
 } weir_msg_type;
 
-/* Durability tiers (docs: "Durability tiers"). */
+/* Durability tiers (docs: "Durability tiers"). WEIR_DUR_BATCHED (0x02) is
+ * retired: still a valid wire byte that permissively decodes to Durable, but
+ * a conformant encoder never emits it. See docs/wire_protocol.md. */
 typedef enum {
-    WEIR_DUR_SYNC     = 0x01,
+    WEIR_DUR_DURABLE  = 0x01,
     WEIR_DUR_BATCHED  = 0x02,
     WEIR_DUR_BUFFERED = 0x03
 } weir_durability;

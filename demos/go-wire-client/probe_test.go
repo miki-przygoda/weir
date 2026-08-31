@@ -39,8 +39,8 @@ func dialOrSkip(t *testing.T) *Client {
 func TestProbe_ShortHeaderBlocks(t *testing.T) {
 	c := dialOrSkip(t)
 	defer c.Close()
-	// 8 bytes: "WEIR" + version + push + sync + flags. No len/crc/payload.
-	partial := []byte{'W', 'E', 'I', 'R', WireVersion, byte(MsgPush), byte(Sync), 0}
+	// 8 bytes: "WEIR" + version + push + durable + flags. No len/crc/payload.
+	partial := []byte{'W', 'E', 'I', 'R', WireVersion, byte(MsgPush), byte(Durable), 0}
 	if _, err := c.conn.Write(partial); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestProbe_HealthCheckWithPayloadIsLenient(t *testing.T) {
 	frame := EncodeFrame(Frame{
 		Version:     WireVersion,
 		MessageType: MsgHealthCheck,
-		Durability:  Sync,
+		Durability:  Durable,
 		Flags:       0,
 		Payload:     []byte("not-empty"),
 	})
@@ -91,7 +91,7 @@ func TestProbe_HealthCheckWithPayloadIsLenient(t *testing.T) {
 func TestProbe_TrailingBytesOnLiveStreamAreNextFrame(t *testing.T) {
 	c := dialOrSkip(t)
 	defer c.Close()
-	frame := EncodePush([]byte("hi"), Sync)
+	frame := EncodePush([]byte("hi"), Durable)
 	frame = append(frame, 0xde, 0xad, 0xbe, 0xef) // 4 trailing bytes
 	if _, err := c.conn.Write(frame); err != nil {
 		t.Fatalf("write: %v", err)
@@ -117,7 +117,7 @@ func TestProbe_TrailingBytesOnLiveStreamAreNextFrame(t *testing.T) {
 }
 
 // Probe: does the daemon's response durability filler match the doc claim that
-// it is "always 0x01 (Sync)" (worked example) vs the conformance vector
+// it is "always 0x01 (Durable)" (worked example) vs the conformance vector
 // ack_nonsync_durability_filler which shows a Buffered filler is also valid?
 // We push at Buffered and inspect the Ack's durability byte.
 func TestProbe_AckDurabilityFiller(t *testing.T) {
@@ -134,9 +134,9 @@ func TestProbe_AckDurabilityFiller(t *testing.T) {
 	t.Logf("Ack durability filler byte = %s (0x%02x) for a Buffered push",
 		resp.Frame.Durability, byte(resp.Frame.Durability))
 	// wire_protocol.md line 272-275 says the response durability is ALWAYS
-	// 0x01 (Sync). If the daemon echoes Buffered instead, that's a doc/impl gap.
-	if resp.Frame.Durability != Sync {
-		t.Errorf("DOC GAP: worked-example says response durability is always Sync(0x01); got %s", resp.Frame.Durability)
+	// 0x01 (Durable). If the daemon echoes Buffered instead, that's a doc/impl gap.
+	if resp.Frame.Durability != Durable {
+		t.Errorf("DOC GAP: worked-example says response durability is always Durable(0x01); got %s", resp.Frame.Durability)
 	}
 }
 

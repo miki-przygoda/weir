@@ -94,8 +94,11 @@ typedef struct {
 
 static const char *durability_byte_to_str(uint8_t d) {
     switch (d) {
-        case WEIR_DUR_SYNC:     return "Sync";
-        case WEIR_DUR_BATCHED:  return "Batched";
+        /* 0x02 (retired Batched) permissively decodes to the same canonical
+         * label as 0x01 — see docs/wire_protocol.md "Durability tiers" and
+         * crates/weir-core/src/durability.rs's permissive TryFrom. */
+        case WEIR_DUR_DURABLE:
+        case WEIR_DUR_BATCHED:  return "Durable";
         case WEIR_DUR_BUFFERED: return "Buffered";
         default:                return "?";
     }

@@ -32,7 +32,7 @@ Offset  Size  Field          Value
  0       4    magic          "WEIR"
  4       1    version        WIRE_VERSION = 1
  5       1    message_type    Push=0x01 / Ack=0x02 / Nack=0x03 / HealthCheck=0x04 / HealthCheckResponse=0x05
- 6       1    durability      Sync=0x01 / Batched=0x02 / Buffered=0x03
+ 6       1    durability      Durable=0x01 / Batched=0x02 (retired, decodes to Durable) / Buffered=0x03
  7       1    flags          reserved; must be 0 on write
  8       4    payload_len    u32 little-endian (writeUInt32LE)
 12       4    header_crc32   CRC32 over bytes [0..12], little-endian
@@ -48,7 +48,7 @@ friction note below.)
 
 ### The Push → Ack round-trip
 
-`WeirClient.push(payload, durability = Durability.Sync)` (in `src/client.ts`)
+`WeirClient.push(payload, durability = Durability.Durable)` (in `src/client.ts`)
 encodes a `Push` frame, writes it, and returns a `Promise<PushResult>` that
 resolves on `Ack` and rejects with `NackError` on a Nack. `healthCheck()` sends a
 zero-length `HealthCheck`. The client is serial: each request is queued FIFO and
