@@ -54,7 +54,7 @@ does not build this project.
 > distinction is entirely untested here (the schedule runs `Sync` only). This is
 > minutes of load, not the multi-day soak the design calls for.
 >
-> Getting here took six defects in the harness against two in weir. Quiescence
+> Getting here took eight defects in the harness against three in weir. Quiescence
 > alone was wrong four times, in both directions. Treat a green run as a claim
 > that needs its reasoning checked, not as a formality.
 

@@ -144,7 +144,8 @@ A `payload_len` of `0` is the end-of-records sentinel (not a valid record).
 Offset  Size  Field         Description
 ──────  ────  ────────────  ──────────────────────────────────────
  0       8    record_count  u64 little-endian
- 8       8    data_bytes    u64 LE — total payload bytes (no overhead)
+ 8       8    data_bytes    u64 LE — total STORED payload bytes, post-compression,
+                            excluding per-record overhead (see below)
 16       4    file_crc32    CRC32 of all bytes before sentinel, u32 LE
 20       8    sealed_at     Unix timestamp, nanoseconds, i64 LE
 28       4    reserved      0x00

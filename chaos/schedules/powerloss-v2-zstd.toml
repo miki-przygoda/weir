@@ -29,7 +29,11 @@
 #
 # Reference (v1, run 920510542071102, 40 episodes):
 #   canary bit 40/40 · I1 0 · I2 0
-#   loss min 1,802 · p50 71,160 · MAX 124,897 · acked/ep p50 412,519
+#   loss min 1,802 · p50 70,747 · MAX 124,897 · acked/ep p50 412,519
+#
+# (p50 is the statistical median — at n=40 that is the mean of the two middle
+# samples. An index-based q[20] gives 71,160 for the same data; the report in
+# docs/benchmarks/ uses the median, so this does too.)
 #
 # A v2 result that matches on canary, I1 and I2 clears the format. Loss
 # magnitude may legitimately differ: zstd changes how many records fit a

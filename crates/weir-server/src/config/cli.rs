@@ -23,9 +23,15 @@ OPTIONS:
                                                [default: 268435456 (256 MiB)]
     --wab-segment-max-age-secs <n>           Idle-seal threshold secs, 0=disabled (0-86400)
                                                [default: 0]
-    --wab-max-bytes <n>                      Soft cap on live WAB bytes, 0=disabled
-                                               (else must be >= wab-segment-max-bytes)
-                                               [default: 0]
+    --wab-max-bytes <n>                      Soft cap on live WAB bytes [default: 0]
+                                               0=disabled; else its resume threshold,
+                                               n/10*9, must exceed
+                                               wab-segment-max-bytes x shard-count
+    --wab-compression <none|zstd>            WAB payload compression (default: none).
+                                               zstd writes v2 segments a 1.x daemon
+                                               cannot read
+    --wab-compression-level <n>              zstd level 1-19 (default: 3), ignored
+                                               unless --wab-compression=zstd
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
@@ -79,7 +85,10 @@ OPTIONS:
     -V, --version                            Print version and exit
 
 ENVIRONMENT:
-    Every option above can be set via WEIR_<UPPER_SNAKE_NAME>.
+    Every option above can be set via WEIR_<UPPER_SNAKE_NAME>, with four
+    exceptions: --tls-cert is WEIR_TLS_CERT, --tls-key is WEIR_TLS_KEY and
+    --tls-client-ca is WEIR_TLS_CLIENT_CA (each drops the _PATH the field name
+    carries), and --config has no environment variable at all.
     WEIR_SINK_BEARER_TOKEN is env-only (never sourced from --sink-* flags
     or the config file). When the sink URL carries credentials
     (mysql/postgres/clickhouse), prefer setting it via WEIR_SINK_URL rather

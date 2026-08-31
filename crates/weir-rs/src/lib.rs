@@ -20,7 +20,7 @@
 //!
 //! ```toml
 //! # just the wire types
-//! weir-rs = "1.3"
+//! weir-rs = "2.0"
 //! # an app that talks to the daemon
 //! weir-rs = { version = "1.3", features = ["client"] }
 //! ```

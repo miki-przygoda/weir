@@ -14,10 +14,18 @@ the producer, then drains records to your sink in batches — turning N per-reco
 commits into 1. **An ack is never a false ack:** an acked record is on disk and
 replays after a crash.
 
-`~69 µs` Buffered (non-durable) ack p50 · `~364 µs` Durable ack p50 ·
-`~2,550` Durable RPS · `~58,600` RPS at saturation (Buffered, ~64 threads)
-*(indicative — single box, sandboxed CI runners; reproduce on your own hardware, see [benchmarks](docs/benchmarks.md))* ·
-5 built-in sinks (4 in a default build; `clickhouse` opt-in) · v1 wire + Rust API frozen under SemVer
+**Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
+records at the durable tier, **none lost**
+([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md)) ·
+5 built-in sinks (4 in a default build; `clickhouse` opt-in) ·
+wire format + Rust API under SemVer
+
+*Latency and throughput figures are deliberately not quoted here. The last
+published run is v1.3.1 on a 2-vCPU shared CI runner
+([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md)), there is no published
+measurement of 2.0.0, and this project's own rule is that external performance
+claims cite bare-metal numbers — which have not been captured yet. Measure on
+your own hardware: `cargo test -p weir-server --test load --release -- --nocapture`.*
 
 **▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
 simulation of the pipeline: push records, flip the durability tier, crash the
@@ -25,8 +33,8 @@ daemon mid-flight, and watch unconfirmed segments replay, side by side with a
 naive insert-per-record baseline. No build step — open `demo/index.html` in any
 browser. *(Hosted version coming with the public launch.)*
 
-> **Status — 1.x (stable).** The v1 wire protocol and public Rust API (`weir-core`,
-> `weir-client`, `weir-sink-sdk`, `weir-wab`) are frozen under
+> **Status — 2.0 (stable).** The wire protocol and public Rust API (`weir-core`,
+> `weir-client`, `weir-sink-sdk`, `weir-wab`) are under
 > [Semantic Versioning](https://semver.org/), with a
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
 > format for non-Rust implementers. The WAB on-disk format is stable and
@@ -34,7 +42,14 @@ browser. *(Hosted version coming with the public launch.)*
 > `mysql`, `postgres` in the default build, plus `clickhouse` behind the opt-in
 > `clickhouse-sink` Cargo feature (see [Crates](#crates) and the
 > [configuration reference](docs/operations/configuration.md)). WAB flusher and
-> drain threads are panic-supervised. Publishing to crates.io with the public release.
+> drain threads are panic-supervised. Published on crates.io.
+>
+> **2.0 is a major release and the wire protocol did not break.** `Durability`
+> collapsed from three tiers to two — `Sync` and `Batched` had carried an
+> identical guarantee since both moved to the batch-boundary group fsync — but
+> the retired `0x02` tier byte still decodes, so a 1.x producer keeps working
+> against a 2.0 daemon without recompiling. See
+> [`CHANGELOG.md`](CHANGELOG.md) for the full break list.
 
 ## How it works
 
