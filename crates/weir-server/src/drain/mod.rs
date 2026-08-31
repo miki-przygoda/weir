@@ -230,8 +230,13 @@ fn run_drain_supervised<S: Sink>(
         let sink = Arc::clone(&sink);
         let cfg = config.clone();
         let m = Arc::clone(&metrics);
+        // True on the first start; false on every respawn (a panic destroys
+        // `pending`, so a respawn must treat its first healthy probe as a
+        // recovery edge and rescan the disk — see `drain_thread`'s
+        // `initial_health_ok`).
+        let first_start = attempts == 0;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drain_thread(rx, sink, cfg, m)
+            drain_thread(rx, sink, cfg, m, first_start)
         }));
         // A clean Ok(()) return means the channel closed (all flushers gone) — done.
         let Err(_) = result else { break };
@@ -465,6 +470,12 @@ fn drain_thread<S: Sink>(
     sink: Arc<S>,
     config: DrainConfig,
     metrics: Arc<Metrics>,
+    // False on every respawn. A panic takes `pending` with it, and the only
+    // in-run rescan is the `now_ok && !prev_health_ok` edge — starting at
+    // `true` with a healthy sink means that edge never fires again and the
+    // backlog waits for a process restart. Starting at `false` makes the
+    // first healthy probe an edge, which re-queues everything still on disk.
+    initial_health_ok: bool,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -492,10 +503,13 @@ fn drain_thread<S: Sink>(
     let mut block_episode: Option<Instant> = None;
 
     // Tracks the sink's last-observed health so we can detect a down→up recovery
-    // edge and re-drain stranded segments. Starts `true` (startup replay already
-    // handled any pre-existing unconfirmed segments, so the first healthy probe
-    // is not a recovery). Set `false` whenever a segment strands.
-    let mut prev_health_ok = true;
+    // edge and re-drain stranded segments. On a fresh start this is `true`
+    // (startup replay already handled any pre-existing unconfirmed segments, so
+    // the first healthy probe is not a recovery); on a respawn it is `false` (see
+    // `initial_health_ok`), so the first healthy probe IS treated as a recovery
+    // edge and rescans the disk for whatever `pending` lost to the panic. Set
+    // `false` again whenever a segment strands.
+    let mut prev_health_ok = initial_health_ok;
 
     // Wall-clock anchor for the health-poll + stranded-segment rescan. Driving it
     // off elapsed time (not channel idleness) means recovery fires even under
@@ -2254,6 +2268,60 @@ mod tests {
             get_confirmed_path(&seg_b).exists(),
             "the drain must survive the panic and confirm the following segment"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── A respawned drain must rescan the disk ──────────────────────────────
+    //
+    // After a panic, `pending` is gone and the only in-run rescan is gated on
+    // the `now_ok && !prev_health_ok` health edge. Starting a respawn's
+    // `prev_health_ok` at `true` means that edge never fires again against a
+    // healthy sink, so a segment stranded before the panic (never sent through
+    // the channel — exactly like one left over from an earlier crash) is never
+    // rescanned in this run; it waits for a process restart while `drain_state`
+    // still reads `draining`. Exercised directly against `drain_thread`, using
+    // `initial_health_ok = false` to simulate exactly the state a respawn
+    // resumes into, rather than forcing a real panic through the supervisor.
+
+    #[test]
+    fn a_respawned_drain_rescans_the_disk_for_stranded_segments() {
+        let dir = tmp_dir("respawn_rescan");
+        // Sealed-but-unconfirmed on disk from the start — never sent through
+        // the channel, exactly like a segment left stranded by an earlier
+        // crash that a respawn must pick back up.
+        let stranded = make_sealed_segment(&dir, 0, &[b"stranded"]);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let metrics_for_thread = metrics.clone();
+        // A respawn starts here: no in-memory pending, healthy sink,
+        // initial_health_ok = false (what run_drain_supervised passes on every
+        // respawn). Run on its own thread so the test can keep `tx` alive long
+        // enough for the thread's wall-clock health poll to fire (an
+        // already-disconnected channel would make it exit before ever polling).
+        let handle = std::thread::spawn(move || {
+            drain_thread(rx, sink, config, metrics_for_thread, false);
+        });
+
+        // Bounded poll for the rescan's effect. health_poll_interval is 50 ms
+        // in fast_config, so this resolves quickly once the fix is in place;
+        // the cap just bounds the pre-fix (never happens) case.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !get_confirmed_path(&stranded).exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        assert!(
+            get_confirmed_path(&stranded).exists(),
+            "a respawn (initial_health_ok = false) must treat its first \
+             healthy probe as a down\u{2192}up edge and rescan the disk for \
+             stranded segments, or the backlog waits for a process restart"
+        );
+
         std::fs::remove_dir_all(dir).ok();
     }
 
