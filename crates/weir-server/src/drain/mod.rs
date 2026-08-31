@@ -212,12 +212,24 @@ pub fn spawn<S: Sink + 'static>(
 pub(crate) const MAX_DRAIN_RESPAWNS: u32 = 10;
 
 /// Runs [`drain_thread`] under panic supervision. A panic in the drain (a sink
-/// impl, `process_segment`, `confirm_and_delete`, …) is caught and the drain is
-/// respawned with a fresh runtime + dead-letter writer, reading from the same
-/// channel so buffered segments survive. Without this, a single panic would kill
-/// delivery permanently while producers keep being acked and the WAB grows
-/// unbounded. The segment in flight at panic time is not re-delivered this run,
-/// but it is durable on disk and replayed on the next restart.
+/// impl, `process_segment`, `confirm_and_delete`, a `DeadLetterWriter::open`
+/// failure, …) is caught and the drain is respawned with a fresh runtime +
+/// dead-letter writer, reading from the same channel so buffered segments
+/// survive. Without this, a single panic would kill delivery permanently while
+/// producers keep being acked and the WAB grows unbounded. The segment in
+/// flight at panic time is not re-delivered this run, but it is durable on
+/// disk and replayed on the next restart.
+///
+/// Behavioural consequence for a *permanently* unusable dead-letter directory
+/// (the case this exists for is a stray file sitting where the directory
+/// should be): `drain_state` only reaches `stopped` after the respawn ladder
+/// is exhausted, i.e. up to `MAX_DRAIN_RESPAWNS` (10) attempts with
+/// `100ms * attempts` backoff between them — roughly 4.5 s in the real
+/// default, not immediate. That is the intended cost of routing this failure
+/// through the same panic-supervision path as every other drain failure
+/// (rather than a special-cased instant bail-out); an operator or readiness
+/// script watching `drain_state`/`drain_panics` should expect that delay
+/// rather than reading it as a hang.
 fn run_drain_supervised<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
@@ -260,10 +272,11 @@ fn run_drain_supervised<S: Sink>(
         ));
     }
     // EVERY exit from the loop above lands here — there is no other way out of
-    // it. The `Ok(())` arm breaks (channel closed on shutdown, or `drain_thread`
-    // returning before its own loop ever starts, as it does when the dead-letter
-    // writer will not open), and the respawn-budget arm breaks. So one
-    // assignment covers all of them.
+    // it. The `Ok(())` arm breaks on a clean channel close (shutdown — all WAB
+    // flushers exited), and the respawn-budget arm breaks once panics (which
+    // now include a `DeadLetterWriter::open` failure — see `drain_thread` —
+    // as well as a sink impl / `process_segment` / `confirm_and_delete` panic)
+    // exhaust `MAX_DRAIN_RESPAWNS`. So one assignment covers both.
     //
     // `drain_state` is written ONLY by the drain thread, and it is pre-initialised
     // to `draining = 1`. Left untouched on exit it stays frozen there: an operator
@@ -2380,13 +2393,17 @@ mod tests {
     }
 
     /// The second permanent-stop path, and the one the whole-branch review
-    /// reproduced against a live daemon: `DeadLetterWriter::open` fails, so
-    /// `drain_thread` returns *cleanly* before its loop ever starts, which the
-    /// supervisor reads as `Ok(())` and breaks on. No panic, no respawn, no log
-    /// beyond one ERROR line — and, before this fix, no gauge movement either:
-    /// `drain_state` stayed pre-initialised at `draining = 1` forever while
-    /// nothing was delivered, which also kept `drain_is_healthy` (main.rs) true
-    /// and the WAB growth warning permanently silent.
+    /// reproduced against a live daemon: `DeadLetterWriter::open` fails. This
+    /// now `panic!`s (see `drain_thread`) rather than returning cleanly, so the
+    /// supervisor catches it, respawns, and — because this directory never
+    /// becomes openable — exhausts `max_respawns` and gives up: `drain_panics`
+    /// counts one per attempt, and only THEN does `drain_state` settle at
+    /// `stopped`. (Before this fix, `drain_thread` returned *cleanly* before
+    /// its loop ever started, the supervisor read that `Ok(())` as "the channel
+    /// closed, delivery is finished," and neither respawned nor counted a
+    /// panic; before an earlier, separate fix, `drain_state` also stayed
+    /// pre-initialised at `draining = 1` forever, which kept `drain_is_healthy`
+    /// (main.rs) true and the WAB growth warning permanently silent.)
     #[test]
     fn drain_supervisor_publishes_stopped_when_the_dead_letter_writer_cannot_open() {
         let dir = tmp_dir("drain_dl_open_fails");
