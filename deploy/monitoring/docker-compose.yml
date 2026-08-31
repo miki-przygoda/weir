@@ -209,7 +209,13 @@ services:
       WEIR_SOCKET: /run/weir/weir.sock
 
   prometheus:
-    image: prom/prometheus:latest
+    # PINNED. These were `:latest`, which means an upstream release can turn CI
+    # red with no change to this repository — and did, on 2026-08-31, when a
+    # docs-only commit failed the monitoring job. A build that can go red
+    # without a repo change can go green without one too, which makes the
+    # signal untrustworthy in both directions. Version chosen because the
+    # smoke test passes 13/13 against it. Bump deliberately, not by drift.
+    image: prom/prometheus:v3.14.0
     restart: unless-stopped
     depends_on:
       - weir
@@ -230,7 +236,8 @@ services:
       - ../prometheus/weir-alerts.yml:/etc/prometheus/weir-alerts.yml:ro
 
   grafana:
-    image: grafana/grafana:latest
+    # PINNED — see the note on the Prometheus image above.
+    image: grafana/grafana:13.2.0
     restart: unless-stopped
     depends_on:
       - prometheus
