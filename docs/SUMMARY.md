@@ -12,6 +12,7 @@
 
 - [Configuration reference](operations/configuration.md)
 - [TCP + mutual TLS](operations/tcp-mtls.md)
+- [Quarantine recovery](operations/quarantine-recovery.md)
 - [Monitoring](monitoring.md)
 
 # Protocol

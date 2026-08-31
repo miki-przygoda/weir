@@ -7,7 +7,7 @@ throughput ceiling.
 
 **As of 2.0.0 there are two durability tiers, `Durable` and `Buffered`, not
 three.** `Sync` and `Batched` are deprecated aliases for `Durable` — see the
-[2.0.0 CHANGELOG entry](../CHANGELOG.md). Some tables below still carry
+[2.0.0 CHANGELOG entry](https://github.com/miki-przygoda/weir/blob/main/CHANGELOG.md). Some tables below still carry
 `Sync` / `Batched` as separate rows; that is CI history collected before the
 collapse (or, for the latency suite, a scenario kept under its old tag for
 tag continuity — see `crates/weir-server/tests/load.rs`), not a claim that
