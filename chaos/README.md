@@ -90,11 +90,19 @@ does not build this project.
 > of 63,790 (~0.89 s). The ceiling, not the mean, is what characterises the
 > tier.
 >
-> **What it does NOT establish.** The run was `tier="U"`. A run is single-tier,
-> so **the Durable tier is still untested under power loss** — this measures
-> Buffered's exposure and the injector's reliability, and is not evidence for
-> weir's headline claim. WAB format v2 (zstd) is also uncovered: the run used
-> v1, which is 2.0.0's default.
+> **What that run alone did NOT establish** — both since closed, and left here
+> because the sequence is the point: a Buffered run measures Buffered, and
+> saying so is what made the two follow-ups obviously necessary.
+>
+> - ~~The Durable tier is untested under power loss.~~ **Closed 2026-08-30:**
+>   5,311 episodes over 24 h, 42,814,591 acked, **nothing lost**, and the WAB
+>   completely empty at shutdown.
+> - ~~WAB format v2 (zstd) is uncovered.~~ **Closed 2026-08-29:** a 40-episode
+>   controlled comparison differing only in `wab_compression`. The contract
+>   held; the exposure ceiling roughly tripled and went bimodal.
+>
+> **Phase 2 totals: 6,129 power-loss episodes, 687,712,504 acked records, zero
+> durability violations, zero weir defects.** Both tiers, both on-disk formats.
 
 The injector itself was validated on real hardware first:
 [`docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md`](../docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md).
