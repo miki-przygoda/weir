@@ -8,9 +8,10 @@ use std::{
 use tracing::{error, info, warn};
 
 use super::format::{
-    ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION_MAX_SUPPORTED,
-    SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SEGMENT_MAGIC, build_segment_footer, build_sentinel,
-    parse_confirmed, unix_nanos_now,
+    Compression, ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED,
+    FORMAT_VERSION_MAX_SUPPORTED, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
+    build_segment_footer, build_sentinel, max_stored_record_bytes, parse_confirmed,
+    parse_segment_header, unix_nanos_now,
 };
 use super::segment::{sealed_path_for, segment_counter_from_path, shard_id_from_path};
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
@@ -258,6 +259,21 @@ pub(crate) fn recover_segment(
         return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
+    // Recovery must accept exactly what the writer was allowed to write. Under
+    // Zstd a stored record may be up to compress_bound(MAX_PAYLOAD_HARD_CAP)
+    // (max_stored_record_bytes()), which exceeds the flat MAX_PAYLOAD_HARD_CAP
+    // by ~65 KiB — incompressible payloads land in that window (zstd -1 over
+    // 16 MiB of random data produces 16,777,614 bytes). Comparing against the
+    // flat cap regardless of compression turns an acked record into
+    // "corruption" and truncates every acked record behind it. Mirrors the
+    // writer's cap selection (segment.rs:139-142).
+    let header_meta = parse_segment_header(&header_buf)
+        .map_err(|e| quarantine_and_count(path, wab_dir, metrics, &e.to_string()))?;
+    let max_stored = match header_meta.compression {
+        Compression::None => MAX_PAYLOAD_HARD_CAP,
+        Compression::Zstd => max_stored_record_bytes(),
+    };
+
     // ── Replay records ───────────────────────────────────────────────────────
     // running_crc covers the header bytes plus every complete record that passes.
     let mut running_crc = crc32fast::Hasher::new();
@@ -346,7 +362,7 @@ pub(crate) fn recover_segment(
             break;
         }
 
-        if payload_len > MAX_PAYLOAD_HARD_CAP {
+        if payload_len > max_stored {
             // Oversized length field — corruption. If anything follows the
             // truncation point (i.e. more bytes than just this 4-byte field were
             // already on disk), those bytes were fully written and might hold
@@ -2202,6 +2218,67 @@ mod tests {
             1,
             "a mid-file-corrupt compressed segment must be quarantined"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Task 2 (2.0.1): recovery's payload cap must match the writer's under
+    /// Zstd. The writer bounds a STORED record by `max_stored_record_bytes()`
+    /// (`compress_bound(MAX_PAYLOAD_HARD_CAP)` ~= 16,843,025 — segment.rs:139),
+    /// but recovery used to compare against the flat `MAX_PAYLOAD_HARD_CAP`
+    /// (16,777,216) regardless of compression. `zstd -1` over 16 MiB of random
+    /// data produces 16,777,614 bytes — 398 over the flat cap but comfortably
+    /// under the writer's — so an incompressible (e.g. pre-compressed or
+    /// encrypted) payload can be written, fsynced, and acked `true`, then
+    /// quarantined as "corruption" by the very next crash recovery, along with
+    /// every acked record behind it.
+    ///
+    /// No real zstd frame is needed to exercise this: recovery's replay loop
+    /// never decompresses (see the "Compression (format v2)" note above) — it
+    /// only compares `payload_len` against the cap and checks the STORED
+    /// bytes' CRC. A hand-built stored payload of the right LENGTH drives the
+    /// real cap comparison without the cost of a real 16 MiB zstd compress.
+    #[test]
+    fn recovery_accepts_a_record_the_writer_was_allowed_to_write_under_zstd() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("zstd_cap_window");
+        let path = segment_path(&dir, 1);
+        // Above the flat MAX_PAYLOAD_HARD_CAP, but within the writer's Zstd
+        // bound (max_stored_record_bytes() ~= 16,843,025).
+        let stored_len = MAX_PAYLOAD_HARD_CAP + 400;
+        {
+            let mut seg = WabSegment::create(&path, 0, Compression::Zstd).unwrap();
+            seg.write_record(&vec![0xABu8; stored_len]).unwrap();
+        }
+
+        let metrics = noop_metrics();
+        let before = metrics.recovery_segments_quarantined.get();
+
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            before,
+            "a record the writer legitimately accepted must not be read as corruption"
+        );
+
+        // The hand-built payload isn't a real zstd frame, so we don't round-trip
+        // it through `SegmentReader` (which decompresses) — recovery's replay
+        // loop never decompresses either (see the "Compression (format v2)"
+        // note above). Instead confirm directly that the WHOLE record made it
+        // into the sealed file untruncated: header + (len+crc+payload) +
+        // sentinel + footer, with no bytes dropped from the stored payload.
+        assert!(sealed.exists());
+        let expected_len = SEGMENT_HEADER_LEN as u64
+            + 8
+            + stored_len as u64
+            + 4 // sentinel
+            + SEGMENT_FOOTER_LEN as u64;
+        assert_eq!(
+            fs::metadata(&sealed).unwrap().len(),
+            expected_len,
+            "the full stored record must survive recovery untruncated"
+        );
+
         fs::remove_dir_all(dir).ok();
     }
 
