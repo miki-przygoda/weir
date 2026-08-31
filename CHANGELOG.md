@@ -13,7 +13,7 @@ protocol** below.
 
 ---
 
-## [2.0.0] - 2026-08-26
+## [2.0.0] - 2026-08-31
 
 **This is a major release.** The `Sink` trait changes shape and `Durability`
 collapses from three tiers to two. The wire protocol is unaffected, so **no
@@ -75,6 +75,42 @@ type, needs a small source change — see Breaking below.
   available under MIT — this change is not retroactive.
 
 ### Added
+
+- **The durability tiers are now measured against real power loss, not just
+  described.** Every prior durability result came from `kill -9`, which does
+  **not** lose the page cache — so the central claim had never met the fault it
+  is written for. 6,129 simulated power-loss episodes over 687,712,504
+  acknowledged records, injected with `dm-flakey drop_writes` on ext4, with a
+  per-episode canary confirming the fault actually fired in every one. Full
+  method and results:
+  `docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`.
+
+  - **`Durable` lost nothing across 5,311 power cuts** (42,814,591 acked
+    records, 24 hours). No I1 violation, no I2 leak, and the WAB was completely
+    empty at shutdown — nothing quarantined, unconfirmed, or dead-lettered,
+    because it has already `fdatasync`ed everything it acknowledged. Stated as
+    a bound rather than proof: this puts the per-episode violation rate under
+    ~0.06% at 95% confidence, on one machine, one filesystem, one kernel.
+
+  - **`Buffered`'s exposure now has a number.** Loss is *uniformly distributed*
+    between zero and one writeback interval — mean and standard deviation both
+    land within 2% of a uniform distribution's `max/2` and `max/√12`. On the
+    reference hardware at ~72,000 records/s that is a **ceiling of 1.76 seconds
+    of acknowledged writes**, median 0.89 s. The ceiling, not the median, is
+    the number to size risk against. What generalises is the shape: one
+    writeback interval of your throughput, which does not grow with uptime or
+    queue depth.
+
+- **`wab_compression = "zstd"` roughly triples `Buffered`'s power-loss
+  exposure.** Correctness is unaffected — zero violations, and recovery parses
+  a torn zstd frame as reliably as a torn plain record — but the loss
+  distribution stops being uniform and becomes **bimodal**, with the ceiling
+  rising from 124,897 records (~1.8 s) to 449,876 (~5.7 s) in a 40-episode
+  controlled comparison. Compression packs more records behind each unflushed
+  byte, so a cut that catches the larger unit takes proportionally more with
+  it. Treat the multiplier as indicative: the load generator's payload is far
+  more compressible than real data, so the mechanism is demonstrated and its
+  magnitude on a realistic workload is not. `Durable` is unaffected either way.
 
 - **`weir-sink-sdk` — `SinkBatch` and `DedupToken`.** Every sink now receives a
   content-derived, batch-scoped idempotency handle alongside its records:
