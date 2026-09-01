@@ -30,6 +30,22 @@ drop a record it has acked?* If you can't rule that out, the change isn't ready.
 - **Docker** (with the `docker compose` plugin) — only for the optional
   sink-integration and monitoring suites below.
 
+## Recommended: run CI locally before you push
+
+The gate below is the quick subset to run while iterating. Before pushing, it is
+worth running **everything CI runs**, in Docker, against the same toolchain — it
+catches the red builds that cost a ten-minute round trip and Actions minutes to
+discover, and it catches the ones this gate structurally cannot see.
+
+[`deploy/ci-local/README.md`](deploy/ci-local/README.md) describes how, in about
+a page: parse `.github/workflows/ci.yml` and execute its own `run:` steps rather
+than restating them, so the local run cannot drift from CI. It also lists the
+traps worth knowing before you start — the two kinds of `uses:` step and how
+conflating them produces a runner that passes having checked nothing, plus the
+arm64, stale-artifact and toolchain-version issues that bite in practice.
+
+No tooling is committed for this, and that note explains why.
+
 ## The pre-PR gate
 
 Run this before opening a PR. It is exactly what CI enforces (`.github/workflows/ci.yml`),
