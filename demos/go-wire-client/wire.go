@@ -52,17 +52,18 @@ func (m MessageType) String() string {
 type Durability uint8
 
 const (
-	Sync     Durability = 0x01
-	Batched  Durability = 0x02
+	Durable  Durability = 0x01
+	Batched  Durability = 0x02 // retired; still decodes, permissively, to Durable
 	Buffered Durability = 0x03
 )
 
 func (d Durability) String() string {
 	switch d {
-	case Sync:
-		return "Sync"
-	case Batched:
-		return "Batched"
+	case Durable, Batched:
+		// 0x02 (the retired Batched byte) canonicalises to the same label as
+		// 0x01 on decode — see docs/wire_protocol.md "Durability tiers" and
+		// crates/weir-core/src/durability.rs's permissive TryFrom.
+		return "Durable"
 	case Buffered:
 		return "Buffered"
 	default:
@@ -166,12 +167,12 @@ func EncodePush(payload []byte, d Durability) []byte {
 	})
 }
 
-// EncodeHealthCheck builds a zero-payload HealthCheck (Sync filler by convention).
+// EncodeHealthCheck builds a zero-payload HealthCheck (Durable filler by convention).
 func EncodeHealthCheck() []byte {
 	return EncodeFrame(Frame{
 		Version:     WireVersion,
 		MessageType: MsgHealthCheck,
-		Durability:  Sync,
+		Durability:  Durable,
 		Flags:       0,
 		Payload:     nil,
 	})
@@ -227,7 +228,7 @@ func DecodeFrame(buf []byte) (Frame, error) {
 	}
 	d := Durability(buf[6])
 	switch d {
-	case Sync, Batched, Buffered:
+	case Durable, Batched, Buffered:
 	default:
 		return Frame{}, ErrUnknownDurability
 	}

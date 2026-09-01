@@ -73,9 +73,13 @@ public final class Wire {
         }
     }
 
-    /** Durability tier bytes (see spec "Durability tiers" table). */
+    /**
+     * Durability tier bytes (see spec "Durability tiers" table). {@code BATCHED}
+     * (0x02) is retired: still a valid wire byte that permissively decodes to
+     * {@code DURABLE}, but a conformant encoder never emits it.
+     */
     public enum Durability {
-        SYNC((byte) 0x01),
+        DURABLE((byte) 0x01),
         BATCHED((byte) 0x02),
         BUFFERED((byte) 0x03);
 

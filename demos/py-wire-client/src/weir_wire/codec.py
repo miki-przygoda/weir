@@ -40,7 +40,10 @@ class MessageType(enum.IntEnum):
 
 
 class Durability(enum.IntEnum):
-    SYNC = 0x01
+    DURABLE = 0x01
+    # Retired: still a valid wire byte that permissively decodes to DURABLE,
+    # but a conformant encoder never emits it. See docs/wire_protocol.md
+    # "Durability tiers".
     BATCHED = 0x02
     BUFFERED = 0x03
 

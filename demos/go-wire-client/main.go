@@ -42,7 +42,7 @@ func main() {
 	}
 
 	// --- Happy path: a valid Push at each durability tier ---
-	for _, d := range []Durability{Sync, Batched, Buffered} {
+	for _, d := range []Durability{Durable, Batched, Buffered} {
 		add(runOnce("push_"+d.String(), EncodePush([]byte("hello-"+d.String()), d),
 			"Ack", false))
 	}
@@ -51,14 +51,14 @@ func main() {
 	add(runHealthCheck())
 
 	// --- EmptyPayload (0x07): zero-length Push payload, closes conn ---
-	add(runOnce("empty_payload", EncodePush(nil, Sync), "Nack:EmptyPayload", true))
+	add(runOnce("empty_payload", EncodePush(nil, Durable), "Nack:EmptyPayload", true))
 
 	// --- ReservedFlagsSet (0x09): flags byte nonzero, closes conn ---
-	flagsFrame := EncodeFrame(Frame{Version: WireVersion, MessageType: MsgPush, Durability: Sync, Flags: 0x01, Payload: []byte("x")})
+	flagsFrame := EncodeFrame(Frame{Version: WireVersion, MessageType: MsgPush, Durability: Durable, Flags: 0x01, Payload: []byte("x")})
 	add(runOnce("reserved_flags", flagsFrame, "Nack:ReservedFlagsSet", true))
 
 	// --- BadMagic (0x01): corrupt first 4 bytes, closes conn ---
-	bad := EncodePush([]byte("data"), Sync)
+	bad := EncodePush([]byte("data"), Durable)
 	bad[0] = 'X'
 	bad[1] = 'X' // recompute header CRC so we isolate magic, not CRC
 	bad[2] = 'X'
@@ -67,23 +67,23 @@ func main() {
 	add(runOnce("bad_magic", bad, "Nack:BadMagic", true))
 
 	// --- VersionMismatch (0x02): version byte != 1, carries daemon version ---
-	ver := EncodePush([]byte("data"), Sync)
+	ver := EncodePush([]byte("data"), Durable)
 	ver[4] = 0x02
 	binary.LittleEndian.PutUint32(ver[12:16], crc(ver[0:12]))
 	add(runVersionMismatch("version_mismatch", ver))
 
 	// --- BadHeaderCrc (0x03): corrupt the header CRC field, closes conn ---
-	hc := EncodePush([]byte("data"), Sync)
+	hc := EncodePush([]byte("data"), Durable)
 	binary.LittleEndian.PutUint32(hc[12:16], crc(hc[0:12])^0xFFFFFFFF)
 	add(runOnce("bad_header_crc", hc, "Nack:BadHeaderCrc", true))
 
 	// --- BadPayloadCrc (0x05): corrupt trailing payload CRC, closes conn ---
-	pc := EncodePush([]byte("data"), Sync)
+	pc := EncodePush([]byte("data"), Durable)
 	pc[len(pc)-1] ^= 0xFF
 	add(runOnce("bad_payload_crc", pc, "Nack:BadPayloadCrc", true))
 
 	// --- UnknownMessage (0x08) via unknown message_type, closes conn ---
-	umt := EncodeFrame(Frame{Version: WireVersion, MessageType: MessageType(0x7F), Durability: Sync, Flags: 0, Payload: []byte("x")})
+	umt := EncodeFrame(Frame{Version: WireVersion, MessageType: MessageType(0x7F), Durability: Durable, Flags: 0, Payload: []byte("x")})
 	add(runOnce("unknown_message_type", umt, "Nack:UnknownMessage", true))
 
 	// --- UnknownMessage (0x08) via unknown durability, closes conn ---
@@ -91,7 +91,7 @@ func main() {
 	add(runOnce("unknown_durability", udur, "Nack:UnknownMessage", true))
 
 	// --- UnknownMessage (0x08): client SENDS a daemon->client type (Ack) ---
-	sendAck := EncodeFrame(Frame{Version: WireVersion, MessageType: MsgAck, Durability: Sync, Flags: 0, Payload: nil})
+	sendAck := EncodeFrame(Frame{Version: WireVersion, MessageType: MsgAck, Durability: Durable, Flags: 0, Payload: nil})
 	add(runOnce("client_sends_ack", sendAck, "Nack:UnknownMessage", true))
 
 	// --- PayloadTooLarge (0x04): header declares len > hard cap, closes conn.
@@ -220,7 +220,7 @@ func runPayloadTooLarge() caseResult {
 	copy(hdr[0:4], magic[:])
 	hdr[4] = WireVersion
 	hdr[5] = byte(MsgPush)
-	hdr[6] = byte(Sync)
+	hdr[6] = byte(Durable)
 	hdr[7] = 0
 	binary.LittleEndian.PutUint32(hdr[8:12], MaxPayloadHardCap+1)
 	binary.LittleEndian.PutUint32(hdr[12:16], crc(hdr[0:12]))
@@ -252,8 +252,8 @@ func runPipeline() caseResult {
 	defer conn.Close()
 	c := &Client{conn: conn}
 	var w bytes.Buffer
-	w.Write(EncodePush([]byte("p1"), Sync))
-	w.Write(EncodePush([]byte("p2"), Sync))
+	w.Write(EncodePush([]byte("p1"), Durable))
+	w.Write(EncodePush([]byte("p2"), Durable))
 	if _, err := conn.Write(w.Bytes()); err != nil {
 		r.got = "write-err:" + err.Error()
 		return r

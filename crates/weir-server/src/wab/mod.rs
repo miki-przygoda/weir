@@ -883,7 +883,15 @@ fn fsync_observed(
                 "WAB fsync failed — durability hazard; the record cannot be \
                  guaranteed durable on stable storage. Producer receives \
                  Nack(InternalError); operator should investigate the \
-                 underlying disk/filesystem."
+                 underlying disk/filesystem. NOTE: the active segment is \
+                 retired (not sealed) so no later batch can be acked over the \
+                 hole this left. Nothing at runtime rescans an unsealed .wab, \
+                 so any already-acked, already-fsynced records still in it — \
+                 up to wab_segment_max_bytes, 256 MiB by default — are \
+                 STRANDED on disk until the daemon restarts, when crash \
+                 recovery seals and delivers them. Stranded but safe: no ack \
+                 is falsified, and delivery is deferred, not lost. Restart the \
+                 daemon once the storage fault is cleared to release them."
             );
             metrics.wab_fsync_failures.inc();
             false

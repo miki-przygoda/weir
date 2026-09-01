@@ -8,9 +8,10 @@ use std::{
 use tracing::{error, info, warn};
 
 use super::format::{
-    ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED, FORMAT_VERSION_MAX_SUPPORTED,
-    SEGMENT_HEADER_LEN, SEGMENT_MAGIC, build_segment_footer, build_sentinel, parse_confirmed,
-    unix_nanos_now,
+    Compression, ConfirmedParseError, EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED,
+    FORMAT_VERSION_MAX_SUPPORTED, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
+    build_segment_footer, build_sentinel, max_stored_record_bytes, parse_confirmed,
+    parse_segment_footer, parse_segment_header, unix_nanos_now,
 };
 use super::segment::{sealed_path_for, segment_counter_from_path, shard_id_from_path};
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
@@ -258,6 +259,21 @@ pub(crate) fn recover_segment(
         return Err(quarantine_and_count(path, wab_dir, metrics, &reason));
     }
 
+    // Recovery must accept exactly what the writer was allowed to write. Under
+    // Zstd a stored record may be up to compress_bound(MAX_PAYLOAD_HARD_CAP)
+    // (max_stored_record_bytes()), which exceeds the flat MAX_PAYLOAD_HARD_CAP
+    // by ~65 KiB — incompressible payloads land in that window (zstd -1 over
+    // 16 MiB of random data produces 16,777,614 bytes). Comparing against the
+    // flat cap regardless of compression turns an acked record into
+    // "corruption" and truncates every acked record behind it. Mirrors the
+    // writer's cap selection (segment.rs:139-142).
+    let header_meta = parse_segment_header(&header_buf)
+        .map_err(|e| quarantine_and_count(path, wab_dir, metrics, &e.to_string()))?;
+    let max_stored = match header_meta.compression {
+        Compression::None => MAX_PAYLOAD_HARD_CAP,
+        Compression::Zstd => max_stored_record_bytes(),
+    };
+
     // ── Replay records ───────────────────────────────────────────────────────
     // running_crc covers the header bytes plus every complete record that passes.
     let mut running_crc = crc32fast::Hasher::new();
@@ -319,11 +335,126 @@ pub(crate) fn recover_segment(
         // This shouldn't appear in a crash recovery (the file was never sealed),
         // but handle it gracefully in case of partial seals.
         if payload_len == 0 {
-            info!(path = %path.display(), records = record_count, "found sentinel during recovery — file was partially sealed");
+            // Is this zero a REAL seal, or corruption sitting in front of acked
+            // records? Truncating here destroys everything behind it AND rewrites
+            // the footer to match, so the drain's record-count cross-check cannot
+            // see the loss — the tail has to be judged before we do that. Both
+            // neighbouring branches (oversized length, CRC mismatch) quarantine
+            // on the same reasoning.
+            //
+            // SIZE ALONE CANNOT DECIDE IT. 2.0.1's first attempt quarantined only
+            // a tail LONGER than `4 + SEGMENT_FOOTER_LEN`, on the theory that a
+            // real partial seal leaves at most that. True, but not sufficient: a
+            // corrupt tail can be short too. The spec's own reproduction — three
+            // 7-byte records, middle length-prefix zeroed — leaves 26 trailing
+            // bytes, under the threshold, and was still silently truncated (F1).
+            //
+            // CONTENT decides it. `finalize_to_disk` (segment.rs) writes exactly
+            // `sentinel || 32-byte footer` and nothing else, and the footer's
+            // record_count / data_bytes / file_crc32 describe precisely the
+            // records this replay loop just accumulated. So a genuine seal agrees
+            // with the replay, byte for byte; corruption does not agree with
+            // itself. We accept exactly two shapes:
+            //
+            //   * NO trailing bytes — a crash between the sentinel write and the
+            //     footer write. Unambiguous: there is no tail, so nothing can be
+            //     lost by truncating at the sentinel.
+            //   * EXACTLY a footer that cross-checks — a crash between
+            //     `finalize_to_disk`'s fsync and `seal`'s rename, which leaves a
+            //     fully-formed segment at the `.wab` path. Re-seal it cleanly.
+            //
+            // Everything else — a short/torn tail we cannot parse as a footer, a
+            // footer-sized tail that disagrees, or a tail too long to be a footer
+            // at all — is quarantined. That is deliberately asymmetric: a
+            // quarantine is a COPY (the valid prefix is still sealed and
+            // delivered) costing an operator an ERROR line and some disk, while a
+            // wrong "clean seal" verdict destroys acked records with no trace.
+            let field_start = valid_end_offset;
+            let sentinel_end = field_start + 4;
+            // Stat the ALREADY-OPEN handle, not the path. `fs::metadata(path)`
+            // re-resolves the name and follows symlinks, which defeats the
+            // O_NOFOLLOW guard this function opened the file with (S26) and
+            // reintroduces a TOCTOU window between the open and this call. The
+            // sibling oversized-length branch below already does it this way.
+            match reader.get_ref().metadata() {
+                Ok(m) => {
+                    let trailing = m.len().saturating_sub(sentinel_end);
+                    if trailing == 0 {
+                        info!(path = %path.display(), records = record_count,
+                              "found sentinel during recovery — file was partially sealed \
+                               (crash between the sentinel and the footer)");
+                    } else if trailing == SEGMENT_FOOTER_LEN as u64 {
+                        // Read the trailing bytes and cross-check them against
+                        // the replay. `running_crc` is cloned, not consumed: the
+                        // rebuild below finalises the same hasher.
+                        let mut footer_buf = [0u8; SEGMENT_FOOTER_LEN];
+                        match reader
+                            .read_exact(&mut footer_buf)
+                            .map_err(|e| e.to_string())
+                            .and_then(|()| {
+                                parse_segment_footer(&footer_buf).map_err(|e| e.to_string())
+                            }) {
+                            Ok(footer) => {
+                                let replay_crc = running_crc.clone().finalize();
+                                if footer.record_count == record_count
+                                    && footer.data_bytes == data_bytes
+                                    && footer.file_crc32 == replay_crc
+                                {
+                                    info!(path = %path.display(), records = record_count,
+                                          "found sentinel during recovery — file was fully \
+                                           sealed but never renamed; footer cross-checks \
+                                           against the replayed records");
+                                } else {
+                                    quarantine_reason = Some(format!(
+                                        "zero length prefix at offset {field_start} followed by a \
+                                         footer-sized tail that CONTRADICTS the replayed records \
+                                         (footer says record_count={} data_bytes={} \
+                                         file_crc32={:#010x}; replay found record_count={record_count} \
+                                         data_bytes={data_bytes} file_crc32={replay_crc:#010x}) — \
+                                         not a partial seal",
+                                        footer.record_count, footer.data_bytes, footer.file_crc32
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                quarantine_reason = Some(format!(
+                                    "zero length prefix at offset {field_start} with a \
+                                     footer-sized tail that could not be read or parsed as a \
+                                     footer ({e}) — cannot confirm a partial seal"
+                                ));
+                            }
+                        }
+                    } else {
+                        quarantine_reason = Some(format!(
+                            "zero length prefix at offset {field_start} with {trailing} trailing \
+                             byte(s) — a genuine seal leaves either none (crash before the \
+                             footer) or exactly {SEGMENT_FOOTER_LEN} (the footer), so these \
+                             bytes are not a partial seal"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    // Same fail-closed reasoning as the oversized-length branch:
+                    // if we cannot stat we cannot rule out a live tail, so
+                    // preserve the segment and surface the ACTUAL error rather
+                    // than inventing a byte count from a sentinel file length.
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not stat segment at a mid-file sentinel; conservatively preserving \
+                         the segment in quarantine rather than risk silently dropping a trailing tail"
+                    );
+                    quarantine_reason = Some(format!(
+                        "zero length prefix at offset {field_start} and metadata() failed ({e}); \
+                         cannot confirm a partial seal or rule out a trailing tail — preserving \
+                         conservatively"
+                    ));
+                }
+            }
             break;
         }
 
-        if payload_len > MAX_PAYLOAD_HARD_CAP {
+        if payload_len > max_stored {
             // Oversized length field — corruption. If anything follows the
             // truncation point (i.e. more bytes than just this 4-byte field were
             // already on disk), those bytes were fully written and might hold
@@ -1512,6 +1643,25 @@ mod tests {
         f.flush().unwrap();
     }
 
+    /// Zeroes the 4-byte length prefix of record `index` (0-based) of a
+    /// segment written by `make_segment`, turning it into a mid-file sentinel
+    /// in place while leaving every other byte — including any records
+    /// behind it — untouched. Walks the same header + (len, crc, payload)*
+    /// layout `recover_segment` parses, so it finds the field regardless of
+    /// each record's size.
+    fn zero_length_prefix_of_record(path: &Path, index: usize) {
+        let bytes = fs::read(path).unwrap();
+        let mut offset = SEGMENT_HEADER_LEN;
+        for _ in 0..index {
+            let len_buf: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+            let payload_len = u32::from_le_bytes(len_buf) as usize;
+            offset += 8 + payload_len;
+        }
+        let mut f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(offset as u64)).unwrap();
+        f.write_all(&[0u8; 4]).unwrap();
+    }
+
     /// F17 boundary: a record whose length field is exactly MAX_PAYLOAD_HARD_CAP
     /// is a LEGAL record and must be recovered, not truncated. Guards the `>` in
     /// the oversized-payload_len check against a `>=` off-by-one that would
@@ -1681,6 +1831,242 @@ mod tests {
             "recovery must stop at the sentinel, recovering only pre-sentinel records"
         );
         assert_eq!(recovered[0], b"before-sentinel" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Task 1 (2.0.1): a zero length-prefix sentinel is ALWAYS mid-file
+    /// corruption when live records sit behind it, never a partial seal —
+    /// `seal()` consumes the `WabSegment` handle (segment.rs:383) and
+    /// `write_record` rejects empty payloads at two layers (segment.rs:117,
+    /// :546), so nothing can write a real record after a sentinel that this
+    /// process itself wrote. A sentinel with a full record behind it means
+    /// lost writeback or bit-rot, and must quarantine like its CRC-mismatch
+    /// and oversized-length siblings — not truncate the tail away with no
+    /// trace, which is what silently destroyed acked records here.
+    #[test]
+    fn mid_file_sentinel_with_a_live_tail_is_quarantined_not_truncated() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        let dir = tmp_dir("sentinel_live_tail");
+        // B and C are sized so the corrupted tail (B's leftover crc+payload,
+        // plus C's whole record) is far longer than a footer — the LONG-tail
+        // shape. F1's sibling test covers the short-tail shape the original
+        // size-only rule let through; size no longer decides either of them,
+        // but keeping both shapes covered guards the branch end to end.
+        let path = make_segment(
+            &dir,
+            0,
+            &[
+                b"A-acked",
+                b"B-acked-with-enough-bytes-to-clear-the-footer-threshold",
+                b"C-acked-with-enough-bytes-to-clear-the-footer-threshold",
+            ],
+        );
+
+        // Zero B's 4-byte length prefix in place, leaving C intact behind it.
+        zero_length_prefix_of_record(&path, 1);
+        let on_disk = fs::read(&path).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "a mid-file sentinel with a live tail must quarantine, not truncate"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1
+        );
+
+        let q_dir = dir.join("quarantine");
+        let q_entry = fs::read_dir(&q_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .next()
+            .expect("a quarantine copy must exist — C-acked must not be lost with no trace");
+        assert_eq!(
+            fs::read(&q_entry).unwrap(),
+            on_disk,
+            "the quarantine copy must hold the full original segment bytes, including C-acked, \
+             for forensics — the original bytes must be preserved, not truncated away"
+        );
+
+        // The valid prefix in front of the sentinel is still recovered and
+        // sealed for delivery.
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the pre-sentinel record A is delivered"
+        );
+        assert_eq!(recovered[0], b"A-acked" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F1 (final 2.0.1 review): the AMBIGUOUS BAND, which Task 1 left open.
+    ///
+    /// Task 1 quarantined a mid-file zero length-prefix only when the trailing
+    /// bytes exceeded `4 + SEGMENT_FOOTER_LEN` (36) — "the most a real partial
+    /// seal could leave". At or below 36 the original silent truncate stood, so
+    /// the spec's OWN reproduction still reproduced: three 7-byte records with
+    /// the middle length-prefix zeroed leaves a 26-byte tail (B's orphaned
+    /// crc+payload, 11, plus C's whole 15-byte record), which is under the
+    /// threshold. Recovery truncated C away and rewrote the footer to match, so
+    /// the drain's record-count cross-check could not see the loss: a
+    /// CRC-correct, acked-durable record destroyed with no trace.
+    ///
+    /// Size is not what distinguishes a partial seal from corruption — CONTENT
+    /// is. A genuine seal writes `sentinel + a 32-byte footer whose
+    /// record_count / data_bytes / file_crc32 describe exactly the records the
+    /// replay loop just accumulated`. Corruption does not agree with itself.
+    /// This fixture is the spec's original one, byte for byte.
+    #[test]
+    fn mid_file_sentinel_below_the_footer_threshold_is_quarantined_not_truncated() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        let dir = tmp_dir("sentinel_small_tail");
+        let path = make_segment(&dir, 0, &[b"A-acked", b"B-acked", b"C-acked"]);
+
+        // Zero B's 4-byte length prefix in place, leaving C intact behind it.
+        // Trailing bytes after the zeroed field: 26 — under the old 36-byte
+        // threshold, so pre-fix this took the silent-truncate branch.
+        zero_length_prefix_of_record(&path, 1);
+        let on_disk = fs::read(&path).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "a mid-file sentinel whose tail is too SMALL to hold a footer is still corruption — \
+             C-acked must not be destroyed silently"
+        );
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1
+        );
+
+        let q_dir = dir.join("quarantine");
+        let q_entry = fs::read_dir(&q_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .next()
+            .expect("a quarantine copy must exist — C-acked must not be lost with no trace");
+        assert_eq!(
+            fs::read(&q_entry).unwrap(),
+            on_disk,
+            "the quarantine copy must hold the full original segment bytes, including C-acked"
+        );
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "only the pre-sentinel record A is delivered"
+        );
+        assert_eq!(recovered[0], b"A-acked" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F1: the complementary half — a segment that crashed between
+    /// `finalize_to_disk`'s fsync and `seal`'s rename is a GENUINE complete
+    /// seal sitting at the `.wab` path. Its sentinel is followed by exactly a
+    /// 32-byte footer that agrees with the replayed records, so recovery must
+    /// re-seal it cleanly with NO quarantine. This is the case the content
+    /// cross-check has to get right, or every crash in that window turns into
+    /// a spurious quarantine + ERROR during recovery.
+    #[test]
+    fn a_complete_footer_that_matches_the_replay_is_a_clean_partial_seal() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("sentinel_full_footer");
+        let path = segment_path(&dir, 1);
+        {
+            let seg = {
+                let mut s = WabSegment::create(&path, 0, Compression::None).unwrap();
+                s.write_record(b"A-acked").unwrap();
+                s.write_record(b"B-acked").unwrap();
+                s
+            };
+            // Sentinel + footer + fsync, but NOT the rename: exactly the crash
+            // window `finalize_to_disk` documents.
+            seg.finalize_to_disk().unwrap();
+        }
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            0,
+            "a footer that agrees with the replayed records is a real seal, not corruption"
+        );
+        assert!(
+            !dir.join("quarantine").exists(),
+            "no quarantine directory should be created for a genuine partial seal"
+        );
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0], b"A-acked" as &[u8]);
+        assert_eq!(recovered[1], b"B-acked" as &[u8]);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// F1: a 32-byte tail is not a free pass either. If the trailing bytes are
+    /// footer-SIZED but disagree with what the replay loop accumulated, they
+    /// are not a footer — they are a corrupt record's remains that happen to
+    /// be 32 bytes long. Quarantine.
+    #[test]
+    fn a_footer_sized_tail_that_disagrees_with_the_replay_is_quarantined() {
+        let dir = tmp_dir("sentinel_bad_footer");
+        let path = make_segment(&dir, 0, &[b"A-acked"]);
+        // Sentinel + a footer claiming 99 records / 9999 bytes / a bogus CRC.
+        append_raw(&path, &[0u8; 4]);
+        append_raw(
+            &path,
+            &crate::wab::format::build_segment_footer(99, 9999, 0xdead_beef, 1),
+        );
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "a footer that contradicts the replayed records must quarantine"
+        );
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -2079,6 +2465,67 @@ mod tests {
             1,
             "a mid-file-corrupt compressed segment must be quarantined"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Task 2 (2.0.1): recovery's payload cap must match the writer's under
+    /// Zstd. The writer bounds a STORED record by `max_stored_record_bytes()`
+    /// (`compress_bound(MAX_PAYLOAD_HARD_CAP)` ~= 16,843,025 — segment.rs:139),
+    /// but recovery used to compare against the flat `MAX_PAYLOAD_HARD_CAP`
+    /// (16,777,216) regardless of compression. `zstd -1` over 16 MiB of random
+    /// data produces 16,777,614 bytes — 398 over the flat cap but comfortably
+    /// under the writer's — so an incompressible (e.g. pre-compressed or
+    /// encrypted) payload can be written, fsynced, and acked `true`, then
+    /// quarantined as "corruption" by the very next crash recovery, along with
+    /// every acked record behind it.
+    ///
+    /// No real zstd frame is needed to exercise this: recovery's replay loop
+    /// never decompresses (see the "Compression (format v2)" note above) — it
+    /// only compares `payload_len` against the cap and checks the STORED
+    /// bytes' CRC. A hand-built stored payload of the right LENGTH drives the
+    /// real cap comparison without the cost of a real 16 MiB zstd compress.
+    #[test]
+    fn recovery_accepts_a_record_the_writer_was_allowed_to_write_under_zstd() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        let dir = tmp_dir("zstd_cap_window");
+        let path = segment_path(&dir, 1);
+        // Above the flat MAX_PAYLOAD_HARD_CAP, but within the writer's Zstd
+        // bound (max_stored_record_bytes() ~= 16,843,025).
+        let stored_len = MAX_PAYLOAD_HARD_CAP + 400;
+        {
+            let mut seg = WabSegment::create(&path, 0, Compression::Zstd).unwrap();
+            seg.write_record(&vec![0xABu8; stored_len]).unwrap();
+        }
+
+        let metrics = noop_metrics();
+        let before = metrics.recovery_segments_quarantined.get();
+
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            before,
+            "a record the writer legitimately accepted must not be read as corruption"
+        );
+
+        // The hand-built payload isn't a real zstd frame, so we don't round-trip
+        // it through `SegmentReader` (which decompresses) — recovery's replay
+        // loop never decompresses either (see the "Compression (format v2)"
+        // note above). Instead confirm directly that the WHOLE record made it
+        // into the sealed file untruncated: header + (len+crc+payload) +
+        // sentinel + footer, with no bytes dropped from the stored payload.
+        assert!(sealed.exists());
+        let expected_len = SEGMENT_HEADER_LEN as u64
+            + 8
+            + stored_len as u64
+            + 4 // sentinel
+            + SEGMENT_FOOTER_LEN as u64;
+        assert_eq!(
+            fs::metadata(&sealed).unwrap().len(),
+            expected_len,
+            "the full stored record must survive recovery untruncated"
+        );
+
         fs::remove_dir_all(dir).ok();
     }
 

@@ -26,7 +26,7 @@ def main():
         for i in range(5):
             payload = f'{{"event": "signup", "user": {i}}}'.encode()
             try:
-                r = c.push(payload, Durability.SYNC)
+                r = c.push(payload, Durability.DURABLE)
                 print(f"  push #{i}: acked={r.acked} tier={r.durability_used.name}")
             except NackError as e:
                 # retryable tells the caller whether a fresh-connection retry is sane

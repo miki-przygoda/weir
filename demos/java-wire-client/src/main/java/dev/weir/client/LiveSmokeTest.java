@@ -74,7 +74,7 @@ public final class LiveSmokeTest {
         try (WeirClient c = WeirClient.connect(socket)) {
             boolean threw = false;
             try {
-                c.push(new byte[0], Wire.Durability.SYNC);
+                c.push(new byte[0], Wire.Durability.DURABLE);
             } catch (ProtocolException pe) {
                 threw = true;
             }
@@ -97,7 +97,7 @@ public final class LiveSmokeTest {
         System.arraycopy(Wire.MAGIC, 0, b, 0, 4);
         b[4] = (byte) Wire.WIRE_VERSION;
         b[5] = Wire.MessageType.PUSH.code;
-        b[6] = Wire.Durability.SYNC.code;
+        b[6] = Wire.Durability.DURABLE.code;
         b[7] = (byte) (flags & 0xFF);
         putIntLE(b, 8, payload.length);
         putIntLE(b, 12, (int) Frame.crc32(b, 0, 12));
@@ -116,7 +116,7 @@ public final class LiveSmokeTest {
         System.arraycopy(Wire.MAGIC, 0, b, 0, 4);
         b[4] = (byte) Wire.WIRE_VERSION;
         b[5] = Wire.MessageType.PUSH.code;
-        b[6] = Wire.Durability.SYNC.code;
+        b[6] = Wire.Durability.DURABLE.code;
         b[7] = 0;
         putIntLE(b, 8, Wire.MAX_PAYLOAD_HARD_CAP + 1);
         putIntLE(b, 12, (int) Frame.crc32(b, 0, 12));

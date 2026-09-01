@@ -14,7 +14,7 @@ vectors, the way a polyglot developer would.
 
 The example (`examples/produce.py`) demonstrates **event logging**: it health-checks
 the daemon, then pushes a handful of JSON `signup` events
-(`{"event": "signup", "user": N}`) at Sync durability. The payload is opaque to
+(`{"event": "signup", "user": N}`) at Durable durability. The payload is opaque to
 weir — JSON is the producer's choice; an MCU would push packed binary, a SIEM
 client would push something else. weir just durably buffers the bytes.
 
@@ -30,7 +30,7 @@ Offset  Size  Field          Value
  0       4    magic          b"WEIR"
  4       1    version        WIRE_VERSION = 1
  5       1    message_type    Push=0x01 / Ack=0x02 / Nack=0x03 / HealthCheck=0x04 / HealthCheckResponse=0x05
- 6       1    durability      Sync=0x01 / Batched=0x02 / Buffered=0x03
+ 6       1    durability      Durable=0x01 / Batched=0x02 (retired, decodes to Durable) / Buffered=0x03
  7       1    flags          reserved; must be 0 on write
  8       4    payload_len    u32 little-endian (struct "<I")
 12       4    header_crc32   CRC32 over bytes [0..12], little-endian
@@ -44,7 +44,7 @@ zlib/PNG variant, **not** CRC-32C. The header CRC covers exactly bytes `[0..12]`
 
 ### The Push → Ack round-trip
 
-`WeirClient.push(payload, durability=Durability.SYNC)` (in
+`WeirClient.push(payload, durability=Durability.DURABLE)` (in
 `src/weir_wire/client.py`) encodes a `Push` frame, `sendall`s it, then reads the
 response frame and returns a `PushResult(acked, durability_used)`. An `Ack`
 response means the record is accepted; a `Nack` raises `NackError`. The client

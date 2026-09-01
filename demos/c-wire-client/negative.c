@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     {
         uint8_t f[WEIR_HEADER_LEN + 4];
         f[0]='W';f[1]='E';f[2]='I';f[3]='R';
-        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_SYNC; f[7]=0;
+        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_DURABLE; f[7]=0;
         put_u32_le(f+8, 0);
         put_u32_le(f+12, weir_crc32(f, 12));
         put_u32_le(f+16, weir_crc32(NULL, 0)); /* empty-payload CRC = 0 */
@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
         const uint8_t payload[] = {0xDE, 0xAD};
         uint8_t f[WEIR_HEADER_LEN + 2 + 4];
         f[0]='W';f[1]='E';f[2]='I';f[3]='R';
-        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_SYNC; f[7]=0;
+        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_DURABLE; f[7]=0;
         put_u32_le(f+8, 2);
         put_u32_le(f+12, weir_crc32(f, 12));
         memcpy(f+16, payload, 2);
@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
     {
         uint8_t f[WEIR_HEADER_LEN + 1 + 4];
         f[0]='X';f[1]='X';f[2]='X';f[3]='X';
-        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_SYNC; f[7]=0;
+        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_DURABLE; f[7]=0;
         put_u32_le(f+8, 1);
         put_u32_le(f+12, weir_crc32(f, 12));
         f[16]=0x41;
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
         const uint8_t payload[] = {0x42};
         uint8_t f[WEIR_HEADER_LEN + 1 + 4];
         f[0]='W';f[1]='E';f[2]='I';f[3]='R';
-        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_SYNC; f[7]=0x01; /* flag */
+        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_PUSH; f[6]=WEIR_DUR_DURABLE; f[7]=0x01; /* flag */
         put_u32_le(f+8, 1);
         put_u32_le(f+12, weir_crc32(f, 12));
         f[16]=payload[0];
@@ -112,7 +112,7 @@ int main(int argc, char **argv) {
     {
         uint8_t f[WEIR_HEADER_LEN + 1 + 4];
         f[0]='W';f[1]='E';f[2]='I';f[3]='R';
-        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_ACK; f[6]=WEIR_DUR_SYNC; f[7]=0;
+        f[4]=WEIR_WIRE_VERSION; f[5]=WEIR_MSG_ACK; f[6]=WEIR_DUR_DURABLE; f[7]=0;
         put_u32_le(f+8, 1);
         put_u32_le(f+12, weir_crc32(f, 12));
         f[16]=0x00;

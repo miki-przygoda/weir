@@ -94,8 +94,11 @@ typedef struct {
 
 static const char *durability_byte_to_str(uint8_t d) {
     switch (d) {
-        case WEIR_DUR_SYNC:     return "Sync";
-        case WEIR_DUR_BATCHED:  return "Batched";
+        /* 0x02 (retired Batched) permissively decodes to the same canonical
+         * label as 0x01 — see docs/wire_protocol.md "Durability tiers" and
+         * crates/weir-core/src/durability.rs's permissive TryFrom. */
+        case WEIR_DUR_DURABLE:
+        case WEIR_DUR_BATCHED:  return "Durable";
         case WEIR_DUR_BUFFERED: return "Buffered";
         default:                return "?";
     }
@@ -133,6 +136,25 @@ int main(int argc, char **argv) {
     if (!p) { fprintf(stderr, "malformed vectors array\n"); return 2; }
     p++;
 
+    /* GROUND TRUTH, independent of the brace-slicing loop below.
+     *
+     * That loop skips objects it cannot handle — one larger than its 1024-byte
+     * stack buffer, or one missing "name"/"hex" — with a bare `continue`, and
+     * then still printed RESULT: PASS. A conformance check that silently omits
+     * a vector is not a conformance check: the largest vector in the canonical
+     * file is already 799 bytes, so one added `notes` sentence would have
+     * dropped a vector from coverage while the suite went on claiming wire
+     * compatibility. Count the vectors the file actually declares, and demand
+     * the loop reach every one.
+     *
+     * Every vector object carries exactly one "name" key and nothing else in
+     * this file does, so counting that token from the start of the array is an
+     * exact count that does not depend on the parser under test. */
+    int declared_vectors = 0;
+    for (const char *q = strstr(arr, "\"name\""); q; q = strstr(q + 1, "\"name\"")) {
+        declared_vectors++;
+    }
+
     int total_vectors = 0;
     while (1) {
         /* find next object start */
@@ -144,7 +166,14 @@ int main(int argc, char **argv) {
 
         size_t len = (size_t)(close - open) + 1;
         char obj[1024];
-        if (len >= sizeof(obj)) { p = close + 1; continue; }
+        if (len >= sizeof(obj)) {
+            /* Say so. The count floor below turns this into a FAIL, but the
+             * operator still needs to know which object and how big. */
+            printf("  SKIP vector object of %zu bytes exceeds the %zu-byte parse buffer\n",
+                   len, sizeof(obj));
+            p = close + 1;
+            continue;
+        }
         memcpy(obj, open, len);
         obj[len] = '\0';
 
@@ -158,7 +187,11 @@ int main(int argc, char **argv) {
         v.has_payload_hex =
             json_str(obj, "payload_hex", v.payload_hex, sizeof(v.payload_hex));
 
-        if (v.name[0] == '\0' || v.hex[0] == '\0') { p = close + 1; continue; }
+        if (v.name[0] == '\0' || v.hex[0] == '\0') {
+            printf("  SKIP vector object with no \"name\" or no \"hex\" field\n");
+            p = close + 1;
+            continue;
+        }
         total_vectors++;
 
         uint8_t raw[512];
@@ -261,8 +294,16 @@ int main(int argc, char **argv) {
     }
 
     free(doc);
-    printf("\nvectors scanned: %d   checks passed: %d   failed: %d\n",
-           total_vectors, g_pass, g_fail);
+
+    /* The floor. Without this the suite could check ZERO vectors and still
+     * report PASS, because g_fail only counts checks that ran. */
+    check(declared_vectors > 0, "(suite)",
+          "no vectors found in the file — a conformance run that checks nothing is a FAIL");
+    check(total_vectors == declared_vectors, "(suite)",
+          "not every vector in the file was checked (see SKIP lines above)");
+
+    printf("\nvectors declared: %d   vectors scanned: %d   checks passed: %d   failed: %d\n",
+           declared_vectors, total_vectors, g_pass, g_fail);
     if (g_fail == 0)
         printf("RESULT: PASS — C codec is wire-compatible with weir v1.\n");
     else

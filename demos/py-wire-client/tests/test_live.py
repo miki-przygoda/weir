@@ -72,15 +72,15 @@ def t_health():
         assert c.health_check() is True, "health check did not respond"
 
 
-def t_push_sync():
+def t_push_durable():
     with WeirClient(SOCKET) as c:
-        r = c.push(b"hello from python", Durability.SYNC)
+        r = c.push(b"hello from python", Durability.DURABLE)
         assert r.acked, "push not acked"
 
 
 def t_push_all_tiers():
     with WeirClient(SOCKET) as c:
-        for dur in (Durability.SYNC, Durability.BATCHED, Durability.BUFFERED):
+        for dur in (Durability.DURABLE, Durability.BATCHED, Durability.BUFFERED):
             r = c.push(f"tier-{dur.name}".encode(), dur)
             assert r.acked, f"push at {dur.name} not acked"
 
@@ -101,7 +101,7 @@ def t_pipelined():
 
 def t_empty_payload_nack():
     # Build a zero-length Push by hand (our client refuses to, by design).
-    frame = encode_frame(MessageType.PUSH, Durability.SYNC, b"")
+    frame = encode_frame(MessageType.PUSH, Durability.DURABLE, b"")
     try:
         resp = _raw_roundtrip(frame)
     except ConnectionClosed:
@@ -111,7 +111,7 @@ def t_empty_payload_nack():
 
 
 def t_bad_payload_crc_nack():
-    frame = bytearray(encode_frame(MessageType.PUSH, Durability.SYNC, b"corruptme"))
+    frame = bytearray(encode_frame(MessageType.PUSH, Durability.DURABLE, b"corruptme"))
     frame[-1] ^= 0xFF  # flip a byte in the payload CRC
     try:
         resp = _raw_roundtrip(bytes(frame))
@@ -122,7 +122,7 @@ def t_bad_payload_crc_nack():
 
 
 def t_bad_magic_nack():
-    frame = bytearray(encode_frame(MessageType.PUSH, Durability.SYNC, b"x"))
+    frame = bytearray(encode_frame(MessageType.PUSH, Durability.DURABLE, b"x"))
     frame[0:4] = b"XXXX"
     try:
         resp = _raw_roundtrip(bytes(frame))
@@ -133,7 +133,7 @@ def t_bad_magic_nack():
 
 
 def t_reserved_flags_nack():
-    frame = bytearray(encode_frame(MessageType.PUSH, Durability.SYNC, b"x"))
+    frame = bytearray(encode_frame(MessageType.PUSH, Durability.DURABLE, b"x"))
     frame[7] = 0x01  # set a reserved flag bit
     # header CRC now stale; recompute so we exercise the flags path, not BadHeaderCrc
     frame[12:16] = _crc32(bytes(frame[:12])).to_bytes(4, "little")
@@ -147,7 +147,7 @@ def t_reserved_flags_nack():
 
 def t_client_sends_ack_nack():
     # Spec: client sending a daemon->client type gets Nack(UnknownMessage), close.
-    frame = encode_frame(MessageType.ACK, Durability.SYNC, b"")
+    frame = encode_frame(MessageType.ACK, Durability.DURABLE, b"")
     try:
         resp = _raw_roundtrip(frame)
     except ConnectionClosed:
@@ -163,7 +163,7 @@ def t_oversize_payload_nack():
     header[0:4] = b"WEIR"
     header[4] = 1
     header[5] = MessageType.PUSH
-    header[6] = Durability.SYNC
+    header[6] = Durability.DURABLE
     header[7] = 0
     header[8:12] = (16 * 1024 * 1024 + 1).to_bytes(4, "little")
     header[12:16] = _crc32(bytes(header[:12])).to_bytes(4, "little")
@@ -177,7 +177,7 @@ def t_oversize_payload_nack():
 
 def t_nack_then_close():
     # After a permanent Nack the daemon must close. Verify the socket is dead.
-    frame = bytearray(encode_frame(MessageType.PUSH, Durability.SYNC, b"x"))
+    frame = bytearray(encode_frame(MessageType.PUSH, Durability.DURABLE, b"x"))
     frame[0:4] = b"XXXX"
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5.0)
@@ -201,7 +201,7 @@ def t_nack_then_close():
 def main():
     tests = [
         ("health_check", t_health),
-        ("push_sync", t_push_sync),
+        ("push_durable", t_push_durable),
         ("push_all_durability_tiers", t_push_all_tiers),
         ("pipelined_50_pushes", t_pipelined),
         ("empty_payload -> Nack(EmptyPayload)", t_empty_payload_nack),

@@ -68,7 +68,7 @@ public final class WeirClient implements AutoCloseable {
 
     /** Sends a HealthCheck and returns the HealthCheckResponse. */
     public Frame healthCheck() throws IOException {
-        Frame request = new Frame(Wire.MessageType.HEALTH_CHECK, Wire.Durability.SYNC, new byte[0]);
+        Frame request = new Frame(Wire.MessageType.HEALTH_CHECK, Wire.Durability.DURABLE, new byte[0]);
         writeFrame(request);
         Frame response = readResponse();
         if (response.messageType != Wire.MessageType.HEALTH_CHECK_RESPONSE) {

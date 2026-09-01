@@ -13,6 +13,165 @@ protocol** below.
 
 ---
 
+## [2.0.1] - 2026-09-01
+
+**Patch release. Every item below was found by an internal audit of the 2.0.0
+tree — none was reported by a user.** Six are silent-failure fixes on the
+ingest → WAB → ack → drain path; one is a demo/conformance-suite defect with
+no effect on the wire format itself. If you have not seen the symptoms
+described below, you were most likely not affected; read each entry's
+trigger condition to check. Sections below cover a new detection-only
+addition and one operator-facing timing change, called out separately.
+
+### Fixed
+
+- **A crash could silently destroy records the daemon had already acked as
+  durable.** Recovery treated *every* zero length-prefix (the sentinel the
+  writer emits only at a genuine partial seal) as the end of the segment,
+  truncated the file there with no quarantine, and rewrote the footer's
+  record count to match the truncated prefix — which is exactly what let the
+  drain's record-count cross-check pass over the loss without noticing, and
+  the only log output was an INFO line ("found sentinel during recovery —
+  file was partially sealed") indistinguishable from the ordinary case.
+  Recovery now decides the question on the tail's *content*, not its size: a
+  genuine seal writes exactly the sentinel followed by a 32-byte footer whose
+  `record_count`, `data_bytes`, and `file_crc32` describe precisely the records
+  just replayed, so only two shapes are accepted as a real partial seal — no
+  trailing bytes at all (a crash between the sentinel and the footer), or
+  exactly a footer that cross-checks against the replay (a crash between the
+  seal's fsync and its rename). Every other tail — unparseable, footer-sized
+  but contradicting the replay, or too long to be a footer — is treated as
+  corruption: the whole original segment is copied to `quarantine/` for
+  forensics and logged at ERROR, and only the valid prefix in front of the
+  sentinel is sealed for delivery. Nothing is truncated away unseen. **Check:**
+  if you ever saw the "found sentinel..." INFO log after an unclean shutdown,
+  on a segment that also lost acked records, you were affected.
+
+- **`wab_compression = "zstd"` deployments only: an oversized-but-legal
+  record, acked durable, could vanish on the very next crash.** The writer
+  bounds a stored record at `compress_bound(16 MiB)` (~16,843,025 bytes)
+  when zstd is enabled, but recovery checked every record — regardless of
+  compression — against the flat, uncompressed cap of 16,777,216 bytes.
+  zstd applied to already-incompressible data can produce output a few
+  hundred bytes over that flat cap while staying well under the writer's
+  real limit, so such a record would be written, fsynced, and acked `true`
+  — and then the next crash recovery would call it corrupt and truncate it,
+  along with every acked record behind it in the segment. Recovery now
+  derives its cap from the segment's own compression flag, the same way the
+  writer does. **Check:** this can only have bitten deployments running
+  `wab_compression = "zstd"` with records near the 16 MiB ceiling.
+
+- **A failed `fsync` could leave the very next batch acked `true` over a
+  hole.** `ShardWriter::fsync_current` left the segment marked active after
+  a failed sync. On Linux, a writeback error is reported once per file
+  descriptor and the kernel then discards the failed dirty pages as clean —
+  so the *next* `fsync` on that same handle reports success even though nothing
+  new reached disk under it, and the batch that follows the failure would be
+  acked `true` over data that was never durably written. The failing batch
+  itself was, and still is, correctly nacked — this only affects the batch
+  immediately after it. The segment is now retired on any fsync failure,
+  matching the daemon's existing behavior for a failed write. **Trade-off, and
+  it is a real one:** retiring the segment leaves it on disk as an unsealed
+  `.wab`, and nothing at runtime rescans those — only crash recovery, at
+  startup, does. So any already-acked, already-fsynced records still in that
+  segment (up to `wab_segment_max_bytes`, 256 MiB by default) are **stranded
+  until the daemon is restarted**, where before the fix they would have rotated
+  into delivery. Stranded is strictly better than false-acked — no ack is
+  falsified and nothing is lost, delivery is deferred — but it is a deferral,
+  not a no-op: after an fsync failure, clear the storage fault and restart the
+  daemon to release the segment. The ERROR log at the failure says so.
+  **Check:** this requires an underlying storage fault (a real writeback error)
+  to trigger at all; if your disks and filesystem have been healthy, you were
+  not exposed.
+
+- **A drain respawn after a panic could leave already-queued work stranded
+  until the next process restart, while health metrics read fine.** A panic
+  in the drain (a sink bug, a corrupt segment, the dead-letter failure below,
+  …) is caught and the drain thread is respawned automatically — but the
+  respawn never rescanned disk, so any segment that was sitting in the
+  drain's in-memory backlog at panic time waited for a full process restart
+  to be delivered, even though `weir_drain_state` reported healthy again
+  immediately after the respawn. A respawn now starts in a not-yet-healthy
+  state, so its first healthy probe re-queues the backlog from disk instead
+  of assuming it is empty. **Check:** relevant only if `weir_drain_panics`
+  has ever incremented on your deployment; look for segments that appeared
+  stuck until the next restart around the same time.
+
+- **A dead-letter-directory hiccup at drain startup could make the daemon
+  accept and ack producers forever while delivering nothing, with no error
+  after the first log line.** If opening the dead-letter writer failed when
+  the drain (re)started — a transient `ENOENT` racing its own directory scan
+  is enough — the drain thread returned normally instead of panicking. The
+  supervisor reads a normal return as "the channel closed, shutdown is
+  complete," so it neither respawned nor counted a failure: no further log
+  output, no metric change, just a daemon that keeps binding its socket and
+  acknowledging every producer while nothing is ever delivered. This failure
+  now panics like any other drain failure, so it goes through the same
+  supervised-respawn path as everything else and — being persistent —
+  exhausts the respawn budget and reaches the loud, unmistakable
+  "delivery is stopped" error instead. See "Behavioral change" below for the
+  timing this introduces. **Check:** if you have ever seen a single
+  "drain: failed to open dead-letter writer" log line with no follow-up
+  panic or respawn logging after it, you were affected.
+
+- **All five reference conformance clients in `demos/` (Python, Go, C, Java,
+  TypeScript) failed the wire-protocol conformance vectors as shipped in
+  2.0.0, and nothing in CI caught it.** Two independent causes: the 2.0.0
+  wire-vector data renamed the durable tier's label from `Sync` to
+  `Durable` and `demos/` was not updated to match, and separately, none of
+  the five clients decoded the retired `0x02` byte permissively to the
+  durable tier the way `docs/wire_protocol.md` and `weir-core`'s own
+  `Durability` type require. This is a demo/reference-client defect only:
+  no encoder logic changed, `docs/conformance/wire_v1_vectors.json` has zero
+  diff, and the wire format and `weir-client` crate are unaffected. A new
+  `conformance` CI job now runs the Rust vectors plus all five client suites
+  on every change, so a regression like this cannot ship unnoticed again.
+  **Check:** only affects anyone who copied one of the `demos/` reference
+  clients as a starting point for their own producer; the published
+  `weir-client` crate was never affected.
+
+### Detection added, not a fix
+
+- **A sink that blocks its thread instead of yielding can wedge the drain
+  forever, and until now this was completely invisible.** The drain runs on
+  a current-thread tokio runtime, so `tokio::time::timeout` around both
+  `commit_timeout` and `health_probe_timeout` can only fire if the wedged
+  future actually yields — a sink that blocks the thread (a blocking DB
+  driver, `std::fs`, a spin loop) never does, which defeats *both* timeouts
+  simultaneously. `drain_state` and `sink_health` freeze at their last
+  healthy reading, which also silences the WAB-growth warning, since it
+  reads the same frozen gauge. A new heartbeat — bumped at the drain loop's
+  head *and* inside its two long deliberate waits (the transient-retry backoff
+  and the dead-letter-full block), so that waiting-but-alive still reads as
+  alive — is observed independently from the metrics-poll task on the daemon's
+  own multi-thread runtime, and a stall past a grace period now logs a warning.
+  The warning names what actually happened: a frozen heartbeat while
+  `drain_state` still reports a live state is reported as a wedge, while a
+  frozen heartbeat alongside `drain_state{stopped}` is reported as a drain that
+  has *exited* (respawn budget exhausted, or shutdown) — the operator is told to
+  restart rather than sent hunting a blocked sink call that does not exist.
+  **This does not fix the wedge** — a sink that truly never yields still hangs
+  delivery indefinitely; it only gives an operator a signal where previously
+  there was none. The real fix is moving sink calls onto a multi-thread runtime,
+  which is source-breaking and out of scope for a patch release.
+
+### Behavioral change
+
+- **Reaching `weir_drain_state{state="stopped"}` for a permanently-unusable
+  dead-letter directory now takes the full respawn ladder instead of being
+  immediate.** This is a direct, intended consequence of the dead-letter fix
+  above: since that failure now goes through the same panic-supervision path
+  as every other drain failure rather than returning early, it costs up to
+  `MAX_DRAIN_RESPAWNS` (10) respawn attempts at `100ms * attempt` backoff
+  between them — about 4.5 seconds in the real default — before
+  `drain_state` reaches `stopped`. `deploy/systemd/weir-readiness.sh` keys
+  its NOT-READY exit specifically on that gauge, so a readiness probe or
+  orchestrator health check watching it for this exact scenario should
+  expect a bounded ~4.5 s delay rather than an immediate transition. No other
+  condition that script checks is affected.
+
+---
+
 ## [2.0.0] - 2026-08-31
 
 **This is a major release.** The `Sink` trait changes shape and `Durability`

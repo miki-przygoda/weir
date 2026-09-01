@@ -203,7 +203,7 @@ export class WeirClient {
   }
 
   /** Push a non-empty payload. Rejects with NackError on daemon rejection. */
-  push(payload: Buffer | string, durability: Durability = Durability.Sync): Promise<PushResult> {
+  push(payload: Buffer | string, durability: Durability = Durability.Durable): Promise<PushResult> {
     const body = typeof payload === "string" ? Buffer.from(payload, "utf8") : payload;
     return this.send(encodeFrame(body, { messageType: MessageType.Push, durability }));
   }
@@ -213,7 +213,7 @@ export class WeirClient {
     return this.send(
       encodeFrame(Buffer.alloc(0), {
         messageType: MessageType.HealthCheck,
-        durability: Durability.Sync,
+        durability: Durability.Durable,
       }),
     );
   }

@@ -597,9 +597,33 @@ impl ShardWriter {
     }
 
     /// Fsyncs the current active segment. No-op if no segment is open.
-    pub(crate) fn fsync_current(&self) -> io::Result<()> {
-        if let Some(seg) = &self.active {
-            seg.fsync()?;
+    ///
+    /// On a failed fsync, drops `active` so the next write opens a fresh
+    /// segment — same reasoning as the write-error path above (:571-577).
+    /// Linux reports a writeback error once per fd and then drops the failed
+    /// pages clean, so the NEXT `fsync` on this same handle would return
+    /// `Ok`; without retiring the segment here, the batch after the failure
+    /// would be acked `true` over the hole the failed batch left behind. The
+    /// failing batch's own nack is untouched — it is decided by the `Err`
+    /// this returns, which the caller (`fsync_observed` in `wab/mod.rs`)
+    /// already forwards to `ack_tx` as `false`.
+    ///
+    /// COST OF RETIRING, stated plainly because nothing else surfaces it: the
+    /// retired segment stays on disk as an unsealed `.wab`, and no runtime path
+    /// scans those — only `recovery::recover_open_segments`, at startup. So the
+    /// already-acked, already-fsynced records still in it (up to
+    /// `wab_segment_max_bytes`, 256 MiB by default) are STRANDED until the
+    /// daemon restarts, where before they would have rotated into delivery.
+    /// Stranded-but-safe beats false-acked, so this is the right trade — but it
+    /// is a deferral, not a no-op, and the ERROR in `fsync_observed` tells the
+    /// operator to restart once the storage fault is cleared.
+    pub(crate) fn fsync_current(&mut self) -> io::Result<()> {
+        let Some(seg) = self.active.as_ref() else {
+            return Ok(());
+        };
+        if let Err(e) = seg.fsync() {
+            self.active = None;
+            return Err(e);
         }
         Ok(())
     }
@@ -903,6 +927,105 @@ mod tests {
         assert_eq!(
             active_count, 2,
             "recovery must open a new segment file, not reuse the orphaned one"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A `SegmentStore`/`SegmentHandle` pair that wraps real `WabSegment`s but
+    /// makes the Nth `fsync()` call (1-based, across the whole store — mirrors
+    /// how a real fd-level writeback error is scoped) fail with an injected
+    /// error. Writes pass straight through to the real segment. Built for
+    /// `a_failed_fsync_retires_the_active_segment` below: no existing seam
+    /// injected an fsync-only failure (the DST harness's `SimSegmentHandle` in
+    /// `wab/dst.rs` does, but that module drives the whole flusher thread, not
+    /// a bare `ShardWriter`), and this is the smallest addition that doesn't
+    /// touch production behaviour.
+    struct FailingFsyncStore {
+        fail_on: u64,
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl FailingFsyncStore {
+        fn new(fail_on: u64) -> Self {
+            FailingFsyncStore {
+                fail_on,
+                calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl SegmentStore for FailingFsyncStore {
+        fn create(
+            &self,
+            path: &Path,
+            shard_id: u16,
+            compression: Compression,
+        ) -> io::Result<Box<dyn SegmentHandle>> {
+            let inner = WabSegment::create(path, shard_id, compression)?;
+            Ok(Box::new(FailingFsyncHandle {
+                inner,
+                fail_on: self.fail_on,
+                calls: Arc::clone(&self.calls),
+            }))
+        }
+
+        fn segment_counters(&self, dir: &Path) -> io::Result<Vec<u64>> {
+            FsSegmentStore.segment_counters(dir)
+        }
+    }
+
+    struct FailingFsyncHandle {
+        inner: WabSegment,
+        fail_on: u64,
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl SegmentHandle for FailingFsyncHandle {
+        fn write_record(&mut self, stored: &[u8]) -> io::Result<()> {
+            self.inner.write_record(stored)
+        }
+        fn fsync(&self) -> io::Result<()> {
+            let nth = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if nth == self.fail_on {
+                return Err(io::Error::other("injected fsync failure"));
+            }
+            self.inner.fsync()
+        }
+        fn should_rotate(&self, max_bytes: u64) -> bool {
+            self.inner.should_rotate(max_bytes)
+        }
+        fn seal(self: Box<Self>) -> io::Result<PathBuf> {
+            self.inner.seal()
+        }
+    }
+
+    #[test]
+    fn a_failed_fsync_retires_the_active_segment() {
+        // Mirrors the write path (segment.rs:571-577): once the file's
+        // durability is in doubt, stop using it. Without this the next
+        // batch's fsync succeeds (Linux reports a writeback error once per
+        // fd, then drops the pages clean) and gets acked TRUE over the hole
+        // the failed batch left.
+        let dir = tmp_dir("fsync_poison");
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::new(Metrics::new().0),
+            Arc::new(FailingFsyncStore::new(1)),
+            Compression::None,
+            1,
+        );
+
+        w.write_record(b"batch-N").unwrap();
+        assert!(w.has_active_segment());
+
+        let first = w.fsync_current();
+        assert!(first.is_err(), "the injected fsync must fail");
+        assert!(
+            !w.has_active_segment(),
+            "a failed fsync must retire the segment; reusing it acks later records over a hole"
         );
 
         fs::remove_dir_all(dir).ok();
