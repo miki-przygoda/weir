@@ -5,6 +5,13 @@
 //! issues one request and reads one response — no pipelining. For concurrent
 //! producers, create one [`WeirClient`] per thread.
 //!
+//! # Platforms
+//!
+//! The Unix-socket transport is, unsurprisingly, Unix-only. **The TCP + mutual
+//! TLS transport is not** — it builds wherever rustls does, Windows included,
+//! as of 2.0.3. Before then it was gated on `unix` by accident: it lives in its
+//! own module but imported two types that happened to sit in the Unix one.
+//!
 //! # Throughput: one record per round-trip
 //!
 //! [`push`](WeirClient::push) is synchronous: it sends one frame and blocks for
@@ -15,9 +22,9 @@
 //! across connections**: create one `WeirClient` per producer thread (they're
 //! independent and the daemon handles many concurrently). Ordering is only
 //! guaranteed within a single connection's sequential pushes, not across
-//! connections. A built-in batched-push frame and a pooled client are a possible
-//! future (2.0) wire-protocol addition; today, parallel connections are the way
-//! to scale a producer.
+//! connections. A built-in batched-push frame and a pooled client would need a
+//! `WIRE_VERSION` bump, so they remain a possible 3.0 addition; today, parallel
+//! connections are the way to scale a producer.
 //!
 //! # Example
 //!
