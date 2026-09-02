@@ -2383,8 +2383,22 @@ fn weir_ctl_binary() -> PathBuf {
     // that behind), and `cargo build` is a fast no-op recompile when nothing
     // changed. An existence-only check here would happily hand back a stale
     // binary that predates whatever quarantine subcommand this test needs.
+    //
+    // The build must target the SAME profile this test binary was built with.
+    // `CARGO_BIN_EXE_weir-server` points inside the active profile's directory,
+    // so `candidate` is `target/release/weir-ctl` under `cargo test --release`
+    // — and an unqualified `cargo build` writes `target/debug/weir-ctl`. The
+    // guard above then passes (the build succeeded, the file exists) while the
+    // test executes whatever stale binary happens to sit in `target/release`.
+    // Observed as a 1.3.0 weir-ctl from three months earlier, failing with
+    // "unrecognized subcommand 'quarantine'" — precisely the staleness the
+    // comment above set out to prevent.
+    let mut build_args = vec!["build", "-p", "weir-ctl", "--bin", "weir-ctl"];
+    if !cfg!(debug_assertions) {
+        build_args.push("--release");
+    }
     let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "weir-ctl", "--bin", "weir-ctl"])
+        .args(&build_args)
         .status()
         .expect("failed to invoke `cargo build -p weir-ctl`");
     assert!(status.success(), "cargo build -p weir-ctl failed");

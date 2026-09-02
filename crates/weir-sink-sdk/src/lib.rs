@@ -394,6 +394,93 @@ impl std::fmt::Debug for DedupToken {
     }
 }
 
+/// A per-record identity: unique even across records carrying identical bytes.
+///
+/// # Why this exists separately from [`DedupToken`]
+///
+/// The two answer different questions and pull in opposite directions.
+///
+/// A `DedupToken` must be **stable across a retry**: the same batch, re-sent
+/// after a transient failure, has to present the same value or the retry
+/// deduplicates as new data. It is therefore a pure function of the payload
+/// bytes, and two batches carrying identical bytes are — correctly — the same
+/// token.
+///
+/// A per-record idempotency key must be **unique across records**. Derived from
+/// payload bytes alone, a producer emitting repetitive records (a heartbeat, a
+/// status ping, any fixed-shape event) hands the downstream the same key for
+/// genuinely distinct events, and a correctly-implemented idempotent endpoint
+/// keeps the first and discards the rest. weir acked those records and wrote
+/// them to disk; they are then dropped downstream by weir's own header.
+///
+/// `RecordId` mixes the record's WAB coordinate — the segment it was read from
+/// and its index within that segment — into the digest, so identical bytes at
+/// different coordinates are different ids. The coordinate is stable across a
+/// re-read of the same segment, so a retried delivery still presents the same
+/// id and per-record retry dedup keeps working.
+///
+/// # Format
+///
+/// SHA-256 over `segment_len ++ segment ++ index ++ payload_len ++ payload`,
+/// every length a little-endian `u64`. The lengths are what stop
+/// `("ab", 1)` and `("a", 0xb...)` from colliding.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecordId([u8; 32]);
+
+impl RecordId {
+    /// Derives the id from a record's WAB coordinate and bytes.
+    ///
+    /// `segment` is the segment's file name and `index` the record's ordinal
+    /// within it — together the record's address in the buffer, which is what
+    /// makes this unique where a content hash is not.
+    pub fn for_record(segment: &str, index: u64, payload: &Payload) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update((segment.len() as u64).to_le_bytes());
+        hasher.update(segment.as_bytes());
+        hasher.update(index.to_le_bytes());
+        hasher.update((payload.len() as u64).to_le_bytes());
+        hasher.update(payload.as_ref());
+        Self(hasher.finalize().into())
+    }
+
+    /// Rebuilds an id from a previously captured digest. Intended for sink
+    /// authors' tests.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw 32-byte digest.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Lower-hex, 64 characters, no prefix.
+    pub fn to_hex(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(64);
+        for b in self.0 {
+            // Writing to a String is infallible.
+            let _ = write!(out, "{b:02x}");
+        }
+        out
+    }
+
+    /// `sha256:<lower-hex>` — the form an HTTP `Idempotency-Key` wants.
+    pub fn to_prefixed_hex(&self) -> String {
+        format!("sha256:{}", self.to_hex())
+    }
+}
+
+impl std::fmt::Debug for RecordId {
+    /// Prints the hex digest rather than 32 raw bytes, for the same reason
+    /// [`DedupToken`] does: an id shows up in drain logs, where a byte array is
+    /// useless for correlating against a downstream's dedup table.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RecordId({})", self.to_hex())
+    }
+}
+
 /// One batch of records on its way to [`Sink::commit`], with the
 /// [`DedupToken`] the drain derived from it.
 ///
@@ -410,6 +497,9 @@ impl std::fmt::Debug for DedupToken {
 pub struct SinkBatch {
     records: Vec<Payload>,
     dedup_token: DedupToken,
+    /// Parallel to `records` when present. `None` from [`SinkBatch::new`], so a
+    /// batch built by a 1.x-era caller or a sink author's test is unchanged.
+    record_ids: Option<Vec<RecordId>>,
 }
 
 impl SinkBatch {
@@ -419,7 +509,48 @@ impl SinkBatch {
         Self {
             records,
             dedup_token,
+            record_ids: None,
         }
+    }
+
+    /// Builds a batch that also carries a [`RecordId`] per record, in the same
+    /// order. The drain uses this; [`SinkBatch::new`] remains the plain form.
+    ///
+    /// # Panics
+    ///
+    /// If `record_ids.len() != records.len()`. They are read positionally, so a
+    /// length mismatch would silently pair records with other records' ids —
+    /// worse than the bug this type exists to fix.
+    pub fn with_record_ids(
+        records: Vec<Payload>,
+        dedup_token: DedupToken,
+        record_ids: Vec<RecordId>,
+    ) -> Self {
+        assert_eq!(
+            records.len(),
+            record_ids.len(),
+            "SinkBatch::with_record_ids: {} records but {} ids",
+            records.len(),
+            record_ids.len()
+        );
+        Self {
+            records,
+            dedup_token,
+            record_ids: Some(record_ids),
+        }
+    }
+
+    /// The per-record ids, if the batch carries them, in record order.
+    ///
+    /// `None` means the batch was built without them — a sink should fall back
+    /// to whatever key it used before rather than treat this as an error.
+    pub fn record_ids(&self) -> Option<&[RecordId]> {
+        self.record_ids.as_deref()
+    }
+
+    /// Consumes the batch for its records paired with their ids, where present.
+    pub fn into_records_with_ids(self) -> (Vec<Payload>, Option<Vec<RecordId>>) {
+        (self.records, self.record_ids)
     }
 
     /// The records, borrowed.
@@ -466,6 +597,7 @@ impl From<Vec<Payload>> for SinkBatch {
         Self {
             records,
             dedup_token,
+            record_ids: None,
         }
     }
 }
@@ -524,6 +656,98 @@ pub trait Sink: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect this type exists to fix: two distinct records that happen to
+    /// carry identical bytes must not present the same idempotency key.
+    #[test]
+    fn identical_payloads_at_different_coordinates_get_different_ids() {
+        let p = Payload::from(b"heartbeat".as_ref());
+        let a = RecordId::for_record("seg-000042.wab", 7, &p);
+        let b = RecordId::for_record("seg-000042.wab", 8, &p);
+        let c = RecordId::for_record("seg-000043.wab", 7, &p);
+        assert_ne!(a, b, "same segment, different index must differ");
+        assert_ne!(a, c, "same index, different segment must differ");
+        assert_ne!(b, c);
+    }
+
+    /// And the property that keeps per-record retry dedup working: a re-read of
+    /// the same record from the same place is the same id.
+    #[test]
+    fn the_same_record_reread_gets_the_same_id() {
+        let p = Payload::from(b"heartbeat".as_ref());
+        assert_eq!(
+            RecordId::for_record("seg-000042.wab", 7, &p),
+            RecordId::for_record("seg-000042.wab", 7, &p)
+        );
+    }
+
+    /// The length prefixes are load-bearing: without them a segment name and an
+    /// index could be re-split to produce the same byte stream.
+    #[test]
+    fn field_boundaries_cannot_be_confused() {
+        let p = Payload::from(b"x".as_ref());
+        assert_ne!(
+            RecordId::for_record("ab", 1, &p),
+            RecordId::for_record("a", 1, &p),
+            "a shorter segment name must not collide with a longer one"
+        );
+    }
+
+    /// Payload bytes still participate, so a corrupted re-read is a different id
+    /// rather than silently reusing the original record's key.
+    #[test]
+    fn payload_bytes_still_participate() {
+        let a = RecordId::for_record("seg.wab", 0, &Payload::from(b"one".as_ref()));
+        let b = RecordId::for_record("seg.wab", 0, &Payload::from(b"two".as_ref()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn record_id_hex_forms_are_well_shaped() {
+        let id = RecordId::for_record("seg.wab", 0, &Payload::from(b"x".as_ref()));
+        assert_eq!(id.to_hex().len(), 64);
+        assert!(id.to_hex().chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(id.to_prefixed_hex(), format!("sha256:{}", id.to_hex()));
+        // Debug prints the digest, not a byte array — it lands in drain logs.
+        assert!(format!("{id:?}").contains(&id.to_hex()));
+    }
+
+    #[test]
+    fn with_record_ids_round_trips() {
+        let records = vec![Payload::from(b"a".as_ref()), Payload::from(b"b".as_ref())];
+        let ids: Vec<_> = records
+            .iter()
+            .enumerate()
+            .map(|(i, p)| RecordId::for_record("seg.wab", i as u64, p))
+            .collect();
+        let batch = SinkBatch::with_record_ids(
+            records.clone(),
+            DedupToken::for_payloads(records.iter()),
+            ids.clone(),
+        );
+        assert_eq!(batch.record_ids(), Some(&ids[..]));
+        let (r, got) = batch.into_records_with_ids();
+        assert_eq!(r, records);
+        assert_eq!(got, Some(ids));
+    }
+
+    /// A batch built the plain way carries no ids, and a sink must be able to
+    /// tell that apart from "ids that happen to be empty".
+    #[test]
+    fn plain_batches_carry_no_record_ids() {
+        let records = vec![Payload::from(b"a".as_ref())];
+        let batch = SinkBatch::new(records.clone(), DedupToken::for_payloads(records.iter()));
+        assert_eq!(batch.record_ids(), None);
+        assert_eq!(SinkBatch::from(records).record_ids(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "2 records but 1 ids")]
+    fn mismatched_id_count_panics_rather_than_mispairing() {
+        let records = vec![Payload::from(b"a".as_ref()), Payload::from(b"b".as_ref())];
+        let token = DedupToken::for_payloads(records.iter());
+        SinkBatch::with_record_ids(records, token, vec![RecordId::from_bytes([0u8; 32])]);
+    }
 
     /// Minimal std-only executor: drives a future to completion by polling with a
     /// no-op waker. Enough to test a sink whose `commit`/`health` are immediately

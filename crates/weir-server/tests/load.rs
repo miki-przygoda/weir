@@ -32,12 +32,14 @@
 //!
 //! - **Ingest-only.** Every scenario here measures the producer→daemon→WAB
 //!   ingest path against the **noop** sink; none exercise sink *drain*
-//!   throughput. The HTTP per-record vs NDJSON-batch delivery rate (the thing
-//!   `sink_http_batch = ndjson` was built for) is therefore NOT covered by this
-//!   baseline. A drain-throughput scenario (a localhost mock endpoint,
-//!   parameterised over batch mode / batch size / concurrency) is a worthwhile
-//!   follow-up; until then, treat these numbers as ingest ceilings, not
-//!   end-to-end delivery rates.
+//!   throughput. Treat these numbers as ingest ceilings, not end-to-end
+//!   delivery rates.
+//!
+//!   The delivery side now has its own suite: [`load_drain`](load_drain.rs),
+//!   added in 2.0.3, which measures the HTTP per-record vs NDJSON-batch rate
+//!   this caveat used to call a worthwhile follow-up. Baseline numbers are in
+//!   `docs/benchmarks/drain-throughput.md`. The short version: delivery is the
+//!   narrower half, so a ceiling here is not a ceiling end-to-end.
 //! - **`thundering_herd_*` is warmup-dominated.** Those scenarios spawn N threads
 //!   that each push a fixed count with no warmup, so connection/thread setup
 //!   dominates short runs and the throughput swings run-to-run (observed up to

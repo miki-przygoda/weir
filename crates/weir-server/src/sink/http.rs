@@ -9,11 +9,17 @@
 //!   serialisation, no encoding, no framing — endpoints decide what to do
 //!   with the bytes. (See "Batch framing" below for the NDJSON mode.)
 //! - `Content-Type: application/octet-stream`.
-//! - `Idempotency-Key: sha256:<hex>` of the payload, unless explicitly
-//!   disabled via `send_idempotency_key = false`. The drain guarantees
-//!   at-least-once delivery per segment, so retries re-POST records that
-//!   may have already been accepted; the idempotency key lets the endpoint
-//!   deduplicate without computing the hash itself.
+//! - `Idempotency-Key: sha256:<hex>` — the record's [`RecordId`], unless
+//!   explicitly disabled via `send_idempotency_key = false`. The drain
+//!   guarantees at-least-once delivery per segment, so retries re-POST records
+//!   that may have already been accepted; the key lets the endpoint deduplicate
+//!   without computing anything itself.
+//!
+//!   **This is derived from the record's WAB coordinate, not from its bytes
+//!   alone.** Through 2.0.1 it was `sha256(payload)`, which gave two distinct
+//!   records carrying identical bytes the same key — so a producer emitting
+//!   repetitive records had its events deduplicated away downstream by weir's
+//!   own header. See [`RecordId`] for why a content hash cannot do this job.
 //! - Optional `Authorization: Bearer <token>` if `WEIR_SINK_BEARER_TOKEN`
 //!   was set at startup (token never appears in config files or logs).
 //! - Per-request timeout via `sink_timeout_secs`.
@@ -59,7 +65,7 @@ use tracing::{debug, warn};
 use weir_core::Payload;
 
 use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
-use weir_sink_sdk::DedupToken;
+use weir_sink_sdk::{DedupToken, RecordId};
 
 /// How the HTTP sink frames a commit batch into HTTP requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -94,6 +100,8 @@ pub struct HttpSinkConfig {
     pub bearer_token: Option<Arc<str>>,
     /// Send `Idempotency-Key: sha256:<hex>` with each request so the endpoint
     /// can deduplicate retries that follow the drain's at-least-once contract.
+    /// The value is the record's [`RecordId`] in per-record mode and the
+    /// batch's [`DedupToken`] in NDJSON mode.
     /// Default: true. Set false only if your endpoint can't tolerate the
     /// extra header (e.g. strict CORS, header allow-lists).
     pub send_idempotency_key: bool,
@@ -177,12 +185,30 @@ impl HttpSink {
 
     /// Per-record POST (the default mode): one record per request, with the
     /// record's own Idempotency-Key.
-    async fn post_record(&self, payload: Payload) -> Result<(), HttpSinkError> {
+    ///
+    /// `record_id` is the drain's per-record identity. It is preferred over the
+    /// payload digest because the digest is a pure function of the bytes, so a
+    /// producer emitting repetitive records — a heartbeat, a status ping — gave
+    /// every one of them the same key and a correctly-implemented idempotent
+    /// endpoint discarded all but the first. See [`RecordId`].
+    ///
+    /// `None` only happens for a batch built without ids (a sink author's test,
+    /// or a caller using `SinkBatch::new`); the payload digest remains the
+    /// fallback so behaviour there is unchanged.
+    async fn post_record(
+        &self,
+        payload: Payload,
+        record_id: Option<RecordId>,
+    ) -> Result<(), HttpSinkError> {
         let mut req = self
             .base_request()
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
         if self.config.send_idempotency_key {
-            req = req.header("Idempotency-Key", payload_idempotency_key(&payload));
+            let key = match record_id {
+                Some(id) => id.to_prefixed_hex(),
+                None => payload_idempotency_key(&payload),
+            };
+            req = req.header("Idempotency-Key", key);
         }
         // No-copy: reqwest::Body implements From<bytes::Bytes> — the payload's
         // inner Bytes is handed to reqwest without any allocation or memcopy.
@@ -428,7 +454,10 @@ impl Sink for HttpSink {
         match self.config.batch_mode {
             // Per-record mode gives each request its own key derived from that
             // record, so the batch token means nothing here.
-            HttpBatchMode::PerRecord => self.commit_per_record(batch.into_records()).await,
+            HttpBatchMode::PerRecord => {
+                let (records, record_ids) = batch.into_records_with_ids();
+                self.commit_per_record(records, record_ids).await
+            }
             HttpBatchMode::Ndjson => {
                 let (records, token) = batch.into_parts();
                 self.commit_ndjson(records, &token).await
@@ -447,10 +476,22 @@ impl Sink for HttpSink {
 
 impl HttpSink {
     /// Per-record commit: one POST per record, up to `concurrency` in flight.
-    async fn commit_per_record(&self, batch: Vec<Payload>) -> Result<CommitResult, HttpSinkError> {
+    async fn commit_per_record(
+        &self,
+        batch: Vec<Payload>,
+        record_ids: Option<Vec<RecordId>>,
+    ) -> Result<CommitResult, HttpSinkError> {
         use futures_util::stream::StreamExt;
 
         let concurrency = self.config.concurrency.max(1);
+
+        // Pair each record with its id up front. `SinkBatch::with_record_ids`
+        // has already enforced that the two are the same length, so zip cannot
+        // silently truncate here.
+        let keyed: Vec<(Payload, Option<RecordId>)> = match record_ids {
+            Some(ids) => batch.into_iter().zip(ids.into_iter().map(Some)).collect(),
+            None => batch.into_iter().map(|p| (p, None)).collect(),
+        };
 
         // One POST per record (per-record Idempotency-Key + per-record
         // dead-lettering), but up to `concurrency` in flight. The drain thread is
@@ -458,11 +499,11 @@ impl HttpSink {
         // overlap — a 1000-record segment no longer pays 1000× the serial RTT.
         // `buffered` (not `buffer_unordered`) keeps the results in batch order, so
         // `committed` stays in submission order.
-        let stream = futures_util::stream::iter(batch)
-            .map(|record| async move {
+        let stream = futures_util::stream::iter(keyed)
+            .map(|(record, record_id)| async move {
                 // Clone the Bytes handle (O(1) ref-bump) so we keep the record
                 // for accounting while posting it.
-                let outcome = self.post_record(record.clone()).await;
+                let outcome = self.post_record(record.clone(), record_id).await;
                 (record, outcome)
             })
             .buffered(concurrency);
@@ -1273,6 +1314,155 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_transient(), "503 must be transient: {err}");
+    }
+
+    /// The defect: two distinct records carrying identical bytes were given
+    /// identical `Idempotency-Key`s, because the key was `sha256(payload)` and
+    /// nothing else. A producer emitting repetitive records — a heartbeat, a
+    /// status ping, any fixed-shape event — therefore handed the endpoint the
+    /// same key for genuinely distinct events, and a correctly-implemented
+    /// idempotent endpoint kept the first and dropped the rest. weir acked them
+    /// all and wrote them all to disk.
+    ///
+    /// The batch below is the minimal reproduction: three byte-identical
+    /// records. Before the fix they produced one distinct key; they must now
+    /// produce three.
+    #[tokio::test]
+    async fn identical_records_get_distinct_idempotency_keys() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let captured_task = Arc::clone(&captured);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = Arc::clone(&captured_task);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let header_end = loop {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = find_double_crlf(&buf) {
+                                    break pos;
+                                }
+                            }
+                        }
+                    };
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..header_end]).to_string());
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        // Three identical payloads, as a repetitive producer emits.
+        let records = vec![p(b"heartbeat"), p(b"heartbeat"), p(b"heartbeat")];
+        let ids: Vec<RecordId> = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| RecordId::for_record("seg-000001.wab", i as u64, r))
+            .collect();
+        let token = DedupToken::for_payloads(records.iter());
+
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        sink.commit(SinkBatch::with_record_ids(records, token, ids))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 3, "per-record mode sends one request each");
+
+        let keys: std::collections::HashSet<String> = headers
+            .iter()
+            .flat_map(|h| h.lines())
+            .filter(|l| l.to_ascii_lowercase().starts_with("idempotency-key:"))
+            .map(|l| l.trim().to_string())
+            .collect();
+        assert_eq!(
+            keys.len(),
+            3,
+            "three distinct records must carry three distinct keys; got {keys:?}"
+        );
+
+        // And specifically NOT the payload digest, which is what made them
+        // collide. Assert the break, not only the new value.
+        let old_key = payload_idempotency_key(b"heartbeat");
+        assert!(
+            !keys.iter().any(|k| k.contains(&old_key)),
+            "a key is still the bare payload digest: {keys:?}"
+        );
+    }
+
+    /// A batch built without ids — a sink author's test, or any caller using
+    /// `SinkBatch::new` — must keep the old behaviour rather than lose its key.
+    #[tokio::test]
+    async fn a_batch_without_record_ids_falls_back_to_the_payload_digest() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+        let captured_task = Arc::clone(&captured);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = Arc::clone(&captured_task);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    let header_end = loop {
+                        match socket.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&tmp[..n]);
+                                if let Some(pos) = find_double_crlf(&buf) {
+                                    break pos;
+                                }
+                            }
+                        }
+                    };
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..header_end]).to_string());
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let sink = HttpSink::new(cfg(&url)).unwrap();
+        sink.commit(SinkBatch::from(vec![p(b"solo")]))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 1);
+        let expected = payload_idempotency_key(b"solo");
+        assert!(
+            headers[0]
+                .lines()
+                .any(|l| l.to_ascii_lowercase().starts_with("idempotency-key:")
+                    && l.contains(&expected)),
+            "expected the payload-digest fallback:\n{}",
+            headers[0]
+        );
     }
 
     #[tokio::test]

@@ -48,7 +48,11 @@ RUN mkdir -p \
 # it during the build. Without --locked, a transient lockfile-resolution issue
 # could silently pull a newer transitive dep than the lockfile specifies, which
 # is a real supply-chain concern for a security-sensitive daemon.
-RUN cargo build --release --locked -p weir-server && \
+# `--features tls` is what gives the image a TCP+mTLS ingest listener. Without
+# it the daemon is Unix-socket-only, which is useless in a container: the socket
+# lives inside the container's filesystem and nothing outside can reach it.
+# Every image before 2.0.3 shipped that way.
+RUN cargo build --release --locked -p weir-server --features tls && \
     rm -rf crates/*/src
 
 # Now copy real sources and rebuild only weir-server (deps are cached above).
@@ -61,7 +65,7 @@ COPY crates/ crates/
 # their mtime to "now" (> 0), signalling a change and forcing a full recompile
 # of all workspace crates while keeping the cached external-dep artifacts.
 RUN find crates -name "*.rs" -exec touch {} + && \
-    cargo build --release --locked -p weir-server
+    cargo build --release --locked -p weir-server --features tls
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim

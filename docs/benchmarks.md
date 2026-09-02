@@ -22,6 +22,7 @@ they are two selectable tiers today.
 | [latest.md](benchmarks/latest.md) | Full results from the most recent CI run — throughput comparison, per-tier latency tables, saturation ramp |
 | [bare-metal.md](benchmarks/bare-metal.md) | Operator-run results on named hardware — the canonical source for any external performance claim (CI runners are sandboxed and noisier) |
 | [history.md](benchmarks/history.md) | One row per CI run on `main` — headline single-thread `Durable`-tier RPS and p99 (columns are still labelled `Sync`, their pre-2.0 name), `Buffered` p50, and ramp peak over time |
+| [drain-throughput.md](benchmarks/drain-throughput.md) | **Delivery-side** rates — how fast the buffer *empties* into an HTTP sink, per-record vs NDJSON, and under a slow sink. Every other row on this table is ingest. |
 | [environments.md](benchmarks/environments.md) | How CI and local numbers differ, what is safe to compare across environments, and how to run the suite locally |
 | [batch-tuning.md](benchmarks/batch-tuning.md) | `batch_size` × `batch_deadline_ms` sweep informing the current defaults |
 | [agent-count-tuning.md](benchmarks/agent-count-tuning.md) | `shard_count` / `worker_count` sweep informing the startup advisory; cores-vs-agents heuristic |

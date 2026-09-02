@@ -181,6 +181,36 @@ jobs:
             git push
           fi
 
+  drain:
+    name: drain (tests/load_drain)
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The delivery-side counterpart to the `load` job. Every scenario in
+      # tests/load.rs measures ingest; nothing measured how fast the buffer
+      # empties, which for a write buffer is the half that decides whether it
+      # ever does. These also assert that no record is lost between the WAB and
+      # the sink across a sink outage — a correctness gate, not only a number.
+      #
+      # Run once rather than the load job's ten times: each scenario builds a
+      # real backlog and drains it, so the wall-clock is minutes, and the
+      # numbers are reported for tracking rather than gated on.
+      - name: Run drain load tests
+        run: |
+          cargo test -p weir-server --test load_drain --release -- --nocapture 2>/dev/null \
+            | grep '^BENCH: ' | tee drain_results.jsonl
+      - name: Summary
+        if: always()
+        run: |
+          echo '### Drain throughput' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat drain_results.jsonl >> "$GITHUB_STEP_SUMMARY" || echo '(no results)' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
   bench:
     name: bench (tests/load)
     runs-on: ubuntu-latest
@@ -224,21 +254,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `features: tls` is what gives the shipped binary a TCP+mTLS ingest
+          # listener. Without it the build is Unix-socket-only, which is NOT what
+          # the docs describe — every release before 2.0.3 shipped that way.
+          # Windows is the exception on purpose: the listener layer is
+          # `#[cfg(unix)]`, so there is nothing for `tls` to switch on there.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: false
+            features: tls
+            smoke: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
+            features: tls
           - target: x86_64-apple-darwin
             os: macos-latest
             use_cross: false
+            features: tls
           - target: aarch64-apple-darwin
             os: macos-latest
             use_cross: false
+            features: tls
+            smoke: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             use_cross: false
+            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -260,11 +302,51 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} -p weir-server
-          else
-            cargo build --release --target ${{ matrix.target }} -p weir-server
+          FEATURES=""
+          if [ -n "${{ matrix.features }}" ]; then
+            FEATURES="--features ${{ matrix.features }}"
           fi
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p weir-server $FEATURES
+          else
+            cargo build --release --target ${{ matrix.target }} -p weir-server $FEATURES
+          fi
+      # A4 proof. The TCP+mTLS client must build on EVERY target, Windows
+      # included. It was gated `#[cfg(all(unix, feature = "tls"))]` purely
+      # because it imported two types that happened to live in the Unix module;
+      # `tls.rs` itself uses TcpStream and rustls and nothing else. Building it
+      # here is what turns that from a claim into a fact — the previous gate was
+      # never questioned precisely because nothing ever tried.
+      - name: Build the mTLS client on every target
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p weir-client --features tls
+          else
+            cargo build --release --target ${{ matrix.target }} -p weir-client --features tls
+          fi
+
+      # A1 regression guard. Proves the binary that is about to be uploaded
+      # actually has the TCP+mTLS listener compiled in. It needs no certificates:
+      # a tls-less build is rejected by config validation with a DIFFERENT
+      # message ("built without the 'tls' feature") than a tls build ("tls_cert_path
+      # is required"), so the startup error alone distinguishes them. Runs only on
+      # targets this runner can execute natively.
+      - name: Verify the shipped binary has a TLS listener
+        if: matrix.smoke
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/weir-server"
+          WAB="$(mktemp -d)"
+          set +e
+          OUT="$("$BIN" --tcp-bind 127.0.0.1:17100 --wab-dir "$WAB" 2>&1)"
+          set -e
+          echo "$OUT"
+          if printf '%s' "$OUT" | grep -q "without the 'tls' feature"; then
+            echo "::error::weir-server was built WITHOUT --features tls; this artifact would ship with no network ingest listener."
+            exit 1
+          fi
+          echo "OK: binary accepts tcp_bind and fails on the missing cert, as a tls build should."
       - name: Stage binary (Unix)
         if: matrix.target != 'x86_64-pc-windows-msvc'
         shell: bash
