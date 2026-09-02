@@ -1089,6 +1089,33 @@ fn enter_blocked(
 
 // ── Segment processing ────────────────────────────────────────────────────────
 
+/// A segment's address in the WAB, as `<shard-dir>/<file-name>` — the string
+/// mixed into every [`RecordId`] derived from that segment.
+///
+/// **The file name alone is not unique, and using it alone was a defect.** Every
+/// `ShardWriter` starts its counter at 1 and names files `seg_{counter:08}`
+/// inside its own shard directory (`wab/segment.rs`), so
+/// `shard_00/seg_00000001.wab.sealed` and `shard_01/seg_00000001.wab.sealed`
+/// share a basename. Hashing the basename gave two genuinely distinct records
+/// the same `RecordId` whenever `shard_count > 1` and their payloads matched —
+/// the HTTP sink sends that as `Idempotency-Key`, so a correctly-implemented
+/// endpoint kept one and dropped the other. That is precisely the collision
+/// `RecordId` was introduced in 2.0.3 to prevent; it was merely moved from
+/// payload granularity to shard granularity.
+///
+/// Falls back to the bare file name when there is no parent component, which
+/// only happens for a bare relative path in tests.
+fn segment_identity(segment: &Path) -> String {
+    let file = segment
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match segment.parent().and_then(|p| p.file_name()) {
+        Some(shard) => format!("{}/{}", shard.to_string_lossy(), file),
+        None => file,
+    }
+}
+
 async fn process_segment<S: Sink>(
     segment: &Path,
     sink: &S,
@@ -1130,15 +1157,12 @@ async fn process_segment<S: Sink>(
     let mut durable_through: u64 = skip;
     let mut batch: Vec<Payload> = Vec::with_capacity(max_batch);
 
-    // Per-record identity for the sink's idempotency key. The segment's file
-    // name plus the record's index within it is the record's address in the
-    // buffer, and that address is what tells two records carrying identical
-    // bytes apart — a content hash cannot. Kept parallel to `batch` rather than
-    // folded into `Payload`, so nothing about the record type changes.
-    let segment_name = segment
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    // Per-record identity for the sink's idempotency key: the segment's address
+    // in the buffer plus the record's index within it, which is what tells two
+    // records carrying identical bytes apart — a content hash cannot. Kept
+    // parallel to `batch` rather than folded into `Payload`, so nothing about
+    // the record type changes.
+    let segment_name = segment_identity(segment);
     let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
 
     let mut read_failed = false;
@@ -2069,6 +2093,55 @@ mod tests {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// The defect `segment_identity` exists to fix: every ShardWriter starts its
+    /// counter at 1 and names files `seg_{counter:08}` inside its own shard dir,
+    /// so the BASENAME repeats across shards. Hashing the basename alone gave two
+    /// genuinely distinct records the same RecordId whenever shard_count > 1 and
+    /// their payloads matched — which the HTTP sink sends as Idempotency-Key, so
+    /// a correct endpoint drops one. Shipped in 2.0.3 and 2.0.4.
+    #[test]
+    fn record_ids_differ_across_shards_for_the_same_segment_number() {
+        let a = Path::new("/var/lib/weir/wab/shard_00/seg_00000001.wab.sealed");
+        let b = Path::new("/var/lib/weir/wab/shard_01/seg_00000001.wab.sealed");
+        assert_eq!(
+            a.file_name(),
+            b.file_name(),
+            "precondition: the basenames really do collide, which is the trap"
+        );
+        assert_ne!(
+            segment_identity(a),
+            segment_identity(b),
+            "two shards' segment #1 must not share an identity"
+        );
+
+        let payload = Payload::from(b"heartbeat".as_ref());
+        assert_ne!(
+            RecordId::for_record(&segment_identity(a), 1, &payload),
+            RecordId::for_record(&segment_identity(b), 1, &payload),
+            "identical bytes at index 1 of each shard's segment #1 must not \
+             produce the same idempotency key"
+        );
+    }
+
+    /// The property that must survive the fix: a re-read of the same segment
+    /// yields the same identity, so the drain's own retry still deduplicates.
+    #[test]
+    fn segment_identity_is_stable_for_the_same_segment() {
+        let p = Path::new("/var/lib/weir/wab/shard_03/seg_00000042.wab.sealed");
+        assert_eq!(segment_identity(p), segment_identity(p));
+        assert_eq!(segment_identity(p), "shard_03/seg_00000042.wab.sealed");
+    }
+
+    /// A bare relative path (tests only) has no parent component; it must not
+    /// panic or produce a leading separator.
+    #[test]
+    fn segment_identity_tolerates_a_bare_file_name() {
+        assert_eq!(
+            segment_identity(Path::new("seg_00000001.wab")),
+            "seg_00000001.wab"
+        );
+    }
 
     /// Ids for a test batch, at a synthetic coordinate. `commit_batch` only
     /// forwards these, so the exact segment name is immaterial — what matters is
