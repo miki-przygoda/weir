@@ -863,13 +863,23 @@ impl Config {
                         "'{s}' is not a valid socket address (expected e.g. '0.0.0.0:7100' or '[::]:7100')"
                     ),
                 })?;
-                if !cfg!(feature = "tls") {
+                // Must match main.rs's `all(unix, feature = "tls")` gate exactly.
+                // Testing the feature alone would accept tcp_bind on a Windows
+                // build that has no listener layer to run it — config would say
+                // yes and the daemon would then listen on nothing, which is the
+                // silent failure this check exists to prevent.
+                if !cfg!(all(unix, feature = "tls")) {
                     return Err(ConfigError::InvalidValue {
                         field: "tcp_bind",
-                        reason: "tcp_bind is set but this binary was built without the 'tls' \
-                                 feature; rebuild with --features tls \
-                                 (plaintext TCP is never exposed)"
-                            .to_string(),
+                        reason: if cfg!(unix) {
+                            "tcp_bind is set but this binary was built without the 'tls' \
+                             feature; rebuild with --features tls \
+                             (plaintext TCP is never exposed)"
+                        } else {
+                            "tcp_bind is set but this is a non-Unix build, where weir-server \
+                             has no listener layer at all; the 'tls' feature cannot change that"
+                        }
+                        .to_string(),
                     });
                 }
                 // Validate each required TLS path field individually so we
@@ -1739,7 +1749,9 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
-    #[cfg(feature = "tls")]
+    // Gated to match the guard: on a non-Unix build the feature check fires
+    // first, so path validation is never reached and this test would fail.
+    #[cfg(all(unix, feature = "tls"))]
     #[test]
     fn tcp_bind_without_tls_paths_is_rejected() {
         let dir = tmp_dir("tcp_no_certs");
@@ -1758,7 +1770,7 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
-    #[cfg(not(feature = "tls"))]
+    #[cfg(not(all(unix, feature = "tls")))]
     #[test]
     fn tcp_bind_without_tls_feature_is_rejected() {
         let dir = tmp_dir("tcp_no_feature");
@@ -1777,6 +1789,14 @@ mod tests {
         // isolates the compile-time feature guard from the "path missing" error
         // (which would also contain the substring "tls").
         assert!(err.to_string().contains("feature"), "{err}");
+        // And that it names the RIGHT reason for this platform: telling a
+        // Windows user to "rebuild with --features tls" would send them after a
+        // fix that cannot work, since the listener layer is `#[cfg(unix)]`.
+        if cfg!(unix) {
+            assert!(err.to_string().contains("--features tls"), "{err}");
+        } else {
+            assert!(err.to_string().contains("non-Unix build"), "{err}");
+        }
         fs::remove_dir_all(dir).ok();
     }
 

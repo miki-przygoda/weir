@@ -4,6 +4,12 @@ mod metrics;
 mod models;
 mod queue;
 mod sink;
+// The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
+// `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
+// feature alone: `--features tls` on Windows would otherwise name `crate::socket`,
+// which does not exist there, and fail to compile rather than degrade. Nothing
+// builds that combination today (CI lints `--all-features` on ubuntu only), which
+// is exactly why the mistake was invisible.
 #[cfg(unix)]
 mod socket;
 mod wab;
@@ -316,7 +322,7 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
 /// is retained and an error is logged. Both outcomes increment the
 /// `tls_config_reloads` counter with the appropriate label so operators can
 /// alert on sustained reload failures.
-#[cfg(feature = "tls")]
+#[cfg(all(unix, feature = "tls"))]
 fn spawn_tls_reload_task(
     tls: crate::socket::tls::ReloadableServerConfig,
     metrics: std::sync::Arc<crate::metrics::Metrics>,
@@ -970,7 +976,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         //
         // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
         // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
-        #[cfg(feature = "tls")]
+        #[cfg(all(unix, feature = "tls"))]
         let (tcp_shutdown_tx, tcp_join) = {
             use socket::tcp::{self, TcpConfig};
             use socket::tls::ReloadableServerConfig;
@@ -1071,7 +1077,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("failed to install Ctrl-C handler");
                 info!("received Ctrl-C, initiating shutdown");
             }
-            #[cfg(feature = "tls")]
+            #[cfg(all(unix, feature = "tls"))]
             if let Some(tx) = tcp_shutdown_tx {
                 let _ = tx.send(());
             }
@@ -1108,7 +1114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // would cancel that drain the moment the Unix loop returns (e.g. when there
         // are no Unix connections), severing live TCP connections instead of
         // letting them finish within `shutdown_timeout_secs` (S09).
-        #[cfg(feature = "tls")]
+        #[cfg(all(unix, feature = "tls"))]
         if let Some(h) = tcp_join {
             let _ = h.await;
         }
