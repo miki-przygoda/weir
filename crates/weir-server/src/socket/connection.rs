@@ -41,6 +41,17 @@ pub const QUEUE_PUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// written by the eventual flusher completion — at-least-once semantics.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound on how much payload buffer is allocated before the client has
+/// proved it is actually sending. A frame declaring more than this gets the
+/// remainder reserved only once this first slice has arrived.
+///
+/// 64 KiB is chosen to sit above essentially every real record — so the common
+/// case still allocates once, reads once, and never reserves again — while
+/// capping what a peer can reserve by lying in the header at a value that stays
+/// harmless multiplied by `max_connections`. The 16 MiB hard cap still bounds
+/// the payload itself; this bounds the *speculative* part of it.
+const PAYLOAD_PREALLOC_CAP: usize = 64 * 1024;
+
 /// Per-connection configuration derived from the server config.
 #[derive(Clone)]
 pub struct ConnectionConfig {
@@ -229,10 +240,35 @@ where
         // eat the drain window. No ack/nack has been sent for this frame, so the
         // client sees the dropped connection as a failed push and retries — no
         // false ack, no data loss (F26).
-        let mut payload_buf = vec![0u8; payload_len];
+        // `payload_len` is the CLIENT's number, checked only against the cap
+        // above. Allocating it up front reserves that much before a single body
+        // byte arrives, so N connections each declaring the maximum reserve
+        // N * cap — with the 16 MiB hard cap, bounded only by the connection
+        // semaphore, which is not a memory budget anyone chose.
+        //
+        // So: allocate a bounded first slice, and only reserve the remainder
+        // once the client has actually delivered it. A peer that declares 16 MiB
+        // and sends nothing now costs PAYLOAD_PREALLOC_CAP, not 16 MiB. A genuine
+        // large sender pays one extra reserve and one copy of the first slice,
+        // which is why this reserves the exact remainder in a single call rather
+        // than growing chunk by chunk (that would memcpy the whole payload
+        // O(log n) times).
+        //
+        // The timeout still wraps the WHOLE read, so the deadline a slow peer
+        // faces is unchanged — this bounds memory, not patience.
+        let first_len = payload_len.min(PAYLOAD_PREALLOC_CAP);
+        let mut payload_buf = vec![0u8; first_len];
         let payload_read = tokio::select! {
             biased;
-            res = tokio::time::timeout(config.read_timeout, stream.read_exact(&mut payload_buf)) => res,
+            res = tokio::time::timeout(config.read_timeout, async {
+                stream.read_exact(&mut payload_buf).await?;
+                if payload_len > first_len {
+                    payload_buf.reserve_exact(payload_len - first_len);
+                    payload_buf.resize(payload_len, 0);
+                    stream.read_exact(&mut payload_buf[first_len..]).await?;
+                }
+                Ok::<(), io::Error>(())
+            }) => res,
             _ = shutdown_rx.changed() => return Ok(()),
         };
         match payload_read {
@@ -902,6 +938,48 @@ mod tests {
         let (msg_type, payload) = read_response(&mut client).await;
         assert_eq!(msg_type, MessageType::Nack);
         assert_eq!(payload[0], NackReason::BadPayloadCrc as u8);
+    }
+
+    /// The payload read is two-phase above `PAYLOAD_PREALLOC_CAP`: a bounded
+    /// first slice, then `reserve_exact` + a second `read_exact` for the
+    /// remainder. Splitting a read is exactly where an off-by-one silently
+    /// corrupts or truncates a record, and nothing else in this suite sends a
+    /// payload big enough to cross the boundary.
+    ///
+    /// The trailing payload CRC is the oracle: the handler validates it against
+    /// the bytes it actually assembled, so an Ack is only reachable if the two
+    /// slices were stitched back together exactly. A short, doubled, or
+    /// misaligned second read yields Nack(BadPayloadCrc) instead.
+    #[tokio::test]
+    async fn payload_spanning_the_prealloc_boundary_reassembles_exactly() {
+        for len in [
+            1usize,
+            PAYLOAD_PREALLOC_CAP - 1,     // single read, buffer exactly full
+            PAYLOAD_PREALLOC_CAP,         // single read, no remainder — must NOT resize
+            PAYLOAD_PREALLOC_CAP + 1,     // smallest remainder: the off-by-one case
+            PAYLOAD_PREALLOC_CAP * 2 + 7, // multi-slice with a ragged tail
+        ] {
+            // Position-dependent bytes: a payload of one repeated value would
+            // still CRC correctly if the two slices were swapped or overlapped.
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let frame = push_frame(&payload);
+
+            let mut client = spawn_handler(test_cfg()).await;
+            // `write_all` can exceed the socketpair buffer for the larger sizes
+            // here, so it only completes because the handler task spawned above
+            // is already draining the other end. That is also what makes this a
+            // real test of the split read: the bytes arrive in several chunks
+            // rather than one.
+            client.write_all(&frame).await.unwrap();
+
+            let (msg_type, _) = read_response(&mut client).await;
+            assert_eq!(
+                msg_type,
+                MessageType::Ack,
+                "payload of {len} B must round-trip intact across the \
+                 PAYLOAD_PREALLOC_CAP ({PAYLOAD_PREALLOC_CAP}) boundary"
+            );
+        }
     }
 
     #[tokio::test]
