@@ -13,6 +13,74 @@ protocol** below.
 
 ---
 
+## [2.0.4] - 2026-09-02
+
+**Documentation and CI. No runtime behaviour changed** — the library and daemon
+code is byte-for-byte 2.0.3. It is a separate release because each crate's
+`README.md` is packaged into its crates.io artifact, and several of those were
+wrong.
+
+### Fixed
+
+- **The `drain` CI job could not fail.** It ran `cargo test | grep | tee` with no
+  `shell:` key, and GitHub's default `run:` shell is `bash -e` *without*
+  `pipefail` — so the step's exit status was `tee`'s, which is always 0. The job
+  reported success regardless of the suite's result, including on
+  `load_drain.rs`'s assertion that no record is lost between the WAB and the sink
+  across a sink outage, which is the reason it is a gate rather than a
+  benchmark. Now `set -euo pipefail`, matching the `bench` job that had it right
+  all along. stderr is no longer discarded either: panics go there.
+
+- **`weir-rs`'s README told people to depend on `weir-rs = "1.3"`** — in four
+  places, on the crate's own crates.io landing page, two majors behind.
+
+- **`weir-ctl`'s README documented no `quarantine` subcommand.** `list`,
+  `inspect` and `requeue` — the tooling that makes a corrupt segment
+  recoverable — were missing entirely, as was `--json`.
+
+- **The dead-letter runbook (`docs/monitoring.md`) told operators the opposite of
+  what now happens.** It said an interrupted `weir-ctl dl requeue` would be
+  deduplicated downstream by the HTTP sink's idempotency key. That was true of
+  the pre-2.0.3 `sha256(payload)` key. Since 2.0.3 the key is derived from the
+  record's WAB coordinate, and `dl requeue` re-pushes records into a *new*
+  segment — so a re-run now presents new keys and delivers duplicates. This is
+  the intended trade (delivery is at-least-once; the old behaviour silently
+  dropped distinct records), and it is now recorded under 2.0.3 as well.
+
+- **Operator docs still told readers to build from source for mTLS.**
+  `docs/operations/configuration.md`, `docs/operations/tcp-mtls.md`,
+  `docs/security/container.md` and the monitoring stack all predated 2.0.3
+  shipping `--features tls` in the release binaries and the Docker image.
+
+- **The threat model overstated the cost of a memory-amplification attack.** Its
+  "aggregate memory" row described a ceiling reachable only by streaming real
+  data; before 2.0.3 a client could reserve it for free by lying in the header.
+  It now describes the two-phase allocation and the actual
+  free-of-data-transfer floor.
+
+- **`CONTRIBUTING.md`'s pre-PR gate claimed to be "exactly what CI enforces"**
+  and was missing the `conformance` and `drain` jobs. It also now warns that
+  `cargo deny` reads a *cached* crates.io index, so a local pass can precede a
+  CI failure on a newly-yanked crate — which happened on PR #29.
+
+- **The client's platform support was documented backwards** in `README.md`,
+  `docs/getting-started/quickstart.md`, `docs/getting-started/install.md` and
+  `CONTRIBUTING.md`, all of which still said Windows had no usable client. 2.0.3
+  made the TCP + mutual-TLS transport build on Windows; only
+  `WeirClient::connect`, the Unix-socket constructor, is Unix-only. The Windows
+  *server* binary remains a non-functional stub.
+
+### Added
+
+- `drain` CI results are retained as a 30-day build artifact.
+  `docs/benchmarks/drain-throughput.md` and `docs/benchmarks/environments.md`
+  now state the tracking gap plainly: delivery numbers reach neither
+  `latest.md` nor `history.md`, so a gradual regression would go unnoticed.
+  Closing that means teaching `deploy/avg_benchmarks.py` about scenarios with no
+  deadline suffix; deliberately left as its own change.
+
+---
+
 ## [2.0.3] - 2026-09-02
 
 **Every item below was found by an internal audit of the 2.0.1 tree — none was
