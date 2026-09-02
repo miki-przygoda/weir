@@ -44,6 +44,20 @@ before fsync). Kept; needs a design pass when revisited (likely post-1.0).
   which is the actual reusable asset — more so than reserved bytes would have
   been.
 
+  **Follow-up, 2.0.3: the *per-record* half landed too, also without a format
+  change.** This entry originally wanted a token "stable across retries but
+  distinct per record" and assumed it needed an on-disk field. It did not.
+  `weir_sink_sdk::RecordId` mixes the record's WAB *coordinate* — the segment
+  file name plus its index within that segment — into the digest, and the drain
+  knows both at read time without storing anything. That is now the HTTP sink's
+  per-record `Idempotency-Key`; `DedupToken` stayed exactly as described above,
+  because the two answer opposite questions (a retry token must be *stable*, an
+  idempotency key must be *unique*) and one digest cannot be both.
+
+  The cost, worth not rediscovering: a coordinate-derived key does **not**
+  survive `weir-ctl dl requeue`, which re-pushes records into a new segment. The
+  drain's own retry is unaffected — it re-reads the same coordinate.
+
 ## Observability extras (parked from thread #4 — 2026-06-13)
 
 Thread #4 ships the standard stack (the Prometheus exposition `/metrics` is

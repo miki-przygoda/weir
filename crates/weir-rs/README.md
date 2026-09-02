@@ -14,15 +14,15 @@ contains no logic of its own — each module *is* the corresponding crate.
 
 | You want to…                       | Use                                                                          |
 |------------------------------------|------------------------------------------------------------------------------|
-| Just the wire-protocol types       | `weir-rs = "1.3"` → `weir_rs::core` (always on)                              |
-| Send records from your app         | `weir-rs = { version = "1.3", features = ["client"] }` → `weir_rs::client`   |
-| Build a custom sink                | `weir-rs = { version = "1.3", features = ["sink-sdk"] }` → `weir_rs::sink_sdk` |
-| Read on-disk WAB segments          | `weir-rs = { version = "1.3", features = ["wab"] }` → `weir_rs::wab`         |
+| Just the wire-protocol types       | `weir-rs = "2.0"` → `weir_rs::core` (always on)                              |
+| Send records from your app         | `weir-rs = { version = "2.0", features = ["client"] }` → `weir_rs::client`   |
+| Build a custom sink                | `weir-rs = { version = "2.0", features = ["sink-sdk"] }` → `weir_rs::sink_sdk` |
+| Read on-disk WAB segments          | `weir-rs = { version = "2.0", features = ["wab"] }` → `weir_rs::wab`         |
 | Run the daemon                     | `cargo install weir-server`                                                  |
 | Operate / inspect a running daemon | `cargo install weir-ctl`                                                     |
 
 `features = ["full"]` enables client + sink-sdk + wab together; `features = ["tls"]`
-adds the mutual-TLS client.
+adds the mutual-TLS client — which, since 2.0.3, builds on Windows as well as Unix.
 
 ## Example
 

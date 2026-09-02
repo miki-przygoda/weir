@@ -53,6 +53,20 @@ one is a measurement the project had never taken.
   across records, and one digest cannot be both. See **Added** below.
   `DedupToken` is untouched and its 1.x compatibility pin still passes.
 
+  **Operator-visible consequence.** Because the key is now derived from where a
+  record sits in the WAB, it no longer deduplicates across a
+  `weir-ctl dl requeue`: a requeue re-pushes records through the socket, so they
+  land in a new segment and present a new key. Previously — keyed on payload
+  bytes alone — an interrupted requeue re-run happened to be deduplicated
+  downstream. The drain's own retry of a segment is unaffected and still
+  deduplicates, because it re-reads the same coordinate.
+
+  This is the intended trade, not a regression: delivery is documented
+  at-least-once, so a duplicate is within contract, whereas the old behaviour
+  silently *dropped* distinct records, which never was. `docs/monitoring.md`'s
+  dead-letter runbook has been corrected — it previously told operators the
+  opposite.
+
 - **A client could reserve 16 MiB per connection by lying in its header.** The
   payload buffer was allocated from the client-declared length before any body
   byte arrived, so N connections each declaring the maximum reserved

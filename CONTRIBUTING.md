@@ -26,7 +26,9 @@ drop a record it has acked?* If you can't rule that out, the change isn't ready.
   Unix-only socket APIs. The daemon still *builds* on Windows (CI compiles
   it there), but it is a non-functional stub: no Unix-socket listener, so it
   never serves. `weir-core` is genuinely cross-platform; `weir-client`
-  compiles everywhere but its client type is Unix-only.
+  compiles everywhere, and as of 2.0.3 its TCP + mutual-TLS transport (the
+  `tls` feature) builds and works on Windows too — only the Unix-socket
+  constructor (`WeirClient::connect`) is Unix-only.
 - **Docker** (with the `docker compose` plugin) — only for the optional
   sink-integration and monitoring suites below.
 
@@ -82,8 +84,23 @@ cargo test --workspace --exclude weir-server --all-features
 cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener --all-features
 cargo test -p weir-server --bins --all-features -- --test-threads=1
 
+# Wire-protocol conformance: the vectors' own reference codec, plus the five
+# from-spec demo clients (Python, Go, C, Java, TypeScript). The Rust decoder
+# is already covered above (crates/weir-core/tests/conformance.rs). This is
+# what catches a durability-tier rename breaking all five clients at once —
+# which happened, unseen, in 2.0.0.
+python3 docs/conformance/run_vectors.py
+python3 demos/py-wire-client/tests/test_conformance.py
+(cd demos/go-wire-client && go test ./...)
+(cd demos/c-wire-client && make check)
+(cd demos/java-wire-client && javac -d out $(find src -name '*.java') && java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json)
+(cd demos/ts-wire-client && node src/conformance.ts)
+
 # Dependency advisories, license, bans, and sources.
 # Install once: cargo install cargo-deny
+# cargo-deny reads a CACHED crates.io index, so a local run can pass while CI
+# fails on a newly-yanked crate. Refresh first: `cargo deny fetch` (or
+# `cargo update -w` without --offline). This bit a real PR.
 cargo deny check advisories bans licenses sources
 
 # Minimum supported Rust version, and that Cargo.lock is consistent.
@@ -91,9 +108,11 @@ cargo deny check advisories bans licenses sources
 rustup toolchain install 1.88 --profile minimal   # once
 rustup run 1.88 cargo check --workspace --all-features --locked
 
-# Deterministic simulation sweep, and that the load suite still compiles.
+# Deterministic simulation sweep, and that the load and drain suites still
+# compile.
 cargo test -p weir-server --bin weir-server --features dst "wab::dst::" -- --test-threads=1
 cargo test -p weir-server --test load --no-run
+cargo test -p weir-server --test load_drain --no-run
 
 # The docs book, with link checking. THIS IS PART OF CI AND WAS MISSING HERE
 # until 2026-08-31, when a PR went red on two link errors no local gate could
@@ -108,7 +127,12 @@ All of the above must pass. CI builds `weir-server` on all five release targets:
 Linux (x86_64 + aarch64), macOS (x86_64 + aarch64), **and Windows
 (x86_64-pc-windows-msvc)** — so **cfg-gate any Unix-only code** or the Windows
 build breaks. The Windows build is a non-functional stub (no Unix-socket
-listener); the daemon runs only on Linux and macOS.
+listener); the daemon runs only on Linux and macOS. The same job also builds
+`weir-client --features tls` on every target (Windows included) and, on the
+targets it can run natively, starts the freshly built `weir-server` to confirm
+the TCP+mTLS listener actually compiled in. None of that cross-compilation is
+practical to reproduce locally — treat a change to `weir-client`'s platform
+gating as needing the CI round-trip.
 
 ## Heavier suites (run when your change touches them)
 
@@ -124,6 +148,12 @@ WEIR_DST_SWEEP=300 cargo test -p weir-server --bin weir-server \
 
 # Load / benchmark scenarios (release build; emits BENCH: JSONL).
 cargo test -p weir-server --test load --release -- --nocapture
+
+# Delivery-side counterpart to the load scenarios above: measures how fast
+# the buffer drains rather than how fast it ingests, and asserts no record is
+# lost between the WAB and the sink across a sink outage (a correctness gate,
+# not only a number).
+cargo test -p weir-server --test load_drain --release -- --nocapture
 
 # SQL sink end-to-end tests against real MySQL + Postgres (brings up and tears
 # down a docker-compose stack; needs ports 33306 / 55432 free).

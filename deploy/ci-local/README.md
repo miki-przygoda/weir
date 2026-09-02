@@ -78,6 +78,11 @@ in `.github/workflows/docs.yml` or the docs job checks something else.
 **`cargo install cargo-deny` takes ~40 minutes** in a fresh Rust image and is one
 network hiccup away from failing the build. Fetch the prebuilt release binary.
 
+**`cargo-deny` reads a cached crates.io index.** A local run can pass on a
+stale index while CI fails on a crate yanked since the last fetch — this bit a
+real PR. Refresh before trusting a local pass: `cargo deny fetch`, or
+`cargo update -w` without `--offline`.
+
 **Python buffers stdout when it is not a TTY**, so a runner's progress output
 vanishes until the process ends. Use `PYTHONUNBUFFERED=1` or `docker run -it`.
 
