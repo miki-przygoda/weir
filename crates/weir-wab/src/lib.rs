@@ -531,11 +531,23 @@ pub fn verify_sealed_segment(
         // A real record header → hash the length field.
         hasher.update(&len_buf);
 
-        if payload_len > MAX_PAYLOAD_HARD_CAP {
+        // `payload_len` is the STORED length, so the bound must be the stored
+        // one. Staying "compression-unaware" means never decompressing — it does
+        // not mean pretending a zstd record fits the plaintext cap. A v2/ZSTD
+        // record may legitimately exceed MAX_PAYLOAD_HARD_CAP on disk (zstd's
+        // worst case is n + n/255 + 16), so the flat cap condemned valid
+        // segments that `SegmentReader` reads back byte-perfect. Both the reader
+        // (`SegmentReader::next`) and `recovery_reader` already key this on the
+        // header's compression; this was the only site that did not.
+        let stored_cap = match header.compression {
+            Compression::None => MAX_PAYLOAD_HARD_CAP,
+            Compression::Zstd => max_stored_record_bytes(),
+        };
+        if payload_len > stored_cap {
             return Err(SegmentVerifyError::BadRecord(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "record payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"
+                    "record payload_len {payload_len} exceeds the stored-record cap {stored_cap}"
                 ),
             )));
         }
