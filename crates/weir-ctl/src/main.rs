@@ -109,7 +109,10 @@ enum DlCommand {
     /// delete each segment once all its records are re-accepted. Defaults to a
     /// dry run. Re-delivery is at-least-once: if interrupted partway through a
     /// segment, that segment's already-pushed records are re-sent on the next
-    /// run (the sink's idempotency key dedupes identical payloads).
+    /// run, and a dedup-capable sink will NOT filter those duplicates — since
+    /// 2.0.3 the per-record idempotency key is derived from a record's WAB
+    /// coordinate as well as its bytes, and a requeue re-pushes into a new
+    /// segment, so the sink sees genuinely distinct records and accepts both.
     ///
     /// Skip semantics: a sealed segment with ANY unreadable/corrupt record is
     /// skipped WHOLESALE (left in place, nothing from it requeued) so a corrupt
@@ -985,11 +988,7 @@ fn cmd_dl_requeue(
             dl_dir.display(),
             socket.display(),
         );
-        println!(
-            "re-run with --yes to confirm. Re-delivery is at-least-once: a record may be \
-             delivered more than once if the run is interrupted (the sink's idempotency key \
-             dedupes identical payloads)."
-        );
+        println!("re-run with --yes to confirm. {DL_REQUEUE_DUPLICATE_WARNING}");
         if !unreadable.is_empty() {
             println!(
                 "\n⚠ {} of {} segment(s) could not be read and would be SKIPPED:\n  {}",
@@ -1569,6 +1568,21 @@ fn quarantine_requeue_plan(q_dir: &Path) -> Result<QuarantineRequeuePlan, String
 /// first commit-message draft claimed the dedup token *would* save you; it
 /// does not, because the token covers a batch's boundaries as well as its
 /// contents, and a requeue re-batches).
+/// What `dl requeue` tells an operator about duplicates, in one place so the
+/// human and any future machine-readable output cannot drift apart — the same
+/// reason [`QUARANTINE_REQUEUE_DUPLICATE_WARNING`] exists.
+///
+/// The claim this replaced was true until 2.0.3 and is now the opposite of the
+/// truth. `RecordId::for_record` (weir-sink-sdk) hashes a record's WAB segment
+/// and index alongside its bytes, and `dl requeue` re-pushes through the socket
+/// — so the record lands at a NEW coordinate and presents a NEW key. The drain's
+/// own retry of a segment still dedupes, because it re-reads the same
+/// coordinate; an operator re-running an interrupted requeue does not.
+const DL_REQUEUE_DUPLICATE_WARNING: &str = "Re-delivery is at-least-once: a record may be delivered more than once if the \
+     run is interrupted. A dedup-capable sink will NOT filter those duplicates — since 2.0.3 the \
+     per-record idempotency key covers a record's WAB coordinate as well as its bytes, and a \
+     requeue re-pushes into a new segment, so the sink sees genuinely distinct records.";
+
 const QUARANTINE_REQUEUE_DUPLICATE_WARNING: &str = "requeueing WILL re-send records that already reached the sink: recovery delivered the \
      valid prefix when it sealed it, and that prefix lives in the same file as the preserved \
      tail. A dedup-capable sink will NOT filter these duplicates — the dedup token is derived \
@@ -3633,6 +3647,37 @@ weir_sink_health{state=\"degraded\"} 0
             "the dry run must not contain the wrong reassurance form, got: {text}"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dl_requeue_duplicate_warning_states_the_corrected_dedup_claim() {
+        // The sibling `quarantine requeue` warning was corrected and pinned;
+        // `dl requeue` was missed and kept asserting the OPPOSITE — that the
+        // sink's idempotency key "dedupes identical payloads" — in both its
+        // --help text and the line printed immediately before an operator
+        // types --yes. True until 2.0.3, false since: RecordId covers a
+        // record's WAB coordinate, and a requeue re-pushes into a new segment.
+        //
+        // Pin the CONSTANT, not merely that something got printed, and use
+        // `contains_word` so "not" is not satisfied by "nothing" — the trap
+        // the sibling test already documents.
+        let w = DL_REQUEUE_DUPLICATE_WARNING.to_lowercase();
+        assert!(
+            contains_word(&w, "not") && w.contains("filter"),
+            "must say a dedup-capable sink will NOT filter these duplicates; got: \
+             {DL_REQUEUE_DUPLICATE_WARNING}"
+        );
+        assert!(
+            !w.contains("dedupes identical payloads"),
+            "the pre-2.0.3 claim came back: {DL_REQUEUE_DUPLICATE_WARNING}"
+        );
+        // The reason must survive too, or a later editor deletes the "not" as
+        // redundant: name the coordinate.
+        assert!(
+            w.contains("coordinate"),
+            "must say WHY (the key covers the WAB coordinate); got: \
+             {DL_REQUEUE_DUPLICATE_WARNING}"
+        );
     }
 
     #[test]
