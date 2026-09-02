@@ -83,6 +83,31 @@ impl WeirClient<UnixStream> {
 mod tests {
     use super::*;
 
+    /// `is_poisoned()` and `!is_recoverable()` are documented as equivalent.
+    /// `health_check` broke that: it propagated a write failure with a bare `?`
+    /// while `push` poisoned first, so a caller saw a non-recoverable error on a
+    /// client that still claimed to be usable — and the stream may be desynced
+    /// by a partial frame write.
+    #[test]
+    fn health_check_write_failure_poisons_like_push_does() {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // Drop the peer so the very next write is a broken pipe.
+        drop(b);
+        let mut c = WeirClient::from_stream(a);
+        let err = c
+            .health_check()
+            .expect_err("writing to a closed peer must fail");
+        assert!(
+            !err.is_recoverable(),
+            "an I/O failure is non-recoverable; got {err:?}"
+        );
+        assert!(
+            c.is_poisoned(),
+            "the documented invariant is that a non-recoverable error leaves the \
+             client poisoned — health_check used to return one without poisoning"
+        );
+    }
+
     #[test]
     fn push_default_without_default_errors() {
         let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();

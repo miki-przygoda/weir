@@ -22,9 +22,15 @@
 //! across connections**: create one `WeirClient` per producer thread (they're
 //! independent and the daemon handles many concurrently). Ordering is only
 //! guaranteed within a single connection's sequential pushes, not across
-//! connections. A built-in batched-push frame and a pooled client would need a
-//! `WIRE_VERSION` bump, so they remain a possible 3.0 addition; today, parallel
-//! connections are the way to scale a producer.
+//! connections.
+//!
+//! **A pooled client needs no protocol change at all** — the wire protocol
+//! already permits several frames in flight on one connection, and fanning out
+//! across connections is measurable today: roughly 5× on `Buffered` at 16
+//! connections and 9× on `Durable` at 48. A built-in batched-push *frame* is the
+//! part that needs new wire machinery. An earlier version of this paragraph
+//! attributed the protocol cost to both and so steered readers away from the one
+//! option that already works.
 //!
 //! # Example
 //!
