@@ -40,6 +40,7 @@ use std::{
 use crossbeam_channel::RecvTimeoutError;
 use tracing::{error, info, warn};
 use weir_core::Payload;
+use weir_sink_sdk::RecordId;
 
 use crate::{
     metrics::{
@@ -1129,6 +1130,17 @@ async fn process_segment<S: Sink>(
     let mut durable_through: u64 = skip;
     let mut batch: Vec<Payload> = Vec::with_capacity(max_batch);
 
+    // Per-record identity for the sink's idempotency key. The segment's file
+    // name plus the record's index within it is the record's address in the
+    // buffer, and that address is what tells two records carrying identical
+    // bytes apart — a content hash cannot. Kept parallel to `batch` rather than
+    // folded into `Payload`, so nothing about the record type changes.
+    let segment_name = segment
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
+
     let mut read_failed = false;
     for result in reader {
         let payload = match result {
@@ -1157,12 +1169,14 @@ async fn process_segment<S: Sink>(
         if read_index <= skip {
             continue;
         }
+        batch_ids.push(RecordId::for_record(&segment_name, read_index, &payload));
         batch.push(payload);
 
         if batch.len() >= max_batch {
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
+            let full_ids = std::mem::replace(&mut batch_ids, Vec::with_capacity(max_batch));
             let n = full_batch.len() as u64;
-            match commit_batch(&full_batch, sink, config, metrics, dead_letter).await {
+            match commit_batch(&full_batch, &full_ids, sink, config, metrics, dead_letter).await {
                 BatchResult::Ok => durable_through += n,
                 BatchResult::Transient { retry_after } => {
                     return ProcessResult::Transient {
@@ -1181,7 +1195,7 @@ async fn process_segment<S: Sink>(
 
     if !batch.is_empty() {
         let n = batch.len() as u64;
-        match commit_batch(&batch, sink, config, metrics, dead_letter).await {
+        match commit_batch(&batch, &batch_ids, sink, config, metrics, dead_letter).await {
             BatchResult::Ok => durable_through += n,
             BatchResult::Transient { retry_after } => {
                 return ProcessResult::Transient {
@@ -1296,6 +1310,7 @@ fn quarantine_segment(segment: &Path, config: &DrainConfig, metrics: &Metrics, r
 
 async fn commit_batch<S: Sink>(
     payloads: &[Payload],
+    record_ids: &[RecordId],
     sink: &S,
     config: &DrainConfig,
     metrics: &Metrics,
@@ -1316,7 +1331,11 @@ async fn commit_batch<S: Sink>(
     // is a refcount bump. (weir 1.x also ran every payload through
     // `SinkRecord::from_payload` here; that conversion was the identity in every
     // implementation that ever existed, and 2.0 removes it.)
-    let batch = weir_sink_sdk::SinkBatch::new(payloads.to_vec(), dedup_token);
+    let batch = weir_sink_sdk::SinkBatch::with_record_ids(
+        payloads.to_vec(),
+        dedup_token,
+        record_ids.to_vec(),
+    );
 
     let t = std::time::Instant::now();
     // Backstop timeout: a sink that hangs (e.g. a third-party sink with no
@@ -2051,6 +2070,17 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// Ids for a test batch, at a synthetic coordinate. `commit_batch` only
+    /// forwards these, so the exact segment name is immaterial — what matters is
+    /// that the count matches, which `SinkBatch::with_record_ids` enforces.
+    fn test_record_ids(payloads: &[Payload]) -> Vec<RecordId> {
+        payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| RecordId::for_record("test-segment.wab", i as u64, p))
+            .collect()
+    }
+
     fn noop_metrics() -> Arc<Metrics> {
         Arc::new(Metrics::new().0)
     }
@@ -2497,7 +2527,10 @@ mod tests {
         let config = fast_config(dir.clone());
         let payloads = vec![Payload::from(b"r1".as_ref()), Payload::from(b"r2".as_ref())];
 
-        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        let ids = test_record_ids(&payloads);
+        let result = block_on(commit_batch(
+            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+        ));
         assert!(
             matches!(result, BatchResult::Transient { .. }),
             "permanent sink error + failed dead-letter write must be Transient (preserve \
@@ -2526,7 +2559,10 @@ mod tests {
             Payload::from(b"bad".as_ref()),
         ];
 
-        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        let ids = test_record_ids(&payloads);
+        let result = block_on(commit_batch(
+            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+        ));
         assert!(
             matches!(result, BatchResult::Transient { .. }),
             "successful commit with a failed dead-letter write must be Transient \
@@ -2553,7 +2589,10 @@ mod tests {
         let config = fast_config(dir.clone());
         let payloads = vec![Payload::from(b"r1".as_ref()), Payload::from(b"r2".as_ref())];
 
-        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        let ids = test_record_ids(&payloads);
+        let result = block_on(commit_batch(
+            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+        ));
         assert!(
             matches!(result, BatchResult::Transient { .. }),
             "an under-accounting CommitResult must be Transient (preserve segment), not Ok"
@@ -3573,7 +3612,10 @@ mod tests {
         let sink = MockSink::with_responses([Err(MockError::Permanent)]);
         let payloads = vec![Payload::from(b"a-record".as_ref())];
 
-        let result = block_on(commit_batch(&payloads, &sink, &config, &metrics, &mut dl));
+        let ids = test_record_ids(&payloads);
+        let result = block_on(commit_batch(
+            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+        ));
         assert!(
             matches!(result, BatchResult::Ok),
             "a single batch larger than the cap must be written anyway (overshoot), not Blocked"
