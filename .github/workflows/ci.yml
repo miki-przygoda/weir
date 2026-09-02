@@ -222,6 +222,21 @@ jobs:
           echo '```json' >> "$GITHUB_STEP_SUMMARY"
           cat drain_results.jsonl >> "$GITHUB_STEP_SUMMARY" || echo '(no results)' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
+      # A step summary is discarded with the run. `avg_benchmarks.py` renders
+      # only the deadline-suffixed ingest scenarios, so these numbers reach
+      # neither docs/benchmarks/latest.md nor history.md — a delivery regression
+      # would currently show up nowhere. Retaining the JSONL is the cheap half of
+      # closing that; teaching the renderer about delivery scenarios is the rest,
+      # and is tracked in docs/benchmarks/drain-throughput.md rather than bolted
+      # onto the script that writes main's committed baselines.
+      - name: Retain results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drain-results
+          path: drain_results.jsonl
+          if-no-files-found: warn
+          retention-days: 30
 
   bench:
     name: bench (tests/load)

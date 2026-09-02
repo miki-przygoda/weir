@@ -80,3 +80,21 @@ cap — is what stands between that and a full disk.
   lost between the WAB and the sink across an outage — but the rates are reported
   for tracking, not enforced. Failing a throughput threshold on shared CI
   hardware produces flakes, not signal.
+- **Not yet trended.** `deploy/avg_benchmarks.py` renders only the
+  deadline-suffixed *ingest* scenarios, so these numbers reach neither
+  `latest.md` nor `history.md`. The `drain` CI job retains its JSONL as a
+  30-day build artifact, which preserves the raw data but does not plot a trend
+  — **a gradual delivery regression would currently go unnoticed.** Closing it
+  means teaching the renderer about delivery scenarios (which have no deadline
+  suffix and report `delivered_rps`, not `throughput_rps`); that touches the
+  script writing main's committed baselines, so it is deliberately a separate
+  change rather than a rider on this one.
+
+## Reproducing
+
+```sh
+cargo test -p weir-server --test load_drain --release -- --nocapture
+```
+
+Each scenario prints one `BENCH: {json}` line. The `drain` CI job runs exactly
+this.
