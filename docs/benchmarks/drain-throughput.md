@@ -25,8 +25,19 @@ These are the first delivery numbers the project has.
 | Segments | 64 KiB (`wab_segment_max_bytes`), 1 s idle seal |
 | Daemon | `bench_preset`: 4 shards, 4 workers, batch 64 |
 
-Numbers below are the **median of three consecutive runs**; the spread was under
-±8% on every scenario.
+Numbers below are the **median of three consecutive runs**. The spread is wider
+than a single figure suggests: per-record ranged 5,695–6,674 around its 5,961
+median, i.e. **+12.0% / −4.5%** — an earlier version of this file claimed "under
+±8%", which its own table contradicts.
+
+> **Treat these as a first measurement, not a baseline.** A later investigation
+> reproducing this suite saw a **2.6–4.1× spread across five consecutive runs**,
+> and found the window is dominated by macOS `F_FULLFSYNC` on the confirm path
+> plus a slice of the drain's own retry timer rather than by delivery work:
+> moving the WAB to a RAM disk raised per-record from 6,548 to 20,233 rec/s, and
+> shortening the retry base delay reached six figures. The methodology needs
+> fixing before these numbers carry weight — see
+> `.workdocs/explorations/2026-09-02/drain-architecture.md`.
 
 ## Results
 
