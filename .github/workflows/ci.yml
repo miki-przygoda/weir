@@ -281,6 +281,21 @@ jobs:
           else
             cargo build --release --target ${{ matrix.target }} -p weir-server $FEATURES
           fi
+      # A4 proof. The TCP+mTLS client must build on EVERY target, Windows
+      # included. It was gated `#[cfg(all(unix, feature = "tls"))]` purely
+      # because it imported two types that happened to live in the Unix module;
+      # `tls.rs` itself uses TcpStream and rustls and nothing else. Building it
+      # here is what turns that from a claim into a fact — the previous gate was
+      # never questioned precisely because nothing ever tried.
+      - name: Build the mTLS client on every target
+        shell: bash
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p weir-client --features tls
+          else
+            cargo build --release --target ${{ matrix.target }} -p weir-client --features tls
+          fi
+
       # A1 regression guard. Proves the binary that is about to be uploaded
       # actually has the TCP+mTLS listener compiled in. It needs no certificates:
       # a tls-less build is rejected by config validation with a DIFFERENT

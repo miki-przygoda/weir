@@ -64,11 +64,15 @@
 //! `weir_records_nack_total{tier="durable",reason="empty_payload"}`.
 #![deny(missing_docs)]
 
-#[cfg(unix)]
-mod unix;
+/// Transport-agnostic client core. Split out of `unix` so that `tls` — which
+/// needs a `TcpStream` and rustls, and nothing Unix-specific — is gated on the
+/// feature alone rather than on the platform.
+mod client;
+
+pub use client::{ClientError, DefaultTransport, WeirClient};
 
 #[cfg(unix)]
-pub use unix::{ClientError, WeirClient};
+mod unix;
 
 /// Re-export of [`weir_core::Durability`] so the common producer path needs a
 /// single crate import (`weir_client::Durability`).
@@ -79,8 +83,8 @@ pub use weir_core::Durability;
 /// connection-closing Nacks) without taking a direct dependency on `weir-core`.
 pub use weir_core::NackReason;
 
-#[cfg(all(unix, feature = "tls"))]
+#[cfg(feature = "tls")]
 mod tls;
 
-#[cfg(all(unix, feature = "tls"))]
+#[cfg(feature = "tls")]
 pub use tls::{ClientTlsConfig, TlsStream};
