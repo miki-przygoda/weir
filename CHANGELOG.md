@@ -13,6 +13,94 @@ protocol** below.
 
 ---
 
+## [2.0.3] - 2026-09-02
+
+**Every item below was found by an internal audit of the 2.0.1 tree — none was
+reported by a user.** Two are defects a user would have hit; two are hardening;
+one is a measurement the project had never taken.
+
+*(2.0.2 was never released; this branch carried all five gaps together.)*
+
+### Fixed
+
+- **Published binaries and the Docker image had no network ingest listener.**
+  The TCP+mTLS listener is behind the non-default `tls` feature, and neither
+  `release.yml` nor the Dockerfile passed `--features tls`. Every release
+  artifact and every published image was therefore Unix-socket-only, while the
+  docs described a TCP+mTLS ingest path they could not open — in a container,
+  not a degraded mode but a useless one, since the socket lives inside the
+  container's filesystem. Both build paths now pass the feature, and CI and the
+  release job run the binary they are about to upload to prove the listener is
+  compiled in.
+
+  Windows is excluded deliberately: `mod socket` is `#[cfg(unix)]`, so the
+  listener layer does not exist there and `tls` has nothing to switch on. That
+  also means `--features tls` on Windows did not merely do nothing — it named
+  `crate::socket` and failed to compile. All four sites are now gated
+  `all(unix, feature = "tls")`, and the `tcp_bind` config guard was tightened to
+  match so it cannot accept a listener the binary has no way to run.
+
+- **Two distinct records carrying identical bytes were given the same
+  `Idempotency-Key`.** The per-record key was `sha256(payload)` and nothing
+  else, so a producer emitting repetitive records — a heartbeat, a status ping,
+  any fixed-shape event — handed the endpoint one key for many events, and a
+  correctly-implemented idempotent endpoint kept the first and dropped the rest.
+  weir acked them and wrote them to disk; they were then discarded downstream by
+  weir's own header.
+
+  Fixed with a **new value rather than a changed one**, because a retry token
+  must be *stable* across a re-send while an idempotency key must be *unique*
+  across records, and one digest cannot be both. See **Added** below.
+  `DedupToken` is untouched and its 1.x compatibility pin still passes.
+
+- **A client could reserve 16 MiB per connection by lying in its header.** The
+  payload buffer was allocated from the client-declared length before any body
+  byte arrived, so N connections each declaring the maximum reserved
+  `N × 16 MiB` — bounded by the connection semaphore, but at a figure nobody
+  chose. A bounded first slice is now allocated and the remainder reserved only
+  once the client has delivered it; the read timeout is unchanged, so a slow
+  peer faces exactly the deadline it did before.
+
+### Added
+
+- **`weir_sink_sdk::RecordId`** — a per-record identity that mixes the record's
+  WAB coordinate (segment file name plus index within it) into the digest, so
+  identical bytes at different coordinates are different ids while a re-read of
+  the same record is the same id. The HTTP sink's per-record mode now keys on
+  it. A batch built without ids falls back to the payload digest, so existing
+  sink-author tests are unaffected.
+
+- **`SinkBatch::with_record_ids`, `SinkBatch::record_ids`,
+  `SinkBatch::into_records_with_ids`** — additive; `SinkBatch::new` still builds
+  a batch carrying no ids.
+
+- **`weir_client::DefaultTransport`** — the transport `WeirClient` uses when no
+  type parameter is given. Still `UnixStream` on Unix, so `WeirClient` means
+  exactly what it always did.
+
+- **A delivery-side load suite** (`tests/load_drain.rs`) and its baseline
+  (`docs/benchmarks/drain-throughput.md`). Every one of the fifteen existing
+  load scenarios measures ingest; nothing measured how fast the buffer empties,
+  which for a write buffer is the half that decides whether it ever does. First
+  numbers: NDJSON 7,457 rec/s, per-record 5,961 rec/s, 5,130 rec/s against a
+  1 ms sink. NDJSON's advantage is ~1.25×, not the order of magnitude its
+  framing implies — against a loopback mock there is little per-request overhead
+  for batching to remove. The suite also asserts that no record is lost between
+  the WAB and the sink across a sink outage.
+
+### Changed
+
+- **The mTLS client now builds on Windows.** `weir-client`'s `tls` module uses
+  `TcpStream` and rustls and contains no Unix-only API, but was gated
+  `#[cfg(all(unix, feature = "tls"))]` because it imports `ClientError` and
+  `WeirClient`, which lived in the `#[cfg(unix)]` `unix` module. Those types
+  moved to a transport-agnostic `client` module; `unix` keeps only the
+  `UnixStream` constructors. `tls` is now gated on the feature alone, and CI
+  builds `weir-client --features tls` on every target in the matrix.
+
+  No existing signature changes. Half of "weir is Rust-only and Unix-only" was
+  a file in the wrong place.
+
 ## [2.0.1] - 2026-09-01
 
 **Patch release. Every item below was found by an internal audit of the 2.0.0

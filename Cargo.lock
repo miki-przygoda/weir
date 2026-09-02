@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "weir-client"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "crc32fast",
  "proptest",
@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "weir-ctl"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "clap",
  "crc32fast",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "weir-rs"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "weir-client",
  "weir-core",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "weir-server"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "arc-swap",
  "core_affinity",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "weir-sink-sdk"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "sha2 0.10.9",
  "weir-core",
@@ -2771,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "weir-testkit"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "libc",
  "rcgen",
@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "weir-wab"
-version = "2.0.1"
+version = "2.0.3"
 dependencies = [
  "crc32fast",
  "weir-core",
