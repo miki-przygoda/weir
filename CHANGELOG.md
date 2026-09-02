@@ -88,6 +88,14 @@ one is a measurement the project had never taken.
   for batching to remove. The suite also asserts that no record is lost between
   the WAB and the sink across a sink outage.
 
+### Dependencies
+
+- `mysql_async` 0.37.0 → **0.37.1**. 0.37.0 was **yanked upstream** on
+  2026-09-01; `deny.toml` sets `yanked = "deny"`, so this is a hard CI failure
+  that appeared with no local change. `arc-swap` 1.9.1 → **1.9.2** because
+  mysql_async 0.37.1 requires it — bumping either alone does not resolve.
+  Lockfile only; no manifest requirement changed.
+
 ### Changed
 
 - **The mTLS client now builds on Windows.** `weir-client`'s `tls` module uses
