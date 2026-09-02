@@ -200,9 +200,21 @@ jobs:
       # real backlog and drains it, so the wall-clock is minutes, and the
       # numbers are reported for tracking rather than gated on.
       - name: Run drain load tests
+        # `set -euo pipefail` is load-bearing, and matches the bench job above.
+        # GitHub's default `run:` shell is `bash -e` WITHOUT pipefail, so in a
+        # `cargo test | grep | tee` pipeline the step's exit status is tee's —
+        # always 0. This job would have reported success on a failing suite,
+        # including on the assertion that no record is lost between the WAB and
+        # the sink across an outage, which is the whole reason it is a gate and
+        # not just a benchmark.
+        #
+        # stderr is NOT sent to /dev/null here (the bench job does, being a pure
+        # benchmark): panics and compile errors go there, and this job is a gate.
         run: |
-          cargo test -p weir-server --test load_drain --release -- --nocapture 2>/dev/null \
-            | grep '^BENCH: ' | tee drain_results.jsonl
+          set -euo pipefail
+          cargo test -p weir-server --test load_drain --release -- --nocapture \
+            | tee drain_output.txt
+          grep '^BENCH: ' drain_output.txt | tee drain_results.jsonl
       - name: Summary
         if: always()
         run: |
