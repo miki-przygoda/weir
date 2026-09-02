@@ -1082,9 +1082,14 @@ sink request.
 **Why it matters**: the drain's at-least-once delivery contract means
 records can be re-POSTed if a transient failure mid-batch causes the
 drain to retry the whole segment. The endpoint needs to dedupe to
-avoid double-writes. The key is a pure hash of the payload, so the
-same payload always produces the same key — exactly the property
-endpoint-side dedup needs.
+avoid double-writes. In per-record mode (`sink_http_batch = "none"`,
+the default) the key is the record's `RecordId`
+(`weir_sink_sdk::RecordId`), derived from the record's WAB coordinate
+(segment file name + index within it) *and* its payload — a retried
+record always presents the same key, but two distinct records never
+collide just because their payload bytes match. In `ndjson` mode the
+key is the batch's `DedupToken` — a pure hash of the batch's payload
+bytes (see [`sink_http_batch`](#sink_http_batch)).
 
 **Format**: `sha256:` prefix + 64-char lowercase hex digest. The
 prefix lets endpoints distinguish weir's scheme from other key sources
@@ -1095,22 +1100,18 @@ breaking parsers.
 header (strict CORS, header allow-lists). In that case the endpoint
 must implement its own dedup — usually by hashing the body server-side.
 
-> ⚠ **Content-collision caveat.** The key is `sha256(payload)` — a function of
-> the payload bytes *only*, with no per-record identity. So two **legitimately
-> distinct** records that happen to have byte-identical payloads (heartbeats,
-> repeated `OK`/empty bodies, identical log lines, repeated metric samples)
-> produce the **same** key. An endpoint that dedupes on the key will accept the
-> first and drop the rest — silently collapsing at-least-once into at-most-once
-> for duplicate-payload workloads. This is safe only when payloads are unique or
-> already carry their own dedup id. If your workload has repeating payloads,
-> either set `sink_send_idempotency_key = false` (and let the endpoint dedupe on
-> its own record id), or ensure each record embeds a unique field. (A future
-> per-record dedup token — `sha256(segment_id ‖ offset ‖ payload)`, stable across
-> retries but distinct per record — is parked for an on-disk WAB-format revision;
-> see "Generalized dedup token → WAB format v2" in
-> `docs/explorations/parked-future-directions.md`.
-> It can't be done without a format change because the sink today receives no
-> per-record identity, only the payload bytes.)
+> **Changed in 2.0.3.** Through 2.0.1, the per-record key was
+> `sha256(payload)` — a function of the payload bytes *only*, with no
+> per-record identity. Two **legitimately distinct** records that happened
+> to have byte-identical payloads (heartbeats, repeated `OK`/empty bodies,
+> identical log lines, repeated metric samples) produced the **same** key,
+> so an endpoint that deduped on it accepted the first and silently
+> dropped the rest — collapsing at-least-once into at-most-once for
+> duplicate-payload workloads. The key is now `RecordId`, which mixes in
+> the record's WAB coordinate, so identical payloads at different
+> coordinates now get different keys. Endpoints that deduplicated on the
+> pre-2.0.3 key will not recognise a retry that spans the upgrade, same as
+> any key-value change.
 
 ---
 
@@ -1634,9 +1635,14 @@ log_level = "info"
 ## TCP + mutual TLS
 
 > **Requires `--features tls`** — the `tls` feature on `weir-server` (and
-> `weir-client`) is **off by default**. A build without `--features tls` has
-> no TCP listener and the five keys below are not recognised. Enabling
-> `tcp_bind` without building with the feature is a startup error.
+> `weir-client`) is **off by default** for a plain `cargo build`; a binary
+> built without it has no TCP listener and the five keys below are not
+> recognised, and enabling `tcp_bind` without the feature is a startup error.
+> This does **not** mean operators must build from source: as of 2.0.3, the
+> official release binaries (Linux/macOS) and the official Docker image are
+> already built with `--features tls`. Windows binaries are the exception —
+> the listener layer is Unix-only, so the feature has nothing to enable
+> there.
 
 TLS is **mandatory** on the TCP path. Setting `tcp_bind` without a valid TLS
 configuration (or without building with `--features tls`) is a **fatal startup

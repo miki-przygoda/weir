@@ -2,7 +2,13 @@
 
 > **Default-off feature.** The TCP listener and all TLS code lives behind the
 > `tls` Cargo feature on `weir-server` (and `weir-client`). A standard
-> `cargo build` produces a Unix-socket-only binary. To enable the TCP path:
+> `cargo build` produces a Unix-socket-only binary — but you do not need to
+> build from source to get the TCP path: as of 2.0.3, the official release
+> binaries (Linux and macOS) and the official Docker image are built with
+> `--features tls` already, so the listener is present out of the box and
+> just needs `tcp_bind` and the TLS cert paths configured (see below).
+> Windows is the exception — the listener layer is Unix-only, so there is
+> nothing for the feature to enable there. To build it yourself from source:
 >
 > ```bash
 > cargo build --features tls

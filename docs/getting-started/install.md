@@ -21,10 +21,14 @@ method.)
   `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
 - A Unix host (Linux or macOS) to **run** the daemon. `weir-server`
   *builds* on Windows (CI and the release workflow produce a
-  `weir-server.exe`), but it is a non-functional stub there — there is no
-  Unix-socket listener, so the daemon never serves. `weir-core` is
-  genuinely cross-platform; `weir-client` compiles everywhere but its
-  client type (`WeirClient`) is Unix-only, so Windows has no usable client.
+  `weir-server.exe`), but it is a non-functional stub there — the whole
+  listener layer is `#[cfg(unix)]`, so the daemon never serves.
+- **Producers are a different matter.** `weir-core` is genuinely
+  cross-platform, and since 2.0.3 the client's TCP + mutual-TLS transport is
+  too — CI builds `weir-client --features tls` on every release target,
+  Windows included. A Windows producer against a Linux/macOS daemon over the
+  mTLS listener is a supported configuration; only `WeirClient::connect`, the
+  Unix-socket constructor, stays Unix-only.
 - ~500 MB free disk (build artifacts).
 
 ### Build

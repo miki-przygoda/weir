@@ -72,11 +72,14 @@ The chaos instance is scraped as `job=weir-chaos`; because Prometheus regexes ar
 anchored, the shipped alerts (`job=~"weir"`) don't match it, so an idle/off chaos
 profile never trips `WeirInstanceDown`.
 
-> **TLS chaos is intentionally not here.** Handshake-failure metrics are gated
-> behind the `tls` build feature (not in the default image), so demonstrating
-> them needs a `--features tls` weir build + certs. Parked for Phase 5 (see
-> `docs/explorations/parked-future-directions.md`); the TLS panel renders a
-> clean `0` baseline in the meantime.
+> **TLS chaos is intentionally not here.** Since 2.0.3 `deploy/docker/Dockerfile`
+> — which this compose stack builds from — passes `--features tls`, so the
+> TCP+mTLS listener is compiled into the image. (`tls` is still a non-default
+> cargo feature; the Dockerfile opts in.) What is missing is runtime config:
+> demonstrating handshake-failure chaos needs `tcp_bind` and the three `tls_*`
+> cert paths wired into the stack, which this profile doesn't do. Parked
+> for Phase 5 (see `docs/explorations/parked-future-directions.md`); the TLS
+> panel renders a clean `0` baseline in the meantime.
 
 Tear down everything with `docker compose --profile levels --profile chaos down -v`.
 

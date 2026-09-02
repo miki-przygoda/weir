@@ -79,16 +79,21 @@ per-batch `insert_deduplication_token` the sink sends. Either way the
 tests exercise the idempotent re-commit path the drain relies on under
 crash-recovery.
 
-> **Dedup keys on the whole payload bytes — a byte collision collapses
-> distinct records.** The reference schemas dedup on the payload (or its
-> sha256), and the HTTP sink's `Idempotency-Key`/ClickHouse token are hashes of
-> the bytes — there is **no per-record identity**. Two *legitimately distinct*
-> events that happen to have **byte-identical payloads** (heartbeats, repeated
-> `OK` bodies, identical log lines) collapse to **one** row, even though weir
-> **acks both** — the drop is invisible to weir. If distinct events can share
-> bytes, embed a unique field (event id, timestamp, sequence) in the payload so
-> each record is byte-distinct. See the content-collision caveat under
+> **SQL-sink dedup keys on the whole payload bytes — a byte collision
+> collapses distinct records.** The reference schemas dedup on the payload
+> (or its sha256), and the ClickHouse `insert_deduplication_token` is a hash
+> of the batch's bytes — there is **no per-record identity** in either case.
+> Two *legitimately distinct* events that happen to have **byte-identical
+> payloads** (heartbeats, repeated `OK` bodies, identical log lines) collapse
+> to **one** row, even though weir **acks both** — the drop is invisible to
+> weir. If distinct events can share bytes, embed a unique field (event id,
+> timestamp, sequence) in the payload so each record is byte-distinct. (As of
+> 2.0.3 this no longer applies to the HTTP sink's default per-record
+> `Idempotency-Key` — it is derived from the record's WAB coordinate, not the
+> payload alone; see
 > [`sink_send_idempotency_key`](../operations/configuration.md#sink_send_idempotency_key).
+> The HTTP sink's NDJSON batch-mode key is still a pure content hash and
+> collides the same way ClickHouse's token does.)
 
 > **`weir_sink_commit_records_total{outcome="committed"}` counts records *sent to
 > the INSERT*, not rows *persisted*.** With `INSERT IGNORE` /

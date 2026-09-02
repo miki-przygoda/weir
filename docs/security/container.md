@@ -30,6 +30,16 @@ handles attacker-controlled wire traffic. `--locked` makes Cargo refuse to
 update the lockfile during the build, so the dep set is exactly what the
 repository's `Cargo.lock` records.
 
+### TCP + mutual TLS listener (`--features tls`)
+
+Both `cargo build` invocations also pass `--features tls`, so the shipped
+image includes the TCP+mTLS listener, not just the Unix socket. The
+listener stays inert unless an operator sets `tcp_bind` and the three TLS
+cert-path config keys — see [TCP + mutual TLS](../operations/tcp-mtls.md)
+for setup. Building from source without `--features tls` (e.g. a custom
+image) produces a Unix-socket-only binary and rejects a configured
+`tcp_bind` at startup instead of opening it.
+
 ### Non-root daemon user
 
 The runtime stage creates a system user `weir` with:
@@ -151,10 +161,16 @@ Operator hardening that **must be applied externally**:
   is correct behaviour (delivered, then removed), not data loss. To observe
   recovery, strand a segment first (e.g. point at a down sink).
 - **No PID namespace constraints, no user namespace remap, no network
-  namespace by default.** These are orchestrator-level settings. The
-  daemon listens on a Unix socket only; in most deployments the network
-  namespace should be `none` (with bind-mounts providing the socket
-  path to peer containers) or restricted to localhost.
+  namespace by default.** These are orchestrator-level settings. By
+  default — no `tcp_bind` configured — the daemon listens on a Unix
+  socket only, and in most such deployments the network namespace should
+  be `none` (with bind-mounts providing the socket path to peer
+  containers) or restricted to localhost. The image is built with
+  `--features tls`, so it can also serve the TCP+mTLS listener if an
+  operator sets `tcp_bind` and the TLS cert paths; in that case the
+  container needs the TCP port published (e.g. `-p 7100:7100`) and a
+  network namespace that allows the intended inbound access — see
+  [TCP + mutual TLS](../operations/tcp-mtls.md).
 - **No image-level scanning in CI.** Recommended: add a Trivy or Grype
   scan step to the `docker.yml` workflow to catch CVEs in the base image
   on every rebuild.

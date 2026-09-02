@@ -199,9 +199,13 @@ dead-letter directory for manual handling — not retried.
 then reprocess with `weir-ctl dl requeue` — it re-submits the dead-lettered
 records back through the daemon's socket and deletes each segment once all its
 records are re-accepted. Re-delivery is at-least-once (a record may be delivered
-more than once if a requeue run is interrupted; the HTTP sink's idempotency key
-dedupes identical payloads). `weir-ctl dl` also offers `list` (inspect) and
-`drop` (discard) for when the records aren't worth reprocessing.
+more than once if a requeue run is interrupted). The HTTP sink's per-record
+idempotency key is derived from where the record lands in the WAB (segment +
+index), not just its payload bytes, so it dedupes a retry within one delivery
+attempt but not a duplicate from a separate, later `dl requeue` run — that
+writes the record into a new WAB entry with a different key. `weir-ctl dl`
+also offers `list` (inspect) and `drop` (discard) for when the records aren't
+worth reprocessing.
 
 ### Ingest / backpressure
 

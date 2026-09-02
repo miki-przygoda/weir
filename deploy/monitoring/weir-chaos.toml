@@ -17,8 +17,11 @@
 #     by SO_PEERCRED while the uid-10001 loadgen is accepted —
 #     `weir_connection_rejected_peer_uid_total` climbs.
 #
-# TLS handshake-failure chaos is intentionally NOT here: it needs a weir image
-# built with the `tls` feature (not in the default build). Parked for Phase 5.
+# TLS handshake-failure chaos is intentionally NOT here. The reason changed in
+# 2.0.3: the image DOES now have the listener compiled in (deploy/docker/Dockerfile
+# passes `--features tls`, which this compose stack builds from). What is missing
+# is the runtime config — `tcp_bind` plus the three `tls_*` cert paths — and the
+# certs to go with it. Parked for Phase 5.
 
 [server]
 socket_path = "/run/weir/weir.sock"
