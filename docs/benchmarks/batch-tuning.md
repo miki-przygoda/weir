@@ -76,8 +76,15 @@ fsync → ack), `batched` (request → flush-or-deadline → ack), `buffered`
   few hundred µs. A 5 ms deadline pushes p50 to ~6 ms; a 10 ms deadline pushes
   it to ~11 ms.
 - **`batch_size` has a small effect at the same deadline**: 256 slightly
-  outperforms 64 on the tail (p99 / p999), most likely because more records
-  amortise per fsync.
+  outperforms 64 on the tail (p99 / p999), and this sweep does not explain why.
+  The explanation this bullet used to give — "more records amortise per fsync" —
+  cannot apply to these tables, which are single-producer (see
+  [Caveat](#caveat)): one connection gets **1.00 records per `fdatasync`**,
+  because the daemon acks frame N before reading frame N+1
+  (`crates/weir-server/src/socket/connection.rs:485-491`), so there is never a
+  second record from that connection to amortise against. Treat the gap as
+  unexplained and possibly run-to-run noise in a 3-trial median on a shared
+  sandbox.
 - **(256, 1 ms) is the sweet spot** in this sweep — lowest p50 across sync /
   batched / buffered and tightest p99 tail in batched.
 - The `config/mod.rs` defaults at the time of this sweep (`batch_size = 1000`,
@@ -92,9 +99,9 @@ Change `Config::from_layers` defaults to `batch_size = 256`,
 `batch_deadline_ms = 1`. This:
 - Brings defaults in line with what the project actually exercises in CI
 - Lands a ~6× p50 latency improvement for any operator who runs with defaults
-- **Improves** throughput by 3-6× across every concurrency level measured —
-  the throughput companion sweep below shows no scenario where the current
-  default beats (256, 1ms)
+- **Improves** throughput by 3.6–7.9× across every scenario measured (computed
+  against (1000, 10ms) in the companion sweep below, which shows no scenario
+  where the old default beats (256, 1ms))
 
 Applied in the commit that follows this doc.
 
@@ -124,7 +131,7 @@ scenario, 256 B payload). Median RPS across the 3 trials per scenario.
 | 256 / 5ms        |  1440 |  4780 |  8131 |
 | 1000 / 10ms      |   749 |  2654 |  4779 |
 
-(256, 1ms) leads or ties on every scenario; (1000, 10ms) is 3-6× worse on
+(256, 1ms) leads or ties on every scenario; (1000, 10ms) is 3.6–6.7× worse on
 every concurrency level. The throughput data agrees with the latency data:
 no axis on which the (1000, 10ms) default beats (256, 1ms).
 
@@ -163,7 +170,12 @@ seal does an extra fsync (sentinel+footer durability commit, plus a parent-dir
 fsync to publish the rename), so more rotations = more seal fsyncs = lower RPS —
 a sweep observed sync throughput drop from ~90k to ~26k RPS when the segment cap
 was lowered to 1 MiB (observed on one box; treat the absolute numbers as
-machine-specific). **Durability is unaffected** — every accepted record is
+machine-specific). The *size* of the cliff is also platform-specific: the
+parent-directory fsync that publishes each seal is `File::sync_all`
+(`crates/weir-server/src/wab/segment.rs:712-714`), which is a plain `fsync` on
+Linux but `F_FULLFSYNC` on macOS — measured at 36 µs and 3,965 µs respectively on
+one M3 Max. Do not carry a macOS-measured cliff to a Linux deployment or the
+reverse. **Durability is unaffected** — every accepted record is
 fsynced before its ack regardless of segment size; the seal fsync only publishes
 the sealed-segment boundary to the drain. Default is 256 MiB (`SEGMENT_MAX_BYTES`);
 see [`wab_segment_max_bytes`](../operations/configuration.md#wab_segment_max_bytes).

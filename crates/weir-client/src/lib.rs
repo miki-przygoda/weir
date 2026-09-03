@@ -15,14 +15,29 @@
 //! # Throughput: one record per round-trip
 //!
 //! [`push`](WeirClient::push) is synchronous: it sends one frame and blocks for
-//! the ack before returning. So a **single** client's throughput is bounded by
-//! the round-trip time — roughly `1 / RTT` records/sec on one connection
-//! (e.g. a ~50 µs Unix-socket RTT caps a single client near ~20k rec/s; a
-//! `Durable`-tier push also waits on the daemon's fsync). To go faster, **fan out
-//! across connections**: create one `WeirClient` per producer thread (they're
-//! independent and the daemon handles many concurrently). Ordering is only
-//! guaranteed within a single connection's sequential pushes, not across
-//! connections.
+//! the ack before returning, so one connection carries one record at a time.
+//! What that costs depends on the tier, and the two are bounded by different
+//! things:
+//!
+//! - **`Buffered`** is round-trip bound. The daemon acks from memory, so the
+//!   ceiling is roughly `1 / RTT`.
+//! - **`Durable`** is fsync bound, not RTT bound. The ack waits on the daemon's
+//!   fsync, which dominates the round trip by orders of magnitude — batching at
+//!   the daemon amortises it across concurrent producers, which is why fanning
+//!   out helps this tier *more* than it helps `Buffered`.
+//!
+//! Measured on one machine (Apple M3 Max, Unix socket, 256-byte records): a bare
+//! AF_UNIX round trip is **~7 µs**, and a single client reaches **~32,000 rec/s
+//! `Buffered`** and **~5,700 rec/s `Durable`**. On a 2-vCPU CI runner the same
+//! figures are ~13,900 and ~3,700. Treat these as the shape of the problem, not
+//! as a spec: they move with hardware, filesystem, and record size. An earlier
+//! version of this paragraph quoted "~50 µs RTT" and "~20k rec/s", which matched
+//! neither tier on any machine we have measured.
+//!
+//! To go faster, **fan out across connections**: create one `WeirClient` per
+//! producer thread (they're independent and the daemon handles many
+//! concurrently). Ordering is only guaranteed within a single connection's
+//! sequential pushes, not across connections.
 //!
 //! **A pooled client needs no protocol change at all** — the wire protocol
 //! already permits several frames in flight on one connection, and fanning out

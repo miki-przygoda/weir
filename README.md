@@ -20,11 +20,17 @@ records at the durable tier, **none lost**
 5 built-in sinks (4 in a default build; `clickhouse` opt-in) ·
 wire format + Rust API under SemVer
 
-*Latency and throughput figures are deliberately not quoted here. The last
-published run is v1.3.1 on a 2-vCPU shared CI runner
-([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md)), there is no published
-measurement of 2.0.0, and this project's own rule is that external performance
-claims cite bare-metal numbers — which have not been captured yet. Measure on
+*Latency and throughput figures are deliberately not quoted here. Every published
+run — 2.0.3 as of 2026-09-02
+([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
+[`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner, and
+this project's own rule is that external performance claims cite bare-metal
+numbers, which have not been captured yet. The "microseconds" above is the fsync:
+a `Durable` ack is one fsync, so it is your disk's number, not weir's. Measured
+single-thread `Durable` p50 is ~133–152 µs on a Mac NVMe — where the primitive is
+macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4 ms** on a
+SATA SSD with an honest Linux `fdatasync`
+([comparison](docs/benchmarks/snapshot-2026-06-13-comparison.md)). Measure on
 your own hardware: `cargo test -p weir-server --test load --release -- --nocapture`.*
 
 **▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
