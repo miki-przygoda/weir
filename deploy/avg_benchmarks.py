@@ -212,9 +212,11 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
         f"Averaged over: {run_count} CI run(s) per deadline  ",
         f"Server config: `shard_count=4`, `batch_size=64`",
         "",
-        "> These numbers are the baseline for an ongoing performance improvement",
-        "> effort. Changes that move throughput down or latency up by more than",
-        "> ~10% should be investigated before merging.",
+        "> **CI numbers, not a baseline.** These come from a shared 2-vCPU runner.",
+        "> The same version's rows in `history.md` span ~1.45x on RPS and ~2x on",
+        "> p99 with no code change between them, so a ~10% move here is noise, not",
+        "> signal. Compare like-for-like on one machine before drawing a",
+        "> conclusion — see `environments.md` for which comparisons are valid.",
         "",
     ]
 
