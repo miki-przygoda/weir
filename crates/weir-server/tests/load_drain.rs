@@ -67,10 +67,30 @@ fn emit_delivery(scenario: &str, records: usize, elapsed: Duration) {
     let rps = records as f64 / elapsed.as_secs_f64();
     println!(
         "BENCH: {{\"scenario\":\"{scenario}\",\"delivered_records\":{records},\
-         \"wall_ms\":{},\"delivered_rps\":{}}}",
+         \"wall_ms\":{},\"delivered_rps\":{},\"wab\":\"{}\"}}",
         elapsed.as_millis(),
         rps as u64,
+        wab_backing(),
     );
+}
+
+/// What the WAB is sitting on, recorded in every result line.
+///
+/// This is not decoration. The confirm path calls `sync_all`, which on macOS is
+/// `F_FULLFSYNC` — measured at 3,965 µs against 238 µs for the `F_BARRIERFSYNC`
+/// used for record data. That single call dominated this suite's window, so a
+/// number is meaningless without knowing what it was written to: the same
+/// scenario went from 6,548 to 20,233 rec/s purely by moving the WAB to a RAM
+/// disk, and its run-to-run spread went from ±100% to ±9%.
+///
+/// Set `WEIR_BENCH_WAB_DIR` to a tmpfs/RAM-disk path to measure the drain rather
+/// than the filesystem. Leave it unset to measure what a real deployment sees.
+fn wab_backing() -> &'static str {
+    if std::env::var_os("WEIR_BENCH_WAB_DIR").is_some() {
+        "external"
+    } else {
+        "default"
+    }
 }
 
 // ── Mock HTTP sink ─────────────────────────────────────────────────────────
@@ -155,10 +175,27 @@ impl MockSink {
         self.failing.store(failing, Ordering::Relaxed);
     }
 
-    /// Blocks until `n` records have been counted, or panics on timeout.
+    /// Blocks until at least one record has been delivered.
     ///
-    /// Returns how long the wait took — that duration IS the measurement in
-    /// every throughput scenario below.
+    /// This is what separates the drain's RATE from the drain's LATENCY TO
+    /// START. After a sink outage the drain is inside an exponential backoff
+    /// (`100ms * attempts`), so the interval between "the sink became healthy"
+    /// and "the drain noticed" is a sleep, not work. Timing from the flip folded
+    /// a variable few-hundred-ms sleep into a window of roughly the same size —
+    /// which is most of why five consecutive runs of this suite spread 2.6-4.1x.
+    fn await_first_delivery(&self, timeout: Duration) -> Duration {
+        let t0 = Instant::now();
+        while self.delivered() == 0 {
+            assert!(
+                t0.elapsed() < timeout,
+                "no record was delivered within {timeout:?} of the sink recovering"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        t0.elapsed()
+    }
+
+    /// Blocks until `n` records have been counted, or panics on timeout.
     fn await_delivery(&self, n: usize, timeout: Duration) -> Duration {
         let t0 = Instant::now();
         while self.delivered() < n {
@@ -296,18 +333,37 @@ const IDLE_SEAL_SECS: &str = "1";
 /// count arrives, so the tail is checked for correctness without polluting the
 /// rate.
 fn bulk(n: usize) -> usize {
-    n * 3 / 4
+    // 50%, not 75%. A 256-byte record costs ~270 bytes framed, so a 64 KiB
+    // segment holds ~242 of them and only whole rotated segments are sealed.
+    // At 1,000 records that is 3 sealed segments = ~726 records, but 75% asked
+    // for 750 — so the wait ran past the sealed data and blocked on the 1 s
+    // idle-seal timer. `drain_under_slow_sink` was returning 1,004/1,010/1,010 ms
+    // as a result: three digits of timer, not of drain.
+    //
+    // 50% leaves a whole segment of headroom at every size this file uses.
+    n / 2
 }
 
 /// Builds a daemon pointed at `sink`, with the segment sizing every scenario
 /// needs. Callers add sink-specific env on top.
 fn daemon(tag: &'static str, sink: &MockSink) -> weir_testkit::WeirServerBuilder {
-    weir_server!(tag)
+    let b = weir_server!(tag)
         .bench_preset()
         .env("WEIR_SINK_TYPE", "http")
         .env("WEIR_SINK_URL", sink.addr.clone())
         .env("WEIR_WAB_SEGMENT_MAX_BYTES", SEGMENT_BYTES)
         .env("WEIR_WAB_SEGMENT_MAX_AGE_SECS", IDLE_SEAL_SECS)
+        // Shorten the retry backoff. The scenarios below hold the sink down to
+        // build a known backlog, so the drain is always in backoff when the sink
+        // returns; the default 100ms-per-attempt schedule then decides when
+        // measurement starts. The window itself now begins at the first
+        // delivered record, so this only reduces dead time — it does not move
+        // the rate.
+        .env("WEIR_SINK_RETRY_BASE_DELAY_MS", "5");
+    match std::env::var("WEIR_BENCH_WAB_DIR") {
+        Ok(d) if !d.is_empty() => b.wab_dir(std::path::PathBuf::from(d).join(tag)),
+        _ => b,
+    }
 }
 
 /// Pushes `n` Buffered records and returns once every one is acked at ingest.
@@ -349,7 +405,19 @@ fn measure_backlog_drain(
 
     let requests_before = sink.requests();
     sink.set_failing(false);
-    let elapsed = sink.await_delivery(bulk(records), timeout);
+
+    // Start the clock at the FIRST delivered record, not at the flip. Between
+    // the two the drain is asleep in its retry backoff, and that sleep is not
+    // delivery work — including it measured the backoff timer as though it were
+    // throughput.
+    let wakeup = sink.await_first_delivery(timeout);
+    let t0 = Instant::now();
+    sink.await_delivery(bulk(records), timeout);
+    let elapsed = t0.elapsed();
+    println!(
+        "    (drain woke {} ms after the sink recovered; excluded from the rate)",
+        wakeup.as_millis()
+    );
 
     // Correctness, separate from the rate: nothing may be dropped on the way to
     // the sink. No other test in either load suite checks this.

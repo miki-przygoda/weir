@@ -149,16 +149,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build test binary
         run: cargo test -p weir-server --test load --no-run
+      # `|| true` per run is deliberate: a benchmark should not gate the build on
+      # timing flake. Silently COMMITTING baselines averaged from a crashed run
+      # is a different thing, and that is what used to happen — no pipefail, both
+      # the exit status and stderr discarded, then the commit step ran anyway. A
+      # suite that panicked halfway produced a partial JSONL that was averaged
+      # and pushed to main as the new reference numbers.
+      #
+      # So: tolerate a failing run, but record that it failed, show its stderr,
+      # and refuse to publish the results.
       - name: Run load tests (5 × 1ms deadline, 5 × 2ms deadline)
         run: |
+          set -uo pipefail
+          failures=0
           for deadline in 1 2; do
             for i in 1 2 3 4 5; do
               echo "--- deadline=${deadline}ms run $i ---"
-              WEIR_BENCH_DEADLINE=$deadline \
-                cargo test -p weir-server --test load --release -- --nocapture 2>/dev/null \
-                | grep '^BENCH: ' >> load_results.jsonl || true
+              if WEIR_BENCH_DEADLINE=$deadline \
+                   cargo test -p weir-server --test load --release -- --nocapture \
+                   >load_run.out 2>load_run.err; then
+                grep '^BENCH: ' load_run.out >> load_results.jsonl || true
+              else
+                failures=$((failures + 1))
+                echo "::warning::load run deadline=${deadline}ms iteration=${i} FAILED"
+                tail -40 load_run.err
+              fi
             done
           done
+          echo "LOAD_FAILURES=${failures}" >> "$GITHUB_ENV"
+          if [ "${failures}" -gt 0 ]; then
+            echo "::error::${failures}/10 load runs failed — baselines will NOT be committed"
+          fi
+          # No results at all means the suite is broken, not flaky.
+          test -s load_results.jsonl
       - name: Extract version
         run: |
           echo "WEIR_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')" >> "$GITHUB_ENV"
@@ -170,8 +193,9 @@ jobs:
             docs/benchmarks/history.md
       - name: Show benchmark summary
         run: cat docs/benchmarks/latest.md
+      # Never publish numbers from a run set that contained a failure.
       - name: Commit benchmark results
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && env.LOAD_FAILURES == '0'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

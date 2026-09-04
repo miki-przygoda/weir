@@ -38,7 +38,15 @@ client.push(b"hello, weir!", Durability::Durable)?;
 ```
 
 For throughput, fan out across connections (one `WeirClient` per producer
-thread) — a single connection is bounded by the round-trip time. See the
+thread) — a single connection is bounded by **one ack per record**, not by the
+socket round trip: the daemon does not read the next frame until the current one
+is acked, so on `Durable` a lone connection gets ~1 fsync per record however the
+client is written. Fanning out gives each group fsync more records to ride —
+measured on one M3 Max over a loopback Unix socket, 16 connections reached
+**5.2×** a single client's `Buffered` rate and 48 reached **9.4×** its `Durable`
+rate. The gain is not monotonic, though: a few `Durable` connections spread thin
+across a multi-shard daemon can land *below* the single-connection rate — see the
+[`shard_count` caveat](../operations/configuration.md#shard_count). See the
 `weir-client` crate docs for the ordering caveat.
 
 > **Already inside an async runtime?** `push()` is a *blocking* call — calling it

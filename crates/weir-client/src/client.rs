@@ -13,6 +13,15 @@ use weir_core::{
     Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType, NackReason,
 };
 
+/// The largest payload any weir daemon response carries: `Ack` and
+/// `HealthCheckResponse` are empty, `Nack` is one reason byte, and
+/// `VersionMismatch` adds the daemon's wire version — 2 bytes.
+///
+/// A larger declared length on a *response* is a desync or a non-weir peer. A
+/// future wire version that grew this would arrive with a version bump the
+/// client already rejects before reaching here.
+const MAX_RESPONSE_PAYLOAD_LEN: usize = 2;
+
 /// The transport [`WeirClient`] uses when no type parameter is given.
 ///
 /// Unix keeps the Unix-domain socket it has always defaulted to, so
@@ -374,7 +383,16 @@ impl<S: Read + Write> WeirClient<S> {
         self.ensure_usable()?;
         let header = Header::new(MessageType::HealthCheck, Durability::Durable, 0);
         let frame = Envelope::new(header, vec![]).encode();
-        self.stream.write_all(&frame)?;
+        // Poison on a write failure, exactly as `push` does. A bare `?` here
+        // left the client in a state the crate documents as impossible: the
+        // error is non-recoverable while `is_poisoned()` returns false, and
+        // those two are promised to be equivalent (see `is_poisoned`). A partial
+        // write of the frame also desyncs the stream, which is precisely what
+        // poisoning exists to stop the caller from ignoring.
+        if let Err(e) = self.stream.write_all(&frame) {
+            self.poisoned = true;
+            return Err(e.into());
+        }
 
         let resp = self.read_response()?;
         match resp.header().message_type() {
@@ -480,15 +498,21 @@ impl<S: Read + Write> WeirClient<S> {
             Header::decode(&header_buf).map_err(|e| ClientError::Protocol(e.to_string()))?;
 
         let payload_len = header.payload_len() as usize;
-        // Cap before allocating, mirroring the server's pre-allocation guard
-        // (Envelope::decode). A malformed or hostile daemon could otherwise
-        // declare payload_len up to u32::MAX and make the client allocate ~4 GiB
-        // for a response (F44). Daemon responses are tiny, so this never trips
-        // legitimately.
-        if payload_len > MAX_PAYLOAD_HARD_CAP {
+        // Cap before allocating. The bound is the RESPONSE bound, not the record
+        // one: every weir response payload is at most 2 bytes (`Ack` and
+        // `HealthCheckResponse` are 0, `Nack` is 1, `VersionMismatch` is 2) —
+        // see the producer checklist in docs/wire_protocol.md, which tells every
+        // other implementer to "cap the response payload_len at a few bytes".
+        //
+        // This used to compare against MAX_PAYLOAD_HARD_CAP (16 MiB), the cap on
+        // a RECORD being sent the other way. So the reference client violated the
+        // checklist it publishes: a desynced or hostile peer could make it
+        // allocate 16 MiB and — with the default `read_timeout` of None — block
+        // forever waiting for bytes that never come.
+        if payload_len > MAX_RESPONSE_PAYLOAD_LEN {
             return Err(ClientError::Protocol(format!(
-                "response payload_len {payload_len} exceeds MAX_PAYLOAD_HARD_CAP \
-                 ({MAX_PAYLOAD_HARD_CAP}); refusing to allocate"
+                "response payload_len {payload_len} exceeds the {MAX_RESPONSE_PAYLOAD_LEN}-byte \
+                 response cap; refusing to allocate"
             )));
         }
         let mut payload_buf = vec![0u8; payload_len];

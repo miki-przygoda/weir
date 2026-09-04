@@ -4,7 +4,7 @@
 > grab a pre-built binary from the
 > [GitHub Releases](https://github.com/miki-przygoda/weir/releases), or use the
 > container image (`docker compose -f deploy/docker/docker-compose.yml up`).
-> `cargo install weir-server` lands with the first crates.io publish (see below).
+> or `cargo install weir-server` (see below) — the crates are published.
 
 Several install paths are covered below — from source, container image,
 `cargo install`, or a pre-built release binary. They all produce the same
@@ -209,9 +209,8 @@ See `deploy/systemd/README.md` for install, enable, and shutdown-tuning steps.
 
 ## `cargo install`
 
-> **Status:** the crates are not on crates.io yet — publishing lands with
-> the first crates.io release. Until then, use the from-source path above. Once
-> published, this will work:
+> **Status:** published. All seven crates are on crates.io (2.0.4 as of
+> 2026-09-02). This works today:
 
 ```bash
 cargo install weir-server

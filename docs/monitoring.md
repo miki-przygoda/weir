@@ -5,11 +5,16 @@ companion: how to wire up monitoring, what each alert means and how to respond,
 and a reference for every metric.
 
 **The one thing to internalise:** weir is **fsync-bound**. `weir_wab_fsync_duration_seconds`
-is the dominant latency signal in any durable-write deployment — Durable-tier latency is
-≈100% fsync (measured: NVMe ~150 µs, SATA SSD ~1.4 ms; see
-`docs/benchmarks/snapshot-2026-06-13-comparison.md`). Durable throughput is set
-by your disk's fsync latency, full stop. The dashboard and alerts are organised
-around making that obvious and actionable.
+is the dominant latency signal in any durable-write deployment — fsync is
+**~90–98%** of Durable-tier latency, the share rising as the disk gets slower
+(measured: Mac NVMe ~150 µs, SATA SSD ~1.4 ms; see
+`docs/benchmarks/phase3-results.md` and
+`docs/benchmarks/snapshot-2026-06-13-comparison.md`). Read those two as the range
+of what storage charges, not as a hardware ranking: they differ by **primitive as
+well as by medium** — the Mac figure is macOS `F_BARRIERFSYNC`, a barrier rather
+than a full flush, and the SATA one is an honest Linux `fdatasync`. Durable
+throughput is set by your disk's fsync latency, full stop. The dashboard and
+alerts are organised around making that obvious and actionable.
 
 **A reassurance baked into the failure modes:** weir's durability guarantees are
 deterministically fault-tested (the DST harness — `wab::dst`). A failed fsync, a

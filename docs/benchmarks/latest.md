@@ -4,9 +4,18 @@ Last updated: 2026-09-02 21:56 UTC
 Averaged over: 5 CI run(s) per deadline  
 Server config: `shard_count=4`, `batch_size=64`
 
-> These numbers are the baseline for an ongoing performance improvement
-> effort. Changes that move throughput down or latency up by more than
-> ~10% should be investigated before merging.
+> **These are CI numbers from a shared 2-vCPU runner, not a baseline.** The
+> `±σ` columns below are the deviation across the 5 passes of one run; they are
+> not the spread *between* runs. Consecutive runs of the same released version
+> in [`history.md`](history.md) differ by up to 1.45× on single-thread `Sync`
+> RPS and ~2× on `Sync` p99, so a ~10% move here is the runner, not a
+> regression. The CI surface's gate is an order-of-magnitude one — see
+> [`environments.md`](environments.md); the 10% / 20% thresholds belong to
+> same-machine before-and-after runs.
+>
+> (Maintainers: this blockquote is templated at
+> `deploy/avg_benchmarks.py:215-217` — change it there too, or the next CI run
+> reverts this file.)
 
 ## Throughput — deadline comparison
 

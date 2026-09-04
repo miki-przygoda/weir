@@ -109,7 +109,10 @@ enum DlCommand {
     /// delete each segment once all its records are re-accepted. Defaults to a
     /// dry run. Re-delivery is at-least-once: if interrupted partway through a
     /// segment, that segment's already-pushed records are re-sent on the next
-    /// run (the sink's idempotency key dedupes identical payloads).
+    /// run, and a dedup-capable sink will NOT filter those duplicates — since
+    /// 2.0.3 the per-record idempotency key is derived from a record's WAB
+    /// coordinate as well as its bytes, and a requeue re-pushes into a new
+    /// segment, so the sink sees genuinely distinct records and accepts both.
     ///
     /// Skip semantics: a sealed segment with ANY unreadable/corrupt record is
     /// skipped WHOLESALE (left in place, nothing from it requeued) so a corrupt
@@ -859,6 +862,42 @@ fn read_segment_records(path: &Path) -> Result<Vec<Payload>, String> {
             path.display()
         ));
     }
+
+    // A clean sentinel is NOT proof the whole segment was read. A zero length
+    // prefix IS the end-of-records sentinel, so an interior zeroed prefix — disk
+    // damage, a partial overwrite — makes the reader stop early and report a
+    // clean termination. The check above passes, `out` holds only the prefix,
+    // and the caller then DELETES the file: acked records destroyed, and the
+    // dry run reports `skipped_segments: 0` while it happens.
+    //
+    // The daemon's own recovery was hardened against exactly this (61fb0c9,
+    // then 70bebc1, which replaced a size heuristic with a footer cross-check).
+    // `weir-ctl` drives `SegmentReader` directly and inherited neither, so the
+    // operator tool destroyed what the daemon would have quarantined.
+    //
+    // The footer records how many records were sealed. If the walk disagrees,
+    // the segment is damaged: skip it wholesale, leave it on disk, and let the
+    // operator inspect it — mirroring the torn-tail and corrupt-record paths.
+    match weir_wab::verify_sealed_segment(path) {
+        Ok(v) => {
+            let sealed = v.footer.record_count;
+            if sealed != out.len() as u64 {
+                return Err(format!(
+                    "{}: footer records {sealed} record(s) but only {} were readable before an \
+                     end-of-records sentinel — damaged segment, left in place for inspection",
+                    path.display(),
+                    out.len()
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(format!(
+                "{}: sealed-segment verification failed ({e}) — left in place for inspection",
+                path.display()
+            ));
+        }
+    }
+
     Ok(out)
 }
 
@@ -985,11 +1024,7 @@ fn cmd_dl_requeue(
             dl_dir.display(),
             socket.display(),
         );
-        println!(
-            "re-run with --yes to confirm. Re-delivery is at-least-once: a record may be \
-             delivered more than once if the run is interrupted (the sink's idempotency key \
-             dedupes identical payloads)."
-        );
+        println!("re-run with --yes to confirm. {DL_REQUEUE_DUPLICATE_WARNING}");
         if !unreadable.is_empty() {
             println!(
                 "\n⚠ {} of {} segment(s) could not be read and would be SKIPPED:\n  {}",
@@ -1569,6 +1604,21 @@ fn quarantine_requeue_plan(q_dir: &Path) -> Result<QuarantineRequeuePlan, String
 /// first commit-message draft claimed the dedup token *would* save you; it
 /// does not, because the token covers a batch's boundaries as well as its
 /// contents, and a requeue re-batches).
+/// What `dl requeue` tells an operator about duplicates, in one place so the
+/// human and any future machine-readable output cannot drift apart — the same
+/// reason [`QUARANTINE_REQUEUE_DUPLICATE_WARNING`] exists.
+///
+/// The claim this replaced was true until 2.0.3 and is now the opposite of the
+/// truth. `RecordId::for_record` (weir-sink-sdk) hashes a record's WAB segment
+/// and index alongside its bytes, and `dl requeue` re-pushes through the socket
+/// — so the record lands at a NEW coordinate and presents a NEW key. The drain's
+/// own retry of a segment still dedupes, because it re-reads the same
+/// coordinate; an operator re-running an interrupted requeue does not.
+const DL_REQUEUE_DUPLICATE_WARNING: &str = "Re-delivery is at-least-once: a record may be delivered more than once if the \
+     run is interrupted. A dedup-capable sink will NOT filter those duplicates — since 2.0.3 the \
+     per-record idempotency key covers a record's WAB coordinate as well as its bytes, and a \
+     requeue re-pushes into a new segment, so the sink sees genuinely distinct records.";
+
 const QUARANTINE_REQUEUE_DUPLICATE_WARNING: &str = "requeueing WILL re-send records that already reached the sink: recovery delivered the \
      valid prefix when it sealed it, and that prefix lives in the same file as the preserved \
      tail. A dedup-capable sink will NOT filter these duplicates — the dedup token is derived \
@@ -2373,27 +2423,62 @@ mod tests {
 
     // ── Requeue ──────────────────────────────────────────────────────────────
 
-    /// Writes a valid sealed dead-letter segment `dl_<counter>.wab.sealed` that
-    /// `SegmentReader` can read: header + `[len][crc][payload]` per record +
-    /// sentinel. (The reader stops at the sentinel, so the footer is omitted.)
+    /// Writes a valid sealed dead-letter segment `dl_<counter>.wab.sealed`:
+    /// header + `[len][crc][payload]` per record + sentinel + footer.
+    ///
+    /// The footer is NOT optional here even though `SegmentReader` stops at the
+    /// sentinel and never reads it. An earlier version of this helper omitted it
+    /// on that reasoning, which made every test segment structurally unlike the
+    /// ones `DeadLetterWriter` actually produces (it seals through the normal
+    /// path, footer included) — so nothing exercised the footer, and the
+    /// interior-sentinel data loss below went unnoticed.
     fn write_dl_segment(dl_dir: &Path, counter: u64, records: &[&[u8]]) {
+        write_dl_segment_raw(dl_dir, counter, records, None)
+    }
+
+    /// As `write_dl_segment`, but `damage_at` zeroes the length prefix of the
+    /// record at that index — the interior-sentinel corruption. The footer still
+    /// records the true count, which is what makes the damage detectable.
+    fn write_dl_segment_raw(
+        dl_dir: &Path,
+        counter: u64,
+        records: &[&[u8]],
+        damage_at: Option<usize>,
+    ) {
         use std::io::Write;
         std::fs::create_dir_all(dl_dir).unwrap();
         let path = dl_dir.join(format!("dl_{counter:08}.wab.sealed"));
-        let mut f = std::fs::File::create(&path).unwrap();
+        let mut body: Vec<u8> = Vec::new();
         // Shard ID 0xFFFF is the dead-letter marker the daemon uses.
-        f.write_all(&weir_wab::format::build_segment_header(
+        body.extend_from_slice(&weir_wab::format::build_segment_header(
             0xFFFF,
             weir_wab::format::Compression::None,
+        ));
+        let mut data_bytes: u64 = 0;
+        for (i, r) in records.iter().enumerate() {
+            let len = if damage_at == Some(i) {
+                0u32
+            } else {
+                r.len() as u32
+            };
+            body.extend_from_slice(&len.to_le_bytes());
+            // Same CRC32 (IEEE) SegmentReader verifies — see weir-wab.
+            body.extend_from_slice(&crc32fast::hash(r).to_le_bytes());
+            body.extend_from_slice(r);
+            data_bytes += r.len() as u64;
+        }
+        // The footer's CRC covers every pre-sentinel byte.
+        let file_crc = crc32fast::hash(&body);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&body).unwrap();
+        f.write_all(&weir_wab::format::build_sentinel()).unwrap();
+        f.write_all(&weir_wab::format::build_segment_footer(
+            records.len() as u64,
+            data_bytes,
+            file_crc,
+            0,
         ))
         .unwrap();
-        for r in records {
-            f.write_all(&(r.len() as u32).to_le_bytes()).unwrap();
-            // Same CRC32 (IEEE) SegmentReader verifies — see weir-wab.
-            f.write_all(&crc32fast::hash(r).to_le_bytes()).unwrap();
-            f.write_all(r).unwrap();
-        }
-        f.write_all(&weir_wab::format::build_sentinel()).unwrap();
         f.sync_all().unwrap();
     }
 
@@ -2406,6 +2491,36 @@ mod tests {
         let recs = read_segment_records(&path).unwrap();
         let got: Vec<&[u8]> = recs.iter().map(|p| p.as_ref()).collect();
         assert_eq!(got, vec![b"alpha".as_ref(), b"beta", b"gamma"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CRITICAL regression. A zero length prefix IS the end-of-records
+    /// sentinel, so an interior zeroed prefix makes `SegmentReader` stop early
+    /// and report a CLEAN termination. Before the footer cross-check, that meant
+    /// `dl requeue` read only the prefix, reported no skipped segments, requeued
+    /// what it had, and then DELETED the file — destroying the acked records
+    /// after the damage point.
+    ///
+    /// The daemon's own recovery was hardened against this exact shape
+    /// (61fb0c9, then 70bebc1); weir-ctl drives SegmentReader directly and
+    /// inherited neither, so the operator tool destroyed what the daemon would
+    /// have quarantined.
+    #[test]
+    fn read_segment_records_refuses_a_segment_with_an_interior_sentinel() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_rq_mid_{}", std::process::id()));
+        let dl = dir.join("dead_letter");
+        // Three records; the SECOND one's length prefix is zeroed.
+        write_dl_segment_raw(&dl, 1, &[b"alpha", b"beta", b"gamma"], Some(1));
+        let path = dl.join("dl_00000001.wab.sealed");
+
+        let err = read_segment_records(&path)
+            .expect_err("a segment whose footer disagrees with the walk must NOT be requeued");
+        assert!(
+            err.contains("left in place for inspection"),
+            "the segment must be preserved, not deleted; got: {err}"
+        );
+        // The file is still there — that is the whole point.
+        assert!(path.exists(), "the damaged segment must remain on disk");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3633,6 +3748,37 @@ weir_sink_health{state=\"degraded\"} 0
             "the dry run must not contain the wrong reassurance form, got: {text}"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dl_requeue_duplicate_warning_states_the_corrected_dedup_claim() {
+        // The sibling `quarantine requeue` warning was corrected and pinned;
+        // `dl requeue` was missed and kept asserting the OPPOSITE — that the
+        // sink's idempotency key "dedupes identical payloads" — in both its
+        // --help text and the line printed immediately before an operator
+        // types --yes. True until 2.0.3, false since: RecordId covers a
+        // record's WAB coordinate, and a requeue re-pushes into a new segment.
+        //
+        // Pin the CONSTANT, not merely that something got printed, and use
+        // `contains_word` so "not" is not satisfied by "nothing" — the trap
+        // the sibling test already documents.
+        let w = DL_REQUEUE_DUPLICATE_WARNING.to_lowercase();
+        assert!(
+            contains_word(&w, "not") && w.contains("filter"),
+            "must say a dedup-capable sink will NOT filter these duplicates; got: \
+             {DL_REQUEUE_DUPLICATE_WARNING}"
+        );
+        assert!(
+            !w.contains("dedupes identical payloads"),
+            "the pre-2.0.3 claim came back: {DL_REQUEUE_DUPLICATE_WARNING}"
+        );
+        // The reason must survive too, or a later editor deletes the "not" as
+        // redundant: name the coordinate.
+        assert!(
+            w.contains("coordinate"),
+            "must say WHY (the key covers the WAB coordinate); got: \
+             {DL_REQUEUE_DUPLICATE_WARNING}"
+        );
     }
 
     #[test]

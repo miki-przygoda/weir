@@ -4,6 +4,14 @@ One row appended per CI run on `main`. All numbers at `batch_deadline_ms=1`.
 Sync p99 and Buffered p50 are single-thread latency measurements.
 Ramp peak = highest throughput level before connection-cap saturation kicks in.
 
+**Read the deltas conservatively.** These are shared 2-vCPU CI runners and the
+run-to-run spread is large. Rows for the *same released version* span
+1,926–2,783 Sync RPS (1.45×) and 610 µs – 1.2 ms Sync p99 (~2×) across the three
+1.3.1 runs; the three 0.3.0 runs span 621–692 RPS with p99 from 1.7 to 3.6 ms. A
+difference between adjacent rows smaller than that is the runner, not a
+regression or an improvement. Only order-of-magnitude moves are signal here — see
+[`environments.md`](environments.md).
+
 | Version | Date | Runs | Sync RPS | Sync p99 | Buf p50 | Ramp peak RPS |
 |---------|------|------|----------|----------|---------|---------------|
 | 0.2.0 | 2026-05-24 | 2 | 623 | 3.2 ms | — | 17,229 |

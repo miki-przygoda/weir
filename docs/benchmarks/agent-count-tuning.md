@@ -29,10 +29,19 @@ Source: `tests/load.rs::sweep_agent_count_vs_throughput`. Workload:
 | 6           | 25,048      | 24,609  | 25,225  | 1.50         |
 | 8           | 24,684      | 24,136  | 24,846  | 2.00         |
 
-The peak is at `agent_count = 1` on this 4-core box — **14% above the
-current bench-preset default of 4**. The trough is at `agent_count = 3`,
-exactly where `agents × 2 threads + ~2 reserved (tokio + accept) = cores`
-saturates the CPU.
+The peak is at `agent_count = 1` on this 4-core box — **16% above the
+bench-preset default of 4** (29,012 vs 24,961), and that is the only separation
+this table supports: `agent_count = 1`'s *min* (28,462) sits above the *max* of
+every row from 3 upward.
+
+Everything else is inside the noise. The min/max ranges for 3, 4, 6 and 8 all
+overlap each other, so "the trough is at `agent_count = 3`" — and the tidy story
+that it lands exactly where `agents × 2 threads + ~2 reserved (tokio + accept)`
+saturates 4 cores — is a shape this data cannot resolve; it was asserted in an
+earlier version of this file and is withdrawn here. `agent_count = 2` also
+overlaps the peak (25,684–29,303 vs 28,462–33,194), so even the peak's exact
+location is only probable. What the sweep does establish is **1 or 2 beats 3 or
+more, on this box**.
 
 ## Why fewer is better on small hosts
 

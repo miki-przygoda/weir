@@ -1126,11 +1126,22 @@ must implement its own dedup — usually by hashing the body server-side.
 
 How many per-record POSTs the HTTP sink keeps in flight per `commit`
 batch. The drain runs on a single thread, but the POSTs are async, so
-up to this many overlap their network round-trips — collapsing a
-segment's serial latency (1000 records × one RTT each would otherwise
-serialise to ~1000 RTTs). The protocol is unchanged: still one POST per
+up to this many overlap their network round-trips instead of paying one
+RTT per record in series. The protocol is unchanged: still one POST per
 record, each with its own `Idempotency-Key`, and dead-lettering stays
 per-record. Results are committed in submission order.
+
+**The overlap is bounded by one `commit` batch, not by the segment.** The drain
+awaits each batch of `sink_max_batch_size` records before reading the next
+records off the segment, so at the defaults a 1000-record segment is 10
+sequential batches, each internally ~13 waves of 8 — not one 8-wide pipeline
+running the length of the segment. Widening the window means raising
+[`sink_max_batch_size`](#sink_max_batch_size) alongside this knob.
+
+**Inert in `ndjson` mode.** With `sink_http_batch = "ndjson"` the whole batch is
+a single POST that the drain awaits, so exactly one request is in flight
+whatever this is set to — the daemon logs `concurrency = "n/a (ndjson)"` at
+startup rather than a misleading `8`.
 
 **When to tune**: raise it for high-latency endpoints where the RTT
 dominates; lower it (or set `1` for fully serial) for endpoints that
@@ -1158,6 +1169,17 @@ How the HTTP sink frames a `commit` batch into HTTP requests.
   Elasticsearch `_bulk` API, and similar log/trace ingesters expect. One
   POST per batch instead of N collapses the round-trip cost for sustained
   high-throughput forwarding.
+
+> **What batching buys depends on the endpoint's RTT — and it gives up the
+> per-record concurrency.** `ndjson` trades up to `sink_http_concurrency` POSTs
+> of one record for **one** POST of up to `sink_max_batch_size` records, so the
+> win grows with the endpoint's round-trip time and shrinks toward nothing (or
+> below) against a very fast local one. The only measurement the project has —
+> [drain-throughput.md](../benchmarks/drain-throughput.md), against a loopback
+> mock answering in microseconds — put `ndjson` at ~1.25× per-record mode, and
+> that figure is itself disputed: the window was dominated by fsync and retry
+> timing rather than delivery work (see the caveat on that page). Don't size a
+> deployment from it; measure against your own endpoint.
 
 **Trade-off (NDJSON is all-or-nothing).** The endpoint returns a single
 status for the whole batch, so there is no per-record outcome: a `2xx`
@@ -1596,7 +1618,11 @@ A more typical production TOML, with comments explaining each deviation:
 socket_path = "/run/weir/weir.sock"
 wab_dir     = "/var/lib/weir/wab"
 
-# Two shards on this NVMe; measured 1.4× throughput gain over single shard.
+# Two shards on this NVMe. Set this from your own measurement, not from this
+# file: shard_count is non-monotonic (see its caveat above), and the only sweep
+# weir publishes found *fewer* agents faster on a small host
+# (benchmarks/agent-count-tuning.md). No published weir number supports a gain
+# for two shards over one.
 shard_count  = 2
 worker_count = 4
 
