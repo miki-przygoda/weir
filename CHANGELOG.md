@@ -13,6 +13,154 @@ protocol** below.
 
 ---
 
+## [2.0.5] - 2026-09-04
+
+Seven verified defects from an overnight exploration sweep, one of them a
+data-loss path in an operator tool, plus a measurement fix that invalidates
+several published performance numbers. Every fix is mutation-checked: the test
+was confirmed to fail against the shipped behaviour before it was kept.
+
+> **Not published to crates.io.** 2.0.4 remains the latest registry release.
+> This tag exists so the fixes below are reachable and reviewable; the publish
+> is a separate, deliberate step.
+
+### Fixed
+
+- **`weir-ctl dl requeue` destroyed acked records (CRITICAL).** A zero length
+  prefix *is* the end-of-records sentinel, so an interior zeroed prefix — disk
+  damage, a partial overwrite — makes `SegmentReader` stop early and report a
+  *clean* termination. The torn-tail guard passed, only the prefix was
+  returned, and the caller then deleted the file. Demonstrated end to end: 3
+  records in, 1 requeued, `"skipped_segments": 0`, file gone, 2 acked records
+  destroyed. The daemon's own recovery was hardened against this exact shape
+  (61fb0c9, then 70bebc1, which replaced a size heuristic with a footer
+  cross-check); `weir-ctl` drives `SegmentReader` directly and inherited
+  neither, so the operator tool destroyed what the daemon would have
+  quarantined. `read_segment_records` now cross-checks the footer's
+  `record_count` against the walk and refuses the segment on any mismatch,
+  leaving it on disk for inspection.
+
+- **`RecordId` collided across shards, so a sink dropped distinct records.**
+  2.0.3 introduced `RecordId` precisely to stop two records with identical
+  bytes sharing an idempotency key, and moved the collision rather than
+  removing it. The drain hashed `segment.file_name()`; every `ShardWriter`
+  starts its counter at 1 and names files `seg_{counter:08}` inside its *own*
+  shard directory, so `shard_00/seg_00000001.wab.sealed` and
+  `shard_01/seg_00000001.wab.sealed` share a basename. Two matching payloads
+  at the same index in different shards produced one `RecordId`, which the
+  HTTP sink sends as `Idempotency-Key` — so a correct endpoint keeps one and
+  silently drops the other. Shipped in 2.0.3 and 2.0.4. Default `shard_count`
+  is 1, so a stock deployment never hit it; any deployment tuned for
+  throughput uses more. The identity is now `<shard-dir>/<file-name>`.
+
+- **`verify_sealed_segment` condemned valid compressed segments.** It compared
+  a *stored* length against the *plaintext* cap, so it rejected v2/ZSTD
+  segments that `SegmentReader` reads back byte-perfect (zstd's stored worst
+  case is `n + n/255 + 16`). `SegmentReader` and `recovery_reader` already
+  keyed this on the header; this was the only site that did not.
+
+- **`Client::health_check` broke the poisoning invariant.** It propagated a
+  write failure with a bare `?` while `push` poisons first, so the client
+  returned a non-recoverable error while `is_poisoned()` said `false` — the
+  crate documents those two as equivalent, in two places. A partial write of
+  the 20-byte frame also desyncs the stream, which is the case poisoning
+  exists to prevent a caller ignoring.
+
+- **The client's response cap was 16 MiB.** It compared against
+  `MAX_PAYLOAD_HARD_CAP`, the cap on a *record* travelling the other way.
+  Every weir response is at most 2 bytes, and `docs/wire_protocol.md`'s
+  producer checklist tells every other implementer to cap "at a few bytes" —
+  the reference client was violating the checklist it publishes. A desynced or
+  hostile peer could make it allocate 16 MiB and, with the default
+  `read_timeout` of `None`, block forever.
+
+- **`dl requeue` promised a dedup that 2.0.3 removed.** Both the `--help` text
+  and the line printed immediately before an operator types `--yes` said "the
+  sink's idempotency key dedupes identical payloads". True until 2.0.3, false
+  since: a requeue re-pushes through the socket into a *new* segment, so the
+  record presents a new key and a dedup-capable sink accepts both copies. The
+  sibling `quarantine requeue` was corrected for this exact reason; `dl
+  requeue` was missed, and the wrong text is what an operator reads
+  mid-incident. The wording now lives in `DL_REQUEUE_DUPLICATE_WARNING` so the
+  two cannot drift apart.
+
+- **The `load` CI job could not fail, and published its results anyway.** The
+  per-run `|| true` is deliberate — a benchmark should not gate on timing
+  flake — but with no `pipefail` and stderr discarded, a suite that panicked
+  halfway produced a partial JSONL that was averaged and pushed to `main` as
+  the new reference numbers. Failures are now counted, their stderr shown, and
+  the commit step gated on a clean run set.
+
+### Changed — measurement
+
+- **The drain benchmark was measuring a backoff timer and an idle timer.** The
+  published delivery figures were 3.4–5.4× too low with a 2.6–4.1× run-to-run
+  spread; neither was the drain. The clock started when the mock sink was
+  flipped healthy, but the drain was asleep in its retry backoff and woke
+  8–38 ms later — a sleep inside a window of roughly its own size. The window
+  now opens at the first delivered record. Separately, `bulk()` asked for 75%
+  of the fill while a 64 KiB segment holds only ~242 framed 256-byte records
+  and only whole rotated segments seal, so the wait ran past the sealed data
+  onto the 1 s idle-seal timer — `drain_slow_sink_1ms_conc16` was returning
+  1,004/1,010/1,010 ms, three digits of timer. Median of five runs after the
+  fix: NDJSON **40,710 rec/s** (was 7,457), per-record **24,381** (was 5,961),
+  1 ms sink **4,977** (was 5,130), spread now 1.15–1.30×.
+
+- **"Delivery is the narrower half" is withdrawn.** It compared ~6,000 rec/s
+  against an ingest number measured differently. The drain sustains ~40,700
+  NDJSON, above a single client's ~32,000 Buffered and ~5,700 Durable. That
+  claim was load-bearing for arguing A6's priority, so the argument has to be
+  remade.
+
+- Every drain result line now records what the WAB sat on, and
+  `WEIR_BENCH_WAB_DIR` points it at a tmpfs. The confirm path calls
+  `sync_all` — `F_FULLFSYNC` on macOS, 3,965 µs against 238 µs for the barrier
+  used for record data — so a delivery number without its storage is not
+  interpretable. All figures here are macOS; a bare-metal Linux run is the
+  outstanding follow-up.
+
+### Documentation
+
+Two agents audited every performance claim in the tree against the runs that
+produced it. The pattern: numbers outlived their runs, and several were never
+produced by a run at all.
+
+- **`configuration.md`'s example config claimed a "measured 1.4× throughput
+  gain over single shard".** No such measurement exists anywhere in
+  `docs/benchmarks/`, and the only published sweep found the opposite
+  direction — one agent at 29,012 against two at 26,233. The example survives;
+  the number is replaced with a note to measure it on your own hardware.
+- `benchmarks.md`'s headline table was stale by up to 40% and claimed to be
+  regenerated on every push when the script says it is hand-maintained.
+- `bare-metal.md` called itself "the ship gate" with 10%/20% thresholds while
+  holding zero captures.
+- `environments.md` asserted a "±10%" cross-environment tolerance that
+  measurement puts at 2.3×.
+- `agent-count-tuning.md` attributed a trough to CPU saturation when its own
+  min/max ranges overlap across every count.
+- `batch-tuning.md` stated a per-fsync amortisation mechanism that cannot hold
+  when one connection gets 1.00 records per fsync.
+- `monitoring.md`'s fsync share went from "≈100%" to the measured 90–98%, and
+  now says the Mac and SATA figures differ by *primitive* as well as medium —
+  macOS `F_BARRIERFSYNC` is a barrier, not a full flush.
+- `integrating.md` attributed the single-connection ceiling to round-trip
+  time. It is not RTT — the daemon will not read frame N+1 before acking N, so
+  Durable gets ~1 fsync per record however the client is written. Fan-out
+  measures 5.2× and 9.4×.
+- The getting-started path still told every new user "weir isn't on crates.io
+  yet" and handed them a git dependency. All seven crates are published;
+  `quickstart` now shows `weir-client = "2.0"`.
+- `weir-client`'s crate docs claimed a batched-push frame "and a pooled
+  client" would need a `WIRE_VERSION` bump. The pool half is false — the
+  protocol already permits frames in flight — and it shipped to docs.rs in
+  2.0.4, steering readers away from the only option that works today.
+- `avg_benchmarks.py`'s templated blockquote asserted the CI numbers are a
+  baseline where a ~10% move warrants investigation, while the same version's
+  rows in `history.md` span ~1.45× RPS with no code change between them. Left
+  alone, the next CI run would have undone the corresponding doc fix.
+
+---
+
 ## [2.0.4] - 2026-09-02
 
 **Documentation and CI. No runtime behaviour changed** — the library and daemon
