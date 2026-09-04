@@ -1,61 +1,54 @@
 # Benchmark Results
 
-Last updated: 2026-09-02 21:56 UTC  
+Last updated: 2026-09-04 20:47 UTC  
 Averaged over: 5 CI run(s) per deadline  
 Server config: `shard_count=4`, `batch_size=64`
 
-> **These are CI numbers from a shared 2-vCPU runner, not a baseline.** The
-> `±σ` columns below are the deviation across the 5 passes of one run; they are
-> not the spread *between* runs. Consecutive runs of the same released version
-> in [`history.md`](history.md) differ by up to 1.45× on single-thread `Sync`
-> RPS and ~2× on `Sync` p99, so a ~10% move here is the runner, not a
-> regression. The CI surface's gate is an order-of-magnitude one — see
-> [`environments.md`](environments.md); the 10% / 20% thresholds belong to
-> same-machine before-and-after runs.
->
-> (Maintainers: this blockquote is templated at
-> `deploy/avg_benchmarks.py:215-217` — change it there too, or the next CI run
-> reverts this file.)
+> **CI numbers, not a baseline.** These come from a shared 2-vCPU runner.
+> The same version's rows in `history.md` span ~1.45x on RPS and ~2x on
+> p99 with no code change between them, so a ~10% move here is noise, not
+> signal. Compare like-for-like on one machine before drawing a
+> conclusion — see `environments.md` for which comparisons are valid.
 
 ## Throughput — deadline comparison
 
 | Scenario | RPS (1ms) | ±σ (1ms) | RPS (2ms) | ±σ (2ms) | d1ms/d2ms |
 |----------|---------|------- | ---------|------- | ---------|
-| single_thread_buffered | 12,932 | ±332 | 12,264 | ±131 | **1.05×** |
-| single_thread_sync | 2,849 | ±31 | 2,805 | ±16 | **1.02×** |
-| thundering_herd_8_threads | 10,125 | ±284 | 10,011 | ±134 | **1.01×** |
-| thundering_herd_32_threads | 33,596 | ±1,222 | 34,078 | ±370 | **0.99×** |
-| thundering_herd_64_threads | 49,683 | ±1,984 | 51,055 | ±1,425 | **0.97×** |
-| connection_churn | 7,004 | ±156 | 7,335 | ±41 | **0.95×** |
-| fire_and_forget_overload | 4,319 | ±84 | 4,055 | ±192 | **1.07×** |
+| single_thread_buffered | 11,965 | ±206 | 11,569 | ±126 | **1.03×** |
+| single_thread_sync | 2,600 | ±62 | 2,594 | ±63 | **1.00×** |
+| thundering_herd_8_threads | 9,655 | ±485 | 9,462 | ±212 | **1.02×** |
+| thundering_herd_32_threads | 31,404 | ±921 | 31,142 | ±1,711 | **1.01×** |
+| thundering_herd_64_threads | 48,355 | ±1,387 | 47,327 | ±1,701 | **1.02×** |
+| connection_churn | 6,579 | ±101 | 6,940 | ±103 | **0.95×** |
+| fire_and_forget_overload | 4,045 | ±150 | 4,144 | ±152 | **0.98×** |
 
 ## Latency — single thread, `batch_deadline_ms=1`
 
 | Metric | Durable | Durable (batched) | Buffered |
 |--------|------- | ------- | -------|
-| Min | 286 µs | 283 µs | 48 µs |
-| Mean | 349 µs | 351 µs | 77 µs |
-| σ | 58 µs | 70 µs | 17 µs |
-| p50 | 341 µs | 342 µs | 76 µs |
-| p75 | 356 µs | 357 µs | 83 µs |
-| p95 | 402 µs | 406 µs | 96 µs |
-| p99 | 540 µs | 554 µs | 106 µs |
-| p99.9 | 1.2 ms | 1.7 ms | 234 µs |
-| Max | 1.7 ms | 2.2 ms | 637 µs |
+| Min | 293 µs | 294 µs | 50 µs |
+| Mean | 382 µs | 380 µs | 82 µs |
+| σ | 137 µs | 174 µs | 28 µs |
+| p50 | 362 µs | 358 µs | 80 µs |
+| p75 | 387 µs | 379 µs | 89 µs |
+| p95 | 473 µs | 456 µs | 101 µs |
+| p99 | 693 µs | 738 µs | 111 µs |
+| p99.9 | 2.8 ms | 3.7 ms | 135 µs |
+| Max | 3.3 ms | 4.7 ms | 1.2 ms |
 
 ## Latency — single thread, `batch_deadline_ms=2`
 
 | Metric | Durable | Durable (batched) | Buffered |
 |--------|------- | ------- | -------|
-| Min | 289 µs | 289 µs | 47 µs |
-| Mean | 352 µs | 354 µs | 79 µs |
-| σ | 48 µs | 63 µs | 14 µs |
-| p50 | 345 µs | 346 µs | 80 µs |
-| p75 | 358 µs | 359 µs | 86 µs |
-| p95 | 405 µs | 406 µs | 95 µs |
-| p99 | 523 µs | 547 µs | 104 µs |
-| p99.9 | 1.1 ms | 1.4 ms | 138 µs |
-| Max | 1.3 ms | 1.8 ms | 571 µs |
+| Min | 296 µs | 295 µs | 50 µs |
+| Mean | 386 µs | 383 µs | 85 µs |
+| σ | 146 µs | 142 µs | 20 µs |
+| p50 | 366 µs | 364 µs | 86 µs |
+| p75 | 393 µs | 389 µs | 92 µs |
+| p95 | 463 µs | 464 µs | 101 µs |
+| p99 | 683 µs | 732 µs | 112 µs |
+| p99.9 | 3.1 ms | 2.7 ms | 257 µs |
+| Max | 3.6 ms | 3.6 ms | 673 µs |
 
 
 ## Saturation Ramp — Buffered tier
@@ -65,12 +58,12 @@ Server config: `shard_count=4`, `batch_size=64`
 
 | Threads | RPS (d1ms) | RPS (d2ms) | I/O drops | Status |
 |---------|-------- | --------|-----------|--------|
-| 8 | 54,463 | 54,445 | 0 | ok |
-| 16 | 72,695 | 73,044 | 0 | ok |
-| 32 | 87,698 | 88,025 | 0 | ok |
-| 48 | 96,887 | 98,334 | 0 | ok |
-| 64 | 97,992 | 93,448 | 16 | **SATURATED** ← |
-| 96 | 94,383 | 95,098 | 48 | SATURATED |
+| 8 | 53,770 | 53,737 | 0 | ok |
+| 16 | 72,166 | 72,719 | 0 | ok |
+| 32 | 85,975 | 86,016 | 0 | ok |
+| 48 | 96,332 | 94,593 | 0 | ok |
+| 64 | 94,632 | 91,062 | 16 | **SATURATED** ← |
+| 96 | 93,940 | 93,823 | 48 | SATURATED |
 
 ## Saturation Ramp — Sync tier
 
@@ -79,12 +72,12 @@ Server config: `shard_count=4`, `batch_size=64`
 
 | Threads | RPS (d1ms) | RPS (d2ms) | I/O drops | Status |
 |---------|-------- | --------|-----------|--------|
-| 8 | 10,935 | 10,793 | 0 | ok |
-| 16 | 19,403 | 19,288 | 0 | ok |
-| 32 | 34,769 | 34,620 | 0 | ok |
-| 48 | 46,919 | 46,649 | 0 | ok |
-| 64 | 46,854 | 46,723 | 16 | **SATURATED** ← |
-| 96 | 46,945 | 46,818 | 48 | SATURATED |
+| 8 | 10,673 | 10,610 | 0 | ok |
+| 16 | 18,003 | 18,180 | 0 | ok |
+| 32 | 32,269 | 32,875 | 0 | ok |
+| 48 | 43,180 | 43,984 | 0 | ok |
+| 64 | 43,987 | 44,175 | 16 | **SATURATED** ← |
+| 96 | 43,651 | 44,034 | 48 | SATURATED |
 
 ---
 *Generated by `deploy/avg_benchmarks.py`*
