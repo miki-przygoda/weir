@@ -14,8 +14,14 @@ jobs:
           # `features: tls` is what gives the shipped binary a TCP+mTLS ingest
           # listener. Without it the build is Unix-socket-only, which is NOT what
           # the docs describe — every release before 2.0.3 shipped that way.
-          # Windows is the exception on purpose: the listener layer is
-          # `#[cfg(unix)]`, so there is nothing for `tls` to switch on there.
+          #
+          # Unix only, and that is now deliberate. Releases up to and including v2.0.4 also
+          # carried weir-server-x86_64-pc-windows-msvc.exe, a binary that could
+          # not accept a record by any route: `mod socket` is `#[cfg(unix)]`, the
+          # TCP+mTLS listener is `#[cfg(all(unix, feature = "tls"))]`, and the
+          # `#[cfg(not(unix))]` arm of main.rs simply awaits shutdown. It was also
+          # the only target with no smoke test, because the smoke test asserts the
+          # binary was built WITH tls — which on Windows it cannot be.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: false
@@ -34,10 +40,6 @@ jobs:
             use_cross: false
             features: tls
             smoke: true
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            use_cross: false
-            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -85,14 +87,9 @@ jobs:
             exit 1
           fi
           echo "OK: binary accepts tcp_bind and fails on the missing cert, as a tls build should."
-      - name: Stage binary (Unix)
-        if: matrix.target != 'x86_64-pc-windows-msvc'
+      - name: Stage binary
         shell: bash
         run: mv target/${{ matrix.target }}/release/weir-server weir-server-${{ matrix.target }}
-      - name: Stage binary (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
-        run: mv target/${{ matrix.target }}/release/weir-server.exe weir-server-${{ matrix.target }}.exe
       - uses: actions/upload-artifact@v4
         with:
           name: weir-server-${{ matrix.target }}

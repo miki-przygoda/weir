@@ -16,9 +16,9 @@ see [configuration.md](../operations/configuration.md).
 
 - **Rust 1.88+** (edition 2024) — `rustup toolchain install stable` (1.88
   is the declared MSRV, enforced in CI)
-- **Unix host to run the DAEMON** — Linux or macOS. `weir-server` builds on
-  Windows but is a non-functional stub there (the listener layer is
-  `#[cfg(unix)]`, so it accepts nothing). `weir-core` is genuinely
+- **Unix host to run the DAEMON** — Linux or macOS. `weir-server` is not built
+  for Windows: the listener layer is `#[cfg(unix)]`, so it would accept
+  nothing. `weir-core` is genuinely
   cross-platform, and since 2.0.3 so is the **client's TCP + mutual-TLS
   transport**: a Windows producer can use `weir-client --features tls` against
   a Linux/macOS daemon. Only `WeirClient::connect`, the Unix-socket
