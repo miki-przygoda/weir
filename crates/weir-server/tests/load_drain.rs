@@ -361,7 +361,20 @@ fn daemon(tag: &'static str, sink: &MockSink) -> weir_testkit::WeirServerBuilder
         // the rate.
         .env("WEIR_SINK_RETRY_BASE_DELAY_MS", "5");
     match std::env::var("WEIR_BENCH_WAB_DIR") {
-        Ok(d) if !d.is_empty() => b.wab_dir(std::path::PathBuf::from(d).join(tag)),
+        Ok(d) if !d.is_empty() => {
+            // `wab_dir` requires the caller to create the directory — the whole
+            // point of the override is to choose the filesystem, so the builder
+            // will not conjure a path for us. Omitting this is why the knob
+            // never worked: every scenario panicked before pushing a record.
+            //
+            // Per-tag, so concurrently-running scenarios do not share a WAB, and
+            // fresh, so a previous run's segments are not drained by this one.
+            let dir = std::path::PathBuf::from(d).join(tag);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)
+                .unwrap_or_else(|e| panic!("WEIR_BENCH_WAB_DIR: create {}: {e}", dir.display()));
+            b.wab_dir(dir)
+        }
         _ => b,
     }
 }
