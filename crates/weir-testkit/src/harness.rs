@@ -438,10 +438,27 @@ impl WeirServerBuilder {
         let config_path = tmp_dir.join("weir.toml");
         let log_path = tmp_dir.join("weir.log");
 
-        // Create the wab dir if no override was supplied (override callers
-        // create it themselves so they can place it on a custom filesystem).
+        // Create the wab dir if no override was supplied. An override caller
+        // creates it itself, because WHERE it lands is the point of the knob:
+        // `create_dir_all` on a mistyped path would silently put the WAB on the
+        // root filesystem, and the ENOSPC test would then never hit ENOSPC.
+        //
+        // That contract is only worth having if breaking it says so. It used to
+        // surface as `NotFound` from the `set_permissions` call below — an error
+        // about permissions, naming neither the directory nor the requirement —
+        // which is how `WEIR_BENCH_WAB_DIR` shipped in 2.0.5 having never once
+        // worked.
         if self.wab_dir_override.is_none() {
             std::fs::create_dir_all(&wab_dir).unwrap();
+        } else {
+            assert!(
+                wab_dir.is_dir(),
+                "wab_dir override {} does not exist: `WeirServerBuilder::wab_dir` \
+                 requires the caller to create the directory, so that the WAB \
+                 lands on the filesystem the caller chose and not on whatever \
+                 `create_dir_all` would have made for it",
+                wab_dir.display(),
+            );
         }
         std::fs::create_dir_all(&socket_dir).unwrap();
         // WAB dir must be mode 0o700.

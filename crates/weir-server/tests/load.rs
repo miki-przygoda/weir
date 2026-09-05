@@ -37,9 +37,16 @@
 //!
 //!   The delivery side now has its own suite: [`load_drain`](load_drain.rs),
 //!   added in 2.0.3, which measures the HTTP per-record vs NDJSON-batch rate
-//!   this caveat used to call a worthwhile follow-up. Baseline numbers are in
-//!   `docs/benchmarks/drain-throughput.md`. The short version: delivery is the
-//!   narrower half, so a ceiling here is not a ceiling end-to-end.
+//!   this caveat used to call a worthwhile follow-up. Numbers are in
+//!   `docs/benchmarks/drain-throughput.md`.
+//!
+//!   That file used to say "delivery is the narrower half", and this caveat
+//!   repeated it. It is false: the drain sustains 105,909 rec/s NDJSON on a
+//!   4-core Linux box, several times a single client's ingest. The original
+//!   comparison put a drain figure that was measuring `F_FULLFSYNC` against an
+//!   ingest figure measured differently. A ceiling here is still not a ceiling
+//!   end-to-end — but because the two paths are measured against different
+//!   sinks, not because delivery is the constraint.
 //! - **`thundering_herd_*` is warmup-dominated.** Those scenarios spawn N threads
 //!   that each push a fixed count with no warmup, so connection/thread setup
 //!   dominates short runs and the throughput swings run-to-run (observed up to
