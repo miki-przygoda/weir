@@ -184,7 +184,7 @@ not benchmarks.*
 | `weir-core`     | lib        | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`, `Payload`. Cross-platform.   |
 | `weir-wab`      | lib        | On-disk WAB segment format + `SegmentReader`. Shared by the daemon and `weir-ctl` (one parser) so `dl requeue` can read dead-letter segments without the daemon's dep tree. Cross-platform. |
 | `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
-| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and CI compiles `weir-client --features tls` on every release target. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`, and the Windows *server* binary is still a non-functional stub. |
+| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and the `windows` CI job compiles `weir-client --features tls` there on every push. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`. There is no Windows *server* build: it had no ingest path, and 2.0.5 dropped it. |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
 | `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
@@ -223,12 +223,15 @@ listener is available behind the `tls` feature for cross-host producers.
   ([docs/conformance.md](docs/conformance.md)).
 - **Cross-platform CI:** `fmt` + `clippy` across the feature matrix + `cargo-deny`
   + the full test suites + a monitoring-stack end-to-end smoke test, on every
-  push. The build matrix compiles `weir-server` on all five release targets,
-  including `x86_64-pc-windows-msvc` — though that binary is a non-functional
-  stub (the listener layer is `#[cfg(unix)]`, so it accepts nothing); the
-  **daemon** runs only on Linux and macOS. The **client** is a different story
-  since 2.0.3: CI builds `weir-client --features tls` on every one of those
-  targets, Windows included, so a Windows producer is a supported configuration.
+  push. The build matrix compiles `weir-server` on all four release targets —
+  two Linux, two macOS. The **daemon** runs only on Linux and macOS, and as of
+  2.0.5 that is also all it is built for: releases through v2.0.4 attached an
+  `x86_64-pc-windows-msvc` binary that could not accept a record by any route,
+  and it has been dropped. The **client** is a different story since 2.0.3: a
+  dedicated `windows` CI job builds `weir-client --features tls` there, so a
+  Windows producer against a Linux/macOS daemon over the mTLS listener remains
+  a supported configuration, alongside a portability check of the three
+  published libraries (`weir-core`, `weir-wab`, `weir-sink-sdk`).
 
 ## Contributing
 

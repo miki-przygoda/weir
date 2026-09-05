@@ -23,9 +23,9 @@ drop a record it has acked?* If you can't rule that out, the change isn't ready.
 - **Rust 1.88+** (edition 2024) — the declared MSRV (`rust-version` in
   `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
 - **A Unix host** (Linux or macOS) to **run** `weir-server` — it uses
-  Unix-only socket APIs. The daemon still *builds* on Windows (CI compiles
-  it there), but it is a non-functional stub: no Unix-socket listener, so it
-  never serves. `weir-core` is genuinely cross-platform; `weir-client`
+  Unix-only socket APIs. It is no longer built for Windows at all: the binary
+  had no ingest path, and 2.0.5 dropped it. `weir-core` is genuinely
+  cross-platform; `weir-client`
   compiles everywhere, and as of 2.0.3 its TCP + mutual-TLS transport (the
   `tls` feature) builds and works on Windows too — only the Unix-socket
   constructor (`WeirClient::connect`) is Unix-only.
@@ -123,16 +123,21 @@ cargo test -p weir-server --test load_drain --no-run
 mdbook build
 ```
 
-All of the above must pass. CI builds `weir-server` on all five release targets:
-Linux (x86_64 + aarch64), macOS (x86_64 + aarch64), **and Windows
-(x86_64-pc-windows-msvc)** — so **cfg-gate any Unix-only code** or the Windows
-build breaks. The Windows build is a non-functional stub (no Unix-socket
-listener); the daemon runs only on Linux and macOS. The same job also builds
-`weir-client --features tls` on every target (Windows included) and, on the
-targets it can run natively, starts the freshly built `weir-server` to confirm
-the TCP+mTLS listener actually compiled in. None of that cross-compilation is
-practical to reproduce locally — treat a change to `weir-client`'s platform
-gating as needing the CI round-trip.
+All of the above must pass. CI builds `weir-server` on all four release targets:
+Linux (x86_64 + aarch64) and macOS (x86_64 + aarch64). On the targets it can run
+natively it then starts the freshly built binary to confirm the TCP+mTLS listener
+actually compiled in.
+
+**Windows is a separate `windows` job, and it does not build the daemon.** It
+builds `weir-client --features tls` — the supported Windows-producer
+configuration — and `cargo check`s the three published libraries (`weir-core`,
+`weir-wab`, `weir-sink-sdk`). **Cfg-gate any Unix-only code in those four
+crates** or that job breaks. `weir-server` and `weir-ctl` are exempt: they are
+Unix-only by design, and 2.0.5 stopped building the Windows `weir-server.exe`
+that had no ingest path.
+
+None of that cross-compilation is practical to reproduce locally — treat a
+change to `weir-client`'s platform gating as needing the CI round-trip.
 
 ## Heavier suites (run when your change touches them)
 

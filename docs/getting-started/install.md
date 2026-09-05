@@ -19,16 +19,16 @@ method.)
 
 - **Rust 1.88+** (edition 2024) — the declared MSRV (`rust-version` in
   `Cargo.toml`, enforced in CI). `rustup default stable` is enough.
-- A Unix host (Linux or macOS) to **run** the daemon. `weir-server`
-  *builds* on Windows (CI and the release workflow produce a
-  `weir-server.exe`), but it is a non-functional stub there — the whole
-  listener layer is `#[cfg(unix)]`, so the daemon never serves.
+- A Unix host (Linux or macOS) to **run** the daemon. There is no Windows
+  build: the whole listener layer is `#[cfg(unix)]`, so a Windows `weir-server`
+  never serves. Releases through v2.0.4 attached a `weir-server.exe` anyway;
+  2.0.5 stopped building it.
 - **Producers are a different matter.** `weir-core` is genuinely
   cross-platform, and since 2.0.3 the client's TCP + mutual-TLS transport is
-  too — CI builds `weir-client --features tls` on every release target,
-  Windows included. A Windows producer against a Linux/macOS daemon over the
-  mTLS listener is a supported configuration; only `WeirClient::connect`, the
-  Unix-socket constructor, stays Unix-only.
+  too — the `windows` CI job builds `weir-client --features tls` there on every
+  push. A Windows producer against a Linux/macOS daemon over the mTLS listener
+  is a supported configuration; only `WeirClient::connect`, the Unix-socket
+  constructor, stays Unix-only.
 - ~500 MB free disk (build artifacts).
 
 ### Build
@@ -223,13 +223,19 @@ public API are frozen at 1.0 under Semantic Versioning.
 ## Pre-built release binaries
 
 The `release.yml` GitHub Actions workflow builds and attaches `weir-server`
-binaries for `x86_64-linux`, `aarch64-linux`, `x86_64-macos`, `aarch64-macos`,
-and `x86_64-windows` to each version tag's
-[GitHub Release](https://github.com/miki-przygoda/weir/releases). The
-`x86_64-windows` artifact is a `weir-server.exe`, but it is a non-functional
-stub: there is no Unix-socket listener on Windows, so the daemon does not
-serve — run the daemon only on Linux or macOS. Download the archive for your
-platform, or use the from-source or container paths above.
+binaries for `x86_64-linux`, `aarch64-linux`, `x86_64-macos` and
+`aarch64-macos` to each version tag's
+[GitHub Release](https://github.com/miki-przygoda/weir/releases). Download the
+archive for your platform, or use the from-source or container paths above.
+
+> **`x86_64-windows` was removed in 2.0.5.** Releases up to and including
+> v2.0.4 carried a `weir-server.exe`. It was a non-functional stub — no
+> Unix-socket listener, and the mTLS listener is `#[cfg(all(unix, ...))]` too,
+> so it had no ingest path at all — and it was the only artifact with no smoke
+> test, because the smoke test asserts the binary was built with `tls`, which
+> on Windows it could not be. If you were downloading it, it was not doing
+> anything. Run the daemon on Linux or macOS; a Windows *producer* over
+> [TCP + mutual TLS](../operations/tcp-mtls.md) is still supported.
 
 ## Verifying the install
 

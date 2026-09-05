@@ -91,6 +91,33 @@ was confirmed to fail against the shipped behaviour before it was kept.
   the new reference numbers. Failures are now counted, their stderr shown, and
   the commit step gated on a clean run set.
 
+### Removed
+
+- **The `x86_64-pc-windows-msvc` release binary.** Releases up to and including
+  v2.0.4 attached a `weir-server.exe` that could not accept a record by any
+  route: `mod socket` is `#[cfg(unix)]`, the TCP+mTLS listener is
+  `#[cfg(all(unix, feature = "tls"))]`, and `main.rs`'s `#[cfg(not(unix))]` arm
+  simply awaits shutdown under the comment *"On non-Unix builds weir-server is
+  not supported"*. It was also the only release target with no smoke test — the
+  smoke test asserts the binary was built **with** `tls`, which on Windows it
+  cannot be. The target is gone from both `ci.yml`'s build matrix and
+  `release.yml`.
+
+  **This changes what a release contains.** Anything scripted against the
+  `weir-server-x86_64-pc-windows-msvc.exe` asset will 404 on the next tag. The
+  binary was inert, so nothing that worked stops working.
+
+- **Nothing was lost from the Windows *client* guarantee.** The old matrix entry
+  also built `weir-client --features tls` for Windows — the "A4 proof" behind
+  the documented Windows-producer configuration, and the only thing enforcing
+  it. That now has its own `windows` CI job, which additionally `cargo check`s
+  the three published libraries (`weir-core`, `weir-wab`, `weir-sink-sdk`) for
+  Windows. Those compiled there already, incidentally, because they are
+  `weir-server`'s dependencies; the check is now explicit rather than a side
+  effect of building an unusable binary. A Windows producer talking to a
+  Linux/macOS daemon over [TCP + mutual TLS](docs/operations/tcp-mtls.md)
+  remains supported.
+
 ### Changed — measurement
 
 - **The drain benchmark was measuring a backoff timer and an idle timer.** The

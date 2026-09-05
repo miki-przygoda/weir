@@ -299,6 +299,53 @@ jobs:
             docs/benchmarks/bench-latest.md
           cat docs/benchmarks/bench-latest.md
 
+  windows:
+    name: windows (mTLS client + published libraries)
+    runs-on: windows-latest
+    needs: lint
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+          # Windows tar.exe intermittently fails to save the cache; skipping the
+          # save step keeps a flaky infrastructure error from failing the job.
+          save-if: false
+
+      # A4 proof, kept. The TCP+mTLS client must build on Windows: a Windows
+      # producer talking to a Linux/macOS daemon over the mTLS listener is a
+      # documented, supported configuration (README.md, docs/getting-started/
+      # install.md, CONTRIBUTING.md). `connect_tls` was gated
+      # `#[cfg(all(unix, feature = "tls"))]` until 2.0.3 purely because it
+      # imported two types that happened to live in the Unix module; tls.rs
+      # itself uses TcpStream and rustls and nothing else. This step is what
+      # turns that from a claim into a fact, and it is the ONLY thing enforcing
+      # it — the gate was never questioned precisely because nothing ever tried.
+      #
+      # It used to ride along in the `build` matrix's Windows entry, which also
+      # produced a weir-server.exe with no ingest path. 2.0.5 drops that binary;
+      # this job is where the part that was actually worth keeping now lives.
+      - name: Build the mTLS client on Windows
+        run: cargo build --release -p weir-client --features tls
+
+      # The three published libraries have no Unix API surface — a Rust
+      # developer on Windows can legitimately depend on them for the wire codec,
+      # the on-disk format, or to write a sink. They already compiled for Windows
+      # (the old weir-server build proved it incidentally, since all three are
+      # its dependencies); this makes the guarantee explicit rather than a side
+      # effect, and catches an ungated `libc::` or `std::os::unix` import landing
+      # in one of them.
+      #
+      # weir-server and weir-ctl are deliberately absent: the server has no
+      # ingest path on Windows at all (`mod socket` is `#[cfg(unix)]`, the mTLS
+      # listener is `#[cfg(all(unix, feature = "tls"))]`, and main.rs's
+      # `#[cfg(not(unix))]` arm just awaits shutdown), and weir-ctl drives a
+      # Unix-socket client.
+      - name: Check the published libraries for Windows
+        run: cargo check -p weir-core -p weir-wab -p weir-sink-sdk --all-features --locked
+
   build:
     needs: test
     strategy:
@@ -308,8 +355,16 @@ jobs:
           # `features: tls` is what gives the shipped binary a TCP+mTLS ingest
           # listener. Without it the build is Unix-socket-only, which is NOT what
           # the docs describe — every release before 2.0.3 shipped that way.
-          # Windows is the exception on purpose: the listener layer is
-          # `#[cfg(unix)]`, so there is nothing for `tls` to switch on there.
+          #
+          # Every target here is Unix, and that is deliberate. weir-server has no
+          # ingest path at all on Windows: `mod socket` is `#[cfg(unix)]`, the
+          # TCP+mTLS listener is `#[cfg(all(unix, feature = "tls"))]`, and
+          # `main.rs`'s `#[cfg(not(unix))]` arm just awaits shutdown under the
+          # comment "weir-server is not supported". We built and shipped that .exe
+          # through v2.0.4. What that matrix entry ALSO did — build
+          # `weir-client --features tls` for Windows, the A4 proof behind the
+          # supported Windows-producer configuration — now lives in the `windows`
+          # job above, where it is not a side effect of an unusable binary.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: false
@@ -328,10 +383,6 @@ jobs:
             use_cross: false
             features: tls
             smoke: true
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            use_cross: false
-            features: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -341,10 +392,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-          # Windows tar.exe intermittently fails to save the cache; skip the
-          # post-run save step to prevent a flaky infrastructure error from
-          # failing the build job.
-          save-if: ${{ matrix.os != 'windows-latest' }}
       - name: Install cross
         if: matrix.use_cross
         uses: taiki-e/install-action@v2
@@ -398,14 +445,9 @@ jobs:
             exit 1
           fi
           echo "OK: binary accepts tcp_bind and fails on the missing cert, as a tls build should."
-      - name: Stage binary (Unix)
-        if: matrix.target != 'x86_64-pc-windows-msvc'
+      - name: Stage binary
         shell: bash
         run: mv target/${{ matrix.target }}/release/weir-server weir-server-${{ matrix.target }}
-      - name: Stage binary (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: bash
-        run: mv target/${{ matrix.target }}/release/weir-server.exe weir-server-${{ matrix.target }}.exe
       - uses: actions/upload-artifact@v4
         with:
           name: weir-server-${{ matrix.target }}
