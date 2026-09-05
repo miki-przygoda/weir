@@ -117,6 +117,55 @@ is inside that overlap and should not be read as tmpfs being slower. Bounded by
 the 1 ms sink delay and concurrency, exactly as the scenario intends. It is the
 only one of the three currently measuring what its name claims.
 
+## The CI runner's disk is not a disk
+
+The `drain` CI job reports `"wab":"default"`, which reads as "what a real
+deployment sees". On GitHub's 2-vCPU `ubuntu-latest` it is not — and the same
+data shows the job's numbers cannot be compared with anything at all on two
+of its three scenarios.
+
+Five CI runs since the harness fix, from the job's retained artifacts:
+
+| Scenario | min | median | max | spread | linux-ssd | linux-tmpfs |
+|---|---:|---:|---:|---|---:|---:|
+| `drain_http_ndjson` | 187,089 | **233,992** | 236,144 | 1.26x | 105,909 | 238,573 |
+| `drain_http_per_record` | 24,411 | 25,858 | 37,713 | **1.54x** | 28,719 | 37,991 |
+| `drain_slow_sink_1ms_conc16` | 1,864 | 6,460 | 7,284 | **3.91x** | 8,826 | 7,570 |
+
+**What holds.** On `drain_http_ndjson` — the one storage-bound scenario — CI
+sits at RAM-disk level: median 0.98x beast's tmpfs, **2.21x** beast's real
+SATA SSD, and beast's SSD figure (105,909) falls far outside CI's entire
+five-run range. That is the storage-sensitive scenario, the confirm is what
+makes it storage-sensitive, and CI behaves as though the confirm is free.
+Treat the CI drain figures as an upper bound with the filesystem removed, not
+as a deployment number, and never compare them against hardware that honours
+a flush.
+
+**What does not hold, and was claimed here earlier today.** An earlier version
+of this section argued that CI is *slower* than beast on the two
+non-storage-bound scenarios — as a 2-vCPU runner should be — and faster only
+on the storage-bound one, so the storage must be unreal. A fifth run
+withdrew it. `drain_http_per_record`'s CI range now spans 24,411-37,713,
+which *contains* beast's SSD figure and nearly reaches beast's RAM disk, so it
+distinguishes nothing. That argument rested on four runs and did not survive
+the fifth. The conclusion above stands on `drain_http_ndjson` alone.
+
+This is not a diagnosis either. Nothing here identifies *why* the confirm is
+cheap; host write-back caching on an ephemeral virtual disk is the obvious
+candidate and is unverified.
+
+**The spreads are the more useful finding.** 1.54x and 3.91x are not
+measurements. In particular `drain_slow_sink_1ms_conc16` exists to catch a
+regression that turns the HTTP sink serial — serial delivery caps at
+~1,000 rec/s, and one of these five runs came in at **1,864**. A scenario
+whose healthy range reaches down to twice its own failure threshold cannot
+tell a serialisation regression from a busy runner. That is a gap in what
+this suite can detect on CI, not a number to publish.
+
+For scale, the five CI runs *before* the harness fix median 8,093 rec/s on
+`drain_http_ndjson` against 233,992 after — the fault documented above, not a
+change in the runner.
+
 ## What changed in the conclusions
 
 **"Delivery is the narrower half" stays withdrawn, and is now clearly false.**
@@ -151,7 +200,12 @@ fill should scale with the platform before these numbers are trended.**
   whether the ext4 figure generalises or is specific to SATA.
 - **A record count sized for the platform.** 2,000 records was chosen when the
   fastest scenario took 25 ms; on tmpfs it takes 4. Trending these numbers
-  before fixing that would trend scheduling noise.
+  before fixing that would trend scheduling noise — and the CI spreads above
+  (1.54x and 3.91x) are what that looks like in practice.
+- **Whether `drain_slow_sink_1ms_conc16` can still do its job on CI.** Its
+  purpose is catching a drain that has gone serial (~1,000 rec/s); one CI run
+  in five measured 1,864. Either the scenario needs a longer window or the
+  gate needs to live somewhere less contended.
 - **A real sink over a real network.** The mock answers in microseconds on
   loopback. Every ratio above should be re-derived at a realistic RTT.
 - **Concurrent ingest and drain.** Every scenario fills, then drains. A buffer
