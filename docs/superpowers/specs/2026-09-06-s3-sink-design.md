@@ -4,7 +4,7 @@
 - **Date:** 2026-09-06
 - **Target version:** 2.1.0 (additive `weir-sink-sdk` change → minor bump)
 - **Author:** Mikolaj (with Claude Code)
-- **Base:** `main` — *after* `fix/sweep-truth-up` lands (5 commits, currently unpushed)
+- **Base:** `main` — *after* `fix/sweep-truth-up` lands (7 commits, currently unpushed)
 
 ## 1. Goal
 
@@ -36,12 +36,13 @@ Two things make this the right next sink rather than just another one:
 | S3 client | **Hand-rolled SigV4** over the existing `reqwest` + `sha2` + `hmac` stack | +1 crate vs +68 (official SDK) or +39 (`rust-s3`). Keeps the ring-only unification. Full control of transient-vs-permanent classification. See §2.1. |
 | Placement | **New published crate** `weir-sink-s3` + optional `s3-sink` feature in `weir-server` | Usable via `--sink-type s3` *and* proves the SDK is externally implementable. Keeps ~1,100 LOC of signing out of the 33k-LOC daemon. |
 | Object body | **NDJSON default**, framing configurable | Athena / DuckDB / Spark / Glue read the bucket directly, zero weir-specific tooling. Length-prefixed mode for binary payloads. |
-| Object key | **Content-addressed filename under a segment-derived time partition** | Replay-stable *and* partition-prunable. See §3 — this is the load-bearing decision. |
+| Object key | **WAB-coordinate filename under a segment-derived time partition** | Replay-stable, partition-prunable, *and* collision-free. See §3 — the load-bearing decision, and the one an early draft got wrong. |
 | Feature default | **Opt-in** (not in `default`) | Consistent with `clickhouse-sink`. Promote later if it earns it. |
 
 ### 2.1 Why not the official AWS SDK — measured, not assumed
 
-Against `weir-server`'s actual dependency tree (202 crates, all features):
+Against `weir-server`'s actual dependency tree (210 crates, all features —
+counting rule at the end of this section):
 
 | Approach | Net **new** crates | `aws-lc-sys` C build |
 |---|---|---|
@@ -61,8 +62,24 @@ reachable only by adding `aws-smithy-http-client` as a *direct* dependency with
 then own and have to CI-guard against regression forever.
 
 `sha2`, `base64`, `percent-encoding`, `reqwest` and `rustls`-on-`ring` are all
-already in the tree. `hmac` is the sole addition, and it is already present
-whenever `postgres-sink` is enabled (via `postgres-protocol`).
+already in the tree. **`hmac` is the one genuinely new crate.** The tree does
+carry `hmac 0.13.0` (via `postgres-protocol`, so only when `postgres-sink` is
+enabled), but this crate pins `hmac 0.12` to pair with the `sha2 0.10` that
+`weir-sink-sdk` uses — a different node. Do not describe it as "already there".
+
+Two more dependencies were checked and cost nothing:
+
+- **`percent-encoding 2.3.2`** is already in the tree via `reqwest`, so taking
+  it as a direct dependency adds **zero** crates. §5 needs it for `UriEncode`.
+- **`flate2 1.1.9`** is already in the tree via `mysql_async` (the `mysql-sink`
+  feature, which is on by default), so `gzip` survives the first cut at no cost.
+  It is *not* present under `--no-default-features --features s3-sink`; the
+  manifest therefore declares it explicitly rather than relying on that path.
+
+Counting rule for the table above: **unique `name + version` pairs on normal
+(non-dev, non-build) edges**. By that rule `weir-server --all-features` is
+**210** crates. Deduplicating by bare name instead gives 202 — the two figures
+differ because the tree legitimately carries two `sha2` versions.
 
 ## 3. The object key — the load-bearing decision
 
@@ -96,7 +113,7 @@ Replay-stable, but forfeits partition pruning entirely: every Athena query
 scans the whole bucket. For an archive sink that is the dominant read pattern,
 this is a real cost, not a theoretical one.
 
-### 3.3 The segment header already carries the answer
+### 3.3 The partition comes from the segment header
 
 The WAB segment header stores **`created_at` — unix nanoseconds, header bytes
 `[8..16]` LE** (`crates/weir-wab/src/format.rs:343`). It is written once when
@@ -104,21 +121,81 @@ the segment is created, lives on disk, and is therefore **identical across a
 replay**.
 
 `SegmentReader::header()` is already public
-(`crates/weir-wab/src/lib.rs:181`), and the drain already holds an open reader
-at `crates/weir-server/src/drain/mod.rs:1143`. The value is sitting there,
-one field access away from the batch construction site.
+(`crates/weir-wab/src/lib.rs:181`) and the drain already holds an open reader at
+`crates/weir-server/src/drain/mod.rs:1143` — though in `process_segment`, a
+different function from the batch construction site at `:1374`, so the value
+travels as a new parameter rather than a field access.
+
+That settles the **partition path**. It does not settle the filename.
+
+### 3.3a The filename must NOT be the `DedupToken` — it would destroy data
+
+An earlier draft of this spec named the object after the batch's `DedupToken`.
+**That is wrong, and its failure is worse than the duplication §3.1 avoids.**
+
+`DedupToken` is a pure content hash (`weir-sink-sdk/src/lib.rs:349-357`; the
+drain builds it at `drain/mod.rs:1367`). The SDK's own documentation on
+`RecordId` — a type that exists *because of* this — states the consequence at
+`lib.rs:405-414`:
+
+> It is therefore a pure function of the payload bytes, and two batches carrying
+> identical bytes are — correctly — the same token. […] a producer emitting
+> repetitive records (a heartbeat, a status ping, any fixed-shape event) hands
+> the downstream the same key for genuinely distinct events […] weir acked those
+> records and wrote them to disk; they are then dropped downstream by weir's own
+> header.
+
+An S3 bucket is the most literal "correctly-implemented idempotent endpoint"
+there is: same key means last-write-wins. And the partition contributes **no**
+uniqueness — at `hour=%H` granularity every object in an hour shares one path.
+
+**The failure needs no crash.** A heartbeat producer at the default
+`sink_max_batch_size = 100` emits batches of 100 byte-identical payloads. Every
+batch hashes to the same token, lands on the same key, and **overwrites the
+previous one**. weir acks 360,000 records in an hour; the bucket holds 100.
+That is silent loss of acked records — the failure the daemon exists to prevent.
+
+### 3.3b The filename is the batch's first `RecordId` plus its length
+
+`RecordId` mixes the record's WAB coordinate — segment name plus index — into
+the digest (`weir-sink-sdk/src/lib.rs:428-437`), which is exactly the uniqueness
+`DedupToken` cannot carry. It is **already on `SinkBatch`**, populated by the
+drain on every commit (`drain/mod.rs:1374`) and exposed at `lib.rs:547`.
+
+It is also replay-stable, for a reason worth pinning: `read_index += 1` at
+`drain/mod.rs:1199` runs **before** the `if read_index <= skip { continue; }`
+guard at `:1209`, so the index is the record's absolute ordinal within the
+segment regardless of resume state.
 
 So the key is:
 
 ```
-{prefix}/dt=2026-09-06/hour=14/{dedup_token_hex}.ndjson.zst
-         └── segment created_at ──┘  └── batch content ──┘
+{prefix}/dt=2026-09-06/hour=14/{first_record_id_hex}-{count}.ndjson.zst
+         └── segment created_at ──┘ └─ WAB coordinate ─┘ └ batch size ┘
 ```
 
-Both halves are replay-invariant. A crash-replayed batch writes **the same key
-with byte-identical bytes** — an idempotent overwrite, not a duplicate. No
+The record count is in the name because the start coordinate alone still
+collides when `sink_max_batch_size` changes: a resized batch beginning at the
+same index would overwrite an object holding different content. With the count
+present, a resize yields a distinct key and degrades to plain duplication —
+which the at-least-once contract already absorbs — instead of an overwrite.
+
+Every component is replay-invariant, so a crash-replayed batch writes the same
+key with byte-identical bytes: an idempotent overwrite. And because the
+coordinate is unique per batch, **no two distinct batches can collide**. No
 dedup support is required from the downstream at all, which is true of no other
 weir sink.
+
+**Fallback.** `record_ids()` is `None` for a batch built by `SinkBatch::new` or
+`From<Vec<Payload>>` — never from the drain, only from a sink author's test. The
+sink then logs a one-time `WARN` and falls back to the `DedupToken`, naming the
+collision risk. It does not silently proceed.
+
+**Requeue.** `weir-ctl dl requeue` and `quarantine requeue` re-push through the
+daemon socket into a *new* segment, so the segment name changes and the key
+changes. Under this scheme that yields a clean duplicate object, which
+at-least-once absorbs. Under the rejected `DedupToken` scheme it was a coin-flip
+between duplicating and overwriting, depending on the hour.
 
 ### 3.4 The `weir-sink-sdk` change
 
@@ -148,6 +225,17 @@ field, `None` from `new()`, populated by the drain through a dedicated
 constructor. Fields are private, so this is **additive and non-breaking** —
 a minor bump.
 
+Two consequences worth writing down:
+
+- **There are three struct-literal sites, not two.** `SinkBatch::new`
+  (`lib.rs:509`), `with_record_ids` (`:536`) and
+  `impl From<Vec<Payload>> for SinkBatch` (`:597`). Missing the third is a
+  compile error.
+- **`SinkBatch` derives `PartialEq, Eq`.** Adding a field is compile-compatible
+  but changes equality: a batch from `new()` no longer compares equal to one
+  from `with_segment_context()` carrying the same records. Call it out in the
+  changelog for sink authors who assert on batch equality in their tests.
+
 The drain switches to a superseding constructor at
 `crates/weir-server/src/drain/mod.rs:1374`:
 
@@ -172,26 +260,29 @@ comment gains a pointer to the new constructor.
 The sink receives a `SinkBatch`, not a path — and giving sinks filesystem
 access to the WAB would be a far larger contract change than adding a field.
 
-### 3.5 Inherited caveat — `sink_max_batch_size` must be stable
+### 3.5 `sink_max_batch_size` must be constant — not merely stable
 
-`DedupToken` covers exactly the sub-batch handed to `commit`, which the drain
-sizes by `sink_max_batch_size` (`drain/mod.rs:1166`). If that setting changes
-across a restart, a replayed segment re-splits into differently-sized
-sub-batches, whose tokens differ, whose **object keys therefore differ** — and
-the bucket gets duplicates.
+The drain sizes each sub-batch by `sink_max_batch_size`, and re-reads it on
+**every** call (`drain/mod.rs:1166`) rather than capturing it per segment. So
+the requirement is stronger than the "stable across a restart" that `DedupToken`
+documents: the value must be **constant for the life of the bucket**. A
+third-party sink returning a varying `max_batch_size()` would shift batch
+boundaries mid-run, not just across a restart.
 
-This is the same precondition `DedupToken` already documents and the ClickHouse
-sink already carries. For S3 it is sharper, because the token is in the object
-name rather than a header the downstream may ignore. It gets an explicit,
-blunt warning in the configuration reference.
+Under §3.3b the consequence is bounded — a changed size yields a distinct key,
+so the outcome is duplicate objects rather than an overwrite, and at-least-once
+already absorbs duplicates. It still deserves a blunt warning in the
+configuration reference and in the daemon's startup log, because the duplicates
+are silent and permanent.
 
 ## 4. Crate layout and module boundaries
 
 New workspace member `crates/weir-sink-s3`, published.
 
-Dependencies — all already in the workspace tree: `weir-sink-sdk`,
-`weir-core`, `reqwest` (rustls-tls, no default features), `sha2`, `hmac`,
-`zstd`, `tokio`, `thiserror`, `tracing`.
+Dependencies: `weir-sink-sdk`, `weir-core`, `reqwest` (rustls-tls, no default
+features), `sha2`, `zstd`, `tokio`, `thiserror`, `tracing`, `percent-encoding`
+and `flate2` — all already in the workspace tree — plus **`hmac`**, the one
+genuinely new crate (§2.1).
 
 | Module | Responsibility | I/O |
 |---|---|---|
@@ -222,12 +313,81 @@ This is the same pattern weir already uses for its own wire format
 (`docs/conformance.md`): canonical vectors, checked in, cannot drift from the
 implementation because both are asserted against the same fixtures.
 
-Scope limits, deliberate:
+### 5.1 `sigv4.rs` owns URI encoding — it is not the caller's job
+
+AWS's `UriEncode` is **not** waived for S3. S3 waives *double*-encoding and
+*normalization*; it still requires every byte outside `A-Za-z0-9-._~` to be
+percent-encoded with **uppercase** hex, `/` excepted inside an object key.
+
+An early draft delegated this to the caller ("`uri_path` is already
+percent-encoded") on the grounds of the dependency budget. That was wrong twice
+over: `percent-encoding 2.3.2` is already in the tree via `reqwest`, so it costs
+nothing (§2.1), and the delegation created a live hazard. `sink_s3_prefix` is
+free text that nothing validates, so a space or non-ASCII byte there means the
+signer signs `/has space/` while `reqwest` sends `/has%20space/` — a permanent
+`403 SignatureDoesNotMatch` with no diagnosis path. A `#` or `?` is worse: the
+path is silently truncated, and if the caller signs the URL it parsed, both
+sides agree and the batch is written **to the wrong key with a valid
+signature**.
+
+`sigv4.rs` therefore exports `uri_encode_path`, and the client builds both the
+canonical URI and the request URL from that one string. Hive keys are safe
+either way — `=` and `/` survive unencoded — but the sink must not depend on
+that.
+
+### 5.2 Header canonicalisation
+
+Beyond lowercasing, sorting and trimming, AWS requires two steps an early draft
+omitted, both of which the vendored suite exercises:
+
+- **Collapse runs of ASCII whitespace to a single space**, including inside
+  quoted values (`get-header-value-trim` expects `my-header2:"a b c"`).
+- **Merge duplicate header names** into one comma-joined line in original
+  request order, appearing once in `SignedHeaders`
+  (`get-header-key-duplicate`).
+
+Use explicit ASCII whitespace handling, not `str::trim()` — the latter strips
+Unicode whitespace such as U+00A0, which AWS's `Trim()` would not.
+
+### 5.3 The signed header set is an input, not an output
+
+S3 **requires** `x-amz-content-sha256` to be signed, alongside `host`,
+`x-amz-date`, and `x-amz-security-token` when a session token is present. An
+early draft had `sign()` *return* the date and payload hash, which is circular:
+the caller cannot assemble the headers it must sign without the helpers that
+produce them.
+
+`sign()` therefore owns the required set. `SigningParams` takes `host` (with
+the port, for the MinIO test's `127.0.0.1:19000`) plus any caller extras, and
+`Signed` returns the **exact list of headers to attach**. Signing a set that
+differs from what is sent becomes unrepresentable.
+
+This matters beyond ergonomics: a malformed signature returns `403`, and §9
+must not dead-letter on that — see §9.
+
+### 5.4 Scope limits, deliberate
 
 - **SigV4 only.** No SigV4a (multi-region access points) — out of scope, §16.
 - **Header-based signing only.** No presigned URLs; the sink only PUTs.
 - **`UNSIGNED-PAYLOAD` is not used.** The body hash is computed — the batch is
   already in memory, and providers differ in what they accept.
+- **No path normalization.** Correct for S3: keys may legitimately contain `.`,
+  `..` and `//` segments.
+
+### 5.5 The vector suite needs an explicit exclusion list
+
+The suite cannot be applied wholesale, and a plan that gates on "all of it"
+gates on something impossible. Roughly 16 of the 38 cases in the maintained
+mirror (`awslabs/aws-c-auth/tests/aws-signing-test-suite/v4`) exercise path
+handling; the `*-normalized` variants require RFC 3986 normalization that an S3
+signer **must not** do. Those are excluded by name, with that rule cited as the
+reason.
+
+Note also that the mirror's fixture filenames are `request.txt`,
+`header-canonical-request.txt`, `header-string-to-sign.txt`,
+`header-signature.txt` — not the `.req`/`.creq`/`.sts`/`.authz` of the retired
+zip on the IAM docs site. Confirm the layout of whatever is actually fetched
+before writing the case collector.
 
 ## 6. Credentials
 
@@ -252,10 +412,10 @@ instance role. Revisit only on real demand.
 
 Static secrets are stored in a wrapper whose `Debug` impl redacts.
 
-**The daemon's redaction helpers are not reachable.** `redact_url_password` and
-`sanitize_log_excerpt` are both `pub(crate)` in
-`crates/weir-server/src/sink/mod.rs:50` — deliberately, since they are internal
-to the daemon. `weir-sink-s3` therefore carries its own copies, each with a
+**The daemon's redaction helpers are not reachable.** `redact_url_password`
+(`crates/weir-server/src/sink/mod.rs:50`) and `sanitize_log_excerpt` (`:135`,
+additionally gated `#[cfg(any(feature = "http-sink", feature = "clickhouse-sink"))]`)
+are both `pub(crate)` — deliberately, since they are internal to the daemon. `weir-sink-s3` therefore carries its own copies, each with a
 comment naming the original and the finding it came from (S31 for URL
 redaction, S29 for log-forging). This is the first concrete cost of the
 out-of-tree placement, and it is worth paying: promoting them to a public
@@ -299,7 +459,7 @@ compressed NDJSON file, which is what query engines expect.
 ## 8. Config surface
 
 Following the established `sink_<type>_<key>` convention
-(`config/mod.rs:213-239`). All available as `WEIR_*` env vars and TOML keys.
+(`config/mod.rs:213-238`). All available as `WEIR_*` env vars and TOML keys.
 
 | Key | Default | Notes |
 |---|---|---|
@@ -338,18 +498,32 @@ UTC is not configurable, and the reference says so.
 Mirrors `sink/clickhouse.rs:214` (`status_is_transient`), which the repo
 already pins with an explicit test.
 
+**The rule: dead-letter on record-level rejection, strand on connection-level
+rejection.** A record is dead-lettered only when *that record* is the problem.
+Anything about the credential, the endpoint, or the bucket applies equally to
+every record in the backlog, so it strands — which is recoverable and visible
+(`WeirSegmentStranded` fires, the `wab_max_bytes` cap engages) — rather than
+dead-lettering, which silently displaces acked data.
+
 **Transient** (strand the segment, retry): 500, 502, 503 (including S3
 `SlowDown`), 504, 408, 429; connect / DNS / TLS / reset / timeout; credential
-refresh failure.
+refresh failure; **and every authentication and authorization failure** — 401,
+403 `AccessDenied`, `SignatureDoesNotMatch`, `ExpiredToken`,
+`TokenRefreshRequired`, `RequestTimeTooSkewed`; plus 404 `NoSuchBucket`.
 
-**Permanent** (dead-letter): 400 `InvalidRequest`, 401, 403 `AccessDenied` /
-`SignatureDoesNotMatch`, 404 `NoSuchBucket`, 411, 413.
+**Permanent** (dead-letter): 400 `InvalidRequest`, 411, 413 — request-shape
+faults that will not change on retry.
 
-`403` deserves a note: it is permanent, but it is also what a *clock-skewed*
-host returns (`RequestTimeTooSkewed`). That specific S3 error code is
-classified **transient** — the clock may resync, and dead-lettering a whole
-backlog over NTP drift would be a bad trade. The distinction is made on the S3
-error code in the response body, not the status alone.
+**Unrecognised status or S3 error code → transient.** Providers diverge (R2, B2,
+Ceph). Stranding an unknown response is recoverable; dead-lettering it is not.
+
+This **departs from the ClickHouse sink** (`clickhouse.rs:214`), which maps auth
+4xx to permanent. The departure is deliberate. A day-one credential
+misconfiguration, an expired IRSA token, a rotated key, or a signing bug all
+present as `403`; dead-lettering the entire backlog over any of them converts a
+recoverable operator error into displaced data. The ClickHouse precedent is
+arguably wrong for the same reason, but changing it is a separate matter, not
+this PR's.
 
 A `PutObject` is all-or-nothing, so `CommitResult.committed` is the entire
 batch on success. `dead_lettered` carries **only** records rejected by framing
@@ -382,11 +556,19 @@ least-privilege IAM setup would strand its backlog permanently.
 - `SinkType::S3` added to the enum at `config/mod.rs:74`, with the same
   built-without-the-feature error arm the other sinks have.
 - A construction arm in `main.rs` beside the existing five
-  (`main.rs:615-778`).
+  (`main.rs:615-791`).
 - `weir_sink_info{sink_type="s3"}` via the existing `as_str()`.
 
 Publish order becomes:
-`core → wab → sink-sdk → sink-s3 → client → server → ctl`.
+`core → wab → sink-sdk → sink-s3 → rs → client → server → ctl`.
+
+`weir-rs` is in the list because it is a published facade with an optional
+`weir-sink-sdk` dependency, so it must follow `sink-sdk`. `weir-testkit` stays
+`publish = false`. The workspace version bump to `2.1.0` and the
+`[workspace.dependencies]` pins must land in the **same commit** as the new
+crate: `weir-sink-s3` needs `weir-sink-sdk 2.1.0` for `segment_created_at`, and
+a path dependency hides that locally while an external user resolving `^2.0.5`
+from crates.io would fail to compile.
 
 ## 12. Object sizing — the small-object trap
 
@@ -414,10 +596,22 @@ operator's knob.
 ## 13. Testing
 
 **Unit (no network):**
-- `sigv4` — the full `aws-sig-v4-test-suite`, staged assertions (§5).
-- `key` — template parsing; partition rendering from a fixed `created_at`;
-  and the property that matters: **the same `(created_at, token)` always yields
-  the same key**, asserted across simulated restarts.
+- `sigv4` — the applicable `aws-sig-v4-test-suite` cases with the §5.5
+  exclusion list, staged assertions; plus `uri_encode_path` against the
+  `get-space-unnormalized` and `get-utf8` expectations, and header
+  canonicalisation against `get-header-value-trim` and
+  `get-header-key-duplicate`.
+- `key` — template parsing; partition rendering from a fixed `created_at`; and
+  the two properties that matter:
+  1. **the same `(created_at, record_id, count)` always yields the same key**
+     — replay stability;
+  2. **two batches with byte-identical records yield different keys** — the
+     §3.3a collision guard. This is the assertion an early draft's design
+     failed.
+  Assert a rendered value for an instant whose UTC and local dates differ, to
+  pin UTC-ness. Do **not** mutate `TZ`: the code never reads it, so such a test
+  proves nothing, and `set_var` races sibling tests in the same binary — which
+  here includes `creds`, and `creds` reads `AWS_*` from the environment.
 - `framing` — NDJSON round-trip; newline records dead-lettered, not silently
   dropped; length-prefixed round-trip; empty-payload handling; compression
   round-trip.
@@ -429,18 +623,31 @@ operator's knob.
 **Integration (MinIO, `--ignored`):**
 A `minio` service joins `deploy/docker/test/docker-compose.yml` alongside
 MySQL/Postgres/ClickHouse, driven by the existing
-`scripts/run-sink-integration-tests.sh` with a healthcheck the runner waits on.
+`deploy/run-sink-integration-tests.sh` with a healthcheck the runner waits on.
 
 - `s3_sink_end_to_end` — push → seal → drain → object present with expected
   key, bytes, and content type.
-- `s3_sink_replay_is_an_idempotent_overwrite` — **the headline test.** Commit a
+- `s3_sink_replay_is_an_idempotent_overwrite` — **headline test 1.** Commit a
   batch, kill the daemon before the segment is confirmed, restart, let it
   replay, then assert the bucket holds **exactly one** object and its bytes are
-  unchanged. This is the §3 property; if it does not hold, the design is wrong.
+  unchanged.
+- `s3_sink_distinct_batches_of_identical_records_produce_distinct_objects` —
+  **headline test 2, and the one that catches the §3.3a failure.** Push two
+  separate batches of byte-identical records within the same partition hour,
+  then assert the bucket holds **two** objects. The first test alone is not
+  enough: "exactly one object" is equally true when the design is destroying
+  data, which is precisely how an early draft's `DedupToken` key scheme would
+  have passed review.
+
+  Both are needed. Test 1 pins replay stability; test 2 pins collision freedom.
+  A key scheme satisfying only one of them is broken.
 - `s3_sink_least_privilege_iam_is_degraded_not_down` — a MinIO policy granting
   PutObject but not ListBucket must keep delivering (§10).
 - `s3_sink_transient_failure_strands_and_resumes` — stop MinIO mid-drain,
   restart it, assert the backlog resumes.
+
+**Harness note:** `WeirServer::kill_ungracefully` and `restart_in_place` take
+`&mut self`, so the crash tests bind `let mut handle = weir_server!(…)`.
 
 **Conformance:** the SigV4 vectors are wired into the same CI job that runs the
 wire-format vectors, so both drift-guards live together.
@@ -453,7 +660,12 @@ wire-format vectors, so both drift-guards live together.
   walk-through.
 - New `docs/sinks/s3.md` — key layout, the replay-idempotency property and its
   precondition, IAM policy minimum, provider notes (AWS / MinIO / R2 / B2),
-  and how to point Athena or DuckDB at the bucket.
+  and how to point Athena or DuckDB at the bucket. It must also state that
+  **`weir-ctl dl requeue` and `quarantine requeue` produce duplicate objects**:
+  both re-push through the daemon socket into a new segment, so the key changes
+  by design. `quarantine requeue` already warns that it re-sends records that
+  reached the sink; for S3 that surfaces as a second object rather than a
+  downstream-side dedup.
 - `README.md` — sink count and the crate table.
 - `CHANGELOG.md` — under 2.1.0, with the `SinkBatch` addition called out
   explicitly for sink authors.
@@ -494,14 +706,21 @@ is needed. `weir-sink-s3` starts at `2.1.0` to match the workspace version line.
 
 ## 18. Acceptance criteria
 
-1. `cargo test -p weir-sink-s3` passes, including the full SigV4 vector suite.
-2. `scripts/run-sink-integration-tests.sh` brings up MinIO and all four
-   `--ignored` S3 tests pass — **`s3_sink_replay_is_an_idempotent_overwrite`
-   included**.
+1. `cargo test -p weir-sink-s3` passes, including the applicable SigV4 vector
+   cases (§5.5's exclusion list applied and justified in the fixtures README).
+2. `deploy/run-sink-integration-tests.sh` brings up MinIO and all five
+   `--ignored` S3 tests pass — **both**
+   `s3_sink_replay_is_an_idempotent_overwrite` **and**
+   `s3_sink_distinct_batches_of_identical_records_produce_distinct_objects`.
+   Either alone is insufficient: the first passes while the design destroys
+   data, the second passes while it duplicates on replay.
 3. `cargo build -p weir-server --features s3-sink` produces a daemon that
    accepts `--sink-type s3` and delivers to MinIO.
 4. `cargo tree -p weir-server --features s3-sink` shows **no `aws-lc-sys`** and
    exactly one `rustls` version.
+4b. The workspace version is `2.1.0` and every `[workspace.dependencies]` pin
+   matches it, so `weir-sink-s3` resolves `weir-sink-sdk 2.1.0` from crates.io
+   rather than a `2.0.5` that lacks `segment_created_at`.
 5. `cargo clippy --workspace --all-targets -- -D warnings` and
    `cargo fmt --all --check` are clean.
 6. `cargo publish --dry-run` succeeds for `weir-sink-s3`.
