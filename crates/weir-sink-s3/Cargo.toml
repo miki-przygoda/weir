@@ -1,0 +1,48 @@
+[package]
+name = "weir-sink-s3"
+description = "S3-API object-storage sink for the weir daemon (AWS S3, MinIO, R2, B2, Ceph)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["weir", "sink", "s3", "object-storage", "archive"]
+categories = ["database", "asynchronous"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+weir-core = { workspace = true }
+weir-sink-sdk = { workspace = true }
+# reqwest with rustls-tls. default-features = false keeps the surface tight and,
+# critically, keeps the crypto provider on `ring` — the workspace deliberately
+# dropped aws-lc-rs and its aws-lc-sys C build. Do not enable default features.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "charset",
+] }
+# SigV4 payload/canonical hashing. Pinned to 0.10 to match weir-sink-sdk, so the
+# RecordId/DedupToken hex this crate consumes comes from the same digest stack.
+sha2 = "0.10"
+# SigV4 key derivation — the ONE genuinely new crate in this feature's budget.
+# The tree carries hmac 0.13 via postgres-protocol, but only under the
+# postgres-sink feature and on digest 0.11; 0.12 pairs with sha2 0.10 above.
+hmac = "0.12"
+# AWS UriEncode. Already in the tree via reqwest -> url -> form_urlencoded, so
+# taking it directly costs zero crates. Signing must encode the path itself:
+# see sigv4::uri_encode_path for why delegating it to the caller is a live bug.
+percent-encoding = "2.3"
+# Object body compression. zstd is already in weir-server for WAB format v2.
+zstd = "0.13"
+# gzip, for query engines that do not read zstd. Already in the tree via
+# mysql_async (the mysql-sink feature, which is in `default`) — but declared
+# explicitly because it is absent under --no-default-features.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tokio = { version = "1", features = ["time"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
