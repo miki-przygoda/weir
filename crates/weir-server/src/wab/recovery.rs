@@ -828,7 +828,34 @@ pub(crate) fn check_confirmed(
         return Ok(false);
     }
 
-    let buf = fs::read(&confirmed_path)?;
+    // An unreadable sidecar is an environment fault (EIO on a failing disk,
+    // EACCES after a permissions change), not corruption — so it must not be
+    // quarantined, which would move a healthy segment out of the replay path.
+    //
+    // It must not propagate either. Every other `Err` this function returns comes
+    // *after* `quarantine_and_count` has run, which is what makes the caller's
+    // "skipping quarantined segment" log true; returning `Err` from here made
+    // that message a lie about a segment still sitting in its shard directory,
+    // and — far worse — dropped it from the replay pass entirely.
+    //
+    // Those are acked records. weir is at-least-once: a duplicate is absorbed by
+    // the contract, silent non-delivery is not. A sidecar we cannot read proves
+    // nothing about delivery, so the segment replays.
+    let buf = match fs::read(&confirmed_path) {
+        Ok(buf) => buf,
+        Err(e) => {
+            warn!(
+                sealed = %sealed_path.display(),
+                confirmed = %confirmed_path.display(),
+                error = %e,
+                "cannot read the .confirmed sidecar; replaying the segment rather \
+                 than dropping it. Delivery is unproven, so at-least-once says \
+                 deliver again; the sink's idempotency key absorbs the duplicate \
+                 if it was already delivered."
+            );
+            return Ok(false);
+        }
+    };
     match parse_confirmed(&buf) {
         Ok(_) => Ok(true),
         Err(
@@ -2212,6 +2239,51 @@ mod tests {
         let sealed = dir.join("seg_00000001.wab.sealed");
         fs::write(&sealed, b"placeholder").unwrap();
         assert!(!check_confirmed(&sealed, &dir, &noop_metrics()).unwrap());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// An I/O error reading the `.confirmed` sidecar is not corruption, and must
+    /// not be treated as one.
+    ///
+    /// The three PARSE failures below quarantine the segment first, so the
+    /// caller's `Err` arm in `wab/mod.rs` — which logs "skipping quarantined
+    /// segment" — tells the truth for them. `fs::read` failing propagates
+    /// *before* any quarantine runs, so on that path the segment was never
+    /// quarantined, is still sitting in its shard directory, is silently dropped
+    /// from the replay pass, and the operator is sent to look in a quarantine
+    /// directory that does not contain it.
+    ///
+    /// Dropping it is the serious half: those are acked records, and skipping a
+    /// segment we could not prove was delivered is silent non-delivery. weir is
+    /// at-least-once — a duplicate is absorbed by the contract, a skip is not —
+    /// so an unprovable sidecar must replay.
+    ///
+    /// A directory in the sidecar's place gives `exists() == true` and a failing
+    /// `read()` (EISDIR), standing in for EIO on a failing disk or EACCES after a
+    /// permissions change without having to break the filesystem.
+    #[test]
+    fn an_unreadable_confirmed_sidecar_replays_rather_than_dropping_the_segment() {
+        let dir = tmp_dir("conf_unreadable");
+        let sealed = dir.join("seg_00000001.wab.sealed");
+        fs::write(&sealed, b"placeholder").unwrap();
+        let confirmed = dir.join("seg_00000001.wab.confirmed");
+        fs::create_dir(&confirmed).unwrap();
+
+        let metrics = noop_metrics();
+        let out = check_confirmed(&sealed, &dir, &metrics);
+
+        assert_eq!(
+            out.ok(),
+            Some(false),
+            "a sidecar that cannot be read proves nothing about delivery, so the \
+             segment must be replayed, not dropped from the pass"
+        );
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            0,
+            "an unreadable sidecar is an environment fault, not corruption; \
+             quarantining would move a healthy segment out of the replay path"
+        );
         fs::remove_dir_all(dir).ok();
     }
 
