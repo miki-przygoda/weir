@@ -38,8 +38,12 @@ pub(crate) enum TemplateError {
     UnknownSpecifier(char),
     /// The template ended with a bare `%`.
     TrailingPercent,
-    /// The template contained a `..` path segment.
-    ParentSegment,
+    /// The template contained a `.` or `..` path segment.
+    DotSegment,
+    /// A segment was empty (an interior `//`) or contained only whitespace.
+    EmptySegment,
+    /// A character that a URL parser would strip, reinterpret, or truncate at.
+    UnsafeCharacter(char),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -50,7 +54,21 @@ impl std::fmt::Display for TemplateError {
                 "unknown partition specifier '%{c}'; only %Y, %m, %d and %H are supported"
             ),
             Self::TrailingPercent => write!(f, "partition template ends with a bare '%'"),
-            Self::ParentSegment => write!(f, "partition template may not contain a '..' segment"),
+            Self::DotSegment => write!(
+                f,
+                "'.' and '..' path segments are not allowed: a URL parser removes them, so the \
+                 object would be signed under one key and written under another"
+            ),
+            Self::EmptySegment => write!(
+                f,
+                "empty or whitespace-only path segment (an interior '//' or '  /'): it becomes a \
+                 zero-length key component and breaks Hive partition discovery"
+            ),
+            Self::UnsafeCharacter(c) => write!(
+                f,
+                "character {c:?} is not allowed: a URL parser strips or truncates at it, so the \
+                 signed key and the written key would differ"
+            ),
         }
     }
 }
@@ -78,13 +96,50 @@ pub(crate) struct PartitionTemplate {
     pieces: Vec<Piece>,
 }
 
+/// Rejects path text that a URL parser would rewrite, so that the key weir
+/// signs is always the key weir writes.
+///
+/// Encoding alone cannot cover this. AWS's `UriEncode` leaves `.` unescaped (it
+/// is in the unreserved set) and exempts `/`, so `.` and `..` segments survive
+/// the encoder untouched — and `Url::parse` then applies RFC 3986
+/// `remove_dot_segments` and deletes them. `a/../../b/x` is signed as written
+/// and sent as `/b/x`: either a `403 SignatureDoesNotMatch`, or, if the caller
+/// signs the URL it parsed, a silent write to the **wrong key**.
+///
+/// A literal newline or tab is worse still: `Url::parse` removes those outright
+/// rather than encoding them, so `a<LF>b` reaches the wire as `ab`.
+///
+/// Applied to `sink_s3_prefix` and to partition templates alike — an earlier
+/// version validated only the template, leaving the prefix (also operator free
+/// text) able to escape by exactly the route the template check existed to
+/// close.
+pub(crate) fn validate_path_text(s: &str) -> Result<(), TemplateError> {
+    for seg in s.trim_matches('/').split('/') {
+        if seg.is_empty() || seg.trim().is_empty() {
+            // A bare "" from an empty input is fine; an interior // is not.
+            if s.trim_matches('/').is_empty() {
+                continue;
+            }
+            return Err(TemplateError::EmptySegment);
+        }
+        if seg == "." || seg == ".." {
+            return Err(TemplateError::DotSegment);
+        }
+    }
+    if let Some(c) = s
+        .chars()
+        .find(|c| c.is_control() || matches!(c, '#' | '?' | '\\'))
+    {
+        return Err(TemplateError::UnsafeCharacter(c));
+    }
+    Ok(())
+}
+
 impl PartitionTemplate {
     /// Parses a template, rejecting unknown specifiers rather than passing
     /// them through.
     pub(crate) fn parse(s: &str) -> Result<Self, TemplateError> {
-        if s.split('/').any(|seg| seg == "..") {
-            return Err(TemplateError::ParentSegment);
-        }
+        validate_path_text(s)?;
         let mut pieces = Vec::new();
         let mut literal = String::new();
         let mut chars = s.chars();
@@ -151,6 +206,12 @@ impl PartitionTemplate {
 /// for two batches carrying identical bytes, and an S3 key is last-write-wins,
 /// so a token-named object is destroyed by the next batch of the same
 /// repetitive records.
+/// # Injectivity
+///
+/// `count` renders as decimal digits, which contain no `-`, so the **last** `-`
+/// in the result is always the separator and the decomposition is unique for
+/// any `hex` — including one of varying length or containing `-`. That, not the
+/// fixed 64-char width of a `RecordId`, is what makes the name collision-free.
 pub(crate) fn batch_name(first_record_id_hex: &str, count: usize) -> String {
     format!("{first_record_id_hex}-{count}")
 }
@@ -323,10 +384,79 @@ mod tests {
     }
 
     #[test]
-    fn a_template_may_not_escape_the_prefix() {
+    fn dot_segments_are_rejected_in_templates() {
+        // Encoding cannot save these: AWS's unreserved set includes '.' and
+        // exempts '/', so both survive uri_encode_path untouched and Url::parse
+        // then removes them -- the object is signed under one key and written
+        // under another.
+        for t in ["../etc", "a/../b", "a/./b", "."] {
+            assert!(
+                matches!(
+                    PartitionTemplate::parse(t).unwrap_err(),
+                    TemplateError::DotSegment
+                ),
+                "template {t:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prefix_is_validated_by_the_same_rule_as_the_template() {
+        // The gap an earlier version left: only the template was checked, while
+        // sink_s3_prefix -- equally operator-supplied free text -- could escape
+        // by exactly the route the template check existed to close.
         assert!(matches!(
-            PartitionTemplate::parse("../etc").unwrap_err(),
-            TemplateError::ParentSegment
+            validate_path_text("a/../../b").unwrap_err(),
+            TemplateError::DotSegment
         ));
+        assert!(validate_path_text("archive/raw").is_ok());
+        assert!(validate_path_text("").is_ok());
+    }
+
+    #[test]
+    fn interior_empty_and_whitespace_only_segments_are_rejected() {
+        // An interior '//' is a zero-length key component: stable, but it
+        // breaks Hive partition discovery and confuses `aws s3 sync`.
+        assert!(matches!(
+            validate_path_text("a//b").unwrap_err(),
+            TemplateError::EmptySegment
+        ));
+        assert!(matches!(
+            validate_path_text("   ").unwrap_err(),
+            TemplateError::EmptySegment
+        ));
+        // Leading and trailing slashes are trimmed, not an error.
+        assert!(validate_path_text("/a/b/").is_ok());
+    }
+
+    #[test]
+    fn characters_a_url_parser_would_rewrite_are_rejected() {
+        // '#' and '?' truncate the path; control characters are deleted.
+        for bad in ["arch#ive", "dt=?x", "a\nb", "a\tb", "a\\b"] {
+            assert!(
+                matches!(
+                    validate_path_text(bad).unwrap_err(),
+                    TemplateError::UnsafeCharacter(_)
+                ),
+                "{bad:?} must be rejected"
+            );
+        }
+        // Spaces and non-ASCII are legal: uri_encode_path handles them.
+        assert!(validate_path_text("my archive/caf\u{e9}").is_ok());
+    }
+
+    #[test]
+    fn the_batch_name_separator_is_load_bearing() {
+        // Collision freedom rests on the LAST '-' being the separator, which
+        // holds because a decimal count contains no '-'. Without the separator
+        // these two distinct batches would produce the same name.
+        assert_ne!(batch_name("a1", 23), batch_name("a12", 3));
+        assert_eq!(batch_name("a1", 23), "a1-23");
+    }
+
+    #[test]
+    fn prefix_and_template_slashes_are_trimmed_on_both_ends() {
+        let k = object_key("/p/", &tmpl("/dt=%Y/"), T, &batch_name(RID, 1), "x");
+        assert_eq!(k, format!("p/dt=2026/{RID}-1.x"));
     }
 }

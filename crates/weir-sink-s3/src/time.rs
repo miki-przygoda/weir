@@ -21,9 +21,15 @@ pub(crate) struct Utc {
 
 /// Days since 1970-01-01 → `(year, month, day)`.
 ///
-/// Howard Hinnant, "chrono-Compatible Low-Level Date Algorithms". The
-/// `if z >= 0 { z } else { z - 146_096 }` emulates floor division under Rust's
-/// truncating `/`, which is what makes negative (pre-epoch) inputs correct.
+/// Howard Hinnant, "chrono-Compatible Low-Level Date Algorithms".
+///
+/// The `if z >= 0 { z } else { z - 146_096 }` emulates floor division under
+/// Rust's truncating `/`. It is **not** what makes pre-epoch instants correct —
+/// `utc_from_unix_nanos`'s `div_euclid` does that, and this branch is in fact
+/// unreachable from there, since `i64` nanoseconds bound `days` to
+/// -106,752..=106,751 and so `z` to 612,716..=826,219, always positive. The
+/// guard is kept because it is part of the published algorithm and makes this
+/// function correct for any `z` a future caller might pass directly.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
