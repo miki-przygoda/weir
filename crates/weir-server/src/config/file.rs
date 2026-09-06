@@ -58,6 +58,19 @@ struct RawServer {
     sink_clickhouse_table: Option<String>,
     #[cfg(feature = "clickhouse-sink")]
     sink_clickhouse_column: Option<String>,
+    sink_s3_bucket: Option<String>,
+    sink_s3_region: Option<String>,
+    sink_s3_endpoint: Option<String>,
+    sink_s3_prefix: Option<String>,
+    sink_s3_partition: Option<String>,
+    sink_s3_framing: Option<String>,
+    sink_s3_compression: Option<String>,
+    sink_s3_access_key_id: Option<String>,
+    sink_s3_secret_access_key: Option<String>,
+    sink_s3_storage_class: Option<String>,
+    sink_s3_sse: Option<String>,
+    sink_s3_sse_kms_key_id: Option<String>,
+    sink_s3_force_path_style: Option<bool>,
     dead_letter_max_bytes: Option<u64>,
     dead_letter_check_interval_secs: Option<u64>,
     health_poll_interval_secs: Option<u64>,
@@ -132,6 +145,19 @@ const FEATURE_GATED_SERVER_KEYS: &[(&str, &str)] = &[
     ("sink_clickhouse_database", "clickhouse-sink"),
     ("sink_clickhouse_table", "clickhouse-sink"),
     ("sink_clickhouse_column", "clickhouse-sink"),
+    ("sink_s3_bucket", "s3-sink"),
+    ("sink_s3_region", "s3-sink"),
+    ("sink_s3_endpoint", "s3-sink"),
+    ("sink_s3_prefix", "s3-sink"),
+    ("sink_s3_partition", "s3-sink"),
+    ("sink_s3_framing", "s3-sink"),
+    ("sink_s3_compression", "s3-sink"),
+    ("sink_s3_access_key_id", "s3-sink"),
+    ("sink_s3_secret_access_key", "s3-sink"),
+    ("sink_s3_storage_class", "s3-sink"),
+    ("sink_s3_sse", "s3-sink"),
+    ("sink_s3_sse_kms_key_id", "s3-sink"),
+    ("sink_s3_force_path_style", "s3-sink"),
 ];
 
 /// Whether the named sink feature is compiled into this binary.
@@ -146,6 +172,7 @@ fn feature_compiled(feature: &str) -> bool {
         "mysql-sink" => cfg!(feature = "mysql-sink"),
         "postgres-sink" => cfg!(feature = "postgres-sink"),
         "clickhouse-sink" => cfg!(feature = "clickhouse-sink"),
+        "s3-sink" => cfg!(feature = "s3-sink"),
         _ => false,
     }
 }
@@ -227,6 +254,19 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             sink_clickhouse_table: s.sink_clickhouse_table,
             #[cfg(feature = "clickhouse-sink")]
             sink_clickhouse_column: s.sink_clickhouse_column,
+            sink_s3_bucket: s.sink_s3_bucket,
+            sink_s3_region: s.sink_s3_region,
+            sink_s3_endpoint: s.sink_s3_endpoint,
+            sink_s3_prefix: s.sink_s3_prefix,
+            sink_s3_partition: s.sink_s3_partition,
+            sink_s3_framing: s.sink_s3_framing,
+            sink_s3_compression: s.sink_s3_compression,
+            sink_s3_access_key_id: s.sink_s3_access_key_id,
+            sink_s3_secret_access_key: s.sink_s3_secret_access_key,
+            sink_s3_storage_class: s.sink_s3_storage_class,
+            sink_s3_sse: s.sink_s3_sse,
+            sink_s3_sse_kms_key_id: s.sink_s3_sse_kms_key_id,
+            sink_s3_force_path_style: s.sink_s3_force_path_style,
             dead_letter_max_bytes: s.dead_letter_max_bytes,
             dead_letter_check_interval_secs: s.dead_letter_check_interval_secs,
             health_poll_interval_secs: s.health_poll_interval_secs,
@@ -300,7 +340,10 @@ mod tests {
                 "{key} is in both BASE and FEATURE_GATED"
             );
             assert!(
-                matches!(*feature, "mysql-sink" | "postgres-sink" | "clickhouse-sink"),
+                matches!(
+                    *feature,
+                    "mysql-sink" | "postgres-sink" | "clickhouse-sink" | "s3-sink"
+                ),
                 "{key} names an unknown feature {feature}"
             );
         }

@@ -2766,6 +2766,7 @@ dependencies = [
  "webpki-roots 1.0.7",
  "weir-client",
  "weir-core",
+ "weir-sink-s3",
  "weir-sink-sdk",
  "weir-testkit",
  "weir-wab",

@@ -789,6 +789,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_heartbeat.clone(),
             )
         }
+        #[cfg(feature = "s3-sink")]
+        SinkType::S3 => {
+            if config.sink_s3_bucket.is_empty() {
+                return Err(Box::<dyn std::error::Error>::from(
+                    "sink_type = \"s3\" requires sink_s3_bucket",
+                ));
+            }
+            // One object per commit batch. At the default sink_max_batch_size of
+            // 100 that is roughly a 50 KB object for a 500-byte record --
+            // hundreds of thousands per hour for a busy producer, which is
+            // expensive to PUT and pathological for every query engine.
+            if config.sink_max_batch_size < 1000 {
+                warn!(
+                    sink_max_batch_size = config.sink_max_batch_size,
+                    "s3 sink: small batches produce many small objects; consider \
+                     sink_max_batch_size = 10000. NOTE: this value determines batch \
+                     boundaries, and batch boundaries determine object keys -- changing it \
+                     after records have been written makes replayed batches land under new \
+                     keys and duplicate. Choose it once."
+                );
+            }
+            info!(
+                bucket = %config.sink_s3_bucket,
+                region = %config.sink_s3_region,
+                // Endpoint omitted: it is operator-supplied and may carry a host
+                // an operator would rather not see echoed. Bucket + region are
+                // enough to identify the target.
+                path_style = config.sink_s3_force_path_style,
+                prefix = %config.sink_s3_prefix,
+                partition = %config.sink_s3_partition,
+                framing = %config.sink_s3_framing,
+                compression = %config.sink_s3_compression,
+                timeout_secs = config.sink_timeout_secs,
+                max_batch_size = config.sink_max_batch_size,
+                "sink: s3"
+            );
+            let opt = |v: &str| (!v.is_empty()).then(|| v.to_string());
+            let s3_cfg = weir_sink_s3::S3SinkConfig {
+                endpoint: opt(&config.sink_s3_endpoint),
+                bucket: config.sink_s3_bucket.clone(),
+                region: config.sink_s3_region.clone(),
+                force_path_style: config.sink_s3_force_path_style,
+                prefix: config.sink_s3_prefix.clone(),
+                partition: config.sink_s3_partition.clone(),
+                framing: weir_sink_s3::Framing::parse(&config.sink_s3_framing)
+                    .expect("sink_s3_framing validated at config parse"),
+                compression: weir_sink_s3::Compression::parse(&config.sink_s3_compression)
+                    .expect("sink_s3_compression validated at config parse"),
+                access_key_id: opt(&config.sink_s3_access_key_id),
+                secret_access_key: opt(&config.sink_s3_secret_access_key),
+                storage_class: opt(&config.sink_s3_storage_class),
+                sse: opt(&config.sink_s3_sse),
+                sse_kms_key_id: opt(&config.sink_s3_sse_kms_key_id),
+                max_batch_size: config.sink_max_batch_size,
+                timeout: Duration::from_secs(config.sink_timeout_secs),
+            };
+            let sink = weir_sink_s3::S3Sink::new(s3_cfg).map_err(|e| {
+                Box::<dyn std::error::Error>::from(format!("failed to build S3 sink: {e}"))
+            })?;
+            build_and_spawn_drain(
+                sink,
+                drain_rx,
+                drain_config,
+                Arc::clone(&metrics),
+                drain_heartbeat.clone(),
+            )
+        }
     };
 
     // ── Replay recovery backlog (drain consumer is now live) ──────────────────

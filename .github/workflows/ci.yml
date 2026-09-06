@@ -22,6 +22,31 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      # s3-sink alone: --all-features hides a feature-gating regression that
+      # only shows when this sink is built WITHOUT the others (S08's lesson).
+      - run: cargo clippy --all-targets --features s3-sink -- -D warnings
+      # The workspace is ring-only: aws-lc-rs and its aws-lc-sys cmake/C build
+      # were deliberately dropped. The S3 sink hand-rolls SigV4 specifically so
+      # that choice survives, and this is what stops it silently regressing --
+      # a single transitive dep pulling aws-lc-rs would undo it invisibly.
+      - name: Crypto provider stays on ring
+        run: |
+          if cargo tree -p weir-server --all-features --prefix none | grep -q '^aws-lc-sys'; then
+            echo "aws-lc-sys entered the tree; the workspace is ring-only" >&2
+            cargo tree -p weir-server --all-features -i aws-lc-sys >&2
+            exit 1
+          fi
+          # `awk '{print $1" "$2}'` strips cargo tree's "(*)" dedup marker --
+          # without it `rustls v0.23.40` and `rustls v0.23.40 (*)` count as two
+          # and the guard fails on a perfectly healthy tree.
+          versions=$(cargo tree -p weir-server --all-features --prefix none \
+                     | grep -E '^rustls v' | awk '{print $1" "$2}' | sort -u)
+          count=$(printf '%s\n' "$versions" | wc -l | tr -d ' ')
+          if [ "$count" -ne 1 ]; then
+            echo "expected exactly 1 rustls version, found $count:" >&2
+            printf '%s\n' "$versions" >&2
+            exit 1
+          fi
       # The demo banners show the weir version via demo/version.js (single source,
       # generated from [workspace.package] in Cargo.toml). Fail if it drifts — after
       # a version bump, run scripts/sync-demo-version.sh and commit demo/version.js.
@@ -95,6 +120,9 @@ jobs:
       # another thread in that window loses its execute bit (~66 spurious
       # PermissionDenied failures). See docs/security/socket-bind.md.
       - run: cargo test --workspace --exclude weir-server
+      # The vendored AWS SigV4 vectors live here; run them explicitly so a
+      # failure names this crate rather than hiding in a workspace summary.
+      - run: cargo test -p weir-sink-s3
       - run: cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener
       - run: cargo test -p weir-server --bins -- --test-threads=1
       # Build + run the clickhouse-sink and tls test code, which the default
