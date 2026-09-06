@@ -13,6 +13,70 @@ protocol** below.
 
 ---
 
+## [Unreleased]
+
+Findings from a second exploration sweep over the published 2.0.5 tree. The
+three fixes below are one shape: a safety mechanism that failed silently *in the
+safe-looking direction* — the cap reporting an empty WAB, the probe reporting a
+recovered sink, the replay pass reporting a quarantine that never happened.
+
+### Fixed
+
+- **A failed WAB scan reported an empty WAB and lifted the `wab_max_bytes` cap.**
+  `compute_wab_bytes_on_disk` answered `0` when it could not read the WAB
+  directory, and `0` is a success — it was published to the gauge and stored in
+  the atomic checked before accepting a record, so the only gate stopping weir
+  acking into an unbounded buffer was lifted by the very condition that should
+  have closed it. The growth warning stayed quiet too, because the gauge also
+  read empty. Now returns `Option<u64>`, where `None` means "could not look" and
+  is handled exactly as a join failure already was: keep the last known size,
+  move nothing. Every error path returns `None`, including a per-shard one — an
+  unreadable shard is an undercount, and an undercount lifts the cap by the bytes
+  it failed to see. A `metadata` NotFound is exempt, since the drain deletes
+  confirmed segments continuously and that race is routine.
+
+- **A sink that came back DEGRADED never un-stranded its backlog.** The HTTP
+  probe maps any 4xx outside 401/403/405/501 to `Degraded`, which includes the
+  **404** a method-routed framework returns for HEAD on a POST-only ingest path.
+  The drain treated only `Healthy` as recovered, so the recovery edge — the code's
+  own "only in-run rescan" — could never fire again, and acked segments stayed
+  undelivered for the life of the process while new ones flowed past them. This
+  made `Degraded` a *stickier* failure than `Down`. `Degraded` now counts as
+  deliverable, matching what the probe's own comment ("the real signal is commit
+  success") and the shipped alert rule both already said. The rescan also no
+  longer depends on an edge when the drain is idle: a segment strands on transient
+  *commit* failures, which need not change what the *probe* answers, so a sink
+  holding one health state throughout stranded a segment with no edge on either
+  side of it.
+
+- **An unreadable `.confirmed` sidecar dropped acked records from the replay
+  pass.** An I/O error reading the sidecar propagated from before any quarantine
+  ran, so the segment was not quarantined, was silently omitted from replay, and
+  the operator was pointed at a quarantine directory that did not contain it.
+  Since weir is at-least-once, a sidecar that cannot be read proves nothing about
+  delivery and the segment now replays: a duplicate is absorbed by the contract
+  and the sink's idempotency key, silent non-delivery is absorbed by nothing. It
+  is deliberately not quarantined — an environment fault is not corruption.
+
+### Documentation
+
+- `sink_max_batch_size` told operators to freeze the knob for ClickHouse and then
+  exempted HTTP: "the HTTP sink's per-record `Idempotency-Key` is unaffected".
+  That is false in `ndjson` mode, where one POST carries the whole batch and the
+  key is the batch's `DedupToken` — so the mode carrying the batch-split hazard
+  was the one told it had none. This matters beyond accuracy: raising this knob
+  is the cheapest fix for the NDJSON round-trip ceiling, so the exemption was
+  booby-trapping its own remedy.
+- The 2.0.5 entry still said it was not published to crates.io, steering readers
+  to 2.0.4 — the release with the `dl requeue` path that destroys acked records.
+- `weir.toml.example` described the `Idempotency-Key` as a hash "of the payload",
+  which is the scheme 2.0.3 removed as a defect.
+- `deploy/ci-local` gained no "cannot run locally" entry when 2.0.5 split the
+  Windows client check into its own job, so a local runner listed it as runnable
+  and passed it on the wrong operating system.
+
+---
+
 ## [2.0.5] - 2026-09-04
 
 Seven verified defects from an overnight exploration sweep, one of them a
