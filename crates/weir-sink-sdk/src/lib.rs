@@ -519,7 +519,16 @@ impl SinkBatch {
     }
 
     /// Builds a batch that also carries a [`RecordId`] per record, in the same
-    /// order. The drain uses this; [`SinkBatch::new`] remains the plain form.
+    /// order. [`SinkBatch::new`] remains the plain form.
+    ///
+    /// The drain no longer calls this — it uses
+    /// [`SinkBatch::with_segment_context`], which additionally carries the
+    /// owning segment's creation time. This constructor remains the right one
+    /// for a sink author's tests, and is not deprecated.
+    ///
+    /// Note for tests that compare batches: `SinkBatch` derives `PartialEq`, so
+    /// a batch from this constructor does **not** equal one from
+    /// `with_segment_context` even with identical records and ids.
     ///
     /// # Panics
     ///
@@ -576,7 +585,7 @@ impl SinkBatch {
         assert_eq!(
             records.len(),
             record_ids.len(),
-            "record_ids must be parallel to records"
+            "with_segment_context: record_ids must be parallel to records"
         );
         Self {
             records,
@@ -1088,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "record_ids")]
+    #[should_panic(expected = "with_segment_context: record_ids must be parallel")]
     fn with_segment_context_keeps_the_length_mismatch_assertion() {
         // The assertion is why with_record_ids exists; a new constructor that
         // dropped it would silently pair records with other records' ids.

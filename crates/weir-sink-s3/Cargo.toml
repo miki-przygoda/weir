@@ -30,10 +30,6 @@ sha2 = "0.10"
 # The tree carries hmac 0.13 via postgres-protocol, but only under the
 # postgres-sink feature and on digest 0.11; 0.12 pairs with sha2 0.10 above.
 hmac = "0.12"
-# AWS UriEncode. Already in the tree via reqwest -> url -> form_urlencoded, so
-# taking it directly costs zero crates. Signing must encode the path itself:
-# see sigv4::uri_encode_path for why delegating it to the caller is a live bug.
-percent-encoding = "2.3"
 # Object body compression. zstd is already in weir-server for WAB format v2.
 zstd = "0.13"
 # gzip, for query engines that do not read zstd. Already in the tree via
@@ -46,3 +42,5 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+# Parses the vendored SigV4 vectors' context.json. Test-only.
+serde_json = "1"

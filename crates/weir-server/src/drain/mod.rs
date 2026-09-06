@@ -2192,7 +2192,7 @@ mod tests {
 
     /// Ids for a test batch, at a synthetic coordinate. `commit_batch` only
     /// forwards these, so the exact segment name is immaterial — what matters is
-    /// that the count matches, which `SinkBatch::with_record_ids` enforces.
+    /// that the count matches, which `SinkBatch::with_segment_context` enforces.
     fn test_record_ids(payloads: &[Payload]) -> Vec<RecordId> {
         payloads
             .iter()
@@ -2776,6 +2776,15 @@ mod tests {
             async fn health(&self) -> SinkHealth {
                 SinkHealth::Healthy
             }
+
+            /// Forces `process_segment` to flush a full sub-batch mid-loop
+            /// rather than only at the tail. Without this the default of 1000
+            /// means a 2-record segment only ever exercises the tail flush, and
+            /// the batched `commit_batch` call site goes untested — verified by
+            /// mutation: passing 0 there alone left 440/440 green.
+            fn max_batch_size(&self) -> usize {
+                1
+            }
         }
 
         let dir = tmp_dir("segment_created_at");
@@ -2801,7 +2810,13 @@ mod tests {
         );
 
         let observed = sink.0.lock().unwrap().clone();
-        assert!(!observed.is_empty(), "the sink saw no commits");
+        // With max_batch_size = 1 and two records, this is one batched flush
+        // plus one tail flush — so both `commit_batch` call sites are covered.
+        assert_eq!(
+            observed.len(),
+            2,
+            "expected both the batched and the tail commit_batch call sites to fire"
+        );
         for seen in observed {
             assert_eq!(
                 seen,

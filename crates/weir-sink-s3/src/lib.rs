@@ -18,3 +18,14 @@ pub(crate) mod key;
 pub(crate) mod redact;
 pub(crate) mod sigv4;
 pub(crate) mod time;
+
+#[doc(hidden)]
+/// Internal seams exposed for the vendored SigV4 vector suite
+/// (`tests/sigv4_vectors.rs`), which is a separate crate and cannot reach
+/// `pub(crate)` items. Not a public API: no stability guarantee, and it may
+/// change in a patch release.
+pub mod sigv4_test_hooks {
+    pub use crate::sigv4::{
+        Signed, SigningParams, canonical_request, sign, signature, string_to_sign, uri_encode_path,
+    };
+}
