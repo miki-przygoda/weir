@@ -61,9 +61,24 @@ use sink::postgres::{PostgresSink, PostgresSinkConfig};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
+/// Total live shard-segment bytes, or `None` if the WAB could not be scanned.
+///
+/// `None` is not "empty" — it is "we do not know", and the two must never
+/// collapse. This value feeds the atomic that the `wab_max_bytes` cap is checked
+/// against, so a scan error reported as `0` reads as an empty WAB and lifts the
+/// cap entirely until the next tick. `apply_wab_scan` already refuses to do that
+/// for a join failure (see its doc comment, which names this as "failing open on
+/// the one feature whose job is to fail closed"); returning `Option` here closes
+/// the same hole on the path that produces the number.
+///
+/// Any error makes the whole answer untrustworthy, including a per-shard one: an
+/// unreadable shard is an undercount, and an undercount lifts the cap by exactly
+/// the bytes we failed to see. The single exception is a file that vanished
+/// between `read_dir` and `metadata` — the drain confirms and deletes segments
+/// continuously, so that race is routine and the file genuinely occupies nothing.
+fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
     let Ok(dir) = std::fs::read_dir(wab_dir) else {
-        return 0;
+        return None;
     };
     let mut total = 0u64;
     for entry in dir.flatten() {
@@ -85,17 +100,21 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> u64 {
             continue;
         }
         let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
-            continue;
+            return None;
         };
         for file in shard_dir.flatten() {
             let fpath = file.path();
             let name = fpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.ends_with(".wab") || name.ends_with(".wab.sealed") {
-                total += std::fs::metadata(&fpath).map(|m| m.len()).unwrap_or(0);
+                match std::fs::metadata(&fpath) {
+                    Ok(m) => total += m.len(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return None,
+                }
             }
         }
     }
-    total
+    Some(total)
 }
 
 /// Number of 5 s samples the growth warning considers (60 s).
@@ -222,13 +241,21 @@ fn growth_warning_is_due(last_warned: Option<std::time::Instant>, now: std::time
 /// the last known size stands, 5 s stale, which is exactly the staleness the cap
 /// is already documented to carry.
 fn apply_wab_scan(
-    scan: Result<u64, tokio::task::JoinError>,
+    scan: Result<Option<u64>, tokio::task::JoinError>,
     samples: &mut Vec<u64>,
     metrics: &crate::metrics::Metrics,
     wab_bytes_now: &std::sync::atomic::AtomicU64,
 ) -> Option<u64> {
     let bytes = match scan {
-        Ok(bytes) => bytes,
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            warn!(
+                "WAB byte scan could not read the WAB directory; keeping the last \
+                 known size. The wab_max_bytes cap and weir_wab_bytes_on_disk are \
+                 stale until the next tick."
+            );
+            return None;
+        }
         Err(e) => {
             warn!(
                 error = %e,
@@ -1269,10 +1296,39 @@ mod wab_bytes_tests {
 
         assert_eq!(
             compute_wab_bytes_on_disk(&root),
-            100,
+            Some(100),
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The cap's job is to fail CLOSED. A scan that cannot read the WAB
+    /// directory knows nothing about its size, and must not be able to report
+    /// the same answer as a directory it read successfully and found empty --
+    /// that answer is 0, which `apply_wab_scan` takes as a success and writes
+    /// into the atomic the cap is checked against, lifting the cap entirely.
+    ///
+    /// `apply_wab_scan` already refuses to do this for a JoinError, and says so
+    /// by name: "failing open on the one feature whose job is to fail closed".
+    /// The hole is upstream of that guard, in the value this function produces.
+    #[test]
+    fn an_unreadable_wab_dir_is_not_reported_as_empty() {
+        let empty = std::env::temp_dir().join(format!("weir_scanfail_ok_{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let unreadable = empty.join("no_such_wab_dir");
+        assert!(!unreadable.exists(), "the failure case must actually fail");
+
+        assert_eq!(
+            compute_wab_bytes_on_disk(&unreadable),
+            None,
+            "a WAB directory that could not be scanned reports no size at all"
+        );
+        assert_eq!(
+            compute_wab_bytes_on_disk(&empty),
+            Some(0),
+            "a directory that WAS scanned and found empty still reports a size"
+        );
+        std::fs::remove_dir_all(&empty).ok();
     }
 }
 
@@ -1562,13 +1618,40 @@ mod apply_wab_scan_tests {
         );
     }
 
+    /// The sibling of `failed_scan_leaves_the_cap_reading_the_last_known_size`,
+    /// for the other way a scan can fail to produce a number. `compute_wab_bytes_on_disk`
+    /// returns `None` when it could not read the WAB directory; treating that as a
+    /// size would write it into `wab_bytes_now` and lift the cap. Mutation-checked:
+    /// making the `Ok(None)` arm fall through to 0 fails this test on both asserts.
+    #[tokio::test]
+    async fn incomplete_scan_leaves_the_cap_reading_the_last_known_size() {
+        let m = Metrics::new().0;
+        let mut samples = vec![4_096];
+        let live = AtomicU64::new(4_096);
+
+        let out = apply_wab_scan(Ok(None), &mut samples, &m, &live);
+
+        assert_eq!(out, None, "an incomplete scan yields no size");
+        assert_eq!(
+            live.load(Ordering::Relaxed),
+            4_096,
+            "an unreadable WAB directory must not move the value the cap is \
+             checked against -- reporting 0 there lifts the cap entirely"
+        );
+        assert_eq!(
+            samples,
+            vec![4_096],
+            "an incomplete scan must not push a sample"
+        );
+    }
+
     #[tokio::test]
     async fn successful_scan_publishes_the_size_and_extends_the_window() {
         let m = Metrics::new().0;
         let mut samples = Vec::new();
         let live = AtomicU64::new(0);
 
-        let out = apply_wab_scan(Ok(8_192), &mut samples, &m, &live);
+        let out = apply_wab_scan(Ok(Some(8_192)), &mut samples, &m, &live);
 
         assert_eq!(out, Some(8_192));
         assert_eq!(live.load(Ordering::Relaxed), 8_192);
@@ -1583,7 +1666,7 @@ mod apply_wab_scan_tests {
 
         // One more than the window holds, so the oldest must fall off.
         for i in 0..=WAB_GROWTH_WINDOW as u64 {
-            apply_wab_scan(Ok(i), &mut samples, &m, &live);
+            apply_wab_scan(Ok(Some(i)), &mut samples, &m, &live);
         }
 
         assert_eq!(samples.len(), WAB_GROWTH_WINDOW);
