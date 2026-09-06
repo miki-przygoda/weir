@@ -148,9 +148,16 @@ sink_timeout_secs = 10
 # Env: WEIR_SINK_MAX_BATCH_SIZE
 sink_max_batch_size = 100
 
-# Send `Idempotency-Key: sha256:<hex>` of the payload with each HTTP request
-# so the endpoint can dedupe retries. The drain delivers at-least-once per
-# segment, so retries re-POST records that may have already been accepted.
+# Send `Idempotency-Key: sha256:<hex>` with each HTTP request so the endpoint
+# can dedupe retries. The drain delivers at-least-once per segment, so retries
+# re-POST records that may have already been accepted.
+#
+# The key is NOT a hash of the payload alone. In per_record mode it is the
+# record's RecordId — sha256(segment name, index, payload) — so two distinct
+# records carrying identical bytes get distinct keys. Hashing only the payload
+# is what weir did before 2.0.3, and it made a correct endpoint drop every
+# repeat of a fixed-shape event. In ndjson mode the key is the batch's
+# DedupToken instead; see sink_max_batch_size in docs/operations/configuration.md.
 # Set false only if your endpoint can't tolerate the extra header.
 # Env: WEIR_SINK_SEND_IDEMPOTENCY_KEY
 sink_send_idempotency_key = true

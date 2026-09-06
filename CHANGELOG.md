@@ -20,9 +20,9 @@ data-loss path in an operator tool, plus a measurement fix that invalidates
 several published performance numbers. Every fix is mutation-checked: the test
 was confirmed to fail against the shipped behaviour before it was kept.
 
-> **Not published to crates.io.** 2.0.4 remains the latest registry release.
-> This tag exists so the fixes below are reachable and reviewable; the publish
-> is a separate, deliberate step.
+> **Published to crates.io.** All seven crates are live at 2.0.5. Upgrade from
+> 2.0.4, which contains the `weir-ctl dl requeue` path that destroys acked
+> records and the cross-shard `RecordId` collision below.
 
 ### Fixed
 

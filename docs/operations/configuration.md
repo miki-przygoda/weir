@@ -1058,13 +1058,24 @@ For the SQL sinks it is the number of rows per multi-row `INSERT`.
 ndjson/SQL bulk throughput. The default 100 is a balanced point for most
 deployments.
 
-> **Keep this stable for dedup-by-batch sinks (ClickHouse).** The ClickHouse
-> sink's `insert_deduplication_token` is a hash of the **per-`commit` batch**.
-> Changing `sink_max_batch_size` across a restart re-splits a replayed segment
-> into different batches with different tokens, so ClickHouse no longer
-> recognises them as duplicates and you get **double-counting** on replay. Pick a
-> value and freeze it for the life of the deployment. (The HTTP sink's per-record
-> `Idempotency-Key` is unaffected — it's per record, not per batch.)
+> **Keep this stable for every dedup-by-batch sink.** A batch-scoped dedup key is
+> a hash of the **per-`commit` batch**, so changing `sink_max_batch_size` across a
+> restart re-splits a replayed segment into different batches carrying different
+> keys. The endpoint no longer recognises them as duplicates and you get
+> **double-counting** on replay. Pick a value and freeze it for the life of the
+> deployment. This applies to:
+>
+> - **ClickHouse** — `insert_deduplication_token`.
+> - **HTTP in `ndjson` batch mode** — one POST carries the whole batch, so the
+>   `Idempotency-Key` is the batch's `DedupToken`, not a per-record key.
+>
+> **Only HTTP in the default `per_record` batch mode is exempt**: it sends one
+> POST per record keyed by that record's `RecordId`, which is stable regardless
+> of how the batch is split.
+>
+> If you need to raise this knob on a running NDJSON deployment, drain the
+> backlog to empty first — a re-split can only double-deliver records that are
+> still on disk waiting to be replayed.
 
 ---
 
