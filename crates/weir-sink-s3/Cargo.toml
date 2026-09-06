@@ -36,7 +36,7 @@ zstd = "0.13"
 # mysql_async (the mysql-sink feature, which is in `default`) — but declared
 # explicitly because it is absent under --no-default-features.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["time", "sync"] }
 thiserror = "2"
 tracing = "0.1"
 
