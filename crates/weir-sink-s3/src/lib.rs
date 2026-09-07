@@ -139,11 +139,46 @@ impl S3Sink {
             transient: false,
         };
         key::validate_path_text(&config.prefix).map_err(|e| invalid(e, "prefix"))?;
+        // An endpoint is a scheme and an authority, never a path. `Endpoint::resolve`
+        // treats everything after "://" as the authority, so "http://host/s3gw"
+        // would produce the Host header "host/s3gw" and sign "/bucket/key" while
+        // sending "/s3gw/bucket/key" -- a guaranteed 403 SignatureDoesNotMatch
+        // that classifies as transient and strands forever, with nothing in the
+        // message pointing at the endpoint. The prefix and partition are
+        // validated for exactly this failure; the endpoint was the gap.
+        if let Some(ep) = &config.endpoint {
+            let authority = ep.split_once("://").map_or(ep.as_str(), |(_, a)| a);
+            if authority.trim_end_matches('/').contains('/') {
+                return Err(S3SinkError {
+                    message: format!(
+                        "sink_s3_endpoint must be a scheme and host only (optionally with a \
+                         port), with no path component: got {ep:?}. A path here would be \
+                         signed and sent differently, giving a permanent \
+                         SignatureDoesNotMatch."
+                    ),
+                    transient: false,
+                });
+            }
+            if authority.is_empty() {
+                return Err(S3SinkError {
+                    message: format!("sink_s3_endpoint has no host: {ep:?}"),
+                    transient: false,
+                });
+            }
+        }
         let partition =
             PartitionTemplate::parse(&config.partition).map_err(|e| invalid(e, "partition"))?;
 
         let http = reqwest::Client::builder()
             .timeout(config.timeout)
+            // Never follow redirects. reqwest strips `authorization` across
+            // hosts but NOT `x-amz-*`, so a 307 or 301 (S3 answers both for a
+            // wrong-region or renamed bucket) would forward the session token
+            // AND the record body to another host, return 200, and have this
+            // sink report the batch committed -- after which the drain deletes
+            // the segment, with nothing in the configured bucket. A redirect
+            // must surface as a status this sink classifies, not be chased.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| S3SinkError {
                 message: format!("could not build the HTTP client: {e}"),
@@ -226,7 +261,23 @@ impl Sink for S3Sink {
     type Error = S3SinkError;
 
     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, S3SinkError> {
-        let created_at = batch.segment_created_at().unwrap_or_default();
+        // 0 partitions under 1970-01-01. Reachable only from a hand-built batch
+        // (the drain always supplies it), and warned about for the same reason
+        // the missing-RecordId path is: silently mis-partitioning is worse than
+        // a noisy one-time line.
+        let created_at = match batch.segment_created_at() {
+            Some(t) => t,
+            None => {
+                if !self.warned_missing_ids.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "s3 sink: batch carries no segment creation time; partitioning under \
+                         1970-01-01. The drain always supplies one, so this indicates a \
+                         hand-built batch."
+                    );
+                }
+                0
+            }
+        };
         let name = self.batch_name(&batch);
         let object_key = key::object_key(
             &self.prefix,
@@ -242,6 +293,17 @@ impl Sink for S3Sink {
         // is noise in the bucket, and for a compressed framing it would not even
         // be empty -- zstd and gzip of no input are non-empty frame headers.
         if framed.body.is_empty() {
+            // The empty check is on the BODY, not the record count: zstd and
+            // gzip of no input are non-empty frame headers, so an empty-count
+            // check would upload a valid but meaningless object. The converse
+            // invariant -- empty body implies nothing committed -- holds for
+            // both framings today and is asserted so a future framing that
+            // breaks it fails here rather than silently dropping records from
+            // the CommitResult.
+            debug_assert!(
+                framed.committed.is_empty(),
+                "an empty body must mean nothing was committed"
+            );
             return Ok(CommitResult::new(Vec::new(), framed.dead_lettered));
         }
 
@@ -275,12 +337,21 @@ impl Sink for S3Sink {
             // ae392bc, Degraded was a STICKIER failure than Down, which would
             // have stranded such a deployment's backlog for the life of the
             // process.
-            Ok(403) => SinkHealth::Degraded(
-                "bucket reachable but HeadBucket is denied; PutObject may still succeed \
-                 (a least-privilege policy without s3:ListBucket looks like this)"
-                    .to_string(),
-            ),
-            Ok(404) => SinkHealth::Down("no such bucket".to_string()),
+            // AWS documents HeadBucket as answering "a generic 400 Bad Request,
+            // 403 Forbidden, or 404 Not Found" when the bucket is missing OR the
+            // caller lacks permission, with no body to distinguish them -- and
+            // HeadBucket requires s3:ListBucket, which is exactly what a
+            // least-privilege PutObject-only policy omits. Mapping only 403 to
+            // Degraded left the same deployment reporting Down on 400 or 404, and
+            // the drain never rescans a Down sink, so its stranded backlog would
+            // sit until a restart. All three are therefore Degraded: PutObject is
+            // the authority on whether delivery works.
+            Ok(s @ (400 | 403 | 404)) => SinkHealth::Degraded(format!(
+                "HeadBucket returned HTTP {s}, which AWS uses for both a missing bucket and \
+                 a denied one. Delivery may still work: HeadBucket needs s3:ListBucket, which \
+                 a least-privilege PutObject-only policy does not grant. Commit success is \
+                 the real signal."
+            )),
             Ok(s) => SinkHealth::Down(format!("HeadBucket returned HTTP {s}")),
             Err(e) => SinkHealth::Down(e.message),
         }
@@ -337,6 +408,35 @@ mod tests {
             let e = S3Sink::new(c).expect_err(&format!("{bad:?} must be rejected"));
             assert!(!e.is_transient(), "a config error is permanent");
             assert!(e.to_string().contains("sink_s3_prefix"), "{e}");
+        }
+    }
+
+    #[test]
+    fn an_endpoint_with_a_path_component_is_rejected() {
+        // Endpoint::resolve treats everything after "://" as the authority, so a
+        // path here signs "/bucket/key" while sending "/gw/bucket/key" -- a
+        // permanent SignatureDoesNotMatch that classifies as transient and
+        // strands forever, with nothing naming the endpoint.
+        for bad in [
+            "http://127.0.0.1:19000/s3gw",
+            "https://gw.example/prefix/",
+            "https://",
+        ] {
+            let mut c = cfg();
+            c.endpoint = Some(bad.to_string());
+            let e = S3Sink::new(c).expect_err(&format!("{bad:?} must be rejected"));
+            assert!(!e.is_transient());
+            assert!(e.to_string().contains("sink_s3_endpoint"), "{e}");
+        }
+        // A bare host, and a host with a port, are both fine.
+        for good in [
+            "http://127.0.0.1:19000",
+            "https://s3.example.com",
+            "https://h/",
+        ] {
+            let mut c = cfg();
+            c.endpoint = Some(good.to_string());
+            assert!(S3Sink::new(c).is_ok(), "{good:?} must be accepted");
         }
     }
 

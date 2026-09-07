@@ -48,8 +48,42 @@ pub(crate) fn classify(status: u16, s3_code: Option<&str>) -> Classification {
     ) {
         return Classification::Transient;
     }
+    // 400 is NOT uniformly a record-level fault, which an earlier version
+    // assumed. S3 answers 400 for transport corruption, for facts about the
+    // bucket, for credential problems, and -- worst -- for headers this sink
+    // itself adds from config. Each of those applies to every record in the
+    // backlog, so each must strand.
+    if matches!(
+        s3_code,
+        Some(
+            // Transport: the body did not arrive intact. Retrying re-sends it.
+            "RequestTimeout"
+                | "BadDigest"
+                | "IncompleteBody"
+                | "XAmzContentSHA256Mismatch"
+                // A fact about the bucket, not the record.
+                | "InvalidBucketName"
+                // Sibling of ExpiredToken; an STS token problem, not a record one.
+                | "InvalidToken"
+                // Produced by sink_s3_storage_class / sink_s3_sse / sink_s3_sse_kms_key_id
+                // -- headers THIS SINK adds. A config typo must not dead-letter
+                // a backlog; that is the same argument this module makes for 403.
+                | "InvalidArgument"
+                | "InvalidStorageClass"
+        )
+    ) || s3_code.is_some_and(|c| c.starts_with("KMS."))
+    {
+        // SSE-KMS burns a GenerateDataKey call per object and KMS has a
+        // per-region rate quota, so KMS.ThrottlingException is the expected
+        // response to throughput -- backpressure wearing a 400.
+        return Classification::Transient;
+    }
     match status {
-        // Request-shape faults: the same bytes will be rejected again.
+        // Genuinely record-level: these are facts about the bytes just sent,
+        // and the same bytes will be rejected again.
+        //   400 -- a malformed request not matched above
+        //   411 -- missing Content-Length (unreachable via reqwest)
+        //   413 -- EntityTooLarge: this batch is too big for the endpoint
         400 | 411 | 413 => Classification::Permanent,
         // Everything else -- 5xx, throttling, auth, missing bucket, and any
         // status this code does not recognise. Providers diverge (R2, B2,
@@ -60,10 +94,35 @@ pub(crate) fn classify(status: u16, s3_code: Option<&str>) -> Classification {
 }
 
 /// Extracts `<Code>…</Code>` from an S3 error body.
+///
+/// Searches outside `<Message>` first: some providers quote a different error
+/// code inside the human-readable message, and taking the first `<Code>`
+/// anywhere would classify on the quoted one. Falls back to a plain search so a
+/// body this heuristic does not fit still yields something.
 pub(crate) fn s3_error_code(body: &str) -> Option<&str> {
-    let start = body.find("<Code>")? + "<Code>".len();
-    let end = body[start..].find("</Code>")? + start;
-    Some(&body[start..end])
+    fn first_code(s: &str) -> Option<(usize, usize)> {
+        let start = s.find("<Code>")? + "<Code>".len();
+        let end = s[start..].find("</Code>")? + start;
+        Some((start, end))
+    }
+    // Strip the Message element, then look there first.
+    if let Some(m0) = body.find("<Message>")
+        && let Some(m1) = body[m0..]
+            .find("</Message>")
+            .map(|i| i + m0 + "</Message>".len())
+    {
+        let outside = format!("{}{}", &body[..m0], &body[m1..]);
+        if let Some((s, e)) = first_code(&outside) {
+            // Map back into `body` by searching for the exact code text.
+            let code = &outside[s..e];
+            if let Some(p) = body.find(&format!("<Code>{code}</Code>")) {
+                let s = p + "<Code>".len();
+                return Some(&body[s..s + code.len()]);
+            }
+        }
+    }
+    let (s, e) = first_code(body)?;
+    Some(&body[s..e])
 }
 
 /// A transport-level or HTTP-level failure, already classified.
@@ -217,8 +276,18 @@ impl S3Client {
             .map_err(|e| S3Error::transient(sanitize_log_excerpt(&e.to_string())))?;
         let status = resp.status().as_u16();
         // HEAD responses carry no body; PUT errors carry an XML one.
-        let text = resp.text().await.unwrap_or_default();
-        Ok((status, text))
+        //
+        // A body that fails mid-read is a TRANSPORT failure, not an empty body.
+        // Swallowing it would hand `classify` a `None` error code and, for a
+        // 400, dead-letter the batch on the strength of evidence that was
+        // erased rather than absent.
+        match resp.text().await {
+            Ok(text) => Ok((status, text)),
+            Err(e) => Err(S3Error::transient(format!(
+                "HTTP {status} but the response body could not be read: {}",
+                sanitize_log_excerpt(&e.to_string())
+            ))),
+        }
     }
 
     /// Writes one object.
@@ -271,9 +340,66 @@ mod tests {
     }
 
     #[test]
+    fn transport_level_400s_strand_rather_than_dead_letter() {
+        // Each of these is a 400 that says the bytes did not arrive intact, or
+        // says something about the bucket or the credential. An earlier version
+        // mapped all 400s to Permanent and dead-lettered acked records on them.
+        for code in [
+            "RequestTimeout",
+            "BadDigest",
+            "IncompleteBody",
+            "XAmzContentSHA256Mismatch",
+            "InvalidBucketName",
+            "InvalidToken",
+        ] {
+            assert_eq!(
+                classify(400, Some(code)),
+                Classification::Transient,
+                "400 {code} must strand"
+            );
+        }
+    }
+
+    #[test]
+    fn a_400_caused_by_this_sinks_own_config_headers_strands() {
+        // sink_s3_storage_class / sink_s3_sse / sink_s3_sse_kms_key_id become
+        // request headers. A typo in one must not dead-letter a backlog -- that
+        // is the same argument this module makes for 403, applied to a header
+        // the sink itself adds.
+        for code in ["InvalidArgument", "InvalidStorageClass"] {
+            assert_eq!(
+                classify(400, Some(code)),
+                Classification::Transient,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn kms_throttling_is_backpressure_wearing_a_400() {
+        // SSE-KMS burns a GenerateDataKey call per object and KMS has a
+        // per-region rate quota, so this is the expected response to throughput
+        // -- the one case where a 400 means "slow down", not "bad request".
+        assert_eq!(
+            classify(400, Some("KMS.ThrottlingException")),
+            Classification::Transient
+        );
+        assert_eq!(
+            classify(400, Some("KMS.KeyUnavailableException")),
+            Classification::Transient
+        );
+    }
+
+    #[test]
     fn only_request_shape_faults_are_permanent() {
         // Dead-lettering is for bytes the downstream will never accept.
-        for (s, code) in [(400u16, Some("InvalidRequest")), (411, None), (413, None)] {
+        // EntityTooLarge is the real one: this batch is too big for the
+        // endpoint, and the same bytes will be rejected again.
+        for (s, code) in [
+            (400u16, Some("InvalidRequest")),
+            (413, Some("EntityTooLarge")),
+            (411, None),
+        ] {
             assert_eq!(
                 classify(s, code),
                 Classification::Permanent,
@@ -320,6 +446,15 @@ mod tests {
         // by an operator; a dead-lettered one needs a requeue.
         assert_eq!(classify(418, None), Classification::Transient);
         assert_eq!(classify(451, Some("WhoKnows")), Classification::Transient);
+    }
+
+    #[test]
+    fn a_code_quoted_inside_the_message_does_not_win() {
+        // Some providers quote a different code in the human-readable message.
+        // Taking the first <Code> anywhere would classify on the quoted one.
+        let body = "<Error><Message>saw <Code>AccessDenied</Code> earlier</Message>\
+                    <Code>InvalidStorageClass</Code></Error>";
+        assert_eq!(s3_error_code(body), Some("InvalidStorageClass"));
     }
 
     #[test]
