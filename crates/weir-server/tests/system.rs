@@ -2692,6 +2692,14 @@ fn mysql_sink_end_to_end() {
         .extra_config("sink_mysql_table      = \"weir_records\"")
         .extra_config("sink_mysql_column     = \"payload\"")
         .extra_config("sink_mysql_insert_mode = \"ignore\"")
+        // Idle-seal after 1s. Without this the test is not slow -- it is
+        // impossible: it asserts on delivery metrics scraped while the daemon is
+        // still running, but the default seal thresholds are
+        // wab_segment_max_bytes = 256 MiB and wab_segment_max_age_secs = 0
+        // (idle-seal off), and 100 short records are ~1.5 KB. The segment stays
+        // open, the drain never receives it, Sink::commit is never called, and
+        // the assertion reads "got 0" with a perfectly healthy sink.
+        .extra_config("wab_segment_max_age_secs = 1")
         .start();
 
     let mut client = handle.client();
@@ -2784,6 +2792,14 @@ fn postgres_sink_end_to_end() {
         .extra_config("sink_postgres_table       = \"weir_records\"")
         .extra_config("sink_postgres_column      = \"payload\"")
         .extra_config("sink_postgres_insert_mode = \"on_conflict_do_nothing\"")
+        // Idle-seal after 1s. Without this the test is not slow -- it is
+        // impossible: it asserts on delivery metrics scraped while the daemon is
+        // still running, but the default seal thresholds are
+        // wab_segment_max_bytes = 256 MiB and wab_segment_max_age_secs = 0
+        // (idle-seal off), and 100 short records are ~1.5 KB. The segment stays
+        // open, the drain never receives it, Sink::commit is never called, and
+        // the assertion reads "got 0" with a perfectly healthy sink.
+        .extra_config("wab_segment_max_age_secs = 1")
         .start();
 
     let mut client = handle.client();
@@ -2867,6 +2883,14 @@ fn clickhouse_sink_end_to_end() {
         .extra_config("sink_max_batch_size    = 1000")
         .extra_config("sink_clickhouse_table  = \"weir_records\"")
         .extra_config("sink_clickhouse_column = \"payload\"")
+        // Idle-seal after 1s. Without this the test is not slow -- it is
+        // impossible: it asserts on delivery metrics scraped while the daemon is
+        // still running, but the default seal thresholds are
+        // wab_segment_max_bytes = 256 MiB and wab_segment_max_age_secs = 0
+        // (idle-seal off), and 100 short records are ~1.5 KB. The segment stays
+        // open, the drain never receives it, Sink::commit is never called, and
+        // the assertion reads "got 0" with a perfectly healthy sink.
+        .extra_config("wab_segment_max_age_secs = 1")
         .start();
 
     let mut client = handle.client();
@@ -3167,7 +3191,13 @@ fn s3_sink_an_unreachable_endpoint_strands_rather_than_dead_letters() {
     // A port nothing listens on: every PutObject fails at connect, which must
     // classify transient. Dead-lettering here would displace acked records over
     // a network blip.
-    let handle = s3_server(&prefix, "http://127.0.0.1:1").start();
+    let handle = s3_server(&prefix, "http://127.0.0.1:1")
+        // Same reason as the SQL sink tests: without idle-seal the segment never
+        // reaches the drain, and "zero dead-lettered" is then trivially true --
+        // this test passed for that reason before, and would have kept passing
+        // with the classification rules completely broken.
+        .extra_config("wab_segment_max_age_secs = 1")
+        .start();
     let mut client = handle.client();
     for i in 0..10 {
         client
@@ -3178,15 +3208,35 @@ fn s3_sink_an_unreachable_endpoint_strands_rather_than_dead_letters() {
     thread::sleep(Duration::from_secs(3));
 
     let body = handle.scrape_metrics();
-    let dead = parse_metric(&body, "weir_dead_letter_records_total");
-    assert_eq!(
-        dead,
-        0,
-        "an unreachable endpoint must strand, never dead-letter:\n{}",
+    let excerpt = || {
         body.lines()
-            .filter(|l| l.starts_with("weir_dead_letter") || l.starts_with("weir_sink_"))
+            .filter(|l| {
+                l.starts_with("weir_dead_letter")
+                    || l.starts_with("weir_sink_")
+                    || l.starts_with("weir_drain")
+            })
             .collect::<Vec<_>>()
             .join("\n")
+    };
+
+    // Non-vacuity first: prove the drain actually tried. Without this the
+    // dead-letter assertion below is satisfied by a sink that was never called,
+    // which is exactly how this test passed before the seal knob was set.
+    assert!(
+        parse_metric(&body, "weir_sink_commit_duration_seconds_count") > 0,
+        "the drain never attempted a commit, so this test asserts nothing:\n{}",
+        excerpt()
+    );
+    assert!(
+        parse_metric(&body, "weir_drain_segments_stranded_total") > 0,
+        "the segment must strand:\n{}",
+        excerpt()
+    );
+    assert_eq!(
+        parse_metric(&body, "weir_dead_letter_records_total"),
+        0,
+        "an unreachable endpoint must strand, never dead-letter:\n{}",
+        excerpt()
     );
     handle.shutdown();
 }

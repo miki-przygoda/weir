@@ -7,7 +7,16 @@
 # WEIR_TEST_POSTGRES_URL, runs the two `#[ignore]`-marked
 # `*_sink_end_to_end` tests, then tears down the stack on exit.
 #
-# Exit code: 0 = both sink tests passed, non-zero = something failed.
+# Exit code: 0 = every sink test passed, non-zero = something failed.
+#
+# NOTE: nothing in .github/workflows/ci.yml runs this. These tests are
+# `#[ignore]`-marked and invoked only from here, so they are only ever exercised
+# when someone runs this script by hand. That is how all three SQL sink tests
+# came to be silently broken for an unknown period: they asserted on delivery
+# metrics scraped while the daemon was still running, which the default seal
+# thresholds make impossible, and nothing was watching. If you are adding a sink
+# test, either run this before merging or make the case for a CI job with
+# service containers.
 #
 # Usage:
 #   bash deploy/run-sink-integration-tests.sh           # debug build (fast)
