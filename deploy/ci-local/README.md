@@ -92,10 +92,18 @@ vanishes until the process ends. Use `PYTHONUNBUFFERED=1` or `docker run -it`.
 |---|---|
 | `monitoring` | Needs `docker compose` inside the container. Run it on the host instead: `deploy/monitoring/smoke-test.sh --teardown` |
 | `build` | Cross-compiles to macOS and `windows-msvc`, which need those SDKs. The Linux targets build fine locally; the other three only really prove out on GitHub's runners. |
+| `windows` | Builds the mTLS client and checks the published libraries for `x86_64-pc-windows-msvc`, which needs the MSVC toolchain. Both steps compile happily on Linux and macOS, so running it locally reports green while proving nothing about Windows. |
 
 List them explicitly in whatever you build. A job missing from both the run set
 and the "cannot run" list is a silent gap — the exact failure this whole note is
 about.
+
+The `windows` row is the worked example: 2.0.5 dropped the Windows `weir-server`
+target and moved the mTLS-client guarantee out of `build` into a job of its own.
+The new job inherited no "cannot run" entry, so a local runner listed it as
+runnable and it passed — on the wrong operating system. **When a CI job is split
+or renamed, re-check this table**; the gap opens at the moment the workflow
+changes, not when the job is written.
 
 ## Why the implementation is not committed
 

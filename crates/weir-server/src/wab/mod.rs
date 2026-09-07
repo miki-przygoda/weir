@@ -408,7 +408,16 @@ pub(crate) fn scan_unconfirmed_sealed(
                 }
                 Ok(false) => unconfirmed.push(sealed),
                 Err(e) => {
-                    // check_confirmed quarantined the segment; skip it.
+                    // Skipping is safe here ONLY because every `Err` arm in
+                    // check_confirmed runs quarantine_and_count on the segment
+                    // first, so this log is true and the bytes are preserved for
+                    // an operator. That invariant is load-bearing: an I/O error
+                    // reading the sidecar used to propagate from *before* any
+                    // quarantine, which made this line claim a quarantine that
+                    // had not happened AND dropped acked records from the replay
+                    // pass. That path now returns Ok(false) and replays instead.
+                    // If you add an `Err` return to check_confirmed, quarantine
+                    // before it or this skip becomes silent non-delivery.
                     warn!(error = %e, "skipping quarantined segment");
                 }
             }

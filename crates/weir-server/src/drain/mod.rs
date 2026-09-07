@@ -395,10 +395,26 @@ fn probe_and_resume_stranded<S: Sink>(
     in_flight: Option<&Path>,
 ) -> bool {
     let health = probe_health(rt, sink, config.health_probe_timeout);
-    let now_ok = matches!(health, SinkHealth::Healthy);
+    // Deliverable, not perfect. `Degraded` means "reachable but not fully
+    // healthy" — the HTTP probe returns it for any 4xx outside 401/403/405/501,
+    // which includes 404, what a method-routed framework answers for HEAD on a
+    // POST-only ingest path (`sink/http.rs:645`). Commits over such a sink
+    // succeed; only the probe 4xxes. Requiring `Healthy` here made Degraded a
+    // STICKIER failure than Down — a sink that went down and came back healthy
+    // un-stranded its backlog, while one that came back degraded never did, for
+    // the life of the process. Only `Down` means "do not bother".
+    let now_ok = !matches!(health, SinkHealth::Down(_));
     set_sink_health(metrics, health);
 
-    if now_ok && !prev_health_ok {
+    // Recovered, or idle. The edge alone is not enough: a segment strands after
+    // `sink_max_retries` transient COMMIT failures, which need not change what
+    // the PROBE answers, so a sink that holds one health state across the whole
+    // episode strands a segment with no edge on either side of it. An idle drain
+    // is precisely when such a segment is invisible and when a directory walk
+    // costs nothing, so it rescans unconditionally. The edge stays as the cost
+    // control for the busy case: with `pending` non-empty the scan is skipped,
+    // and the segments in it are about to be processed anyway.
+    if now_ok && (!prev_health_ok || pending.is_empty()) {
         // `None` shard_count: skip the beyond-configured-count advisory — that's
         // a startup-replay concern, not a recovery one.
         match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None, metrics) {
@@ -3296,6 +3312,114 @@ mod tests {
         m.sink_health
             .get_or_create(&crate::metrics::SinkHealthLabel { state })
             .get()
+    }
+
+    /// A sink that comes back DEGRADED rather than Healthy must still un-strand
+    /// its backlog. `Degraded` means "reachable but not fully healthy" — the
+    /// HTTP probe returns it for any 4xx that is not 401/403/405/501, which
+    /// includes **404**, what a method-routed framework answers for HEAD on a
+    /// POST-only ingest path (`sink/http.rs:645`, pinned by
+    /// `health_treats_other_4xx_as_degraded_and_5xx_as_down`). Commits over that
+    /// sink succeed; only the probe 4xxes.
+    ///
+    /// Treating Degraded as not-recovered makes it a *stickier* failure than
+    /// Down: a sink that goes Down and returns Healthy resumes, while one that
+    /// returns Degraded never does, for the life of the process. That inversion
+    /// is the defect.
+    #[test]
+    fn stranded_segments_resume_when_the_sink_comes_back_degraded() {
+        let dir = tmp_dir("edge_degraded");
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let mut pending: VecDeque<PathBuf> = VecDeque::new();
+
+        let sink = MockSink::with_health_script([
+            SinkHealth::Down("offline".into()),
+            SinkHealth::Degraded("HEAD returned 404 Not Found".into()),
+        ]);
+
+        let after1 =
+            probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, true, None);
+        assert!(!after1, "Down probe must return now_ok = false");
+
+        let after2 =
+            probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, after1, None);
+
+        assert!(
+            after2,
+            "a Degraded sink is reachable and delivering; it must count as recovered"
+        );
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            1,
+            "a sink that returns Degraded must re-queue its stranded segments"
+        );
+        assert_eq!(pending.len(), 1, "exactly one segment re-queued");
+        assert_eq!(
+            pending[0], sealed,
+            "the re-queued segment is the stranded one"
+        );
+    }
+
+    /// An edge cannot fire if the health never changes. A segment strands after
+    /// `sink_max_retries` transient commit failures, which does not require the
+    /// *probe* to have changed its answer — a sink whose HEAD 404s throughout
+    /// (Degraded) while its POSTs fail transiently and then recover strands a
+    /// segment with no edge on either side of it. The same is true of a Healthy
+    /// sink with flaky commits.
+    ///
+    /// So when the drain has nothing queued, the rescan must not depend on an
+    /// edge. Idle is exactly when a stranded segment is invisible and exactly
+    /// when a directory walk is free; the edge remains the cost control for the
+    /// busy case, where `pending` is non-empty and the scan is skipped.
+    #[test]
+    fn an_idle_drain_rescans_without_a_health_edge() {
+        let dir = tmp_dir("idle_rescan");
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let mut pending: VecDeque<PathBuf> = VecDeque::new();
+
+        // Health never changes: Degraded throughout, so there is no edge at all.
+        let sink = MockSink::with_health_script([
+            SinkHealth::Degraded("HEAD returned 404 Not Found".into()),
+            SinkHealth::Degraded("HEAD returned 404 Not Found".into()),
+        ]);
+
+        // prev_health_ok stays true across both polls — never a down→up edge.
+        let after1 =
+            probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, true, None);
+        assert!(after1, "a Degraded sink is deliverable");
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            1,
+            "an idle drain must find the stranded segment without a health edge"
+        );
+        assert_eq!(pending.len(), 1, "exactly one segment re-queued");
+        assert_eq!(
+            pending[0], sealed,
+            "the re-queued segment is the stranded one"
+        );
+
+        // Second poll: pending is no longer empty, so the scan is skipped and
+        // nothing is queued twice.
+        probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, after1, None);
+        assert_eq!(
+            pending.len(),
+            1,
+            "a busy drain skips the rescan; no segment is queued twice"
+        );
     }
 
     /// The recovery edge (`now_ok && !prev_health_ok`) must fire EXACTLY once on
