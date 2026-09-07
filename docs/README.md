@@ -51,6 +51,19 @@ Documentation for running weir in production.
 
 ---
 
+## Sinks
+
+Per-sink guides. Every option is also in the
+[configuration reference](operations/configuration.md); these pages cover the
+parts that need more than a table.
+
+- [**sinks/s3.md**](sinks/s3.md) — S3-API object storage (AWS S3, MinIO,
+  Cloudflare R2, Backblaze B2, Ceph). The object key scheme and why it is shaped
+  that way, minimum IAM policy, object sizing, failure handling, provider notes,
+  and how to point Athena or DuckDB at the bucket.
+
+---
+
 ## Protocol
 
 For implementing a client in a non-Rust language, or understanding

@@ -913,10 +913,11 @@ if shorter), independent of the long `commit` backstop.
 
 ### Sink selection
 
-Weir ships with five built-in sinks. The **default build** compiles in `noop`,
-`http`, `mysql`, and `postgres`; `clickhouse` is compiled in only when you build
-with the opt-in `clickhouse-sink` Cargo feature (a default binary rejects
-`sink_type = "clickhouse"` with a clear "built without it" error):
+Weir ships with six built-in sinks. The **default build** compiles in `noop`,
+`http`, `mysql`, and `postgres`; `clickhouse` and `s3` are compiled in only when
+you build with their opt-in Cargo features (`clickhouse-sink`, `s3-sink`). A
+default binary rejects `sink_type = "clickhouse"` or `"s3"` with a clear "built
+without it" error rather than an unknown-value one:
 
 | `sink_type` | What it does | When to use |
 |------------|--------------|------|
@@ -925,10 +926,11 @@ with the opt-in `clickhouse-sink` Cargo feature (a default binary rejects
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 | `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
 | `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` (**requires the `clickhouse-sink` build feature**) | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
+| `"s3"` | writes each batch as one object to S3-compatible storage — AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph (**requires the `s3-sink` build feature**) | durable archive that Athena/DuckDB/Spark read directly. The object key is replay-stable, so the downstream needs **no** dedup support at all ([full guide](../sinks/s3.md)) |
 
 #### `sink_type`
 
-- **Type**: string (`"noop"`, `"http"`, `"mysql"`, `"postgres"`, or `"clickhouse"`)
+- **Type**: string (`"noop"`, `"http"`, `"mysql"`, `"postgres"`, `"clickhouse"`, or `"s3"`)
 - **Default**: `"noop"`
 - **CLI**: `--sink-type <value>`
 - **Env**: `WEIR_SINK_TYPE`
@@ -1590,6 +1592,135 @@ once resolved. `trace` is verbose enough to materially impact
 throughput; don't leave it on in production.
 
 ---
+
+### Sink: S3 (`sink_type = "s3"`)
+
+Requires the opt-in `s3-sink` feature. The full guide, including the object key
+scheme, IAM policy, provider notes and how to point Athena or DuckDB at the
+bucket, is in [the S3 sink page](../sinks/s3.md); this section is the key
+reference.
+
+These are **file/env only** — there are no CLI flags for them.
+
+#### `sink_s3_bucket`
+
+- **Type**: string
+- **Default**: *(none — required when `sink_type = "s3"`)*
+- **Env**: `WEIR_SINK_S3_BUCKET`
+- **TOML**: `sink_s3_bucket`
+
+Target bucket. Startup fails with a named error if unset.
+
+#### `sink_s3_region`
+
+- **Type**: string
+- **Default**: `us-east-1`
+- **Env**: `WEIR_SINK_S3_REGION`
+
+SigV4 signing region, and the AWS endpoint's region when `sink_s3_endpoint` is
+unset. MinIO ignores it but still signs with it, so it must match on both sides.
+
+#### `sink_s3_endpoint`
+
+- **Type**: string
+- **Default**: *(empty — the AWS regional endpoint)*
+- **Env**: `WEIR_SINK_S3_ENDPOINT`
+
+Scheme and host, optionally with a port. **No path component** — startup rejects
+one, because `Endpoint::resolve` treats everything after `://` as the authority,
+so a path would be signed and sent differently and every request would fail
+`SignatureDoesNotMatch` with nothing naming the cause.
+
+#### `sink_s3_force_path_style`
+
+- **Type**: bool
+- **Default**: `false`
+- **Env**: `WEIR_SINK_S3_FORCE_PATH_STYLE`
+
+Puts the bucket in the path (`host/bucket/key`) rather than the hostname
+(`bucket.host/key`). Set `true` for MinIO and most self-hosted gateways.
+
+#### `sink_s3_prefix`
+
+- **Type**: string
+- **Default**: *(empty)*
+- **Env**: `WEIR_SINK_S3_PREFIX`
+
+Key prefix, no leading `/`. Rejected at startup if it contains `.` or `..`
+segments, an interior `//`, `#`, `?`, a backslash, or a control character — a
+URL parser rewrites or truncates all of those, which would make weir sign one
+key and write another.
+
+#### `sink_s3_partition`
+
+- **Type**: string
+- **Default**: `dt=%Y-%m-%d/hour=%H`
+- **Env**: `WEIR_SINK_S3_PARTITION`
+
+Hive-style partition template. Only `%Y`, `%m`, `%d` and `%H` are recognised;
+anything else is literal, and an unknown `%X` is rejected at startup rather than
+passed through. `""` disables partitioning.
+
+**Always rendered in UTC**, and not configurable. The value comes from the WAB
+segment header, so it survives a replay; rendering it in local time would make
+the key depend on the host's `TZ`, and a restart across a DST change would
+duplicate objects.
+
+#### `sink_s3_framing`
+
+- **Type**: string — `ndjson` | `length-prefixed`
+- **Default**: `ndjson`
+- **Env**: `WEIR_SINK_S3_FRAMING`
+
+`ndjson` writes one record per line, which every common query engine reads
+directly. A record containing `\n` or `\r` cannot be represented that way and is
+**dead-lettered** rather than written — framing it anyway would split one record
+into two lines downstream. `length-prefixed` (a `u64` LE length before each
+record) is binary-safe and dead-letters nothing on content, but needs a
+weir-aware reader; those objects use the `.weirbin` extension.
+
+#### `sink_s3_compression`
+
+- **Type**: string — `none` | `zstd` | `gzip`
+- **Default**: `zstd`
+- **Env**: `WEIR_SINK_S3_COMPRESSION`
+
+Applied to the whole framed body, so an object is a compressed NDJSON file —
+what query engines expect. Athena and Spark read both zstd and gzip.
+
+#### `sink_s3_access_key_id` / `sink_s3_secret_access_key`
+
+- **Type**: string
+- **Default**: *(empty — use the environment, IRSA, or an instance role)*
+- **Env**: `WEIR_SINK_S3_ACCESS_KEY_ID`, `WEIR_SINK_S3_SECRET_ACCESS_KEY`
+
+Static credentials. **Set both or neither** — startup rejects one without the
+other, because a lone key id would silently fall through to the environment or
+an instance role and authenticate as something other than what the config names.
+The secret is redacted in every diagnostic that formats the config.
+
+#### `sink_s3_storage_class` / `sink_s3_sse` / `sink_s3_sse_kms_key_id`
+
+- **Type**: string
+- **Default**: *(empty — the header is omitted)*
+- **Env**: `WEIR_SINK_S3_STORAGE_CLASS`, `WEIR_SINK_S3_SSE`, `WEIR_SINK_S3_SSE_KMS_KEY_ID`
+
+Become `x-amz-storage-class`, `x-amz-server-side-encryption` and
+`x-amz-server-side-encryption-aws-kms-key-id`. A rejected value here produces a
+`400` that weir treats as **transient**, so a typo strands the backlog rather
+than dead-lettering it.
+
+> **Sizing: raise `sink_max_batch_size` for this sink.** One object per commit
+> batch means the default of 100 produces roughly 50 KB objects for a 500-byte
+> record — hundreds of thousands per hour for a busy producer, expensive to PUT
+> and pathological for every query engine. Use `10000`. The daemon warns at
+> startup below 1000.
+>
+> **And then never change it.** For S3 the batch boundary determines the object
+> *key*, so changing `sink_max_batch_size` after records have been written makes
+> replayed batches land under new keys and duplicate. This is stronger than the
+> stability rule the other dedup-by-batch sinks carry: constant for the life of
+> the bucket, not merely across a restart.
 
 ## Example minimal config
 

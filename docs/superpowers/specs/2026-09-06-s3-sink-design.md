@@ -170,9 +170,21 @@ segment regardless of resume state.
 So the key is:
 
 ```
-{prefix}/dt=2026-09-06/hour=14/{first_record_id_hex}-{count}.ndjson.zst
-         └── segment created_at ──┘ └─ WAB coordinate ─┘ └ batch size ┘
+{prefix}/dt=2026-09-06/hour=14/{created_at:016x}-{first_record_id_hex}-{count}.ndjson.zst
+         └── segment created_at ──┘└ same, full ns ┘└─ WAB coordinate ─┘ └ batch size ┘
 ```
+
+**The full-nanosecond `created_at` in the *name* was added during
+implementation**, after the MinIO integration test caught a collision the unit
+tests could not. A `RecordId` is `sha256(segment_name ++ index ++ payload)`, and
+segment names restart at `seg_00000001` in every fresh WAB directory — so two
+daemon runs on *different* WAB dirs produce identical `RecordId`s for their
+first batches. A pod redeployed without a PVC, a wiped WAB, or a fresh container
+writing to the same bucket and prefix within one partition hour would silently
+overwrite the previous deployment's objects. That is the ephemeral-volume case
+`phase4-k8s-deployment.md` warned about, arriving through the key scheme rather
+than through fsync. `created_at` distinguishes segment *instances* where the
+name cannot, and being on disk it stays replay-invariant.
 
 The record count is in the name because the start coordinate alone still
 collides when `sink_max_batch_size` changes: a resized batch beginning at the

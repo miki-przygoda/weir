@@ -17,7 +17,7 @@ replays after a crash.
 **Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
 records at the durable tier, **none lost**
 ([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md)) ·
-5 built-in sinks (4 in a default build; `clickhouse` opt-in) ·
+6 built-in sinks (4 in a default build; `clickhouse` and `s3` opt-in) ·
 wire format + Rust API under SemVer
 
 *Latency and throughput figures are deliberately not quoted here. Every published
@@ -104,6 +104,7 @@ entry point. The structure:
 |--------------------|---------------------------------------------------------------------------|
 | **Getting started**| [install](docs/getting-started/install.md), [quickstart](docs/getting-started/quickstart.md) |
 | **Operations**     | [configuration reference](docs/operations/configuration.md) (every option, default, range, tuning notes), [TCP + mutual TLS](docs/operations/tcp-mtls.md), [monitoring](docs/monitoring.md) (Prometheus metrics, alerts, Grafana) |
+| **Sinks**          | [S3 / object storage](docs/sinks/s3.md) (key scheme, IAM policy, provider notes, reading the bucket from Athena or DuckDB) |
 | **Protocol**       | [wire format](docs/wire_protocol.md), [WAB format](docs/wab_format.md), [conformance vectors](docs/conformance.md) (language-neutral test vectors for non-Rust clients) |
 | **Architecture**   | [internals](docs/architecture.md), [benchmarks](docs/benchmarks.md)       |
 | **Security**       | [threat model](docs/security/threat-model.md), [socket-bind hardening](docs/security/socket-bind.md), [container hardening](docs/security/container.md) — reporting policy at [SECURITY.md](SECURITY.md) |
@@ -186,6 +187,7 @@ not benchmarks.*
 | `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
 | `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and the `windows` CI job compiles `weir-client --features tls` there on every push. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`. There is no Windows *server* build: it had no ingest path, and 2.0.5 dropped it. |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
+| `weir-sink-s3` | lib | The S3-API object-storage sink (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph), behind `weir-server`'s opt-in `s3-sink` feature. The first weir sink built **outside** the daemon against `weir-sink-sdk` alone — so it is also the proof that the SDK is a contract a third party can build against. See [docs/sinks/s3.md](docs/sinks/s3.md). |
 | `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
 
