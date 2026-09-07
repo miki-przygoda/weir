@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# deploy/run-sink-integration-tests.sh — exercise the SQL sinks against
-# real MySQL and PostgreSQL backends.
+# deploy/run-sink-integration-tests.sh — exercise every sink against a real
+# backend: MySQL, PostgreSQL, ClickHouse, and MinIO for the S3 sink.
 #
 # Brings up the docker-compose stack at deploy/docker/test/, waits for
-# both services' healthchecks to pass, exports WEIR_TEST_MYSQL_URL and
-# WEIR_TEST_POSTGRES_URL, runs the two `#[ignore]`-marked
-# `*_sink_end_to_end` tests, then tears down the stack on exit.
+# every service's healthcheck to pass, exports the WEIR_TEST_* endpoints and
+# the S3 credentials, runs the `#[ignore]`-marked sink tests, then tears down
+# the stack on exit.
 #
 # Exit code: 0 = every sink test passed, non-zero = something failed.
 #
-# NOTE: nothing in .github/workflows/ci.yml runs this. These tests are
-# `#[ignore]`-marked and invoked only from here, so they are only ever exercised
-# when someone runs this script by hand. That is how all three SQL sink tests
-# came to be silently broken for an unknown period: they asserted on delivery
-# metrics scraped while the daemon was still running, which the default seal
-# thresholds make impossible, and nothing was watching. If you are adding a sink
-# test, either run this before merging or make the case for a CI job with
-# service containers.
+# CI runs this via the `sink-integration` job. It did not until 2.1.0, and the
+# cost of that was concrete: because these tests are `#[ignore]`-marked, the
+# `test` job's `--test system` skipped them and nothing else invoked them, so
+# all three SQL sink tests sat broken for an unknown period — asserting on a
+# segment seal the default thresholds make impossible — with no signal at all.
+# Keep the CI job and this script in step: the job runs exactly this file, so a
+# test added here is a test CI runs.
 #
 # Usage:
 #   bash deploy/run-sink-integration-tests.sh           # debug build (fast)
@@ -24,7 +23,8 @@
 #
 # Requirements:
 #   - Docker (or compatible runtime) with `docker compose` plugin.
-#   - Ports 33306 (mysql) and 55432 (postgres) available on 127.0.0.1.
+#   - These ports free on 127.0.0.1: 33306 (mysql), 55432 (postgres),
+#     18123 (clickhouse), 19000 (minio).
 
 set -euo pipefail
 
