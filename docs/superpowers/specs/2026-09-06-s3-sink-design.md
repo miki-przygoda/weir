@@ -572,10 +572,13 @@ least-privilege IAM setup would strand its backlog permanently.
 - `weir_sink_info{sink_type="s3"}` via the existing `as_str()`.
 
 Publish order becomes:
-`core → wab → sink-sdk → sink-s3 → rs → client → server → ctl`.
+`core → wab → sink-sdk → sink-s3 → client → rs → server → ctl`.
 
-`weir-rs` is in the list because it is a published facade with an optional
-`weir-sink-sdk` dependency, so it must follow `sink-sdk`. `weir-testkit` stays
+`weir-rs` is a published facade whose optional dependencies include
+`weir-client` as well as `weir-sink-sdk` and `weir-wab`, so it follows **all** of
+them — `client` included. An earlier draft of this section placed `rs` before
+`client`, which would have failed mid-publish with `weir-client 2.1.0` not found
+on crates.io, leaving a partially published release. `weir-testkit` stays
 `publish = false`. The workspace version bump to `2.1.0` and the
 `[workspace.dependencies]` pins must land in the **same commit** as the new
 crate: `weir-sink-s3` needs `weir-sink-sdk 2.1.0` for `segment_created_at`, and
