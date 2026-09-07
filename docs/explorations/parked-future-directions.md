@@ -11,6 +11,32 @@ nature (NFS/EFS make `fdatasync` 5–50× slower — degrading exactly what Phas
 optimized). A **Helm chart is a cheap 2–3 day add** when a user actually deploys
 weir on k8s. Kept for when there's real demand.
 
+## ~~Object storage / S3 sink~~ — SHIPPED
+
+Landed as the published crate `weir-sink-s3`, behind `weir-server`'s opt-in
+`s3-sink` feature. See [`docs/sinks/s3.md`](../sinks/s3.md).
+
+Two things worth not rediscovering:
+
+**The reusable half is the credential and signing layer, not the sink.**
+`sigv4.rs` and `creds.rs` are provider-agnostic AWS plumbing — hand-rolled to
+keep `aws-lc-sys` out of a workspace unified on `ring`, and pinned by 31 of
+AWS's own published vectors. A Kinesis, SQS or CloudWatch Logs sink is now
+mostly a request shape on top of them, which is what makes those cheap in a way
+they were not before.
+
+**The idempotency story turned out stronger than expected, but not for the
+reason the original entry assumed.** The note below on the dedup token said a
+content-addressed object key would make at-least-once "naturally idempotent".
+That is exactly half right and the wrong half is dangerous: a `DedupToken` is a
+pure content hash, so two batches of byte-identical records share one, and an S3
+key is last-write-wins — a content-named object is *destroyed* by the next
+identical batch, with no crash involved. The working key derives from the WAB
+coordinate (`RecordId`) plus the segment's `created_at`, both replay-invariant
+and both unique. The result is genuinely what the entry hoped for — no
+downstream dedup support required at all — but a content hash could not have
+delivered it.
+
 ## k8s-native sinks
 User idea: sinks that target Kubernetes-native systems (or weir deployed as a
 k8s-integrated buffer). Park until the sink ecosystem (`weir-sink-sdk`) exists and

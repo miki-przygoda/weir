@@ -500,6 +500,10 @@ pub struct SinkBatch {
     /// Parallel to `records` when present. `None` from [`SinkBatch::new`], so a
     /// batch built by a 1.x-era caller or a sink author's test is unchanged.
     record_ids: Option<Vec<RecordId>>,
+    /// Creation time of the owning WAB segment, unix nanoseconds. `None` from
+    /// every constructor except [`SinkBatch::with_segment_context`], which only
+    /// the drain calls.
+    segment_created_at: Option<i64>,
 }
 
 impl SinkBatch {
@@ -510,11 +514,21 @@ impl SinkBatch {
             records,
             dedup_token,
             record_ids: None,
+            segment_created_at: None,
         }
     }
 
     /// Builds a batch that also carries a [`RecordId`] per record, in the same
-    /// order. The drain uses this; [`SinkBatch::new`] remains the plain form.
+    /// order. [`SinkBatch::new`] remains the plain form.
+    ///
+    /// The drain no longer calls this — it uses
+    /// [`SinkBatch::with_segment_context`], which additionally carries the
+    /// owning segment's creation time. This constructor remains the right one
+    /// for a sink author's tests, and is not deprecated.
+    ///
+    /// Note for tests that compare batches: `SinkBatch` derives `PartialEq`, so
+    /// a batch from this constructor does **not** equal one from
+    /// `with_segment_context` even with identical records and ids.
     ///
     /// # Panics
     ///
@@ -537,7 +551,56 @@ impl SinkBatch {
             records,
             dedup_token,
             record_ids: Some(record_ids),
+            segment_created_at: None,
         }
+    }
+
+    /// Builds a batch carrying per-record ids **and** the owning segment's
+    /// creation time. The drain calls this; it is the constructor that lets a
+    /// sink derive a stable object key or partition path.
+    ///
+    /// `segment_created_at` is the WAB segment header's `created_at` field
+    /// (unix nanoseconds). Unlike wall-clock, it is written once and read back
+    /// unchanged after a crash-replay — so a sink may derive a partition path
+    /// from it and have the replayed batch land in the same place. Deriving one
+    /// from `SystemTime::now()` instead would place a replayed batch somewhere
+    /// new and duplicate it downstream.
+    ///
+    /// Note that this timestamp identifies the *segment*, not the batch: many
+    /// batches share one. A sink needing a unique per-batch name must use
+    /// [`SinkBatch::record_ids`], whose WAB coordinate is unique — a
+    /// [`DedupToken`] is **not** unique across batches carrying identical bytes.
+    ///
+    /// # Panics
+    ///
+    /// If `record_ids.len() != records.len()`, for the reason given on
+    /// [`SinkBatch::with_record_ids`].
+    #[must_use]
+    pub fn with_segment_context(
+        records: Vec<Payload>,
+        dedup_token: DedupToken,
+        record_ids: Vec<RecordId>,
+        segment_created_at: i64,
+    ) -> Self {
+        assert_eq!(
+            records.len(),
+            record_ids.len(),
+            "with_segment_context: record_ids must be parallel to records"
+        );
+        Self {
+            records,
+            dedup_token,
+            record_ids: Some(record_ids),
+            segment_created_at: Some(segment_created_at),
+        }
+    }
+
+    /// Creation time of the owning WAB segment in unix nanoseconds, when the
+    /// batch came from the drain. See [`SinkBatch::with_segment_context`] for
+    /// why this and not wall-clock.
+    #[must_use]
+    pub fn segment_created_at(&self) -> Option<i64> {
+        self.segment_created_at
     }
 
     /// The per-record ids, if the batch carries them, in record order.
@@ -598,6 +661,7 @@ impl From<Vec<Payload>> for SinkBatch {
             records,
             dedup_token,
             record_ids: None,
+            segment_created_at: None,
         }
     }
 }
@@ -986,5 +1050,63 @@ mod tests {
         let batch = SinkBatch::new(vec![], DedupToken::for_payloads(&[] as &[Payload]));
         assert!(batch.is_empty());
         assert_eq!(batch.len(), 0);
+    }
+
+    // ── segment_created_at (2.1.0) ──────────────────────────────────────────
+
+    #[test]
+    fn segment_created_at_is_none_from_the_plain_constructors() {
+        // A 1.x-era caller, or a sink author's test, must be unaffected by the
+        // field's existence.
+        let token = DedupToken::for_payloads(&[p(b"a")]);
+        assert_eq!(
+            SinkBatch::new(vec![p(b"a")], token).segment_created_at(),
+            None
+        );
+        assert_eq!(SinkBatch::from(vec![p(b"a")]).segment_created_at(), None);
+        assert_eq!(
+            SinkBatch::with_record_ids(
+                vec![p(b"a")],
+                token,
+                vec![RecordId::for_record(
+                    "shard_00/seg_00000001.wab",
+                    1,
+                    &p(b"a")
+                )],
+            )
+            .segment_created_at(),
+            None
+        );
+    }
+
+    #[test]
+    fn segment_created_at_round_trips_through_with_segment_context() {
+        let payload = p(b"a");
+        let batch = SinkBatch::with_segment_context(
+            vec![payload.clone()],
+            DedupToken::for_payloads(std::slice::from_ref(&payload)),
+            vec![RecordId::for_record(
+                "shard_00/seg_00000001.wab",
+                1,
+                &payload,
+            )],
+            1_788_704_730_000_000_000,
+        );
+        assert_eq!(batch.segment_created_at(), Some(1_788_704_730_000_000_000));
+        assert_eq!(batch.record_ids().map(<[RecordId]>::len), Some(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "with_segment_context: record_ids must be parallel")]
+    fn with_segment_context_keeps_the_length_mismatch_assertion() {
+        // The assertion is why with_record_ids exists; a new constructor that
+        // dropped it would silently pair records with other records' ids.
+        let a = p(b"a");
+        let _ = SinkBatch::with_segment_context(
+            vec![a.clone(), p(b"b")],
+            DedupToken::for_payloads(std::slice::from_ref(&a)),
+            vec![RecordId::for_record("s", 1, &a)],
+            0,
+        );
     }
 }

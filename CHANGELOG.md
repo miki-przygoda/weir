@@ -15,12 +15,80 @@ protocol** below.
 
 ## [Unreleased]
 
+Two independent pieces: the S3 sink (a new published crate and a minor version
+bump), and the second-sweep fixes below.
+
+### Added
+
+- **`weir-sink-s3` — an S3-API object-storage sink**, behind `weir-server`'s
+  opt-in `s3-sink` feature. Targets the S3 *API* rather than AWS specifically,
+  so MinIO, Cloudflare R2, Backblaze B2 and Ceph work on the same code path with
+  a configurable endpoint. Each commit batch becomes one object, NDJSON-framed
+  and zstd-compressed by default, so Athena, DuckDB, Spark and Glue read the
+  bucket with no weir-specific tooling. Full guide: [`docs/sinks/s3.md`](docs/sinks/s3.md).
+
+  It is also weir's **first sink built outside the daemon**, against
+  `weir-sink-sdk` alone and under the same constraints a third party would face
+  — which is the first real test of the claim that the SDK is an implementable
+  contract. One cost surfaced immediately and is recorded in the crate: the
+  daemon's log-hygiene helpers are `pub(crate)`, so the crate carries its own
+  copies rather than weir publishing an API it never intended.
+
+  **The object key is replay-stable and collision-free, so the downstream needs
+  no dedup support at all** — no `ON CONFLICT`, no `Idempotency-Key`, no
+  engine-side dedup window. That is true of no other weir sink. It is built from
+  the WAB segment header's `created_at` (for both the Hive partition and a
+  segment-instance discriminator) plus the batch's first `RecordId` and its
+  record count. Every component is read from disk or derived from a WAB
+  coordinate, so none of them moves under a crash-replay.
+
+  Two things this deliberately does **not** use, each because it silently loses
+  or duplicates data:
+
+  - **Wall-clock for the partition.** A replayed batch would land under a new
+    partition path and appear twice in every query.
+  - **The batch's `DedupToken` for the object name.** A `DedupToken` is a pure
+    content hash, so two batches of byte-identical records share one — and an S3
+    key is last-write-wins, so the second batch would *destroy* the first. A
+    heartbeat producer triggers that within one partition hour with no crash
+    involved. `RecordId` mixes the WAB coordinate in, which is exactly the
+    uniqueness a content hash cannot carry.
+
+  SigV4 is hand-rolled rather than taken from `aws-sdk-s3`, which adds 68 crates
+  and pulls `aws-lc-sys` into a workspace that deliberately unified on `ring`.
+  Correctness is bought back with AWS's own published vectors: 31 of the 38
+  cases run and all 31 pass, the seven excluded being the `*-normalized` path
+  cases an S3 signer must not satisfy. CI gains a guard that the tree stays
+  ring-only.
+
+  Credentials resolve from static config, the environment, web identity (IRSA),
+  then IMDSv2. IMDSv1 is deliberately absent — it is the unauthenticated variant
+  reachable through any SSRF bug in a co-located process. ECS task roles and EKS
+  Pod Identity are detected and **refused** rather than ignored, because
+  silently continuing would authenticate as the *node* role instead of the pod's.
+
+- **`SinkBatch::with_segment_context` and `SinkBatch::segment_created_at`** in
+  `weir-sink-sdk`. The drain now supplies the owning WAB segment's creation time
+  alongside the records, dedup token and record ids. Additive: fields were
+  already private, every existing constructor still exists unchanged, and a
+  2.0-era third-party sink compiles untouched.
+
+  **Note for sink authors comparing batches in tests:** `SinkBatch` derives
+  `PartialEq`, so a batch from `new()` or `with_record_ids()` no longer compares
+  equal to one from `with_segment_context()` carrying the same records. The
+  drain used `with_record_ids` up to 2.0.5, so a test that reconstructed the
+  drain's expected batch used exactly that constructor.
+
+  A sink deriving object names or partition paths from `SystemTime::now()`
+  should switch to this value. It is the only timestamp on the batch that
+  survives a replay.
+
+### Fixed
+
 Findings from a second exploration sweep over the published 2.0.5 tree. The
 three fixes below are one shape: a safety mechanism that failed silently *in the
 safe-looking direction* — the cap reporting an empty WAB, the probe reporting a
 recovered sink, the replay pass reporting a quarantine that never happened.
-
-### Fixed
 
 - **A failed WAB scan reported an empty WAB and lifted the `wab_max_bytes` cap.**
   `compute_wab_bytes_on_disk` answered `0` when it could not read the WAB

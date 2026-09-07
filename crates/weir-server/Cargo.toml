@@ -8,6 +8,10 @@ mysql-sink = ["dep:mysql_async", "_sql-sink"]
 postgres-sink = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:rustls", "_sql-sink"]
 # ClickHouse sink: HTTP RowBinary batch inserts with a content-derived dedup token.
 clickhouse-sink = ["dep:reqwest", "dep:sha2", "_sql-sink"]
+# S3-API object-storage sink (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph).
+# Opt-in like clickhouse-sink: a new target should not grow the default binary's
+# dependency tree for users who did not ask for it.
+s3-sink = ["dep:weir-sink-s3"]
 # Internal: the shared sql_common module used by mysql-sink + postgres-sink + clickhouse-sink.
 _sql-sink = []
 # Per-stage latency instrumentation for the load suite. Off by default and
@@ -56,6 +60,10 @@ weir-wab = { workspace = true }
 # parties can write sinks without depending on the daemon; the built-in sinks
 # (http/mysql/postgres/clickhouse/noop) implement these traits.
 weir-sink-sdk = { workspace = true }
+# S3 sink, feature-gated. Lives in its own published crate rather than in
+# src/sink/: it is the first proof that weir-sink-sdk is a contract a third
+# party can build against, written under the same constraints one would face.
+weir-sink-s3 = { workspace = true, optional = true }
 crc32fast = "1.4"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = [

@@ -81,6 +81,8 @@ pub enum SinkType {
     Postgres,
     #[cfg(feature = "clickhouse-sink")]
     ClickHouse,
+    #[cfg(feature = "s3-sink")]
+    S3,
 }
 
 impl SinkType {
@@ -97,6 +99,8 @@ impl SinkType {
             SinkType::Postgres => "postgres",
             #[cfg(feature = "clickhouse-sink")]
             SinkType::ClickHouse => "clickhouse",
+            #[cfg(feature = "s3-sink")]
+            SinkType::S3 => "s3",
         }
     }
 
@@ -127,6 +131,15 @@ impl SinkType {
             "postgres" => Err(ConfigError::InvalidValue {
                 field: "sink_type",
                 reason: "sink_type 'postgres' requires the 'postgres-sink' feature; \
+                         this binary was built without it"
+                    .to_string(),
+            }),
+            #[cfg(feature = "s3-sink")]
+            "s3" => Ok(SinkType::S3),
+            #[cfg(not(feature = "s3-sink"))]
+            "s3" => Err(ConfigError::InvalidValue {
+                field: "sink_type",
+                reason: "sink_type 's3' requires the 's3-sink' feature; \
                          this binary was built without it"
                     .to_string(),
             }),
@@ -237,6 +250,20 @@ pub(crate) struct PartialConfig {
     pub sink_clickhouse_table: Option<String>,
     #[cfg(feature = "clickhouse-sink")]
     pub sink_clickhouse_column: Option<String>,
+
+    pub sink_s3_bucket: Option<String>,
+    pub sink_s3_region: Option<String>,
+    pub sink_s3_endpoint: Option<String>,
+    pub sink_s3_force_path_style: Option<bool>,
+    pub sink_s3_prefix: Option<String>,
+    pub sink_s3_partition: Option<String>,
+    pub sink_s3_framing: Option<String>,
+    pub sink_s3_compression: Option<String>,
+    pub sink_s3_access_key_id: Option<String>,
+    pub sink_s3_secret_access_key: Option<String>,
+    pub sink_s3_storage_class: Option<String>,
+    pub sink_s3_sse: Option<String>,
+    pub sink_s3_sse_kms_key_id: Option<String>,
     pub dead_letter_max_bytes: Option<u64>,
     pub dead_letter_check_interval_secs: Option<u64>,
     pub health_poll_interval_secs: Option<u64>,
@@ -275,6 +302,32 @@ impl fmt::Debug for RedactedUrl {
         match &self.0 {
             Some(url) => write!(f, "Some({:?})", crate::sink::redact_url_password(url)),
             None => f.write_str("None"),
+        }
+    }
+}
+
+/// A secret that never appears in `Debug` output.
+///
+/// [`RedactedUrl`] is not a substitute: it scrubs the userinfo and credential
+/// query parameters of a *URL*, and would print a bare secret access key
+/// verbatim. `Config` derives `Debug`, so a plain `String` here would put the
+/// key in any diagnostic that formats the config.
+#[derive(Clone, Default)]
+pub struct RedactedSecret(pub String);
+
+impl std::ops::Deref for RedactedSecret {
+    type Target = String;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            f.write_str("\"\"")
+        } else {
+            f.write_str("\"<redacted>\"")
         }
     }
 }
@@ -436,6 +489,46 @@ pub struct Config {
     pub sink_clickhouse_table: String,
     #[cfg(feature = "clickhouse-sink")]
     pub sink_clickhouse_column: String,
+
+    /// Target bucket. Required when `sink_type = "s3"`.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_bucket: String,
+    /// Signing region.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_region: String,
+    /// Scheme + authority. Empty means the AWS regional endpoint.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_endpoint: String,
+    /// Bucket in the path rather than the hostname. Required by MinIO.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_force_path_style: bool,
+    /// Key prefix, no leading `/`.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_prefix: String,
+    /// Partition template: `%Y`, `%m`, `%d`, `%H`, rendered in UTC.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_partition: String,
+    /// `ndjson` or `length-prefixed`.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_framing: String,
+    /// `none`, `zstd` or `gzip`.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_compression: String,
+    /// Static access key id; prefer the environment, IRSA or an instance role.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_access_key_id: String,
+    /// Static secret access key.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_secret_access_key: RedactedSecret,
+    /// `x-amz-storage-class`, empty to omit.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_storage_class: String,
+    /// `x-amz-server-side-encryption`, empty to omit.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_sse: String,
+    /// `x-amz-server-side-encryption-aws-kms-key-id`, empty to omit.
+    #[cfg_attr(not(feature = "s3-sink"), allow(dead_code))]
+    pub sink_s3_sse_kms_key_id: String,
     pub dead_letter_max_bytes: u64,
     pub dead_letter_check_interval_secs: u64,
     /// How often (seconds) the drain re-probes sink health and rescans for
@@ -799,6 +892,50 @@ impl Config {
         let sink_clickhouse_column =
             merge!(sink_clickhouse_column).unwrap_or_else(|| "payload".to_string());
 
+        // ── S3 sink ──────────────────────────────────────────────────────────
+        let sink_s3_bucket = merge!(sink_s3_bucket).unwrap_or_default();
+        let sink_s3_region = merge!(sink_s3_region).unwrap_or_else(|| "us-east-1".to_string());
+        let sink_s3_endpoint = merge!(sink_s3_endpoint).unwrap_or_default();
+        let sink_s3_force_path_style = merge!(sink_s3_force_path_style).unwrap_or(false);
+        let sink_s3_prefix = merge!(sink_s3_prefix).unwrap_or_default();
+        // Hive-style, so Athena/Spark/Glue partition-prune for free. Rendered in
+        // UTC: a local-time render would make the key depend on the host's TZ,
+        // and a replay after a DST change would duplicate the object.
+        let sink_s3_partition =
+            merge!(sink_s3_partition).unwrap_or_else(|| "dt=%Y-%m-%d/hour=%H".to_string());
+        let sink_s3_framing = merge!(sink_s3_framing).unwrap_or_else(|| "ndjson".to_string());
+        if !matches!(sink_s3_framing.as_str(), "ndjson" | "length-prefixed") {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_s3_framing",
+                reason: format!("expected 'ndjson' or 'length-prefixed', got '{sink_s3_framing}'"),
+            });
+        }
+        let sink_s3_compression = merge!(sink_s3_compression).unwrap_or_else(|| "zstd".to_string());
+        if !matches!(sink_s3_compression.as_str(), "none" | "zstd" | "gzip") {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_s3_compression",
+                reason: format!("expected 'none', 'zstd' or 'gzip', got '{sink_s3_compression}'"),
+            });
+        }
+        let sink_s3_access_key_id = merge!(sink_s3_access_key_id).unwrap_or_default();
+        let sink_s3_secret_access_key =
+            RedactedSecret(merge!(sink_s3_secret_access_key).unwrap_or_default());
+        // Both or neither: a lone key id silently falls through to the
+        // environment or an instance role, which is a confusing way to end up
+        // authenticated as something other than what the config names.
+        if sink_s3_access_key_id.is_empty() != sink_s3_secret_access_key.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "sink_s3_access_key_id",
+                reason: "sink_s3_access_key_id and sink_s3_secret_access_key must be set \
+                         together, or both left unset to use the environment, IRSA, or an \
+                         EC2 instance role"
+                    .to_string(),
+            });
+        }
+        let sink_s3_storage_class = merge!(sink_s3_storage_class).unwrap_or_default();
+        let sink_s3_sse = merge!(sink_s3_sse).unwrap_or_default();
+        let sink_s3_sse_kms_key_id = merge!(sink_s3_sse_kms_key_id).unwrap_or_default();
+
         let dead_letter_max_bytes = merge!(dead_letter_max_bytes).unwrap_or(1_073_741_824);
         if dead_letter_max_bytes == 0 {
             return Err(ConfigError::InvalidValue {
@@ -957,6 +1094,19 @@ impl Config {
             sink_clickhouse_table,
             #[cfg(feature = "clickhouse-sink")]
             sink_clickhouse_column,
+            sink_s3_bucket,
+            sink_s3_region,
+            sink_s3_endpoint,
+            sink_s3_force_path_style,
+            sink_s3_prefix,
+            sink_s3_partition,
+            sink_s3_framing,
+            sink_s3_compression,
+            sink_s3_access_key_id,
+            sink_s3_secret_access_key,
+            sink_s3_storage_class,
+            sink_s3_sse,
+            sink_s3_sse_kms_key_id,
             dead_letter_max_bytes,
             dead_letter_check_interval_secs,
             health_poll_interval_secs,

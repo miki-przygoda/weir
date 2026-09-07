@@ -15,11 +15,15 @@ COPY crates/weir-wab/Cargo.toml      crates/weir-wab/Cargo.toml
 COPY crates/weir-server/Cargo.toml   crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml   crates/weir-client/Cargo.toml
 # weir-sink-sdk is a real dependency of weir-server (the Sink trait contract);
-# weir-ctl, weir-testkit, and the `weir-rs` facade are workspace members that
-# don't ship in the image but whose manifests Cargo must read to resolve the
-# workspace. All member Cargo.tomls must be present here (+ a stub source below)
-# or `cargo build` fails resolving the workspace.
+# weir-sink-s3, weir-ctl, weir-testkit and the `weir-rs` facade are workspace
+# members that don't ship in the image (the S3 sink is behind the non-default
+# `s3-sink` feature, which this image does not enable) but whose manifests Cargo
+# must read to resolve the workspace. All member Cargo.tomls must be present
+# here (+ a stub source below) or `cargo build` fails resolving the workspace --
+# adding a workspace member without touching this list breaks the image build,
+# which is exactly what happened when weir-sink-s3 landed.
 COPY crates/weir-sink-sdk/Cargo.toml crates/weir-sink-sdk/Cargo.toml
+COPY crates/weir-sink-s3/Cargo.toml  crates/weir-sink-s3/Cargo.toml
 COPY crates/weir-ctl/Cargo.toml      crates/weir-ctl/Cargo.toml
 COPY crates/weir-testkit/Cargo.toml  crates/weir-testkit/Cargo.toml
 COPY crates/weir-rs/Cargo.toml       crates/weir-rs/Cargo.toml
@@ -31,6 +35,7 @@ RUN mkdir -p \
         crates/weir-server/src \
         crates/weir-client/src \
         crates/weir-sink-sdk/src \
+        crates/weir-sink-s3/src \
         crates/weir-ctl/src \
         crates/weir-testkit/src \
         crates/weir-rs/src && \
@@ -41,6 +46,7 @@ RUN mkdir -p \
         crates/weir-wab/src/lib.rs \
         crates/weir-client/src/lib.rs \
         crates/weir-sink-sdk/src/lib.rs \
+        crates/weir-sink-s3/src/lib.rs \
         crates/weir-testkit/src/lib.rs \
         crates/weir-rs/src/lib.rs
 

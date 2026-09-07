@@ -453,6 +453,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -724,6 +725,15 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "hmac"
@@ -1359,7 +1369,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "fallible-iterator",
- "hmac",
+ "hmac 0.13.0",
  "md-5",
  "memchr",
  "rand 0.10.1",
@@ -2681,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "weir-client"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "crc32fast",
  "proptest",
@@ -2692,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2702,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "weir-ctl"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "clap",
  "crc32fast",
@@ -2714,7 +2724,7 @@ dependencies = [
 
 [[package]]
 name = "weir-rs"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "weir-client",
  "weir-core",
@@ -2724,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "weir-server"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "arc-swap",
  "core_affinity",
@@ -2756,6 +2766,7 @@ dependencies = [
  "webpki-roots 1.0.7",
  "weir-client",
  "weir-core",
+ "weir-sink-s3",
  "weir-sink-sdk",
  "weir-testkit",
  "weir-wab",
@@ -2763,8 +2774,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "weir-sink-s3"
+version = "2.1.0"
+dependencies = [
+ "flate2",
+ "hmac 0.12.1",
+ "reqwest",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "weir-core",
+ "weir-sink-sdk",
+ "zstd",
+]
+
+[[package]]
 name = "weir-sink-sdk"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "sha2 0.10.9",
  "weir-core",
@@ -2772,7 +2800,7 @@ dependencies = [
 
 [[package]]
 name = "weir-testkit"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "libc",
  "rcgen",
@@ -2781,7 +2809,7 @@ dependencies = [
 
 [[package]]
 name = "weir-wab"
-version = "2.0.5"
+version = "2.1.0"
 dependencies = [
  "crc32fast",
  "weir-core",

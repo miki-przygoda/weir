@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# deploy/run-sink-integration-tests.sh — exercise the SQL sinks against
-# real MySQL and PostgreSQL backends.
+# deploy/run-sink-integration-tests.sh — exercise every sink against a real
+# backend: MySQL, PostgreSQL, ClickHouse, and MinIO for the S3 sink.
 #
 # Brings up the docker-compose stack at deploy/docker/test/, waits for
-# both services' healthchecks to pass, exports WEIR_TEST_MYSQL_URL and
-# WEIR_TEST_POSTGRES_URL, runs the two `#[ignore]`-marked
-# `*_sink_end_to_end` tests, then tears down the stack on exit.
+# every service's healthcheck to pass, exports the WEIR_TEST_* endpoints and
+# the S3 credentials, runs the `#[ignore]`-marked sink tests, then tears down
+# the stack on exit.
 #
-# Exit code: 0 = both sink tests passed, non-zero = something failed.
+# Exit code: 0 = every sink test passed, non-zero = something failed.
+#
+# CI runs this via the `sink-integration` job. It did not until 2.1.0, and the
+# cost of that was concrete: because these tests are `#[ignore]`-marked, the
+# `test` job's `--test system` skipped them and nothing else invoked them, so
+# all three SQL sink tests sat broken for an unknown period — asserting on a
+# segment seal the default thresholds make impossible — with no signal at all.
+# Keep the CI job and this script in step: the job runs exactly this file, so a
+# test added here is a test CI runs.
 #
 # Usage:
 #   bash deploy/run-sink-integration-tests.sh           # debug build (fast)
@@ -15,7 +23,8 @@
 #
 # Requirements:
 #   - Docker (or compatible runtime) with `docker compose` plugin.
-#   - Ports 33306 (mysql) and 55432 (postgres) available on 127.0.0.1.
+#   - These ports free on 127.0.0.1: 33306 (mysql), 55432 (postgres),
+#     18123 (clickhouse), 19000 (minio).
 
 set -euo pipefail
 
@@ -103,16 +112,23 @@ except Exception:
 wait_for_healthy mysql
 wait_for_healthy postgres
 wait_for_healthy clickhouse
+wait_for_healthy minio
 
 # ── Run the integration tests ─────────────────────────────────────────────────
 
 export WEIR_TEST_MYSQL_URL="mysql://root:test@127.0.0.1:33306/weir_test"
 export WEIR_TEST_POSTGRES_URL="postgres://postgres:test@127.0.0.1:55432/weir_test"
 export WEIR_TEST_CLICKHOUSE_URL="http://127.0.0.1:18123"
+export WEIR_TEST_S3_ENDPOINT="http://127.0.0.1:19000"
+# The S3 sink reads credentials from the environment, as a production
+# deployment would; they never touch the generated config file.
+export AWS_ACCESS_KEY_ID="weirtest"
+export AWS_SECRET_ACCESS_KEY="weirtestsecret"
 
 info "WEIR_TEST_MYSQL_URL=$WEIR_TEST_MYSQL_URL"
 info "WEIR_TEST_POSTGRES_URL=$WEIR_TEST_POSTGRES_URL"
 info "WEIR_TEST_CLICKHOUSE_URL=$WEIR_TEST_CLICKHOUSE_URL"
+info "WEIR_TEST_S3_ENDPOINT=$WEIR_TEST_S3_ENDPOINT"
 
 CARGO_FLAGS=""
 if [ "${RELEASE:-0}" = "1" ]; then
@@ -137,4 +153,15 @@ info "running clickhouse_sink_end_to_end"
 cargo test $CARGO_FLAGS -p weir-server --features clickhouse-sink --test system -- --ignored --exact \
     clickhouse_sink_end_to_end
 
-info "all three sink integration tests passed"
+# The S3 suite is five tests, not one, and two of them carry the design:
+# s3_sink_replay_is_an_idempotent_overwrite pins replay stability, and
+# s3_sink_distinct_batches_of_identical_records_produce_distinct_objects pins
+# collision freedom. Either alone passes a broken key scheme -- the first is
+# equally true when the sink is overwriting its own data, the second when it is
+# duplicating on every replay. Run them as a group so neither can be dropped.
+info "running the s3 sink suite (5 tests) against MinIO"
+# shellcheck disable=SC2086
+cargo test $CARGO_FLAGS -p weir-server --features s3-sink --test system -- \
+    --ignored --test-threads=1 s3_sink
+
+info "all sink integration tests passed"

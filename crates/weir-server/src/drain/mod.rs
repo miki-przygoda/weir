@@ -1163,6 +1163,10 @@ async fn process_segment<S: Sink>(
         }
     };
 
+    // Read once from the header the reader already parsed. Stable across a
+    // crash-replay, unlike wall-clock — see SinkBatch::with_segment_context.
+    let segment_created_at = reader.header().created_at;
+
     let max_batch = sink.max_batch_size().max(1);
     // `read_index` counts every record the reader yields (including the `skip`
     // prefix already handled on a prior attempt). `durable_through` is how many
@@ -1216,7 +1220,17 @@ async fn process_segment<S: Sink>(
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
             let full_ids = std::mem::replace(&mut batch_ids, Vec::with_capacity(max_batch));
             let n = full_batch.len() as u64;
-            match commit_batch(&full_batch, &full_ids, sink, config, metrics, dead_letter).await {
+            match commit_batch(
+                &full_batch,
+                &full_ids,
+                segment_created_at,
+                sink,
+                config,
+                metrics,
+                dead_letter,
+            )
+            .await
+            {
                 BatchResult::Ok => durable_through += n,
                 BatchResult::Transient { retry_after } => {
                     return ProcessResult::Transient {
@@ -1235,7 +1249,17 @@ async fn process_segment<S: Sink>(
 
     if !batch.is_empty() {
         let n = batch.len() as u64;
-        match commit_batch(&batch, &batch_ids, sink, config, metrics, dead_letter).await {
+        match commit_batch(
+            &batch,
+            &batch_ids,
+            segment_created_at,
+            sink,
+            config,
+            metrics,
+            dead_letter,
+        )
+        .await
+        {
             BatchResult::Ok => durable_through += n,
             BatchResult::Transient { retry_after } => {
                 return ProcessResult::Transient {
@@ -1351,6 +1375,7 @@ fn quarantine_segment(segment: &Path, config: &DrainConfig, metrics: &Metrics, r
 async fn commit_batch<S: Sink>(
     payloads: &[Payload],
     record_ids: &[RecordId],
+    segment_created_at: i64,
     sink: &S,
     config: &DrainConfig,
     metrics: &Metrics,
@@ -1371,10 +1396,16 @@ async fn commit_batch<S: Sink>(
     // is a refcount bump. (weir 1.x also ran every payload through
     // `SinkRecord::from_payload` here; that conversion was the identity in every
     // implementation that ever existed, and 2.0 removes it.)
-    let batch = weir_sink_sdk::SinkBatch::with_record_ids(
+    // `segment_created_at` comes from the owning segment's WAB header, which is
+    // written once and read back unchanged after a crash-replay. A sink that
+    // derives a partition path or object key from it therefore puts a replayed
+    // batch in the same place; deriving one from wall-clock would scatter
+    // replays across partitions and duplicate them downstream.
+    let batch = weir_sink_sdk::SinkBatch::with_segment_context(
         payloads.to_vec(),
         dedup_token,
         record_ids.to_vec(),
+        segment_created_at,
     );
 
     let t = std::time::Instant::now();
@@ -2161,7 +2192,7 @@ mod tests {
 
     /// Ids for a test batch, at a synthetic coordinate. `commit_batch` only
     /// forwards these, so the exact segment name is immaterial — what matters is
-    /// that the count matches, which `SinkBatch::with_record_ids` enforces.
+    /// that the count matches, which `SinkBatch::with_segment_context` enforces.
     fn test_record_ids(payloads: &[Payload]) -> Vec<RecordId> {
         payloads
             .iter()
@@ -2618,7 +2649,7 @@ mod tests {
 
         let ids = test_record_ids(&payloads);
         let result = block_on(commit_batch(
-            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+            &payloads, &ids, 0, &sink, &config, &metrics, &mut dl,
         ));
         assert!(
             matches!(result, BatchResult::Transient { .. }),
@@ -2650,7 +2681,7 @@ mod tests {
 
         let ids = test_record_ids(&payloads);
         let result = block_on(commit_batch(
-            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+            &payloads, &ids, 0, &sink, &config, &metrics, &mut dl,
         ));
         assert!(
             matches!(result, BatchResult::Transient { .. }),
@@ -2680,7 +2711,7 @@ mod tests {
 
         let ids = test_record_ids(&payloads);
         let result = block_on(commit_batch(
-            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+            &payloads, &ids, 0, &sink, &config, &metrics, &mut dl,
         ));
         assert!(
             matches!(result, BatchResult::Transient { .. }),
@@ -2720,6 +2751,79 @@ mod tests {
             !get_confirmed_path(&sealed).exists(),
             "an unopenable segment must not be confirmed"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The S3 sink derives its object-key partition from this value. If the
+    /// drain stops populating it, a replayed batch lands under a fresh
+    /// wall-clock partition and duplicates the object — silently.
+    #[test]
+    fn the_drain_passes_the_segment_creation_time_to_the_sink() {
+        use super::dead_letter::DeadLetterWriter;
+        use std::sync::Mutex as StdMutex;
+
+        /// Records what `segment_created_at` each commit carried.
+        struct SpySink(StdMutex<Vec<Option<i64>>>);
+
+        impl crate::sink::Sink for SpySink {
+            type Error = MockError;
+
+            async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MockError> {
+                self.0.lock().unwrap().push(batch.segment_created_at());
+                Ok(CommitResult::new(batch.into_records(), Vec::new()))
+            }
+
+            async fn health(&self) -> SinkHealth {
+                SinkHealth::Healthy
+            }
+
+            /// Forces `process_segment` to flush a full sub-batch mid-loop
+            /// rather than only at the tail. Without this the default of 1000
+            /// means a 2-record segment only ever exercises the tail flush, and
+            /// the batched `commit_batch` call site goes untested — verified by
+            /// mutation: passing 0 there alone left 440/440 green.
+            fn max_batch_size(&self) -> usize {
+                1
+            }
+        }
+
+        let dir = tmp_dir("segment_created_at");
+        let segment = make_sealed_segment(&dir, 0, &[b"a", b"b"]);
+
+        // Read the header directly — this is the value the sink must observe.
+        let expected = weir_wab::SegmentReader::open(&segment)
+            .unwrap()
+            .header()
+            .created_at;
+
+        let sink = SpySink(StdMutex::new(Vec::new()));
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+
+        let result = block_on(process_segment(
+            &segment, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(result, ProcessResult::Confirmed { .. }),
+            "expected the segment to be confirmed"
+        );
+
+        let observed = sink.0.lock().unwrap().clone();
+        // With max_batch_size = 1 and two records, this is one batched flush
+        // plus one tail flush — so both `commit_batch` call sites are covered.
+        assert_eq!(
+            observed.len(),
+            2,
+            "expected both the batched and the tail commit_batch call sites to fire"
+        );
+        for seen in observed {
+            assert_eq!(
+                seen,
+                Some(expected),
+                "the drain must pass the segment header's created_at, not None or wall-clock"
+            );
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3811,7 +3915,7 @@ mod tests {
 
         let ids = test_record_ids(&payloads);
         let result = block_on(commit_batch(
-            &payloads, &ids, &sink, &config, &metrics, &mut dl,
+            &payloads, &ids, 0, &sink, &config, &metrics, &mut dl,
         ));
         assert!(
             matches!(result, BatchResult::Ok),

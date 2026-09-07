@@ -235,6 +235,21 @@ pub(super) fn parse_from(
         sink_clickhouse_column: pargs
             .opt_value_from_str("--sink-clickhouse-column")
             .map_err(pico_err)?,
+        // The S3 knobs are file/env only: thirteen more long flags would
+        // bloat --help for a sink most deployments configure once in TOML.
+        sink_s3_bucket: None,
+        sink_s3_region: None,
+        sink_s3_endpoint: None,
+        sink_s3_prefix: None,
+        sink_s3_partition: None,
+        sink_s3_framing: None,
+        sink_s3_compression: None,
+        sink_s3_access_key_id: None,
+        sink_s3_secret_access_key: None,
+        sink_s3_storage_class: None,
+        sink_s3_sse: None,
+        sink_s3_sse_kms_key_id: None,
+        sink_s3_force_path_style: None,
         dead_letter_max_bytes: pargs
             .opt_value_from_str("--dead-letter-max-bytes")
             .map_err(pico_err)?,

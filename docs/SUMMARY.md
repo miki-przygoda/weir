@@ -15,6 +15,10 @@
 - [Quarantine recovery](operations/quarantine-recovery.md)
 - [Monitoring](monitoring.md)
 
+# Sinks
+
+- [S3 / object storage](sinks/s3.md)
+
 # Protocol
 
 - [Wire protocol](wire_protocol.md)
