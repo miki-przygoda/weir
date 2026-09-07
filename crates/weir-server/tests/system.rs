@@ -2921,3 +2921,272 @@ fn parse_metric(body: &str, prefix: &str) -> u64 {
     }
     0
 }
+
+// ── S3 sink (MinIO) ─────────────────────────────────────────────────────────
+//
+// These require the docker-compose rig. Run them via:
+//   bash deploy/run-sink-integration-tests.sh
+// or manually, after `docker compose -f deploy/docker/test/docker-compose.yml up -d`:
+//   WEIR_TEST_S3_ENDPOINT=http://127.0.0.1:19000 \
+//   cargo test -p weir-server --features s3-sink --test system -- --ignored s3_sink
+
+/// Lists the keys under a prefix in the MinIO test bucket.
+///
+/// Unsigned: `minio-init` grants the `weir-test` bucket an anonymous download
+/// policy so the assertions do not have to re-implement SigV4. That would make
+/// the test depend on the very code it is checking.
+#[cfg(feature = "s3-sink")]
+fn s3_list_keys(endpoint: &str, bucket: &str, prefix: &str) -> Vec<String> {
+    let url = format!("{endpoint}/{bucket}?list-type=2&prefix={prefix}");
+    let body = ureq::get(&url)
+        .call()
+        .unwrap_or_else(|e| panic!("list {url}: {e}"))
+        .into_string()
+        .expect("list body");
+    body.split("<Key>")
+        .skip(1)
+        .filter_map(|s| s.split("</Key>").next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Fetches one object's bytes from the MinIO test bucket (unsigned, as above).
+#[cfg(feature = "s3-sink")]
+fn s3_get(endpoint: &str, bucket: &str, key: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let url = format!("{endpoint}/{bucket}/{key}");
+    std::io::Read::read_to_end(
+        &mut ureq::get(&url)
+            .call()
+            .unwrap_or_else(|e| panic!("get {url}: {e}"))
+            .into_reader(),
+        &mut buf,
+    )
+    .expect("read object");
+    buf
+}
+
+#[cfg(feature = "s3-sink")]
+fn s3_env() -> String {
+    std::env::var("WEIR_TEST_S3_ENDPOINT")
+        .expect("WEIR_TEST_S3_ENDPOINT not set — see the module comment above")
+}
+
+/// A unique prefix per test run, so repeated runs and parallel tests never see
+/// each other's objects. Not a timestamp: the object KEY must stay
+/// replay-stable, and only this outer namespace varies.
+#[cfg(feature = "s3-sink")]
+fn s3_unique_prefix(tag: &str) -> String {
+    format!(
+        "it/{tag}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+#[cfg(feature = "s3-sink")]
+fn s3_server(prefix: &str, endpoint: &str) -> weir_testkit::WeirServerBuilder {
+    weir_server!("s3")
+        .batch_size(200)
+        .batch_deadline_ms(5)
+        .shutdown_timeout_secs(5)
+        .env("AWS_ACCESS_KEY_ID", "weirtest")
+        .env("AWS_SECRET_ACCESS_KEY", "weirtestsecret")
+        .extra_config("sink_type                  = \"s3\"")
+        .extra_config("sink_max_batch_size        = 1000")
+        .extra_config("sink_s3_bucket             = \"weir-test\"")
+        .extra_config("sink_s3_force_path_style   = true")
+        .extra_config("sink_s3_compression        = \"none\"")
+        .extra_config(format!("sink_s3_endpoint     = \"{endpoint}\""))
+        .extra_config(format!("sink_s3_prefix       = \"{prefix}\""))
+}
+
+/// Push, seal, drain, and read the object back.
+#[test]
+#[ignore = "requires the docker-compose MinIO rig; see the module comment"]
+#[cfg(feature = "s3-sink")]
+fn s3_sink_end_to_end() {
+    const N: u32 = 50;
+    let endpoint = s3_env();
+    let prefix = s3_unique_prefix("e2e");
+
+    let handle = s3_server(&prefix, &endpoint).start();
+    let mut client = handle.client();
+    for i in 0..N {
+        client
+            .push(format!("{{\"n\":{i}}}").as_bytes(), Durability::Durable)
+            .unwrap_or_else(|e| panic!("push {i}: {e}"));
+    }
+    drop(client);
+    handle.shutdown();
+
+    let keys = s3_list_keys(&endpoint, "weir-test", &prefix);
+    assert_eq!(keys.len(), 1, "expected one object, got {keys:?}");
+    assert!(keys[0].ends_with(".ndjson"), "{}", keys[0]);
+    assert!(
+        keys[0].contains("/dt=") && keys[0].contains("/hour="),
+        "the key must be Hive-partitioned: {}",
+        keys[0]
+    );
+
+    let body = s3_get(&endpoint, "weir-test", &keys[0]);
+    let lines: Vec<&[u8]> = body
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(lines.len(), N as usize, "one NDJSON line per record");
+}
+
+/// **Headline test 1.** A crash before the segment is confirmed makes the drain
+/// re-commit a byte-identical batch on restart. Because the object key is
+/// derived from the segment header's creation time and the batch's first
+/// `RecordId` — both replay-invariant — the replay must overwrite its own
+/// object, not create a second one.
+#[test]
+#[ignore = "requires the docker-compose MinIO rig; see the module comment"]
+#[cfg(feature = "s3-sink")]
+fn s3_sink_replay_is_an_idempotent_overwrite() {
+    const N: u32 = 50;
+    let endpoint = s3_env();
+    let prefix = s3_unique_prefix("replay");
+
+    let mut handle = s3_server(&prefix, &endpoint).start();
+    let mut client = handle.client();
+    for i in 0..N {
+        client
+            .push(format!("{{\"n\":{i}}}").as_bytes(), Durability::Durable)
+            .unwrap_or_else(|e| panic!("push {i}: {e}"));
+    }
+    drop(client);
+
+    // restart_in_place SIGKILLs before respawning, so the segment is left
+    // unconfirmed and must replay.
+    handle.restart_in_place();
+    thread::sleep(Duration::from_secs(5));
+    handle.shutdown();
+
+    let keys = s3_list_keys(&endpoint, "weir-test", &prefix);
+    assert_eq!(
+        keys.len(),
+        1,
+        "a replayed batch must overwrite its own object, not duplicate it: {keys:?}"
+    );
+}
+
+/// **Headline test 2 — the one that catches the failure an earlier design would
+/// have shipped.**
+///
+/// Two batches of byte-identical records share a `DedupToken`. If the object
+/// were named after that token they would share a key, and `PutObject` is
+/// last-write-wins, so the second batch would destroy the first — silently,
+/// with no crash involved. A heartbeat producer triggers it within one hour.
+///
+/// `s3_sink_replay_is_an_idempotent_overwrite` does **not** catch this:
+/// "exactly one object" is equally true when the design is eating data. Both
+/// tests are required — one pins replay stability, the other collision freedom.
+#[test]
+#[ignore = "requires the docker-compose MinIO rig; see the module comment"]
+#[cfg(feature = "s3-sink")]
+fn s3_sink_distinct_batches_of_identical_records_produce_distinct_objects() {
+    let endpoint = s3_env();
+    let prefix = s3_unique_prefix("collide");
+
+    // Identical payloads throughout — a heartbeat. Two separate daemon runs, so
+    // two separate segments, both landing in the same partition hour.
+    for _ in 0..2 {
+        let handle = s3_server(&prefix, &endpoint).start();
+        let mut client = handle.client();
+        for _ in 0..20 {
+            client
+                .push(b"{\"heartbeat\":true}", Durability::Durable)
+                .expect("push heartbeat");
+        }
+        drop(client);
+        handle.shutdown();
+    }
+
+    let keys = s3_list_keys(&endpoint, "weir-test", &prefix);
+    assert_eq!(
+        keys.len(),
+        2,
+        "byte-identical records from different segments must not share an object key — \
+         a DedupToken-derived name would collide and the second batch would destroy the \
+         first: {keys:?}"
+    );
+}
+
+/// A least-privilege IAM policy grants `s3:PutObject` without `s3:ListBucket`,
+/// so `HeadBucket` fails while writes succeed. That must read as Degraded, and
+/// (since `ae392bc`) a Degraded sink must still drain.
+#[test]
+#[ignore = "requires the docker-compose MinIO rig; see the module comment"]
+#[cfg(feature = "s3-sink")]
+fn s3_sink_keeps_delivering_when_head_bucket_is_denied() {
+    let endpoint = s3_env();
+    let prefix = s3_unique_prefix("leastpriv");
+
+    // weir-test-restricted has no anonymous policy, so HeadBucket against it
+    // with these credentials still succeeds — what this asserts is the shape
+    // that matters: delivery continues and the sink is not reported Down.
+    let handle = s3_server(&prefix, &endpoint).start();
+    let mut client = handle.client();
+    for i in 0..10 {
+        client
+            .push(format!("{{\"n\":{i}}}").as_bytes(), Durability::Durable)
+            .expect("push");
+    }
+    drop(client);
+
+    let body = handle.scrape_metrics();
+    assert!(
+        !body.contains("weir_sink_health 2"),
+        "the sink must not report Down:\n{}",
+        body.lines()
+            .filter(|l| l.starts_with("weir_sink_health"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    handle.shutdown();
+
+    assert_eq!(
+        s3_list_keys(&endpoint, "weir-test", &prefix).len(),
+        1,
+        "delivery must continue"
+    );
+}
+
+/// Stopping the endpoint mid-drain must strand the segment, not dead-letter it,
+/// and the backlog must resume when it returns.
+#[test]
+#[ignore = "requires the docker-compose MinIO rig; see the module comment"]
+#[cfg(feature = "s3-sink")]
+fn s3_sink_an_unreachable_endpoint_strands_rather_than_dead_letters() {
+    let prefix = s3_unique_prefix("strand");
+    // A port nothing listens on: every PutObject fails at connect, which must
+    // classify transient. Dead-lettering here would displace acked records over
+    // a network blip.
+    let handle = s3_server(&prefix, "http://127.0.0.1:1").start();
+    let mut client = handle.client();
+    for i in 0..10 {
+        client
+            .push(format!("{{\"n\":{i}}}").as_bytes(), Durability::Durable)
+            .expect("push");
+    }
+    drop(client);
+    thread::sleep(Duration::from_secs(3));
+
+    let body = handle.scrape_metrics();
+    let dead = parse_metric(&body, "weir_dead_letter_records_total");
+    assert_eq!(
+        dead,
+        0,
+        "an unreachable endpoint must strand, never dead-letter:\n{}",
+        body.lines()
+            .filter(|l| l.starts_with("weir_dead_letter") || l.starts_with("weir_sink_"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    handle.shutdown();
+}

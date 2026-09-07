@@ -116,5 +116,6 @@ services:
       mc alias set local http://minio:9000 weirtest weirtestsecret &&
       mc mb --ignore-existing local/weir-test &&
       mc mb --ignore-existing local/weir-test-restricted &&
+      mc anonymous set download local/weir-test &&
       echo minio-init done
       "

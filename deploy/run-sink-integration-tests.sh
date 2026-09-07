@@ -103,16 +103,23 @@ except Exception:
 wait_for_healthy mysql
 wait_for_healthy postgres
 wait_for_healthy clickhouse
+wait_for_healthy minio
 
 # ── Run the integration tests ─────────────────────────────────────────────────
 
 export WEIR_TEST_MYSQL_URL="mysql://root:test@127.0.0.1:33306/weir_test"
 export WEIR_TEST_POSTGRES_URL="postgres://postgres:test@127.0.0.1:55432/weir_test"
 export WEIR_TEST_CLICKHOUSE_URL="http://127.0.0.1:18123"
+export WEIR_TEST_S3_ENDPOINT="http://127.0.0.1:19000"
+# The S3 sink reads credentials from the environment, as a production
+# deployment would; they never touch the generated config file.
+export AWS_ACCESS_KEY_ID="weirtest"
+export AWS_SECRET_ACCESS_KEY="weirtestsecret"
 
 info "WEIR_TEST_MYSQL_URL=$WEIR_TEST_MYSQL_URL"
 info "WEIR_TEST_POSTGRES_URL=$WEIR_TEST_POSTGRES_URL"
 info "WEIR_TEST_CLICKHOUSE_URL=$WEIR_TEST_CLICKHOUSE_URL"
+info "WEIR_TEST_S3_ENDPOINT=$WEIR_TEST_S3_ENDPOINT"
 
 CARGO_FLAGS=""
 if [ "${RELEASE:-0}" = "1" ]; then
@@ -137,4 +144,15 @@ info "running clickhouse_sink_end_to_end"
 cargo test $CARGO_FLAGS -p weir-server --features clickhouse-sink --test system -- --ignored --exact \
     clickhouse_sink_end_to_end
 
-info "all three sink integration tests passed"
+# The S3 suite is five tests, not one, and two of them carry the design:
+# s3_sink_replay_is_an_idempotent_overwrite pins replay stability, and
+# s3_sink_distinct_batches_of_identical_records_produce_distinct_objects pins
+# collision freedom. Either alone passes a broken key scheme -- the first is
+# equally true when the sink is overwriting its own data, the second when it is
+# duplicating on every replay. Run them as a group so neither can be dropped.
+info "running the s3 sink suite (5 tests) against MinIO"
+# shellcheck disable=SC2086
+cargo test $CARGO_FLAGS -p weir-server --features s3-sink --test system -- \
+    --ignored --test-threads=1 s3_sink
+
+info "all sink integration tests passed"

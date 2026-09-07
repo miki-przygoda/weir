@@ -239,9 +239,9 @@ impl S3Sink {
     /// fallback warns once rather than proceeding silently, because a
     /// token-derived name collides across distinct batches of identical
     /// records and an S3 key is last-write-wins.
-    fn batch_name(&self, batch: &SinkBatch) -> String {
+    fn batch_name(&self, batch: &SinkBatch, created_at: i64) -> String {
         match batch.record_ids().and_then(<[_]>::first) {
-            Some(first) => key::batch_name(&first.to_hex(), batch.len()),
+            Some(first) => key::batch_name(created_at, &first.to_hex(), batch.len()),
             None => {
                 if !self.warned_missing_ids.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
@@ -251,7 +251,7 @@ impl S3Sink {
                          RecordIds, so this indicates a hand-built batch."
                     );
                 }
-                key::batch_name(&batch.dedup_token().to_hex(), batch.len())
+                key::batch_name(created_at, &batch.dedup_token().to_hex(), batch.len())
             }
         }
     }
@@ -278,7 +278,7 @@ impl Sink for S3Sink {
                 0
             }
         };
-        let name = self.batch_name(&batch);
+        let name = self.batch_name(&batch, created_at);
         let object_key = key::object_key(
             &self.prefix,
             &self.partition,
@@ -478,10 +478,10 @@ mod tests {
         let token = DedupToken::for_payloads(std::slice::from_ref(&p));
         let batch = SinkBatch::with_segment_context(vec![p], token, ids.clone(), 0);
 
-        let name = sink.batch_name(&batch);
-        assert!(name.starts_with(&ids[0].to_hex()), "{name}");
+        let name = sink.batch_name(&batch, 0);
+        assert!(name.contains(&ids[0].to_hex()), "{name}");
         assert!(
-            !name.starts_with(&token.to_hex()),
+            !name.contains(&token.to_hex()),
             "the dedup token collides across distinct batches of identical records"
         );
         assert!(
@@ -507,8 +507,8 @@ mod tests {
             )
         };
         assert_ne!(
-            sink.batch_name(&mk(1)),
-            sink.batch_name(&mk(2)),
+            sink.batch_name(&mk(1), 0),
+            sink.batch_name(&mk(2), 0),
             "byte-identical records at different WAB coordinates must not share an object"
         );
     }

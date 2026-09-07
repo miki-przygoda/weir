@@ -206,14 +206,29 @@ impl PartitionTemplate {
 /// for two batches carrying identical bytes, and an S3 key is last-write-wins,
 /// so a token-named object is destroyed by the next batch of the same
 /// repetitive records.
+/// # Why `created_at` is in the *name* and not only the partition
+///
+/// A `RecordId` is `sha256(segment_name ++ index ++ payload)`, and segment names
+/// restart at `seg_00000001` in every fresh WAB directory. So two daemon runs on
+/// **different WAB directories** — a pod redeployed without a PVC, a wiped WAB,
+/// a fresh container — produce identical `RecordId`s for their first batches. If
+/// both write to the same bucket and prefix within one partition hour, the
+/// second silently overwrites the first.
+///
+/// The segment header's `created_at` distinguishes segment *instances* where the
+/// name cannot, and it is read from disk, so it stays invariant under replay.
+/// Rendered as fixed-width hex: compact, monotonic for positive values, and
+/// free of `-` (a negative timestamp printed in decimal would introduce one).
+///
 /// # Injectivity
 ///
-/// `count` renders as decimal digits, which contain no `-`, so the **last** `-`
-/// in the result is always the separator and the decomposition is unique for
-/// any `hex` — including one of varying length or containing `-`. That, not the
-/// fixed 64-char width of a `RecordId`, is what makes the name collision-free.
-pub(crate) fn batch_name(first_record_id_hex: &str, count: usize) -> String {
-    format!("{first_record_id_hex}-{count}")
+/// `created_at` is exactly 16 hex characters and `count` is decimal digits;
+/// neither contains `-`. So the first and last `-` always bound the middle
+/// field, and the decomposition is unique for any `hex` — including one of
+/// varying length or containing `-`. That, not the fixed width of a `RecordId`,
+/// is what makes the name collision-free.
+pub(crate) fn batch_name(created_at: i64, first_record_id_hex: &str, count: usize) -> String {
+    format!("{:016x}-{first_record_id_hex}-{count}", created_at as u64)
 }
 
 /// Builds the full object key.
@@ -267,12 +282,15 @@ mod tests {
             "archive",
             &tmpl("dt=%Y-%m-%d/hour=%H"),
             T,
-            &batch_name(RID, 100),
+            &batch_name(T, RID, 100),
             "ndjson.zst",
         );
         assert_eq!(
             key,
-            format!("archive/dt=2026-09-06/hour=14/{RID}-100.ndjson.zst")
+            format!(
+                "archive/dt=2026-09-06/hour=14/{}.ndjson.zst",
+                batch_name(T, RID, 100)
+            )
         );
     }
 
@@ -281,7 +299,7 @@ mod tests {
         // Replay stability. The drain is at-least-once: after a crash it
         // re-commits a byte-identical batch from the same segment coordinate.
         let t = tmpl("dt=%Y-%m-%d/hour=%H");
-        let n = batch_name(RID, 100);
+        let n = batch_name(T, RID, 100);
         assert_eq!(
             object_key("p", &t, T, &n, "ndjson"),
             object_key("p", &t, T, &n, "ndjson")
@@ -296,12 +314,30 @@ mod tests {
         // the first. RecordId mixes the WAB coordinate in, so they differ here
         // even though their bytes do not.
         let t = tmpl("dt=%Y-%m-%d/hour=%H");
-        let a = batch_name(&"1".repeat(64), 100);
-        let b = batch_name(&"2".repeat(64), 100);
+        let a = batch_name(T, &"1".repeat(64), 100);
+        let b = batch_name(T, &"2".repeat(64), 100);
         assert_ne!(
             object_key("p", &t, T, &a, "ndjson"),
             object_key("p", &t, T, &b, "ndjson"),
             "distinct batches must not share an object key"
+        );
+    }
+
+    #[test]
+    fn two_wab_lifetimes_do_not_collide() {
+        // Segment names restart at seg_00000001 in every fresh WAB directory,
+        // so two daemon runs on different WAB dirs -- a pod redeployed without
+        // a PVC, a wiped WAB -- produce IDENTICAL RecordIds for their first
+        // batches. Without created_at in the name the second silently
+        // overwrites the first. Found by the MinIO integration test, which
+        // gives each run a fresh temp WAB dir; the unit tests could not see it
+        // because they varied the record index.
+        let t = tmpl("dt=%Y-%m-%d/hour=%H");
+        let run1 = object_key("p", &t, T, &batch_name(T, RID, 20), "ndjson");
+        let run2 = object_key("p", &t, T + 1, &batch_name(T + 1, RID, 20), "ndjson");
+        assert_ne!(
+            run1, run2,
+            "two WAB lifetimes in the same partition hour must not share a key"
         );
     }
 
@@ -313,8 +349,8 @@ mod tests {
         // failure to duplication, which at-least-once absorbs.
         let t = tmpl("dt=%Y-%m-%d/hour=%H");
         assert_ne!(
-            object_key("p", &t, T, &batch_name(RID, 100), "ndjson"),
-            object_key("p", &t, T, &batch_name(RID, 50), "ndjson")
+            object_key("p", &t, T, &batch_name(T, RID, 100), "ndjson"),
+            object_key("p", &t, T, &batch_name(T, RID, 50), "ndjson")
         );
     }
 
@@ -325,30 +361,45 @@ mod tests {
         // different date. A real assertion — not a TZ-mutation test, which
         // would prove nothing against a pure function that never reads TZ and
         // would race sibling tests that read AWS_* from the environment.
-        let key = object_key("", &tmpl("dt=%Y-%m-%d"), T, &batch_name(RID, 1), "ndjson");
+        let key = object_key(
+            "",
+            &tmpl("dt=%Y-%m-%d"),
+            T,
+            &batch_name(T, RID, 1),
+            "ndjson",
+        );
         assert!(key.starts_with("dt=2026-09-06/"), "must be UTC, got {key}");
     }
 
     #[test]
     fn an_empty_prefix_produces_no_leading_slash() {
-        let key = object_key("", &tmpl("dt=%Y-%m-%d"), T, &batch_name(RID, 1), "ndjson");
-        assert_eq!(key, format!("dt=2026-09-06/{RID}-1.ndjson"));
+        let key = object_key(
+            "",
+            &tmpl("dt=%Y-%m-%d"),
+            T,
+            &batch_name(T, RID, 1),
+            "ndjson",
+        );
+        assert_eq!(
+            key,
+            format!("dt=2026-09-06/{}.ndjson", batch_name(T, RID, 1))
+        );
         assert!(!key.starts_with('/'), "S3 keys must not start with '/'");
     }
 
     #[test]
     fn an_empty_template_disables_partitioning() {
         assert_eq!(
-            object_key("p", &tmpl(""), 0, &batch_name(RID, 7), "ndjson"),
-            format!("p/{RID}-7.ndjson")
+            object_key("p", &tmpl(""), 0, &batch_name(0, RID, 7), "ndjson"),
+            format!("p/{}.ndjson", batch_name(0, RID, 7))
         );
     }
 
     #[test]
     fn a_trailing_slash_on_the_prefix_does_not_double_up() {
         assert_eq!(
-            object_key("p/", &tmpl(""), 0, &batch_name(RID, 7), "ndjson"),
-            format!("p/{RID}-7.ndjson")
+            object_key("p/", &tmpl(""), 0, &batch_name(0, RID, 7), "ndjson"),
+            format!("p/{}.ndjson", batch_name(0, RID, 7))
         );
     }
 
@@ -359,7 +410,7 @@ mod tests {
             "",
             &tmpl("%Y/%m/%d/%H"),
             1_767_323_045 * 1_000_000_000,
-            &batch_name(RID, 1),
+            &batch_name(T, RID, 1),
             "x",
         );
         assert!(key.starts_with("2026/01/02/03/"), "got {key}");
@@ -450,13 +501,19 @@ mod tests {
         // Collision freedom rests on the LAST '-' being the separator, which
         // holds because a decimal count contains no '-'. Without the separator
         // these two distinct batches would produce the same name.
-        assert_ne!(batch_name("a1", 23), batch_name("a12", 3));
-        assert_eq!(batch_name("a1", 23), "a1-23");
+        assert_ne!(batch_name(T, "a1", 23), batch_name(T, "a12", 3));
+        assert!(
+            batch_name(T, "a1", 23).ends_with("-a1-23"),
+            "{}",
+            batch_name(T, "a1", 23)
+        );
+        // created_at is fixed-width hex, so it can never introduce a '-'.
+        assert_eq!(batch_name(T, "x", 1).len(), 16 + 1 + 1 + 1 + 1);
     }
 
     #[test]
     fn prefix_and_template_slashes_are_trimmed_on_both_ends() {
-        let k = object_key("/p/", &tmpl("/dt=%Y/"), T, &batch_name(RID, 1), "x");
-        assert_eq!(k, format!("p/dt=2026/{RID}-1.x"));
+        let k = object_key("/p/", &tmpl("/dt=%Y/"), T, &batch_name(T, RID, 1), "x");
+        assert_eq!(k, format!("p/dt=2026/{}.x", batch_name(T, RID, 1)));
     }
 }

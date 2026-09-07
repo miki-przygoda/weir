@@ -41,6 +41,14 @@ pub struct WeirServer {
     /// `batch_deadline_ms` value the daemon was launched with — handy for
     /// bench scenarios that name themselves after the deadline.
     pub batch_deadline_ms: u64,
+    /// Environment the child was started with, retained so
+    /// [`restart_in_place`](Self::restart_in_place) can reapply it.
+    ///
+    /// Without this a restarted daemon silently loses every `.env()` the
+    /// builder set — which for a sink configured by environment (credentials,
+    /// `WEIR_SINK_URL`) means the respawned process cannot reach its
+    /// downstream at all, and the test fails somewhere far from the cause.
+    env: Vec<(String, String)>,
     /// Held for the lifetime of the handle to serialise process spawning.
     _proc_lock: MutexGuard<'static, ()>,
 }
@@ -199,12 +207,17 @@ impl WeirServer {
             .open(&log_path)
             .unwrap();
 
-        let child = Command::new(&self.binary_path)
-            .args(["--config", self.config_path.to_str().unwrap()])
+        let mut cmd = Command::new(&self.binary_path);
+        cmd.args(["--config", self.config_path.to_str().unwrap()])
             .stdout(Stdio::from(log_file.try_clone().unwrap()))
-            .stderr(Stdio::from(log_file))
-            .spawn()
-            .expect("failed to respawn weir-server");
+            .stderr(Stdio::from(log_file));
+        // Reapply the builder's environment: the restarted process is the same
+        // daemon, and a sink configured by env must still be able to reach its
+        // downstream after a crash.
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        let child = cmd.spawn().expect("failed to respawn weir-server");
 
         self.child = Some(child);
         self.wait_ready(Duration::from_secs(15));
@@ -550,6 +563,7 @@ impl WeirServerBuilder {
             metrics_port,
             tcp_addr,
             batch_deadline_ms: self.batch_deadline_ms,
+            env: self.env,
             _proc_lock,
         };
 
