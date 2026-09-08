@@ -1,5 +1,6 @@
 # Benchmark Results
 
+Version: 2.1.0  
 Last updated: 2026-09-08 18:52 UTC  
 Averaged over: 5 CI run(s) per deadline  
 Server config: `shard_count=4`, `batch_size=64`

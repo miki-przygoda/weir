@@ -33,7 +33,7 @@ they are two selectable tiers today.
 
 > See [latest.md](benchmarks/latest.md) for the full tables and
 > [history.md](benchmarks/history.md) for the trend over time. The figures
-> below are rounded from one averaged CI run (v2.0.3, 2026-09-02, 5 passes per
+> below are rounded from one averaged CI run (v2.1.0, 2026-09-08, 5 passes per
 > deadline, `shard_count=4`, `batch_size=64`). **This index is hand-maintained
 > and is not regenerated** — `deploy/avg_benchmarks.py` writes `latest.md` and
 > appends to `history.md`, and says so at its own line 9. When the two disagree,
@@ -46,12 +46,33 @@ they are two selectable tiers today.
 
 ### Throughput at `batch_deadline_ms=1`
 
-| Scenario | RPS | ±σ across the 5 passes |
-|----------|-----|-----|
-| Single thread, Buffered | ~13,850 | ±352 |
-| Single thread, Durable | ~3,670 | ±82 |
-| Thundering herd, 64 threads | ~52,250 | ±1,973 |
-| Saturation ceiling (Buffered, 48 threads) | ~91,400 | not sampled |
+| Scenario | Concurrency | RPS | ±σ across the 5 passes |
+|----------|---|-----|-----|
+| Single thread, Buffered | 1 | ~13,100 | ±160 |
+| Single thread, Durable | 1 | ~2,400 | ±91 |
+| Thundering herd, Buffered | 64 | ~47,200 | ±1,673 |
+| Saturation ceiling, Buffered | 48 | ~96,200 | not sampled |
+| Saturation ceiling, Durable | 48 | ~43,200 | not sampled |
+
+> **The single-thread rows are latency reciprocals, not ceilings.** Read down
+> the `Durable` rows: the same tier, on the same runner, in the same run set,
+> does ~2,400 rec/s on one connection and ~43,200 across 48 — **18×**. Nothing
+> about the daemon changed between those two rows.
+>
+> `Durable` is a group commit at the batch boundary
+> (`crates/weir-core/src/durability.rs`), and the daemon acks frame N before
+> reading frame N+1 on a connection
+> (`crates/weir-server/src/socket/connection.rs`). One synchronous producer
+> therefore pays one fsync per record and is bound by fsync *latency*: 1 ÷ 2,400
+> = 417 µs, which is that run's `Durable` mean of 428 µs. Concurrency is what
+> fills a batch, and a filled batch is what amortises the fsync.
+>
+> So a single-thread figure answers "how fast can one caller push-and-wait on
+> this hardware", and only a concurrent figure answers "how much can the daemon
+> absorb". Quoting the first as the second understates weir by more than an
+> order of magnitude — and, because the number is a property of the platform's
+> fsync primitive as much as of weir, it does not transfer between machines
+> either (see [environments.md](benchmarks/environments.md)).
 
 ### Latency at `batch_deadline_ms=1` (single thread)
 
@@ -62,9 +83,9 @@ rows below are the same tier measured twice, not two tiers.
 
 | Tier (scenario tag) | p50 | p99 |
 |------|-----|-----|
-| Buffered | ~70 µs | ~96 µs |
-| Durable (`Sync` tag) | ~265 µs | ~381 µs |
-| Durable (`Batched` tag, historical) | ~265 µs | ~391 µs |
+| Buffered | ~73 µs | ~149 µs |
+| Durable (`Sync` tag) | ~384 µs | ~933 µs |
+| Durable (`Batched` tag, historical) | ~389 µs | ~946 µs |
 
 *Numbers above are approximate CI figures (sandboxed GitHub runners), not a baseline.
 Exact figures are in [latest.md](benchmarks/latest.md); for claims on named

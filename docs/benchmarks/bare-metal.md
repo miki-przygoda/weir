@@ -14,6 +14,17 @@ yet, so the gate is not operable and its thresholds below are unvalidated.**
 > `deploy/run_bare_metal_bench.sh`
 > on the target machine and replace this section with the script's
 > output.
+>
+> **This being empty does not mean weir has no citable numbers.** It means it
+> has no *repeatable gate*. Point-in-time captures on named hardware do exist —
+> [`snapshot-2026-06-13-beast.md`](snapshot-2026-06-13-beast.md) (SATA SSD,
+> honest `fdatasync`), [`snapshot-2026-06-13-mac.md`](snapshot-2026-06-13-mac.md)
+> (NVMe, `F_BARRIERFSYNC`), [`phase3-results.md`](phase3-results.md) and
+> [`drain-throughput.md`](drain-throughput.md) — and
+> [`environments.md`](environments.md) lists what may be cited from them. What
+> those cannot do is gate a release: they were taken at fixed commits and
+> nothing re-runs them, so there is no before-and-after to compare a candidate
+> against.
 
 ## Regression policy
 

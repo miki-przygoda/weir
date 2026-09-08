@@ -737,7 +737,7 @@
     {
       "type": "heatmap",
       "title": "fsync duration distribution",
-      "description": "The dominant durable-write latency signal. NVMe baseline ~150\u00b5s, SATA SSD ~1.4ms.",
+      "description": "The dominant durable-write latency signal. Linux fdatasync: NVMe baseline ~150\u00b5s, SATA SSD ~1.4ms. On macOS this is a different primitive, not a slower disk \u2014 the WAB record path uses F_BARRIERFSYNC (~238\u00b5s on an M3 Max) and the drain confirm pays F_FULLFSYNC (~3,965\u00b5s), so a macOS panel is not comparable to a Linux one at all. See docs/benchmarks/environments.md.",
       "gridPos": {
         "h": 8,
         "w": 12,

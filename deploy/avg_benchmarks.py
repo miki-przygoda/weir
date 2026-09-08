@@ -195,7 +195,7 @@ def build_stage_md(stage_groups: dict[str, list[dict]]) -> str:
     return "\n".join(lines)
 
 
-def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
+def build_md(groups: dict[str, list[dict]], run_count: int, version: str) -> str:
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # Detect which deadlines are actually present in results.
@@ -208,6 +208,7 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
     lines = [
         "# Benchmark Results",
         "",
+        f"Version: {version}  ",
         f"Last updated: {now}  ",
         f"Averaged over: {run_count} CI run(s) per deadline  ",
         f"Server config: `shard_count=4`, `batch_size=64`",
@@ -590,7 +591,12 @@ def main():
         sys.exit(1)
 
     run_count = max(len(v) for v in groups.values()) if groups else 0
-    md = build_md(groups, run_count) if groups else ""
+    # Read once and stamp it into BOTH outputs. Until 2.1.0 this was read
+    # inside the `if history_path:` arm below and reached `history.md` alone,
+    # so `latest.md` carried no version at all -- which is how the README's
+    # "as of" line drifted two releases behind with nothing to catch it.
+    version = os.environ.get("WEIR_VERSION", "dev")
+    md = build_md(groups, run_count, version) if groups else ""
     stage_md = build_stage_md(stage_groups)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -599,7 +605,6 @@ def main():
     print(f"Wrote {output_path} ({run_count} run(s), {len(groups)} scenario(s), {len(stage_groups)} stage scenario(s))")
 
     if history_path:
-        version = os.environ.get("WEIR_VERSION", "dev")
         append_history(groups, run_count, history_path, version)
 
 

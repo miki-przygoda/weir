@@ -24,8 +24,9 @@ wire format + Rust API under SemVer
 run — 2.1.0 as of 2026-09-08
 ([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
 [`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner, and
-this project's own rule is that external performance claims cite bare-metal
-numbers, which have not been captured yet. The "microseconds" above is the fsync:
+this project's own rule is that external performance claims cite an operator-run
+capture on named hardware, with the storage and its fsync primitive disclosed
+([`environments.md`](docs/benchmarks/environments.md#what-an-external-claim-may-cite)). The "microseconds" above is the fsync:
 a `Durable` ack is one fsync, so it is your disk's number, not weir's. Measured
 single-thread `Durable` p50 is ~133–152 µs on a Mac NVMe — where the primitive is
 macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4–1.5 ms** on a
