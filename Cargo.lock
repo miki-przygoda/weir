@@ -2777,6 +2777,7 @@ dependencies = [
 name = "weir-sink-s3"
 version = "2.1.0"
 dependencies = [
+ "base64",
  "flate2",
  "hmac 0.12.1",
  "reqwest",

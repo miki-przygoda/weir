@@ -44,6 +44,14 @@ pub(crate) fn classify(status: u16, s3_code: Option<&str>) -> Classification {
                 | "RequestTimeTooSkewed"
                 | "NoSuchBucket"
                 | "SlowDown"
+                // A fact about the DESTINATION, not about these bytes. S3
+                // returns it when a PutObject lands under an Object Lock
+                // retention period without a checksum header -- including a
+                // bucket DEFAULT retention, which no individual record knows
+                // about. Classifying it Permanent dead-lettered every batch in
+                // the backlog while health() reported Healthy, because
+                // HeadBucket keeps succeeding.
+                | "InvalidRequest"
         )
     ) {
         return Classification::Transient;
@@ -81,7 +89,8 @@ pub(crate) fn classify(status: u16, s3_code: Option<&str>) -> Classification {
     match status {
         // Genuinely record-level: these are facts about the bytes just sent,
         // and the same bytes will be rejected again.
-        //   400 -- a malformed request not matched above
+        //   400 -- a malformed request not matched above (note
+        //          InvalidRequest is matched above and strands)
         //   411 -- missing Content-Length (unreachable via reqwest)
         //   413 -- EntityTooLarge: this batch is too big for the endpoint
         400 | 411 | 413 => Classification::Permanent,
@@ -297,7 +306,25 @@ impl S3Client {
         body: Vec<u8>,
         content_type: &'static str,
     ) -> Result<(), S3Error> {
-        let mut extra = vec![("content-type".to_string(), content_type.to_string())];
+        let mut extra = vec![
+            ("content-type".to_string(), content_type.to_string()),
+            // REQUIRED, not optional. S3 rejects any PutObject landing under an
+            // Object Lock retention period unless the request carries
+            // Content-MD5 or an x-amz-checksum-* header -- and that includes a
+            // bucket DEFAULT retention the caller never mentions. Without it S3
+            // answers 400 InvalidRequest and, before this was fixed, weir
+            // dead-lettered the entire backlog while reporting Healthy.
+            //
+            // SHA-256 rather than MD5 because the payload digest is already
+            // computed for SigV4, so this costs one base64 of bytes we hashed
+            // anyway and avoids adding an md5 crate. Being an x-amz-* header it
+            // is signed, which is why it goes through `extra` rather than being
+            // attached after signing.
+            (
+                "x-amz-checksum-sha256".to_string(),
+                crate::sigv4::sha256_base64(&body),
+            ),
+        ];
         extra.extend(self.put_headers.iter().cloned());
         let (status, body_text) = self.send("PUT", key, body, extra).await?;
         if (200..300).contains(&status) {
@@ -395,11 +422,7 @@ mod tests {
         // Dead-lettering is for bytes the downstream will never accept.
         // EntityTooLarge is the real one: this batch is too big for the
         // endpoint, and the same bytes will be rejected again.
-        for (s, code) in [
-            (400u16, Some("InvalidRequest")),
-            (413, Some("EntityTooLarge")),
-            (411, None),
-        ] {
+        for (s, code) in [(413u16, Some("EntityTooLarge")), (411, None)] {
             assert_eq!(
                 classify(s, code),
                 Classification::Permanent,
@@ -428,6 +451,24 @@ mod tests {
                 "status {s} code {code:?}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_request_strands_because_it_is_usually_a_bucket_policy_fact() {
+        // S3 answers 400 InvalidRequest when a PutObject lands under an Object
+        // Lock retention period without a checksum header -- including a
+        // BUCKET DEFAULT retention, which no individual record knows about. It
+        // is therefore a fact about the destination, not about these bytes, and
+        // classifying it Permanent dead-lettered every batch in the backlog
+        // while health() still reported Healthy (HeadBucket keeps succeeding).
+        //
+        // weir now always sends a checksum (see S3Client::put_object), so this
+        // should not arise -- but a provider that rejects a request for any
+        // other reason under this code must strand, not destroy acked records.
+        assert_eq!(
+            classify(400, Some("InvalidRequest")),
+            Classification::Transient
+        );
     }
 
     #[test]
