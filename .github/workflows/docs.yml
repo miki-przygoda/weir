@@ -64,7 +64,17 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v3
         with:
-          path: book
+          # book/html, NOT book. `[output.linkcheck]` in book.toml is a second
+          # mdBook *backend*, and with more than one backend mdBook writes each
+          # one into book/<backend>/ rather than book/. Uploading `book`
+          # therefore published a root containing html/ and linkcheck/ and no
+          # index.html, so https://miki-przygoda.github.io/weir/ returned 404
+          # while .../weir/html/ served the site correctly.
+          #
+          # This depends on linkcheck being installed: it is `optional = true`,
+          # so a build without it has a single backend and does write to book/.
+          # The step above always installs it, so book/html is always right here.
+          path: book/html
 
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
