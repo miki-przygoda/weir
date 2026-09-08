@@ -1581,6 +1581,56 @@ mod tests {
     /// that drops or mis-wires one knob's guard. Each case sets exactly one knob
     /// just past a bound; all others default to in-range, so only the target
     /// field's check fires.
+    /// Drift guard: every sink the daemon accepts must be named in the README's
+    /// "Built-in sinks" line.
+    ///
+    /// This exists because it already went wrong. The 2.1.0 release added the S3
+    /// sink, updated the README's sink *count* and its crates table, and left the
+    /// prose list saying five — so the README announced `s3` in one paragraph and
+    /// omitted it from the list 27 lines later. A count is easy to grep for and
+    /// remember; a prose list is not, which is exactly why it needs a test.
+    ///
+    /// Gated on the full sink feature set so the assertion is exhaustive: under a
+    /// partial build `SinkType::parse` rejects the absent sinks and the test would
+    /// silently check less than it claims. CI runs `--all-features`.
+    #[cfg(all(
+        feature = "http-sink",
+        feature = "mysql-sink",
+        feature = "postgres-sink",
+        feature = "clickhouse-sink",
+        feature = "s3-sink"
+    ))]
+    #[test]
+    fn readme_lists_every_sink_the_daemon_accepts() {
+        const README: &str = include_str!("../../../../README.md");
+        // The canonical set. Adding a sink means adding it here, which is the
+        // prompt to add it to the README in the same change.
+        const SINKS: &[&str] = &["noop", "http", "mysql", "postgres", "clickhouse", "s3"];
+
+        let line = README
+            .lines()
+            .find(|l| l.contains("Built-in sinks:"))
+            .expect("README must carry a 'Built-in sinks:' line");
+        // The list wraps, so take it and the following few lines.
+        let start = README.find(line).unwrap();
+        let block: String = README[start..]
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for sink in SINKS {
+            assert!(
+                SinkType::parse(sink).is_ok(),
+                "{sink} is in the canonical list but the daemon rejects it"
+            );
+            assert!(
+                block.contains(&format!("`{sink}`")),
+                "the README's 'Built-in sinks' block does not name `{sink}`:\n{block}"
+            );
+        }
+    }
+
     #[test]
     fn bounded_scalar_knobs_reject_out_of_range() {
         assert_knob_rejected("rng_batch_size", "batch_size", |p| p.batch_size = Some(0));

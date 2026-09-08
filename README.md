@@ -21,16 +21,18 @@ records at the durable tier, **none lost**
 wire format + Rust API under SemVer
 
 *Latency and throughput figures are deliberately not quoted here. Every published
-run — 2.0.3 as of 2026-09-02
+run — 2.1.0 as of 2026-09-08
 ([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
 [`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner, and
 this project's own rule is that external performance claims cite bare-metal
 numbers, which have not been captured yet. The "microseconds" above is the fsync:
 a `Durable` ack is one fsync, so it is your disk's number, not weir's. Measured
 single-thread `Durable` p50 is ~133–152 µs on a Mac NVMe — where the primitive is
-macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4 ms** on a
+macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4–1.5 ms** on a
 SATA SSD with an honest Linux `fdatasync`
-([comparison](docs/benchmarks/snapshot-2026-06-13-comparison.md)). Measure on
+([comparison](docs/benchmarks/snapshot-2026-06-13-comparison.md) measured 1.5 ms;
+[phase 3](docs/benchmarks/phase3-results.md) measured 1.4 ms on the same box —
+the spread is the storage, not the software). Measure on
 your own hardware: `cargo test -p weir-server --test load --release -- --nocapture`.*
 
 **▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
@@ -45,8 +47,8 @@ browser. *(Hosted version coming with the public launch.)*
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
 > format for non-Rust implementers. The WAB on-disk format is stable and
 > unconfirmed segments replay on restart. Built-in sinks: `noop`, `http`,
-> `mysql`, `postgres` in the default build, plus `clickhouse` behind the opt-in
-> `clickhouse-sink` Cargo feature (see [Crates](#crates) and the
+> `mysql`, `postgres` in the default build, plus `clickhouse` and `s3` behind
+> the opt-in `clickhouse-sink` and `s3-sink` Cargo features (see [Crates](#crates) and the
 > [configuration reference](docs/operations/configuration.md)). WAB flusher and
 > drain threads are panic-supervised. Published on crates.io.
 >
