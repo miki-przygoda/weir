@@ -15,6 +15,27 @@ protocol** below.
 
 ## [Unreleased]
 
+### Changed
+
+- **Local CI now runs the real workflow, via [`act`](https://nektosact.com).**
+  `.actrc` at the repo root pins the runner images, so a fresh clone can run
+  `act -W .github/workflows/ci.yml -j lint` with no configuration — act
+  otherwise prompts for an image on first run and dies under any
+  non-interactive invocation.
+
+  The previous approach parsed `ci.yml` and executed its `run:` steps inside a
+  hand-built image, which closes the drift hole in the *command list* and leaves
+  it open in the *toolchain*: that image carried Debian's `go1.19.8` against a
+  `go.mod` requiring `go 1.26.3`, so the polyglot conformance step it existed to
+  run had become a step that always failed. act runs `actions/setup-go@v5` and
+  `dtolnay/rust-toolchain` themselves, so there is no image to keep in step.
+
+  `sink-integration` and `monitoring` turn out to run fine under act — it binds
+  the Docker socket and uses `network="host"`, so their `docker compose`
+  services come up as siblings with reachable ports. Only `windows` and the
+  macOS half of `build` genuinely cannot run in a Linux container, and
+  `deploy/ci-local/README.md` still says so rather than skipping them silently.
+
 Two independent pieces: the S3 sink (a new published crate and a minor version
 bump), and the second-sweep fixes below.
 

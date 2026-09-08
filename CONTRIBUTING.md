@@ -39,14 +39,24 @@ worth running **everything CI runs**, in Docker, against the same toolchain — 
 catches the red builds that cost a ten-minute round trip and Actions minutes to
 discover, and it catches the ones this gate structurally cannot see.
 
-[`deploy/ci-local/README.md`](deploy/ci-local/README.md) describes how, in about
-a page: parse `.github/workflows/ci.yml` and execute its own `run:` steps rather
-than restating them, so the local run cannot drift from CI. It also lists the
-traps worth knowing before you start — the two kinds of `uses:` step and how
-conflating them produces a runner that passes having checked nothing, plus the
-arm64, stale-artifact and toolchain-version issues that bite in practice.
+Use [`act`](https://nektosact.com), which runs `.github/workflows/ci.yml` in
+Docker:
 
-No tooling is committed for this, and that note explains why.
+```bash
+brew install act
+act -W .github/workflows/ci.yml -j lint     # one job
+act -W .github/workflows/ci.yml             # everything runnable
+```
+
+Runner images are pinned in [`.actrc`](.actrc), so a fresh clone needs no
+configuration. act executes the workflow's *actions* — `actions/setup-go@v5`,
+`dtolnay/rust-toolchain` — rather than a transcription of them, so a local run
+cannot drift from CI in either its command list or its toolchain.
+
+[`deploy/ci-local/README.md`](deploy/ci-local/README.md) has the detail: which
+two jobs genuinely cannot run in a Linux container and why saying so matters
+more than skipping them, plus the arm64, `cargo-deny` index and copy-vs-bind
+traps that bite in practice.
 
 ## The pre-PR gate
 
