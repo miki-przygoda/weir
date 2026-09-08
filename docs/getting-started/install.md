@@ -31,6 +31,39 @@ method.)
   constructor, stays Unix-only.
 - ~500 MB free disk (build artifacts).
 
+### Storage prerequisites — the part that decides whether weir works
+
+Everything above is about getting a binary. This is about whether that binary
+can keep the promise it makes. weir's entire guarantee is "a `Durable` ack means
+the record is on stable storage", and that reduces to one `fsync` on the WAB
+directory's filesystem — so the WAB's storage *is* weir's durability.
+
+- **Put the WAB on a local block device.** Not NFS, not SMB, not EFS, not a
+  virtiofs share. Those are untested here and unwise regardless: the argument
+  rests on `fsync` semantics a network filesystem does not necessarily provide,
+  and a lie there is a silent lie — weir acks, and the record is not there.
+- **Give it its own filesystem, or at least its own headroom.** A full disk
+  turns every push into a Nack. Set
+  [`wab_max_bytes`](../operations/configuration.md#wab_max_bytes) so weir
+  refuses before the device does, which is a visible failure rather than a
+  confusing one.
+- **Run production data paths on Linux.** On macOS the WAB record path uses
+  `F_BARRIERFSYNC`, an ordering barrier that does not force the drive's volatile
+  cache to the medium, so **macOS is not power-loss safe at any durability
+  tier** — the daemon warns about this at startup. macOS is a fine development
+  platform and a poor durability one. See
+  [Platform support](../platform-support.md#durability-by-platform).
+- **A drive that lies about flushing defeats everything above.** Most consumer
+  SSDs have a volatile write cache; `fdatasync` returning is only a durability
+  claim if the device honours cache-flush. Enterprise drives with
+  power-loss-protected cache, or a battery/capacitor-backed controller, are what
+  makes the `Durable` tier mean what it says on hardware you do not control.
+- **`Buffered` is not power-loss durable, by design.** It acks before any fsync.
+  A process crash survives — the bytes are in the page cache and the kernel
+  writes them out — but a power cut or kernel panic is a loss window. Choose it
+  per record where the data is replaceable; the tier is a per-record wire byte,
+  so one connection can mix both.
+
 ### Build
 
 ```bash

@@ -1134,6 +1134,78 @@ fn mixed_durability_under_concurrent_load() {
     }
 }
 
+#[test]
+fn one_connection_can_interleave_both_durability_tiers() {
+    // The tier is a per-RECORD wire byte (envelope header offset 6), not a
+    // connection or a daemon setting, so a single producer can ask for a
+    // different guarantee on each push -- `Durable` for the transaction, the
+    // `Buffered` fast path for the telemetry beside it, over one socket.
+    //
+    // Nothing said so until now, and nothing tested the interleaved case:
+    // `mixed_durability_under_concurrent_load` gives each *thread* one fixed
+    // tier, and `all_durability_tiers_behave_per_contract` measures the tiers
+    // in separate phases. Both would pass against an implementation that read
+    // the tier correctly in a homogeneous stream but not a mixed one.
+    //
+    // Asserted through the fsync counter rather than the ack counters, because
+    // `weir_records_ack_total{tier}` is labelled from the request header
+    // (`socket/connection.rs`) and would agree with itself even if the flusher
+    // ignored the field entirely. `weir_wab_fsync_duration_seconds_count`
+    // increments once per real fsync syscall, and the flusher skips the group
+    // fsync when a batch holds no Durable record (`wab/mod.rs`), so on a
+    // serial push-and-wait connection -- one record per batch -- the count must
+    // rise by the number of Durable pushes and not by the total.
+    const PAIRS: u64 = 20;
+
+    let srv = weir_server!("interleaved_tiers").start();
+    let mut client = srv.client();
+    let fsyncs = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_wab_fsync_duration_seconds_count",
+        )
+    };
+
+    let before = fsyncs();
+    for i in 0..PAIRS {
+        client
+            .push(format!("durable-{i}").as_bytes(), Durability::Durable)
+            .unwrap_or_else(|e| panic!("durable push {i}: {e}"));
+        client
+            .push(format!("buffered-{i}").as_bytes(), Durability::Buffered)
+            .unwrap_or_else(|e| panic!("buffered push {i}: {e}"));
+    }
+    thread::sleep(Duration::from_millis(150));
+    let delta = fsyncs() - before;
+
+    assert!(
+        delta >= PAIRS,
+        "{PAIRS} interleaved Durable pushes produced only {delta} fsyncs. A \
+         Durable record sharing a stream with Buffered ones must still force \
+         the group fsync before its ack."
+    );
+    assert!(
+        delta < PAIRS * 2,
+        "{delta} fsyncs for {PAIRS} Durable + {PAIRS} Buffered pushes. The \
+         Buffered records are being fsynced too, so the flusher is not reading \
+         the tier per record -- it is applying one tier to the whole stream."
+    );
+
+    // And both tiers were actually accepted, not merely counted.
+    let body = srv.scrape_metrics();
+    for label in ["durable", "buffered"] {
+        let acked = parse_metric(
+            &body,
+            &format!("weir_records_ack_total{{tier=\"{label}\"}}"),
+        );
+        assert_eq!(
+            acked, PAIRS,
+            "one connection pushed {PAIRS} records at each tier; the {label} \
+             counter reads {acked}"
+        );
+    }
+}
+
 // ── Crash recovery ────────────────────────────────────────────────────────────
 
 #[test]

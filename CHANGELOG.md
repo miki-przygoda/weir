@@ -72,11 +72,32 @@ protocol** below.
   — and reading it as speed suggests "buy an NVMe and `Durable` gets 11×
   cheaper", which is false.
 
+- The wire protocol, `integrating.md` and the README now say that the durability
+  tier is a **per-record** wire byte, so one connection can interleave `Durable`
+  and `Buffered` freely — true since 1.0, stated nowhere, and tested nowhere
+  until now. The Ack frame's durability byte is always `0x01`; the protocol doc
+  now warns non-Rust clients not to read it as confirmation of the tier.
+- `install.md` had no durability prerequisites at all — nothing about local
+  storage, network filesystems, headroom, drive write caches, or the macOS
+  barrier — for a system whose whole guarantee is one `fsync`.
+- The README's "an ack is never a false ack" was stated unconditionally; it
+  holds at the `Durable` tier. The chaos figure now also carries the `Buffered`
+  result measured in the same runs (uniform loss, 1.76 s ceiling) and the
+  platform it was measured on.
+- `batch-tuning.md`'s "3.6–7.9× throughput improvement" is a 3-trial median on
+  the shared sandbox the file's own caveat calls too noisy to quote, computed
+  against a nominal default the project never actually ran. Against the config
+  CI used, the same table shows ~4%.
+
 ### Fixed (tooling)
 
 - `deploy/avg_benchmarks.py` read `WEIR_VERSION` inside the history-writing
   branch only, so `history.md` was stamped and `latest.md` was not — leaving
   every hand-written "as of" line in the tree free to drift.
+- Benchmark rows poisoned by a descheduled CI runner (single-thread `Sync` p99
+  of 28.2 ms, 35.5 ms and 98.9 ms, against a healthy ceiling near 3.6 ms) sat
+  unannotated in the published trend. The generator now marks them `(!)` at
+  write time, and the three existing rows are backfilled.
 
 ---
 

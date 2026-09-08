@@ -105,6 +105,27 @@ Change `Config::from_layers` defaults to `batch_size = 256`,
 
 Applied in the commit that follows this doc.
 
+> **Read those two multipliers narrowly; they travel badly.** Both are medians
+> of **three trials on a shared-VM sandbox**, the surface this file's own caveat
+> calls too noisy to quote absolutely, and [Interpretation](#interpretation) attributes a smaller discrepancy to
+> run-to-run noise in exactly this data. The direction is solid —
+> no measured scenario favours the old pair — but "3.6–7.9×" is one sweep's
+> spread, not a reproducible range.
+>
+> The baseline matters as much as the noise. The multipliers are computed
+> against `(1000, 10 ms)`, the *nominal* default of the time, which the bullet
+> above notes **nothing actually ran**: CI used `batch_size = 64`, and the bench
+> job and smoke test used `batch_deadline_ms = 1`. So the gain is real for a
+> hypothetical operator who took the shipped defaults untouched, and close to
+> nothing for anyone whose config resembled what the project itself exercised.
+> Against `(64, 1 ms)` the same table shows 506 vs 486 single-thread sync RPS —
+> about 4%.
+>
+> Do not quote either figure as a weir performance improvement. The change was
+> right for a better reason: the defaults had drifted away from every
+> configuration the project tested, and a default nobody exercises is a default
+> nobody has debugged.
+
 ## Throughput companion sweep
 
 Same 5 configs × 3 trials, but using the `baseline_*_throughput*` and

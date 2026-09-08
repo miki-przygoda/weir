@@ -21,6 +21,7 @@ const DASHBOARD: &str = include_str!("../../../deploy/grafana/weir-dashboard.jso
 const PLATFORMS: &str = include_str!("../../../docs/platform-support.md");
 const RELEASE_YML: &str = include_str!("../../../.github/workflows/release.yml");
 const PEER: &str = include_str!("../src/socket/peer.rs");
+const HISTORY: &str = include_str!("../../../docs/benchmarks/history.md");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -321,4 +322,58 @@ fn peer_uid_is_implemented_for_exactly_the_platforms_the_docs_name() {
              half of why a daemon on a non-Linux, non-macOS Unix looks hung"
         );
     }
+}
+
+/// Three rows in the published benchmark trend were poisoned by a descheduled
+/// CI runner — 28.2 ms, 35.5 ms and 98.9 ms single-thread `Sync` p99, against a
+/// healthy range topping out near 3.6 ms — and sat there unannotated, reading
+/// as catastrophic regressions that never happened.
+///
+/// `deploy/avg_benchmarks.py` now marks them at write time. This checks the
+/// marking is complete, so a row that slips through unmarked (a threshold
+/// change, a generator regression, a hand-edited row) fails here rather than
+/// being quoted as trend.
+#[test]
+fn every_hostile_runner_row_in_the_trend_is_marked() {
+    // Matches the generator's HOSTILE_RUNNER_P99_US.
+    const THRESHOLD_MS: f64 = 10.0;
+
+    let mut checked = 0usize;
+    for line in HISTORY.lines().filter(|l| l.starts_with("| ")) {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // | version | date | runs | sync rps | sync p99 | buf p50 | ramp |
+        let Some(p99) = cells.get(5) else { continue };
+        let Some(ms) = p99
+            .strip_suffix(" ms")
+            .or_else(|| p99.strip_suffix(" ms (!)"))
+        else {
+            continue; // µs rows are far below the threshold, and the header.
+        };
+        let Ok(value) = ms.parse::<f64>() else {
+            continue;
+        };
+        checked += 1;
+        if value > THRESHOLD_MS {
+            assert!(
+                p99.ends_with("(!)"),
+                "history.md row `{}` has a single-thread Sync p99 of {value} ms, \
+                 past the {THRESHOLD_MS} ms hostile-runner threshold, and is not \
+                 marked `(!)`. At one connection and one fsync per record weir \
+                 cannot produce that; it is the shared runner being descheduled \
+                 mid-measurement, and an unmarked row gets read as a regression \
+                 that never happened.",
+                line.trim()
+            );
+        }
+    }
+    assert!(
+        checked >= 3,
+        "parsed {checked} millisecond p99 rows out of history.md; the table shape \
+         must have changed and this guard is no longer reading anything"
+    );
+    assert!(
+        HISTORY.contains("`(!)` marks a run the runner poisoned"),
+        "history.md no longer explains its `(!)` marker, so the rows carrying it \
+         are more confusing than the unmarked ones were"
+    );
 }

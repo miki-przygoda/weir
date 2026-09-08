@@ -11,12 +11,17 @@ A durable, high-throughput write buffer for Rust.
 your database catch up in bulk.** weir writes each record to a CRC32-checksummed
 write-ahead buffer, fsyncs it according to the durability tier you ask for, acks
 the producer, then drains records to your sink in batches — turning N per-record
-commits into 1. **An ack is never a false ack:** an acked record is on disk and
-replays after a crash.
+commits into 1. **At the `Durable` tier an ack is never a false ack:** an acked
+record is on disk and replays after a crash. (`Buffered` acks before the fsync
+and deliberately trades that away — the tier is a per-record choice, so one
+connection can mix them.)
 
 **Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
-records at the durable tier, **none lost**
-([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md)) ·
+records at the durable tier, **none lost** — and, in the same runs, `Buffered`
+loss measured as uniform between zero and one writeback interval, ceiling 1.76 s
+([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md);
+real kernel power cuts on Linux, which is the platform the guarantee is claimed
+for — see [platform support](docs/platform-support.md#durability-by-platform)) ·
 6 built-in sinks (4 in a default build; `clickhouse` and `s3` opt-in) ·
 wire format + Rust API under SemVer
 
