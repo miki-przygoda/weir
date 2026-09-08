@@ -380,6 +380,79 @@ fn idle_seal_drains_low_volume_segment_without_shutdown() {
 }
 
 #[test]
+fn idle_seal_does_not_fire_for_a_producer_that_never_goes_idle() {
+    // `wab_segment_max_age_secs` reads as a maximum age and is an IDLE timer:
+    // the clock restarts on every flush (`wab/mod.rs:683-685`), so the seal
+    // fires only after the producer stops for the whole interval. A steady
+    // trickle therefore never idle-seals at all, and its segment grows toward
+    // `wab_segment_max_bytes` (256 MiB) exactly as if the knob were 0.
+    //
+    // That is the documented behaviour (`docs/operations/configuration.md`,
+    // `docs/sinks/s3.md`) and the shape most likely to surprise an operator who
+    // set the knob precisely to avoid it: "I set a 2-second seal and my archive
+    // is still empty." This pins both halves — writing keeps it open, stopping
+    // seals it — so changing idle semantics to age semantics has to be a
+    // deliberate act that updates those docs.
+    const IDLE_SECS: u64 = 2;
+    const WRITE_GAP: Duration = Duration::from_millis(400);
+
+    let srv = weir_server!("idle_seal_trickle")
+        .extra_config(format!("wab_segment_max_age_secs = {IDLE_SECS}"))
+        .start();
+    let mut client = srv.client();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+
+    // Trickle for well over the idle interval, recording the largest real gap
+    // between writes. A CI runner that stalls mid-loop would legitimately let
+    // the segment idle out, so the assertion below is made only if the premise
+    // — that we never actually went idle — held.
+    let mut worst_gap = Duration::ZERO;
+    let mut last = Instant::now();
+    for _ in 0..12 {
+        thread::sleep(WRITE_GAP);
+        client.push(b"trickle", Durability::Durable).unwrap();
+        worst_gap = worst_gap.max(last.elapsed());
+        last = Instant::now();
+    }
+
+    if worst_gap < Duration::from_secs(IDLE_SECS) {
+        assert_eq!(
+            committed(),
+            0,
+            "a producer writing every {WRITE_GAP:?} against a {IDLE_SECS}s idle \
+             seal must never idle-seal — the clock restarts on every flush. \
+             Records were delivered, so the timer is behaving as a maximum age \
+             rather than an idle interval, and the configuration and S3 sink \
+             docs that describe it as idle-only are now wrong."
+        );
+    } else {
+        eprintln!(
+            "skipping the never-idle assertion: the host stalled for {worst_gap:?}, \
+             which is past the {IDLE_SECS}s threshold, so the premise did not hold"
+        );
+    }
+
+    // Now stop writing. The same knob that refused to fire under load must fire
+    // once the producer is genuinely idle — otherwise this test would also pass
+    // against a build where idle-seal is simply broken.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while committed() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        committed() >= 1,
+        "after the producer stopped, the {IDLE_SECS}s idle seal should have \
+         sealed and drained the segment"
+    );
+}
+
+#[test]
 fn wab_compression_knob_reaches_the_segment_header() {
     // End-to-end proof that the config value actually reaches the WAB writer,
     // not merely that the field is plumbed through Config. Runs a real daemon

@@ -403,6 +403,23 @@ normal seal happens.
 matters more than maximal per-segment batching; leave it `0` on high-throughput
 deployments where segments fill quickly on their own.
 
+> **It is an idle timer, not a maximum age — and the difference bites the
+> steady-trickle case.** The clock restarts on every flush
+> (`crates/weir-server/src/wab/mod.rs:683-685`), so the seal fires only after
+> the producer genuinely stops for the whole interval. A producer writing one
+> record a minute against `wab_segment_max_age_secs = 300` resets the clock four
+> times over before it can expire, and **never idle-seals at all** — the segment
+> grows toward [`wab_segment_max_bytes`](#wab_segment_max_bytes) exactly as if
+> this knob were `0`. At 500 bytes a minute, reaching 256 MiB takes about two
+> years.
+>
+> Size the interval against your **gap between writes**, not against the
+> delivery latency you want: shorter than the quiet period for a bursty
+> producer, shorter than the write gap for a steady one. If a steady trickle is
+> your shape and a sub-write-gap interval is too chatty, lower
+> `wab_segment_max_bytes` instead — that is the knob that bounds a segment for a
+> producer that never idles.
+
 ---
 
 #### `wab_max_bytes`

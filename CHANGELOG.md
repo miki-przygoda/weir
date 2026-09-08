@@ -15,6 +15,58 @@ protocol** below.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A bucket-wide S3 Object Lock retention dead-lettered every acked record.**
+  AWS rejects any `PutObject` landing inside a retention period without
+  `Content-MD5` or an `x-amz-checksum-*` header — a bucket *default* retention
+  included. weir sent neither, S3 answered `400 InvalidRequest`, and that code
+  was classified Permanent, so the whole backlog was dead-lettered while
+  `health()` still reported Healthy because `HeadBucket` kept succeeding.
+  `PutObject` now sends `x-amz-checksum-sha256` (the payload digest is already
+  computed for SigV4, so this costs one base64 and no new dependency), and
+  `InvalidRequest` now strands rather than dead-letters — a provider rejecting a
+  request under that code for any other reason must not displace acked data
+  either.
+
+### Documentation
+
+- Published claims corrected, each with a test that fails without the fix
+  (`crates/weir-server/tests/docs_drift.rs`): the README's sink list omitted
+  `s3`, its benchmark vintage was two releases stale, and its 1.4 ms SATA
+  citation pointed at a file reporting 1.5 ms.
+- `docs/benchmarks.md` published a single-thread `Durable` rate in the same
+  column as a saturation ceiling with no concurrency stated. It is a latency
+  reciprocal — one synchronous producer pays one fsync per record — and the same
+  tier on the same runner reaches 18× that across 48 connections.
+- `docs/benchmarks/drain-throughput.md` compared beast's drain against an M3 Max
+  client's ingest, which `environments.md` forbids. Against the same box's own
+  ingest the drain is 2.1× wider at one connection and *narrower* than
+  concurrent `Buffered` ingest — which is the case weir exists for.
+- The Grafana dashboard's durable-write panel quoted Linux `fdatasync`
+  baselines with no macOS caveat; `F_BARRIERFSYNC` and `F_FULLFSYNC` are
+  different primitives, not a slower disk.
+- `environments.md`'s rule that external claims cite `bare-metal.md` was
+  unsatisfiable — that file has never held a capture — so it forbade every
+  performance statement the project makes. It now names the property meant and
+  lists the captures that satisfy it.
+- `wab_segment_max_age_secs` is an **idle** timer, not a maximum age: the clock
+  restarts on every flush, so a steady trickle never idle-seals at all. Now
+  documented at the knob and in the S3 sink guide.
+- `docs/sinks/s3.md` gained Object Lock and versioned-bucket behaviour, the KMS
+  grant an SSE-KMS deployment needs, the boundary of the key's append-only
+  property, and the low-volume seal interaction.
+
+### Fixed (tooling)
+
+- `deploy/avg_benchmarks.py` read `WEIR_VERSION` inside the history-writing
+  branch only, so `history.md` was stamped and `latest.md` was not — leaving
+  every hand-written "as of" line in the tree free to drift.
+
+---
+
+## [2.1.0] - 2026-09-07
+
 Two independent pieces: the S3 sink (a new published crate and a minor version
 bump), and the second-sweep fixes below.
 
@@ -2698,6 +2750,11 @@ The five commits making up this pass:
 
 ---
 
+[2.1.0]: https://github.com/miki-przygoda/weir/compare/v2.0.5...v2.1.0
+[2.0.5]: https://github.com/miki-przygoda/weir/compare/v2.0.4...v2.0.5
+[2.0.4]: https://github.com/miki-przygoda/weir/compare/v2.0.3...v2.0.4
+[2.0.3]: https://github.com/miki-przygoda/weir/compare/v2.0.0...v2.0.3
+[2.0.0]: https://github.com/miki-przygoda/weir/compare/v1.3.1...v2.0.0
 [1.3.1]: https://github.com/miki-przygoda/weir/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/miki-przygoda/weir/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/miki-przygoda/weir/compare/v1.1.0...v1.2.0
