@@ -1825,9 +1825,12 @@ log_level = "info"
 > recognised, and enabling `tcp_bind` without the feature is a startup error.
 > This does **not** mean operators must build from source: as of 2.0.3, the
 > official release binaries (Linux/macOS) and the official Docker image are
-> already built with `--features tls`. Windows binaries are the exception —
-> the listener layer is Unix-only, so the feature has nothing to enable
-> there.
+> already built with `--features tls`. **There is no Windows binary** — the
+> listener layer is Unix-only, so `weir-server` has no ingest path there at
+> all, and 2.0.5 stopped shipping the `.exe` that had implied otherwise. A
+> Windows *producer* is supported and talks to a Unix daemon over this
+> listener using `weir-client --features tls`; see
+> [Platform support](../platform-support.md).
 
 TLS is **mandatory** on the TCP path. Setting `tcp_bind` without a valid TLS
 configuration (or without building with `--features tls`) is a **fatal startup

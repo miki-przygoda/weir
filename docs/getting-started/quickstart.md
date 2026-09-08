@@ -115,7 +115,9 @@ cargo run --release -p weir-client --example push_simple -- \
 > 3. **`Buffered` is not power-loss durable.** It acks *before* fsync. A process
 >    crash survives (page cache), but power loss / OS crash is a loss window — use
 >    `Durable` for data you can't lose. (macOS is not power-safe at any
->    tier; see the durability-tier notes in [Internals](../architecture.md).)
+>    tier — its WAB writes use `F_BARRIERFSYNC`, which orders writes without
+>    forcing the drive's cache to the medium; see
+>    [Platform support](../platform-support.md#durability-by-platform).)
 
 **From your own project.** When you're ready to push from your own code,
 add just `weir-client` and write a small program against the synchronous

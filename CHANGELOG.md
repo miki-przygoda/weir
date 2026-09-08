@@ -56,6 +56,21 @@ protocol** below.
 - `docs/sinks/s3.md` gained Object Lock and versioned-bucket behaviour, the KMS
   grant an SSE-KMS deployment needs, the boundary of the key's append-only
   property, and the low-volume seal interaction.
+- **New: [`docs/platform-support.md`](docs/platform-support.md)** — daemon and
+  library support tables, released binaries, durability by platform, and an
+  explicit *Untested and unsupported* section. Facts that were previously spread
+  across ten places in six files, plus two that were written down nowhere: the
+  test suite runs on Linux only, and a daemon on any other Unix (Android, the
+  BSDs, illumos) compiles, starts, and then refuses every connection, because
+  `peer_uid` has no implementation there and the accept loop fails closed.
+- The quickstart's macOS durability pointer led to `architecture.md`, which never
+  mentions macOS; `configuration.md` implied a Windows binary 2.0.5 removed; the
+  README's `weir-ctl` row carried no platform marker though its table siblings
+  all do, and its copy-pasteable quickstart had no platform line at all.
+- The 2026-06-13 snapshots framed `F_BARRIERFSYNC` vs `fdatasync` as an ~11×
+  *speed* difference. It is a difference in guarantee — a barrier is not a flush
+  — and reading it as speed suggests "buy an NVMe and `Durable` gets 11×
+  cheaper", which is false.
 
 ### Fixed (tooling)
 

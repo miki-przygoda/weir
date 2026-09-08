@@ -71,6 +71,11 @@ are replayed automatically.
 
 ## Quickstart
 
+> **The daemon is Unix-only** (Linux or macOS). A Windows producer talks to it
+> over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using
+> `weir-client`; there is no Windows `weir-server`. Full matrix, including what
+> is untested, in [Platform support](docs/platform-support.md).
+
 ```bash
 cargo build --release -p weir-server
 mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
@@ -191,7 +196,7 @@ not benchmarks.*
 | `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and the `windows` CI job compiles `weir-client --features tls` there on every push. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`. There is no Windows *server* build: it had no ingest path, and 2.0.5 dropped it. |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
 | `weir-sink-s3` | lib | The S3-API object-storage sink (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph), behind `weir-server`'s opt-in `s3-sink` feature. The first weir sink built **outside** the daemon against `weir-sink-sdk` alone — so it is also the proof that the SDK is a contract a third party can build against. See [docs/sinks/s3.md](docs/sinks/s3.md). |
-| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). |
+| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). **Unix only** — it drives `WeirClient::connect`, the Unix-socket constructor. Not a release artifact; build from source or use the Docker image. |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
 
 These are deliberately separate so you can compose the pieces you need without

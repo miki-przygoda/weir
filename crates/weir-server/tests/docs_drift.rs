@@ -18,6 +18,9 @@ const LATEST: &str = include_str!("../../../docs/benchmarks/latest.md");
 const ENVIRONMENTS: &str = include_str!("../../../docs/benchmarks/environments.md");
 const DRAIN: &str = include_str!("../../../docs/benchmarks/drain-throughput.md");
 const DASHBOARD: &str = include_str!("../../../deploy/grafana/weir-dashboard.json");
+const PLATFORMS: &str = include_str!("../../../docs/platform-support.md");
+const RELEASE_YML: &str = include_str!("../../../.github/workflows/release.yml");
+const PEER: &str = include_str!("../src/socket/peer.rs");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -237,6 +240,85 @@ fn the_dashboard_fsync_panel_names_the_macos_primitive() {
             "the durable-write latency panel quotes Linux fdatasync baselines \n\
              without naming {token}. An operator reading it on macOS compares \n\
              their number against a primitive they are not running.\n\n  {fsync_panel}"
+        );
+    }
+}
+
+/// `docs/platform-support.md` exists because the released architectures were
+/// named in exactly one place and what is *untested* was named nowhere. A
+/// consolidated page is only worth having if it cannot silently fall behind
+/// the workflow that does the releasing.
+#[test]
+fn the_platform_page_names_every_released_target() {
+    let released: Vec<&str> = RELEASE_YML
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- target: "))
+        .map(str::trim)
+        .collect();
+    assert!(
+        released.len() >= 4,
+        "parsed {} targets out of release.yml; the `- target:` shape must have \
+         changed and this guard is no longer reading anything",
+        released.len()
+    );
+
+    for target in &released {
+        assert!(
+            PLATFORMS.contains(target),
+            "release.yml ships {target}, which docs/platform-support.md does not \
+             mention. A new release target needs a row in the daemon table and, \
+             if it is untested, a line in the `Untested and unsupported` section."
+        );
+    }
+
+    // The absence is as load-bearing as the presence: 2.0.5 dropped a Windows
+    // binary that could not accept a record by any route, and the page says so.
+    assert!(
+        !released.iter().any(|t| t.contains("windows")),
+        "release.yml has regained a Windows target. weir-server has no ingest \
+         path there -- `mod socket` is #[cfg(unix)], the mTLS listener is \
+         #[cfg(all(unix, feature = \"tls\"))], and main.rs's #[cfg(not(unix))] \
+         arm awaits shutdown -- so shipping one publishes a binary that starts \
+         and does nothing, which is what 2.0.5 removed."
+    );
+}
+
+/// Every Unix that is not Linux or macOS takes `peer_uid`'s `Unsupported` arm,
+/// and the accept loop fails closed on a failed credential lookup with
+/// `peer_uid_check` defaulting to true — so the daemon compiles there, starts,
+/// and refuses every connection.
+///
+/// That is the right behaviour and a bewildering one to meet undocumented.
+/// This asserts the platform set the docs describe is still the platform set
+/// the code implements: adding FreeBSD support should fail here, as the prompt
+/// to move it out of the "untested" section.
+#[test]
+fn peer_uid_is_implemented_for_exactly_the_platforms_the_docs_name() {
+    let implemented: Vec<&str> = ["linux", "macos", "freebsd", "netbsd", "openbsd", "illumos"]
+        .into_iter()
+        .filter(|os| PEER.contains(&format!("#[cfg(target_os = \"{os}\")]")))
+        .collect();
+
+    assert_eq!(
+        implemented,
+        vec!["linux", "macos"],
+        "peer_uid's platform set changed to {implemented:?}. \
+         docs/platform-support.md says Linux and macOS are the only targets with \
+         a peer-credential implementation, and that everything else refuses every \
+         connection because the accept loop fails closed. Update the page -- \
+         moving a platform out of `Untested and unsupported` if it now works."
+    );
+    assert!(
+        PEER.contains("peer credential check not implemented on this platform"),
+        "the unsupported-platform arm is gone; the page's claim that other Unix \
+         targets fail closed no longer follows from the code"
+    );
+
+    for needed in ["Android", "peer_uid_check", "refuse"] {
+        assert!(
+            PLATFORMS.to_lowercase().contains(&needed.to_lowercase()),
+            "docs/platform-support.md no longer mentions {needed:?}, which is \
+             half of why a daemon on a non-Linux, non-macOS Unix looks hung"
         );
     }
 }
