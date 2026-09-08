@@ -1,0 +1,785 @@
+/* ===========================================================================
+   weir — documentation theme
+   ---------------------------------------------------------------------------
+   Presentation layer for the mdBook in docs/. Loaded via `additional-css` in
+   book.toml, so it lands AFTER mdBook's variables.css / general.css /
+   chrome.css and can override them by cascade order alone (no !important).
+
+   Design source of truth: demo/weir.css — the stylesheet behind the browser
+   demo. The palette, the mono-first accents, the square corners and the small
+   uppercase mono labels all come from there, so the docs read as the same
+   product as the demo.
+
+   Theme safety
+   ------------
+   mdBook ships five themes and puts the active one as a class on <html>
+   (.light .rust .coal .navy .ayu). Nothing here hardcodes a colour outside a
+   theme-scoped block:
+
+     * .light and .navy are remapped onto the weir palette. They are the two
+       themes visitors land on (book.toml: default-theme = "light",
+       preferred-dark-theme = "navy"), so they carry the brand.
+     * .rust, .coal and .ayu keep their own mdBook palettes and only pick up
+       the structural work (type scale, tables, callouts, code, sidebar). They
+       are escape hatches; a reader who picks "Ayu" should still get Ayu.
+
+   Every structural rule below therefore reads from --w-* tokens, which each of
+   the five theme blocks defines for itself.
+
+   Fonts
+   -----
+   No webfont is fetched. The stacks name Inter / JetBrains Mono first (used
+   when the reader happens to have them installed, which matches the demo
+   exactly), then fall back to the system UI font and to the Source Code Pro
+   that mdBook already self-hosts in the generated site. Zero new network
+   dependencies, no third-party font host, offline builds keep working.
+   =========================================================================== */
+
+
+/* ---------------------------------------------------------------------------
+   1. Global tokens
+   NOTE: mdBook sets :root { font-size: 62.5% }, so 1rem = 10px here.
+   --------------------------------------------------------------------------- */
+
+:root {
+    --w-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+              Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono-font: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+                 "Source Code Pro", Consolas, "Liberation Mono", monospace;
+
+    /* Wide enough for the reference tables on operations/configuration.md and
+       sinks/s3.md; running text is capped separately at --w-measure so prose
+       keeps a readable line length. */
+    --content-max-width: 860px;
+    /* Running text, headings and rules cap here (~82 characters); tables, code
+       blocks and images get the full --content-max-width. rem, not ch, so the
+       column stays put across the font stack's fallbacks. */
+    --w-measure: 66rem;
+
+    --code-font-size: 0.86em;
+    --page-padding: 20px;
+    --sidebar-width: 300px;
+}
+
+
+/* ---------------------------------------------------------------------------
+   2. Theme mapping
+   --------------------------------------------------------------------------- */
+
+/* --- light: the weir palette inverted -------------------------------------
+   Sky #38bdf8 is a 1.9:1 contrast on white, so light mode uses sky-700
+   (#0369a1, 6.4:1) for anything that carries text. */
+.light {
+    --bg: #ffffff;
+    --fg: #2f2f2f;
+
+    --sidebar-bg: #fafaf9;
+    --sidebar-fg: #4a4a4a;
+    --sidebar-non-existant: #a8a8a8;
+    --sidebar-active: #0369a1;
+    --sidebar-spacer: #e6e6e6;
+
+    --scrollbar: #c4c4c4;
+
+    --icons: #767676;
+    --icons-hover: #111111;
+
+    --links: #0369a1;
+    --inline-code-color: #0b5a80;
+
+    --theme-popup-bg: #ffffff;
+    --theme-popup-border: #dcdcdc;
+    --theme-hover: #f0f0f0;
+
+    --quote-bg: #f7f9fa;
+    --quote-border: #dfe5e9;
+    --warning-border: #b45309;
+
+    --table-border-color: #e3e3e3;
+    --table-header-bg: #f6f6f5;
+    --table-alternate-bg: #fafafa;
+
+    --searchbar-border-color: #d8d8d8;
+    --searchbar-bg: #fbfbfa;
+    --searchbar-fg: #1c1c1c;
+    --searchbar-shadow-color: #0369a1;
+    --searchresults-header-fg: #6b6b6b;
+    --searchresults-border-color: #e3e3e3;
+    --searchresults-li-bg: #f2f8fb;
+    --search-mark-bg: #bde3f7;
+
+    --color-scheme: light;
+
+    --w-line: #e3e3e3;
+    --w-line-soft: #ededed;
+    --w-surface: #f6f6f5;
+    --w-surface-2: #fbfbfa;
+    --w-strong: #111111;
+    --w-muted: #6b6b6b;
+    --w-accent: #0369a1;
+    --w-accent-soft: rgba(3, 105, 161, 0.07);
+    --w-link-underline: rgba(3, 105, 161, 0.32);
+}
+
+/* --- navy: weir dark, straight off demo/weir.css --------------------------
+   Body text is --n-fg-mid (#c0c0c0, 9.6:1 on #141414) rather than the demo's
+   --n-fg (#8a8a8a, 4.3:1); long-form documentation needs the extra contrast. */
+.navy {
+    --bg: #141414;
+    --fg: #c0c0c0;
+
+    --sidebar-bg: #111111;
+    --sidebar-fg: #9a9a9a;
+    --sidebar-non-existant: #4e4e4e;
+    --sidebar-active: #38bdf8;
+    --sidebar-spacer: #262626;
+
+    --scrollbar: #3a3a3a;
+
+    --icons: #6a6a6a;
+    --icons-hover: #f0f0f0;
+
+    --links: #38bdf8;
+    --inline-code-color: #7dd3fc;
+
+    --theme-popup-bg: #1c1c1c;
+    --theme-popup-border: #2a2a2a;
+    --theme-hover: #242424;
+
+    --quote-bg: #1c1c1c;
+    --quote-border: #2a2a2a;
+    --warning-border: #f87171;
+
+    --table-border-color: #2a2a2a;
+    --table-header-bg: #1c1c1c;
+    --table-alternate-bg: #181818;
+
+    --searchbar-border-color: #2a2a2a;
+    --searchbar-bg: #1c1c1c;
+    --searchbar-fg: #f0f0f0;
+    --searchbar-shadow-color: #38bdf8;
+    --searchresults-header-fg: #8a8a8a;
+    --searchresults-border-color: #2a2a2a;
+    --searchresults-li-bg: #1c1c1c;
+    --search-mark-bg: rgba(56, 189, 248, 0.3);
+
+    --color-scheme: dark;
+
+    --w-line: #2a2a2a;
+    --w-line-soft: #222222;
+    --w-surface: #1c1c1c;
+    --w-surface-2: #181818;
+    --w-strong: #f0f0f0;
+    --w-muted: #8a8a8a;
+    --w-accent: #38bdf8;
+    --w-accent-soft: rgba(56, 189, 248, 0.09);
+    --w-link-underline: rgba(56, 189, 248, 0.35);
+}
+
+/* --- rust / coal / ayu: keep their own palettes, structural work only ----- */
+.rust {
+    --w-line: hsl(60, 9%, 78%);
+    --w-line-soft: hsl(60, 9%, 82%);
+    --w-surface: hsl(60, 9%, 83%);
+    --w-surface-2: hsl(60, 9%, 85%);
+    --w-strong: #191918;
+    --w-muted: #5c5b55;
+    --w-accent: #8f4a10;
+    --w-accent-soft: rgba(143, 74, 16, 0.08);
+    --w-link-underline: rgba(43, 121, 162, 0.4);
+}
+
+.coal {
+    --w-line: hsl(200, 7%, 18%);
+    --w-line-soft: hsl(200, 7%, 14%);
+    --w-surface: hsl(200, 7%, 12%);
+    --w-surface-2: hsl(200, 7%, 10%);
+    --w-strong: #dfe4e8;
+    --w-muted: #7c8791;
+    --w-accent: #6bb3d8;
+    --w-accent-soft: rgba(107, 179, 216, 0.09);
+    --w-link-underline: rgba(107, 179, 216, 0.35);
+}
+
+.ayu {
+    --w-line: hsl(210, 25%, 17%);
+    --w-line-soft: hsl(210, 25%, 13%);
+    --w-surface: hsl(210, 25%, 11%);
+    --w-surface-2: hsl(210, 25%, 9%);
+    --w-strong: #e8e8e8;
+    --w-muted: #8a929b;
+    --w-accent: #ffb454;
+    --w-accent-soft: rgba(255, 180, 84, 0.09);
+    --w-link-underline: rgba(255, 180, 84, 0.35);
+}
+
+
+/* ---------------------------------------------------------------------------
+   3. Base typography
+   --------------------------------------------------------------------------- */
+
+html {
+    font-family: var(--w-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+.content {
+    font-size: 1.7rem;
+}
+
+.content p,
+.content li,
+.content dd,
+.content td,
+.content th {
+    line-height: 1.7;
+}
+
+.content p {
+    margin-block: 0 1.5rem;
+}
+
+/* Cap running text at a readable measure while leaving tables, code blocks and
+   images the full --content-max-width. */
+.content main > hr,
+.content main > p,
+.content main > ul,
+.content main > ol,
+.content main > dl,
+.content main > blockquote,
+.content main > h1,
+.content main > h2,
+.content main > h3,
+.content main > h4,
+.content main > h5,
+.content main > h6,
+.content main > .footnote-definition,
+.content main > .warning {
+    max-width: var(--w-measure);
+}
+
+.content strong,
+.content b {
+    color: var(--w-strong);
+    font-weight: 700;
+}
+
+.content hr {
+    height: 0;
+    border: 0;
+    border-block-start: 1px solid var(--w-line);
+    margin-block: 3.2rem;
+}
+
+.content ul,
+.content ol {
+    padding-inline-start: 2.2rem;
+    margin-block: 0 1.5rem;
+}
+
+.content li + li,
+.content li > ul,
+.content li > ol {
+    margin-block-start: 0.5rem;
+}
+
+.content li::marker {
+    color: var(--w-muted);
+}
+
+
+/* ---------------------------------------------------------------------------
+   4. Headings
+   --------------------------------------------------------------------------- */
+
+.content h1,
+.content h2,
+.content h3,
+.content h4,
+.content h5,
+.content h6 {
+    color: var(--w-strong);
+    font-weight: 700;
+    line-height: 1.25;
+    scroll-margin-block-start: calc(var(--menu-bar-height) + 1.6rem);
+}
+
+.content h1 {
+    font-size: 3.4rem;
+    letter-spacing: -0.025em;
+    line-height: 1.15;
+    margin-block: 1.2rem 2.4rem;
+    padding-block-end: 1.6rem;
+    border-block-end: 1px solid var(--w-line);
+}
+
+/* A hairline above every h2 turns a very long page (the configuration
+   reference is ~90 screens) into scannable bands. */
+.content h2 {
+    font-size: 2.4rem;
+    letter-spacing: -0.015em;
+    margin-block: 4.2rem 1.6rem;
+    padding-block-start: 2.6rem;
+    border-block-start: 1px solid var(--w-line-soft);
+}
+
+.content hr + h2 {
+    border-block-start: 0;
+    padding-block-start: 0;
+    margin-block-start: 2.4rem;
+}
+
+.content h3 {
+    font-size: 2.1rem;
+    letter-spacing: -0.01em;
+    margin-block: 3.4rem 1.2rem;
+}
+
+.content h4 {
+    font-size: 1.85rem;
+    margin-block: 2.8rem 1rem;
+}
+
+.content h5,
+.content h6 {
+    font-size: 1.45rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--w-muted);
+    margin-block: 2.4rem 0.8rem;
+}
+
+/* Code inside a heading is an identifier, not a snippet — drop the chrome and
+   let it read as part of the heading. On the configuration reference every
+   option is an h4 wrapping <code>, so this is the page's main scan target. */
+.content h1 code,
+.content h2 code,
+.content h3 code,
+.content h4 code,
+.content h5 code,
+.content h6 code {
+    background: none;
+    border: 0;
+    padding: 0;
+    font-size: 0.94em;
+    font-weight: 700;
+}
+
+.content h4 code,
+.content h3 code {
+    color: var(--w-accent);
+}
+
+/* mdBook wraps heading text in <a class="header">; keep it inheriting. */
+.content .header:link,
+.content .header:visited {
+    color: inherit;
+    text-decoration: none;
+}
+
+/* Hover-revealed anchor marker, only where the centred column leaves room. */
+@media only screen and (min-width: 1100px) {
+    .content main :is(h2, h3, h4) > a.header {
+        position: relative;
+    }
+
+    .content main :is(h2, h3, h4) > a.header::before {
+        content: "#";
+        position: absolute;
+        inset-inline-start: -1.1em;
+        color: var(--w-accent);
+        font-weight: 400;
+        opacity: 0;
+        transition: opacity 0.12s ease-in-out;
+    }
+
+    .content main :is(h2, h3, h4):hover > a.header::before {
+        opacity: 0.55;
+    }
+}
+
+
+/* ---------------------------------------------------------------------------
+   5. Links and focus
+   --------------------------------------------------------------------------- */
+
+.content a:link,
+.content a:visited {
+    color: var(--links);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-decoration-color: var(--w-link-underline);
+    text-underline-offset: 0.18em;
+    transition: text-decoration-color 0.12s ease-in-out;
+}
+
+.content a:hover {
+    text-decoration-color: currentColor;
+}
+
+.content a code {
+    color: inherit;
+}
+
+/* Keyboard focus was invisible on the stock theme in several places. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible,
+.theme-popup .theme:focus-visible {
+    outline: 2px solid var(--w-accent);
+    outline-offset: 2px;
+    border-radius: 1px;
+}
+
+
+/* ---------------------------------------------------------------------------
+   6. Inline code
+   --------------------------------------------------------------------------- */
+
+.content :not(pre) > code {
+    background: var(--w-surface);
+    border: 1px solid var(--w-line-soft);
+    border-radius: 2px;
+    padding: 0.08em 0.34em;
+    font-size: var(--code-font-size);
+    color: var(--inline-code-color);
+    overflow-wrap: break-word;
+}
+
+/* highlight.js runs over inline code too and colours individual tokens, which
+   makes short identifiers look randomly rainbow. Force one colour. */
+.content :not(pre) > code span {
+    color: inherit;
+}
+
+.content a > code {
+    background: none;
+    border-color: transparent;
+    padding-inline: 0;
+}
+
+.content td > code,
+.content th > code,
+.content li > code {
+    white-space: normal;
+}
+
+
+/* ---------------------------------------------------------------------------
+   7. Code blocks
+   --------------------------------------------------------------------------- */
+
+.content pre {
+    margin-block: 2.2rem;
+    background: var(--w-surface-2);
+    border: 1px solid var(--w-line);
+    border-inline-start: 2px solid var(--w-accent);
+    border-radius: 0;
+}
+
+.content pre > code {
+    display: block;
+    padding: 1.4rem 1.6rem;
+    background: transparent;
+    font-size: var(--code-font-size);
+    line-height: 1.65;
+    overflow-x: auto;
+    tab-size: 4;
+}
+
+/* The copy / play buttons sit on top of the block; keep them from inheriting
+   the accent border treatment. */
+.content pre > .buttons button {
+    border-radius: 2px;
+    background-color: var(--w-surface);
+    border-color: var(--w-line);
+}
+
+.content pre > .result {
+    margin-block-start: 0;
+    border-block-start: 1px solid var(--w-line);
+}
+
+
+/* ---------------------------------------------------------------------------
+   8. Tables
+   The configuration reference and the S3 sink page are largely tables; stock
+   mdBook renders them centred, cramped (3px vertical padding) and zebra
+   striped. This is the biggest single readability change in the file.
+   --------------------------------------------------------------------------- */
+
+.content .table-wrapper {
+    overflow-x: auto;
+    margin-block: 2.2rem;
+    border: 1px solid var(--w-line);
+    background: var(--bg);
+}
+
+.content table {
+    margin: 0;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.94em;
+}
+
+.content table thead {
+    background: var(--w-surface);
+}
+
+.content table thead tr {
+    border: 0;
+}
+
+.content table th {
+    font-family: var(--mono-font);
+    font-size: 0.78em;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--w-muted);
+    text-align: start;
+    vertical-align: bottom;
+    padding: 0.9rem 1.3rem;
+    border: 0;
+    border-block-end: 1px solid var(--w-line);
+    white-space: nowrap;
+}
+
+.content table td {
+    padding: 0.85rem 1.3rem;
+    border: 0;
+    border-block-end: 1px solid var(--w-line-soft);
+    vertical-align: top;
+    text-align: start;
+}
+
+/* Column separators — reference tables are read across, not down. */
+.content table th:not(:last-child),
+.content table td:not(:last-child) {
+    border-inline-end: 1px solid var(--w-line-soft);
+}
+
+.content table tbody tr:last-child td {
+    border-block-end: 0;
+}
+
+/* Row rules already do the tracking work; zebra on top of them is noise. */
+.content table tbody tr:nth-child(2n) {
+    background: transparent;
+}
+
+.content table tbody tr:hover {
+    background: var(--w-surface);
+}
+
+.content table code {
+    white-space: nowrap;
+}
+
+
+/* ---------------------------------------------------------------------------
+   9. Callouts
+   The docs lean on `>` blockquotes for warnings and notes (145 quoted lines on
+   the configuration page alone). Stock mdBook gives them a faint tint and a
+   top/bottom hairline, which reads as an accident. Give them a real edge.
+   --------------------------------------------------------------------------- */
+
+.content blockquote {
+    margin-block: 2.2rem;
+    padding: 1.4rem 1.8rem;
+    color: var(--fg);
+    background: var(--quote-bg);
+    border: 1px solid var(--w-line);
+    border-inline-start: 3px solid var(--w-accent);
+    border-radius: 0;
+}
+
+.content blockquote > :first-child {
+    margin-block-start: 0;
+}
+
+.content blockquote > :last-child {
+    margin-block-end: 0;
+}
+
+/* Almost every callout opens with a bolded label — `**NOTE:**`,
+   `**TL;DR**`, `**For agentic workers:**`. Let it read as the callout title. */
+.content blockquote > p:first-child > strong:first-child {
+    color: var(--w-strong);
+}
+
+.content blockquote :not(pre) > code {
+    background: var(--w-surface-2);
+}
+
+.content blockquote pre {
+    background: var(--bg);
+}
+
+/* mdBook's own <div class="warning"> helper, kept consistent with the above. */
+.content .warning {
+    margin-block: 2.2rem;
+    margin-inline: 0;
+    padding: 1.4rem 1.8rem;
+    background: var(--w-accent-soft);
+    border: 1px solid var(--w-line);
+    border-inline-start: 3px solid var(--warning-border);
+}
+
+.content .warning::before {
+    content: none;
+}
+
+
+/* ---------------------------------------------------------------------------
+   10. Sidebar
+   --------------------------------------------------------------------------- */
+
+.sidebar {
+    font-size: 0.86em;
+    border-inline-end: 1px solid var(--w-line);
+}
+
+.sidebar .sidebar-scrollbox {
+    padding: 1.4rem 1.2rem 4rem;
+}
+
+.chapter {
+    line-height: 1.5;
+}
+
+/* Part headings ("Getting started", "Operations", ...) as the small uppercase
+   mono labels the demo uses for section headers. */
+.chapter li.part-title {
+    font-family: var(--mono-font);
+    font-size: 0.8em;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--sidebar-fg);
+    opacity: 0.55;
+    margin-block: 2.6rem 0.8rem;
+    padding-inline-start: 0.9rem;
+}
+
+.chapter li.chapter-item {
+    margin-block-start: 0.3rem;
+}
+
+.chapter li a {
+    padding: 0.35rem 0.6rem 0.35rem 0.9rem;
+    border-radius: 2px;
+    transition: color 0.12s ease-in-out;
+}
+
+/* Section numbers are navigational furniture, not content. */
+.chapter li a strong {
+    font-family: var(--mono-font);
+    font-weight: 400;
+    font-size: 0.92em;
+    opacity: 0.45;
+    margin-inline-end: 0.3rem;
+}
+
+.chapter li a.active {
+    font-weight: 600;
+    box-shadow: inset 2px 0 0 currentColor;
+}
+
+.chapter li a.active strong {
+    opacity: 0.8;
+}
+
+/* Nested chapters (the benchmarks subtree) get a guide rail. */
+.chapter .section {
+    border-inline-start: 1px solid var(--sidebar-spacer);
+    margin-inline-start: 1.4rem;
+    padding-inline-start: 0.8rem;
+    line-height: 1.5;
+}
+
+.chapter .spacer {
+    height: 1px;
+    margin-block: 1.2rem;
+}
+
+
+/* ---------------------------------------------------------------------------
+   11. Menu bar, search, theme popup
+   --------------------------------------------------------------------------- */
+
+.menu-title {
+    font-family: var(--mono-font);
+    font-size: 1.7rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--w-strong);
+}
+
+#menu-bar.bordered {
+    border-block-end-color: var(--w-line);
+}
+
+#searchbar {
+    border-radius: 2px;
+    font-family: var(--w-sans);
+    font-size: 1.5rem;
+}
+
+.searchresults-header {
+    font-family: var(--mono-font);
+    font-size: 0.8em;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+
+.searchresults-outer {
+    border-block-end-color: var(--w-line);
+}
+
+.theme-popup {
+    border-radius: 2px;
+    border-color: var(--w-line);
+}
+
+
+/* ---------------------------------------------------------------------------
+   12. Narrow screens
+   --------------------------------------------------------------------------- */
+
+@media only screen and (max-width: 700px) {
+    .content {
+        font-size: 1.6rem;
+    }
+
+    .content h1 {
+        font-size: 2.8rem;
+    }
+
+    .content h2 {
+        font-size: 2.1rem;
+        margin-block-start: 3.4rem;
+        padding-block-start: 2rem;
+    }
+
+    .content h3 {
+        font-size: 1.95rem;
+    }
+
+    .content table th,
+    .content table td {
+        padding: 0.7rem 0.9rem;
+    }
+
+    .content blockquote,
+    .content .warning {
+        padding: 1.2rem 1.4rem;
+    }
+
+    .content pre > code {
+        padding: 1.2rem;
+    }
+}

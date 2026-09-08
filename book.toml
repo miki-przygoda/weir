@@ -6,14 +6,19 @@ src = "docs"
 language = "en"
 
 [output.html]
-default-theme = "rust"
+# The two themes visitors actually land on. theme/weir.css remaps both onto the
+# weir palette from demo/weir.css; the other three (rust, coal, ayu) keep their
+# stock mdBook colours and only pick up the structural styling.
+default-theme = "light"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/miki-przygoda/weir"
 git-repository-icon = "fab-github"
 edit-url-template = "https://github.com/miki-przygoda/weir/edit/main/docs/{path}"
 mathjax-support = false
 no-section-label = false
-additional-css = []
+# theme/weir.css is loaded after mdBook's own stylesheets and overrides them by
+# cascade order. It is a presentation layer only — no markdown is aware of it.
+additional-css = ["theme/weir.css"]
 
 [output.html.fold]
 enable = true
