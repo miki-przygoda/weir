@@ -45,11 +45,15 @@ struct RawServer {
     #[cfg(feature = "mysql-sink")]
     sink_mysql_column: Option<String>,
     #[cfg(feature = "mysql-sink")]
+    sink_mysql_id_column: Option<String>,
+    #[cfg(feature = "mysql-sink")]
     sink_mysql_insert_mode: Option<String>,
     #[cfg(feature = "postgres-sink")]
     sink_postgres_table: Option<String>,
     #[cfg(feature = "postgres-sink")]
     sink_postgres_column: Option<String>,
+    #[cfg(feature = "postgres-sink")]
+    sink_postgres_id_column: Option<String>,
     #[cfg(feature = "postgres-sink")]
     sink_postgres_insert_mode: Option<String>,
     #[cfg(feature = "clickhouse-sink")]
@@ -138,9 +142,11 @@ const BASE_SERVER_KEYS: &[&str] = &[
 const FEATURE_GATED_SERVER_KEYS: &[(&str, &str)] = &[
     ("sink_mysql_table", "mysql-sink"),
     ("sink_mysql_column", "mysql-sink"),
+    ("sink_mysql_id_column", "mysql-sink"),
     ("sink_mysql_insert_mode", "mysql-sink"),
     ("sink_postgres_table", "postgres-sink"),
     ("sink_postgres_column", "postgres-sink"),
+    ("sink_postgres_id_column", "postgres-sink"),
     ("sink_postgres_insert_mode", "postgres-sink"),
     ("sink_clickhouse_database", "clickhouse-sink"),
     ("sink_clickhouse_table", "clickhouse-sink"),
@@ -241,11 +247,15 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             #[cfg(feature = "mysql-sink")]
             sink_mysql_column: s.sink_mysql_column,
             #[cfg(feature = "mysql-sink")]
+            sink_mysql_id_column: s.sink_mysql_id_column,
+            #[cfg(feature = "mysql-sink")]
             sink_mysql_insert_mode: s.sink_mysql_insert_mode,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_table: s.sink_postgres_table,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_column: s.sink_postgres_column,
+            #[cfg(feature = "postgres-sink")]
+            sink_postgres_id_column: s.sink_postgres_id_column,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_insert_mode: s.sink_postgres_insert_mode,
             #[cfg(feature = "clickhouse-sink")]
