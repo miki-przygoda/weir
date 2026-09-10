@@ -249,3 +249,41 @@ Bounds that make this safe to land:
 7. Gate: `cargo fmt --all --check`; `cargo clippy --all-targets --all-features
    -- -D warnings`; workspace suite; `cargo test -p weir-server --bins
    --all-features -- --test-threads=1`.
+
+---
+
+## 5. What shipped, against §4
+
+All seven tasks landed. Four deltas worth recording:
+
+1. **`per_record_id_hex` moved to `sql_common`** rather than living twice. The
+   Postgres and MySQL versions were identical apart from the driver tag, and the
+   load-bearing part is the reasoning in its rustdoc, not the four lines of code.
+
+2. **Both sinks' parameter binding was factored out of `commit`** —
+   `postgres::build_params` returning a borrowed `BoundParam` enum, and
+   `mysql::build_params` returning `Vec<mysql_async::Value>`. Not in the plan,
+   but without it the `(id, payload)` order was observable only against a live
+   database, and getting it backwards writes every key into the payload column
+   and every payload into the `UNIQUE` key while reporting success. The Postgres
+   form still borrows, so a 10 000-record batch copies nothing.
+
+3. **The key-stability tests assert their own counterfactual.** Each builds the
+   same records with a *batch-relative* index and asserts those keys do move.
+   Added after the first draft of MySQL's test survived a deliberate swap of the
+   two bound slots: `step_by(2)` was reading the payloads, which are also
+   re-batch-invariant, so the test passed a sink that wrote each key into the
+   wrong column. An anchor assertion pins that the compared values are the keys.
+
+4. **No integration test against a real server.** The new column needs a schema
+   change in `deploy/docker/test/`'s compose stack, which cannot be exercised
+   from this environment, and `deploy/run-sink-integration-tests.sh`'s own header
+   records what happened last time untested tests were added there (three SQL
+   sink tests sat broken for an unknown period). The unit tests cover statement
+   shape, binding order, key stability, and every startup rejection; what remains
+   unverified is that a real server accepts the two-column statement.
+
+**Answer to the question that decides how this merges: no WAB format change.**
+`FORMAT_VERSION` is untouched, `weir-wab` is untouched, and no published crate's
+API moved — `weir-sink-sdk`'s only edits are rustdoc and one added test. The
+entire change is inside `weir-server`, plus documentation.
