@@ -49,6 +49,15 @@ across a multi-shard daemon can land *below* the single-connection rate — see 
 [`shard_count` caveat](../operations/configuration.md#shard_count). See the
 `weir-client` crate docs for the ordering caveat.
 
+> **The tier is per call, not per client.** `Durability` is an argument to
+> `push`, and it becomes a byte on that record's wire envelope — so one
+> `WeirClient` can send `Durable` for the record it cannot lose and `Buffered`
+> for the telemetry beside it, interleaved, with no second connection and no
+> reconnect. The daemon dispatches per record inside a single flush batch, so
+> the `Buffered` records genuinely skip the fsync they share a batch with. This
+> is usually the right shape: reach for the fast path where the data is
+> replaceable, and pay for durability only where it matters.
+
 > **Already inside an async runtime?** `push()` is a *blocking* call — calling it
 > directly from an `async fn` blocks the executor thread and starves the runtime.
 > See [Producing from an async runtime](#producing-from-an-async-runtime) below.
@@ -207,6 +216,8 @@ impl Sink for MySink {
     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, BasicSinkError> {
         // `batch.dedup_token()` is a content-derived idempotency handle for this
         // batch — pass it downstream if your target can deduplicate on one.
+        // If a duplicate is expensive, read "Choosing an idempotency key" below
+        // before you build on it: `batch.record_ids()` is usually the right one.
         let mut committed = Vec::new();
         let mut dead_lettered = Vec::new();   // Vec<(Payload, String)>
         for record in batch.into_records() {
@@ -248,6 +259,49 @@ for (record, reason) in &result.dead_lettered {
     eprintln!("dead-lettered {} bytes: {reason}", record.as_ref().len());
 }
 ```
+
+### Choosing an idempotency key
+
+weir's delivery is **at-least-once**: after a crash, or when a stranded segment
+auto-resumes, the drain re-commits records it has already handed you. A
+`SinkBatch` carries two different handles for recognising that, and picking the
+wrong one is a silent bug rather than a visible failure.
+
+| | `batch.dedup_token()` | `batch.record_ids()` |
+|---|---|---|
+| Scope | the whole batch, one value | one value per record |
+| Derived from | the payload bytes | the record's WAB coordinate + its bytes |
+| Two records with identical bytes | same value | **different** values |
+| Same batch re-sent after a retry | same value | same values |
+| Same records re-split because `sink_max_batch_size` changed | **different** value | same values |
+
+Read that last row twice. The drain re-reads `sink_max_batch_size` on every
+call, so an operator editing it — or a redeployed pod with a different config —
+changes where the batch boundaries fall on the *next* delivery of an
+already-partly-delivered segment. A batch-level key is a function of the batch,
+so it moves; a `RecordId` names the record's position in the buffer, so it does
+not.
+
+- **A duplicate is cheap** (an archive, a log, an analytics table you `SELECT
+  DISTINCT` over): `dedup_token()` is simpler, and its precondition — keep
+  `sink_max_batch_size` stable — is easy to hold.
+- **A duplicate is expensive** (a billing row, a metering event, anything that
+  would need a refund): key on `record_ids()`. Write the id as a column with a
+  `UNIQUE` constraint, or send it as a per-request `Idempotency-Key`. This is
+  what the built-in Postgres and MySQL sinks do when
+  `sink_postgres_id_column` / `sink_mysql_id_column` is set, and what the HTTP
+  sink does in per-record mode.
+
+Do **not** reach for a hash of the payload as a dedup key. It is not just
+weaker — it *loses* data: a producer emitting repetitive records (a heartbeat, a
+fixed-shape metering event) hands the downstream the same key for genuinely
+distinct events, and a correctly-implemented idempotent endpoint keeps the first
+and discards the rest. That is what `RecordId` exists to prevent.
+
+The drain always supplies `record_ids()`; `None` means the batch was hand-built,
+which only happens in a sink author's own tests. If your sink's correctness
+rests on them, treat `None` as a programming error and fail loudly rather than
+substituting a key that is a lie.
 
 You can **unit-test** a sink that does no real I/O against the contract with no
 runtime — the test in the `weir-sink-sdk` crate

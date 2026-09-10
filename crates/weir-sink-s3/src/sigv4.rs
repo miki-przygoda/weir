@@ -96,6 +96,16 @@ fn sha256_hex(data: &[u8]) -> String {
     hex(Sha256::digest(data))
 }
 
+/// Base64 of the raw SHA-256 digest — the form `x-amz-checksum-sha256` takes.
+///
+/// Distinct from [`sha256_hex`], which produces the hex form
+/// `x-amz-content-sha256` takes. Both cover the same bytes; S3 wants different
+/// encodings in the two headers.
+pub fn sha256_base64(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(data))
+}
+
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
@@ -335,6 +345,30 @@ mod tests {
         // Hive partition keys: '=' IS escaped. S3 percent-decodes, so the
         // stored key is still `dt=2026-09-06` and partition discovery works.
         assert_eq!(uri_encode_path("/dt=2026-09-06/x"), "/dt%3D2026-09-06/x");
+    }
+
+    #[test]
+    fn the_checksum_header_encoding_matches_aws_expectations() {
+        // base64 of the RAW digest, not of the hex string -- getting that wrong
+        // yields a 44-character value that looks right and is rejected. Values
+        // computed independently:
+        //   python3 -c "import hashlib,base64;
+        //     print(base64.b64encode(hashlib.sha256(b'').digest()).decode())"
+        assert_eq!(
+            sha256_base64(b""),
+            "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+        );
+        assert_eq!(
+            sha256_base64(b"hello"),
+            "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+        );
+        // The two headers cover the same bytes in different encodings.
+        assert_eq!(sha256_hex(b"").len(), 64, "x-amz-content-sha256 is hex");
+        assert_eq!(
+            sha256_base64(b"").len(),
+            44,
+            "x-amz-checksum-sha256 is base64"
+        );
     }
 
     #[test]

@@ -353,15 +353,21 @@ and opens a fresh one. The sealed segment is forwarded to the drain
 for sink commit; until a segment seals, its records are durable on
 disk but invisible to the sink.
 
-> **Low-volume trap: with idle-seal off (the default), a quiet producer
-> delivers nothing.** With this 256 MiB cap and the default
-> [`wab_segment_max_age_secs`](#wab_segment_max_age_secs) `= 0`, a low-volume
-> deployment that writes a handful of small records and goes quiet gets every
-> record **acked** but the segment never reaches 256 MiB, so it never seals and
-> the sink receives **nothing** until shutdown. If your throughput won't fill a
-> segment promptly, set `wab_segment_max_age_secs` (e.g. `2`–`30`) so idle
-> segments seal on a timer — or lower this cap. This is the single most common
-> "weir accepts records but my sink is empty" surprise.
+> **Low-volume trap: with both seal timers off (the default), a low-volume
+> producer delivers nothing.** With this 256 MiB cap and both
+> [`wab_segment_max_age_secs`](#wab_segment_max_age_secs) and
+> [`wab_segment_max_lifetime_secs`](#wab_segment_max_lifetime_secs) at `0`, a
+> deployment that writes a handful of small records gets every record **acked**
+> but the segment never reaches 256 MiB, so it never seals and the sink receives
+> **nothing** until shutdown. This is the single most common "weir accepts
+> records but my sink is empty" surprise.
+>
+> Which timer fixes it depends on the producer, and picking the wrong one leaves
+> the symptom exactly as it was: `wab_segment_max_age_secs` seals a segment that
+> has gone **quiet**, and a producer that trickles steadily never does, so it
+> keeps the segment open indefinitely. `wab_segment_max_lifetime_secs` seals on
+> the segment's age regardless. If in doubt set both — whichever comes due first
+> seals — or lower this cap.
 
 **Effect**: smaller values trigger more frequent drain → sink activity
 and faster failure isolation (a corrupt segment only affects records
@@ -402,6 +408,85 @@ normal seal happens.
 **When to tune**: set it on edge/low-throughput deployments where timely delivery
 matters more than maximal per-segment batching; leave it `0` on high-throughput
 deployments where segments fill quickly on their own.
+
+> **This knob is named like a maximum age and is not one. It is an idle timer,
+> and a steady trickle defeats it.** The clock restarts on every flush
+> (`crates/weir-server/src/wab/mod.rs`), so a
+> producer writing one record a minute against `wab_segment_max_age_secs = 300`
+> resets it four times over before it can expire. That segment never seals on
+> this timer at all — it grows toward `wab_segment_max_bytes` exactly as if the
+> knob were `0`, which at 500 bytes a minute is roughly **two years** before
+> anything reaches the sink. The knob works for a producer that *stops*; it does
+> nothing for one that never pauses for the whole interval.
+>
+> If your producer trickles rather than bursts, you want
+> [`wab_segment_max_lifetime_secs`](#wab_segment_max_lifetime_secs) instead of,
+> or alongside, this one.
+
+---
+
+#### `wab_segment_max_lifetime_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `0` (disabled)
+- **Range**: 0 – 86400
+- **CLI**: `--wab-segment-max-lifetime-secs <n>`
+- **Env**: `WEIR_WAB_SEGMENT_MAX_LIFETIME_SECS`
+- **TOML**: `wab_segment_max_lifetime_secs`
+
+Opt-in **maximum lifetime**: when > 0, the WAB flusher seals the active segment
+(handing it to the drain) this many seconds after the segment was **created**,
+however busy the producer has been in the meantime. `0` (default) preserves the
+historical behaviour.
+
+**This is the knob that bounds delivery latency.** Nothing restarts its clock —
+not a write, not a flush, not a burst — so it is the only setting that makes
+"records reach the sink within N seconds" a statement weir will actually keep.
+
+##### Which of the two timers do I want?
+
+They are different knobs measuring from different instants, and the names do not
+make that obvious. The reference point is the whole distinction:
+
+| | `wab_segment_max_age_secs` | `wab_segment_max_lifetime_secs` |
+| --- | --- | --- |
+| **Clock starts at** | the last flush | segment creation |
+| **Restarted by a write?** | **Yes** — every flush | **No** — never |
+| **Fires when** | the producer has been quiet that long | that long has passed, busy or not |
+| **A steady trickle** | **never seals** | seals on schedule |
+| **A producer that stops** | seals promptly | seals at the lifetime, no sooner |
+| **Bounds delivery latency?** | No | **Yes** |
+
+Read the third row first. `wab_segment_max_age_secs` asks "has anything happened
+recently?"; `wab_segment_max_lifetime_secs` asks "how old is this segment?" Only
+the second question has an answer a producer cannot change by writing.
+
+**Why it exists**: low volume is the normal case for several things weir is
+deployed as — an S3 archive, a meter, a field station, a till — and those
+producers trickle rather than go quiet. The idle timer is the wrong shape for
+all of them, and until this knob existed the only honest advice was to lower
+`wab_segment_max_bytes` and hope the arithmetic worked out.
+
+**Setting both is the usual answer**, and the rule is that **whichever comes due
+first seals**. They are both upper bounds on how long a record can sit
+undelivered, so they compose by taking the minimum; adding one can only make
+delivery earlier, never later. A typical low-volume pair:
+
+```toml
+wab_segment_max_age_secs      = 5    # quiet? deliver in 5s
+wab_segment_max_lifetime_secs = 300  # busy? deliver within 5 minutes regardless
+```
+
+A lifetime shorter than the idle interval is accepted, not rejected — it simply
+means the lifetime always wins and the idle timer never gets the chance to fire.
+That is a legitimate configuration, so weir does not second-guess it.
+
+**When to tune**: lower it when delivery latency matters (a dashboard reading the
+sink, an archive with a freshness SLA); raise it when per-segment batching
+matters more (bigger objects in S3, fewer round trips to a database). Every seal
+is a segment file and one `Sink::commit`, so a 1-second lifetime on a busy shard
+buys latency with a lot of small segments. On-disk format is unchanged; like the
+idle timer this only affects *when* a normal seal happens.
 
 ---
 
@@ -1067,15 +1152,30 @@ deployments.
 > **double-counting** on replay. Pick a value and freeze it for the life of the
 > deployment. This applies to:
 >
-> - **ClickHouse** — `insert_deduplication_token`.
+> - **ClickHouse** — `insert_deduplication_token`. ClickHouse deduplicates per
+>   *block*, so there is no per-record alternative here.
 > - **HTTP in `ndjson` batch mode** — one POST carries the whole batch, so the
 >   `Idempotency-Key` is the batch's `DedupToken`, not a per-record key.
+> - **S3** — one object per batch, so the object key names the batch. See
+>   [the S3 sink guide](../sinks/s3.md#why-that-precondition-is-specific-to-this-sink).
+> - **Postgres / MySQL with no `sink_*_id_column`** — the only thing written is
+>   payload bytes, so the `UNIQUE` constraint has nothing better to sit on.
 >
-> **Only HTTP in the default `per_record` batch mode is exempt**: it sends one
-> POST per record keyed by that record's `RecordId`, which is stable regardless
-> of how the batch is split.
+> **Exempt — these key on the record, not the batch:**
 >
-> If you need to raise this knob on a running NDJSON deployment, drain the
+> - **HTTP in the default `per_record` batch mode**: one POST per record, keyed
+>   by that record's `RecordId`.
+> - **Postgres / MySQL with [`sink_postgres_id_column`](#sink_postgres_id_column)
+>   or [`sink_mysql_id_column`](#sink_mysql_id_column) set**: the `UNIQUE`
+>   constraint sits on the record's `RecordId`.
+>
+> A `RecordId` is the record's WAB coordinate — its segment plus its absolute
+> index *within that segment* — hashed with its bytes, so it does not move when
+> the segment is re-split. **A batch-level key cannot be made to do this**: it
+> is a function of the batch, and re-batching changes the batch. If a duplicate
+> is expensive, use a sink from the exempt list rather than freezing the knob.
+>
+> If you need to raise this knob on a deployment that is not exempt, drain the
 > backlog to empty first — a re-split can only double-deliver records that are
 > still on disk waiting to be replayed.
 
@@ -1305,16 +1405,29 @@ Provision it before pointing weir at the database. The minimal table:
 
 ```sql
 CREATE TABLE weir_records (
-  id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  payload VARBINARY(16384) NOT NULL,
+  id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  record_id CHAR(64) NOT NULL,
+  payload   VARBINARY(16384) NOT NULL,
   ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_payload (payload(255))
+  UNIQUE KEY uq_record_id (record_id)
 );
 ```
 
-The `UNIQUE` constraint pairs with the default `sink_mysql_insert_mode =
-"ignore"`: at-least-once retries that re-insert a payload are silently
-dropped by the server, no consumer-side dedup required.
+…with `sink_mysql_id_column = "record_id"`. The `UNIQUE` constraint pairs with
+the default `sink_mysql_insert_mode = "ignore"`: at-least-once retries that
+re-deliver a record are silently dropped by the server, no consumer-side dedup
+required.
+
+> **Do not put the `UNIQUE` on the payload.** Earlier versions of this page
+> recommended `UNIQUE KEY uq_payload (payload(255))`, which is **content**
+> identity and loses data: two genuinely distinct records that happen to share
+> their first 255 bytes — a metering "one unit consumed" event, a heartbeat, any
+> fixed-shape event — collide, and `INSERT IGNORE` discards the second. weir
+> acked it, wrote it to disk and delivered it. `record_id` is the record's WAB
+> coordinate hashed with its bytes, so it is unique across records with
+> identical bytes and unchanged by a replay — including one that re-splits the
+> segment because `sink_max_batch_size` changed. See
+> [`sink_mysql_id_column`](#sink_mysql_id_column).
 
 #### `sink_mysql_table`
 
@@ -1341,6 +1454,43 @@ Column that receives the payload bytes. Must be a `VARBINARY` or `BLOB`
 column wide enough to hold the largest payload weir accepts (capped
 elsewhere by `max_payload_bytes`).
 
+#### `sink_mysql_id_column`
+
+- **Type**: identifier (same rules as `sink_mysql_table`), optional
+- **Default**: unset — the INSERT writes the payload column only
+- **CLI**: `--sink-mysql-id-column <name>`
+- **Env**: `WEIR_SINK_MYSQL_ID_COLUMN`
+- **TOML**: `sink_mysql_id_column`
+
+Column that receives each record's **`RecordId`** as 64 lower-hex characters —
+the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
+constraint here.
+
+A `RecordId` is the record's WAB coordinate — the segment it was written to plus
+its absolute index *within that segment* — hashed with its bytes. That gives it
+the two properties a dedup key needs and a content hash cannot have together:
+
+- **Unique across records with identical bytes.** A payload hash collides on a
+  repeated heartbeat or a repeated metering event, and `INSERT IGNORE` then
+  discards records weir acked, stored and delivered.
+- **Unchanged by a replay, including a re-batched one.** The index is the
+  record's ordinal in the segment, not in the batch, so it does not move when
+  `sink_max_batch_size` changes between two delivery attempts. The batch-level
+  `DedupToken` does move, which is why it cannot do this job.
+
+The one thing it does not survive is a change of coordinate: `weir-ctl dl
+requeue` re-pushes records into a *new* segment, so they arrive as new ids and
+are inserted again. Both requeue commands say so before asking for
+confirmation.
+
+Rejected at startup: an id column equal to `sink_mysql_column` (the generated
+statement would name one column twice, which MySQL rejects permanently — the
+drain would dead-letter every batch), and any value failing identifier
+validation.
+
+Opt-in because turning it on requires a column your table does not have. With
+it unset every statement weir generates is byte-identical to previous releases.
+
 #### `sink_mysql_insert_mode`
 
 - **Type**: string (`"ignore"` or `"plain"`)
@@ -1353,8 +1503,9 @@ How to phrase the INSERT statement.
 
 - `"ignore"` → `INSERT IGNORE INTO ...`. Duplicate-key errors are
   silently dropped by the server. The recommended default: pair with a
-  `UNIQUE` constraint on the payload (or a hash of it) so crash-recovery
-  retries are idempotent without consumer-side dedup.
+  `UNIQUE` constraint on [`sink_mysql_id_column`](#sink_mysql_id_column) so
+  crash-recovery retries are idempotent without consumer-side dedup. A `UNIQUE`
+  on the payload instead discards distinct records that share bytes.
 - `"plain"` → `INSERT INTO ...`. Duplicates surface as `ER_DUP_ENTRY`
   (code 1062) and are classified as transient — the drain retries the
   segment. Use only if duplicate rows in the target table are tolerable.
@@ -1395,26 +1546,37 @@ connection pool (`deadpool-postgres`, max 4 connections).
 ```sql
 CREATE TABLE weir_records (
     id BIGSERIAL PRIMARY KEY,
+    record_id CHAR(64) NOT NULL,
     payload BYTEA NOT NULL,
-    payload_sha256 BYTEA GENERATED ALWAYS AS (sha256(payload)) STORED,
-    UNIQUE (payload_sha256)
+    UNIQUE (record_id)
 );
 ```
 
-The `UNIQUE (payload_sha256)` constraint pairs with the default
-`sink_postgres_insert_mode = "on_conflict_do_nothing"` so crash-recovery
-retries are idempotent: duplicate inserts are silently dropped by the
-server, no consumer-side dedup required.
+…with `sink_postgres_id_column = "record_id"`. The `UNIQUE (record_id)`
+constraint pairs with the default `sink_postgres_insert_mode =
+"on_conflict_do_nothing"` so crash-recovery retries are idempotent: duplicate
+inserts are silently dropped by the server, no consumer-side dedup required.
 
-> **The generated `payload_sha256` column is a dedup key, not at-rest
-> tamper-evidence.** It is `GENERATED ALWAYS … STORED`, so Postgres
-> **recomputes** it on every `UPDATE` — an attacker (or a buggy migration) that
-> rewrites `payload` also rewrites the hash, leaving the row internally
-> consistent. It anchors the bytes only at *insert* time, against accidental
-> duplication; it does **not** detect a later mutation. Real at-rest
-> tamper-evidence needs an **append-only** table (revoke `UPDATE`/`DELETE`) or an
-> application-maintained **hash chain** (each row's hash folds in the previous
-> row's), neither of which weir provides — see the
+> **Do not put the `UNIQUE` on a payload hash.** Earlier versions of this page
+> recommended a generated `payload_sha256 BYTEA GENERATED ALWAYS AS
+> (sha256(payload)) STORED` with `UNIQUE (payload_sha256)`. That is **content**
+> identity and it loses data: two genuinely distinct records that happen to
+> carry identical bytes — a metering "one unit consumed" event, a heartbeat, any
+> fixed-shape event — collide, and `ON CONFLICT DO NOTHING` discards the second.
+> weir acked it, wrote it to disk and delivered it. `record_id` is the record's
+> WAB coordinate hashed with its bytes, so it is unique across records with
+> identical bytes and unchanged by a replay — including one that re-splits the
+> segment because `sink_max_batch_size` changed. See
+> [`sink_postgres_id_column`](#sink_postgres_id_column).
+
+> **Neither column is at-rest tamper-evidence.** A `GENERATED ALWAYS … STORED`
+> hash is **recomputed** on every `UPDATE`, so an attacker (or a buggy
+> migration) that rewrites `payload` also rewrites the hash and leaves the row
+> internally consistent; a `record_id` written once by weir is likewise just a
+> value a writer with `UPDATE` can change. Both anchor the bytes at *insert*
+> time only. Real at-rest tamper-evidence needs an **append-only** table (revoke
+> `UPDATE`/`DELETE`) or an application-maintained **hash chain** (each row's
+> hash folds in the previous row's), neither of which weir provides — see the
 > [threat model](../security/threat-model.md) ("Signed audit log": records are
 > written verbatim, with no hash chain beyond the per-record wire CRC).
 
@@ -1442,6 +1604,51 @@ no escaping logic — there is no SQL injection vector through this knob.
 - **Env**: `WEIR_SINK_POSTGRES_COLUMN`
 - **TOML**: `sink_postgres_column`
 
+Column that receives the payload bytes. Typically `BYTEA`.
+
+---
+
+#### `sink_postgres_id_column`
+
+- **Type**: identifier (same rules as `sink_postgres_table`), optional
+- **Default**: unset — the INSERT writes the payload column only
+- **CLI**: `--sink-postgres-id-column <name>`
+- **Env**: `WEIR_SINK_POSTGRES_ID_COLUMN`
+- **TOML**: `sink_postgres_id_column`
+
+Column that receives each record's **`RecordId`** as 64 lower-hex characters —
+the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
+constraint here.
+
+A `RecordId` is the record's WAB coordinate — the segment it was written to plus
+its absolute index *within that segment* — hashed with its bytes. That gives it
+the two properties a dedup key needs and a content hash cannot have together:
+
+- **Unique across records with identical bytes.** A payload hash collides on a
+  repeated heartbeat or a repeated metering event, and `ON CONFLICT DO NOTHING`
+  then discards records weir acked, stored and delivered.
+- **Unchanged by a replay, including a re-batched one.** The index is the
+  record's ordinal in the segment, not in the batch, so it does not move when
+  `sink_max_batch_size` changes between two delivery attempts. The batch-level
+  `DedupToken` does move, which is why it cannot do this job.
+
+The one thing it does not survive is a change of coordinate: `weir-ctl dl
+requeue` re-pushes records into a *new* segment, so they arrive as new ids and
+are inserted again. Both requeue commands say so before asking for
+confirmation.
+
+With this set each row takes **two** bind parameters instead of one. Postgres's
+wire protocol caps a statement at 65 535 parameters and `sink_max_batch_size` is
+already validated to `1..=10000`, so the worst case is 20 000 — no new limit.
+
+Rejected at startup: an id column equal to `sink_postgres_column` (the generated
+statement would name one column twice, which Postgres rejects as `42701` —
+permanent, so the drain would dead-letter every batch), and any value failing
+identifier validation.
+
+Opt-in because turning it on requires a column your table does not have. With
+it unset every statement weir generates is byte-identical to previous releases.
+
 ---
 
 #### `sink_postgres_insert_mode`
@@ -1454,7 +1661,7 @@ no escaping logic — there is no SQL injection vector through this knob.
 
 | Mode | INSERT phrasing | Idempotent under crash recovery? |
 |------|------------------|----------------------------------|
-| `on_conflict_do_nothing` (default) | `INSERT INTO t (col) VALUES ($1), ($2), … ON CONFLICT DO NOTHING` | yes, if the table has a `UNIQUE` constraint |
+| `on_conflict_do_nothing` (default) | `INSERT INTO t (col) VALUES ($1), ($2), … ON CONFLICT DO NOTHING` | yes, if the table has a `UNIQUE` constraint on [`sink_postgres_id_column`](#sink_postgres_id_column) — a `UNIQUE` on a payload hash instead discards distinct records that share bytes |
 | `plain` | `INSERT INTO t (col) VALUES ($1), ($2), …` | no — duplicates surface as SQLSTATE `23505` and trigger a transient-retry loop until the operator removes the dup manually |
 
 #### Error classification
@@ -1808,9 +2015,12 @@ log_level = "info"
 > recognised, and enabling `tcp_bind` without the feature is a startup error.
 > This does **not** mean operators must build from source: as of 2.0.3, the
 > official release binaries (Linux/macOS) and the official Docker image are
-> already built with `--features tls`. Windows binaries are the exception —
-> the listener layer is Unix-only, so the feature has nothing to enable
-> there.
+> already built with `--features tls`. **There is no Windows binary** — the
+> listener layer is Unix-only, so `weir-server` has no ingest path there at
+> all, and 2.0.5 stopped shipping the `.exe` that had implied otherwise. A
+> Windows *producer* is supported and talks to a Unix daemon over this
+> listener using `weir-client --features tls`; see
+> [Platform support](../platform-support.md).
 
 TLS is **mandatory** on the TCP path. Setting `tcp_bind` without a valid TLS
 configuration (or without building with `--features tls`) is a **fatal startup

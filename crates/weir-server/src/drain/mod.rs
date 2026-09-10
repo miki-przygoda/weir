@@ -48,7 +48,7 @@ use crate::{
         SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth},
-    wab::{SegmentReader, read_segment_record_count},
+    wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
 };
 
 use confirmed::confirm_and_delete;
@@ -1105,33 +1105,6 @@ fn enter_blocked(
 
 // ── Segment processing ────────────────────────────────────────────────────────
 
-/// A segment's address in the WAB, as `<shard-dir>/<file-name>` — the string
-/// mixed into every [`RecordId`] derived from that segment.
-///
-/// **The file name alone is not unique, and using it alone was a defect.** Every
-/// `ShardWriter` starts its counter at 1 and names files `seg_{counter:08}`
-/// inside its own shard directory (`wab/segment.rs`), so
-/// `shard_00/seg_00000001.wab.sealed` and `shard_01/seg_00000001.wab.sealed`
-/// share a basename. Hashing the basename gave two genuinely distinct records
-/// the same `RecordId` whenever `shard_count > 1` and their payloads matched —
-/// the HTTP sink sends that as `Idempotency-Key`, so a correctly-implemented
-/// endpoint kept one and dropped the other. That is precisely the collision
-/// `RecordId` was introduced in 2.0.3 to prevent; it was merely moved from
-/// payload granularity to shard granularity.
-///
-/// Falls back to the bare file name when there is no parent component, which
-/// only happens for a bare relative path in tests.
-fn segment_identity(segment: &Path) -> String {
-    let file = segment
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    match segment.parent().and_then(|p| p.file_name()) {
-        Some(shard) => format!("{}/{}", shard.to_string_lossy(), file),
-        None => file,
-    }
-}
-
 async fn process_segment<S: Sink>(
     segment: &Path,
     sink: &S,
@@ -1182,6 +1155,10 @@ async fn process_segment<S: Sink>(
     // records carrying identical bytes apart — a content hash cannot. Kept
     // parallel to `batch` rather than folded into `Payload`, so nothing about
     // the record type changes.
+    //
+    // `segment_identity` is the WAB's, not the drain's: the flusher predicts the
+    // same string at ack time for a tracked push's `RecordCoordinate`, and the
+    // two must agree or the coordinate names a record the sink never keyed.
     let segment_name = segment_identity(segment);
     let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
 
@@ -1961,6 +1938,14 @@ mod tests {
         /// stranded-segment recovery-edge tests to drive a Down→Healthy
         /// transition deterministically.
         health_script: Mutex<VecDeque<SinkHealth>>,
+        /// Every `RecordId` the drain handed over, flattened across all
+        /// `commit()` calls in arrival order. This is what a dedup-capable
+        /// sink keys on, so it is the thing a re-batching test has to compare.
+        seen_record_ids: Mutex<Vec<RecordId>>,
+        /// Every `DedupToken` the drain handed over, one per `commit()` call.
+        /// Recorded alongside the ids so the two can be compared under the
+        /// same re-batching — they behave differently, deliberately.
+        seen_dedup_tokens: Mutex<Vec<weir_sink_sdk::DedupToken>>,
     }
 
     impl MockSink {
@@ -1977,6 +1962,8 @@ mod tests {
                 committed_records: Mutex::new(Vec::new()),
                 dead_lettered_records: Mutex::new(Vec::new()),
                 health_script: Mutex::new(VecDeque::new()),
+                seen_record_ids: Mutex::new(Vec::new()),
+                seen_dedup_tokens: Mutex::new(Vec::new()),
             }
         }
 
@@ -2007,6 +1994,8 @@ mod tests {
                 committed_records: Mutex::new(Vec::new()),
                 dead_lettered_records: Mutex::new(Vec::new()),
                 health_script: Mutex::new(VecDeque::new()),
+                seen_record_ids: Mutex::new(Vec::new()),
+                seen_dedup_tokens: Mutex::new(Vec::new()),
             }
         }
 
@@ -2066,6 +2055,19 @@ mod tests {
             self.dead_lettered_records.lock().unwrap().clone()
         }
 
+        /// Every `RecordId` the drain delivered, flattened across `commit()`
+        /// calls in arrival order — deliberately NOT grouped by batch, because
+        /// the whole point of the identity is that it does not depend on how
+        /// the records were grouped.
+        fn seen_record_ids(&self) -> Vec<RecordId> {
+            self.seen_record_ids.lock().unwrap().clone()
+        }
+
+        /// Every `DedupToken` the drain delivered, one per `commit()` call.
+        fn seen_dedup_tokens(&self) -> Vec<weir_sink_sdk::DedupToken> {
+            self.seen_dedup_tokens.lock().unwrap().clone()
+        }
+
         /// Hang the `nth` (1-based) `commit()` call forever — for hanging a
         /// *later* sub-batch (the first N succeed, then call N+1 times out).
         fn hanging_on_call(mut self, nth: u64) -> Self {
@@ -2089,6 +2091,17 @@ mod tests {
         type Error = MockError;
 
         async fn commit(&self, batch: SinkBatch) -> MockResult {
+            // Capture the identity the drain supplied BEFORE consuming the
+            // batch, and before any hang/panic arm — a call that the drain
+            // later cancels still delivered these, and a test asserting what
+            // reached the sink wants to see them.
+            self.seen_dedup_tokens
+                .lock()
+                .unwrap()
+                .push(*batch.dedup_token());
+            if let Some(ids) = batch.record_ids() {
+                self.seen_record_ids.lock().unwrap().extend_from_slice(ids);
+            }
             let batch = batch.into_records();
             let nth = self.call_count.fetch_add(1, Ordering::Relaxed) + 1;
             self.call_timestamps.lock().unwrap().push(Instant::now());
@@ -2187,6 +2200,127 @@ mod tests {
         assert_eq!(
             segment_identity(Path::new("seg_00000001.wab")),
             "seg_00000001.wab"
+        );
+    }
+
+    /// Drains one sealed segment through a sink whose `max_batch_size` is
+    /// `max_batch`, and returns the identity that sink observed: every
+    /// `RecordId` in arrival order, plus one `DedupToken` per `commit()` call.
+    ///
+    /// `process_segment` neither deletes nor rewrites the segment (confirmation
+    /// and unlink happen in the caller), so the same file can be drained twice
+    /// at two different batch sizes — which is exactly the scenario an operator
+    /// creates by editing `sink_max_batch_size` while a segment is unconfirmed.
+    fn drain_identity(
+        dir: &Path,
+        segment: &Path,
+        max_batch: usize,
+        expect_records: u64,
+    ) -> (Vec<RecordId>, Vec<weir_sink_sdk::DedupToken>) {
+        use super::dead_letter::DeadLetterWriter;
+        let sink = MockSink::with_batch_size(max_batch, []);
+        let mut dl = DeadLetterWriter::open(dir).unwrap();
+        let metrics = noop_metrics();
+        let config = fast_config(dir.to_path_buf());
+        let result = block_on(process_segment(
+            segment, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(result, ProcessResult::Confirmed { record_count } if record_count == expect_records),
+            "the segment must drain cleanly at max_batch_size={max_batch}, \
+             confirming all {expect_records} records"
+        );
+        (sink.seen_record_ids(), sink.seen_dedup_tokens())
+    }
+
+    /// **The guarantee this branch exists to establish.** A sink must be able to
+    /// recognise a record it has already committed even if `sink_max_batch_size`
+    /// changed between the two attempts.
+    ///
+    /// The drain re-reads `sink.max_batch_size()` on every call, so an operator
+    /// who edits the knob (or a redeployed pod carrying a different config)
+    /// re-splits an unconfirmed segment at different boundaries on replay.
+    /// Anything derived from the batch moves with those boundaries; the record's
+    /// WAB coordinate does not. `RecordId` is built from that coordinate —
+    /// `segment_identity` plus `read_index`, the record's ABSOLUTE ordinal
+    /// within the segment — so the ids a sink sees are a property of the
+    /// segment, not of the split.
+    ///
+    /// Falsified by changing `process_segment`'s
+    /// `RecordId::for_record(&segment_name, read_index, &payload)` to a
+    /// batch-relative index (`batch.len() as u64`), which is the plausible
+    /// refactor — the index is already in scope three lines away. The final
+    /// assertion then diverges at the fourth id: records 1-3 land in the first
+    /// sub-batch under both splits and agree by accident, and everything after
+    /// the size-3 boundary disagrees. A test that compared only the first
+    /// record would have passed the broken drain.
+    #[test]
+    fn record_ids_survive_a_changed_sink_max_batch_size() {
+        let dir = tmp_dir("rebatch_ids");
+        let payloads: Vec<&[u8]> = vec![
+            b"r01", b"r02", b"r03", b"r04", b"r05", b"r06", b"r07", b"r08", b"r09", b"r10",
+        ];
+        let segment = make_sealed_segment(&dir, 0, &payloads);
+
+        let (ids_at_3, tokens_at_3) = drain_identity(&dir, &segment, 3, 10);
+        let (ids_at_7, tokens_at_7) = drain_identity(&dir, &segment, 7, 10);
+
+        // Precondition: the boundaries really did move. Ten records split four
+        // ways at size 3 (3+3+3+1) and two ways at size 7 (7+3). Without this
+        // the test would also pass against a drain that ignored max_batch_size.
+        assert_eq!(tokens_at_3.len(), 4, "expected 4 sub-batches at size 3");
+        assert_eq!(tokens_at_7.len(), 2, "expected 2 sub-batches at size 7");
+
+        assert_eq!(
+            ids_at_3.len(),
+            10,
+            "every record must arrive with an id — the drain never sends a batch without them"
+        );
+        assert_eq!(
+            ids_at_3, ids_at_7,
+            "the per-record identity must not depend on how the drain grouped the \
+             records: a sink that committed these at sink_max_batch_size=3 has to \
+             recognise the same records at 7, or a replay double-charges"
+        );
+    }
+
+    /// The companion, pinning a limitation that is CORRECT and must not be
+    /// "fixed" by making the token segment-scoped.
+    ///
+    /// A `DedupToken` names a batch. Re-batching produces different batches, so
+    /// it produces different tokens — that is what batch-scoped means, and no
+    /// reformulation of the digest changes it. Making the token segment-scoped
+    /// instead would hand every sub-batch of a segment the same value, and a
+    /// dedup-capable sink would discard sub-batches 2..N as duplicates: silent
+    /// LOSS caused by the feature meant to prevent duplication. (That is the
+    /// argument recorded in the 2026-08-09 design spec, §3.1.)
+    ///
+    /// **If you are here because this test failed:** you have changed the
+    /// token's scope. Do not relax the assertion. The batch-size-stable
+    /// idempotency key is `SinkBatch::record_ids()`, pinned by the test above;
+    /// a sink that needs re-batch survival keys on that instead.
+    #[test]
+    fn the_dedup_token_deliberately_does_not_survive_a_changed_batch_size() {
+        let dir = tmp_dir("rebatch_token");
+        let payloads: Vec<&[u8]> = vec![
+            b"r01", b"r02", b"r03", b"r04", b"r05", b"r06", b"r07", b"r08", b"r09", b"r10",
+        ];
+        let segment = make_sealed_segment(&dir, 0, &payloads);
+
+        let (_, tokens_at_3) = drain_identity(&dir, &segment, 3, 10);
+        let (_, tokens_at_7) = drain_identity(&dir, &segment, 7, 10);
+
+        assert_ne!(
+            tokens_at_3, tokens_at_7,
+            "a batch token is a function of the batch; if re-batching left it \
+             unchanged the token would no longer distinguish sub-batches"
+        );
+        // Sharper than length inequality: even the FIRST sub-batch differs,
+        // because three records and seven records are different batches. There
+        // is no shared prefix a downstream could match on.
+        assert_ne!(
+            tokens_at_3[0], tokens_at_7[0],
+            "not even the first sub-batch survives a re-split"
         );
     }
 
@@ -3404,6 +3538,99 @@ mod tests {
         assert!(
             get_confirmed_path(&sealed).exists(),
             "resumed segment must be confirmed after delivery"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The strand boundary is where F05 deliberately STOPS, and the duplicate
+    /// that follows is a documented, billable cost — not an accident.
+    ///
+    /// `retry_resumes_past_already_processed_sub_batches` and
+    /// `blocked_segment_resumes_past_processed_when_cap_clears` pin the two
+    /// boundaries where the `processed` cursor SURVIVES. This pins the one where
+    /// it is dropped on purpose (H2, the `max_retries` exhausted arm): the
+    /// rescan re-queues only a `PathBuf`, so the Draining arm calls
+    /// `process_segment(.., 0)` and **re-commits the prefix that already
+    /// landed**. Persisting the cursor across a strand would need a crash-safe
+    /// on-disk sidecar; not doing so is the choice, and this is the choice's
+    /// receipt.
+    ///
+    /// It matters downstream, not just here. The S3 sink names each object
+    /// after a WAB coordinate, so in an ordinary bucket the re-PUT overwrites
+    /// and nothing is visible — but Object Lock requires versioning, and there
+    /// each re-commit adds an undeletable noncurrent version. One
+    /// strand-and-recover cycle on a full 256 MiB segment is a few hundred of
+    /// them, which is why `docs/sinks/s3.md` tells operators on locked buckets
+    /// to lower `wab_segment_max_bytes` and to treat `WeirSegmentStranded` as a
+    /// cost alert. That advice is only true while this test passes.
+    ///
+    /// Every existing strand test uses a one-record segment, where a
+    /// restart-at-zero and a resume-past-the-prefix are indistinguishable.
+    #[test]
+    fn a_strand_re_delivers_the_prefix_it_already_committed() {
+        let dir = tmp_dir("strand_reprefix");
+        // batch_size = 1 → A and B commit as separate sub-batches, so there IS
+        // a committed prefix to lose at the strand boundary.
+        let sealed = make_sealed_segment(&dir, 0, &[b"A", b"B"]);
+
+        // call 1:            commit([A]) → Ok         (processed → 1)
+        // calls 2..2+RETRIES: commit([B]) → Transient  (retries exhaust → STRAND)
+        // then responses are exhausted, so MockSink defaults to Ok:
+        // next call:         commit([A]) → Ok         ← the re-delivered prefix
+        // next call:         commit([B]) → Ok         → confirm
+        let mut responses: Vec<MockResult> = vec![MockSink::ok(vec![Payload::from(b"A".as_ref())])];
+        responses.extend((0..=MAX_RETRIES).map(|_| Err(MockError::Transient)));
+        let sink = Arc::new(MockSink::with_batch_size(1, responses));
+        let metrics = noop_metrics();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        // tx stays open so the drain reaches the idle health-poll where the
+        // down→up recovery rescan runs.
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !get_confirmed_path(&sealed).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            1,
+            "the segment must strand once before recovery re-queues it"
+        );
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "the resumed segment must be confirmed after delivery"
+        );
+
+        let committed = sink.committed_records();
+        let a = Payload::from(b"A".as_ref());
+        let b = Payload::from(b"B".as_ref());
+        assert_eq!(
+            committed,
+            vec![a.clone(), a.clone(), b.clone()],
+            "expected A committed twice: once before the strand and once after \
+             the resume restarts at record 0. Getting [A, B] instead means the \
+             `processed` cursor now SURVIVES the strand boundary -- which is an \
+             improvement, but it invalidates the duplicate-version cost warning \
+             in docs/sinks/s3.md and the H2 comment in this file. Update both \
+             before changing this assertion."
+        );
+        assert_eq!(
+            records_committed(&metrics),
+            3,
+            "a 2-record segment delivered 3 records: the duplicate is real and \
+             counted, not hidden inside the sink"
         );
 
         std::fs::remove_dir_all(dir).ok();

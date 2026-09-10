@@ -95,6 +95,118 @@ fn smoke_single_push_ack() {
     client.push(b"hello weir", Durability::Durable).unwrap();
 }
 
+/// A tracked push against the real binary: the daemon hands back an address, it
+/// points at a segment that actually exists on disk, and consecutive records on
+/// one connection get consecutive ordinals in that segment.
+#[test]
+fn tracked_push_returns_a_coordinate_that_matches_the_wab() {
+    let srv = weir_server!("tracked").shard_count(1).start();
+    let mut client = srv.client();
+
+    let first = client
+        .push_tracked(b"first record", Durability::Durable)
+        .unwrap();
+    let second = client
+        .push_tracked(b"second record", Durability::Durable)
+        .unwrap();
+
+    // The address is a real address, not a placeholder.
+    assert!(
+        first.segment().starts_with("shard_00/") && first.segment().ends_with(".wab.sealed"),
+        "unexpected segment address {:?}",
+        first.segment()
+    );
+    // Ordinals are 1-based and consecutive within one segment.
+    assert_eq!(first.index(), 1, "the first record in a segment is index 1");
+    assert_eq!(second.segment(), first.segment());
+    assert_eq!(second.index(), 2);
+
+    // Distinct records get distinct ids, and the id is a real digest rather
+    // than a zero-filled stand-in.
+    assert_ne!(first.record_id(), second.record_id());
+    assert_ne!(first.record_id(), &[0u8; 32]);
+    assert_eq!(first.record_id_hex().len(), 64);
+
+    // The address names a file that really exists. The segment is still open at
+    // ack time — that is the whole reason the sealed name is a prediction — so
+    // what is on disk right now is its `.wab` form. Checking that pins the shard
+    // directory and the segment counter against the real filesystem; the
+    // `.sealed` half of the prediction is pinned by
+    // `write_side_coordinates_match_what_the_drain_derives`, which replays the
+    // drain's derivation over actually-sealed files.
+    //
+    // Deliberately NOT asserted after a shutdown-seal: the default noop sink
+    // drains and DELETES a sealed segment almost immediately, so the sealed file
+    // is legitimately gone by then and asserting on it tests the drain's speed,
+    // not the coordinate.
+    let wab_dir = srv.wab_dir.clone();
+    let active = wab_dir.join(first.segment().trim_end_matches(".sealed"));
+    assert!(
+        active.exists(),
+        "the coordinate named {} but the WAB holds: {:?}",
+        active.display(),
+        list_tree(&wab_dir),
+    );
+}
+
+/// Tracked and untracked pushes interleave on one connection, each getting its
+/// own reply shape. If the daemon ever answered a plain `push` with the longer
+/// frame the stream would desync and the *next* call would fail — so the plain
+/// pushes here are the assertion.
+#[test]
+fn tracked_and_plain_pushes_interleave_on_one_connection() {
+    let srv = weir_server!("tracked_mixed").shard_count(1).start();
+    let mut client = srv.client();
+
+    client.push(b"plain one", Durability::Durable).unwrap();
+    let a = client
+        .push_tracked(b"tracked one", Durability::Durable)
+        .unwrap();
+    client.push(b"plain two", Durability::Durable).unwrap();
+    let b = client
+        .push_tracked(b"tracked two", Durability::Durable)
+        .unwrap();
+    client.push(b"plain three", Durability::Buffered).unwrap();
+
+    // The untracked records still occupy ordinals, so the tracked pair is two
+    // apart — proof the index counts every record in the segment, not just the
+    // tracked ones.
+    assert_eq!(a.segment(), b.segment());
+    assert_eq!(b.index(), a.index() + 2);
+    assert!(!client.is_poisoned());
+}
+
+/// A `Buffered` push gets a coordinate too. The tier decides durability; the
+/// coordinate only says where the record went.
+#[test]
+fn buffered_push_also_gets_a_coordinate() {
+    let srv = weir_server!("tracked_buffered").shard_count(1).start();
+    let mut client = srv.client();
+    let c = client
+        .push_tracked(b"buffered record", Durability::Buffered)
+        .unwrap();
+    assert_eq!(c.index(), 1);
+    assert!(c.segment().ends_with(".wab.sealed"));
+}
+
+/// Lists every file under a directory tree, for a failure message that says
+/// what IS there rather than only what is missing.
+fn list_tree(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend(list_tree(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
 #[test]
 fn all_durability_tiers_behave_per_contract() {
     // Strengthened from `all_durability_tiers_acked`: the original test
@@ -376,6 +488,106 @@ fn idle_seal_drains_low_volume_segment_without_shutdown() {
     assert!(
         committed() >= 1,
         "idle-seal should have sealed + drained the lone record (committed stayed 0)"
+    );
+}
+
+#[test]
+fn max_lifetime_seal_fires_for_a_producer_that_never_goes_idle() {
+    // The case `wab_segment_max_age_secs` cannot serve. That knob is an idle
+    // timer whose clock restarts on every flush, so a steady trickle postpones
+    // it forever and the segment grows toward `wab_segment_max_bytes` (256 MiB)
+    // as if it were unset — two years at 500 bytes a minute, against a fleet
+    // where low volume is the normal case (an S3 archive, a meter, a field
+    // station, a till).
+    //
+    // `wab_segment_max_lifetime_secs` measures from segment creation and
+    // nothing restarts it, so the same trickle must deliver. The write gap here
+    // is deliberately shorter than the lifetime: if the new timer were idle-
+    // based in disguise it would never fire and this test would fail.
+    const LIFETIME_SECS: u64 = 3;
+    const WRITE_GAP: Duration = Duration::from_millis(400);
+
+    let srv = weir_server!("max_lifetime_trickle")
+        .extra_config(format!("wab_segment_max_lifetime_secs = {LIFETIME_SECS}"))
+        .start();
+    let mut client = srv.client();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+
+    // Trickle well past the lifetime, never pausing for as long as the
+    // lifetime. Record the worst real gap: a CI runner that stalls for longer
+    // than LIFETIME_SECS would leave the segment genuinely quiet, at which
+    // point a seal proves nothing about the lifetime timer — an idle timer
+    // would have done it. The premise is checked before the verdict, so a
+    // stalled host reports a skip rather than a false pass.
+    let mut worst_gap = Duration::ZERO;
+    let mut last = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut delivered = 0u64;
+    while delivered == 0 && Instant::now() < deadline {
+        thread::sleep(WRITE_GAP);
+        client.push(b"trickle", Durability::Durable).unwrap();
+        worst_gap = worst_gap.max(last.elapsed());
+        last = Instant::now();
+        delivered = committed();
+    }
+
+    if worst_gap >= Duration::from_secs(LIFETIME_SECS) {
+        eprintln!(
+            "skipping the max-lifetime assertion: the host stalled for {worst_gap:?}, past the \
+             {LIFETIME_SECS}s lifetime, so the segment went genuinely idle and a seal would \
+             not distinguish the two timers"
+        );
+        return;
+    }
+
+    assert!(
+        delivered >= 1,
+        "a producer writing every {WRITE_GAP:?} against a {LIFETIME_SECS}s maximum lifetime \
+         must still deliver — the lifetime clock starts at segment creation and nothing \
+         restarts it. Nothing was committed in 30s while the worst write gap stayed at \
+         {worst_gap:?}, so the lifetime timer is being restarted by writes and is just the \
+         idle timer under a new name."
+    );
+}
+
+#[test]
+fn max_lifetime_seal_is_off_by_default() {
+    // The knob is opt-in, and this is what stops the feature from silently
+    // changing delivery timing for every existing deployment on upgrade. Same
+    // trickle as the test above with the knob unset: nothing may seal, because
+    // 256 MiB is a long way off and the idle timer is unset too.
+    const WRITE_GAP: Duration = Duration::from_millis(400);
+
+    let srv = weir_server!("max_lifetime_default").start();
+    let mut client = srv.client();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+
+    for _ in 0..12 {
+        thread::sleep(WRITE_GAP);
+        client.push(b"trickle", Durability::Durable).unwrap();
+    }
+
+    // No premise to guard here: with both timers unset there is no elapsed time
+    // that could legitimately seal this segment, so a stalled runner cannot
+    // make this assertion lie.
+    assert_eq!(
+        committed(),
+        0,
+        "with wab_segment_max_lifetime_secs unset, a segment must seal only at \
+         wab_segment_max_bytes or shutdown. Records reached the sink, so the new timer \
+         defaults to on and every deployment's delivery timing changes on upgrade."
     );
 }
 
@@ -1057,6 +1269,151 @@ fn mixed_durability_under_concurrent_load() {
             acked, per_tier_expected,
             "expected {per_tier_expected} acks for tier {label}, got {acked} — \
              tier dispatch is dropping or mis-routing records"
+        );
+    }
+}
+
+#[test]
+fn idle_seal_does_not_fire_for_a_producer_that_never_goes_idle() {
+    // `wab_segment_max_age_secs` reads as a maximum age and is an IDLE timer:
+    // the clock restarts on every flush (`wab/mod.rs:683-685`), so the seal
+    // fires only after the producer stops for the whole interval. A steady
+    // trickle therefore never idle-seals at all, and its segment grows toward
+    // `wab_segment_max_bytes` (256 MiB) exactly as if the knob were 0.
+    //
+    // That is the documented behaviour (`docs/operations/configuration.md`,
+    // `docs/sinks/s3.md`) and the shape most likely to surprise an operator who
+    // set the knob precisely to avoid it: "I set a 2-second seal and my archive
+    // is still empty." This pins both halves — writing keeps it open, stopping
+    // seals it — so changing idle semantics to age semantics has to be a
+    // deliberate act that updates those docs.
+    const IDLE_SECS: u64 = 2;
+    const WRITE_GAP: Duration = Duration::from_millis(400);
+
+    let srv = weir_server!("idle_seal_trickle")
+        .extra_config(format!("wab_segment_max_age_secs = {IDLE_SECS}"))
+        .start();
+    let mut client = srv.client();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+
+    // Trickle for well over the idle interval, recording the largest real gap
+    // between writes. A CI runner that stalls mid-loop would legitimately let
+    // the segment idle out, so the assertion below is made only if the premise
+    // — that we never actually went idle — held.
+    let mut worst_gap = Duration::ZERO;
+    let mut last = Instant::now();
+    for _ in 0..12 {
+        thread::sleep(WRITE_GAP);
+        client.push(b"trickle", Durability::Durable).unwrap();
+        worst_gap = worst_gap.max(last.elapsed());
+        last = Instant::now();
+    }
+
+    if worst_gap < Duration::from_secs(IDLE_SECS) {
+        assert_eq!(
+            committed(),
+            0,
+            "a producer writing every {WRITE_GAP:?} against a {IDLE_SECS}s idle \
+             seal must never idle-seal — the clock restarts on every flush. \
+             Records were delivered, so the timer is behaving as a maximum age \
+             rather than an idle interval, and the configuration and S3 sink \
+             docs that describe it as idle-only are now wrong."
+        );
+    } else {
+        eprintln!(
+            "skipping the never-idle assertion: the host stalled for {worst_gap:?}, \
+             which is past the {IDLE_SECS}s threshold, so the premise did not hold"
+        );
+    }
+
+    // Now stop writing. The same knob that refused to fire under load must fire
+    // once the producer is genuinely idle — otherwise this test would also pass
+    // against a build where idle-seal is simply broken.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while committed() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        committed() >= 1,
+        "after the producer stopped, the {IDLE_SECS}s idle seal should have \
+         sealed and drained the segment"
+    );
+}
+
+#[test]
+fn one_connection_can_interleave_both_durability_tiers() {
+    // The tier is a per-RECORD wire byte (envelope header offset 6), not a
+    // connection or a daemon setting, so a single producer can ask for a
+    // different guarantee on each push -- `Durable` for the transaction, the
+    // `Buffered` fast path for the telemetry beside it, over one socket.
+    //
+    // Nothing said so until now, and nothing tested the interleaved case:
+    // `mixed_durability_under_concurrent_load` gives each *thread* one fixed
+    // tier, and `all_durability_tiers_behave_per_contract` measures the tiers
+    // in separate phases. Both would pass against an implementation that read
+    // the tier correctly in a homogeneous stream but not a mixed one.
+    //
+    // Asserted through the fsync counter rather than the ack counters, because
+    // `weir_records_ack_total{tier}` is labelled from the request header
+    // (`socket/connection.rs`) and would agree with itself even if the flusher
+    // ignored the field entirely. `weir_wab_fsync_duration_seconds_count`
+    // increments once per real fsync syscall, and the flusher skips the group
+    // fsync when a batch holds no Durable record (`wab/mod.rs`), so on a
+    // serial push-and-wait connection -- one record per batch -- the count must
+    // rise by the number of Durable pushes and not by the total.
+    const PAIRS: u64 = 20;
+
+    let srv = weir_server!("interleaved_tiers").start();
+    let mut client = srv.client();
+    let fsyncs = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_wab_fsync_duration_seconds_count",
+        )
+    };
+
+    let before = fsyncs();
+    for i in 0..PAIRS {
+        client
+            .push(format!("durable-{i}").as_bytes(), Durability::Durable)
+            .unwrap_or_else(|e| panic!("durable push {i}: {e}"));
+        client
+            .push(format!("buffered-{i}").as_bytes(), Durability::Buffered)
+            .unwrap_or_else(|e| panic!("buffered push {i}: {e}"));
+    }
+    thread::sleep(Duration::from_millis(150));
+    let delta = fsyncs() - before;
+
+    assert!(
+        delta >= PAIRS,
+        "{PAIRS} interleaved Durable pushes produced only {delta} fsyncs. A \
+         Durable record sharing a stream with Buffered ones must still force \
+         the group fsync before its ack."
+    );
+    assert!(
+        delta < PAIRS * 2,
+        "{delta} fsyncs for {PAIRS} Durable + {PAIRS} Buffered pushes. The \
+         Buffered records are being fsynced too, so the flusher is not reading \
+         the tier per record -- it is applying one tier to the whole stream."
+    );
+
+    // And both tiers were actually accepted, not merely counted.
+    let body = srv.scrape_metrics();
+    for label in ["durable", "buffered"] {
+        let acked = parse_metric(
+            &body,
+            &format!("weir_records_ack_total{{tier=\"{label}\"}}"),
+        );
+        assert_eq!(
+            acked, PAIRS,
+            "one connection pushed {PAIRS} records at each tier; the {label} \
+             counter reads {acked}"
         );
     }
 }
@@ -2944,6 +3301,158 @@ fn parse_metric(body: &str, prefix: &str) -> u64 {
         }
     }
     0
+}
+
+/// Counts rows in a test-stack table by shelling into its container, so the
+/// test needs no database client of its own — `tokio-postgres` and
+/// `mysql_async` are dependencies of `weir-server` under feature flags, not
+/// dev-dependencies of this test crate.
+fn count_rows(container: &str, sql: &str) -> u64 {
+    let out = match container {
+        "weir-test-postgres" => Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "weir_test",
+                "-tAc",
+                sql,
+            ])
+            .output(),
+        _ => Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "mysql",
+                "-uroot",
+                "-ptest",
+                "-N",
+                "-B",
+                "weir_test",
+                "-e",
+                sql,
+            ])
+            .output(),
+    }
+    .unwrap_or_else(|e| panic!("docker exec {container}: {e}"));
+    assert!(
+        out.status.success(),
+        "query failed on {container}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no count in output from {container}"))
+}
+
+/// The reference schema this project shipped until 2.2 keys idempotency on the
+/// **payload**, and that silently loses data.
+///
+/// `UNIQUE (payload_sha256)` on Postgres and `UNIQUE KEY uniq_payload` on MySQL
+/// are *content* identity. Paired with the default `ON CONFLICT DO NOTHING` /
+/// `INSERT IGNORE`, two genuinely distinct records that happen to share bytes
+/// collapse to one row — and for a metering event ("one unit consumed") sharing
+/// bytes is the normal case, not an edge case.
+///
+/// This is the demonstration, not a description. It pushes byte-identical
+/// records at both schemas in the same run and asserts the difference:
+/// content-keyed loses all but one, coordinate-keyed keeps every record. The
+/// legacy assertion is deliberately an assertion of the *defect* — if it ever
+/// starts failing, the content-keyed schema stopped losing data and this test
+/// should be re-read rather than repaired.
+///
+/// Run via `bash deploy/run-sink-integration-tests.sh`, or manually with the
+/// compose stack up and both URLs exported.
+#[test]
+#[ignore = "requires the docker-compose test stack (see deploy/run-sink-integration-tests.sh)"]
+fn sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record() {
+    const N: u32 = 8;
+    const PAYLOAD: &[u8] = b"one-unit-consumed";
+
+    for (engine, url_var, container, table_cfg, id_cfg) in [
+        (
+            "postgres",
+            "WEIR_TEST_POSTGRES_URL",
+            "weir-test-postgres",
+            "sink_postgres_table",
+            "sink_postgres_id_column",
+        ),
+        (
+            "mysql",
+            "WEIR_TEST_MYSQL_URL",
+            "weir-test-mysql",
+            "sink_mysql_table",
+            "sink_mysql_id_column",
+        ),
+    ] {
+        let url = std::env::var(url_var)
+            .unwrap_or_else(|_| panic!("{url_var} not set — see the test docstring"));
+
+        // Coordinate-keyed: every distinct record must survive.
+        let srv = weir_server!(&format!("{engine}_keyed"))
+            .batch_size(200)
+            .batch_deadline_ms(5)
+            .shutdown_timeout_secs(5)
+            .env("WEIR_SINK_URL", &url)
+            .extra_config(format!("sink_type = \"{engine}\""))
+            .extra_config(format!("{table_cfg} = \"weir_records_keyed\""))
+            .extra_config(format!("{id_cfg} = \"record_id\""))
+            .extra_config("wab_segment_max_age_secs = 1")
+            .start();
+        let mut client = srv.client();
+        for _ in 0..N {
+            client.push(PAYLOAD, Durability::Durable).expect("push");
+        }
+        drop(client);
+        thread::sleep(Duration::from_secs(3));
+        drop(srv);
+
+        let kept = count_rows(
+            container,
+            "SELECT count(*) FROM weir_records_keyed WHERE payload = 'one-unit-consumed'",
+        );
+        assert_eq!(
+            kept,
+            u64::from(N),
+            "{engine}: keying on the WAB coordinate must keep all {N} distinct records, kept {kept}. \
+             Each push is a separate record at a separate WAB index, so a UNIQUE on record_id \
+             cannot collide between them."
+        );
+
+        // Content-keyed: the defect, asserted so it is visible rather than described.
+        let srv = weir_server!(&format!("{engine}_content"))
+            .batch_size(200)
+            .batch_deadline_ms(5)
+            .shutdown_timeout_secs(5)
+            .env("WEIR_SINK_URL", &url)
+            .extra_config(format!("sink_type = \"{engine}\""))
+            .extra_config(format!("{table_cfg} = \"weir_records\""))
+            .extra_config("wab_segment_max_age_secs = 1")
+            .start();
+        let mut client = srv.client();
+        for _ in 0..N {
+            client.push(PAYLOAD, Durability::Durable).expect("push");
+        }
+        drop(client);
+        thread::sleep(Duration::from_secs(3));
+        drop(srv);
+
+        let survived = count_rows(
+            container,
+            "SELECT count(*) FROM weir_records WHERE payload = 'one-unit-consumed'",
+        );
+        assert_eq!(
+            survived, 1,
+            "{engine}: the content-keyed reference schema should collapse all {N} records to 1 \
+             row, kept {survived}. If this now keeps more, the schema or the insert mode changed \
+             and docs/operations/configuration.md's warning needs re-reading — do not simply \
+             update this number."
+        );
+    }
 }
 
 // ── S3 sink (MinIO) ─────────────────────────────────────────────────────────

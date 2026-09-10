@@ -212,6 +212,7 @@ pub(crate) struct PartialConfig {
     pub batch_deadline_ms: Option<u64>,
     pub wab_segment_max_bytes: Option<u64>,
     pub wab_segment_max_age_secs: Option<u64>,
+    pub wab_segment_max_lifetime_secs: Option<u64>,
     pub wab_max_bytes: Option<u64>,
     pub wab_compression: Option<String>,
     pub wab_compression_level: Option<i32>,
@@ -237,11 +238,15 @@ pub(crate) struct PartialConfig {
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_column: Option<String>,
     #[cfg(feature = "mysql-sink")]
+    pub sink_mysql_id_column: Option<String>,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_insert_mode: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_table: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_column: Option<String>,
+    #[cfg(feature = "postgres-sink")]
+    pub sink_postgres_id_column: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: Option<String>,
     #[cfg(feature = "clickhouse-sink")]
@@ -355,6 +360,16 @@ pub struct Config {
     /// segment idle for this long is sealed and drained — timely delivery for
     /// low-volume deployments.
     pub wab_segment_max_age_secs: u64,
+    /// Maximum-lifetime seal threshold in seconds. `0` (default) disables it.
+    /// When > 0, a segment is sealed and drained this long after it was
+    /// *created*, however busy the producer has been.
+    ///
+    /// The distinction from `wab_segment_max_age_secs` is the whole point of
+    /// having both: that one measures from the last flush and is restarted by
+    /// every write, so a steady trickle holds a segment open indefinitely. This
+    /// one measures from segment creation and nothing restarts it. With both
+    /// set, whichever comes due first seals.
+    pub wab_segment_max_lifetime_secs: u64,
     /// Soft upper bound on live WAB bytes on disk. `0` (default) disables it.
     ///
     /// When exceeded, pushes are Nacked with `NackReason::InternalError` rather
@@ -475,12 +490,20 @@ pub struct Config {
     pub sink_mysql_table: String,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_column: String,
+    /// Column receiving each record's `RecordId` hex — the per-record
+    /// idempotency key. Unset keeps the historical single-column INSERT.
+    #[cfg(feature = "mysql-sink")]
+    pub sink_mysql_id_column: Option<String>,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_insert_mode: crate::sink::mysql::InsertMode,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_table: String,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_column: String,
+    /// Column receiving each record's `RecordId` hex — the per-record
+    /// idempotency key. Unset keeps the historical single-column INSERT.
+    #[cfg(feature = "postgres-sink")]
+    pub sink_postgres_id_column: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: crate::sink::postgres::InsertMode,
     #[cfg(feature = "clickhouse-sink")]
@@ -700,6 +723,19 @@ impl Config {
             0,
             86_400,
         )?;
+        // Maximum-lifetime seal threshold, measured from segment creation and
+        // never restarted by a write — the bound `wab_segment_max_age_secs`
+        // reads like but is not. 0 = disabled; same day cap, and the two are
+        // deliberately independent: a lifetime below the idle interval just
+        // makes the idle timer unreachable, which is a legitimate choice rather
+        // than a misconfiguration, so there is no cross-check between them.
+        let wab_segment_max_lifetime_secs = merge!(wab_segment_max_lifetime_secs).unwrap_or(0);
+        check_range(
+            "wab_segment_max_lifetime_secs",
+            wab_segment_max_lifetime_secs,
+            0,
+            86_400,
+        )?;
 
         let max_connections = merge!(max_connections).unwrap_or(256);
         check_range("max_connections", max_connections, 1, 512)?;
@@ -858,6 +894,12 @@ impl Config {
             merge!(sink_mysql_table).unwrap_or_else(|| "weir_records".to_string());
         #[cfg(feature = "mysql-sink")]
         let sink_mysql_column = merge!(sink_mysql_column).unwrap_or_else(|| "payload".to_string());
+        // Left as an Option all the way to the sink: "unset" is a distinct
+        // state, not a default value. Its identifier is validated inside
+        // MySqlSink::new alongside `table`/`column`, so there is nothing to
+        // check here.
+        #[cfg(feature = "mysql-sink")]
+        let sink_mysql_id_column = merge!(sink_mysql_id_column);
         #[cfg(feature = "mysql-sink")]
         let sink_mysql_insert_mode_str =
             merge!(sink_mysql_insert_mode).unwrap_or_else(|| "ignore".to_string());
@@ -874,6 +916,9 @@ impl Config {
         #[cfg(feature = "postgres-sink")]
         let sink_postgres_column =
             merge!(sink_postgres_column).unwrap_or_else(|| "payload".to_string());
+        // Option-through, same as the MySQL id column above.
+        #[cfg(feature = "postgres-sink")]
+        let sink_postgres_id_column = merge!(sink_postgres_id_column);
         #[cfg(feature = "postgres-sink")]
         let sink_postgres_insert_mode_str = merge!(sink_postgres_insert_mode)
             .unwrap_or_else(|| "on_conflict_do_nothing".to_string());
@@ -1056,6 +1101,7 @@ impl Config {
             batch_deadline_ms,
             wab_segment_max_bytes,
             wab_segment_max_age_secs,
+            wab_segment_max_lifetime_secs,
             wab_max_bytes,
             wab_compression,
             wab_compression_level,
@@ -1081,11 +1127,15 @@ impl Config {
             #[cfg(feature = "mysql-sink")]
             sink_mysql_column,
             #[cfg(feature = "mysql-sink")]
+            sink_mysql_id_column,
+            #[cfg(feature = "mysql-sink")]
             sink_mysql_insert_mode,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_table,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_column,
+            #[cfg(feature = "postgres-sink")]
+            sink_postgres_id_column,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_insert_mode,
             #[cfg(feature = "clickhouse-sink")]
@@ -1264,6 +1314,9 @@ mod tests {
         assert_eq!(c.batch_deadline_ms, 1);
         assert_eq!(c.wab_segment_max_bytes, 256 * 1024 * 1024);
         assert_eq!(c.wab_segment_max_age_secs, 0);
+        // Both seal timers are opt-in. A default that sealed on a timer would
+        // change delivery timing for every existing deployment on upgrade.
+        assert_eq!(c.wab_segment_max_lifetime_secs, 0);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
@@ -1581,6 +1634,56 @@ mod tests {
     /// that drops or mis-wires one knob's guard. Each case sets exactly one knob
     /// just past a bound; all others default to in-range, so only the target
     /// field's check fires.
+    /// Drift guard: every sink the daemon accepts must be named in the README's
+    /// "Built-in sinks" line.
+    ///
+    /// This exists because it already went wrong. The 2.1.0 release added the S3
+    /// sink, updated the README's sink *count* and its crates table, and left the
+    /// prose list saying five — so the README announced `s3` in one paragraph and
+    /// omitted it from the list 27 lines later. A count is easy to grep for and
+    /// remember; a prose list is not, which is exactly why it needs a test.
+    ///
+    /// Gated on the full sink feature set so the assertion is exhaustive: under a
+    /// partial build `SinkType::parse` rejects the absent sinks and the test would
+    /// silently check less than it claims. CI runs `--all-features`.
+    #[cfg(all(
+        feature = "http-sink",
+        feature = "mysql-sink",
+        feature = "postgres-sink",
+        feature = "clickhouse-sink",
+        feature = "s3-sink"
+    ))]
+    #[test]
+    fn readme_lists_every_sink_the_daemon_accepts() {
+        const README: &str = include_str!("../../../../README.md");
+        // The canonical set. Adding a sink means adding it here, which is the
+        // prompt to add it to the README in the same change.
+        const SINKS: &[&str] = &["noop", "http", "mysql", "postgres", "clickhouse", "s3"];
+
+        let line = README
+            .lines()
+            .find(|l| l.contains("Built-in sinks:"))
+            .expect("README must carry a 'Built-in sinks:' line");
+        // The list wraps, so take it and the following few lines.
+        let start = README.find(line).unwrap();
+        let block: String = README[start..]
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for sink in SINKS {
+            assert!(
+                SinkType::parse(sink).is_ok(),
+                "{sink} is in the canonical list but the daemon rejects it"
+            );
+            assert!(
+                block.contains(&format!("`{sink}`")),
+                "the README's 'Built-in sinks' block does not name `{sink}`:\n{block}"
+            );
+        }
+    }
+
     #[test]
     fn bounded_scalar_knobs_reject_out_of_range() {
         assert_knob_rejected("rng_batch_size", "batch_size", |p| p.batch_size = Some(0));
@@ -1589,6 +1692,9 @@ mod tests {
         });
         assert_knob_rejected("rng_seg_age", "wab_segment_max_age_secs", |p| {
             p.wab_segment_max_age_secs = Some(86_401)
+        });
+        assert_knob_rejected("rng_seg_life", "wab_segment_max_lifetime_secs", |p| {
+            p.wab_segment_max_lifetime_secs = Some(86_401)
         });
         assert_knob_rejected("rng_max_conn", "max_connections", |p| {
             p.max_connections = Some(0)

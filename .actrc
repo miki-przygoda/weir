@@ -1,0 +1,17 @@
+# Runner images for `act` (https://nektosact.com), which runs this repo's own
+# .github/workflows/ci.yml locally in Docker.
+#
+# Pinned here for two reasons. act prompts for an image on first run and dies
+# with `level=fatal msg=EOF` under any non-interactive invocation, so without
+# this a new clone cannot run act from a script. And the choice matters: the
+# "large" image is a ~53 GB runner snapshot published for amd64 only, which on
+# an arm64 machine means every job runs under qemu.
+#
+# catthehacker/ubuntu:act-latest is multi-arch (amd64, arm64), ~500 MB, and
+# carries enough to bootstrap the actions themselves -- which then install the
+# real toolchains, exactly as they do on GitHub. That is the whole point: the
+# toolchain comes from `actions/setup-go@v5`, not from an image someone has to
+# remember to update.
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+-P ubuntu-22.04=catthehacker/ubuntu:act-22.04
+-P ubuntu-24.04=catthehacker/ubuntu:act-24.04

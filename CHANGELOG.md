@@ -15,10 +15,260 @@ protocol** below.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-09-10
+
+Three capabilities the idea fleet found weir could not do, one P0 data-loss fix
+in the S3 sink, one silent-loss defect in the SQL sinks' own reference schema,
+and eleven published claims that were wrong.
+
+### Breaking
+
+- **`MessageType` gains two variants**, `PushTracked = 0x06` and
+  `AckTracked = 0x07`. The enum is `pub` in `weir-core` and is not
+  `#[non_exhaustive]`, so a downstream exhaustive `match` on it no longer
+  compiles. That is a breaking change to a published crate's Rust API under
+  this file's own rule, and is why this is 3.0.0 rather than 2.2.0 — the
+  practical blast radius is small, since a producer uses `weir-client::push`
+  rather than matching on the wire enum, but the rule does not have an
+  "unless we think nobody is affected" clause.
+
+  **`WIRE_VERSION` stays 1.** The wire protocol is not broken: a message type
+  is additive the same way `NackReason` bytes `0x0A–0xFF` already are. An
+  existing client never sends `0x06`, so it never receives an `0x07`, and its
+  `Push` still gets the same frozen twenty-byte `Ack`. All 30 frozen
+  conformance vectors pass byte-identical, as do all five polyglot demo
+  clients.
+
+### Added
+
+- **A producer can learn the address of the record it just pushed.**
+  `push_tracked` returns a `RecordCoordinate` — segment identity, 1-based index
+  within that segment, and the record's `RecordId`. Previously `push()` returned
+  a bare `Result`, so a producer knew its record was accepted but never which
+  record it was.
+
+  **What this is not:** a per-producer sequence. The coordinate is a *buffer
+  address*; other producers interleave in the same segment, so any one
+  producer's indices have holes by construction. It does not satisfy the
+  gap-free numbering that fiscalisation regimes require, and the wire and client
+  docs say so rather than letting it look as though it does.
+
+- **`wab_segment_max_lifetime_secs`** — a genuine maximum age, measured from
+  segment creation and never reset. `wab_segment_max_age_secs` is an *idle*
+  timer whose clock restarts on every flush, so a steady trickle postpones it
+  forever: one record a minute against a 300-second setting resets it four times
+  over, and the segment grows toward 256 MiB as if the knob were `0` — roughly
+  two years at 500 bytes a minute. Both knobs are upper bounds on delivery
+  latency, so whichever comes due first seals.
+
+- **`sink_postgres_id_column` / `sink_mysql_id_column`** — write each record's
+  `RecordId` as a second column, so the `UNIQUE` constraint sits on a per-record
+  key.
+
+### Fixed
+
+- **A bucket-wide S3 Object Lock retention dead-lettered every acked record.**
+  AWS rejects any `PutObject` landing inside a retention period without
+  `Content-MD5` or an `x-amz-checksum-*` header — a bucket *default* retention
+  included. weir sent neither, S3 answered `400 InvalidRequest`, and that code
+  was classified Permanent, so the whole backlog was dead-lettered while
+  `health()` still reported Healthy because `HeadBucket` kept succeeding.
+  `PutObject` now sends `x-amz-checksum-sha256`, and `InvalidRequest` strands
+  rather than dead-letters.
+
+- **The SQL sinks' reference schema silently discarded distinct records.** This
+  project documented `UNIQUE (payload_sha256)` on Postgres and
+  `UNIQUE KEY uniq_payload` on MySQL. That is *content* identity, so paired with
+  the default `ON CONFLICT DO NOTHING` / `INSERT IGNORE` two genuinely distinct
+  records that share bytes collapse to one row — and for a metering event
+  ("one unit consumed") sharing bytes is the normal case. Measured against live
+  Postgres and MySQL, eight byte-identical records: coordinate-keyed keeps 8,
+  content-keyed keeps 1. The reference schema now keys on `record_id`, and the
+  old schema is retained in the test stack so the comparison is demonstrated
+  rather than described.
+
+- **No batch-level key can survive re-batching**, because a batch key is a
+  function of the batch. `DedupToken`'s constant-`sink_max_batch_size`
+  precondition is inherent rather than incidental; the escape hatch is
+  `RecordId`, built from the record's absolute index in its segment, which does
+  not move when the batch size changes.
+
+### Changed
+
+- **Local CI now runs the real workflow, via [`act`](https://nektosact.com).**
+  `.actrc` at the repo root pins the runner images, so a fresh clone can run
+  `act -W .github/workflows/ci.yml -j lint` with no configuration — act
+  otherwise prompts for an image on first run and dies under any
+  non-interactive invocation.
+
+  The previous approach parsed `ci.yml` and executed its `run:` steps inside a
+  hand-built image, which closes the drift hole in the *command list* and leaves
+  it open in the *toolchain*: that image carried Debian's `go1.19.8` against a
+  `go.mod` requiring `go 1.26.3`, so the polyglot conformance step it existed to
+  run had become a step that always failed. act runs `actions/setup-go@v5` and
+  `dtolnay/rust-toolchain` themselves, so there is no image to keep in step.
+
+  `sink-integration` and `monitoring` turn out to run fine under act — it binds
+  the Docker socket and uses `network="host"`, so their `docker compose`
+  services come up as siblings with reachable ports. Only `windows` and the
+  macOS half of `build` genuinely cannot run in a Linux container, and
+  `deploy/ci-local/README.md` still says so rather than skipping them silently.
+
+### Fixed
+
+- **A bucket-wide S3 Object Lock retention dead-lettered every acked record.**
+  AWS rejects any `PutObject` landing inside a retention period without
+  `Content-MD5` or an `x-amz-checksum-*` header — a bucket *default* retention
+  included. weir sent neither, S3 answered `400 InvalidRequest`, and that code
+  was classified Permanent, so the whole backlog was dead-lettered while
+  `health()` still reported Healthy because `HeadBucket` kept succeeding.
+  `PutObject` now sends `x-amz-checksum-sha256` (the payload digest is already
+  computed for SigV4, so this costs one base64 and no new dependency), and
+  `InvalidRequest` now strands rather than dead-letters — a provider rejecting a
+  request under that code for any other reason must not displace acked data
+  either.
+
+### Documentation
+
+- Published claims corrected, each with a test that fails without the fix
+  (`crates/weir-server/tests/docs_drift.rs`): the README's sink list omitted
+  `s3`, its benchmark vintage was two releases stale, and its 1.4 ms SATA
+  citation pointed at a file reporting 1.5 ms.
+- `docs/benchmarks.md` published a single-thread `Durable` rate in the same
+  column as a saturation ceiling with no concurrency stated. It is a latency
+  reciprocal — one synchronous producer pays one fsync per record — and the same
+  tier on the same runner reaches 18× that across 48 connections.
+- `docs/benchmarks/drain-throughput.md` compared beast's drain against an M3 Max
+  client's ingest, which `environments.md` forbids. Against the same box's own
+  ingest the drain is 2.1× wider at one connection and *narrower* than
+  concurrent `Buffered` ingest — which is the case weir exists for.
+- The Grafana dashboard's durable-write panel quoted Linux `fdatasync`
+  baselines with no macOS caveat; `F_BARRIERFSYNC` and `F_FULLFSYNC` are
+  different primitives, not a slower disk.
+- `environments.md`'s rule that external claims cite `bare-metal.md` was
+  unsatisfiable — that file has never held a capture — so it forbade every
+  performance statement the project makes. It now names the property meant and
+  lists the captures that satisfy it.
+- `wab_segment_max_age_secs` is an **idle** timer, not a maximum age: the clock
+  restarts on every flush, so a steady trickle never idle-seals at all. Now
+  documented at the knob and in the S3 sink guide.
+- `docs/sinks/s3.md` gained Object Lock and versioned-bucket behaviour, the KMS
+  grant an SSE-KMS deployment needs, the boundary of the key's append-only
+  property, and the low-volume seal interaction.
+- **New: [`docs/platform-support.md`](docs/platform-support.md)** — daemon and
+  library support tables, released binaries, durability by platform, and an
+  explicit *Untested and unsupported* section. Facts that were previously spread
+  across ten places in six files, plus two that were written down nowhere: the
+  test suite runs on Linux only, and a daemon on any other Unix (Android, the
+  BSDs, illumos) compiles, starts, and then refuses every connection, because
+  `peer_uid` has no implementation there and the accept loop fails closed.
+- The quickstart's macOS durability pointer led to `architecture.md`, which never
+  mentions macOS; `configuration.md` implied a Windows binary 2.0.5 removed; the
+  README's `weir-ctl` row carried no platform marker though its table siblings
+  all do, and its copy-pasteable quickstart had no platform line at all.
+- The 2026-06-13 snapshots framed `F_BARRIERFSYNC` vs `fdatasync` as an ~11×
+  *speed* difference. It is a difference in guarantee — a barrier is not a flush
+  — and reading it as speed suggests "buy an NVMe and `Durable` gets 11×
+  cheaper", which is false.
+
+- The wire protocol, `integrating.md` and the README now say that the durability
+  tier is a **per-record** wire byte, so one connection can interleave `Durable`
+  and `Buffered` freely — true since 1.0, stated nowhere, and tested nowhere
+  until now. The Ack frame's durability byte is always `0x01`; the protocol doc
+  now warns non-Rust clients not to read it as confirmation of the tier.
+- `install.md` had no durability prerequisites at all — nothing about local
+  storage, network filesystems, headroom, drive write caches, or the macOS
+  barrier — for a system whose whole guarantee is one `fsync`.
+- The README's "an ack is never a false ack" was stated unconditionally; it
+  holds at the `Durable` tier. The chaos figure now also carries the `Buffered`
+  result measured in the same runs (uniform loss, 1.76 s ceiling) and the
+  platform it was measured on.
+- `batch-tuning.md`'s "3.6–7.9× throughput improvement" is a 3-trial median on
+  the shared sandbox the file's own caveat calls too noisy to quote, computed
+  against a nominal default the project never actually ran. Against the config
+  CI used, the same table shows ~4%.
+
+### Fixed (tooling)
+
+- `deploy/avg_benchmarks.py` read `WEIR_VERSION` inside the history-writing
+  branch only, so `history.md` was stamped and `latest.md` was not — leaving
+  every hand-written "as of" line in the tree free to drift.
+- Benchmark rows poisoned by a descheduled CI runner (single-thread `Sync` p99
+  of 28.2 ms, 35.5 ms and 98.9 ms, against a healthy ceiling near 3.6 ms) sat
+  unannotated in the published trend. The generator now marks them `(!)` at
+  write time, and the three existing rows are backfilled.
+
+---
+
+## [2.1.0] - 2026-09-07
+
 Two independent pieces: the S3 sink (a new published crate and a minor version
 bump), and the second-sweep fixes below.
 
 ### Added
+
+- **`wab_segment_max_lifetime_secs` — a segment seal a steady producer cannot
+  postpone.** When > 0, the active segment is sealed and drained this many
+  seconds after it was *created*, however busy the producer has been. `0`
+  (default) is off, so no existing deployment changes behaviour on upgrade.
+
+  This exists because `wab_segment_max_age_secs` is named like a maximum age and
+  is an **idle timer**: its clock restarts on every flush, so a producer writing
+  one record a minute against a 300-second setting resets it four times over
+  before it can expire. That segment never seals on the timer at all — it grows
+  toward `wab_segment_max_bytes` (256 MiB) exactly as if the knob were `0`, which
+  at 500 bytes a minute is roughly two years before anything reaches a sink. The
+  trap selects precisely for weir's low-volume deployments: an S3 archive, a
+  meter, a field station, a till.
+
+  The existing knob is **unchanged** — renaming or redefining it would silently
+  alter delivery timing for anyone relying on idle semantics. The two are
+  independent, and with both set **whichever comes due first seals**: they are
+  upper bounds on delivery latency, so they compose by taking the minimum and
+  adding one can only make delivery earlier. The configuration reference now
+  carries a side-by-side of the two clocks, since telling them apart from the
+  names alone is not reasonably possible.
+
+  CLI `--wab-segment-max-lifetime-secs`, env `WEIR_WAB_SEGMENT_MAX_LIFETIME_SECS`,
+  TOML `wab_segment_max_lifetime_secs`. Range `0`–`86400`.
+
+- **A durable coordinate for a pushed record — `WeirClient::push_tracked`.**
+  `push()` tells a producer its record was accepted; it has never said *which*
+  record it was. `push_tracked()` returns a `RecordCoordinate`: the WAB segment
+  the record landed in, its 1-based index within that segment, and the
+  `record_id` derived from both plus the payload. That `record_id` is
+  byte-identical to the per-record idempotency key the drain hands a sink (the
+  HTTP sink's `Idempotency-Key: sha256:<hex>`, the S3 sink's object name), so a
+  producer can finally reconcile what it sent against what the downstream
+  received — without carrying its own sequence inside the payload.
+
+  **The wire protocol is unchanged for every existing client.** The feature is
+  two new, additive message types — `PushTracked` (`0x06`) answered by
+  `AckTracked` (`0x07`). A client that does not implement them never sends
+  `0x06`, so it never receives an `0x07`, and its `Push` still gets the same
+  20 constant bytes. `WIRE_VERSION` stays 1;
+  `docs/conformance/wire_v1_vectors.json` is byte-identical and all five
+  polyglot demo clients pass it unchanged. Negotiation needs no handshake: a
+  daemon that predates the type answers `Nack(UnknownMessage 0x08)` and closes,
+  which is the protocol's existing permanent-error path for version skew.
+
+  New in `weir-core`: `RecordCoordinate` and its payload codec, plus the
+  `MessageType::PushTracked` / `AckTracked` variants. New in `weir-client`:
+  `push_tracked` / `push_tracked_default`, and a response pre-allocation cap now
+  chosen by message type — a client that never asks for a coordinate still
+  accepts at most the 2 bytes it always did. Conformance vectors for the
+  extension live in a **separate** `wire_v1_tracked_vectors.json`, because a
+  decoder that implements only types `0x01`–`0x05` is *correct* to reject a
+  `0x06` frame and must stay conformant.
+
+  **What this is not**, stated plainly because the distinction matters: it is a
+  buffer address, not a per-producer sequence. Records from other producers
+  interleave, so one producer's indices have holes — this does **not** provide
+  the gap-free sequential numbering some fiscal statutes require. An
+  `AckTracked` is not a delivery receipt (the record is durably buffered, not
+  yet drained), and a `Buffered` push gets a coordinate without getting
+  durability. See
+  [`docs/wire_protocol.md`](docs/wire_protocol.md#tracked-push--pushtracked--acktracked).
 
 - **`weir-sink-s3` — an S3-API object-storage sink**, behind `weir-server`'s
   opt-in `s3-sink` feature. Targets the S3 *API* rather than AWS specifically,
@@ -83,6 +333,61 @@ bump), and the second-sweep fixes below.
   should switch to this value. It is the only timestamp on the batch that
   survives a replay.
 
+- **`sink_postgres_id_column` and `sink_mysql_id_column`** — an opt-in column
+  receiving each record's `RecordId` as 64 lower-hex characters, so the
+  operator's `UNIQUE` constraint can sit on a **per-record** idempotency key
+  instead of on the payload.
+
+  ```toml
+  sink_postgres_id_column = "record_id"    # CHAR(64), UNIQUE
+  ```
+
+  ```sql
+  CREATE TABLE weir_records (
+      id BIGSERIAL PRIMARY KEY,
+      record_id CHAR(64) NOT NULL,
+      payload BYTEA NOT NULL,
+      UNIQUE (record_id)
+  );
+  ```
+
+  The schema these sinks previously documented put the `UNIQUE` on the payload
+  or a generated `sha256(payload)`, because payload bytes were all the sink
+  wrote. That is **content** identity and it is wrong in both directions:
+
+  - It **loses**. Two genuinely distinct records that carry identical bytes — a
+    metering "one unit consumed" event, a heartbeat, any fixed-shape event —
+    collide, and `ON CONFLICT DO NOTHING` / `INSERT IGNORE` discards the second.
+    weir acked it, wrote it to disk and delivered it; the recommended schema
+    dropped it. The MySQL form (`UNIQUE KEY uq_payload (payload(255))`) collided
+    on a shared 255-byte *prefix*, which is broader still.
+  - It does not survive a re-batch. Nor does the batch's `DedupToken`: a
+    batch-level key is a function of the batch, and the drain re-reads
+    `sink_max_batch_size` on every call, so changing it re-splits an unconfirmed
+    segment at new boundaries and every batch-level key changes with them. A
+    `RecordId` is built from the record's WAB coordinate — its segment plus its
+    absolute index *within that segment* — so it does not move.
+
+  Opt-in, because it needs a column the deployed table does not have. **With the
+  knob unset every statement weir generates is byte-identical to 2.1.0**, pinned
+  by a test in each sink. Rejected at startup rather than at first commit: an id
+  column equal to the payload column (Postgres `42701` / MySQL
+  `ER_FIELD_SPECIFIED_TWICE` are permanent, so the drain would dead-letter every
+  batch), and any value failing identifier validation. A batch carrying no ids,
+  or a count that does not match the records, is a permanent error naming both
+  numbers — only a hand-built `SinkBatch` can produce one, and every alternative
+  to failing writes a dedup key that is a lie.
+
+  Postgres binds two parameters per row with this set. `sink_max_batch_size` is
+  already capped at 10 000, so the worst case is 20 000 against the protocol's
+  65 535 — no new limit, and the reasoning is recorded next to the field so a
+  future raise of that cap trips over it.
+
+  **This does not change any published crate's API.** `weir-sink-sdk` is
+  untouched apart from documentation, `weir-wab` is untouched, and the WAB
+  on-disk format does not move — a re-batch-stable identity needs no on-disk
+  field, only the coordinate `RecordId` already carries.
+
 ### Fixed
 
 Findings from a second exploration sweep over the published 2.0.5 tree. The
@@ -142,6 +447,43 @@ recovered sink, the replay pass reporting a quarantine that never happened.
 - `deploy/ci-local` gained no "cannot run locally" entry when 2.0.5 split the
   Windows client check into its own job, so a local runner listed it as runnable
   and passed it on the wrong operating system.
+- **The `sink_max_batch_size` precondition was stated as if it were a property of
+  weir rather than of batch-scoped keys.** `DedupToken`'s rustdoc and
+  `docs/sinks/s3.md` both said the guarantee holds only while the setting is
+  stable, and neither pointed at the escape hatch sitting in the same struct.
+  Both now say *why* no batch-level key can survive a re-split (the key is a
+  function of the batch; re-batching changes the batch), why making the token
+  segment-scoped would be worse than the problem — every sub-batch of a segment
+  would share a value, and a dedup-capable sink would discard all but the first —
+  and that `SinkBatch::record_ids()` is the key for anything a duplicate is
+  expensive for. `docs/sinks/s3.md` gains a per-sink table of which keys survive
+  a changed batch size and which do not; S3's does not, because one object per
+  batch means the object key *is* a batch name.
+- `docs/getting-started/integrating.md` gained a "Choosing an idempotency key"
+  section: the two handles side by side, when each is right, and why a payload
+  hash is not a third option (it discards genuinely distinct records that share
+  bytes).
+- `SinkBatch::record_ids()` documented `None` as "fall back to whatever key you
+  used before". That is right for a sink where ids are an optimisation and wrong
+  for one whose correctness rests on them; it now says the drain always supplies
+  them, so `None` means a hand-built batch, and says which sinks should fail
+  loudly instead.
+
+### Tests
+
+- **Nothing pinned the per-record identity against a re-batch.** The drain builds
+  `RecordId` from `read_index` — the record's absolute ordinal within its
+  segment — three lines from `batch.len()` and `max_batch`, so the plausible
+  refactor to a batch-relative index would have reintroduced the double-charge
+  hazard with the whole suite still green.
+  `record_ids_survive_a_changed_sink_max_batch_size` drains one sealed segment
+  twice, at batch sizes 3 and 7, and asserts the ids are identical — after first
+  asserting the boundaries really moved (4 sub-batches vs 2), so it cannot pass
+  against a drain that ignored the setting. Its companion,
+  `the_dedup_token_deliberately_does_not_survive_a_changed_batch_size`, pins the
+  opposite for the token and records why that is correct, so a reader who saw
+  only the first test does not conclude the token is safe too. Both were
+  falsified before being kept.
 
 ---
 
@@ -2698,6 +3040,12 @@ The five commits making up this pass:
 
 ---
 
+[3.0.0]: https://github.com/miki-przygoda/weir/compare/v2.1.0...v3.0.0
+[2.1.0]: https://github.com/miki-przygoda/weir/compare/v2.0.5...v2.1.0
+[2.0.5]: https://github.com/miki-przygoda/weir/compare/v2.0.4...v2.0.5
+[2.0.4]: https://github.com/miki-przygoda/weir/compare/v2.0.3...v2.0.4
+[2.0.3]: https://github.com/miki-przygoda/weir/compare/v2.0.0...v2.0.3
+[2.0.0]: https://github.com/miki-przygoda/weir/compare/v1.3.1...v2.0.0
 [1.3.1]: https://github.com/miki-przygoda/weir/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/miki-przygoda/weir/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/miki-przygoda/weir/compare/v1.1.0...v1.2.0

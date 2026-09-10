@@ -13,7 +13,7 @@
 
 ## TL;DR
 
-- **The durable path is fsync-bound** (the Phase 3 finding still holds). A single `Sync` record is ~133 µs p50 on this NVMe — almost all of it `F_BARRIERFSYNC`. `Batched` is statistically identical (shared group-fsync code path). `Buffered` (memory-only ack) is the fast path at ~26 µs p50.
+- **The durable path is fsync-bound** (the Phase 3 finding still holds). A single `Sync` record is ~133 µs p50 on this NVMe — almost all of it `F_BARRIERFSYNC`. **That figure is not comparable to a Linux one:** `F_BARRIERFSYNC` orders writes without forcing the drive's volatile cache to the medium, so this box is buying a weaker guarantee rather than performing the same operation faster, and macOS is not power-loss safe at any tier. See [Platform support](../platform-support.md#durability-by-platform). `Batched` is statistically identical (shared group-fsync code path). `Buffered` (memory-only ack) is the fast path at ~26 µs p50.
 - **Group-fsync amortization scales the Sync tier under load:** single-thread Sync is ~6.1 k RPS, but the Sync saturation ramp reaches **~80 k RPS @ 64 threads** as concurrent records coalesce under one fsync.
 - **Buffered peaks at ~123 k RPS @ 48 threads** (the connection cap), holding flat through saturation.
 - **IOPS compression 249:1** — 4,980 records committed in 20 sink commits (the WAB's batch-to-sink amortization).

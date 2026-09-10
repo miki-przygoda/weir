@@ -30,9 +30,10 @@ __pycache__/
 # schedule is the source of truth; these are derived and disposable.
 chaos/schedules/generated/
 
-# Local CI runner: the technique is documented in deploy/ci-local/README.md,
-# but the implementation is deliberately NOT tracked — see that file for why.
-# Everything in the directory is ignored except the README.
+# Local CI runner: `act` is the supported way to run CI locally (images pinned
+# in .actrc; see deploy/ci-local/README.md). Anything else in that directory is
+# a personal script and stays untracked — opinionated tooling nobody owns
+# becomes another thing claiming to check what it no longer checks.
 deploy/ci-local/*
 !deploy/ci-local/README.md
 scripts/ci-local

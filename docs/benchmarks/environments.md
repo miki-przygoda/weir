@@ -10,9 +10,37 @@ questions and have different regression gates.
 | [`drain-throughput.md`](drain-throughput.md) | Operator-run capture, `tests/load_drain.rs` — the same suite the CI `drain` job runs | Delivery-side (drain) regressions; every scenario above measures ingest only. Its published figures are a **first measurement whose methodology is under review** — see that file's caveat | No throughput gate. The CI `drain` job runs the suite on every push as a **correctness** gate (no record lost between the WAB and the sink across an outage) and retains its output as a build artifact, but does not compare rates to a threshold or write to this file. |
 
 The CI gate is below the noise floor of the bare-metal numbers and
-vice-versa. Performance claims in the README, release notes, or any
-external comparison must cite [`bare-metal.md`](bare-metal.md), not
-[`latest.md`](latest.md).
+vice-versa.
+
+### What an external claim may cite
+
+**Never [`latest.md`](latest.md) or [`history.md`](history.md).** A shared
+2-vCPU runner whose consecutive rows for one released version span 1.45× is an
+order-of-magnitude regression detector, not a performance measurement.
+
+An external claim — README, release notes, a comparison against anything else —
+must cite an **operator-run capture on named hardware**, disclosing the machine,
+the storage, the fsync primitive that storage yields, and the concurrency the
+figure was taken at. Captures in the tree that satisfy that today:
+
+| Capture | Hardware | Covers |
+|---|---|---|
+| [`snapshot-2026-06-13-beast.md`](snapshot-2026-06-13-beast.md) | i9-9900K, ext4 on a Samsung SATA SSD | Ingest, both tiers, single-thread through a 96-thread ramp |
+| [`snapshot-2026-06-13-mac.md`](snapshot-2026-06-13-mac.md) | M3 Max, APFS on internal NVMe | The same, on a `F_BARRIERFSYNC` platform |
+| [`phase3-results.md`](phase3-results.md) | Both of the above | Where the time goes inside a `Durable` ack |
+| [`drain-throughput.md`](drain-throughput.md) | The beast box, three storage configs | Delivery-side rates — **first measurement, methodology under review** |
+
+**[`bare-metal.md`](bare-metal.md) is a different thing and is still empty.** It
+is the *release gate* — a fixed script, on a fixed box, re-run per release so
+two versions are comparable. The snapshots above are point-in-time captures at
+named commits; they are citable, but they cannot gate a release because nothing
+re-runs them. Until `deploy/run_bare_metal_bench.sh` is run and its output
+lands, weir has claimable numbers and no operable performance gate.
+
+Earlier revisions of this file said external claims "must cite `bare-metal.md`".
+That was never satisfiable — the file has never held a capture — so in practice
+it read as a prohibition on every performance statement the project makes,
+including ones it makes correctly. The rule above is what was meant.
 
 ## CI environment
 

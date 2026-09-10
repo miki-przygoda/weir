@@ -21,7 +21,7 @@ them — see [What the storage does](#what-the-storage-does).
 
 | | **mac** | **linux-ssd** | **linux-tmpfs** |
 |---|---|---|---|
-| Machine | Apple M3 Max, 16 cores | 4-core x86_64 | same box |
+| Machine | Apple M3 Max, 16 cores | Intel i9-9900K, 8c/16t (4 cores visible — `isolcpus`) | same box |
 | OS | macOS 26.6.2 | Ubuntu 24.04, kernel 7.0.0-30 | same |
 | Toolchain | rustc 1.97.1 | cargo 1.94.0 | same |
 | WAB storage | APFS, internal SSD | ext4 on Samsung 850 EVO (SATA) | tmpfs (`/dev/shm`) |
@@ -38,6 +38,7 @@ Common to all three:
 | Daemon | `bench_preset`: 4 shards, 4 workers, ingest batch 64 |
 | Sharding | **Inert in this suite.** Shard is assigned per *connection* (`crates/weir-server/src/socket/mod.rs:210`) and the fill opens one client (`tests/load_drain.rs:374-379`), so every record lands on one shard whatever `shard_count` says. |
 | Sink batch size | `sink_max_batch_size` = 100, the default (`crates/weir-server/src/config/mod.rs:721`), never overridden here. The "batch 64" above is the *ingest* coalescing knob — a different setting. |
+| Timed window | **The sealed half of the fill**, not all of it — `bulk(n) = n/2` (`tests/load_drain.rs:335-345`). Only whole rotated segments seal, so timing the tail would fold up to a second of idle-seal timer into a throughput number. Each scenario asserts separately that the full count arrives, so the tail is checked for correctness without polluting the rate. A published rate for `drain_http_ndjson` therefore covers 1,000 delivered records out of a 2,000-record fill. |
 
 ## Results
 
@@ -168,13 +169,45 @@ change in the runner.
 
 ## What changed in the conclusions
 
-**"Delivery is the narrower half" stays withdrawn, and is now clearly false.**
-It rested on ~6,000 rec/s against an ingest figure measured differently. The
-drain sustains 105,909 rec/s NDJSON on a modest Linux box — several times a
-single client's ~32,000 `Buffered` and ~5,700 `Durable`. Delivery is the
-*wider* half on every configuration measured. Any argument that prioritised
-work on the grounds that delivery constrains the system needs remaking from
-scratch.
+**"Delivery is the narrower half" stays withdrawn — but it is not simply
+false, and the previous wording here overstated the case.** The original claim
+rested on ~6,000 rec/s against an ingest figure measured differently. The fixed
+harness puts the drain at 105,909 rec/s NDJSON on linux-ssd. What that is
+"several times" larger than depends entirely on which ingest number you set
+beside it, and the first version of this paragraph picked the wrong one — it
+compared this box's drain against an **M3 Max** client's ~32,000 `Buffered`
+(`crates/weir-client/src/lib.rs`), which is the cross-machine comparison
+[environments.md](environments.md) explicitly forbids.
+
+Against the *same box's own* ingest ([snapshot-2026-06-13-beast.md](snapshot-2026-06-13-beast.md),
+Samsung SATA SSD, same `bench_preset`):
+
+| linux-ssd ingest | rec/s | Drain (105,909) is |
+|---|---|---|
+| Single thread, `Durable` | 653 | 162× wider |
+| Single thread, `Buffered` | 49,725 | **2.1× wider** |
+| 48 threads, `Durable` | 6,178 | 17× wider |
+| 48 threads, `Buffered` | **155,577** | **0.68× — narrower** |
+
+So delivery is the wider half against a *single* producer and against every
+`Durable` configuration, and the **narrower** half against concurrent
+`Buffered` ingest — by about 1.5×. That last row is not an embarrassment; it is
+the case weir exists for. A buffer earns its keep precisely when a burst
+arrives faster than it can be delivered, and the whole design — ack on the WAB,
+drain behind it — assumes that gap.
+
+Two limits on the table above. The ingest capture is from a different commit
+three months earlier, so it is same-machine but **not back-to-back**, which is
+the comparison environments.md actually sanctions; treat the ratios as
+one significant figure. And the drain figure is measured against an in-process
+HTTP mock on loopback answering in microseconds, so it bounds *weir's* side of
+delivery and says nothing about a real sink's — the `drain_slow_sink_1ms_conc16`
+scenario, where a 1 ms sink caps the serial path near 1,000 rec/s, is the
+honest picture of what a network sink does to this number.
+
+What does survive intact: any argument that prioritised work on the grounds
+that **weir's own delivery code** constrains the system needs remaking from
+scratch. The constraint is the sink, not the drain.
 
 **NDJSON's advantage is not a fixed ratio.** It is 1.67x on mac, **3.69x** on
 linux-ssd, **6.28x** on linux-tmpfs. It grows as the confirm gets cheaper,

@@ -61,6 +61,17 @@ wab_segment_max_bytes = 268435456
 # Env: WEIR_WAB_SEGMENT_MAX_AGE_SECS
 wab_segment_max_age_secs = 0
 
+# Maximum lifetime: seal + drain an active segment this many seconds after it was
+# CREATED, however busy the producer has been. 0 = disabled (default).
+# Range: 0-86400. Env: WEIR_WAB_SEGMENT_MAX_LIFETIME_SECS
+# NOT the same knob as wab_segment_max_age_secs above, despite the names. That
+# one is an IDLE timer whose clock restarts on every flush, so a producer that
+# trickles steadily — one record a minute, say — resets it forever and the
+# segment never seals on it at all. This clock starts at segment creation and
+# nothing restarts it, so it is the one that actually bounds delivery latency.
+# Set BOTH on a low-volume deployment; whichever comes due first seals.
+wab_segment_max_lifetime_secs = 0
+
 # Refuse any connection whose peer effective uid does not match the daemon's
 # (SO_PEERCRED / getpeereid). Fail-closed; the application-level access control
 # on the Unix socket. Leave on unless a trusted helper must connect as a

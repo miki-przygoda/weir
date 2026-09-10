@@ -540,6 +540,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 0 = idle-seal disabled (historical behaviour).
         segment_max_age: (config.wab_segment_max_age_secs > 0)
             .then(|| Duration::from_secs(config.wab_segment_max_age_secs)),
+        // 0 = maximum-lifetime seal disabled. Independent of the idle timer
+        // above; with both set, whichever comes due first seals.
+        segment_max_lifetime: (config.wab_segment_max_lifetime_secs > 0)
+            .then(|| Duration::from_secs(config.wab_segment_max_lifetime_secs)),
         // "none" (default) keeps segments at format v1, byte-identical to weir
         // 1.x. Validated at config load, so any other string is unreachable.
         compression: match config.wab_compression.as_str() {
@@ -703,6 +707,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // they can't get from `weir-server --help` plus their config.
                 table = %config.sink_mysql_table,
                 column = %config.sink_mysql_column,
+                // Logged because its absence is the interesting state: without
+                // it the operator's UNIQUE constraint is on payload bytes, and
+                // that discards distinct records that share bytes.
+                id_column = ?config.sink_mysql_id_column,
                 insert_mode = ?config.sink_mysql_insert_mode,
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
@@ -712,6 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 url,
                 table: config.sink_mysql_table.clone(),
                 column: config.sink_mysql_column.clone(),
+                id_column: config.sink_mysql_id_column.clone(),
                 insert_mode,
                 max_batch_size: config.sink_max_batch_size,
                 timeout: Duration::from_secs(config.sink_timeout_secs),
@@ -734,6 +743,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // URL omitted from the log line for the same reason as MySQL.
                 table = %config.sink_postgres_table,
                 column = %config.sink_postgres_column,
+                // See the MySQL arm: absence is the interesting state.
+                id_column = ?config.sink_postgres_id_column,
                 insert_mode = ?config.sink_postgres_insert_mode,
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
@@ -743,6 +754,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 url,
                 table: config.sink_postgres_table.clone(),
                 column: config.sink_postgres_column.clone(),
+                id_column: config.sink_postgres_id_column.clone(),
                 insert_mode: config.sink_postgres_insert_mode,
                 max_batch_size: config.sink_max_batch_size,
                 timeout: Duration::from_secs(config.sink_timeout_secs),

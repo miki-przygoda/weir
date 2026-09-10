@@ -40,6 +40,19 @@ Total frame size: `16 + payload_len + 4` bytes.
 | 0x03 | Nack                  | daemon → client  |
 | 0x04 | HealthCheck           | client → daemon  |
 | 0x05 | HealthCheckResponse   | daemon → client  |
+| 0x06 | PushTracked           | client → daemon  |
+| 0x07 | AckTracked            | daemon → client  |
+
+`PushTracked` / `AckTracked` are an **optional, additive** pair — see
+[Tracked push](#tracked-push--pushtracked--acktracked). A client that does not
+implement them is fully conformant and is unaffected by their existence: it
+never sends `0x06`, so it never receives an `0x07`, and its `Push` still gets
+the same 20-byte `Ack` it always did.
+
+Message-type bytes `0x08`–`0xFF` are unassigned. A daemon rejects an
+unrecognised one with `Nack(UnknownMessage 0x08)` and closes the connection —
+which is also how a client discovers that a daemon predates a type it wanted to
+use.
 
 ---
 
@@ -58,6 +71,19 @@ Total frame size: `16 + payload_len + 4` bytes.
 > canonicalises it to `Durable` — the encoder never emits `0x02`. It will not be
 > reassigned to a future tier, because that would silently mis-tier every 1.x
 > client.
+
+**The tier is per record, and a connection may mix them freely.** It is a
+header byte on each envelope, not a handshake value, a connection mode, or a
+daemon setting. One producer can send `Durable` for the record it cannot lose
+and `Buffered` for the telemetry line beside it, on the same socket, in any
+order, with no reconnect and no negotiation.
+
+The daemon dispatches per record inside a single flush batch: a `Buffered`
+record is acked as soon as its memory write lands, while a `Durable` record in
+that same batch waits for the batch-boundary group fsync. If a batch happens to
+contain no `Durable` record, the fsync is skipped entirely. A client
+implementing this protocol therefore needs no per-connection state for
+durability — read the byte the caller asked for, write it, move on.
 
 ---
 
@@ -90,8 +116,8 @@ than assume a specific meaning.
 header-CRC validation but the daemon will not act on the message: either the
 `message_type` or `durability` byte is unrecognised (typically version skew), **or
 the `message_type` is a valid daemon→client type** (`Ack` `0x02`, `Nack` `0x03`,
-or `HealthCheckResponse` `0x05`) that a client must only ever *receive*, never
-*send*. All of these are **permanent** protocol errors. It is distinct from
+`HealthCheckResponse` `0x05`, or `AckTracked` `0x07`) that a client must only
+ever *receive*, never *send*. All of these are **permanent** protocol errors. It is distinct from
 `InternalError`: the daemon **closes** the connection after an `UnknownMessage`,
 and retrying the identical frame will not succeed (so a client must not retry on
 the same connection).
@@ -106,6 +132,146 @@ explicit, `WIRE_VERSION`-gated change.
 
 The `VersionMismatch` second byte lets a client produce a specific error:
 > "daemon is on wire protocol v1; this client is built against v2 — upgrade the daemon or downgrade the client."
+
+---
+
+## Tracked push — `PushTracked` / `AckTracked`
+
+A `Push` tells a producer its record was accepted. It does not say **which**
+record it was. `PushTracked` asks that question, and `AckTracked` answers it with
+the record's **coordinate**: the segment the record landed in, its index within
+that segment, and the `record_id` derived from those two plus the payload.
+
+`PushTracked` is a `Push` in every other respect — same durability tiers, same
+payload cap, same empty-payload rejection, same Nack reasons, same connection
+effects. The only difference on the wire is the message-type byte and the shape
+of the success reply.
+
+### Why a new message type rather than a longer Ack
+
+Because the alternatives all desync a deployed client:
+
+- A **longer `Ack`** would be read as 20 bytes by every existing client, leaving
+  the coordinate's bytes in the buffer to be mis-read as the *next* reply — a
+  false ack.
+- A **connect-time handshake** would make what an `Ack` means depend on
+  invisible prior state, which is the same desync with more moving parts (and
+  this protocol deliberately has no in-band handshake).
+- A **bit in the reserved `flags` byte** would give one message type two
+  lengths, and would spend a flag whose semantics `wire_v1` reserves for an
+  explicit, `WIRE_VERSION`-gated change (see `ReservedFlagsSet` above).
+
+A distinct message type keeps the invariant that makes the protocol safe to
+extend at all: **the message type determines the response shape.**
+
+### Negotiation
+
+There is none, and none is needed. A client sends `PushTracked`; a daemon that
+does not know the byte answers `Nack(UnknownMessage 0x08)` and closes — the
+protocol's existing permanent-error path for version skew. Receiving that Nack
+from a `PushTracked` means "this daemon does not support tracked pushes"; fall
+back to `Push` on a fresh connection.
+
+### `AckTracked` payload — the record coordinate
+
+```
+Offset  Size  Field                Description
+──────  ────  ───────────────────  ─────────────────────────────────────────────
+ 0       1    coordinate_version   currently 0x01
+ 1       8    index                u64 LE — 1-based ordinal within the segment
+ 9      32    record_id            SHA-256 digest (see below)
+41       2    segment_len          u16 LE — byte length of `segment`
+43     var    segment              UTF-8 segment address
+```
+
+Total payload: `43 + segment_len` bytes, capped at **298** (`segment_len <= 255`).
+
+`coordinate_version` leads so the coordinate can grow inside wire v1 without a
+new message type: a reader that meets a version it does not know **must reject
+the frame**, not parse a layout it has never seen. The buffer must be *exactly*
+one coordinate — a trailing byte means the two ends disagree about the layout,
+and quietly using the prefix is how that disagreement becomes a wrong address.
+
+`record_id` is `SHA-256` over
+`segment_len ++ segment ++ index ++ payload_len ++ payload`, every length a
+little-endian `u64`. It is byte-identical to the per-record idempotency key the
+daemon's drain hands a sink (the HTTP sink's `Idempotency-Key: sha256:<hex>`),
+which is what lets a producer correlate what it sent with what the downstream
+received. The length framing is what stops `("ab", 1)` and `("a", 0xb…)` from
+colliding.
+
+`segment` is `<shard-dir>/<file-name>`, e.g. `shard_00/seg_00000001.wab.sealed`.
+Treat it as an **opaque, stable address**, not a filesystem path: it names the
+segment the drain will read the record from. At ack time that segment is still
+open, so the name is the daemon's *prediction* of its sealed form — exact on
+every path that can deliver the record.
+
+### What a coordinate does and does not tell you
+
+- It is **not a delivery receipt.** An `AckTracked`, like an `Ack`, means the
+  record is durably buffered at the requested tier — not that it has reached the
+  sink. The coordinate says where it will be read from, not that it was read.
+- It is **not a gap-free sequence.** The coordinate is a buffer address. Records
+  from other producers interleave, so one producer's indices have holes.
+  `(segment, index)` gives a total order per shard and identifies a record
+  uniquely; it does not number a producer's own records consecutively.
+- It is **not a durability upgrade.** A `Buffered` push receives a coordinate
+  and can still be lost on power loss. The tier still decides that.
+- **At-least-once still applies.** Two coordinates can point at the same logical
+  event if the producer retried. The coordinate deduplicates *deliveries*, not
+  *intents*.
+- If crash recovery **quarantines** the segment, its records never drain, and
+  the coordinate names an address nothing will deliver from.
+
+### Worked example — `PushTracked` of `"hello"`, Durable
+
+Byte-for-byte a `Push` frame except byte 5 and the header CRC that covers it.
+
+```text
+Offset  Hex bytes                                          Field
+──────  ─────────────────────────────────────────────────  ───────────────────
+ 0      57 45 49 52                                        magic = "WEIR"
+ 4      01                                                 version = 1
+ 5      06                                                 message_type = PushTracked
+ 6      01                                                 durability = Durable
+ 7      00                                                 flags
+ 8      05 00 00 00                                        payload_len = 5
+12      e8 93 da f9                                        header_crc32
+16      68 65 6c 6c 6f                                     payload = "hello"
+21      86 a6 10 36                                        payload_crc32
+```
+
+Total: 25 bytes.
+
+### Worked example — the `AckTracked` reply
+
+For a record at index 7 of `shard_00/seg_00000001.wab.sealed`:
+
+```text
+Offset  Hex bytes                                          Field
+──────  ─────────────────────────────────────────────────  ───────────────────
+ 0      57 45 49 52                                        magic = "WEIR"
+ 4      01                                                 version = 1
+ 5      07                                                 message_type = AckTracked
+ 6      01                                                 durability = Durable (filler)
+ 7      00                                                 flags
+ 8      4b 00 00 00                                        payload_len = 75
+12      52 b7 66 24                                        header_crc32
+16      01                                                 coordinate_version = 1
+17      07 00 00 00 00 00 00 00                            index = 7
+25      ce 1e d3 cf ba 2b d8 f4 …  (32 bytes)              record_id
+57      20 00                                              segment_len = 32
+59      73 68 61 72 64 5f 30 30 …  (32 bytes)              "shard_00/seg_00000001.wab.sealed"
+91      7b 44 b9 cb                                        payload_crc32
+```
+
+Total: 95 bytes. As on a plain `Ack`, the `durability` byte is fixed filler
+(`0x01`) regardless of the request's tier.
+
+These bytes are asserted against the encoder by
+[`conformance/wire_v1_tracked_vectors.json`](conformance/wire_v1_tracked_vectors.json)
+— a **separate** file from the frozen v1 vectors, for the reason given in
+[`conformance.md`](conformance.md#the-tracked-push-extension--a-second-separate-file).
 
 ---
 
@@ -202,20 +368,31 @@ in-flight Pushes (those without a matching Ack/Nack received yet) as
 depending on where in the pipeline the close happened. Retry on a
 fresh connection.
 
-**Cap the response `payload_len` at ≤ 2 bytes before allocating.** Every weir
-response payload is **≤ 2 bytes** (`Ack`/`HealthCheckResponse` = 0; `Nack` = 1,
-except `VersionMismatch` = 2). When reading a *response* header, reject (and close
-the connection) any declared `payload_len` larger than that *before* allocating a
-buffer — a larger length on a response is a desync or a non-weir peer, and the
-daemon never sends a large response, so honouring an attacker-chosen length would
-allocate an arbitrary buffer. This is the read-side mirror of the send-path cap
-and is also enumerated in the [producer checklist](#minimum-producer-checklist).
+**Cap the response `payload_len` before allocating, using the cap for the type
+the header declares.** When reading a *response* header, reject (and close the
+connection) any declared `payload_len` larger than that type's cap *before*
+allocating a buffer — a larger length is a desync or a non-weir peer, and
+honouring an attacker-chosen length would allocate an arbitrary buffer.
+
+| Response type          | Max payload | Note                                  |
+|------------------------|-------------|---------------------------------------|
+| `Ack`                  | 0           |                                       |
+| `HealthCheckResponse`  | 0           |                                       |
+| `Nack`                 | 2           | 1 reason byte; 2 for `VersionMismatch`|
+| `AckTracked`           | 298         | one record coordinate                 |
+
+A client that does not implement tracked pushes never sends a `PushTracked`, so
+it can never receive an `AckTracked` — **≤ 2 bytes remains the correct cap for
+every response it can see**, exactly as before. This is the read-side mirror of
+the send-path cap and is also enumerated in the
+[producer checklist](#minimum-producer-checklist).
 
 ### When the server keeps the connection open
 
 | Event | Connection |
 |-------|-----------|
 | Push → Ack | open |
+| PushTracked → AckTracked | open |
 | Push → Nack(InternalError) | open — covers transient daemon-side conditions: queue saturation, ack timeout, a non-durable write (write/fsync error), or the daemon's `wab_max_bytes` cap rejecting because its write-ahead buffer is full. The record's durable outcome is **unknown** for the first three (the producer should retry); a cap rejection is definitively *not* durable, but it is not distinguishable on the wire — the daemon's `weir_wab_cap_rejections_total` metric is what separates it, so a producer treats all four the same way and retries. |
 | HealthCheck → HealthCheckResponse | open |
 
@@ -227,10 +404,10 @@ and is also enumerated in the [producer checklist](#minimum-producer-checklist).
 | Push with unknown version | closed after Nack(VersionMismatch) |
 | Push with bad header CRC | closed after Nack(BadHeaderCrc) |
 | Push with `payload_len > cap` | closed after Nack(PayloadTooLarge) |
-| Push with a zero-length payload | closed after Nack(EmptyPayload) |
+| Push (or PushTracked) with a zero-length payload | closed after Nack(EmptyPayload) |
 | Push with bad payload CRC | closed after Nack(BadPayloadCrc) |
 | Push with unknown message_type / durability | closed after Nack(UnknownMessage) |
-| Client sends a daemon→client message type (Ack / Nack / HealthCheckResponse) | closed after Nack(UnknownMessage) |
+| Client sends a daemon→client message type (Ack / Nack / HealthCheckResponse / AckTracked) | closed after Nack(UnknownMessage) |
 | Push with a nonzero reserved `flags` byte | closed after Nack(ReservedFlagsSet) |
 | Idle past `connection_read_timeout_secs` mid-frame | closed silently (slowloris guard); no Nack |
 
@@ -303,8 +480,13 @@ Offset  Hex bytes                                          Field
 
 Total: 20 bytes. The `durability` byte on the response is always
 `0x01` (Durable) regardless of the original request's tier — the server
-populates it to a fixed value. Clients reading responses can ignore
-it.
+populates it to a fixed value.
+
+> **Do not read it as confirmation of the tier.** A client that asserts
+> `ack.durability == request.durability` passes every `Durable` test it writes
+> and then rejects every `Buffered` ack in production. Ignore the field on
+> responses; an Ack means the record was accepted under the tier *you* sent,
+> and the guarantee that tier carries is described above.
 
 ### Nack response — `PayloadTooLarge`
 
@@ -365,13 +547,14 @@ A non-Rust client that satisfies the following is wire-compatible:
 - [ ] Writes 4-byte payload CRC32 (same algorithm) after the payload.
 - [ ] Reads 16-byte response header, then `header.payload_len`
       response-payload bytes, then 4 response-CRC bytes.
-- [ ] **Caps the response `payload_len` at a few bytes before allocating.**
-      Every weir response payload is **≤ 2 bytes** (`Ack`/`HealthCheckResponse`
-      = 0; `Nack` = 1, except `VersionMismatch` = 2). A larger declared length
-      on a *response* is a desync or a non-weir peer — treat it as a protocol
-      error and close the connection rather than allocating an attacker-chosen
-      buffer. (This mirrors the send-path cap below; the daemon never sends a
-      large response.)
+- [ ] **Caps the response `payload_len` before allocating, per response type.**
+      `Ack`/`HealthCheckResponse` = 0; `Nack` = 1, except `VersionMismatch` = 2.
+      If — and only if — you send `PushTracked`, an `AckTracked` may carry up to
+      298 bytes; a client that does not send `PushTracked` keeps **≤ 2 bytes** as
+      the cap for every response it can receive. A larger declared length on a
+      *response* is a desync or a non-weir peer — treat it as a protocol error
+      and close the connection rather than allocating an attacker-chosen buffer.
+      (This mirrors the send-path cap below.)
 - [ ] Verifies the response header magic, version, and CRC before
       consuming the payload.
 - [ ] Treats response `message_type == Nack` as failure; decodes the
@@ -422,3 +605,18 @@ weir's own decoder is checked against that file by
 - Header CRC covers bytes `[0..12]`; version is checked before the CRC (see decode order above).
 - `VersionMismatch` Nack carries `[0x02, WIRE_VERSION]` so clients can report both sides of the mismatch.
 - `MAX_PAYLOAD_HARD_CAP = 16 MiB` — absolute ceiling across all code paths.
+
+#### Additive extensions within v1
+
+`WIRE_VERSION` stays 1 for anything that a v1 client can ignore without being
+wrong. Two such growth points exist, both already reserved by this document:
+
+- **Nack reason bytes `0x0A`–`0xFF`** — a client surfaces an unrecognised reason
+  rather than assuming a meaning.
+- **Message-type bytes `0x08`–`0xFF`** — a daemon (or client) that does not know
+  a type rejects it with `UnknownMessage`, which is an actionable, permanent
+  error rather than a misparse.
+
+`PushTracked` (`0x06`) / `AckTracked` (`0x07`) were added this way. No byte a v1
+client reads or writes changed, and the frozen vectors in
+`conformance/wire_v1_vectors.json` are untouched.

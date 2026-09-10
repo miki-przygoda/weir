@@ -18,22 +18,38 @@ slow `fdatasync` (beast SATA SSD).
 
 ## The one thing to take away
 
-**Durable throughput is set by your storage's fsync latency — nothing else.**
-The software pipeline is identical on both boxes; the ~11× gap in `Sync` is
-*entirely* the ~11× gap in fsync. Meanwhile the non-durable (`Buffered`) path,
-which never fsyncs, is actually **faster** on beast — proving the rest of the
-pipeline isn't the bottleneck.
+**Durable throughput is set by your storage's durability primitive — nothing
+else.** The software pipeline is identical on both boxes; the ~11× gap in
+`Sync` is *entirely* the gap in that primitive. Meanwhile the non-durable
+(`Buffered`) path, which never fsyncs, is actually **faster** on beast —
+proving the rest of the pipeline isn't the bottleneck.
+
+> **The ~11× is not a speed difference, and reading it as one leads somewhere
+> wrong.** These two rows are not the same operation performed at different
+> speeds. `fdatasync` on beast tells the drive to commit; `F_BARRIERFSYNC` on
+> the Mac orders writes and returns without forcing the drive's volatile cache
+> to the medium. The Mac is not 11× faster at durability — it is buying a
+> weaker guarantee, and **macOS is not power-loss safe at any weir durability
+> tier** as a result.
+>
+> The conclusion to draw is "your fsync primitive sets your durable
+> throughput", not "buy an NVMe and `Durable` gets 11× cheaper". A Linux NVMe
+> box doing a real `fdatasync` lands around 150 µs — near the Mac's number
+> while actually flushing — which is the comparison worth making. See
+> [Platform support](../platform-support.md#durability-by-platform).
 
 ## Latency by durability tier (single-thread, p50)
 
 | Tier | Mac | beast | What sets it |
 |------|-----|-------|--------------|
-| **Sync** (fsync-before-ack) | 133 µs | **1.5 ms** | the fsync syscall (≈100% of the latency) |
+| **Sync** (fsync-before-ack) | 133 µs *(barrier, not a flush)* | **1.5 ms** | the fsync syscall (≈100% of the latency) |
 | **Batched** (group fsync) | 147 µs | **1.5 ms** | same path as Sync — *identical* on both boxes |
 | **Buffered** (memory-only ack) | 26 µs | **19 µs** | CPU + buffered write; no fsync → beast wins |
 
 `Sync p50 ≈ fsync latency` on *both* machines is the fsync-bound thesis stated
-as a measurement: 133 µs ≈ Mac barrier-fsync, 1.5 ms ≈ beast `fdatasync`.
+as a measurement: 133 µs ≈ Mac barrier-fsync, 1.5 ms ≈ beast `fdatasync`. The
+two are different primitives with different guarantees, not one primitive at
+two speeds — see the note above before comparing the columns.
 
 ## Throughput
 

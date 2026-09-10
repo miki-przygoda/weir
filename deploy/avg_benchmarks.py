@@ -195,7 +195,7 @@ def build_stage_md(stage_groups: dict[str, list[dict]]) -> str:
     return "\n".join(lines)
 
 
-def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
+def build_md(groups: dict[str, list[dict]], run_count: int, version: str) -> str:
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # Detect which deadlines are actually present in results.
@@ -208,6 +208,7 @@ def build_md(groups: dict[str, list[dict]], run_count: int) -> str:
     lines = [
         "# Benchmark Results",
         "",
+        f"Version: {version}  ",
         f"Last updated: {now}  ",
         f"Averaged over: {run_count} CI run(s) per deadline  ",
         f"Server config: `shard_count=4`, `batch_size=64`",
@@ -520,6 +521,13 @@ Ramp peak = highest throughput level before connection-cap saturation kicks in.
 """
 
 
+# Single-thread Sync p99 above this is a descheduled runner, not a weir
+# property: every healthy row in history.md is under 3.6 ms, so 10 ms is ~3x the
+# worst of those and ~25x the median. Rows above it are written with a "(!)"
+# marker rather than dropped.
+HOSTILE_RUNNER_P99_US = 10_000.0
+
+
 def append_history(groups: dict, run_count: int, history_path: str, version: str) -> None:
     import os
 
@@ -551,10 +559,24 @@ def append_history(groups: dict, run_count: int, history_path: str, version: str
         return
 
     date_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    # A stalled runner, marked at write time rather than argued about later.
+    #
+    # Single-thread Sync p99 on this 2-vCPU surface sits between ~380 us and
+    # ~3.6 ms across every healthy row this file has ever held. A row above
+    # HOSTILE_RUNNER_P99_US is an order of magnitude past the worst of those and
+    # cannot be a property of weir at that concurrency -- it is the runner being
+    # descheduled mid-measurement. Three such rows (0.6.0, 2.0.0, 2.0.5) sat in
+    # the published trend unannotated, reading as catastrophic regressions that
+    # never happened.
+    #
+    # The row is still written. Deleting an inconvenient measurement is worse
+    # than publishing it with a marker, and the ramp column in those rows is
+    # often the highest in the file, so the run was not uniformly bad.
+    marker = " (!)" if sync_p99 and sync_p99 > HOSTILE_RUNNER_P99_US else ""
     row = (
         f"| {version} | {date_str} | {run_count}"
         f" | {fmt_rps(sync_rps)}"
-        f" | {fmt_us(sync_p99) if sync_p99 else '—'}"
+        f" | {(fmt_us(sync_p99) + marker) if sync_p99 else '—'}"
         f" | {fmt_us(buf_p50) if buf_p50 else '—'}"
         f" | {fmt_rps(peak_rps) if peak_rps else '—'} |"
     )
@@ -590,7 +612,12 @@ def main():
         sys.exit(1)
 
     run_count = max(len(v) for v in groups.values()) if groups else 0
-    md = build_md(groups, run_count) if groups else ""
+    # Read once and stamp it into BOTH outputs. Until 2.1.0 this was read
+    # inside the `if history_path:` arm below and reached `history.md` alone,
+    # so `latest.md` carried no version at all -- which is how the README's
+    # "as of" line drifted two releases behind with nothing to catch it.
+    version = os.environ.get("WEIR_VERSION", "dev")
+    md = build_md(groups, run_count, version) if groups else ""
     stage_md = build_stage_md(stage_groups)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -599,7 +626,6 @@ def main():
     print(f"Wrote {output_path} ({run_count} run(s), {len(groups)} scenario(s), {len(stage_groups)} stage scenario(s))")
 
     if history_path:
-        version = os.environ.get("WEIR_VERSION", "dev")
         append_history(groups, run_count, history_path, version)
 
 

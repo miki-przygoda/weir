@@ -491,6 +491,91 @@ mod tests {
     }
 
     #[test]
+    fn the_name_carries_the_pre_framing_count_not_the_object_line_count() {
+        // The name is chosen at lib.rs:281, before framing runs at :290, so a
+        // record NDJSON cannot represent is dead-lettered *after* the count is
+        // baked in. The object then holds fewer lines than its key claims.
+        //
+        // This is the right trade -- the alternative is naming the object after
+        // framing, which would make the key depend on record content and break
+        // the replay-stability the whole scheme rests on -- but it is a trap for
+        // anyone validating an archive by parsing counts out of key names, so
+        // docs/sinks/s3.md says so and this pins it.
+        use weir_sink_sdk::{DedupToken, RecordId};
+        let sink = S3Sink::new(cfg()).expect("builds");
+        let good = Payload::from(&b"clean"[..]);
+        let bad = Payload::from(&b"has\nnewline"[..]);
+        let records = vec![good.clone(), bad.clone()];
+        let token = DedupToken::for_payloads(&records);
+        let ids = vec![
+            RecordId::for_record("shard_00/seg_00000001.wab", 0, &good),
+            RecordId::for_record("shard_00/seg_00000001.wab", 1, &bad),
+        ];
+        let batch = SinkBatch::with_segment_context(records.clone(), token, ids, 0);
+
+        let name = sink.batch_name(&batch, 0);
+        assert!(
+            name.ends_with("-2"),
+            "the name must carry the count weir was handed (2): {name}"
+        );
+
+        let framed = crate::framing::frame(records, Framing::Ndjson, Compression::None);
+        assert_eq!(
+            framed.dead_lettered.len(),
+            1,
+            "the newline record is rejected"
+        );
+        assert_eq!(
+            framed.body.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "the object holds one line, while its key says two"
+        );
+    }
+
+    #[test]
+    fn the_name_does_not_cover_records_after_the_first() {
+        // The boundary of the append-only property, asserted so it cannot be
+        // quietly oversold. `batch_name` uses `.first()`, so altering any record
+        // but the first -- while keeping the first and the count -- reproduces
+        // the original key exactly. An S3 key is last-write-wins, so anyone
+        // holding s3:PutObject on the prefix can replace the object's contents
+        // without the name changing.
+        //
+        // weir itself never does this: its records come from an append-only WAB
+        // and a replay re-derives the same bytes. The property is "weir never
+        // rewrites an object with different records", NOT "an altered batch
+        // cannot occupy the original key". docs/sinks/s3.md states both halves;
+        // three separate readers built designs on the stronger, false one.
+        use weir_sink_sdk::{DedupToken, RecordId};
+        let sink = S3Sink::new(cfg()).expect("builds");
+        let first = Payload::from(&b"record-one"[..]);
+        let id = RecordId::for_record("shard_00/seg_00000001.wab", 0, &first);
+
+        // Both batches carry a *correct* second RecordId covering their own
+        // second record -- the ids differ between the two calls. The name is
+        // identical anyway, because only the first one is read.
+        let name_of = |second: &[u8]| {
+            let altered = Payload::from(second);
+            let ids = vec![
+                id,
+                RecordId::for_record("shard_00/seg_00000001.wab", 1, &altered),
+            ];
+            let records = vec![first.clone(), altered];
+            let token = DedupToken::for_payloads(&records);
+            sink.batch_name(&SinkBatch::with_segment_context(records, token, ids, 0), 0)
+        };
+
+        assert_eq!(
+            name_of(b"original"),
+            name_of(b"TAMPERED"),
+            "the key covers only the first RecordId and the count, so changing a \
+             later record leaves the name identical. If this assertion ever \
+             fails the property got STRONGER and docs/sinks/s3.md should be \
+             updated to claim it -- but do not claim it while this passes."
+        );
+    }
+
+    #[test]
     fn two_batches_of_identical_records_get_different_names() {
         // The failure this design exists to prevent, asserted at the sink level
         // rather than only in the key module.

@@ -44,9 +44,30 @@
 //! segment is *stranded* (its transient-retry budget is exhausted while the sink
 //! is unavailable) and later auto-resumed once the sink recovers: the resume
 //! reprocesses from the start, not from the last durably-committed sub-batch.
-//! Implementations **must** handle duplicates gracefully (upsert, `INSERT IGNORE`,
-//! a content-derived dedup key, etc.). This is the explicit durability trade-off,
-//! not a protocol weakness.
+//! Implementations **must** handle duplicates gracefully — upsert,
+//! `INSERT IGNORE`, an `Idempotency-Key`, whatever the downstream offers. This
+//! is the explicit durability trade-off, not a protocol weakness.
+//!
+//! ## Which key to dedup on
+//!
+//! Two handles arrive on every [`SinkBatch`], and they are not
+//! interchangeable:
+//!
+//! - [`SinkBatch::record_ids`] — one [`RecordId`] per record, derived from its
+//!   WAB coordinate. Distinct for two records carrying identical bytes, and
+//!   **unchanged when `sink_max_batch_size` changes between two delivery
+//!   attempts**. Use this when a duplicate is expensive.
+//! - [`SinkBatch::dedup_token`] — one [`DedupToken`] for the whole batch,
+//!   derived from its bytes. Simpler, but it names the batch, so it moves when
+//!   the drain re-splits a segment at different boundaries. Fine for an
+//!   archive; not for a billing row.
+//!
+//! **Do not dedup on a hash of the payload.** It is not a weaker version of the
+//! two above, it is a different thing that loses data: a producer emitting
+//! repetitive records — a heartbeat, a fixed-shape metering event — hands the
+//! downstream the same key for genuinely distinct events, and a correct
+//! idempotent endpoint keeps the first and discards the rest. weir acked those
+//! records and delivered them; the key threw them away.
 //!
 //! # Running your sink in the daemon
 //!
@@ -336,6 +357,20 @@ pub enum SinkHealth {
 /// duplicates, and at-least-once becomes a double-insert. **The guarantee above
 /// holds only while that setting is stable.**
 ///
+/// This is not a weakness in the digest that a better one would fix. A
+/// batch-level key is a function of the batch; re-batching changes the batch;
+/// so the key changes. Deriving it from the batch's WAB coordinate *range*
+/// instead does not help, because the range moves with the boundaries too, and
+/// making it segment-scoped is actively unsafe: every sub-batch of a segment
+/// would present the same value and a dedup-capable sink would discard all but
+/// the first, turning a duplicate-prevention feature into data loss.
+///
+/// **If your downstream cannot accept that precondition, do not use this
+/// token.** Use [`SinkBatch::record_ids`] instead: a [`RecordId`] names the
+/// record's position in the buffer rather than the batch it arrived in, so it
+/// is unchanged by a re-split. For an archive the precondition is cheap; for a
+/// billing or metering record a silent double-charge is not.
+///
 /// # Stability
 ///
 /// The digest is byte-identical to the token weir 1.x's ClickHouse sink computed
@@ -419,6 +454,27 @@ impl std::fmt::Debug for DedupToken {
 /// re-read of the same segment, so a retried delivery still presents the same
 /// id and per-record retry dedup keeps working.
 ///
+/// # It survives a changed `sink_max_batch_size`
+///
+/// The index is the record's ordinal **within its segment**, not within the
+/// batch it was delivered in. The drain re-reads `sink_max_batch_size` on every
+/// call, so an operator who edits it — or a redeployed pod carrying a different
+/// config — re-splits an unconfirmed segment at different boundaries on replay.
+/// A [`DedupToken`] moves with those boundaries and a downstream keyed on it
+/// double-inserts; a `RecordId` does not move, so a downstream keyed on it
+/// still recognises the record.
+///
+/// **This is the identity to use when a duplicate is expensive** — a billing
+/// row, a metering event, anything an operator would be asked to refund. The
+/// invariant is pinned by `record_ids_survive_a_changed_sink_max_batch_size` in
+/// the daemon's drain tests.
+///
+/// The one thing it does not survive is a change of coordinate. `weir-ctl dl
+/// requeue` and `quarantine requeue` re-push records through the daemon socket
+/// into a *new* segment, so they arrive with new ids and a dedup-capable sink
+/// correctly treats them as new records. Both commands say so before asking for
+/// confirmation.
+///
 /// # Format
 ///
 /// SHA-256 over `segment_len ++ segment ++ index ++ payload_len ++ payload`,
@@ -489,6 +545,11 @@ impl std::fmt::Debug for RecordId {
 /// chunk; a token shared across those chunks would make a dedup-capable sink
 /// discard every chunk after the first. See [`DedupToken`] for the stability
 /// precondition that comes with it.
+///
+/// That precondition is why the batch also carries a [`RecordId`] per record
+/// ([`SinkBatch::record_ids`]). Those name the records' positions in the
+/// buffer rather than the batch, so they are the key to use when the downstream
+/// must not double-count — see [`RecordId`] for the two-way comparison.
 ///
 /// Records are [`Payload`] — opaque bytes. weir 1.x let a sink pick its own
 /// record type via `Sink::Record`, but the only implementation was ever the
@@ -603,10 +664,22 @@ impl SinkBatch {
         self.segment_created_at
     }
 
-    /// The per-record ids, if the batch carries them, in record order.
+    /// The per-record ids, in record order — the idempotency key to use when a
+    /// duplicate is expensive.
     ///
-    /// `None` means the batch was built without them — a sink should fall back
-    /// to whatever key it used before rather than treat this as an error.
+    /// **The drain always supplies these**, one per record, on every `commit`.
+    /// A [`RecordId`] names the record's WAB coordinate, so unlike the batch's
+    /// [`DedupToken`] it does not move when `sink_max_batch_size` changes
+    /// between two delivery attempts: a sink keyed on these still recognises a
+    /// record it has already committed after such a change, and one keyed on
+    /// the token does not.
+    ///
+    /// `None` means the batch was **not** built by the drain — a hand-built
+    /// [`SinkBatch::new`] or `From<Vec<Payload>>`, i.e. a sink author's test.
+    /// A sink whose correctness rests on these ids should treat `None` as a
+    /// programming error and fail loudly rather than invent a substitute key;
+    /// one for which they are an optimisation should fall back to whatever key
+    /// it used before.
     pub fn record_ids(&self) -> Option<&[RecordId]> {
         self.record_ids.as_deref()
     }
@@ -732,6 +805,55 @@ mod tests {
         assert_ne!(a, b, "same segment, different index must differ");
         assert_ne!(a, c, "same index, different segment must differ");
         assert_ne!(b, c);
+    }
+
+    /// The property that lets a sink recognise a record it has already
+    /// committed after `sink_max_batch_size` changed: the index is the record's
+    /// ordinal within its SEGMENT, so re-splitting the segment into different
+    /// sub-batches leaves every id alone.
+    ///
+    /// Stated here as well as in the daemon because it is a promise of this
+    /// crate's public API — a third-party sink builds its dedup on it, and this
+    /// crate is what it depends on.
+    #[test]
+    fn ids_do_not_move_when_the_records_are_re_split_into_other_batches() {
+        let segment = "shard_00/seg_00000001.wab.sealed";
+        let payloads: Vec<Payload> = (1..=10)
+            .map(|i| Payload::copy_from_slice(format!("record-{i:02}").as_bytes()))
+            .collect();
+
+        // The drain's own numbering: absolute within the segment, independent
+        // of how the records are grouped for delivery.
+        let ids: Vec<RecordId> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| RecordId::for_record(segment, i as u64 + 1, p))
+            .collect();
+
+        // Two deliveries of the same segment at two batch sizes. `chunks` is
+        // exactly what the drain does with `sink_max_batch_size`.
+        let at = |n: usize| -> Vec<RecordId> { ids.chunks(n).flat_map(|c| c.to_vec()).collect() };
+        assert_eq!(at(3).len(), 10);
+        assert_eq!(at(3), at(7), "a re-split must not change any id");
+
+        // And the counterfactual that makes the assertion non-vacuous: numbering
+        // each record within its BATCH does move them.
+        let batch_relative = |n: usize| -> Vec<RecordId> {
+            payloads
+                .chunks(n)
+                .flat_map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .map(|(i, p)| RecordId::for_record(segment, i as u64 + 1, p))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_ne!(
+            batch_relative(3),
+            batch_relative(7),
+            "precondition: a batch-relative index is what would break this"
+        );
     }
 
     /// And the property that keeps per-record retry dedup working: a re-read of
