@@ -49,6 +49,15 @@ across a multi-shard daemon can land *below* the single-connection rate — see 
 [`shard_count` caveat](../operations/configuration.md#shard_count). See the
 `weir-client` crate docs for the ordering caveat.
 
+> **The tier is per call, not per client.** `Durability` is an argument to
+> `push`, and it becomes a byte on that record's wire envelope — so one
+> `WeirClient` can send `Durable` for the record it cannot lose and `Buffered`
+> for the telemetry beside it, interleaved, with no second connection and no
+> reconnect. The daemon dispatches per record inside a single flush batch, so
+> the `Buffered` records genuinely skip the fsync they share a batch with. This
+> is usually the right shape: reach for the fast path where the data is
+> replaceable, and pay for durability only where it matters.
+
 > **Already inside an async runtime?** `push()` is a *blocking* call — calling it
 > directly from an `async fn` blocks the executor thread and starves the runtime.
 > See [Producing from an async runtime](#producing-from-an-async-runtime) below.

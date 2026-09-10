@@ -72,6 +72,19 @@ use.
 > reassigned to a future tier, because that would silently mis-tier every 1.x
 > client.
 
+**The tier is per record, and a connection may mix them freely.** It is a
+header byte on each envelope, not a handshake value, a connection mode, or a
+daemon setting. One producer can send `Durable` for the record it cannot lose
+and `Buffered` for the telemetry line beside it, on the same socket, in any
+order, with no reconnect and no negotiation.
+
+The daemon dispatches per record inside a single flush batch: a `Buffered`
+record is acked as soon as its memory write lands, while a `Durable` record in
+that same batch waits for the batch-boundary group fsync. If a batch happens to
+contain no `Durable` record, the fsync is skipped entirely. A client
+implementing this protocol therefore needs no per-connection state for
+durability — read the byte the caller asked for, write it, move on.
+
 ---
 
 ## Nack payload format
@@ -467,8 +480,13 @@ Offset  Hex bytes                                          Field
 
 Total: 20 bytes. The `durability` byte on the response is always
 `0x01` (Durable) regardless of the original request's tier — the server
-populates it to a fixed value. Clients reading responses can ignore
-it.
+populates it to a fixed value.
+
+> **Do not read it as confirmation of the tier.** A client that asserts
+> `ack.durability == request.durability` passes every `Durable` test it writes
+> and then rejects every `Buffered` ack in production. Ignore the field on
+> responses; an Ack means the record was accepted under the tier *you* sent,
+> and the guarantee that tier carries is described above.
 
 ### Nack response — `PayloadTooLarge`
 

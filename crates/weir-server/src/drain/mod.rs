@@ -3543,6 +3543,99 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// The strand boundary is where F05 deliberately STOPS, and the duplicate
+    /// that follows is a documented, billable cost — not an accident.
+    ///
+    /// `retry_resumes_past_already_processed_sub_batches` and
+    /// `blocked_segment_resumes_past_processed_when_cap_clears` pin the two
+    /// boundaries where the `processed` cursor SURVIVES. This pins the one where
+    /// it is dropped on purpose (H2, the `max_retries` exhausted arm): the
+    /// rescan re-queues only a `PathBuf`, so the Draining arm calls
+    /// `process_segment(.., 0)` and **re-commits the prefix that already
+    /// landed**. Persisting the cursor across a strand would need a crash-safe
+    /// on-disk sidecar; not doing so is the choice, and this is the choice's
+    /// receipt.
+    ///
+    /// It matters downstream, not just here. The S3 sink names each object
+    /// after a WAB coordinate, so in an ordinary bucket the re-PUT overwrites
+    /// and nothing is visible — but Object Lock requires versioning, and there
+    /// each re-commit adds an undeletable noncurrent version. One
+    /// strand-and-recover cycle on a full 256 MiB segment is a few hundred of
+    /// them, which is why `docs/sinks/s3.md` tells operators on locked buckets
+    /// to lower `wab_segment_max_bytes` and to treat `WeirSegmentStranded` as a
+    /// cost alert. That advice is only true while this test passes.
+    ///
+    /// Every existing strand test uses a one-record segment, where a
+    /// restart-at-zero and a resume-past-the-prefix are indistinguishable.
+    #[test]
+    fn a_strand_re_delivers_the_prefix_it_already_committed() {
+        let dir = tmp_dir("strand_reprefix");
+        // batch_size = 1 → A and B commit as separate sub-batches, so there IS
+        // a committed prefix to lose at the strand boundary.
+        let sealed = make_sealed_segment(&dir, 0, &[b"A", b"B"]);
+
+        // call 1:            commit([A]) → Ok         (processed → 1)
+        // calls 2..2+RETRIES: commit([B]) → Transient  (retries exhaust → STRAND)
+        // then responses are exhausted, so MockSink defaults to Ok:
+        // next call:         commit([A]) → Ok         ← the re-delivered prefix
+        // next call:         commit([B]) → Ok         → confirm
+        let mut responses: Vec<MockResult> = vec![MockSink::ok(vec![Payload::from(b"A".as_ref())])];
+        responses.extend((0..=MAX_RETRIES).map(|_| Err(MockError::Transient)));
+        let sink = Arc::new(MockSink::with_batch_size(1, responses));
+        let metrics = noop_metrics();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        // tx stays open so the drain reaches the idle health-poll where the
+        // down→up recovery rescan runs.
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !get_confirmed_path(&sealed).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            1,
+            "the segment must strand once before recovery re-queues it"
+        );
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "the resumed segment must be confirmed after delivery"
+        );
+
+        let committed = sink.committed_records();
+        let a = Payload::from(b"A".as_ref());
+        let b = Payload::from(b"B".as_ref());
+        assert_eq!(
+            committed,
+            vec![a.clone(), a.clone(), b.clone()],
+            "expected A committed twice: once before the strand and once after \
+             the resume restarts at record 0. Getting [A, B] instead means the \
+             `processed` cursor now SURVIVES the strand boundary -- which is an \
+             improvement, but it invalidates the duplicate-version cost warning \
+             in docs/sinks/s3.md and the H2 comment in this file. Update both \
+             before changing this assertion."
+        );
+        assert_eq!(
+            records_committed(&metrics),
+            3,
+            "a 2-record segment delivered 3 records: the duplicate is real and \
+             counted, not hidden inside the sink"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     // ── probe_and_resume_stranded: recovery-edge contract (H1) ─────────────────
 
     /// Reads the one-hot `weir_sink_health` gauge value for a single state.

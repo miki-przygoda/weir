@@ -1273,6 +1273,151 @@ fn mixed_durability_under_concurrent_load() {
     }
 }
 
+#[test]
+fn idle_seal_does_not_fire_for_a_producer_that_never_goes_idle() {
+    // `wab_segment_max_age_secs` reads as a maximum age and is an IDLE timer:
+    // the clock restarts on every flush (`wab/mod.rs:683-685`), so the seal
+    // fires only after the producer stops for the whole interval. A steady
+    // trickle therefore never idle-seals at all, and its segment grows toward
+    // `wab_segment_max_bytes` (256 MiB) exactly as if the knob were 0.
+    //
+    // That is the documented behaviour (`docs/operations/configuration.md`,
+    // `docs/sinks/s3.md`) and the shape most likely to surprise an operator who
+    // set the knob precisely to avoid it: "I set a 2-second seal and my archive
+    // is still empty." This pins both halves — writing keeps it open, stopping
+    // seals it — so changing idle semantics to age semantics has to be a
+    // deliberate act that updates those docs.
+    const IDLE_SECS: u64 = 2;
+    const WRITE_GAP: Duration = Duration::from_millis(400);
+
+    let srv = weir_server!("idle_seal_trickle")
+        .extra_config(format!("wab_segment_max_age_secs = {IDLE_SECS}"))
+        .start();
+    let mut client = srv.client();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+
+    // Trickle for well over the idle interval, recording the largest real gap
+    // between writes. A CI runner that stalls mid-loop would legitimately let
+    // the segment idle out, so the assertion below is made only if the premise
+    // — that we never actually went idle — held.
+    let mut worst_gap = Duration::ZERO;
+    let mut last = Instant::now();
+    for _ in 0..12 {
+        thread::sleep(WRITE_GAP);
+        client.push(b"trickle", Durability::Durable).unwrap();
+        worst_gap = worst_gap.max(last.elapsed());
+        last = Instant::now();
+    }
+
+    if worst_gap < Duration::from_secs(IDLE_SECS) {
+        assert_eq!(
+            committed(),
+            0,
+            "a producer writing every {WRITE_GAP:?} against a {IDLE_SECS}s idle \
+             seal must never idle-seal — the clock restarts on every flush. \
+             Records were delivered, so the timer is behaving as a maximum age \
+             rather than an idle interval, and the configuration and S3 sink \
+             docs that describe it as idle-only are now wrong."
+        );
+    } else {
+        eprintln!(
+            "skipping the never-idle assertion: the host stalled for {worst_gap:?}, \
+             which is past the {IDLE_SECS}s threshold, so the premise did not hold"
+        );
+    }
+
+    // Now stop writing. The same knob that refused to fire under load must fire
+    // once the producer is genuinely idle — otherwise this test would also pass
+    // against a build where idle-seal is simply broken.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while committed() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        committed() >= 1,
+        "after the producer stopped, the {IDLE_SECS}s idle seal should have \
+         sealed and drained the segment"
+    );
+}
+
+#[test]
+fn one_connection_can_interleave_both_durability_tiers() {
+    // The tier is a per-RECORD wire byte (envelope header offset 6), not a
+    // connection or a daemon setting, so a single producer can ask for a
+    // different guarantee on each push -- `Durable` for the transaction, the
+    // `Buffered` fast path for the telemetry beside it, over one socket.
+    //
+    // Nothing said so until now, and nothing tested the interleaved case:
+    // `mixed_durability_under_concurrent_load` gives each *thread* one fixed
+    // tier, and `all_durability_tiers_behave_per_contract` measures the tiers
+    // in separate phases. Both would pass against an implementation that read
+    // the tier correctly in a homogeneous stream but not a mixed one.
+    //
+    // Asserted through the fsync counter rather than the ack counters, because
+    // `weir_records_ack_total{tier}` is labelled from the request header
+    // (`socket/connection.rs`) and would agree with itself even if the flusher
+    // ignored the field entirely. `weir_wab_fsync_duration_seconds_count`
+    // increments once per real fsync syscall, and the flusher skips the group
+    // fsync when a batch holds no Durable record (`wab/mod.rs`), so on a
+    // serial push-and-wait connection -- one record per batch -- the count must
+    // rise by the number of Durable pushes and not by the total.
+    const PAIRS: u64 = 20;
+
+    let srv = weir_server!("interleaved_tiers").start();
+    let mut client = srv.client();
+    let fsyncs = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_wab_fsync_duration_seconds_count",
+        )
+    };
+
+    let before = fsyncs();
+    for i in 0..PAIRS {
+        client
+            .push(format!("durable-{i}").as_bytes(), Durability::Durable)
+            .unwrap_or_else(|e| panic!("durable push {i}: {e}"));
+        client
+            .push(format!("buffered-{i}").as_bytes(), Durability::Buffered)
+            .unwrap_or_else(|e| panic!("buffered push {i}: {e}"));
+    }
+    thread::sleep(Duration::from_millis(150));
+    let delta = fsyncs() - before;
+
+    assert!(
+        delta >= PAIRS,
+        "{PAIRS} interleaved Durable pushes produced only {delta} fsyncs. A \
+         Durable record sharing a stream with Buffered ones must still force \
+         the group fsync before its ack."
+    );
+    assert!(
+        delta < PAIRS * 2,
+        "{delta} fsyncs for {PAIRS} Durable + {PAIRS} Buffered pushes. The \
+         Buffered records are being fsynced too, so the flusher is not reading \
+         the tier per record -- it is applying one tier to the whole stream."
+    );
+
+    // And both tiers were actually accepted, not merely counted.
+    let body = srv.scrape_metrics();
+    for label in ["durable", "buffered"] {
+        let acked = parse_metric(
+            &body,
+            &format!("weir_records_ack_total{{tier=\"{label}\"}}"),
+        );
+        assert_eq!(
+            acked, PAIRS,
+            "one connection pushed {PAIRS} records at each tier; the {label} \
+             counter reads {acked}"
+        );
+    }
+}
+
 // ── Crash recovery ────────────────────────────────────────────────────────────
 
 #[test]

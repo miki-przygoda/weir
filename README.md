@@ -11,26 +11,34 @@ A durable, high-throughput write buffer for Rust.
 your database catch up in bulk.** weir writes each record to a CRC32-checksummed
 write-ahead buffer, fsyncs it according to the durability tier you ask for, acks
 the producer, then drains records to your sink in batches — turning N per-record
-commits into 1. **An ack is never a false ack:** an acked record is on disk and
-replays after a crash.
+commits into 1. **At the `Durable` tier an ack is never a false ack:** an acked
+record is on disk and replays after a crash. (`Buffered` acks before the fsync
+and deliberately trades that away — the tier is a per-record choice, so one
+connection can mix them.)
 
 **Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
-records at the durable tier, **none lost**
-([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md)) ·
+records at the durable tier, **none lost** — and, in the same runs, `Buffered`
+loss measured as uniform between zero and one writeback interval, ceiling 1.76 s
+([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md);
+real kernel power cuts on Linux, which is the platform the guarantee is claimed
+for — see [platform support](docs/platform-support.md#durability-by-platform)) ·
 6 built-in sinks (4 in a default build; `clickhouse` and `s3` opt-in) ·
 wire format + Rust API under SemVer
 
 *Latency and throughput figures are deliberately not quoted here. Every published
-run — 2.0.3 as of 2026-09-02
+run — 2.1.0 as of 2026-09-08
 ([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
 [`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner, and
-this project's own rule is that external performance claims cite bare-metal
-numbers, which have not been captured yet. The "microseconds" above is the fsync:
+this project's own rule is that external performance claims cite an operator-run
+capture on named hardware, with the storage and its fsync primitive disclosed
+([`environments.md`](docs/benchmarks/environments.md#what-an-external-claim-may-cite)). The "microseconds" above is the fsync:
 a `Durable` ack is one fsync, so it is your disk's number, not weir's. Measured
 single-thread `Durable` p50 is ~133–152 µs on a Mac NVMe — where the primitive is
-macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4 ms** on a
+macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4–1.5 ms** on a
 SATA SSD with an honest Linux `fdatasync`
-([comparison](docs/benchmarks/snapshot-2026-06-13-comparison.md)). Measure on
+([comparison](docs/benchmarks/snapshot-2026-06-13-comparison.md) measured 1.5 ms;
+[phase 3](docs/benchmarks/phase3-results.md) measured 1.4 ms on the same box —
+the spread is the storage, not the software). Measure on
 your own hardware: `cargo test -p weir-server --test load --release -- --nocapture`.*
 
 **▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
@@ -45,8 +53,8 @@ browser. *(Hosted version coming with the public launch.)*
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
 > format for non-Rust implementers. The WAB on-disk format is stable and
 > unconfirmed segments replay on restart. Built-in sinks: `noop`, `http`,
-> `mysql`, `postgres` in the default build, plus `clickhouse` behind the opt-in
-> `clickhouse-sink` Cargo feature (see [Crates](#crates) and the
+> `mysql`, `postgres` in the default build, plus `clickhouse` and `s3` behind
+> the opt-in `clickhouse-sink` and `s3-sink` Cargo features (see [Crates](#crates) and the
 > [configuration reference](docs/operations/configuration.md)). WAB flusher and
 > drain threads are panic-supervised. Published on crates.io.
 >
@@ -67,6 +75,11 @@ reclaimed until the sink confirms the batch; on restart, unconfirmed segments
 are replayed automatically.
 
 ## Quickstart
+
+> **The daemon is Unix-only** (Linux or macOS). A Windows producer talks to it
+> over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using
+> `weir-client`; there is no Windows `weir-server`. Full matrix, including what
+> is untested, in [Platform support](docs/platform-support.md).
 
 ```bash
 cargo build --release -p weir-server
@@ -188,7 +201,7 @@ not benchmarks.*
 | `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and the `windows` CI job compiles `weir-client --features tls` there on every push. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`. There is no Windows *server* build: it had no ingest path, and 2.0.5 dropped it. |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
 | `weir-sink-s3` | lib | The S3-API object-storage sink (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph), behind `weir-server`'s opt-in `s3-sink` feature. The first weir sink built **outside** the daemon against `weir-sink-sdk` alone — so it is also the proof that the SDK is a contract a third party can build against. See [docs/sinks/s3.md](docs/sinks/s3.md). |
-| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). |
+| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). **Unix only** — it drives `WeirClient::connect`, the Unix-socket constructor. Not a release artifact; build from source or use the Docker image. |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
 
 These are deliberately separate so you can compose the pieces you need without

@@ -410,7 +410,8 @@ matters more than maximal per-segment batching; leave it `0` on high-throughput
 deployments where segments fill quickly on their own.
 
 > **This knob is named like a maximum age and is not one. It is an idle timer,
-> and a steady trickle defeats it.** The clock restarts on every flush, so a
+> and a steady trickle defeats it.** The clock restarts on every flush
+> (`crates/weir-server/src/wab/mod.rs`), so a
 > producer writing one record a minute against `wab_segment_max_age_secs = 300`
 > resets it four times over before it can expire. That segment never seals on
 > this timer at all — it grows toward `wab_segment_max_bytes` exactly as if the
@@ -2014,9 +2015,12 @@ log_level = "info"
 > recognised, and enabling `tcp_bind` without the feature is a startup error.
 > This does **not** mean operators must build from source: as of 2.0.3, the
 > official release binaries (Linux/macOS) and the official Docker image are
-> already built with `--features tls`. Windows binaries are the exception —
-> the listener layer is Unix-only, so the feature has nothing to enable
-> there.
+> already built with `--features tls`. **There is no Windows binary** — the
+> listener layer is Unix-only, so `weir-server` has no ingest path there at
+> all, and 2.0.5 stopped shipping the `.exe` that had implied otherwise. A
+> Windows *producer* is supported and talks to a Unix daemon over this
+> listener using `weir-client --features tls`; see
+> [Platform support](../platform-support.md).
 
 TLS is **mandatory** on the TCP path. Setting `tcp_bind` without a valid TLS
 configuration (or without building with `--features tls`) is a **fatal startup

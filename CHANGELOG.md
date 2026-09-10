@@ -36,6 +36,94 @@ protocol** below.
   macOS half of `build` genuinely cannot run in a Linux container, and
   `deploy/ci-local/README.md` still says so rather than skipping them silently.
 
+### Fixed
+
+- **A bucket-wide S3 Object Lock retention dead-lettered every acked record.**
+  AWS rejects any `PutObject` landing inside a retention period without
+  `Content-MD5` or an `x-amz-checksum-*` header — a bucket *default* retention
+  included. weir sent neither, S3 answered `400 InvalidRequest`, and that code
+  was classified Permanent, so the whole backlog was dead-lettered while
+  `health()` still reported Healthy because `HeadBucket` kept succeeding.
+  `PutObject` now sends `x-amz-checksum-sha256` (the payload digest is already
+  computed for SigV4, so this costs one base64 and no new dependency), and
+  `InvalidRequest` now strands rather than dead-letters — a provider rejecting a
+  request under that code for any other reason must not displace acked data
+  either.
+
+### Documentation
+
+- Published claims corrected, each with a test that fails without the fix
+  (`crates/weir-server/tests/docs_drift.rs`): the README's sink list omitted
+  `s3`, its benchmark vintage was two releases stale, and its 1.4 ms SATA
+  citation pointed at a file reporting 1.5 ms.
+- `docs/benchmarks.md` published a single-thread `Durable` rate in the same
+  column as a saturation ceiling with no concurrency stated. It is a latency
+  reciprocal — one synchronous producer pays one fsync per record — and the same
+  tier on the same runner reaches 18× that across 48 connections.
+- `docs/benchmarks/drain-throughput.md` compared beast's drain against an M3 Max
+  client's ingest, which `environments.md` forbids. Against the same box's own
+  ingest the drain is 2.1× wider at one connection and *narrower* than
+  concurrent `Buffered` ingest — which is the case weir exists for.
+- The Grafana dashboard's durable-write panel quoted Linux `fdatasync`
+  baselines with no macOS caveat; `F_BARRIERFSYNC` and `F_FULLFSYNC` are
+  different primitives, not a slower disk.
+- `environments.md`'s rule that external claims cite `bare-metal.md` was
+  unsatisfiable — that file has never held a capture — so it forbade every
+  performance statement the project makes. It now names the property meant and
+  lists the captures that satisfy it.
+- `wab_segment_max_age_secs` is an **idle** timer, not a maximum age: the clock
+  restarts on every flush, so a steady trickle never idle-seals at all. Now
+  documented at the knob and in the S3 sink guide.
+- `docs/sinks/s3.md` gained Object Lock and versioned-bucket behaviour, the KMS
+  grant an SSE-KMS deployment needs, the boundary of the key's append-only
+  property, and the low-volume seal interaction.
+- **New: [`docs/platform-support.md`](docs/platform-support.md)** — daemon and
+  library support tables, released binaries, durability by platform, and an
+  explicit *Untested and unsupported* section. Facts that were previously spread
+  across ten places in six files, plus two that were written down nowhere: the
+  test suite runs on Linux only, and a daemon on any other Unix (Android, the
+  BSDs, illumos) compiles, starts, and then refuses every connection, because
+  `peer_uid` has no implementation there and the accept loop fails closed.
+- The quickstart's macOS durability pointer led to `architecture.md`, which never
+  mentions macOS; `configuration.md` implied a Windows binary 2.0.5 removed; the
+  README's `weir-ctl` row carried no platform marker though its table siblings
+  all do, and its copy-pasteable quickstart had no platform line at all.
+- The 2026-06-13 snapshots framed `F_BARRIERFSYNC` vs `fdatasync` as an ~11×
+  *speed* difference. It is a difference in guarantee — a barrier is not a flush
+  — and reading it as speed suggests "buy an NVMe and `Durable` gets 11×
+  cheaper", which is false.
+
+- The wire protocol, `integrating.md` and the README now say that the durability
+  tier is a **per-record** wire byte, so one connection can interleave `Durable`
+  and `Buffered` freely — true since 1.0, stated nowhere, and tested nowhere
+  until now. The Ack frame's durability byte is always `0x01`; the protocol doc
+  now warns non-Rust clients not to read it as confirmation of the tier.
+- `install.md` had no durability prerequisites at all — nothing about local
+  storage, network filesystems, headroom, drive write caches, or the macOS
+  barrier — for a system whose whole guarantee is one `fsync`.
+- The README's "an ack is never a false ack" was stated unconditionally; it
+  holds at the `Durable` tier. The chaos figure now also carries the `Buffered`
+  result measured in the same runs (uniform loss, 1.76 s ceiling) and the
+  platform it was measured on.
+- `batch-tuning.md`'s "3.6–7.9× throughput improvement" is a 3-trial median on
+  the shared sandbox the file's own caveat calls too noisy to quote, computed
+  against a nominal default the project never actually ran. Against the config
+  CI used, the same table shows ~4%.
+
+### Fixed (tooling)
+
+- `deploy/avg_benchmarks.py` read `WEIR_VERSION` inside the history-writing
+  branch only, so `history.md` was stamped and `latest.md` was not — leaving
+  every hand-written "as of" line in the tree free to drift.
+- Benchmark rows poisoned by a descheduled CI runner (single-thread `Sync` p99
+  of 28.2 ms, 35.5 ms and 98.9 ms, against a healthy ceiling near 3.6 ms) sat
+  unannotated in the published trend. The generator now marks them `(!)` at
+  write time, and the three existing rows are backfilled.
+
+---
+
+## [2.1.0] - 2026-09-07
+
 Two independent pieces: the S3 sink (a new published crate and a minor version
 bump), and the second-sweep fixes below.
 
@@ -2874,6 +2962,11 @@ The five commits making up this pass:
 
 ---
 
+[2.1.0]: https://github.com/miki-przygoda/weir/compare/v2.0.5...v2.1.0
+[2.0.5]: https://github.com/miki-przygoda/weir/compare/v2.0.4...v2.0.5
+[2.0.4]: https://github.com/miki-przygoda/weir/compare/v2.0.3...v2.0.4
+[2.0.3]: https://github.com/miki-przygoda/weir/compare/v2.0.0...v2.0.3
+[2.0.0]: https://github.com/miki-przygoda/weir/compare/v1.3.1...v2.0.0
 [1.3.1]: https://github.com/miki-przygoda/weir/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/miki-przygoda/weir/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/miki-przygoda/weir/compare/v1.1.0...v1.2.0

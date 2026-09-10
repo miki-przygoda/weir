@@ -26,6 +26,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 # SigV4 payload/canonical hashing. Pinned to 0.10 to match weir-sink-sdk, so the
 # RecordId/DedupToken hex this crate consumes comes from the same digest stack.
 sha2 = "0.10"
+# base64, for the x-amz-checksum-sha256 header S3 requires on any PutObject
+# landing under an Object Lock retention. Already in the tree via reqwest, so
+# taking it directly adds no crates.
+base64 = "0.22"
 # SigV4 key derivation — the ONE genuinely new crate in this feature's budget.
 # The tree carries hmac 0.13 via postgres-protocol, but only under the
 # postgres-sink feature and on digest 0.11; 0.12 pairs with sha2 0.10 above.
