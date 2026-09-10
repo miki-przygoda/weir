@@ -58,6 +58,31 @@
 //! # }
 //! ```
 //!
+//! # Knowing *which* record you pushed
+//!
+//! [`push`](WeirClient::push) returns `()`: the record was accepted, and nothing
+//! more. [`push_tracked`](WeirClient::push_tracked) instead returns a
+//! [`RecordCoordinate`] — the buffer segment the record landed in, its index
+//! within that segment, and the `record_id` the downstream sink will see for it
+//! as its idempotency key. That is what lets a producer reconcile what it sent
+//! against what arrived, rather than carrying its own sequence inside the
+//! payload and reconciling server-side.
+//!
+//! ```no_run
+//! # #[cfg(unix)] {
+//! use weir_client::{WeirClient, Durability};
+//!
+//! let mut client = WeirClient::connect("/run/weir/weir.sock").unwrap();
+//! let at = client.push_tracked(b"hello world", Durability::Durable).unwrap();
+//! println!("{} record {} -> {}", at.segment(), at.index(), at.record_id_hex());
+//! # }
+//! ```
+//!
+//! It is a **buffer address, not a per-producer sequence**: other producers'
+//! records interleave, so your own indices have holes. See
+//! [`push_tracked`](WeirClient::push_tracked) for the full list of what it does
+//! and does not promise, including how to detect a daemon that predates it.
+//!
 //! # Ack vs. delivery
 //!
 //! A successful [`push`](WeirClient::push) means the record is **durably buffered
@@ -69,6 +94,10 @@
 //! shutdown). For a small smoke test the sink may not be touched at all — watch
 //! `weir_records_ack_total` (acceptance), not the sink-commit metric, to confirm
 //! the daemon took your records.
+//!
+//! [`push_tracked`](WeirClient::push_tracked) does not change this. Its
+//! coordinate says *where the record will be read from*, not that it has been
+//! read — it is an address, not a delivery receipt.
 //!
 //! # Running the daemon
 //!
@@ -105,6 +134,11 @@ mod unix;
 /// Re-export of [`weir_core::Durability`] so the common producer path needs a
 /// single crate import (`weir_client::Durability`).
 pub use weir_core::Durability;
+
+/// Re-exported: the durable address [`WeirClient::push_tracked`] returns for an
+/// accepted record. Lives in `weir-core` because both ends of the socket build
+/// it from the same bytes.
+pub use weir_core::RecordCoordinate;
 
 /// Re-export of [`weir_core::NackReason`] — the payload of [`ClientError::Nack`].
 /// Re-exported so consumers can match on the reason (e.g. to distinguish the

@@ -45,6 +45,23 @@ pub enum MessageType {
     HealthCheck = 0x04,
     /// Daemon → producer: reply to a [`HealthCheck`](MessageType::HealthCheck).
     HealthCheckResponse = 0x05,
+    /// Producer → daemon: a record to durably buffer, **and** tell me where it
+    /// landed. Identical to [`Push`](MessageType::Push) in every other respect —
+    /// same durability tiers, same caps, same Nack reasons — but answered with
+    /// [`AckTracked`](MessageType::AckTracked) instead of a bare
+    /// [`Ack`](MessageType::Ack).
+    ///
+    /// Additive by construction: a producer built against wire v1 never emits
+    /// this byte, so it never receives the longer reply, and a daemon that
+    /// predates the type rejects it with the already-specified
+    /// [`UnknownMessage`](crate::NackReason::UnknownMessage) — the permanent,
+    /// connection-closing error for exactly this version skew.
+    PushTracked = 0x06,
+    /// Daemon → producer: the pushed record was accepted, and here is its
+    /// [`RecordCoordinate`](crate::RecordCoordinate) — the only weir response
+    /// whose payload exceeds two bytes, and only ever sent in reply to a
+    /// [`PushTracked`](MessageType::PushTracked).
+    AckTracked = 0x07,
 }
 
 /// Error returned when a byte does not map to a known MessageType.
@@ -69,6 +86,8 @@ impl TryFrom<u8> for MessageType {
             0x03 => Ok(MessageType::Nack),
             0x04 => Ok(MessageType::HealthCheck),
             0x05 => Ok(MessageType::HealthCheckResponse),
+            0x06 => Ok(MessageType::PushTracked),
+            0x07 => Ok(MessageType::AckTracked),
             v => Err(UnknownMessageType(v)),
         }
     }
@@ -505,12 +524,20 @@ mod tests {
             MessageType::try_from(0x05).unwrap(),
             MessageType::HealthCheckResponse
         );
+        assert_eq!(
+            MessageType::try_from(0x06).unwrap(),
+            MessageType::PushTracked
+        );
+        assert_eq!(
+            MessageType::try_from(0x07).unwrap(),
+            MessageType::AckTracked
+        );
     }
 
     #[test]
     fn message_type_try_from_rejects_unknown() {
         assert!(MessageType::try_from(0x00).is_err());
-        assert!(MessageType::try_from(0x06).is_err());
+        assert!(MessageType::try_from(0x08).is_err());
         assert!(MessageType::try_from(0xff).is_err());
     }
 
@@ -524,6 +551,8 @@ mod tests {
             MessageType::Nack,
             MessageType::HealthCheck,
             MessageType::HealthCheckResponse,
+            MessageType::PushTracked,
+            MessageType::AckTracked,
         ] {
             assert_eq!(MessageType::try_from(u8::from(mt)).unwrap(), mt);
         }
@@ -536,6 +565,8 @@ mod tests {
         assert_eq!(MessageType::Nack as u8, 0x03);
         assert_eq!(MessageType::HealthCheck as u8, 0x04);
         assert_eq!(MessageType::HealthCheckResponse as u8, 0x05);
+        assert_eq!(MessageType::PushTracked as u8, 0x06);
+        assert_eq!(MessageType::AckTracked as u8, 0x07);
     }
 
     // ── Envelope ─────────────────────────────────────────────────────────────
@@ -572,6 +603,16 @@ mod tests {
     #[test]
     fn envelope_round_trip_health_check_response() {
         round_trip(MessageType::HealthCheckResponse);
+    }
+
+    #[test]
+    fn envelope_round_trip_push_tracked() {
+        round_trip(MessageType::PushTracked);
+    }
+
+    #[test]
+    fn envelope_round_trip_ack_tracked() {
+        round_trip(MessageType::AckTracked);
     }
 
     #[test]

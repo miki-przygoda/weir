@@ -45,6 +45,44 @@ bump), and the second-sweep fixes below.
   CLI `--wab-segment-max-lifetime-secs`, env `WEIR_WAB_SEGMENT_MAX_LIFETIME_SECS`,
   TOML `wab_segment_max_lifetime_secs`. Range `0`–`86400`.
 
+- **A durable coordinate for a pushed record — `WeirClient::push_tracked`.**
+  `push()` tells a producer its record was accepted; it has never said *which*
+  record it was. `push_tracked()` returns a `RecordCoordinate`: the WAB segment
+  the record landed in, its 1-based index within that segment, and the
+  `record_id` derived from both plus the payload. That `record_id` is
+  byte-identical to the per-record idempotency key the drain hands a sink (the
+  HTTP sink's `Idempotency-Key: sha256:<hex>`, the S3 sink's object name), so a
+  producer can finally reconcile what it sent against what the downstream
+  received — without carrying its own sequence inside the payload.
+
+  **The wire protocol is unchanged for every existing client.** The feature is
+  two new, additive message types — `PushTracked` (`0x06`) answered by
+  `AckTracked` (`0x07`). A client that does not implement them never sends
+  `0x06`, so it never receives an `0x07`, and its `Push` still gets the same
+  20 constant bytes. `WIRE_VERSION` stays 1;
+  `docs/conformance/wire_v1_vectors.json` is byte-identical and all five
+  polyglot demo clients pass it unchanged. Negotiation needs no handshake: a
+  daemon that predates the type answers `Nack(UnknownMessage 0x08)` and closes,
+  which is the protocol's existing permanent-error path for version skew.
+
+  New in `weir-core`: `RecordCoordinate` and its payload codec, plus the
+  `MessageType::PushTracked` / `AckTracked` variants. New in `weir-client`:
+  `push_tracked` / `push_tracked_default`, and a response pre-allocation cap now
+  chosen by message type — a client that never asks for a coordinate still
+  accepts at most the 2 bytes it always did. Conformance vectors for the
+  extension live in a **separate** `wire_v1_tracked_vectors.json`, because a
+  decoder that implements only types `0x01`–`0x05` is *correct* to reject a
+  `0x06` frame and must stay conformant.
+
+  **What this is not**, stated plainly because the distinction matters: it is a
+  buffer address, not a per-producer sequence. Records from other producers
+  interleave, so one producer's indices have holes — this does **not** provide
+  the gap-free sequential numbering some fiscal statutes require. An
+  `AckTracked` is not a delivery receipt (the record is durably buffered, not
+  yet drained), and a `Buffered` push gets a coordinate without getting
+  durability. See
+  [`docs/wire_protocol.md`](docs/wire_protocol.md#tracked-push--pushtracked--acktracked).
+
 - **`weir-sink-s3` — an S3-API object-storage sink**, behind `weir-server`'s
   opt-in `s3-sink` feature. Targets the S3 *API* rather than AWS specifically,
   so MinIO, Cloudflare R2, Backblaze B2 and Ceph work on the same code path with

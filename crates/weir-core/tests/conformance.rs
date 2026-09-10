@@ -75,6 +75,8 @@ fn message_type_name(mt: MessageType) -> &'static str {
         MessageType::Nack => "Nack",
         MessageType::HealthCheck => "HealthCheck",
         MessageType::HealthCheckResponse => "HealthCheckResponse",
+        MessageType::PushTracked => "PushTracked",
+        MessageType::AckTracked => "AckTracked",
     }
 }
 

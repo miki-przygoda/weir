@@ -48,7 +48,7 @@ use crate::{
         SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth},
-    wab::{SegmentReader, read_segment_record_count},
+    wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
 };
 
 use confirmed::confirm_and_delete;
@@ -1105,33 +1105,6 @@ fn enter_blocked(
 
 // ── Segment processing ────────────────────────────────────────────────────────
 
-/// A segment's address in the WAB, as `<shard-dir>/<file-name>` — the string
-/// mixed into every [`RecordId`] derived from that segment.
-///
-/// **The file name alone is not unique, and using it alone was a defect.** Every
-/// `ShardWriter` starts its counter at 1 and names files `seg_{counter:08}`
-/// inside its own shard directory (`wab/segment.rs`), so
-/// `shard_00/seg_00000001.wab.sealed` and `shard_01/seg_00000001.wab.sealed`
-/// share a basename. Hashing the basename gave two genuinely distinct records
-/// the same `RecordId` whenever `shard_count > 1` and their payloads matched —
-/// the HTTP sink sends that as `Idempotency-Key`, so a correctly-implemented
-/// endpoint kept one and dropped the other. That is precisely the collision
-/// `RecordId` was introduced in 2.0.3 to prevent; it was merely moved from
-/// payload granularity to shard granularity.
-///
-/// Falls back to the bare file name when there is no parent component, which
-/// only happens for a bare relative path in tests.
-fn segment_identity(segment: &Path) -> String {
-    let file = segment
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    match segment.parent().and_then(|p| p.file_name()) {
-        Some(shard) => format!("{}/{}", shard.to_string_lossy(), file),
-        None => file,
-    }
-}
-
 async fn process_segment<S: Sink>(
     segment: &Path,
     sink: &S,
@@ -1182,6 +1155,10 @@ async fn process_segment<S: Sink>(
     // records carrying identical bytes apart — a content hash cannot. Kept
     // parallel to `batch` rather than folded into `Payload`, so nothing about
     // the record type changes.
+    //
+    // `segment_identity` is the WAB's, not the drain's: the flusher predicts the
+    // same string at ack time for a tracked push's `RecordCoordinate`, and the
+    // two must agree or the coordinate names a record the sink never keyed.
     let segment_name = segment_identity(segment);
     let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
 

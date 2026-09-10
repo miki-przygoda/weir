@@ -158,6 +158,226 @@ mod tests {
         assert_eq!(wire_byte, 0x03);
     }
 
+    // ── Tracked push: the coordinate round trip ──────────────────────────────
+
+    /// Runs one request/response exchange against a scripted peer: reads the
+    /// client's frame, hands the caller its decoded header + payload, and writes
+    /// back whatever frame the caller returns.
+    fn scripted_peer(
+        server_end: std::os::unix::net::UnixStream,
+        respond: impl FnOnce(weir_core::Header, Vec<u8>) -> Vec<u8> + Send + 'static,
+    ) -> std::thread::JoinHandle<(weir_core::Header, Vec<u8>)> {
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut server_end = server_end;
+            let mut hdr = [0u8; weir_core::HEADER_LEN];
+            server_end.read_exact(&mut hdr).unwrap();
+            let h = weir_core::Header::decode(&hdr).unwrap();
+            let mut rest = vec![0u8; h.payload_len() as usize + 4];
+            server_end.read_exact(&mut rest).unwrap();
+            let payload = rest[..h.payload_len() as usize].to_vec();
+            let reply = respond(h, payload.clone());
+            server_end.write_all(&reply).unwrap();
+            (h, payload)
+        })
+    }
+
+    fn ack_tracked_frame(coordinate: &weir_core::RecordCoordinate) -> Vec<u8> {
+        weir_core::Envelope::new(
+            weir_core::Header::new(
+                weir_core::MessageType::AckTracked,
+                weir_core::Durability::Durable,
+                0,
+            ),
+            coordinate.encode(),
+        )
+        .encode()
+    }
+
+    #[test]
+    fn push_tracked_sends_the_tracked_type_and_returns_the_coordinate() {
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+
+        let expected = weir_core::RecordCoordinate::new(
+            "shard_02/seg_00000009.wab.sealed".into(),
+            42,
+            [0x7C; 32],
+        )
+        .unwrap();
+        let reply = ack_tracked_frame(&expected);
+        let peer = scripted_peer(server_end, move |_, _| reply);
+
+        let got = c.push_tracked(b"hello", Durability::Durable).unwrap();
+        let (header, payload) = peer.join().unwrap();
+
+        assert_eq!(
+            header.message_type(),
+            weir_core::MessageType::PushTracked,
+            "push_tracked must put 0x06 on the wire, not 0x01"
+        );
+        assert_eq!(payload, b"hello");
+        assert_eq!(got, expected);
+        assert!(!c.is_poisoned());
+    }
+
+    /// The read-side cap is chosen by the declared type. An `AckTracked` may
+    /// exceed two bytes; every other response still may not.
+    #[test]
+    fn ack_tracked_payload_passes_the_cap_that_an_ack_would_fail() {
+        // A coordinate is well over the 2-byte bound that applies to Ack/Nack.
+        let coordinate =
+            weir_core::RecordCoordinate::new("shard_00/seg_00000001.wab.sealed".into(), 1, [0; 32])
+                .unwrap();
+        assert!(coordinate.encode().len() > 2);
+
+        // Same bytes, mislabelled as a plain Ack: rejected before allocating.
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let bad = weir_core::Envelope::new(
+            weir_core::Header::new(
+                weir_core::MessageType::Ack,
+                weir_core::Durability::Durable,
+                0,
+            ),
+            coordinate.encode(),
+        )
+        .encode();
+        let peer = scripted_peer(server_end, move |_, _| bad);
+        let err = c.push(b"hello", Durability::Durable).unwrap_err();
+        peer.join().unwrap();
+        assert!(
+            matches!(&err, ClientError::Protocol(m) if m.contains("refusing to allocate")),
+            "an over-cap Ack must still be refused; got {err:?}"
+        );
+    }
+
+    /// A daemon that answers a tracked push with a bare Ack accepted the record
+    /// but did not answer the question. Reporting Ok would hand the caller a
+    /// coordinate it never received, so it is a protocol error.
+    #[test]
+    fn push_tracked_refuses_a_bare_ack() {
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let ack = weir_core::Envelope::new(
+            weir_core::Header::new(
+                weir_core::MessageType::Ack,
+                weir_core::Durability::Durable,
+                0,
+            ),
+            vec![],
+        )
+        .encode();
+        let peer = scripted_peer(server_end, move |_, _| ack);
+        let err = c.push_tracked(b"hello", Durability::Durable).unwrap_err();
+        peer.join().unwrap();
+        assert!(
+            matches!(&err, ClientError::Protocol(m) if m.contains("expected AckTracked")),
+            "got {err:?}"
+        );
+        assert!(!err.is_recoverable() && c.is_poisoned());
+    }
+
+    /// The negotiation, from the client's side: a daemon that predates
+    /// PushTracked rejects the type with UnknownMessage and closes. That error —
+    /// not a special handshake — is how a client learns the feature is absent.
+    #[test]
+    fn push_tracked_against_an_old_daemon_surfaces_unknown_message() {
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let nack = weir_core::Envelope::new(
+            weir_core::Header::new(
+                weir_core::MessageType::Nack,
+                weir_core::Durability::Durable,
+                0,
+            ),
+            vec![NackReason::UnknownMessage as u8],
+        )
+        .encode();
+        let peer = scripted_peer(server_end, move |_, _| nack);
+        let err = c.push_tracked(b"hello", Durability::Durable).unwrap_err();
+        peer.join().unwrap();
+        assert!(matches!(err, ClientError::Nack(NackReason::UnknownMessage)));
+        assert!(
+            !err.is_recoverable() && c.is_poisoned(),
+            "the daemon closes after this Nack, so the client must report itself unusable"
+        );
+    }
+
+    /// A coordinate this build cannot parse is a version skew every subsequent
+    /// tracked push would hit again, so the client reports itself unusable —
+    /// keeping `is_poisoned` the exact complement of `is_recoverable`.
+    #[test]
+    fn push_tracked_poisons_on_a_malformed_coordinate() {
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let bogus = weir_core::Envelope::new(
+            weir_core::Header::new(
+                weir_core::MessageType::AckTracked,
+                weir_core::Durability::Durable,
+                0,
+            ),
+            vec![0xFFu8; 8], // shorter than the fixed prefix
+        )
+        .encode();
+        let peer = scripted_peer(server_end, move |_, _| bogus);
+        let err = c.push_tracked(b"hello", Durability::Durable).unwrap_err();
+        peer.join().unwrap();
+        assert!(
+            matches!(&err, ClientError::Protocol(m) if m.contains("malformed record coordinate")),
+            "got {err:?}"
+        );
+        assert!(!err.is_recoverable() && c.is_poisoned());
+    }
+
+    /// The local guards are the push guards: they fire before any byte reaches
+    /// the wire, and they leave the connection usable.
+    #[test]
+    fn push_tracked_keeps_the_local_guards() {
+        let (client_end, _server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        assert!(matches!(
+            c.push_tracked(b"", Durability::Durable).unwrap_err(),
+            ClientError::EmptyPayload
+        ));
+        let oversized = vec![0u8; MAX_PAYLOAD_HARD_CAP + 1];
+        assert!(matches!(
+            c.push_tracked(&oversized, Durability::Durable).unwrap_err(),
+            ClientError::PayloadTooLarge { .. }
+        ));
+        assert!(
+            !c.is_poisoned(),
+            "local pre-send rejections must not poison the connection"
+        );
+    }
+
+    #[test]
+    fn push_tracked_default_uses_the_stored_tier() {
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        c.set_default_durability(Durability::Buffered);
+
+        let coordinate =
+            weir_core::RecordCoordinate::new("shard_00/seg_00000001.wab.sealed".into(), 3, [1; 32])
+                .unwrap();
+        let reply = ack_tracked_frame(&coordinate);
+        let peer = scripted_peer(server_end, move |_, _| reply);
+
+        assert_eq!(c.push_tracked_default(b"hello").unwrap(), coordinate);
+        let (header, _) = peer.join().unwrap();
+        assert_eq!(header.durability(), Durability::Buffered);
+    }
+
+    #[test]
+    fn push_tracked_default_without_default_errors() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(a);
+        assert!(matches!(
+            c.push_tracked_default(b"x").unwrap_err(),
+            ClientError::NoDefaultDurability
+        ));
+    }
+
     #[test]
     fn nack_error_surfaces_daemon_version_on_version_mismatch() {
         // Daemon sends `[VersionMismatch (0x02), daemon_wire_version]`.

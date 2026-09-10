@@ -1,0 +1,99 @@
+{
+  "wire_version": 1,
+  "coordinate_version": 1,
+  "coordinate_fixed_len": 43,
+  "max_segment_name_len": 255,
+  "max_tracked_ack_payload_len": 298,
+  "description": "Conformance vectors for the tracked-push extension to the weir v1 wire protocol: message types PushTracked (0x06) and AckTracked (0x07), and the RecordCoordinate payload an AckTracked carries. Kept apart from wire_v1_vectors.json, which is frozen and is read by decoders that know only message types 0x01..0x05 \u2014 such a decoder is CORRECT to reject a 0x06 frame, and stays conformant by ignoring this file. 'frame_vectors' are complete frames; 'coordinate_vectors' are bare AckTracked payloads.",
+  "frame_vectors": [
+    {
+      "name": "push_tracked_hello",
+      "notes": "PushTracked of \"hello\" at Durable durability. Byte-for-byte a Push frame except for the message_type byte (0x06 instead of 0x01) and the header CRC that covers it.",
+      "hex": "574549520106010005000000e893daf968656c6c6f86a61036",
+      "decode": "ok",
+      "message_type": "PushTracked",
+      "durability": "Durable",
+      "flags": 0,
+      "payload_hex": "68656c6c6f"
+    },
+    {
+      "name": "push_tracked_buffered",
+      "notes": "PushTracked at Buffered durability. Every tier is available to a tracked push; the tier still decides durability, the coordinate only says where the record went.",
+      "hex": "574549520106030005000000e33212b468656c6c6f86a61036",
+      "decode": "ok",
+      "message_type": "PushTracked",
+      "durability": "Buffered",
+      "flags": 0,
+      "payload_hex": "68656c6c6f"
+    },
+    {
+      "name": "ack_tracked_hello",
+      "notes": "The daemon's reply to `push_tracked_hello`: an AckTracked whose payload is the record's coordinate. The durability byte is fixed filler (0x01) exactly as it is on a plain Ack.",
+      "hex": "57454952010701004b00000052b76624010700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae200073686172645f30302f7365675f30303030303030312e7761622e7365616c65647b44b9cb",
+      "decode": "ok",
+      "message_type": "AckTracked",
+      "durability": "Durable",
+      "flags": 0,
+      "payload_hex": "010700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae200073686172645f30302f7365675f30303030303030312e7761622e7365616c6564"
+    }
+  ],
+  "coordinate_vectors": [
+    {
+      "name": "coordinate_hello",
+      "notes": "The coordinate carried by `ack_tracked_hello`. The record_id is sha256(segment_len ++ segment ++ index ++ payload_len ++ payload) over the payload \"hello\" \u2014 the same value the drain hands the sink as its per-record idempotency key.",
+      "hex": "010700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae200073686172645f30302f7365675f30303030303030312e7761622e7365616c6564",
+      "decode": "ok",
+      "segment": "shard_00/seg_00000001.wab.sealed",
+      "index": 7,
+      "record_id_hex": "ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae"
+    },
+    {
+      "name": "coordinate_empty_segment",
+      "notes": "Boundary: a zero-length segment name is structurally legal (the daemon never emits one, but a decoder must not special-case it into a rejection).",
+      "hex": "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "decode": "ok",
+      "segment": "",
+      "index": 0,
+      "record_id_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "name": "coordinate_max_segment",
+      "notes": "Boundary: a segment name at the 255-byte cap, which makes the payload exactly 298 bytes \u2014 the largest AckTracked a conformant daemon sends, and the number a reader caps its allocation at.",
+      "hex": "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff007a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+      "decode": "ok",
+      "segment": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "index": 18446744073709551615,
+      "record_id_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "name": "reject_coordinate_truncated",
+      "notes": "Shorter than the fixed prefix every coordinate has. Rejected before any field offset is interpreted.",
+      "hex": "010700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae20",
+      "decode": "Truncated"
+    },
+    {
+      "name": "reject_coordinate_unknown_version",
+      "notes": "Leading version byte is 0x02. The version leads the payload so a reader meeting a layout it does not know rejects it instead of mis-parsing it.",
+      "hex": "020700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae200073686172645f30302f7365675f30303030303030312e7761622e7365616c6564",
+      "decode": "UnsupportedVersion"
+    },
+    {
+      "name": "reject_coordinate_trailing_bytes",
+      "notes": "One byte past the declared length. The buffer must be EXACTLY one coordinate \u2014 quietly using the prefix is how a layout disagreement becomes a wrong address.",
+      "hex": "010700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae200073686172645f30302f7365675f30303030303030312e7761622e7365616c656400",
+      "decode": "LengthMismatch"
+    },
+    {
+      "name": "reject_coordinate_segment_too_long",
+      "notes": "Declares a segment name over the 255-byte cap. Rejected on the declared length, before the buffer is consulted.",
+      "hex": "010700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae000173686172645f30302f7365675f30303030303030312e7761622e7365616c6564",
+      "decode": "SegmentTooLong"
+    },
+    {
+      "name": "reject_coordinate_not_utf8",
+      "notes": "Segment name bytes are not valid UTF-8.",
+      "hex": "010700000000000000ce1ed3cfba2bd8f479aada1e16a60f784179ef1a1226b75b247c3624bf6c1fae200073686172645f30302f7365675f30303030303030312e7761622e7365616c65ff",
+      "decode": "SegmentNotUtf8"
+    }
+  ]
+}

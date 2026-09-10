@@ -422,11 +422,12 @@ fn simd_warmup() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::AckOutcome;
     use crate::queue;
     use crossbeam_channel::Receiver;
     use tokio::sync::oneshot;
 
-    fn make_unit(shard_id: u32, payload: &[u8]) -> (WorkUnit, oneshot::Receiver<bool>) {
+    fn make_unit(shard_id: u32, payload: &[u8]) -> (WorkUnit, oneshot::Receiver<AckOutcome>) {
         make_unit_tier(shard_id, payload, weir_core::Durability::Buffered)
     }
 
@@ -434,13 +435,14 @@ mod tests {
         shard_id: u32,
         payload: &[u8],
         durability: weir_core::Durability,
-    ) -> (WorkUnit, oneshot::Receiver<bool>) {
+    ) -> (WorkUnit, oneshot::Receiver<AckOutcome>) {
         let (tx, rx) = oneshot::channel();
         (
             WorkUnit {
                 shard_id,
                 payload: weir_core::Payload::copy_from_slice(payload),
                 durability,
+                wants_coordinate: false,
                 ack_tx: tx,
                 #[cfg(feature = "bench-trace")]
                 enqueued_at: std::time::Instant::now(),

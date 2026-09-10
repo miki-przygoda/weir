@@ -315,6 +315,40 @@ pub(crate) fn sealed_path_for(active_path: &Path) -> PathBuf {
     p
 }
 
+/// A segment's address in the WAB, as `<shard-dir>/<file-name>` — the string
+/// mixed into every `RecordId` derived from that segment, and the `segment`
+/// field of a [`RecordCoordinate`](weir_core::RecordCoordinate).
+///
+/// **The file name alone is not unique, and using it alone was a defect.** Every
+/// `ShardWriter` starts its counter at 1 and names files `seg_{counter:08}`
+/// inside its own shard directory, so `shard_00/seg_00000001.wab.sealed` and
+/// `shard_01/seg_00000001.wab.sealed` share a basename. Hashing the basename
+/// gave two genuinely distinct records the same `RecordId` whenever
+/// `shard_count > 1` and their payloads matched — the HTTP sink sends that as
+/// `Idempotency-Key`, so a correctly-implemented endpoint kept one and dropped
+/// the other. That is precisely the collision `RecordId` was introduced in 2.0.3
+/// to prevent; it was merely moved from payload granularity to shard granularity.
+///
+/// It lives here, beside [`sealed_path_for`], because the drain (which reads a
+/// sealed segment) and the flusher (which predicts the sealed name at ack time
+/// for a [`RecordCoordinate`](weir_core::RecordCoordinate)) must produce the
+/// *same* string for the same record. Two copies of this function would be two
+/// things to keep in step, and a coordinate that disagrees with the sink's
+/// idempotency key is worse than no coordinate at all.
+///
+/// Falls back to the bare file name when there is no parent component, which
+/// only happens for a bare relative path in tests.
+pub(crate) fn segment_identity(segment: &Path) -> String {
+    let file = segment
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match segment.parent().and_then(|p| p.file_name()) {
+        Some(shard) => format!("{}/{}", shard.to_string_lossy(), file),
+        None => file,
+    }
+}
+
 /// Derives the segment counter from a segment filename regardless of which
 /// lifecycle extension it carries — `seg_00000001.wab`, `seg_00000001.wab.sealed`,
 /// and `seg_00000001.wab.confirmed` all yield `1`. The counter is the digit run
@@ -465,6 +499,17 @@ pub(crate) struct ShardWriter {
     /// value left behind when a segment is retired is unobservable and the
     /// three paths that clear `active` have nothing to remember to reset.
     active_opened_at: Instant,
+    /// Path of the active segment, mirrored out of the handle so the flusher can
+    /// name the segment a record landed in without a `SegmentHandle` method the
+    /// DST backend would also have to carry. Cloned once per segment, never per
+    /// record.
+    active_path: Option<PathBuf>,
+    /// Records written into the active segment so far — the 1-based index of the
+    /// most recent one, which is exactly the ordinal the drain's `read_index`
+    /// assigns it. Reset when a fresh segment is opened, so it survives the
+    /// rotation window: after a rotating write `active` is already `None` but
+    /// this still names the sealed segment's last record.
+    active_records: u64,
     /// The filesystem backend. `FsSegmentStore` in production; a fault-injecting
     /// store in the DST harness. Boxed as `Arc<dyn>` so `ShardWriter` and the
     /// public `spawn` API stay free of a backend generic.
@@ -511,6 +556,8 @@ impl ShardWriter {
             // Overwritten by the first `ensure_open`; never read before that,
             // because `active_segment_age` returns None while `active` is None.
             active_opened_at: Instant::now(),
+            active_path: None,
+            active_records: 0,
             store,
             metrics,
             compression,
@@ -583,8 +630,16 @@ impl ShardWriter {
             // The segment is poisoned (or its create() left it half-headered).
             // Drop it so the next write opens a fresh segment.
             self.active = None;
+            self.active_path = None;
             return Err(e);
         }
+        // The record is on the segment now, so it owns this ordinal. Bumped
+        // before the rotation check below, which is what keeps a rotating write's
+        // index pointing at the segment it actually landed in.
+        self.active_records = self
+            .active_records
+            .checked_add(1)
+            .expect("record ordinal overflow");
         // Ratio accounting, bumped only after a successful write so a failed
         // record never inflates either side. `logical` is what the producer
         // sent, `stored` is what reached the disk; equal when compression is off.
@@ -601,6 +656,7 @@ impl ShardWriter {
             .is_some_and(|s| s.should_rotate(self.segment_max_bytes));
         if should_rotate {
             let sealed = self.active.take().unwrap().seal()?;
+            self.active_path = None;
             return Ok(Some(sealed));
         }
         Ok(None)
@@ -633,6 +689,7 @@ impl ShardWriter {
         };
         if let Err(e) = seg.fsync() {
             self.active = None;
+            self.active_path = None;
             return Err(e);
         }
         Ok(())
@@ -641,6 +698,7 @@ impl ShardWriter {
     /// Seals the current active segment and returns its sealed path.
     /// Returns `None` if no segment is currently open.
     pub(crate) fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
+        self.active_path = None;
         match self.active.take() {
             Some(seg) => Ok(Some(seg.seal()?)),
             None => Ok(None),
@@ -669,6 +727,39 @@ impl ShardWriter {
             .map(|_| self.active_opened_at.elapsed())
     }
 
+    /// 1-based ordinal of the record most recently accepted by
+    /// [`write_record`](Self::write_record), within the segment it landed in.
+    ///
+    /// Only meaningful immediately after a successful `write_record`; it is the
+    /// index half of that record's [`RecordCoordinate`](weir_core::RecordCoordinate).
+    pub(crate) fn last_record_index(&self) -> u64 {
+        self.active_records
+    }
+
+    /// The address the drain will read the most recently written record from.
+    ///
+    /// `rotated` is whatever [`write_record`](Self::write_record) just returned:
+    /// `Some` means that write sealed the segment, so it already carries its
+    /// final name. `None` means the segment is still open, and the drain will
+    /// read it under its **sealed** name — which every path that can seal it
+    /// derives with [`sealed_path_for`]: rotation (`WabSegment::seal`), the
+    /// idle/shutdown seal ([`seal_current`](Self::seal_current)), and crash
+    /// recovery (`recovery::recover_segment`). So predicting it here is exact
+    /// wherever the record can actually be delivered.
+    ///
+    /// Returns `None` only if there is no segment to name — which cannot happen
+    /// straight after a successful write, and is reported rather than papered
+    /// over so a caller never hands a producer an empty address.
+    pub(crate) fn drain_address(&self, rotated: Option<&Path>) -> Option<String> {
+        match rotated {
+            Some(sealed) => Some(segment_identity(sealed)),
+            None => self
+                .active_path
+                .as_deref()
+                .map(|active| segment_identity(&sealed_path_for(active))),
+        }
+    }
+
     fn ensure_open(&mut self) -> io::Result<()> {
         if self.active.is_none() {
             let path = segment_path(&self.shard_dir, self.next_counter);
@@ -681,6 +772,11 @@ impl ShardWriter {
             // None, and a lifetime measured from a segment that never existed
             // would seal the next one early.
             self.active_opened_at = Instant::now();
+            self.active_path = Some(path);
+            // A fresh segment restarts the record ordinal at 0, so the first
+            // write below yields index 1 — matching the drain's `read_index`,
+            // which counts from 1.
+            self.active_records = 0;
             // Newly opened segment — bump the `open` state counter so the
             // open → sealed → confirmed/quarantined transition story is
             // observable end to end via `weir_wab_segments_total{state="..."}`.
@@ -1242,6 +1338,212 @@ mod tests {
             writer.next_counter, 1,
             "a failed scan must not advance next_counter past its default"
         );
+    }
+
+    /// **The drift guard for `RecordCoordinate`.**
+    ///
+    /// A tracked push is answered with the address the flusher *predicts* the
+    /// record will be drained from — the segment is still open at ack time, so
+    /// `drain_address` names its future `.wab.sealed` form. The drain then
+    /// derives the sink's idempotency key from the *actual* sealed path and its
+    /// own 1-based `read_index`. If those two ever disagree the coordinate is
+    /// worse than useless: it names a record the downstream keyed differently,
+    /// and a producer reconciling against it would conclude records went missing
+    /// that in fact arrived.
+    ///
+    /// So this replays the drain's exact derivation over the sealed files and
+    /// requires it to reproduce, record for record, what the writer handed back
+    /// at write time. Rotation is forced mid-run (tiny `segment_max_bytes`) so
+    /// the prediction is checked on both sides of a seal, and two records carry
+    /// **identical bytes** so the test would still fail if the coordinate
+    /// collapsed to a content hash.
+    #[test]
+    fn write_side_coordinates_match_what_the_drain_derives() {
+        use weir_sink_sdk::RecordId;
+
+        let root = tmp_dir("coord_drift");
+        let shard_dir = root.join("shard_00");
+        let _ = fs::remove_dir_all(&shard_dir);
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        // 48 bytes rotates after roughly two of these records, so the run spans
+        // several segments and exercises both the rotated and still-open arms of
+        // `drain_address`.
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            shard_dir.clone(),
+            48,
+            Arc::new(Metrics::new().0),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+
+        let payloads: Vec<&[u8]> = vec![
+            b"alpha", b"beta", b"repeat", b"delta", b"repeat", b"zeta", b"eta",
+        ];
+
+        // What the daemon would put in each producer's AckTracked frame.
+        let mut predicted: Vec<RecordId> = Vec::new();
+        for payload in &payloads {
+            let rotated = writer.write_record(payload).unwrap();
+            let address = writer
+                .drain_address(rotated.as_deref())
+                .expect("a successful write always has a segment to name");
+            let index = writer.last_record_index();
+            predicted.push(RecordId::for_record(
+                &address,
+                index,
+                &weir_core::Payload::copy_from_slice(payload),
+            ));
+        }
+        writer.seal_current().unwrap();
+
+        // Now the drain's side, replicated exactly: segments in counter order,
+        // `read_index` counting from 1, identity taken from the sealed path.
+        let mut sealed: Vec<PathBuf> = fs::read_dir(&shard_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
+            .collect();
+        sealed.sort_by_key(|p| segment_counter_from_path(p).unwrap());
+        assert!(
+            sealed.len() > 1,
+            "the fixture must rotate at least once to be worth running; got {} segment(s)",
+            sealed.len()
+        );
+
+        let mut derived: Vec<RecordId> = Vec::new();
+        for segment in &sealed {
+            let identity = segment_identity(segment);
+            let mut read_index: u64 = 0;
+            for record in crate::wab::SegmentReader::open(segment).unwrap() {
+                read_index += 1;
+                derived.push(RecordId::for_record(
+                    &identity,
+                    read_index,
+                    &record.unwrap(),
+                ));
+            }
+        }
+
+        assert_eq!(
+            derived.len(),
+            payloads.len(),
+            "every written record must be readable back"
+        );
+        for (i, (want, got)) in predicted.iter().zip(derived.iter()).enumerate() {
+            assert_eq!(
+                want,
+                got,
+                "record {i} ({:?}): the coordinate handed to the producer does not \
+                 match the id the drain derives for the same record",
+                String::from_utf8_lossy(payloads[i])
+            );
+        }
+        // The two identical payloads must still have distinct ids — that is the
+        // whole reason the coordinate is mixed in.
+        assert_ne!(
+            predicted[2], predicted[4],
+            "identical payloads at different coordinates must not share an id"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The ordinal is 1-based and per-segment: it restarts at 1 in a fresh
+    /// segment rather than running as a writer-lifetime counter, because the
+    /// drain's `read_index` restarts too.
+    #[test]
+    fn record_index_is_one_based_and_restarts_each_segment() {
+        let root = tmp_dir("coord_index");
+        let shard_dir = root.join("shard_00");
+        let _ = fs::remove_dir_all(&shard_dir);
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            shard_dir.clone(),
+            48,
+            Arc::new(Metrics::new().0),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+
+        let mut seen: Vec<(u64, bool)> = Vec::new();
+        for _ in 0..6 {
+            let rotated = writer.write_record(b"record-payload").unwrap();
+            seen.push((writer.last_record_index(), rotated.is_some()));
+        }
+
+        assert_eq!(seen[0].0, 1, "the first record in a segment is index 1");
+        // Every non-rotating write advances by one; the write *after* a rotation
+        // opens a fresh segment and restarts at 1.
+        for w in seen.windows(2) {
+            let (prev_index, prev_rotated) = w[0];
+            let (index, _) = w[1];
+            if prev_rotated {
+                assert_eq!(index, 1, "a new segment restarts the ordinal at 1");
+            } else {
+                assert_eq!(index, prev_index + 1, "an ordinal must not skip");
+            }
+        }
+        assert!(
+            seen.iter().any(|(_, rotated)| *rotated),
+            "the fixture must rotate to be worth running"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `drain_address` names the segment the record actually landed in on both
+    /// sides of a rotation: the rotating write reports the segment it just
+    /// sealed, and the next write reports the fresh one.
+    #[test]
+    fn drain_address_follows_the_record_across_a_rotation() {
+        let root = tmp_dir("coord_addr");
+        let shard_dir = root.join("shard_07");
+        let _ = fs::remove_dir_all(&shard_dir);
+        fs::create_dir_all(&shard_dir).unwrap();
+
+        let mut writer = ShardWriter::new_with_store(
+            7,
+            shard_dir.clone(),
+            48,
+            Arc::new(Metrics::new().0),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+
+        let mut addresses: Vec<(String, bool)> = Vec::new();
+        for _ in 0..4 {
+            let rotated = writer.write_record(b"record-payload").unwrap();
+            addresses.push((
+                writer.drain_address(rotated.as_deref()).unwrap(),
+                rotated.is_some(),
+            ));
+        }
+
+        // Every address carries the shard directory, which is what stops two
+        // shards' `seg_00000001` from colliding.
+        for (address, _) in &addresses {
+            assert!(
+                address.starts_with("shard_07/") && address.ends_with(EXT_SEALED),
+                "unexpected address {address:?}"
+            );
+        }
+        // The address changes exactly when a rotation happened.
+        for w in addresses.windows(2) {
+            if w[0].1 {
+                assert_ne!(w[0].0, w[1].0, "a rotation must change the address");
+            } else {
+                assert_eq!(w[0].0, w[1].0, "records in one segment share one address");
+            }
+        }
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -27,7 +27,7 @@ use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
-use crate::models::Batch;
+use crate::models::{AckOutcome, Batch, RecordSlot};
 use clock::{BlockingClock, RealClock};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::{FsSegmentStore, SegmentStore, ShardWriter};
@@ -867,8 +867,8 @@ fn flush_batch(
     //     Nacked here — otherwise they would ride a group fsync of a *different*
     //     (or absent) segment and be falsely acked durable while their bytes sit
     //     in an abandoned, never-fsynced file (silent data loss on crash).
-    let mut durable_acks: Vec<oneshot::Sender<bool>> = Vec::new();
-    let mut pending_acks: Vec<oneshot::Sender<bool>> = Vec::new();
+    let mut durable_acks: Vec<PendingAck> = Vec::new();
+    let mut pending_acks: Vec<PendingAck> = Vec::new();
 
     // bench-trace: per-record enqueued_at for stage_total observation, split the
     // same way as the acks.
@@ -904,13 +904,28 @@ fn flush_batch(
                 // file — Nack them rather than let the group fsync below
                 // falsely ack them. Records in already-rotated (sealed +
                 // fsynced) segments are durable and untouched.
-                for ack_tx in pending_acks.drain(..) {
-                    let _ = ack_tx.send(false);
+                for pending in pending_acks.drain(..) {
+                    pending.resolve(false);
                 }
                 #[cfg(feature = "bench-trace")]
                 pending_ts.clear();
-                let _ = unit.ack_tx.send(false);
+                let _ = unit.ack_tx.send(AckOutcome::failed());
                 continue;
+            };
+
+            // The record's address, captured HERE — while `writer` still knows
+            // which segment took it and at what ordinal — and only for a
+            // producer that asked (`PushTracked`). An ordinary push does no
+            // extra work: no string, no allocation, no branch beyond this one.
+            let slot = if unit.wants_coordinate {
+                writer.drain_address(rotation.as_deref()).map(|segment| {
+                    Box::new(RecordSlot {
+                        segment,
+                        index: writer.last_record_index(),
+                    })
+                })
+            } else {
+                None
             };
 
             // Observe the write stage (pre-fsync).
@@ -945,11 +960,17 @@ fn flush_batch(
                     // (durable) segment; otherwise it's in the current active
                     // segment, awaiting the group fsync.
                     if rotated {
-                        durable_acks.push(unit.ack_tx);
+                        durable_acks.push(PendingAck {
+                            tx: unit.ack_tx,
+                            slot,
+                        });
                         #[cfg(feature = "bench-trace")]
                         durable_ts.push(unit.enqueued_at);
                     } else {
-                        pending_acks.push(unit.ack_tx);
+                        pending_acks.push(PendingAck {
+                            tx: unit.ack_tx,
+                            slot,
+                        });
                         #[cfg(feature = "bench-trace")]
                         pending_ts.push(unit.enqueued_at);
                     }
@@ -960,7 +981,7 @@ fn flush_batch(
                     metrics
                         .stage_total
                         .observe(unit.enqueued_at.elapsed().as_secs_f64());
-                    let _ = unit.ack_tx.send(true);
+                    let _ = unit.ack_tx.send(AckOutcome::durable(slot));
                 }
             }
         }
@@ -977,8 +998,8 @@ fn flush_batch(
                 .stage_total
                 .observe(enqueued_at.elapsed().as_secs_f64());
         }
-        for ack_tx in pending_acks {
-            let _ = ack_tx.send(ok);
+        for pending in pending_acks {
+            pending.resolve(ok);
         }
     }
 
@@ -990,8 +1011,35 @@ fn flush_batch(
             .stage_total
             .observe(enqueued_at.elapsed().as_secs_f64());
     }
-    for ack_tx in durable_acks {
-        let _ = ack_tx.send(true);
+    for pending in durable_acks {
+        pending.resolve(true);
+    }
+}
+
+/// One record's ack sender held together with the address the record was written
+/// to, so the two cannot be separated while the batch waits on its group fsync.
+///
+/// They are paired rather than kept in two parallel vectors because the vectors
+/// are drained, appended and cleared at several points in `flush_batch` (a
+/// mid-batch write error, a rotation promoting pending → durable), and a pair of
+/// vectors that must stay index-aligned across all of that is a defect waiting
+/// for its first edit.
+struct PendingAck {
+    tx: oneshot::Sender<AckOutcome>,
+    slot: Option<Box<RecordSlot>>,
+}
+
+impl PendingAck {
+    /// Resolves the producer's ack. A non-durable outcome drops the coordinate:
+    /// handing back an address for a record that did not survive would invite a
+    /// producer to reconcile against something that is not there.
+    fn resolve(self, durable: bool) {
+        let outcome = if durable {
+            AckOutcome::durable(self.slot)
+        } else {
+            AckOutcome::failed()
+        };
+        let _ = self.tx.send(outcome);
     }
 }
 
