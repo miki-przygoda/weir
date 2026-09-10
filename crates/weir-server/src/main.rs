@@ -707,6 +707,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // they can't get from `weir-server --help` plus their config.
                 table = %config.sink_mysql_table,
                 column = %config.sink_mysql_column,
+                // Logged because its absence is the interesting state: without
+                // it the operator's UNIQUE constraint is on payload bytes, and
+                // that discards distinct records that share bytes.
+                id_column = ?config.sink_mysql_id_column,
                 insert_mode = ?config.sink_mysql_insert_mode,
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
@@ -716,6 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 url,
                 table: config.sink_mysql_table.clone(),
                 column: config.sink_mysql_column.clone(),
+                id_column: config.sink_mysql_id_column.clone(),
                 insert_mode,
                 max_batch_size: config.sink_max_batch_size,
                 timeout: Duration::from_secs(config.sink_timeout_secs),
@@ -738,6 +743,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // URL omitted from the log line for the same reason as MySQL.
                 table = %config.sink_postgres_table,
                 column = %config.sink_postgres_column,
+                // See the MySQL arm: absence is the interesting state.
+                id_column = ?config.sink_postgres_id_column,
                 insert_mode = ?config.sink_postgres_insert_mode,
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,
@@ -747,6 +754,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 url,
                 table: config.sink_postgres_table.clone(),
                 column: config.sink_postgres_column.clone(),
+                id_column: config.sink_postgres_id_column.clone(),
                 insert_mode: config.sink_postgres_insert_mode,
                 max_batch_size: config.sink_max_batch_size,
                 timeout: Duration::from_secs(config.sink_timeout_secs),

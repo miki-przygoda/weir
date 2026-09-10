@@ -166,6 +166,72 @@ impl SinkError for SqlSinkError {
     }
 }
 
+// ── Per-record idempotency keys ───────────────────────────────────────────────
+
+/// The per-record idempotency keys a SQL sink should bind alongside its
+/// payloads, as 64-character lower-hex `RecordId`s, or `None` when the sink has
+/// no `id_column` configured (in which case the batch's record ids go unused
+/// and the INSERT keeps its historical single-column shape).
+///
+/// Shared because both SQL sinks make exactly the same decision here and the
+/// reasoning below is the load-bearing part, not the four lines of code.
+///
+/// # Why a `RecordId` and not a payload hash
+///
+/// A `RecordId` is the record's WAB coordinate — its segment plus its absolute
+/// index within that segment — hashed with its bytes. That gives it the two
+/// properties a `UNIQUE`-constraint dedup key needs and a content hash cannot
+/// have at the same time:
+///
+/// - **Unique across records with identical bytes.** A content hash makes a
+///   repeated heartbeat or a repeated "one unit consumed" metering event
+///   collide, and `ON CONFLICT DO NOTHING` / `INSERT IGNORE` then discards
+///   records weir acked, stored and delivered.
+/// - **Stable across a replay, including a re-batched one.** The index is the
+///   record's ordinal in the segment, not in the batch, so it does not move
+///   when `sink_max_batch_size` changes between two delivery attempts. The
+///   batch-scoped `DedupToken` does move, which is why it cannot do this job.
+///
+/// # Errors
+///
+/// Permanent, when an `id_column` is configured but the batch does not carry
+/// one id per record. The drain always supplies them
+/// (`SinkBatch::with_segment_context`), so the only way here is a hand-built
+/// `SinkBatch`. Every alternative to failing is worse: a placeholder key makes
+/// every record collide on the operator's `UNIQUE` constraint and discards all
+/// but one, and falling back to a content hash silently reinstates exactly the
+/// identical-bytes collision the id column exists to remove. Permanent rather
+/// than transient because retrying cannot make ids appear — the drain
+/// dead-letters the batch loudly instead of stranding the whole backlog.
+pub(super) fn per_record_id_hex(
+    driver: &'static str,
+    id_column: Option<&str>,
+    record_count: usize,
+    record_ids: Option<Vec<weir_sink_sdk::RecordId>>,
+) -> Result<Option<Vec<String>>, SqlSinkError> {
+    let Some(id_column) = id_column else {
+        return Ok(None);
+    };
+    // `SinkBatch`'s constructors already enforce the parallel-length
+    // invariant. It is re-checked because the failure it prevents — writing
+    // one record's key against another record's bytes — is worse than writing
+    // no key at all, and this is the last point where it is checkable.
+    match record_ids {
+        Some(ids) if ids.len() == record_count => {
+            Ok(Some(ids.iter().map(|id| id.to_hex()).collect()))
+        }
+        other => Err(SqlSinkError::permanent(
+            driver,
+            format!(
+                "id column {id_column:?} is configured but the batch carries {} \
+                 record ids for {record_count} records; the drain always supplies \
+                 one per record, so this batch did not come from the drain",
+                other.map_or(0, |ids| ids.len()),
+            ),
+        )),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

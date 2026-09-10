@@ -238,11 +238,15 @@ pub(crate) struct PartialConfig {
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_column: Option<String>,
     #[cfg(feature = "mysql-sink")]
+    pub sink_mysql_id_column: Option<String>,
+    #[cfg(feature = "mysql-sink")]
     pub sink_mysql_insert_mode: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_table: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_column: Option<String>,
+    #[cfg(feature = "postgres-sink")]
+    pub sink_postgres_id_column: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: Option<String>,
     #[cfg(feature = "clickhouse-sink")]
@@ -486,12 +490,20 @@ pub struct Config {
     pub sink_mysql_table: String,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_column: String,
+    /// Column receiving each record's `RecordId` hex — the per-record
+    /// idempotency key. Unset keeps the historical single-column INSERT.
+    #[cfg(feature = "mysql-sink")]
+    pub sink_mysql_id_column: Option<String>,
     #[cfg(feature = "mysql-sink")]
     pub sink_mysql_insert_mode: crate::sink::mysql::InsertMode,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_table: String,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_column: String,
+    /// Column receiving each record's `RecordId` hex — the per-record
+    /// idempotency key. Unset keeps the historical single-column INSERT.
+    #[cfg(feature = "postgres-sink")]
+    pub sink_postgres_id_column: Option<String>,
     #[cfg(feature = "postgres-sink")]
     pub sink_postgres_insert_mode: crate::sink::postgres::InsertMode,
     #[cfg(feature = "clickhouse-sink")]
@@ -882,6 +894,12 @@ impl Config {
             merge!(sink_mysql_table).unwrap_or_else(|| "weir_records".to_string());
         #[cfg(feature = "mysql-sink")]
         let sink_mysql_column = merge!(sink_mysql_column).unwrap_or_else(|| "payload".to_string());
+        // Left as an Option all the way to the sink: "unset" is a distinct
+        // state, not a default value. Its identifier is validated inside
+        // MySqlSink::new alongside `table`/`column`, so there is nothing to
+        // check here.
+        #[cfg(feature = "mysql-sink")]
+        let sink_mysql_id_column = merge!(sink_mysql_id_column);
         #[cfg(feature = "mysql-sink")]
         let sink_mysql_insert_mode_str =
             merge!(sink_mysql_insert_mode).unwrap_or_else(|| "ignore".to_string());
@@ -898,6 +916,9 @@ impl Config {
         #[cfg(feature = "postgres-sink")]
         let sink_postgres_column =
             merge!(sink_postgres_column).unwrap_or_else(|| "payload".to_string());
+        // Option-through, same as the MySQL id column above.
+        #[cfg(feature = "postgres-sink")]
+        let sink_postgres_id_column = merge!(sink_postgres_id_column);
         #[cfg(feature = "postgres-sink")]
         let sink_postgres_insert_mode_str = merge!(sink_postgres_insert_mode)
             .unwrap_or_else(|| "on_conflict_do_nothing".to_string());
@@ -1106,11 +1127,15 @@ impl Config {
             #[cfg(feature = "mysql-sink")]
             sink_mysql_column,
             #[cfg(feature = "mysql-sink")]
+            sink_mysql_id_column,
+            #[cfg(feature = "mysql-sink")]
             sink_mysql_insert_mode,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_table,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_column,
+            #[cfg(feature = "postgres-sink")]
+            sink_postgres_id_column,
             #[cfg(feature = "postgres-sink")]
             sink_postgres_insert_mode,
             #[cfg(feature = "clickhouse-sink")]

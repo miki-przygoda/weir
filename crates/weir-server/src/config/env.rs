@@ -38,11 +38,15 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         #[cfg(feature = "mysql-sink")]
         sink_mysql_column: env_string("WEIR_SINK_MYSQL_COLUMN")?,
         #[cfg(feature = "mysql-sink")]
+        sink_mysql_id_column: env_string("WEIR_SINK_MYSQL_ID_COLUMN")?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_insert_mode: env_string("WEIR_SINK_MYSQL_INSERT_MODE")?,
         #[cfg(feature = "postgres-sink")]
         sink_postgres_table: env_string("WEIR_SINK_POSTGRES_TABLE")?,
         #[cfg(feature = "postgres-sink")]
         sink_postgres_column: env_string("WEIR_SINK_POSTGRES_COLUMN")?,
+        #[cfg(feature = "postgres-sink")]
+        sink_postgres_id_column: env_string("WEIR_SINK_POSTGRES_ID_COLUMN")?,
         #[cfg(feature = "postgres-sink")]
         sink_postgres_insert_mode: env_string("WEIR_SINK_POSTGRES_INSERT_MODE")?,
         #[cfg(feature = "clickhouse-sink")]

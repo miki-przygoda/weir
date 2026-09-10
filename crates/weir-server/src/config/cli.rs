@@ -60,9 +60,13 @@ OPTIONS:
                                                (1-60000) [default: 100]
     --sink-mysql-table <name>                MySQL target table [default: weir_records]
     --sink-mysql-column <name>               MySQL target column [default: payload]
+    --sink-mysql-id-column <name>            MySQL column for the per-record idempotency
+                                               key; put the UNIQUE on it [default: unset]
     --sink-mysql-insert-mode <mode>          MySQL: ignore | plain [default: ignore]
     --sink-postgres-table <name>             Postgres target table [default: weir_records]
     --sink-postgres-column <name>            Postgres target column [default: payload]
+    --sink-postgres-id-column <name>         Postgres column for the per-record idempotency
+                                               key; put the UNIQUE on it [default: unset]
     --sink-postgres-insert-mode <mode>       Postgres: on_conflict_do_nothing | plain
                                                [default: on_conflict_do_nothing]
     --sink-clickhouse-database <name>        ClickHouse database (requires build with
@@ -211,6 +215,10 @@ pub(super) fn parse_from(
             .opt_value_from_str("--sink-mysql-column")
             .map_err(pico_err)?,
         #[cfg(feature = "mysql-sink")]
+        sink_mysql_id_column: pargs
+            .opt_value_from_str("--sink-mysql-id-column")
+            .map_err(pico_err)?,
+        #[cfg(feature = "mysql-sink")]
         sink_mysql_insert_mode: pargs
             .opt_value_from_str("--sink-mysql-insert-mode")
             .map_err(pico_err)?,
@@ -221,6 +229,10 @@ pub(super) fn parse_from(
         #[cfg(feature = "postgres-sink")]
         sink_postgres_column: pargs
             .opt_value_from_str("--sink-postgres-column")
+            .map_err(pico_err)?,
+        #[cfg(feature = "postgres-sink")]
+        sink_postgres_id_column: pargs
+            .opt_value_from_str("--sink-postgres-id-column")
             .map_err(pico_err)?,
         #[cfg(feature = "postgres-sink")]
         sink_postgres_insert_mode: pargs
