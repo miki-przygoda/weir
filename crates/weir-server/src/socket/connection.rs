@@ -15,8 +15,9 @@ use tracing::debug;
 
 use weir_core::{
     DecodeError, Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType,
-    NackReason as WireNack, WIRE_VERSION,
+    NackReason as WireNack, RecordCoordinate, WIRE_VERSION,
 };
+use weir_sink_sdk::RecordId;
 
 use crate::{
     metrics::{Metrics, NackLabel, NackReason as MetricNack, TierLabel, TierValue},
@@ -207,14 +208,15 @@ where
                 .inc();
             return Ok(());
         }
-        if payload_len == 0 && header.message_type() == MessageType::Push {
+        if payload_len == 0 && is_push(header.message_type()) {
             // An empty Push payload can't be represented in the WAB: a zero
             // length prefix is the end-of-records sentinel, so storing one would
             // truncate the segment (silently dropping records written after it).
             // Reject at ingest rather than let it reach the WAB. This applies
-            // ONLY to Push — a HealthCheck frame legitimately carries a
-            // zero-length payload (see docs/wire_protocol.md) and must pass
-            // through to the dispatch below.
+            // ONLY to a push (tracked or not) — a HealthCheck frame
+            // legitimately carries a zero-length payload (see
+            // docs/wire_protocol.md) and must pass through to the dispatch
+            // below.
             let tv = durability_to_tier(header.durability());
             send_nack(
                 stream.get_mut(),
@@ -329,7 +331,12 @@ where
 
         // ── 6 & 7. Dispatch by message type ─────────────────────────────────
         match header.message_type() {
-            MessageType::Push => {
+            // PushTracked is a Push that also asks where the record landed. It
+            // shares every check, counter and failure mode with Push — only the
+            // success reply differs — so it shares the arm rather than growing a
+            // parallel path that could drift out of step on the next fix.
+            mt @ (MessageType::Push | MessageType::PushTracked) => {
+                let tracked = mt == MessageType::PushTracked;
                 let tv = durability_to_tier(header.durability());
 
                 // WAB cap. Checked here — after the frame is fully read and CRC
@@ -376,6 +383,7 @@ where
                     config.ack_timeout,
                     config.read_timeout,
                     &metrics,
+                    tracked,
                 )
                 .await?;
             }
@@ -419,6 +427,12 @@ where
     }
 }
 
+/// Whether a message type is one of the two push variants — the frames that
+/// carry a record and must therefore obey the empty-payload guard.
+fn is_push(mt: MessageType) -> bool {
+    matches!(mt, MessageType::Push | MessageType::PushTracked)
+}
+
 // 8 args — clippy's threshold is 7. Grouping these into a `PushCtx`
 // struct is mechanically possible but doesn't improve call-site
 // readability: each field is a distinct concept the caller already
@@ -436,15 +450,22 @@ async fn handle_push<S>(
     ack_timeout: Duration,
     write_timeout: Duration,
     metrics: &Arc<Metrics>,
+    tracked: bool,
 ) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    // The RecordId is derived from the payload, and the payload is about to move
+    // into the WorkUnit. `Payload` is a `Bytes`, so keeping it is a refcount
+    // bump, not a copy — and hashing it HERE, on the async worker, keeps SHA-256
+    // off the WAB flusher thread, which is serialised with the disk.
+    let tracked_payload = tracked.then(|| payload.clone());
     let unit = WorkUnit {
         shard_id,
         payload,
         durability,
+        wants_coordinate: tracked,
         ack_tx,
         #[cfg(feature = "bench-trace")]
         enqueued_at: std::time::Instant::now(),
@@ -483,12 +504,46 @@ where
     }
 
     match tokio::time::timeout(ack_timeout, ack_rx).await {
-        Ok(Ok(true)) => {
+        Ok(Ok(outcome)) if outcome.durable => {
             metrics
                 .records_ack
-                .get_or_create(&TierLabel { tier: tv })
+                .get_or_create(&TierLabel { tier: tv.clone() })
                 .inc();
-            send_ack(stream, write_timeout).await
+            let Some(payload) = tracked_payload else {
+                return send_ack(stream, write_timeout).await;
+            };
+            // A tracked push that acked durable but produced no address means
+            // the flusher and this handler disagree about what was asked for.
+            // Nack rather than answer with a fabricated or empty coordinate: a
+            // producer reconciling against a wrong address is worse off than one
+            // that knows the push failed.
+            let coordinate = outcome
+                .coordinate
+                .map(|slot| {
+                    let record_id = RecordId::for_record(&slot.segment, slot.index, &payload);
+                    RecordCoordinate::new(slot.segment, slot.index, *record_id.as_bytes())
+                })
+                .transpose();
+            match coordinate {
+                Ok(Some(coordinate)) => send_ack_tracked(stream, &coordinate, write_timeout).await,
+                Ok(None) | Err(_) => {
+                    tracing::error!(
+                        error = ?coordinate.err(),
+                        "tracked push acked durable but its record coordinate could not be \
+                         built; nacking rather than returning an address the producer \
+                         cannot trust"
+                    );
+                    send_nack(stream, WireNack::InternalError, &[], write_timeout).await?;
+                    metrics
+                        .records_nack
+                        .get_or_create(&NackLabel {
+                            tier: tv,
+                            reason: MetricNack::internal_error,
+                        })
+                        .inc();
+                    Ok(())
+                }
+            }
         }
         Ok(_) => {
             // Flusher fired ack with `false` (write/fsync error) or dropped
@@ -664,6 +719,22 @@ fn healthcheck_response_frame_bytes() -> &'static [u8] {
     })
 }
 
+/// Sends the `AckTracked` reply for a tracked push.
+///
+/// Not memoised, unlike [`ack_frame_bytes`]: every coordinate differs, so there
+/// is nothing constant to cache. Only a producer that sent a `PushTracked` ever
+/// receives one of these, which is what keeps the 20-byte `Ack` every existing
+/// client reads exactly as it was.
+async fn send_ack_tracked<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    coordinate: &RecordCoordinate,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    let header = Header::new(MessageType::AckTracked, Durability::Durable, 0);
+    let frame = Envelope::new(header, coordinate.encode()).encode();
+    write_all_timeout(stream, &frame, write_timeout).await
+}
+
 async fn send_ack<S: AsyncWrite + Unpin>(
     stream: &mut S,
     write_timeout: Duration,
@@ -676,7 +747,10 @@ async fn send_ack<S: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{models::WorkUnit, queue};
+    use crate::{
+        models::{AckOutcome, WorkUnit},
+        queue,
+    };
     use tokio::net::UnixStream;
     use weir_core::{
         Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType, NackReason,
@@ -750,7 +824,11 @@ mod tests {
             while let Ok(unit) = rx.recv() {
                 match ack {
                     Some(b) => {
-                        let _ = unit.ack_tx.send(b);
+                        let _ = unit.ack_tx.send(if b {
+                            AckOutcome::durable(None)
+                        } else {
+                            AckOutcome::failed()
+                        });
                     }
                     None => drop(unit), // drop the sender without responding
                 }
@@ -765,6 +843,140 @@ mod tests {
             never_shutdown_rx(),
         ));
         client
+    }
+
+    /// Spawns a handler whose flusher acks durable and reports `slot` as the
+    /// record's address — the shape of a real `PushTracked` round trip without
+    /// standing up a WAB.
+    async fn spawn_handler_with_slot(
+        cfg: ConnectionConfig,
+        slot: Option<(&'static str, u64)>,
+    ) -> UnixStream {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let (m, _reg) = crate::metrics::Metrics::new();
+
+        std::thread::spawn(move || {
+            let rx = queue_rx.get(0);
+            while let Ok(unit) = rx.recv() {
+                let coordinate = slot.map(|(segment, index)| {
+                    Box::new(crate::models::RecordSlot {
+                        segment: segment.to_string(),
+                        index,
+                    })
+                });
+                let _ = unit.ack_tx.send(AckOutcome::durable(coordinate));
+            }
+        });
+
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            Arc::new(m),
+            never_shutdown_rx(),
+        ));
+        client
+    }
+
+    /// A `PushTracked` is answered with `AckTracked`, and the coordinate it
+    /// carries is exactly the address the flusher reported plus the `RecordId`
+    /// derived from it — the same id the drain hands the sink.
+    #[tokio::test]
+    async fn push_tracked_returns_the_coordinate_the_flusher_reported() {
+        let payload = b"hello";
+        let mut client =
+            spawn_handler_with_slot(test_cfg(), Some(("shard_00/seg_00000001.wab.sealed", 7)))
+                .await;
+        client
+            .write_all(&push_tracked_frame(payload))
+            .await
+            .unwrap();
+
+        let (msg_type, body) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::AckTracked);
+
+        let coordinate = weir_core::RecordCoordinate::decode(&body).expect("decodes");
+        assert_eq!(coordinate.segment(), "shard_00/seg_00000001.wab.sealed");
+        assert_eq!(coordinate.index(), 7);
+        assert_eq!(
+            coordinate.record_id(),
+            RecordId::for_record(
+                "shard_00/seg_00000001.wab.sealed",
+                7,
+                &weir_core::Payload::copy_from_slice(payload),
+            )
+            .as_bytes(),
+            "the coordinate's record_id must be the id the drain would derive"
+        );
+    }
+
+    /// The whole compatibility argument in one assertion: an ordinary `Push` on
+    /// a daemon that speaks `PushTracked` still receives the byte-for-byte
+    /// frozen 20-byte Ack from `docs/conformance/wire_v1_vectors.json`.
+    #[tokio::test]
+    async fn plain_push_still_gets_the_frozen_twenty_byte_ack() {
+        const FROZEN_ACK: &[u8] = &[
+            0x57, 0x45, 0x49, 0x52, 0x01, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc9, 0x47,
+            0x4b, 0x3a, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut client =
+            spawn_handler_with_slot(test_cfg(), Some(("shard_00/seg_00000001.wab.sealed", 7)))
+                .await;
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+
+        let mut got = [0u8; 20];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(
+            got.as_slice(),
+            FROZEN_ACK,
+            "an untracked Push must still receive the frozen 20-byte Ack"
+        );
+    }
+
+    /// A tracked push whose flusher acks durable but reports no address is a
+    /// disagreement inside the daemon. It must Nack — never invent an address,
+    /// and never fall back to a bare Ack the client is not framing for.
+    #[tokio::test]
+    async fn tracked_push_without_a_coordinate_is_nacked_not_faked() {
+        let mut client = spawn_handler_with_slot(test_cfg(), None).await;
+        client
+            .write_all(&push_tracked_frame(b"hello"))
+            .await
+            .unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::InternalError as u8);
+    }
+
+    /// Every pre-existing ingest guard applies to the tracked variant too — it
+    /// is a Push that asks a question, not a second ingest path.
+    #[tokio::test]
+    async fn tracked_push_obeys_the_empty_payload_guard() {
+        let mut client = spawn_handler(test_cfg()).await;
+        let header = Header::new(MessageType::PushTracked, Durability::Durable, 0);
+        client
+            .write_all(&Envelope::new(header, Vec::new()).encode())
+            .await
+            .unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::EmptyPayload as u8);
+    }
+
+    /// A client must never be able to *send* a daemon→client type. `AckTracked`
+    /// joins `Ack`/`Nack`/`HealthCheckResponse` in that rule.
+    #[tokio::test]
+    async fn client_sending_ack_tracked_is_rejected_as_unknown_message() {
+        let mut client = spawn_handler(test_cfg()).await;
+        let header = Header::new(MessageType::AckTracked, Durability::Durable, 0);
+        client
+            .write_all(&Envelope::new(header, b"x".to_vec()).encode())
+            .await
+            .unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::UnknownMessage as u8);
     }
 
     #[tokio::test]
@@ -798,6 +1010,13 @@ mod tests {
         let header = Header::new(MessageType::Push, Durability::Durable, 0);
         let env = Envelope::new(header, payload.to_vec());
         env.encode()
+    }
+
+    /// The same frame with the tracked message type — identical in every other
+    /// byte, which is the point.
+    fn push_tracked_frame(payload: &[u8]) -> Vec<u8> {
+        let header = Header::new(MessageType::PushTracked, Durability::Durable, 0);
+        Envelope::new(header, payload.to_vec()).encode()
     }
 
     /// Builds an encoded Push header that DECLARES `payload_len` bytes without a
@@ -1141,7 +1360,7 @@ mod tests {
         // dropped sender.
         std::thread::spawn(move || {
             let rx = queue_rx.get(0);
-            let mut parked: Vec<tokio::sync::oneshot::Sender<bool>> = Vec::new();
+            let mut parked: Vec<tokio::sync::oneshot::Sender<AckOutcome>> = Vec::new();
             while let Ok(unit) = rx.recv() {
                 parked.push(unit.ack_tx);
             }
@@ -1465,7 +1684,7 @@ mod tests {
         std::thread::spawn(move || {
             let rx = queue_rx.get(0);
             while let Ok(unit) = rx.recv() {
-                let _ = unit.ack_tx.send(true);
+                let _ = unit.ack_tx.send(AckOutcome::durable(None));
             }
         });
 

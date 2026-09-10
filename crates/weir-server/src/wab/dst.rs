@@ -45,7 +45,7 @@ use super::clock::BlockingClock;
 use super::format::Compression;
 use super::segment::{FsSegmentStore, SegmentHandle, SegmentStore, ShardWriter, WabSegment};
 use crate::metrics::Metrics;
-use crate::models::{Batch, WorkUnit};
+use crate::models::{AckOutcome, Batch, WorkUnit};
 use weir_core::{Durability, Payload};
 
 // ── Deterministic RNG ───────────────────────────────────────────────────────
@@ -772,11 +772,18 @@ impl SimEnv {
     }
 }
 
-fn make_unit(payload: Vec<u8>, durability: Durability, ack_tx: oneshot::Sender<bool>) -> WorkUnit {
+fn make_unit(
+    payload: Vec<u8>,
+    durability: Durability,
+    ack_tx: oneshot::Sender<AckOutcome>,
+) -> WorkUnit {
     WorkUnit {
         shard_id: 0,
         payload: Payload::from(payload),
         durability,
+        // The DST harness asserts on durability, not on coordinates, so it
+        // exercises the same path an untracked push takes.
+        wants_coordinate: false,
         ack_tx,
         #[cfg(feature = "bench-trace")]
         enqueued_at: Instant::now(),
@@ -890,9 +897,11 @@ fn drive_sync_flusher(
     let acks: Vec<bool> = ack_rxs
         .into_iter()
         .map(|mut rx| {
-            rx.try_recv().unwrap_or_else(|e| {
-                panic!("DST: Durable record left without an ack (seed {seed:#018x}): {e}")
-            })
+            rx.try_recv()
+                .unwrap_or_else(|e| {
+                    panic!("DST: Durable record left without an ack (seed {seed:#018x}): {e}")
+                })
+                .durable
         })
         .collect();
 
@@ -1065,7 +1074,7 @@ fn run_panic_during_flush(
     // which we record as a Nack (false) — the record was not acked durable.
     let acks: Vec<bool> = ack_rxs
         .into_iter()
-        .map(|mut rx| rx.try_recv().unwrap_or(false))
+        .map(|mut rx| rx.try_recv().map(|o| o.durable).unwrap_or(false))
         .collect();
 
     // I1 — acked ⟹ durable: a panic at the barrier must never fire a `true` ack
@@ -1378,7 +1387,7 @@ fn run_interleaved_flush(
 
     let acks: Vec<bool> = ack_rxs
         .into_iter()
-        .map(|mut rx| rx.try_recv().unwrap_or(false))
+        .map(|mut rx| rx.try_recv().map(|o| o.durable).unwrap_or(false))
         .collect();
 
     // I1 — acked ⟹ durable holds regardless of how the sends interleaved.
@@ -1496,7 +1505,7 @@ mod tests {
         // A dropped ack sender (a record whose batch was aborted) reads as Nack.
         let acks: Vec<bool> = ack_rxs
             .into_iter()
-            .map(|mut rx| rx.try_recv().unwrap_or(false))
+            .map(|mut rx| rx.try_recv().map(|o| o.durable).unwrap_or(false))
             .collect();
         let drain_paths: Vec<PathBuf> = drain_rx.try_iter().collect();
         (acks, ledger, drain_paths, env)
