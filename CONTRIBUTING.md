@@ -183,6 +183,11 @@ breaking change is a major, not a PR. The wire format has a language-neutral
 conformance suite
 ([`docs/conformance.md`](docs/conformance.md)); if you touch the codec, the
 vectors in `docs/conformance/wire_v1_vectors.json` must still pass unchanged.
+**Additive** growth within v1 — a new Nack reason byte, a new message type — goes
+in its own vectors file rather than into that one: a decoder that does not
+implement the addition is *correct* to reject it, so putting the vector in the
+frozen file would fail five conformant clients at once. `PushTracked` /
+`AckTracked` are the worked example (`wire_v1_tracked_vectors.json`).
 
 **Done in 2.0:** `Sink::Record` / the `SinkRecord` trait was an
 over-generalisation — the only implementation was the identity on `Payload`, and

@@ -79,7 +79,9 @@ the on-disk WAB layout.
   vectors (`conformance/wire_v1_vectors.json`): canonical hex frames plus
   the result a conformant decoder must produce for every message type, all
   nine Nack reasons, and each decode-rejection case. Run your codec against
-  them to confirm byte-compatibility.
+  them to confirm byte-compatibility. The optional tracked-push extension has
+  its own file, `conformance/wire_v1_tracked_vectors.json` — a decoder that
+  does not implement it stays conformant by ignoring that file.
 - *Writing a client* — practical client-implementation tutorial.
   *(planned)*
 

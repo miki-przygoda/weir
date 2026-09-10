@@ -121,34 +121,67 @@ is a lie, so:
 
 ## Task list
 
-- [ ] **T1 — `weir-core`: the types.** `MessageType::PushTracked = 0x06` / `AckTracked = 0x07`;
+- [x] **T1 — `weir-core`: the types.** `MessageType::PushTracked = 0x06` / `AckTracked = 0x07`;
       a `RecordCoordinate { segment: String, index: u64, record_id: [u8; 32] }` with
       `encode()`/`decode()` and a `CoordinateDecodeError`. No new dependencies (the digest is
       carried, never computed, here). Tests: round-trip, every rejection arm, `MessageType`
       byte pinning.
-- [ ] **T2 — Regression fence.** Confirm `cargo test -p weir-core --test conformance` and
+- [x] **T2 — Regression fence.** Confirm `cargo test -p weir-core --test conformance` and
       `python3 docs/conformance/run_vectors.py` still pass with T1 landed and the JSON untouched.
-- [ ] **T3 — `weir-server`: shared `segment_identity`.** Move it to `wab::segment`, have `drain`
+- [x] **T3 — `weir-server`: shared `segment_identity`.** Move it to `wab::segment`, have `drain`
       call it, add the drift-guard test (write N records → capture write-side coordinates → seal →
       re-derive with `SegmentReader` + the drain's own code path → assert equal).
-- [ ] **T4 — `weir-server`: plumb the coordinate.** `WorkUnit.ack_tx` becomes
+- [x] **T4 — `weir-server`: plumb the coordinate.** `WorkUnit.ack_tx` becomes
       `oneshot::Sender<AckOutcome>` carrying `durable: bool` + `coordinate: Option<Box<...>>`;
       `flush_batch` fills it in only when the unit asked for it.
-- [ ] **T5 — `weir-server`: the socket path.** Dispatch `PushTracked`, compute the `RecordId`,
+- [x] **T5 — `weir-server`: the socket path.** Dispatch `PushTracked`, compute the `RecordId`,
       send `AckTracked`. A tracked push that acks durable but arrives with no coordinate is a
       loud `Nack(InternalError)` + `error!`, never a fabricated coordinate.
-- [ ] **T6 — `weir-client`: `push_tracked`.** Returns `Result<RecordCoordinate, ClientError>`.
+- [x] **T6 — `weir-client`: `push_tracked`.** Returns `Result<RecordCoordinate, ClientError>`.
       Response-payload cap becomes per-message-type so `Ack`/`Nack` keep the existing 2-byte
       bound exactly.
-- [ ] **T7 — Tracked conformance vectors.** A *separate* `wire_v1_tracked_vectors.json` plus
+- [x] **T7 — Tracked conformance vectors.** A *separate* `wire_v1_tracked_vectors.json` plus
       generator, checked by `run_vectors.py` and by weir-core's conformance test. The five
       polyglot clients keep reading only `wire_v1_vectors.json`.
-- [ ] **T8 — System test.** Real daemon via testkit: `push_tracked` twice, assert the second
+- [x] **T8 — System test.** Real daemon via testkit: `push_tracked` twice, assert the second
       index is the first + 1 in the same segment, and that a plain `push` on the same connection
       still gets a bare Ack.
-- [ ] **T9 — Docs + CHANGELOG.** `wire_protocol.md` (message table, payload layout, worked byte
+- [x] **T9 — Docs + CHANGELOG.** `wire_protocol.md` (message table, payload layout, worked byte
       example, revised response cap), `conformance.md`, and a self-contained `## [Unreleased]`
       entry.
+
+## Outcome — what the plan got wrong
+
+Recorded because a plan that reads as if it went perfectly is not worth keeping.
+
+1. **The system test could not assert what T8 said it would.** The plan wanted an
+   end-to-end check that the *sealed* file exists at the predicted path. It does
+   not: the default noop sink drains and **deletes** a sealed segment almost
+   immediately, so by the time a shutdown-seal has happened the file is
+   legitimately gone. Asserting on it would have been timing the drain, not
+   testing the coordinate. The system test now checks the still-open `.wab`
+   form — which pins the shard directory and counter against the real
+   filesystem — and the `.sealed` half of the prediction is pinned by the WAB
+   unit test that replays the drain's derivation over files that really are
+   sealed. That test is the stronger of the two anyway.
+
+2. **`AckOutcome` needed two constructors, not one.** The first cut had
+   `durable()` and `failed()`; `durable()` was then dead outside tests, because
+   the two live durable paths (the `Buffered` immediate ack and the group-fsync
+   resolution) both carry a coordinate. `-D warnings` caught it. It became
+   `durable(coordinate)`.
+
+3. **`ShardWriter::write_record`'s signature did not have to change.** The plan
+   proposed returning the index from it, which would have touched ~20 call sites
+   across four modules. Tracking the ordinal on the writer and exposing
+   `last_record_index()` gives the same guarantee — it is still only meaningful
+   immediately after a successful write — with zero churn.
+
+4. **`weir-core`'s own conformance test needed a match arm.** `message_type_name`
+   is exhaustive over `MessageType`, so adding two variants broke the build of a
+   test whose *data* did not change. Worth knowing: `MessageType` is
+   deliberately not `#[non_exhaustive]` (changing it is a `WIRE_VERSION` event),
+   so every exhaustive match on it is a place an additive type must be declared.
 
 ## Gate
 
