@@ -20,6 +20,31 @@ bump), and the second-sweep fixes below.
 
 ### Added
 
+- **`wab_segment_max_lifetime_secs` — a segment seal a steady producer cannot
+  postpone.** When > 0, the active segment is sealed and drained this many
+  seconds after it was *created*, however busy the producer has been. `0`
+  (default) is off, so no existing deployment changes behaviour on upgrade.
+
+  This exists because `wab_segment_max_age_secs` is named like a maximum age and
+  is an **idle timer**: its clock restarts on every flush, so a producer writing
+  one record a minute against a 300-second setting resets it four times over
+  before it can expire. That segment never seals on the timer at all — it grows
+  toward `wab_segment_max_bytes` (256 MiB) exactly as if the knob were `0`, which
+  at 500 bytes a minute is roughly two years before anything reaches a sink. The
+  trap selects precisely for weir's low-volume deployments: an S3 archive, a
+  meter, a field station, a till.
+
+  The existing knob is **unchanged** — renaming or redefining it would silently
+  alter delivery timing for anyone relying on idle semantics. The two are
+  independent, and with both set **whichever comes due first seals**: they are
+  upper bounds on delivery latency, so they compose by taking the minimum and
+  adding one can only make delivery earlier. The configuration reference now
+  carries a side-by-side of the two clocks, since telling them apart from the
+  names alone is not reasonably possible.
+
+  CLI `--wab-segment-max-lifetime-secs`, env `WEIR_WAB_SEGMENT_MAX_LIFETIME_SECS`,
+  TOML `wab_segment_max_lifetime_secs`. Range `0`–`86400`.
+
 - **`weir-sink-s3` — an S3-API object-storage sink**, behind `weir-server`'s
   opt-in `s3-sink` feature. Targets the S3 *API* rather than AWS specifically,
   so MinIO, Cloudflare R2, Backblaze B2 and Ceph work on the same code path with

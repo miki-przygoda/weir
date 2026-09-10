@@ -147,6 +147,9 @@ pub(super) fn parse_from(
         wab_segment_max_age_secs: pargs
             .opt_value_from_str("--wab-segment-max-age-secs")
             .map_err(pico_err)?,
+        wab_segment_max_lifetime_secs: pargs
+            .opt_value_from_str("--wab-segment-max-lifetime-secs")
+            .map_err(pico_err)?,
         wab_max_bytes: pargs
             .opt_value_from_str("--wab-max-bytes")
             .map_err(pico_err)?,

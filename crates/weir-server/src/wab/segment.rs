@@ -9,6 +9,7 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crc32fast::Hasher as CrcHasher;
 
@@ -458,6 +459,12 @@ pub(crate) struct ShardWriter {
     /// Set via `WabConfig::segment_max_bytes` at flusher-thread spawn time.
     segment_max_bytes: u64,
     active: Option<Box<dyn SegmentHandle>>,
+    /// When the active segment's file was created, stamped by `ensure_open` —
+    /// the one place in the tree that creates a segment. Read only through
+    /// [`ShardWriter::active_segment_age`], which gates it on `active`, so the
+    /// value left behind when a segment is retired is unobservable and the
+    /// three paths that clear `active` have nothing to remember to reset.
+    active_opened_at: Instant,
     /// The filesystem backend. `FsSegmentStore` in production; a fault-injecting
     /// store in the DST harness. Boxed as `Arc<dyn>` so `ShardWriter` and the
     /// public `spawn` API stay free of a backend generic.
@@ -501,6 +508,9 @@ impl ShardWriter {
             next_counter: 1,
             segment_max_bytes,
             active: None,
+            // Overwritten by the first `ensure_open`; never read before that,
+            // because `active_segment_age` returns None while `active` is None.
+            active_opened_at: Instant::now(),
             store,
             metrics,
             compression,
@@ -646,6 +656,19 @@ impl ShardWriter {
         self.active.is_some()
     }
 
+    /// How long the active segment has been open, or `None` if none is open.
+    ///
+    /// Measured from creation, and nothing restarts it — which is the entire
+    /// difference from the flusher's idle clock, whose whole job is to be
+    /// restarted by every flush. A caller enforcing a maximum lifetime needs a
+    /// clock a steady trickle of writes cannot postpone, and only the creation
+    /// point can offer one.
+    pub(crate) fn active_segment_age(&self) -> Option<Duration> {
+        self.active
+            .as_ref()
+            .map(|_| self.active_opened_at.elapsed())
+    }
+
     fn ensure_open(&mut self) -> io::Result<()> {
         if self.active.is_none() {
             let path = segment_path(&self.shard_dir, self.next_counter);
@@ -654,6 +677,10 @@ impl ShardWriter {
                 .checked_add(1)
                 .expect("segment counter overflow");
             self.active = Some(self.store.create(&path, self.shard_id, self.compression)?);
+            // Stamp AFTER a successful create: a failed create leaves `active`
+            // None, and a lifetime measured from a segment that never existed
+            // would seal the next one early.
+            self.active_opened_at = Instant::now();
             // Newly opened segment — bump the `open` state counter so the
             // open → sealed → confirmed/quarantined transition story is
             // observable end to end via `weir_wab_segments_total{state="..."}`.
@@ -998,6 +1025,66 @@ mod tests {
         fn seal(self: Box<Self>) -> io::Result<PathBuf> {
             self.inner.seal()
         }
+    }
+
+    #[test]
+    fn active_segment_age_tracks_creation_not_writes() {
+        // The clock a maximum-lifetime seal reads. Three properties, and the
+        // middle one is the one that matters: repeated writes must NOT push it
+        // out, because that is exactly the defect in the flusher's idle timer
+        // (`wab/mod.rs`), where a steady trickle restarts the clock forever and
+        // the segment never seals.
+        let dir = tmp_dir("seg_age");
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            Arc::new(Metrics::new().0),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+
+        assert!(
+            w.active_segment_age().is_none(),
+            "no segment is open yet, so there is no age to report"
+        );
+
+        w.write_record(b"first").unwrap();
+        let after_first = w.active_segment_age().expect("a segment is open now");
+
+        // Keep writing across a real interval. The age must include that
+        // interval, not restart with each record.
+        std::thread::sleep(Duration::from_millis(60));
+        w.write_record(b"second").unwrap();
+        w.write_record(b"third").unwrap();
+        let after_trickle = w.active_segment_age().expect("still the same segment");
+
+        assert!(
+            after_trickle >= after_first + Duration::from_millis(50),
+            "writes must not restart the lifetime clock: {after_first:?} -> {after_trickle:?} \
+             after a 60ms trickle. A clock that a producer can postpone is the idle timer \
+             again, and a maximum lifetime built on it would never fire under load."
+        );
+
+        w.seal_current().unwrap();
+        assert!(
+            w.active_segment_age().is_none(),
+            "sealing closes the segment, so the age it reported must go away rather than \
+             keep counting into the next segment's lifetime"
+        );
+
+        // And the next segment starts its own clock, well under the elapsed
+        // total above.
+        w.write_record(b"fourth").unwrap();
+        let fresh = w.active_segment_age().expect("a new segment is open");
+        assert!(
+            fresh < after_trickle,
+            "a rotated-to segment must start a fresh lifetime, got {fresh:?} against the \
+             previous segment's {after_trickle:?}"
+        );
+
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
