@@ -10,17 +10,34 @@
 use std::io::{self, Read, Write};
 
 use weir_core::{
-    Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MessageType, NackReason,
+    Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MAX_TRACKED_ACK_PAYLOAD_LEN,
+    MessageType, NackReason, RecordCoordinate,
 };
 
-/// The largest payload any weir daemon response carries: `Ack` and
+/// The largest payload the *v1 response set* carries: `Ack` and
 /// `HealthCheckResponse` are empty, `Nack` is one reason byte, and
 /// `VersionMismatch` adds the daemon's wire version — 2 bytes.
 ///
-/// A larger declared length on a *response* is a desync or a non-weir peer. A
-/// future wire version that grew this would arrive with a version bump the
-/// client already rejects before reaching here.
+/// A larger declared length on one of those responses is a desync or a non-weir
+/// peer. A future wire version that grew this would arrive with a version bump
+/// the client already rejects before reaching here.
 const MAX_RESPONSE_PAYLOAD_LEN: usize = 2;
+
+/// The pre-allocation cap for a response, chosen by the type the header
+/// declares.
+///
+/// The cap is per message type rather than one flat number because
+/// `AckTracked` — the only response that carries more than two bytes — is only
+/// ever sent to a client that asked for it with a `PushTracked`. A client that
+/// never sends one keeps the old 2-byte bound on every response it can receive,
+/// which is exactly why adding the coordinate did not weaken anybody's
+/// allocation guard.
+fn max_response_payload_len(message_type: MessageType) -> usize {
+    match message_type {
+        MessageType::AckTracked => MAX_TRACKED_ACK_PAYLOAD_LEN,
+        _ => MAX_RESPONSE_PAYLOAD_LEN,
+    }
+}
 
 /// The transport [`WeirClient`] uses when no type parameter is given.
 ///
@@ -271,6 +288,105 @@ impl<S: Read + Write> WeirClient<S> {
         payload: impl AsRef<[u8]>,
         durability: Durability,
     ) -> Result<(), ClientError> {
+        let resp = self.send_record(MessageType::Push, payload, durability)?;
+        match resp.header().message_type() {
+            MessageType::Ack => Ok(()),
+            // A Nack may carry an empty payload, which `nack_error` reports as a
+            // `Protocol` desync; poison in that case (see `surface_nack`).
+            MessageType::Nack => Err(self.surface_nack(resp.payload())),
+            // Any other frame type is a stream desync: the daemon sent something we
+            // never expect here, so leftover/unexpected bytes could be mis-read as a
+            // later reply (a false ack). Poison the connection (Protocol → not
+            // recoverable, matching `ensure_usable`).
+            other => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(format!(
+                    "expected Ack or Nack, got {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// Pushes `payload` and returns the [`RecordCoordinate`] the daemon assigned
+    /// it — where the record landed in the write-ahead buffer, and the id the
+    /// downstream sink will see for it.
+    ///
+    /// Identical to [`push`][Self::push] in every other respect: same durability
+    /// tiers, same local guards, same Nack reasons, same connection effects. It
+    /// sends `PushTracked` instead of `Push` and reads back an `AckTracked`.
+    ///
+    /// # What the coordinate is for
+    ///
+    /// The [`record_id`][RecordCoordinate::record_id] is byte-identical to the
+    /// per-record idempotency key the drain hands the sink (the HTTP sink's
+    /// `Idempotency-Key: sha256:<hex>` header, the S3 sink's object name), so a
+    /// producer can reconcile what it sent against what the downstream received.
+    /// That is the question `push` alone cannot answer.
+    ///
+    /// # What it is not
+    ///
+    /// - **Not a delivery receipt.** Like `push`, an ack means the record is
+    ///   durably buffered at the requested tier — not that it has reached the
+    ///   sink. The coordinate says where it will be read from, not that it has
+    ///   been read.
+    /// - **Not a gap-free sequence.** The coordinate is a buffer address. Other
+    ///   producers' records interleave, so one producer's indices have holes.
+    /// - **Not a durability upgrade.** A `Buffered` push gets a coordinate too,
+    ///   and can still be lost on power loss; the tier still decides that.
+    ///
+    /// # Talking to a daemon that predates this
+    ///
+    /// A daemon built before `PushTracked` existed rejects the frame with
+    /// [`NackReason::UnknownMessage`] and closes the connection — the protocol's
+    /// existing permanent-error path for version skew. So
+    /// `Err(ClientError::Nack(NackReason::UnknownMessage))` from this method
+    /// means "this daemon does not support tracked pushes"; fall back to
+    /// [`push`][Self::push] on a fresh connection.
+    #[must_use = "a dropped push result hides whether the record was acked; an \
+                  unhandled Nack also closes the connection"]
+    pub fn push_tracked(
+        &mut self,
+        payload: impl AsRef<[u8]>,
+        durability: Durability,
+    ) -> Result<RecordCoordinate, ClientError> {
+        let resp = self.send_record(MessageType::PushTracked, payload, durability)?;
+        match resp.header().message_type() {
+            MessageType::AckTracked => {
+                RecordCoordinate::decode(resp.payload()).map_err(|e| {
+                    // The frame was well-formed and fully consumed, so the stream
+                    // is still in sync — but a daemon whose coordinate layout this
+                    // build cannot read is a version skew that every subsequent
+                    // tracked push would hit again. Poison so the caller
+                    // reconnects (and so `is_poisoned` stays the exact complement
+                    // of `is_recoverable`, which the crate promises).
+                    self.poisoned = true;
+                    ClientError::Protocol(format!("malformed record coordinate: {e}"))
+                })
+            }
+            MessageType::Nack => Err(self.surface_nack(resp.payload())),
+            // A bare Ack here is NOT success: the daemon accepted the record but
+            // did not answer the question that was asked, and reporting Ok would
+            // hand the caller a coordinate it never received. Treat it as the
+            // protocol violation it is.
+            other => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(format!(
+                    "expected AckTracked or Nack, got {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// The shared send half of [`push`][Self::push] and
+    /// [`push_tracked`][Self::push_tracked]: the local guards, the frame write,
+    /// and the response read. Returns the response frame for the caller to
+    /// interpret, because that is the only part the two differ on.
+    fn send_record(
+        &mut self,
+        message_type: MessageType,
+        payload: impl AsRef<[u8]>,
+        durability: Durability,
+    ) -> Result<Envelope, ClientError> {
         self.ensure_usable()?;
         let bytes = payload.as_ref();
         // Local guard against an empty payload. An empty payload IS the WAB
@@ -296,7 +412,7 @@ impl<S: Read + Write> WeirClient<S> {
         }
         // copy_from_slice at the API boundary so downstream handling is zero-copy.
         let payload = weir_core::Payload::copy_from_slice(bytes);
-        let header = Header::new(MessageType::Push, durability, 0);
+        let header = Header::new(message_type, durability, 0);
         let frame = Envelope::new(header, payload).encode();
 
         if let Err(write_err) = self.stream.write_all(&frame) {
@@ -315,23 +431,7 @@ impl<S: Read + Write> WeirClient<S> {
             return Err(write_err.into());
         }
 
-        let resp = self.read_response()?;
-        match resp.header().message_type() {
-            MessageType::Ack => Ok(()),
-            // A Nack may carry an empty payload, which `nack_error` reports as a
-            // `Protocol` desync; poison in that case (see `surface_nack`).
-            MessageType::Nack => Err(self.surface_nack(resp.payload())),
-            // Any other frame type is a stream desync: the daemon sent something we
-            // never expect here, so leftover/unexpected bytes could be mis-read as a
-            // later reply (a false ack). Poison the connection (Protocol → not
-            // recoverable, matching `ensure_usable`).
-            other => {
-                self.poisoned = true;
-                Err(ClientError::Protocol(format!(
-                    "expected Ack or Nack, got {other:?}"
-                )))
-            }
-        }
+        self.read_response()
     }
 
     /// Records that a Nack closed the connection (every reason except the
@@ -374,6 +474,20 @@ impl<S: Read + Write> WeirClient<S> {
             .default_durability
             .ok_or(ClientError::NoDefaultDurability)?;
         self.push(payload, d)
+    }
+
+    /// [`push_tracked`][Self::push_tracked] at the connection's default
+    /// durability tier.
+    ///
+    /// Returns [`ClientError::NoDefaultDurability`] if no default was set.
+    pub fn push_tracked_default(
+        &mut self,
+        payload: impl AsRef<[u8]>,
+    ) -> Result<RecordCoordinate, ClientError> {
+        let d = self
+            .default_durability
+            .ok_or(ClientError::NoDefaultDurability)?;
+        self.push_tracked(payload, d)
     }
 
     /// Sends a `HealthCheck` frame and returns `Ok(())` on a valid
@@ -499,8 +613,8 @@ impl<S: Read + Write> WeirClient<S> {
 
         let payload_len = header.payload_len() as usize;
         // Cap before allocating. The bound is the RESPONSE bound, not the record
-        // one: every weir response payload is at most 2 bytes (`Ack` and
-        // `HealthCheckResponse` are 0, `Nack` is 1, `VersionMismatch` is 2) —
+        // one: an `Ack` / `HealthCheckResponse` carries 0 bytes, a `Nack` 1 (2 for
+        // `VersionMismatch`), and an `AckTracked` at most one record coordinate —
         // see the producer checklist in docs/wire_protocol.md, which tells every
         // other implementer to "cap the response payload_len at a few bytes".
         //
@@ -509,10 +623,16 @@ impl<S: Read + Write> WeirClient<S> {
         // checklist it publishes: a desynced or hostile peer could make it
         // allocate 16 MiB and — with the default `read_timeout` of None — block
         // forever waiting for bytes that never come.
-        if payload_len > MAX_RESPONSE_PAYLOAD_LEN {
+        //
+        // The bound is taken from the type the header declares, so a client that
+        // never asks for a coordinate never accepts a payload larger than the two
+        // bytes it always could.
+        let cap = max_response_payload_len(header.message_type());
+        if payload_len > cap {
             return Err(ClientError::Protocol(format!(
-                "response payload_len {payload_len} exceeds the {MAX_RESPONSE_PAYLOAD_LEN}-byte \
-                 response cap; refusing to allocate"
+                "response payload_len {payload_len} exceeds the {cap}-byte cap for \
+                 {:?}; refusing to allocate",
+                header.message_type()
             )));
         }
         let mut payload_buf = vec![0u8; payload_len];

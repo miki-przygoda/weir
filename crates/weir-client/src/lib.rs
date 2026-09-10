@@ -106,6 +106,11 @@ mod unix;
 /// single crate import (`weir_client::Durability`).
 pub use weir_core::Durability;
 
+/// Re-exported: the durable address [`WeirClient::push_tracked`] returns for an
+/// accepted record. Lives in `weir-core` because both ends of the socket build
+/// it from the same bytes.
+pub use weir_core::RecordCoordinate;
+
 /// Re-export of [`weir_core::NackReason`] — the payload of [`ClientError::Nack`].
 /// Re-exported so consumers can match on the reason (e.g. to distinguish the
 /// connection-closing Nacks) without taking a direct dependency on `weir-core`.
