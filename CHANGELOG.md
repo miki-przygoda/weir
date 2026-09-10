@@ -83,6 +83,61 @@ bump), and the second-sweep fixes below.
   should switch to this value. It is the only timestamp on the batch that
   survives a replay.
 
+- **`sink_postgres_id_column` and `sink_mysql_id_column`** — an opt-in column
+  receiving each record's `RecordId` as 64 lower-hex characters, so the
+  operator's `UNIQUE` constraint can sit on a **per-record** idempotency key
+  instead of on the payload.
+
+  ```toml
+  sink_postgres_id_column = "record_id"    # CHAR(64), UNIQUE
+  ```
+
+  ```sql
+  CREATE TABLE weir_records (
+      id BIGSERIAL PRIMARY KEY,
+      record_id CHAR(64) NOT NULL,
+      payload BYTEA NOT NULL,
+      UNIQUE (record_id)
+  );
+  ```
+
+  The schema these sinks previously documented put the `UNIQUE` on the payload
+  or a generated `sha256(payload)`, because payload bytes were all the sink
+  wrote. That is **content** identity and it is wrong in both directions:
+
+  - It **loses**. Two genuinely distinct records that carry identical bytes — a
+    metering "one unit consumed" event, a heartbeat, any fixed-shape event —
+    collide, and `ON CONFLICT DO NOTHING` / `INSERT IGNORE` discards the second.
+    weir acked it, wrote it to disk and delivered it; the recommended schema
+    dropped it. The MySQL form (`UNIQUE KEY uq_payload (payload(255))`) collided
+    on a shared 255-byte *prefix*, which is broader still.
+  - It does not survive a re-batch. Nor does the batch's `DedupToken`: a
+    batch-level key is a function of the batch, and the drain re-reads
+    `sink_max_batch_size` on every call, so changing it re-splits an unconfirmed
+    segment at new boundaries and every batch-level key changes with them. A
+    `RecordId` is built from the record's WAB coordinate — its segment plus its
+    absolute index *within that segment* — so it does not move.
+
+  Opt-in, because it needs a column the deployed table does not have. **With the
+  knob unset every statement weir generates is byte-identical to 2.1.0**, pinned
+  by a test in each sink. Rejected at startup rather than at first commit: an id
+  column equal to the payload column (Postgres `42701` / MySQL
+  `ER_FIELD_SPECIFIED_TWICE` are permanent, so the drain would dead-letter every
+  batch), and any value failing identifier validation. A batch carrying no ids,
+  or a count that does not match the records, is a permanent error naming both
+  numbers — only a hand-built `SinkBatch` can produce one, and every alternative
+  to failing writes a dedup key that is a lie.
+
+  Postgres binds two parameters per row with this set. `sink_max_batch_size` is
+  already capped at 10 000, so the worst case is 20 000 against the protocol's
+  65 535 — no new limit, and the reasoning is recorded next to the field so a
+  future raise of that cap trips over it.
+
+  **This does not change any published crate's API.** `weir-sink-sdk` is
+  untouched apart from documentation, `weir-wab` is untouched, and the WAB
+  on-disk format does not move — a re-batch-stable identity needs no on-disk
+  field, only the coordinate `RecordId` already carries.
+
 ### Fixed
 
 Findings from a second exploration sweep over the published 2.0.5 tree. The
@@ -142,6 +197,43 @@ recovered sink, the replay pass reporting a quarantine that never happened.
 - `deploy/ci-local` gained no "cannot run locally" entry when 2.0.5 split the
   Windows client check into its own job, so a local runner listed it as runnable
   and passed it on the wrong operating system.
+- **The `sink_max_batch_size` precondition was stated as if it were a property of
+  weir rather than of batch-scoped keys.** `DedupToken`'s rustdoc and
+  `docs/sinks/s3.md` both said the guarantee holds only while the setting is
+  stable, and neither pointed at the escape hatch sitting in the same struct.
+  Both now say *why* no batch-level key can survive a re-split (the key is a
+  function of the batch; re-batching changes the batch), why making the token
+  segment-scoped would be worse than the problem — every sub-batch of a segment
+  would share a value, and a dedup-capable sink would discard all but the first —
+  and that `SinkBatch::record_ids()` is the key for anything a duplicate is
+  expensive for. `docs/sinks/s3.md` gains a per-sink table of which keys survive
+  a changed batch size and which do not; S3's does not, because one object per
+  batch means the object key *is* a batch name.
+- `docs/getting-started/integrating.md` gained a "Choosing an idempotency key"
+  section: the two handles side by side, when each is right, and why a payload
+  hash is not a third option (it discards genuinely distinct records that share
+  bytes).
+- `SinkBatch::record_ids()` documented `None` as "fall back to whatever key you
+  used before". That is right for a sink where ids are an optimisation and wrong
+  for one whose correctness rests on them; it now says the drain always supplies
+  them, so `None` means a hand-built batch, and says which sinks should fail
+  loudly instead.
+
+### Tests
+
+- **Nothing pinned the per-record identity against a re-batch.** The drain builds
+  `RecordId` from `read_index` — the record's absolute ordinal within its
+  segment — three lines from `batch.len()` and `max_batch`, so the plausible
+  refactor to a batch-relative index would have reintroduced the double-charge
+  hazard with the whole suite still green.
+  `record_ids_survive_a_changed_sink_max_batch_size` drains one sealed segment
+  twice, at batch sizes 3 and 7, and asserts the ids are identical — after first
+  asserting the boundaries really moved (4 sub-batches vs 2), so it cannot pass
+  against a drain that ignored the setting. Its companion,
+  `the_dedup_token_deliberately_does_not_survive_a_changed_batch_size`, pins the
+  opposite for the token and records why that is correct, so a reader who saw
+  only the first test does not conclude the token is safe too. Both were
+  falsified before being kept.
 
 ---
 

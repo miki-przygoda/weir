@@ -1067,15 +1067,30 @@ deployments.
 > **double-counting** on replay. Pick a value and freeze it for the life of the
 > deployment. This applies to:
 >
-> - **ClickHouse** — `insert_deduplication_token`.
+> - **ClickHouse** — `insert_deduplication_token`. ClickHouse deduplicates per
+>   *block*, so there is no per-record alternative here.
 > - **HTTP in `ndjson` batch mode** — one POST carries the whole batch, so the
 >   `Idempotency-Key` is the batch's `DedupToken`, not a per-record key.
+> - **S3** — one object per batch, so the object key names the batch. See
+>   [the S3 sink guide](../sinks/s3.md#why-that-precondition-is-specific-to-this-sink).
+> - **Postgres / MySQL with no `sink_*_id_column`** — the only thing written is
+>   payload bytes, so the `UNIQUE` constraint has nothing better to sit on.
 >
-> **Only HTTP in the default `per_record` batch mode is exempt**: it sends one
-> POST per record keyed by that record's `RecordId`, which is stable regardless
-> of how the batch is split.
+> **Exempt — these key on the record, not the batch:**
 >
-> If you need to raise this knob on a running NDJSON deployment, drain the
+> - **HTTP in the default `per_record` batch mode**: one POST per record, keyed
+>   by that record's `RecordId`.
+> - **Postgres / MySQL with [`sink_postgres_id_column`](#sink_postgres_id_column)
+>   or [`sink_mysql_id_column`](#sink_mysql_id_column) set**: the `UNIQUE`
+>   constraint sits on the record's `RecordId`.
+>
+> A `RecordId` is the record's WAB coordinate — its segment plus its absolute
+> index *within that segment* — hashed with its bytes, so it does not move when
+> the segment is re-split. **A batch-level key cannot be made to do this**: it
+> is a function of the batch, and re-batching changes the batch. If a duplicate
+> is expensive, use a sink from the exempt list rather than freezing the knob.
+>
+> If you need to raise this knob on a deployment that is not exempt, drain the
 > backlog to empty first — a re-split can only double-deliver records that are
 > still on disk waiting to be replayed.
 
@@ -1305,16 +1320,29 @@ Provision it before pointing weir at the database. The minimal table:
 
 ```sql
 CREATE TABLE weir_records (
-  id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  payload VARBINARY(16384) NOT NULL,
+  id        BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  record_id CHAR(64) NOT NULL,
+  payload   VARBINARY(16384) NOT NULL,
   ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_payload (payload(255))
+  UNIQUE KEY uq_record_id (record_id)
 );
 ```
 
-The `UNIQUE` constraint pairs with the default `sink_mysql_insert_mode =
-"ignore"`: at-least-once retries that re-insert a payload are silently
-dropped by the server, no consumer-side dedup required.
+…with `sink_mysql_id_column = "record_id"`. The `UNIQUE` constraint pairs with
+the default `sink_mysql_insert_mode = "ignore"`: at-least-once retries that
+re-deliver a record are silently dropped by the server, no consumer-side dedup
+required.
+
+> **Do not put the `UNIQUE` on the payload.** Earlier versions of this page
+> recommended `UNIQUE KEY uq_payload (payload(255))`, which is **content**
+> identity and loses data: two genuinely distinct records that happen to share
+> their first 255 bytes — a metering "one unit consumed" event, a heartbeat, any
+> fixed-shape event — collide, and `INSERT IGNORE` discards the second. weir
+> acked it, wrote it to disk and delivered it. `record_id` is the record's WAB
+> coordinate hashed with its bytes, so it is unique across records with
+> identical bytes and unchanged by a replay — including one that re-splits the
+> segment because `sink_max_batch_size` changed. See
+> [`sink_mysql_id_column`](#sink_mysql_id_column).
 
 #### `sink_mysql_table`
 
@@ -1341,6 +1369,43 @@ Column that receives the payload bytes. Must be a `VARBINARY` or `BLOB`
 column wide enough to hold the largest payload weir accepts (capped
 elsewhere by `max_payload_bytes`).
 
+#### `sink_mysql_id_column`
+
+- **Type**: identifier (same rules as `sink_mysql_table`), optional
+- **Default**: unset — the INSERT writes the payload column only
+- **CLI**: `--sink-mysql-id-column <name>`
+- **Env**: `WEIR_SINK_MYSQL_ID_COLUMN`
+- **TOML**: `sink_mysql_id_column`
+
+Column that receives each record's **`RecordId`** as 64 lower-hex characters —
+the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
+constraint here.
+
+A `RecordId` is the record's WAB coordinate — the segment it was written to plus
+its absolute index *within that segment* — hashed with its bytes. That gives it
+the two properties a dedup key needs and a content hash cannot have together:
+
+- **Unique across records with identical bytes.** A payload hash collides on a
+  repeated heartbeat or a repeated metering event, and `INSERT IGNORE` then
+  discards records weir acked, stored and delivered.
+- **Unchanged by a replay, including a re-batched one.** The index is the
+  record's ordinal in the segment, not in the batch, so it does not move when
+  `sink_max_batch_size` changes between two delivery attempts. The batch-level
+  `DedupToken` does move, which is why it cannot do this job.
+
+The one thing it does not survive is a change of coordinate: `weir-ctl dl
+requeue` re-pushes records into a *new* segment, so they arrive as new ids and
+are inserted again. Both requeue commands say so before asking for
+confirmation.
+
+Rejected at startup: an id column equal to `sink_mysql_column` (the generated
+statement would name one column twice, which MySQL rejects permanently — the
+drain would dead-letter every batch), and any value failing identifier
+validation.
+
+Opt-in because turning it on requires a column your table does not have. With
+it unset every statement weir generates is byte-identical to previous releases.
+
 #### `sink_mysql_insert_mode`
 
 - **Type**: string (`"ignore"` or `"plain"`)
@@ -1353,8 +1418,9 @@ How to phrase the INSERT statement.
 
 - `"ignore"` → `INSERT IGNORE INTO ...`. Duplicate-key errors are
   silently dropped by the server. The recommended default: pair with a
-  `UNIQUE` constraint on the payload (or a hash of it) so crash-recovery
-  retries are idempotent without consumer-side dedup.
+  `UNIQUE` constraint on [`sink_mysql_id_column`](#sink_mysql_id_column) so
+  crash-recovery retries are idempotent without consumer-side dedup. A `UNIQUE`
+  on the payload instead discards distinct records that share bytes.
 - `"plain"` → `INSERT INTO ...`. Duplicates surface as `ER_DUP_ENTRY`
   (code 1062) and are classified as transient — the drain retries the
   segment. Use only if duplicate rows in the target table are tolerable.
@@ -1395,26 +1461,37 @@ connection pool (`deadpool-postgres`, max 4 connections).
 ```sql
 CREATE TABLE weir_records (
     id BIGSERIAL PRIMARY KEY,
+    record_id CHAR(64) NOT NULL,
     payload BYTEA NOT NULL,
-    payload_sha256 BYTEA GENERATED ALWAYS AS (sha256(payload)) STORED,
-    UNIQUE (payload_sha256)
+    UNIQUE (record_id)
 );
 ```
 
-The `UNIQUE (payload_sha256)` constraint pairs with the default
-`sink_postgres_insert_mode = "on_conflict_do_nothing"` so crash-recovery
-retries are idempotent: duplicate inserts are silently dropped by the
-server, no consumer-side dedup required.
+…with `sink_postgres_id_column = "record_id"`. The `UNIQUE (record_id)`
+constraint pairs with the default `sink_postgres_insert_mode =
+"on_conflict_do_nothing"` so crash-recovery retries are idempotent: duplicate
+inserts are silently dropped by the server, no consumer-side dedup required.
 
-> **The generated `payload_sha256` column is a dedup key, not at-rest
-> tamper-evidence.** It is `GENERATED ALWAYS … STORED`, so Postgres
-> **recomputes** it on every `UPDATE` — an attacker (or a buggy migration) that
-> rewrites `payload` also rewrites the hash, leaving the row internally
-> consistent. It anchors the bytes only at *insert* time, against accidental
-> duplication; it does **not** detect a later mutation. Real at-rest
-> tamper-evidence needs an **append-only** table (revoke `UPDATE`/`DELETE`) or an
-> application-maintained **hash chain** (each row's hash folds in the previous
-> row's), neither of which weir provides — see the
+> **Do not put the `UNIQUE` on a payload hash.** Earlier versions of this page
+> recommended a generated `payload_sha256 BYTEA GENERATED ALWAYS AS
+> (sha256(payload)) STORED` with `UNIQUE (payload_sha256)`. That is **content**
+> identity and it loses data: two genuinely distinct records that happen to
+> carry identical bytes — a metering "one unit consumed" event, a heartbeat, any
+> fixed-shape event — collide, and `ON CONFLICT DO NOTHING` discards the second.
+> weir acked it, wrote it to disk and delivered it. `record_id` is the record's
+> WAB coordinate hashed with its bytes, so it is unique across records with
+> identical bytes and unchanged by a replay — including one that re-splits the
+> segment because `sink_max_batch_size` changed. See
+> [`sink_postgres_id_column`](#sink_postgres_id_column).
+
+> **Neither column is at-rest tamper-evidence.** A `GENERATED ALWAYS … STORED`
+> hash is **recomputed** on every `UPDATE`, so an attacker (or a buggy
+> migration) that rewrites `payload` also rewrites the hash and leaves the row
+> internally consistent; a `record_id` written once by weir is likewise just a
+> value a writer with `UPDATE` can change. Both anchor the bytes at *insert*
+> time only. Real at-rest tamper-evidence needs an **append-only** table (revoke
+> `UPDATE`/`DELETE`) or an application-maintained **hash chain** (each row's
+> hash folds in the previous row's), neither of which weir provides — see the
 > [threat model](../security/threat-model.md) ("Signed audit log": records are
 > written verbatim, with no hash chain beyond the per-record wire CRC).
 
@@ -1442,6 +1519,51 @@ no escaping logic — there is no SQL injection vector through this knob.
 - **Env**: `WEIR_SINK_POSTGRES_COLUMN`
 - **TOML**: `sink_postgres_column`
 
+Column that receives the payload bytes. Typically `BYTEA`.
+
+---
+
+#### `sink_postgres_id_column`
+
+- **Type**: identifier (same rules as `sink_postgres_table`), optional
+- **Default**: unset — the INSERT writes the payload column only
+- **CLI**: `--sink-postgres-id-column <name>`
+- **Env**: `WEIR_SINK_POSTGRES_ID_COLUMN`
+- **TOML**: `sink_postgres_id_column`
+
+Column that receives each record's **`RecordId`** as 64 lower-hex characters —
+the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
+constraint here.
+
+A `RecordId` is the record's WAB coordinate — the segment it was written to plus
+its absolute index *within that segment* — hashed with its bytes. That gives it
+the two properties a dedup key needs and a content hash cannot have together:
+
+- **Unique across records with identical bytes.** A payload hash collides on a
+  repeated heartbeat or a repeated metering event, and `ON CONFLICT DO NOTHING`
+  then discards records weir acked, stored and delivered.
+- **Unchanged by a replay, including a re-batched one.** The index is the
+  record's ordinal in the segment, not in the batch, so it does not move when
+  `sink_max_batch_size` changes between two delivery attempts. The batch-level
+  `DedupToken` does move, which is why it cannot do this job.
+
+The one thing it does not survive is a change of coordinate: `weir-ctl dl
+requeue` re-pushes records into a *new* segment, so they arrive as new ids and
+are inserted again. Both requeue commands say so before asking for
+confirmation.
+
+With this set each row takes **two** bind parameters instead of one. Postgres's
+wire protocol caps a statement at 65 535 parameters and `sink_max_batch_size` is
+already validated to `1..=10000`, so the worst case is 20 000 — no new limit.
+
+Rejected at startup: an id column equal to `sink_postgres_column` (the generated
+statement would name one column twice, which Postgres rejects as `42701` —
+permanent, so the drain would dead-letter every batch), and any value failing
+identifier validation.
+
+Opt-in because turning it on requires a column your table does not have. With
+it unset every statement weir generates is byte-identical to previous releases.
+
 ---
 
 #### `sink_postgres_insert_mode`
@@ -1454,7 +1576,7 @@ no escaping logic — there is no SQL injection vector through this knob.
 
 | Mode | INSERT phrasing | Idempotent under crash recovery? |
 |------|------------------|----------------------------------|
-| `on_conflict_do_nothing` (default) | `INSERT INTO t (col) VALUES ($1), ($2), … ON CONFLICT DO NOTHING` | yes, if the table has a `UNIQUE` constraint |
+| `on_conflict_do_nothing` (default) | `INSERT INTO t (col) VALUES ($1), ($2), … ON CONFLICT DO NOTHING` | yes, if the table has a `UNIQUE` constraint on [`sink_postgres_id_column`](#sink_postgres_id_column) — a `UNIQUE` on a payload hash instead discards distinct records that share bytes |
 | `plain` | `INSERT INTO t (col) VALUES ($1), ($2), …` | no — duplicates surface as SQLSTATE `23505` and trigger a transient-retry loop until the operator removes the dup manually |
 
 #### Error classification
