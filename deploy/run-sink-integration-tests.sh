@@ -153,6 +153,18 @@ info "running clickhouse_sink_end_to_end"
 cargo test $CARGO_FLAGS -p weir-server --features clickhouse-sink --test system -- --ignored --exact \
     clickhouse_sink_end_to_end
 
+# Both SQL engines in one test, because it is a comparison: byte-identical
+# records are pushed at the coordinate-keyed schema and at the content-keyed
+# one this project shipped as its reference until 2.2, and the assertion is the
+# DIFFERENCE between them (8 rows vs 1). Run it here rather than trusting the
+# unit tests, because those pin the statement's shape and binding order and
+# cannot tell you a live server accepts it -- which is the gap that let all
+# three SQL sink tests above sit silently broken before 2.1.0.
+info "running sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record"
+# shellcheck disable=SC2086
+cargo test $CARGO_FLAGS -p weir-server --test system -- --ignored --exact \
+    sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record
+
 # The S3 suite is five tests, not one, and two of them carry the design:
 # s3_sink_replay_is_an_idempotent_overwrite pins replay stability, and
 # s3_sink_distinct_batches_of_identical_records_produce_distinct_objects pins

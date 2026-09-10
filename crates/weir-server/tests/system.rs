@@ -3158,6 +3158,158 @@ fn parse_metric(body: &str, prefix: &str) -> u64 {
     0
 }
 
+/// Counts rows in a test-stack table by shelling into its container, so the
+/// test needs no database client of its own — `tokio-postgres` and
+/// `mysql_async` are dependencies of `weir-server` under feature flags, not
+/// dev-dependencies of this test crate.
+fn count_rows(container: &str, sql: &str) -> u64 {
+    let out = match container {
+        "weir-test-postgres" => Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "psql",
+                "-U",
+                "postgres",
+                "-d",
+                "weir_test",
+                "-tAc",
+                sql,
+            ])
+            .output(),
+        _ => Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "mysql",
+                "-uroot",
+                "-ptest",
+                "-N",
+                "-B",
+                "weir_test",
+                "-e",
+                sql,
+            ])
+            .output(),
+    }
+    .unwrap_or_else(|e| panic!("docker exec {container}: {e}"));
+    assert!(
+        out.status.success(),
+        "query failed on {container}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no count in output from {container}"))
+}
+
+/// The reference schema this project shipped until 2.2 keys idempotency on the
+/// **payload**, and that silently loses data.
+///
+/// `UNIQUE (payload_sha256)` on Postgres and `UNIQUE KEY uniq_payload` on MySQL
+/// are *content* identity. Paired with the default `ON CONFLICT DO NOTHING` /
+/// `INSERT IGNORE`, two genuinely distinct records that happen to share bytes
+/// collapse to one row — and for a metering event ("one unit consumed") sharing
+/// bytes is the normal case, not an edge case.
+///
+/// This is the demonstration, not a description. It pushes byte-identical
+/// records at both schemas in the same run and asserts the difference:
+/// content-keyed loses all but one, coordinate-keyed keeps every record. The
+/// legacy assertion is deliberately an assertion of the *defect* — if it ever
+/// starts failing, the content-keyed schema stopped losing data and this test
+/// should be re-read rather than repaired.
+///
+/// Run via `bash deploy/run-sink-integration-tests.sh`, or manually with the
+/// compose stack up and both URLs exported.
+#[test]
+#[ignore = "requires the docker-compose test stack (see deploy/run-sink-integration-tests.sh)"]
+fn sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record() {
+    const N: u32 = 8;
+    const PAYLOAD: &[u8] = b"one-unit-consumed";
+
+    for (engine, url_var, container, table_cfg, id_cfg) in [
+        (
+            "postgres",
+            "WEIR_TEST_POSTGRES_URL",
+            "weir-test-postgres",
+            "sink_postgres_table",
+            "sink_postgres_id_column",
+        ),
+        (
+            "mysql",
+            "WEIR_TEST_MYSQL_URL",
+            "weir-test-mysql",
+            "sink_mysql_table",
+            "sink_mysql_id_column",
+        ),
+    ] {
+        let url = std::env::var(url_var)
+            .unwrap_or_else(|_| panic!("{url_var} not set — see the test docstring"));
+
+        // Coordinate-keyed: every distinct record must survive.
+        let srv = weir_server!(&format!("{engine}_keyed"))
+            .batch_size(200)
+            .batch_deadline_ms(5)
+            .shutdown_timeout_secs(5)
+            .env("WEIR_SINK_URL", &url)
+            .extra_config(format!("sink_type = \"{engine}\""))
+            .extra_config(format!("{table_cfg} = \"weir_records_keyed\""))
+            .extra_config(format!("{id_cfg} = \"record_id\""))
+            .extra_config("wab_segment_max_age_secs = 1")
+            .start();
+        let mut client = srv.client();
+        for _ in 0..N {
+            client.push(PAYLOAD, Durability::Durable).expect("push");
+        }
+        drop(client);
+        thread::sleep(Duration::from_secs(3));
+        drop(srv);
+
+        let kept = count_rows(
+            container,
+            "SELECT count(*) FROM weir_records_keyed WHERE payload = 'one-unit-consumed'",
+        );
+        assert_eq!(
+            kept,
+            u64::from(N),
+            "{engine}: keying on the WAB coordinate must keep all {N} distinct records, kept {kept}. \
+             Each push is a separate record at a separate WAB index, so a UNIQUE on record_id \
+             cannot collide between them."
+        );
+
+        // Content-keyed: the defect, asserted so it is visible rather than described.
+        let srv = weir_server!(&format!("{engine}_content"))
+            .batch_size(200)
+            .batch_deadline_ms(5)
+            .shutdown_timeout_secs(5)
+            .env("WEIR_SINK_URL", &url)
+            .extra_config(format!("sink_type = \"{engine}\""))
+            .extra_config(format!("{table_cfg} = \"weir_records\""))
+            .extra_config("wab_segment_max_age_secs = 1")
+            .start();
+        let mut client = srv.client();
+        for _ in 0..N {
+            client.push(PAYLOAD, Durability::Durable).expect("push");
+        }
+        drop(client);
+        thread::sleep(Duration::from_secs(3));
+        drop(srv);
+
+        let survived = count_rows(
+            container,
+            "SELECT count(*) FROM weir_records WHERE payload = 'one-unit-consumed'",
+        );
+        assert_eq!(
+            survived, 1,
+            "{engine}: the content-keyed reference schema should collapse all {N} records to 1 \
+             row, kept {survived}. If this now keeps more, the schema or the insert mode changed \
+             and docs/operations/configuration.md's warning needs re-reading — do not simply \
+             update this number."
+        );
+    }
+}
+
 // ── S3 sink (MinIO) ─────────────────────────────────────────────────────────
 //
 // These require the docker-compose rig. Run them via:
