@@ -66,6 +66,17 @@ pub(crate) struct WabConfig {
     /// to fill `segment_max_bytes` or for shutdown. `None` (default) preserves the
     /// historical behaviour. Lets low-volume deployments deliver promptly.
     pub(crate) segment_max_age: Option<Duration>,
+    /// Optional maximum-lifetime seal: if set, a flusher seals its active
+    /// segment this long after the segment was *created*, however busy the
+    /// producer has been. `None` (default) leaves the historical behaviour.
+    ///
+    /// Distinct from `segment_max_age` in the one way that matters: that clock
+    /// restarts on every flush, so a steady trickle postpones it forever and
+    /// the segment grows toward `segment_max_bytes` as if it were unset. This
+    /// clock is never restarted. With both set, whichever comes due first
+    /// seals — they are upper bounds on delivery latency, and two upper bounds
+    /// compose by taking the minimum.
+    pub(crate) segment_max_lifetime: Option<Duration>,
     /// How records are stored on disk. `None` (default) writes v1 segments
     /// byte-identical to weir 1.x, so a rollback to 1.x is a non-event.
     /// Enabling compression is the one-way door: a 1.x reader refuses a v2
@@ -84,6 +95,7 @@ impl Default for WabConfig {
             batch_deadline: Duration::from_millis(1),
             segment_max_bytes: crate::wab::format::SEGMENT_MAX_BYTES,
             segment_max_age: None,
+            segment_max_lifetime: None,
             compression: Compression::None,
             compression_level: 1,
         }
@@ -274,6 +286,7 @@ pub(crate) fn spawn(
         let batch_deadline = config.batch_deadline;
         let segment_max_bytes = config.segment_max_bytes;
         let segment_max_age = config.segment_max_age;
+        let segment_max_lifetime = config.segment_max_lifetime;
         let compression = config.compression;
         let compression_level = config.compression_level;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
@@ -308,6 +321,7 @@ pub(crate) fn spawn(
                             batch_deadline,
                             segment_max_bytes,
                             segment_max_age,
+                            segment_max_lifetime,
                             core_id,
                             metrics_for_flusher,
                             coalesce_hint,
@@ -489,6 +503,107 @@ pub(crate) fn read_segment_record_count(path: &Path) -> io::Result<u64> {
     Ok(u64::from_le_bytes(footer))
 }
 
+/// Which timer decided to seal the active segment before it reached
+/// `segment_max_bytes`. Carried into the log line so an operator asking why a
+/// segment sealed at 3 KiB gets the answer without reading the config back.
+#[derive(Clone, Copy)]
+enum TimedSeal {
+    /// `segment_max_age`: no records for that long. Restarted by every flush.
+    Idle,
+    /// `segment_max_lifetime`: that long since the segment was created. Nothing
+    /// restarts it, so a producer cannot postpone it.
+    Lifetime,
+}
+
+impl TimedSeal {
+    fn as_str(self) -> &'static str {
+        match self {
+            TimedSeal::Idle => "idle",
+            TimedSeal::Lifetime => "lifetime",
+        }
+    }
+}
+
+/// Whether either seal timer is due, and which. `None` means neither is set or
+/// neither has come due.
+///
+/// **The interaction rule lives here: whichever comes due first wins.** Both
+/// knobs are upper bounds on how long a record can sit undelivered, and two
+/// upper bounds compose by taking the minimum — honouring the later one would
+/// let one knob raise a latency the operator had already capped with the other.
+/// Neither is a floor, so an early seal cannot violate an expressed intent.
+///
+/// Lifetime is reported in preference to idle when both are due, because it is
+/// the stronger statement about why the segment had to go.
+///
+/// Takes the clocks as values rather than reading them, so the rule itself is a
+/// pure function and can be pinned by a test that does not have to wait on wall
+/// time. `active_segment_age` is `None` when no segment is open.
+fn due_timed_seal(
+    segment_max_age: Option<Duration>,
+    idle_for: Option<Duration>,
+    segment_max_lifetime: Option<Duration>,
+    active_segment_age: Option<Duration>,
+) -> Option<TimedSeal> {
+    let lifetime_due = segment_max_lifetime
+        .zip(active_segment_age)
+        .is_some_and(|(max, age)| age >= max);
+    if lifetime_due {
+        return Some(TimedSeal::Lifetime);
+    }
+    let idle_due = segment_max_age
+        .zip(idle_for)
+        .is_some_and(|(max, idle)| idle >= max);
+    idle_due.then_some(TimedSeal::Idle)
+}
+
+/// Seals the active segment ahead of the size threshold and hands it to the
+/// drain. Shared by both timers so the metric bump, the hand-off and the
+/// failure behaviour cannot drift apart depending on which one fired.
+///
+/// Returns `true` when no segment is active any more (sealed, or there was
+/// none) — the caller's cue to stop the idle clock until the next write opens a
+/// fresh segment. Returns `false` when the seal failed and the segment is still
+/// active, so the next cycle retries instead of losing the attempt.
+fn seal_before_size_threshold(
+    writer: &mut ShardWriter,
+    drain_tx: &Sender<PathBuf>,
+    shard_id: u16,
+    metrics: &Metrics,
+    reason: TimedSeal,
+) -> bool {
+    match writer.seal_current() {
+        Ok(Some(sealed)) => {
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::sealed,
+                })
+                .inc();
+            if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
+                error!(
+                    shard = shard_id,
+                    path = %unsent.display(),
+                    reason = reason.as_str(),
+                    "drain channel closed; timed-seal segment not handed off \
+                     (recovered on restart via replay)"
+                );
+            }
+            true
+        }
+        Ok(None) => true,
+        Err(e) => {
+            warn!(
+                shard = shard_id,
+                error = %e,
+                reason = reason.as_str(),
+                "timed seal failed; will retry next cycle (segment stays active)"
+            );
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flusher_thread<C: BlockingClock>(
     shard_id: u16,
@@ -499,6 +614,7 @@ fn flusher_thread<C: BlockingClock>(
     batch_deadline: Duration,
     segment_max_bytes: u64,
     segment_max_age: Option<Duration>,
+    segment_max_lifetime: Option<Duration>,
     core_id: Option<core_affinity::CoreId>,
     metrics: Arc<Metrics>,
     coalesce_hint: Arc<AtomicU64>,
@@ -596,6 +712,13 @@ fn flusher_thread<C: BlockingClock>(
     // segment_max_bytes or for shutdown. Uses real time (not the BlockingClock
     // seam) — only active when the operator opts in, so DST, which never sets
     // segment_max_age, is unaffected.
+    //
+    // The maximum-lifetime timer (segment_max_lifetime) needs no bookkeeping
+    // here: its clock is stamped at segment creation and read back through
+    // writer.active_segment_age(). That is deliberate — the flusher cannot see
+    // every segment birth, because a size rotation happens inside flush_batch,
+    // so a clock kept out here could only be inferred from writes, which is
+    // precisely how the "max age" knob came to measure idleness instead.
     let mut last_write_at: Option<Instant> = None;
 
     loop {
@@ -618,40 +741,26 @@ fn flusher_thread<C: BlockingClock>(
                     );
                     record_count = 0;
                     last_write_at = Some(Instant::now());
-                } else if let Some(max_age) = segment_max_age {
-                    // No new records this cycle: if the active segment has been
-                    // idle past max_age, seal it so the drain delivers it now
-                    // rather than at the next rotation/shutdown (low-volume
-                    // timely-delivery; the open segment always holds >=1 record).
-                    let idle_enough = last_write_at.is_some_and(|t| t.elapsed() >= max_age);
-                    if idle_enough && writer.has_active_segment() {
-                        match writer.seal_current() {
-                            Ok(Some(sealed)) => {
-                                metrics
-                                    .wab_segments
-                                    .get_or_create(&SegmentStateLabel {
-                                        state: SegmentState::sealed,
-                                    })
-                                    .inc();
-                                if let Err(crossbeam_channel::SendError(unsent)) =
-                                    drain_tx.send(sealed)
-                                {
-                                    error!(
-                                        shard = shard_id,
-                                        path = %unsent.display(),
-                                        "drain channel closed; idle-sealed segment not handed off \
-                                         (recovered on restart via replay)"
-                                    );
-                                }
-                                last_write_at = None;
-                            }
-                            Ok(None) => last_write_at = None,
-                            Err(e) => warn!(
-                                shard = shard_id,
-                                error = %e,
-                                "idle-seal failed; will retry next cycle (segment stays active)"
-                            ),
-                        }
+                } else if let Some(reason) = due_timed_seal(
+                    segment_max_age,
+                    last_write_at.map(|t| t.elapsed()),
+                    segment_max_lifetime,
+                    writer.active_segment_age(),
+                ) {
+                    // No new records this cycle, and one of the two timers is
+                    // due: seal so the drain delivers now rather than at the
+                    // next rotation/shutdown (low-volume timely delivery; an
+                    // open segment always holds >=1 record).
+                    if writer.has_active_segment()
+                        && seal_before_size_threshold(
+                            &mut writer,
+                            &drain_tx,
+                            shard_id,
+                            &metrics,
+                            reason,
+                        )
+                    {
+                        last_write_at = None;
                     }
                 }
                 continue;
@@ -683,6 +792,29 @@ fn flusher_thread<C: BlockingClock>(
         // Records just hit the active segment — restart the idle-seal clock.
         if segment_max_age.is_some() {
             last_write_at = Some(Instant::now());
+        }
+        // A producer fast enough to keep the channel non-empty never lets
+        // recv_timeout above time out, so the lifetime bound has to be enforced
+        // here as well — checking it only on the idle path would make it a
+        // second idle timer with extra steps. Safe at this point for the same
+        // reason the shutdown seal is: flush_batch has already fsynced and
+        // acked everything it wrote.
+        //
+        // Only the lifetime can be due here (the idle clock was just restarted
+        // three lines up), but it goes through the same predicate so the two
+        // sites cannot disagree about the rule. Costs one Option discriminant
+        // check per flush when the knob is unset — the clock reads are behind
+        // the short-circuit.
+        if segment_max_lifetime.is_some()
+            && let Some(reason) = due_timed_seal(
+                segment_max_age,
+                last_write_at.map(|t| t.elapsed()),
+                segment_max_lifetime,
+                writer.active_segment_age(),
+            )
+            && seal_before_size_threshold(&mut writer, &drain_tx, shard_id, &metrics, reason)
+        {
+            last_write_at = None;
         }
     }
 
@@ -922,6 +1054,82 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("weir_wab_{label}_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── Timed seals ───────────────────────────────────────────────────────────
+
+    /// Pins the interaction rule between the two seal timers: **whichever comes
+    /// due first wins**. Both knobs are upper bounds on how long a record can
+    /// sit undelivered, and two upper bounds compose by taking the minimum —
+    /// deferring to the later one would let one knob raise a latency the
+    /// operator had already capped with the other.
+    #[test]
+    fn either_timer_can_seal_and_neither_masks_the_other() {
+        const SHORT: Duration = Duration::from_secs(1);
+        const LONG: Duration = Duration::from_secs(60);
+        let past_short = Duration::from_secs(2);
+
+        // Neither knob set: the historical behaviour, size threshold only.
+        assert!(
+            due_timed_seal(None, Some(past_short), None, Some(past_short)).is_none(),
+            "with both timers off nothing may seal ahead of wab_segment_max_bytes"
+        );
+
+        // Idle alone, due and not due.
+        assert!(matches!(
+            due_timed_seal(Some(SHORT), Some(past_short), None, Some(past_short)),
+            Some(TimedSeal::Idle)
+        ));
+        assert!(
+            due_timed_seal(Some(LONG), Some(past_short), None, Some(past_short)).is_none(),
+            "an idle interval that has not elapsed must not seal"
+        );
+
+        // Lifetime alone, due and not due.
+        assert!(matches!(
+            due_timed_seal(None, Some(past_short), Some(SHORT), Some(past_short)),
+            Some(TimedSeal::Lifetime)
+        ));
+        assert!(
+            due_timed_seal(None, Some(past_short), Some(LONG), Some(past_short)).is_none(),
+            "a lifetime that has not elapsed must not seal"
+        );
+
+        // The case the feature exists for: a producer that never goes idle, so
+        // the idle clock keeps being restarted and reads as barely-elapsed,
+        // while the lifetime has run out. The lifetime must still fire.
+        assert!(
+            matches!(
+                due_timed_seal(
+                    Some(SHORT),
+                    Some(Duration::from_millis(1)),
+                    Some(SHORT),
+                    Some(past_short)
+                ),
+                Some(TimedSeal::Lifetime)
+            ),
+            "a busy producer resets the idle clock forever; the lifetime is the bound that \
+             has to survive that, or low-volume deployments never deliver"
+        );
+
+        // And the mirror: a long lifetime must not suppress a due idle seal.
+        // Setting the new knob has to be additive, never a way to lose the
+        // delivery timing an operator already had.
+        assert!(
+            matches!(
+                due_timed_seal(Some(SHORT), Some(past_short), Some(LONG), Some(past_short)),
+                Some(TimedSeal::Idle)
+            ),
+            "adding wab_segment_max_lifetime_secs must not delay an idle seal that was \
+             already due"
+        );
+
+        // No open segment: the lifetime has nothing to measure, so it cannot
+        // fire. Sealing here would hand the drain an empty segment.
+        assert!(
+            due_timed_seal(None, None, Some(SHORT), None).is_none(),
+            "with no active segment there is no lifetime to exceed"
+        );
     }
 
     // ── SegmentReader ─────────────────────────────────────────────────────────

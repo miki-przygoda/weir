@@ -540,6 +540,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 0 = idle-seal disabled (historical behaviour).
         segment_max_age: (config.wab_segment_max_age_secs > 0)
             .then(|| Duration::from_secs(config.wab_segment_max_age_secs)),
+        // 0 = maximum-lifetime seal disabled. Independent of the idle timer
+        // above; with both set, whichever comes due first seals.
+        segment_max_lifetime: (config.wab_segment_max_lifetime_secs > 0)
+            .then(|| Duration::from_secs(config.wab_segment_max_lifetime_secs)),
         // "none" (default) keeps segments at format v1, byte-identical to weir
         // 1.x. Validated at config load, so any other string is unreachable.
         compression: match config.wab_compression.as_str() {

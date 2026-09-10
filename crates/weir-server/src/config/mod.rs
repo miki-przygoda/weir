@@ -212,6 +212,7 @@ pub(crate) struct PartialConfig {
     pub batch_deadline_ms: Option<u64>,
     pub wab_segment_max_bytes: Option<u64>,
     pub wab_segment_max_age_secs: Option<u64>,
+    pub wab_segment_max_lifetime_secs: Option<u64>,
     pub wab_max_bytes: Option<u64>,
     pub wab_compression: Option<String>,
     pub wab_compression_level: Option<i32>,
@@ -355,6 +356,16 @@ pub struct Config {
     /// segment idle for this long is sealed and drained — timely delivery for
     /// low-volume deployments.
     pub wab_segment_max_age_secs: u64,
+    /// Maximum-lifetime seal threshold in seconds. `0` (default) disables it.
+    /// When > 0, a segment is sealed and drained this long after it was
+    /// *created*, however busy the producer has been.
+    ///
+    /// The distinction from `wab_segment_max_age_secs` is the whole point of
+    /// having both: that one measures from the last flush and is restarted by
+    /// every write, so a steady trickle holds a segment open indefinitely. This
+    /// one measures from segment creation and nothing restarts it. With both
+    /// set, whichever comes due first seals.
+    pub wab_segment_max_lifetime_secs: u64,
     /// Soft upper bound on live WAB bytes on disk. `0` (default) disables it.
     ///
     /// When exceeded, pushes are Nacked with `NackReason::InternalError` rather
@@ -697,6 +708,19 @@ impl Config {
         check_range(
             "wab_segment_max_age_secs",
             wab_segment_max_age_secs,
+            0,
+            86_400,
+        )?;
+        // Maximum-lifetime seal threshold, measured from segment creation and
+        // never restarted by a write — the bound `wab_segment_max_age_secs`
+        // reads like but is not. 0 = disabled; same day cap, and the two are
+        // deliberately independent: a lifetime below the idle interval just
+        // makes the idle timer unreachable, which is a legitimate choice rather
+        // than a misconfiguration, so there is no cross-check between them.
+        let wab_segment_max_lifetime_secs = merge!(wab_segment_max_lifetime_secs).unwrap_or(0);
+        check_range(
+            "wab_segment_max_lifetime_secs",
+            wab_segment_max_lifetime_secs,
             0,
             86_400,
         )?;
@@ -1056,6 +1080,7 @@ impl Config {
             batch_deadline_ms,
             wab_segment_max_bytes,
             wab_segment_max_age_secs,
+            wab_segment_max_lifetime_secs,
             wab_max_bytes,
             wab_compression,
             wab_compression_level,
@@ -1264,6 +1289,9 @@ mod tests {
         assert_eq!(c.batch_deadline_ms, 1);
         assert_eq!(c.wab_segment_max_bytes, 256 * 1024 * 1024);
         assert_eq!(c.wab_segment_max_age_secs, 0);
+        // Both seal timers are opt-in. A default that sealed on a timer would
+        // change delivery timing for every existing deployment on upgrade.
+        assert_eq!(c.wab_segment_max_lifetime_secs, 0);
         assert_eq!(c.max_connections, 256);
         assert_eq!(c.max_payload_bytes, MAX_PAYLOAD_HARD_CAP);
         assert_eq!(c.metrics_port, 9185);
@@ -1589,6 +1617,9 @@ mod tests {
         });
         assert_knob_rejected("rng_seg_age", "wab_segment_max_age_secs", |p| {
             p.wab_segment_max_age_secs = Some(86_401)
+        });
+        assert_knob_rejected("rng_seg_life", "wab_segment_max_lifetime_secs", |p| {
+            p.wab_segment_max_lifetime_secs = Some(86_401)
         });
         assert_knob_rejected("rng_max_conn", "max_connections", |p| {
             p.max_connections = Some(0)

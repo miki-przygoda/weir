@@ -353,15 +353,21 @@ and opens a fresh one. The sealed segment is forwarded to the drain
 for sink commit; until a segment seals, its records are durable on
 disk but invisible to the sink.
 
-> **Low-volume trap: with idle-seal off (the default), a quiet producer
-> delivers nothing.** With this 256 MiB cap and the default
-> [`wab_segment_max_age_secs`](#wab_segment_max_age_secs) `= 0`, a low-volume
-> deployment that writes a handful of small records and goes quiet gets every
-> record **acked** but the segment never reaches 256 MiB, so it never seals and
-> the sink receives **nothing** until shutdown. If your throughput won't fill a
-> segment promptly, set `wab_segment_max_age_secs` (e.g. `2`–`30`) so idle
-> segments seal on a timer — or lower this cap. This is the single most common
-> "weir accepts records but my sink is empty" surprise.
+> **Low-volume trap: with both seal timers off (the default), a low-volume
+> producer delivers nothing.** With this 256 MiB cap and both
+> [`wab_segment_max_age_secs`](#wab_segment_max_age_secs) and
+> [`wab_segment_max_lifetime_secs`](#wab_segment_max_lifetime_secs) at `0`, a
+> deployment that writes a handful of small records gets every record **acked**
+> but the segment never reaches 256 MiB, so it never seals and the sink receives
+> **nothing** until shutdown. This is the single most common "weir accepts
+> records but my sink is empty" surprise.
+>
+> Which timer fixes it depends on the producer, and picking the wrong one leaves
+> the symptom exactly as it was: `wab_segment_max_age_secs` seals a segment that
+> has gone **quiet**, and a producer that trickles steadily never does, so it
+> keeps the segment open indefinitely. `wab_segment_max_lifetime_secs` seals on
+> the segment's age regardless. If in doubt set both — whichever comes due first
+> seals — or lower this cap.
 
 **Effect**: smaller values trigger more frequent drain → sink activity
 and faster failure isolation (a corrupt segment only affects records
@@ -402,6 +408,84 @@ normal seal happens.
 **When to tune**: set it on edge/low-throughput deployments where timely delivery
 matters more than maximal per-segment batching; leave it `0` on high-throughput
 deployments where segments fill quickly on their own.
+
+> **This knob is named like a maximum age and is not one. It is an idle timer,
+> and a steady trickle defeats it.** The clock restarts on every flush, so a
+> producer writing one record a minute against `wab_segment_max_age_secs = 300`
+> resets it four times over before it can expire. That segment never seals on
+> this timer at all — it grows toward `wab_segment_max_bytes` exactly as if the
+> knob were `0`, which at 500 bytes a minute is roughly **two years** before
+> anything reaches the sink. The knob works for a producer that *stops*; it does
+> nothing for one that never pauses for the whole interval.
+>
+> If your producer trickles rather than bursts, you want
+> [`wab_segment_max_lifetime_secs`](#wab_segment_max_lifetime_secs) instead of,
+> or alongside, this one.
+
+---
+
+#### `wab_segment_max_lifetime_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `0` (disabled)
+- **Range**: 0 – 86400
+- **CLI**: `--wab-segment-max-lifetime-secs <n>`
+- **Env**: `WEIR_WAB_SEGMENT_MAX_LIFETIME_SECS`
+- **TOML**: `wab_segment_max_lifetime_secs`
+
+Opt-in **maximum lifetime**: when > 0, the WAB flusher seals the active segment
+(handing it to the drain) this many seconds after the segment was **created**,
+however busy the producer has been in the meantime. `0` (default) preserves the
+historical behaviour.
+
+**This is the knob that bounds delivery latency.** Nothing restarts its clock —
+not a write, not a flush, not a burst — so it is the only setting that makes
+"records reach the sink within N seconds" a statement weir will actually keep.
+
+##### Which of the two timers do I want?
+
+They are different knobs measuring from different instants, and the names do not
+make that obvious. The reference point is the whole distinction:
+
+| | `wab_segment_max_age_secs` | `wab_segment_max_lifetime_secs` |
+| --- | --- | --- |
+| **Clock starts at** | the last flush | segment creation |
+| **Restarted by a write?** | **Yes** — every flush | **No** — never |
+| **Fires when** | the producer has been quiet that long | that long has passed, busy or not |
+| **A steady trickle** | **never seals** | seals on schedule |
+| **A producer that stops** | seals promptly | seals at the lifetime, no sooner |
+| **Bounds delivery latency?** | No | **Yes** |
+
+Read the third row first. `wab_segment_max_age_secs` asks "has anything happened
+recently?"; `wab_segment_max_lifetime_secs` asks "how old is this segment?" Only
+the second question has an answer a producer cannot change by writing.
+
+**Why it exists**: low volume is the normal case for several things weir is
+deployed as — an S3 archive, a meter, a field station, a till — and those
+producers trickle rather than go quiet. The idle timer is the wrong shape for
+all of them, and until this knob existed the only honest advice was to lower
+`wab_segment_max_bytes` and hope the arithmetic worked out.
+
+**Setting both is the usual answer**, and the rule is that **whichever comes due
+first seals**. They are both upper bounds on how long a record can sit
+undelivered, so they compose by taking the minimum; adding one can only make
+delivery earlier, never later. A typical low-volume pair:
+
+```toml
+wab_segment_max_age_secs      = 5    # quiet? deliver in 5s
+wab_segment_max_lifetime_secs = 300  # busy? deliver within 5 minutes regardless
+```
+
+A lifetime shorter than the idle interval is accepted, not rejected — it simply
+means the lifetime always wins and the idle timer never gets the chance to fire.
+That is a legitimate configuration, so weir does not second-guess it.
+
+**When to tune**: lower it when delivery latency matters (a dashboard reading the
+sink, an archive with a freshness SLA); raise it when per-segment batching
+matters more (bigger objects in S3, fewer round trips to a database). Every seal
+is a segment file and one `Sink::commit`, so a 1-second lifetime on a busy shard
+buys latency with a lot of small segments. On-disk format is unchanged; like the
+idle timer this only affects *when* a normal seal happens.
 
 ---
 

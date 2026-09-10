@@ -380,6 +380,106 @@ fn idle_seal_drains_low_volume_segment_without_shutdown() {
 }
 
 #[test]
+fn max_lifetime_seal_fires_for_a_producer_that_never_goes_idle() {
+    // The case `wab_segment_max_age_secs` cannot serve. That knob is an idle
+    // timer whose clock restarts on every flush, so a steady trickle postpones
+    // it forever and the segment grows toward `wab_segment_max_bytes` (256 MiB)
+    // as if it were unset — two years at 500 bytes a minute, against a fleet
+    // where low volume is the normal case (an S3 archive, a meter, a field
+    // station, a till).
+    //
+    // `wab_segment_max_lifetime_secs` measures from segment creation and
+    // nothing restarts it, so the same trickle must deliver. The write gap here
+    // is deliberately shorter than the lifetime: if the new timer were idle-
+    // based in disguise it would never fire and this test would fail.
+    const LIFETIME_SECS: u64 = 3;
+    const WRITE_GAP: Duration = Duration::from_millis(400);
+
+    let srv = weir_server!("max_lifetime_trickle")
+        .extra_config(format!("wab_segment_max_lifetime_secs = {LIFETIME_SECS}"))
+        .start();
+    let mut client = srv.client();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+
+    // Trickle well past the lifetime, never pausing for as long as the
+    // lifetime. Record the worst real gap: a CI runner that stalls for longer
+    // than LIFETIME_SECS would leave the segment genuinely quiet, at which
+    // point a seal proves nothing about the lifetime timer — an idle timer
+    // would have done it. The premise is checked before the verdict, so a
+    // stalled host reports a skip rather than a false pass.
+    let mut worst_gap = Duration::ZERO;
+    let mut last = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut delivered = 0u64;
+    while delivered == 0 && Instant::now() < deadline {
+        thread::sleep(WRITE_GAP);
+        client.push(b"trickle", Durability::Durable).unwrap();
+        worst_gap = worst_gap.max(last.elapsed());
+        last = Instant::now();
+        delivered = committed();
+    }
+
+    if worst_gap >= Duration::from_secs(LIFETIME_SECS) {
+        eprintln!(
+            "skipping the max-lifetime assertion: the host stalled for {worst_gap:?}, past the \
+             {LIFETIME_SECS}s lifetime, so the segment went genuinely idle and a seal would \
+             not distinguish the two timers"
+        );
+        return;
+    }
+
+    assert!(
+        delivered >= 1,
+        "a producer writing every {WRITE_GAP:?} against a {LIFETIME_SECS}s maximum lifetime \
+         must still deliver — the lifetime clock starts at segment creation and nothing \
+         restarts it. Nothing was committed in 30s while the worst write gap stayed at \
+         {worst_gap:?}, so the lifetime timer is being restarted by writes and is just the \
+         idle timer under a new name."
+    );
+}
+
+#[test]
+fn max_lifetime_seal_is_off_by_default() {
+    // The knob is opt-in, and this is what stops the feature from silently
+    // changing delivery timing for every existing deployment on upgrade. Same
+    // trickle as the test above with the knob unset: nothing may seal, because
+    // 256 MiB is a long way off and the idle timer is unset too.
+    const WRITE_GAP: Duration = Duration::from_millis(400);
+
+    let srv = weir_server!("max_lifetime_default").start();
+    let mut client = srv.client();
+
+    let committed = || {
+        parse_metric(
+            &srv.scrape_metrics(),
+            "weir_sink_commit_records_total{outcome=\"committed\"}",
+        )
+    };
+
+    for _ in 0..12 {
+        thread::sleep(WRITE_GAP);
+        client.push(b"trickle", Durability::Durable).unwrap();
+    }
+
+    // No premise to guard here: with both timers unset there is no elapsed time
+    // that could legitimately seal this segment, so a stalled runner cannot
+    // make this assertion lie.
+    assert_eq!(
+        committed(),
+        0,
+        "with wab_segment_max_lifetime_secs unset, a segment must seal only at \
+         wab_segment_max_bytes or shutdown. Records reached the sink, so the new timer \
+         defaults to on and every deployment's delivery timing changes on upgrade."
+    );
+}
+
+#[test]
 fn wab_compression_knob_reaches_the_segment_header() {
     // End-to-end proof that the config value actually reaches the WAB writer,
     // not merely that the field is plumbed through Config. Runs a real daemon
