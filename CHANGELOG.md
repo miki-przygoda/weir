@@ -15,6 +15,84 @@ protocol** below.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-09-10
+
+Three capabilities the idea fleet found weir could not do, one P0 data-loss fix
+in the S3 sink, one silent-loss defect in the SQL sinks' own reference schema,
+and eleven published claims that were wrong.
+
+### Breaking
+
+- **`MessageType` gains two variants**, `PushTracked = 0x06` and
+  `AckTracked = 0x07`. The enum is `pub` in `weir-core` and is not
+  `#[non_exhaustive]`, so a downstream exhaustive `match` on it no longer
+  compiles. That is a breaking change to a published crate's Rust API under
+  this file's own rule, and is why this is 3.0.0 rather than 2.2.0 — the
+  practical blast radius is small, since a producer uses `weir-client::push`
+  rather than matching on the wire enum, but the rule does not have an
+  "unless we think nobody is affected" clause.
+
+  **`WIRE_VERSION` stays 1.** The wire protocol is not broken: a message type
+  is additive the same way `NackReason` bytes `0x0A–0xFF` already are. An
+  existing client never sends `0x06`, so it never receives an `0x07`, and its
+  `Push` still gets the same frozen twenty-byte `Ack`. All 30 frozen
+  conformance vectors pass byte-identical, as do all five polyglot demo
+  clients.
+
+### Added
+
+- **A producer can learn the address of the record it just pushed.**
+  `push_tracked` returns a `RecordCoordinate` — segment identity, 1-based index
+  within that segment, and the record's `RecordId`. Previously `push()` returned
+  a bare `Result`, so a producer knew its record was accepted but never which
+  record it was.
+
+  **What this is not:** a per-producer sequence. The coordinate is a *buffer
+  address*; other producers interleave in the same segment, so any one
+  producer's indices have holes by construction. It does not satisfy the
+  gap-free numbering that fiscalisation regimes require, and the wire and client
+  docs say so rather than letting it look as though it does.
+
+- **`wab_segment_max_lifetime_secs`** — a genuine maximum age, measured from
+  segment creation and never reset. `wab_segment_max_age_secs` is an *idle*
+  timer whose clock restarts on every flush, so a steady trickle postpones it
+  forever: one record a minute against a 300-second setting resets it four times
+  over, and the segment grows toward 256 MiB as if the knob were `0` — roughly
+  two years at 500 bytes a minute. Both knobs are upper bounds on delivery
+  latency, so whichever comes due first seals.
+
+- **`sink_postgres_id_column` / `sink_mysql_id_column`** — write each record's
+  `RecordId` as a second column, so the `UNIQUE` constraint sits on a per-record
+  key.
+
+### Fixed
+
+- **A bucket-wide S3 Object Lock retention dead-lettered every acked record.**
+  AWS rejects any `PutObject` landing inside a retention period without
+  `Content-MD5` or an `x-amz-checksum-*` header — a bucket *default* retention
+  included. weir sent neither, S3 answered `400 InvalidRequest`, and that code
+  was classified Permanent, so the whole backlog was dead-lettered while
+  `health()` still reported Healthy because `HeadBucket` kept succeeding.
+  `PutObject` now sends `x-amz-checksum-sha256`, and `InvalidRequest` strands
+  rather than dead-letters.
+
+- **The SQL sinks' reference schema silently discarded distinct records.** This
+  project documented `UNIQUE (payload_sha256)` on Postgres and
+  `UNIQUE KEY uniq_payload` on MySQL. That is *content* identity, so paired with
+  the default `ON CONFLICT DO NOTHING` / `INSERT IGNORE` two genuinely distinct
+  records that share bytes collapse to one row — and for a metering event
+  ("one unit consumed") sharing bytes is the normal case. Measured against live
+  Postgres and MySQL, eight byte-identical records: coordinate-keyed keeps 8,
+  content-keyed keeps 1. The reference schema now keys on `record_id`, and the
+  old schema is retained in the test stack so the comparison is demonstrated
+  rather than described.
+
+- **No batch-level key can survive re-batching**, because a batch key is a
+  function of the batch. `DedupToken`'s constant-`sink_max_batch_size`
+  precondition is inherent rather than incidental; the escape hatch is
+  `RecordId`, built from the record's absolute index in its segment, which does
+  not move when the batch size changes.
+
 ### Changed
 
 - **Local CI now runs the real workflow, via [`act`](https://nektosact.com).**
@@ -2962,6 +3040,7 @@ The five commits making up this pass:
 
 ---
 
+[3.0.0]: https://github.com/miki-przygoda/weir/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/miki-przygoda/weir/compare/v2.0.5...v2.1.0
 [2.0.5]: https://github.com/miki-przygoda/weir/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/miki-przygoda/weir/compare/v2.0.3...v2.0.4

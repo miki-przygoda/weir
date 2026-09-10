@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.1.0"
+version = "3.0.0"
 edition = "2024"
 # MSRV: edition 2024 needs 1.85, but the code uses `if let … && …` let-chains
 # (stable 1.88), so 1.88 is the honest floor. Declared so a future bump is an
