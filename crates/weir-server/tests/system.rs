@@ -95,6 +95,118 @@ fn smoke_single_push_ack() {
     client.push(b"hello weir", Durability::Durable).unwrap();
 }
 
+/// A tracked push against the real binary: the daemon hands back an address, it
+/// points at a segment that actually exists on disk, and consecutive records on
+/// one connection get consecutive ordinals in that segment.
+#[test]
+fn tracked_push_returns_a_coordinate_that_matches_the_wab() {
+    let srv = weir_server!("tracked").shard_count(1).start();
+    let mut client = srv.client();
+
+    let first = client
+        .push_tracked(b"first record", Durability::Durable)
+        .unwrap();
+    let second = client
+        .push_tracked(b"second record", Durability::Durable)
+        .unwrap();
+
+    // The address is a real address, not a placeholder.
+    assert!(
+        first.segment().starts_with("shard_00/") && first.segment().ends_with(".wab.sealed"),
+        "unexpected segment address {:?}",
+        first.segment()
+    );
+    // Ordinals are 1-based and consecutive within one segment.
+    assert_eq!(first.index(), 1, "the first record in a segment is index 1");
+    assert_eq!(second.segment(), first.segment());
+    assert_eq!(second.index(), 2);
+
+    // Distinct records get distinct ids, and the id is a real digest rather
+    // than a zero-filled stand-in.
+    assert_ne!(first.record_id(), second.record_id());
+    assert_ne!(first.record_id(), &[0u8; 32]);
+    assert_eq!(first.record_id_hex().len(), 64);
+
+    // The address names a file that really exists. The segment is still open at
+    // ack time — that is the whole reason the sealed name is a prediction — so
+    // what is on disk right now is its `.wab` form. Checking that pins the shard
+    // directory and the segment counter against the real filesystem; the
+    // `.sealed` half of the prediction is pinned by
+    // `write_side_coordinates_match_what_the_drain_derives`, which replays the
+    // drain's derivation over actually-sealed files.
+    //
+    // Deliberately NOT asserted after a shutdown-seal: the default noop sink
+    // drains and DELETES a sealed segment almost immediately, so the sealed file
+    // is legitimately gone by then and asserting on it tests the drain's speed,
+    // not the coordinate.
+    let wab_dir = srv.wab_dir.clone();
+    let active = wab_dir.join(first.segment().trim_end_matches(".sealed"));
+    assert!(
+        active.exists(),
+        "the coordinate named {} but the WAB holds: {:?}",
+        active.display(),
+        list_tree(&wab_dir),
+    );
+}
+
+/// Tracked and untracked pushes interleave on one connection, each getting its
+/// own reply shape. If the daemon ever answered a plain `push` with the longer
+/// frame the stream would desync and the *next* call would fail — so the plain
+/// pushes here are the assertion.
+#[test]
+fn tracked_and_plain_pushes_interleave_on_one_connection() {
+    let srv = weir_server!("tracked_mixed").shard_count(1).start();
+    let mut client = srv.client();
+
+    client.push(b"plain one", Durability::Durable).unwrap();
+    let a = client
+        .push_tracked(b"tracked one", Durability::Durable)
+        .unwrap();
+    client.push(b"plain two", Durability::Durable).unwrap();
+    let b = client
+        .push_tracked(b"tracked two", Durability::Durable)
+        .unwrap();
+    client.push(b"plain three", Durability::Buffered).unwrap();
+
+    // The untracked records still occupy ordinals, so the tracked pair is two
+    // apart — proof the index counts every record in the segment, not just the
+    // tracked ones.
+    assert_eq!(a.segment(), b.segment());
+    assert_eq!(b.index(), a.index() + 2);
+    assert!(!client.is_poisoned());
+}
+
+/// A `Buffered` push gets a coordinate too. The tier decides durability; the
+/// coordinate only says where the record went.
+#[test]
+fn buffered_push_also_gets_a_coordinate() {
+    let srv = weir_server!("tracked_buffered").shard_count(1).start();
+    let mut client = srv.client();
+    let c = client
+        .push_tracked(b"buffered record", Durability::Buffered)
+        .unwrap();
+    assert_eq!(c.index(), 1);
+    assert!(c.segment().ends_with(".wab.sealed"));
+}
+
+/// Lists every file under a directory tree, for a failure message that says
+/// what IS there rather than only what is missing.
+fn list_tree(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            out.extend(list_tree(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
 #[test]
 fn all_durability_tiers_behave_per_contract() {
     // Strengthened from `all_durability_tiers_acked`: the original test
