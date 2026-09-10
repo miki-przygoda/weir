@@ -12,6 +12,8 @@
 //!   carried in the header and Nack payloads, each with a `TryFrom<u8>` whose
 //!   error is [`UnknownMessageType`] / [`UnknownDurability`] / [`UnknownNackReason`]
 //!   (re-exported here alongside the enums).
+//! - [`RecordCoordinate`] — where an accepted record landed in the WAB, carried
+//!   back by an [`AckTracked`](MessageType::AckTracked) frame.
 //! - [`Payload`] — opaque, ref-counted payload bytes (O(1) clone).
 //! - [`DecodeError`] / [`WeirError`] — the decode failure taxonomy.
 //! - [`WIRE_VERSION`] / [`MAX_PAYLOAD_HARD_CAP`] / [`HEADER_LEN`] /
@@ -21,6 +23,7 @@
 //! is its executable reference (see `tests/reference_frames.rs`).
 #![deny(missing_docs)]
 
+pub mod coordinate;
 pub mod durability;
 pub mod envelope;
 pub mod error;
@@ -28,6 +31,10 @@ pub mod nack;
 pub mod payload;
 pub mod version;
 
+pub use coordinate::{
+    COORDINATE_FIXED_LEN, COORDINATE_VERSION, CoordinateError, MAX_SEGMENT_NAME_LEN,
+    MAX_TRACKED_ACK_PAYLOAD_LEN, RecordCoordinate,
+};
 pub use durability::{Durability, UnknownDurability};
 pub use envelope::{Envelope, HEADER_LEN, Header, MIN_FRAME_LEN, MessageType, UnknownMessageType};
 pub use error::{DecodeError, WeirError};
