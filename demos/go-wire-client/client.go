@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,14 @@ func Dial(socketPath string) (*Client, error) {
 
 func (c *Client) Close() error { return c.conn.Close() }
 
+// ErrTrackedUnsupported reports a daemon that predates PushTracked (0x06).
+//
+// The wire cannot distinguish that from any other unknown message type -- both
+// are Nack(UnknownMessage) -- so only the caller knows which question it asked.
+// Wrapped so callers use errors.Is. Do not retry on this connection: the daemon
+// closes it after the Nack. Open a new one and use Push.
+var ErrTrackedUnsupported = errors.New("daemon does not support PushTracked (0x06)")
+
 // Response is a decoded daemon reply.
 type Response struct {
 	Frame      Frame
@@ -34,6 +43,10 @@ type Response struct {
 	// DaemonWireVersion is set only for a VersionMismatch Nack (2-byte payload).
 	DaemonWireVersion uint8
 	HasDaemonVersion  bool
+	// Coordinate is set only on an AckTracked, i.e. only in reply to a
+	// PushTracked. IsAckTracked says whether it is meaningful.
+	IsAckTracked bool
+	Coordinate   RecordCoordinate
 }
 
 // readFrame reads exactly one framed response from the wire: a 16-byte header,
@@ -55,8 +68,11 @@ func (c *Client) readFrame() (Frame, error) {
 		return Frame{}, ErrHeaderCrcMismatch
 	}
 	plen := binary.LittleEndian.Uint32(hdr[8:12])
-	// Bound the RESPONSE, not a record: see MaxResponsePayload.
-	if plen > MaxResponsePayload {
+	// Bound the RESPONSE by the type the header declares: AckTracked carries a
+	// coordinate of up to 298 bytes, every other response at most two. See
+	// maxResponsePayload -- widening the bound for one frame type is not the
+	// same as removing it.
+	if int(plen) > maxResponsePayload(MessageType(hdr[5])) {
 		return Frame{}, ErrPayloadTooLarge
 	}
 	rest := make([]byte, int(plen)+4)
@@ -90,6 +106,13 @@ func (c *Client) readResponse() (Response, error) {
 			r.DaemonWireVersion = f.Payload[1]
 			r.HasDaemonVersion = true
 		}
+	case MsgAckTracked:
+		coord, cerr := DecodeCoordinate(f.Payload)
+		if cerr != nil {
+			return r, fmt.Errorf("AckTracked payload is not a coordinate: %w", cerr)
+		}
+		r.IsAckTracked = true
+		r.Coordinate = coord
 	case MsgHealthCheckResponse:
 		// fine; caller decides
 	default:
@@ -99,6 +122,37 @@ func (c *Client) readResponse() (Response, error) {
 }
 
 // Push writes a pre-encoded frame and reads exactly one response.
+// PushTracked pushes a record and returns where it landed.
+//
+// Identical to a plain Push in every other respect -- same tiers, same caps,
+// same Nack reasons -- but answered with an AckTracked carrying the coordinate.
+//
+// A bare Ack in reply is an error, not a success: the request determines the
+// response shape, so an Ack here means the peer did not understand what was
+// asked, and treating it as success would report a coordinate that does not
+// exist. A daemon predating the type answers Nack(UnknownMessage), which is
+// returned wrapped in ErrTrackedUnsupported -- open a new connection and use
+// Push, because the daemon closes this one.
+func (c *Client) PushTracked(payload []byte, d Durability) (RecordCoordinate, error) {
+	resp, err := c.PushRaw(EncodePushTracked(payload, d))
+	if err != nil {
+		return RecordCoordinate{}, err
+	}
+	switch {
+	case resp.IsAckTracked:
+		return resp.Coordinate, nil
+	case resp.IsNack && resp.NackReason == NackUnknownMessage:
+		return RecordCoordinate{}, fmt.Errorf("%w: %s", ErrTrackedUnsupported, resp.NackReason)
+	case resp.IsNack:
+		return RecordCoordinate{}, fmt.Errorf("Nack: %s", resp.NackReason)
+	case resp.IsAck:
+		return RecordCoordinate{}, errors.New(
+			"daemon answered a PushTracked with a bare Ack; the record may be durable " +
+				"but its coordinate is unknown")
+	}
+	return RecordCoordinate{}, fmt.Errorf("unexpected response %s", resp.Frame.MessageType)
+}
+
 func (c *Client) PushRaw(frame []byte) (Response, error) {
 	if _, err := c.conn.Write(frame); err != nil {
 		return Response{}, fmt.Errorf("write frame: %w", err)
