@@ -22,6 +22,8 @@ const PLATFORMS: &str = include_str!("../../../docs/platform-support.md");
 const RELEASE_YML: &str = include_str!("../../../.github/workflows/release.yml");
 const PEER: &str = include_str!("../src/socket/peer.rs");
 const HISTORY: &str = include_str!("../../../docs/benchmarks/history.md");
+const MONITORING: &str = include_str!("../../../docs/monitoring.md");
+const ALERTS: &str = include_str!("../../../deploy/prometheus/weir-alerts.yml");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -375,5 +377,56 @@ fn every_hostile_runner_row_in_the_trend_is_marked() {
         HISTORY.contains("`(!)` marks a run the runner poisoned"),
         "history.md no longer explains its `(!)` marker, so the rows carrying it \
          are more confusing than the unmarked ones were"
+    );
+}
+
+/// Every alert's `runbook` annotation must land on a heading that exists.
+///
+/// The annotation is the operator's entry point: an alert fires at 3am, they
+/// follow the link. A rule added without its runbook section, or a section
+/// renamed without its rules, sends them to a page that scrolls to nowhere —
+/// and nothing else in the tree checks it. `promtool` validates that the rules
+/// parse, not that their documentation exists.
+#[test]
+fn every_alert_runbook_anchor_resolves_to_a_heading() {
+    let headings: Vec<String> = MONITORING
+        .lines()
+        .filter_map(|l| l.strip_prefix("#### "))
+        .map(|h| {
+            h.trim()
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == ' ')
+                .collect::<String>()
+                .replace(' ', "-")
+        })
+        .collect();
+
+    let mut unresolved = Vec::new();
+    let mut count = 0usize;
+    for (i, _) in ALERTS.match_indices("runbook: \"docs/monitoring.md#") {
+        let rest = &ALERTS[i..];
+        let start = rest.find('#').expect("anchor marker") + 1;
+        let end = rest[start..]
+            .find('"')
+            .expect("unterminated runbook annotation")
+            + start;
+        let anchor = &rest[start..end];
+        count += 1;
+        if !headings.iter().any(|h| h == anchor) {
+            unresolved.push(anchor.to_string());
+        }
+    }
+
+    assert!(
+        count >= 15,
+        "found only {count} runbook annotations; weir-alerts.yml has eighteen \n\
+         rules and every one should carry a link to its remediation"
+    );
+    assert!(
+        unresolved.is_empty(),
+        "these alert runbook anchors do not resolve to a `#### ` heading in \n\
+         docs/monitoring.md: {unresolved:?}\n\n\
+         An operator following the link from a firing alert lands nowhere."
     );
 }

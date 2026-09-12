@@ -86,6 +86,48 @@ groups:
   # ── Drain / dead-letter ─────────────────────────────────────────────────────
   - name: weir-drain
     rules:
+      # The only rule in this file that can see a WEDGED drain.
+      #
+      # Every other drain alert reads weir_drain_state or weir_sink_health, and
+      # both are written ONLY by the drain thread (drain/mod.rs:285). When that
+      # thread wedges they freeze at their last healthy-looking value, so
+      # WeirDrainBlocked, WeirDrainStopped, WeirSinkDown and WeirSinkDegraded
+      # are all silent in exactly the incident they exist for --
+      # main.rs:1010 names this hazard in so many words -- and
+      # weir-readiness.sh prints READY throughout.
+      #
+      # weir_wab_segments_total is a COUNTER (metrics/mod.rs:232,
+      # "Cumulative WAB segment transitions by state"), incremented by the WAB
+      # flusher for `sealed` and by the drain's confirm path for `confirmed`.
+      # Segments entering the buffer while none leave is the wedge, and neither
+      # side depends on the drain publishing its own health.
+      #
+      # `unless`, not `-`. Two reasons, both load-bearing:
+      #   * The wab_segments family is NOT pre-initialised (only the drain_state
+      #     and sink_health families are, metrics/mod.rs:694-740), so
+      #     {state="confirmed"} does not exist at all until the first confirm.
+      #     A subtraction against an absent series yields no result and the rule
+      #     silently never fires. `unless` is set difference, so an absent right
+      #     side leaves the left side standing.
+      #   * rate(), not a raw difference. Recovery replays segments sealed by the
+      #     PREVIOUS process, so `confirmed` can start far above where it left
+      #     off and a raw `sealed - confirmed` stays negative for a long time --
+      #     measured at 417 segments, which at the default 256 MiB
+      #     wab_segment_max_bytes is ~104 GiB of newly sealed data before the
+      #     naive form could fire. docs/monitoring.md:344-352 warns about this
+      #     and no rule had ever applied the warning.
+      - alert: WeirDrainNotConfirming
+        expr: |
+          sum by (job, instance) (rate(weir_wab_segments_total{job=~"weir", state="sealed"}[5m])) > 0
+          unless
+          sum by (job, instance) (rate(weir_wab_segments_total{job=~"weir", state="confirmed"}[5m])) > 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir drain is not confirming on {{ $labels.instance }} — segments sealing, none confirmed"
+          description: "Segments are entering the WAB and nothing is leaving it. Because this rests on counters rather than the drain-written drain_state/sink_health gauges, it fires even when the drain thread is wedged and those gauges are frozen at a healthy value. Acked data is accumulating on disk and is not reaching the sink. Check the drain thread and the sink, not the gauges."
+          runbook: "docs/monitoring.md#weirdrainnotconfirming"
+
       - alert: WeirDrainBlocked
         expr: weir_drain_state{job=~"weir", state="blocked_dead_letter_full"} == 1
         for: 1m
