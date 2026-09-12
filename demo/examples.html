@@ -57,7 +57,7 @@
     <div class="card">
       <h3>Java</h3>
       <div class="chips"><span class="chip wire">30/30</span><span class="chip dim">JDK stdlib only</span></div>
-      <p class="card-sub">JDK-only producer over a Unix domain socket — no Maven, no jars. An enterprise audit-event logger at Sync durability.</p>
+      <p class="card-sub">JDK-only producer over a Unix domain socket — no Maven, no jars. An enterprise audit-event logger at Durable durability.</p>
       <p style="margin:0"><a href="clients/java.html">→ Java client</a></p>
     </div>
     <div class="card">
@@ -110,7 +110,7 @@
 <pre class="code"><span class="k">use</span> weir_client::{<span class="t">WeirClient</span>, <span class="t">Durability</span>};
 
 <span class="k">let mut</span> client = <span class="t">WeirClient</span>::<span class="f">connect</span>(<span class="s">"/run/weir/weir.sock"</span>)?;
-client.<span class="f">push</span>(<span class="s">b"hello, weir!"</span>, <span class="t">Durability</span>::Sync)?;  <span class="c">// durable before this returns</span>
+client.<span class="f">push</span>(<span class="s">b"hello, weir!"</span>, <span class="t">Durability</span>::Durable)?;  <span class="c">// durable before this returns</span>
 </pre>
     <p style="margin:0"><a href="https://miki-przygoda.github.io/weir/getting-started/quickstart.html">→ quickstart</a></p>
   </div>

@@ -124,12 +124,12 @@ jobs:
       # The vendored AWS SigV4 vectors live here; run them explicitly so a
       # failure names this crate rather than hiding in a workspace summary.
       - run: cargo test -p weir-sink-s3
-      - run: cargo test -p weir-server --lib --test system --test docs_drift --test load --test load_tls --test tls_client --test tls_listener
+      - run: cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test load --test load_tls --test tls_client --test tls_listener
       - run: cargo test -p weir-server --bins -- --test-threads=1
       # Build + run the clickhouse-sink and tls test code, which the default
       # feature set never compiles (S08). --all-features pulls in both.
       - run: cargo test --workspace --exclude weir-server --all-features
-      - run: cargo test -p weir-server --lib --test system --test docs_drift --test load --test load_tls --test tls_client --test tls_listener --all-features
+      - run: cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test load --test load_tls --test tls_client --test tls_listener --all-features
       - run: cargo test -p weir-server --bins --all-features -- --test-threads=1
 
   dst:

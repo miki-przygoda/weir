@@ -76,9 +76,9 @@
 
     <div class="card">
       <h3>weir-client</h3>
-      <div class="chips"><span class="chip">lib</span><span class="chip dim">Unix-only client</span><span class="chip dim">no async runtime</span></div>
+      <div class="chips"><span class="chip">lib</span><span class="chip dim">Unix socket + TCP/mTLS</span><span class="chip dim">no async runtime</span></div>
       <p class="card-sub">Synchronous producer client. One blocking socket round-trip per <code class="inline">push()</code>; <code class="inline">Durability</code>/<code class="inline">NackReason</code> re-exported so a basic producer needs only this one crate.</p>
-      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you produce records from your own app. <code class="inline">is_poisoned()</code> / <code class="inline">is_recoverable()</code> drive reconnect from a long-lived or async-bridged producer. The client type is <code class="inline">#[cfg(unix)]</code>; on Windows only the re-exports are available.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you produce records from your own app. <code class="inline">is_poisoned()</code> / <code class="inline">is_recoverable()</code> drive reconnect from a long-lived or async-bridged producer. Only <code class="inline">WeirClient::connect</code>, the Unix-socket constructor, is <code class="inline">#[cfg(unix)]</code>. Since 2.0.3 <code class="inline">WeirClient&lt;TlsStream&gt;</code> builds on Windows too, and a dedicated CI job compiles it there on every push — so a Windows producer talks to a Linux/macOS daemon over the mutual-TLS listener using this crate.</p>
       <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/getting-started/integrating.html">→ docs</a></p>
     </div>
 
@@ -93,9 +93,25 @@
     <div class="card">
       <h3>weir-wab</h3>
       <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip">deps: weir-core + crc32fast</span></div>
-      <p class="card-sub">Standalone, runtime-free reader of the on-disk WAB segment format. Point <code class="inline">SegmentReader</code> at any segment file and it streams each record, verifying its CRC32. <code class="inline">FORMAT_VERSION = 1</code> is frozen.</p>
+      <p class="card-sub">Standalone, runtime-free reader of the on-disk WAB segment format. Point <code class="inline">SegmentReader</code> at any segment file and it streams each record, verifying its CRC32. The format is versioned: <code class="inline">FORMAT_VERSION_V1</code> and <code class="inline">FORMAT_VERSION_V2</code> (the zstd-compressed segment) are both readable, with <code class="inline">FORMAT_VERSION_MAX_SUPPORTED</code> naming the ceiling.</p>
       <p class="card-sub" style="margin:0"><b>Reach for it when</b> you build an offline recovery / export / inspection tool. This is the same parser the daemon and <code class="inline">weir-ctl</code> use — one implementation, no drift.</p>
       <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/wab_format.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-sink-s3</h3>
+      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip dim">opt-in <code class="inline">s3-sink</code></span></div>
+      <p class="card-sub">The S3-API object-storage sink — AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph — behind <code class="inline">weir-server</code>'s opt-in <code class="inline">s3-sink</code> feature. SigV4 is hand-rolled rather than pulled from an SDK, which costs one extra dependency instead of sixty-eight.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> your downstream is object storage rather than a database. It is also the proof that <code class="inline">weir-sink-sdk</code> is a contract a third party can build against: it is the first weir sink written <em>outside</em> the daemon, against the SDK alone.</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/sinks/s3.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-rs</h3>
+      <div class="chips"><span class="chip">lib</span><span class="chip">facade</span><span class="chip dim">one version line</span></div>
+      <p class="card-sub">A facade that re-exports the published weir libraries, so a consumer can depend on a single crate and a single version line instead of keeping four in step. The crates.io name is <code class="inline">weir-rs</code> because <code class="inline">weir</code> is owned by another account.</p>
+      <p class="card-sub" style="margin:0"><b>Reach for it when</b> you are starting out and would rather not pick crates yet. Drop down to the individual crates once you know which pieces you actually use — that is what they are separated for.</p>
+      <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/getting-started/integrating.html">→ docs</a></p>
     </div>
 
     <div class="card">
@@ -109,7 +125,7 @@
     <div class="card">
       <h3>weir-server</h3>
       <div class="chips"><span class="chip">bin + lib</span><span class="chip dim">Unix only</span></div>
-      <p class="card-sub">The daemon: socket layer, WAB, bounded queue, worker pool, drain, metrics, config. Built-in sinks: <code class="inline">noop</code>, <code class="inline">http</code>, <code class="inline">mysql</code>, <code class="inline">postgres</code>, and <code class="inline">clickhouse</code> (opt-in feature). TCP + mutual TLS behind the <code class="inline">tls</code> feature.</p>
+      <p class="card-sub">The daemon: socket layer, WAB, bounded queue, worker pool, drain, metrics, config. Built-in sinks: <code class="inline">noop</code>, <code class="inline">http</code>, <code class="inline">mysql</code>, <code class="inline">postgres</code> in a default build, plus <code class="inline">clickhouse</code> and <code class="inline">s3</code> behind the opt-in <code class="inline">clickhouse-sink</code> and <code class="inline">s3-sink</code> features. TCP + mutual TLS behind the <code class="inline">tls</code> feature.</p>
       <p class="card-sub" style="margin:0"><b>Reach for it when</b> you run the buffer as a service. Depend on it <em>only</em> when you actually run the daemon — everything else is in the smaller crates.</p>
       <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/operations/configuration.html">→ docs</a></p>
     </div>
