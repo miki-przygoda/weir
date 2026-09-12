@@ -52,6 +52,21 @@ jobs:
       # a version bump, run scripts/sync-demo-version.sh and commit demo/version.js.
       - run: ./scripts/sync-demo-version.sh && git diff --exit-code demo/version.js
 
+      # Alert rules are config, so they belong in the lint gate rather than
+      # behind the container jobs. `check rules` only parses; `test rules` runs
+      # the unit suite in deploy/prometheus/weir-alerts_test.yml, which pins
+      # every rule in both directions -- a suite that only asserts firing cannot
+      # catch a rule that fires constantly. Verified non-vacuous: flipping
+      # `unless` to `and`, or rate() to a raw difference, fails it.
+      - name: Alert rules parse and behave
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/prometheus:/r:ro" -w /r prom/prometheus:v3.14.0 \
+            check rules weir-alerts.yml
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/deploy/prometheus:/r:ro" -w /r prom/prometheus:v3.14.0 \
+            test rules weir-alerts_test.yml
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
@@ -187,8 +202,12 @@ jobs:
       # Brings up the full docker-compose stack (weir + Prometheus + Grafana +
       # loadgen), simulates load, and asserts the metrics advance, the
       # durability/health invariants hold, and the dashboard's panel queries
-      # return data through Grafana's datasource proxy. Validates the dashboard,
-      # alert rules, and the image build end to end.
+      # return data through Grafana's datasource proxy. Validates the dashboard
+      # and the image build end to end.
+      #
+      # It does NOT validate the alert rules, despite this comment having said
+      # so: smoke-test.sh has thirteen checks and none of them reads an alert.
+      # The rules are unit-tested in the `lint` job with `promtool test rules`.
       - name: Monitoring stack smoke test
         run: deploy/monitoring/smoke-test.sh --teardown
 

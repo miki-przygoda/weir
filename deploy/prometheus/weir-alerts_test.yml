@@ -1,0 +1,417 @@
+# Unit tests for weir-alerts.yml.  Run: promtool test rules weir-alerts_test.yml
+#
+# Until this file existed, no weir alert rule had ever been demonstrated to fire.
+# `grep -rn "ALERTS\|alertmanager\|api/v1/alerts" deploy/ .github/` returned
+# nothing, while ci.yml's monitoring job carried a comment claiming it
+# "Validates the dashboard, alert rules, and the image build end to end" -- the
+# smoke test it runs has thirteen checks and not one looks at an alert.
+# `promtool check rules` only parses the file; it cannot tell a correct rule
+# from an inverted one.
+#
+# Every rule is pinned in BOTH directions. A suite that only asserts firing
+# cannot catch a rule that fires constantly, which is the more corrosive
+# failure: an alert nobody trusts is an alert nobody reads.
+#
+# eval_time is synthetic, so a `for: 15m` rule is exercised instantly and the
+# whole suite runs in about a second. The `for:` durations cost no CI time.
+#
+# GENERATED expectations: severity and annotation text are read out of
+# weir-alerts.yml, so they cannot be mistyped. The behaviour -- which rule fires,
+# in which state, at which time -- is hand-written and is the point.
+
+rule_files:
+  - weir-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+
+  - interval: 1m
+    name: a wedged drain fires - segments sealing, none confirmed
+    input_series:
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="sealed"}'
+        values: "0+10x10"
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="confirmed"}'
+        values: "3+0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirDrainNotConfirming
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir drain is not confirming on w:9185 — segments sealing, none confirmed"
+              description: "Segments are entering the WAB and nothing is leaving it. Because this rests on counters rather than the drain-written drain_state/sink_health gauges, it fires even when the drain thread is wedged and those gauges are frozen at a healthy value. Acked data is accumulating on disk and is not reaching the sink. Check the drain thread and the sink, not the gauges."
+              runbook: "docs/monitoring.md#weirdrainnotconfirming"
+
+  - interval: 1m
+    name: a healthy drain does not fire - both counters advancing
+    input_series:
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="sealed"}'
+        values: "0+10x10"
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="confirmed"}'
+        values: "0+10x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirDrainNotConfirming
+        exp_alerts: []
+
+  - interval: 1m
+    name: an idle daemon does not fire - nothing sealing, nothing at risk
+    input_series:
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="sealed"}'
+        values: "7+0x10"
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="confirmed"}'
+        values: "7+0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirDrainNotConfirming
+        exp_alerts: []
+
+  - interval: 1m
+    name: a wedge after a restart-with-replay still fires
+    input_series:
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="sealed"}'
+        values: "0+10x10"
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="confirmed"}'
+        values: "407+0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirDrainNotConfirming
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir drain is not confirming on w:9185 — segments sealing, none confirmed"
+              description: "Segments are entering the WAB and nothing is leaving it. Because this rests on counters rather than the drain-written drain_state/sink_health gauges, it fires even when the drain thread is wedged and those gauges are frozen at a healthy value. Acked data is accumulating on disk and is not reaching the sink. Check the drain thread and the sink, not the gauges."
+              runbook: "docs/monitoring.md#weirdrainnotconfirming"
+
+  - interval: 1m
+    name: a fresh daemon that has never confirmed still fires
+    input_series:
+      - series: 'weir_wab_segments_total{job="weir",instance="w:9185",state="sealed"}'
+        values: "0+10x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirDrainNotConfirming
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir drain is not confirming on w:9185 — segments sealing, none confirmed"
+              description: "Segments are entering the WAB and nothing is leaving it. Because this rests on counters rather than the drain-written drain_state/sink_health gauges, it fires even when the drain thread is wedged and those gauges are frozen at a healthy value. Acked data is accumulating on disk and is not reaching the sink. Check the drain thread and the sink, not the gauges."
+              runbook: "docs/monitoring.md#weirdrainnotconfirming"
+
+  - interval: 1m
+    name: the drain gauges fire on the state they name
+    input_series:
+      - series: 'weir_drain_state{job="weir",instance="w:9185",state="blocked_dead_letter_full"}'
+        values: "1x20"
+      - series: 'weir_drain_state{job="weir",instance="w:9185",state="stopped"}'
+        values: "1x20"
+      - series: 'weir_sink_health{job="weir",instance="w:9185",state="down"}'
+        values: "1x20"
+      - series: 'weir_sink_health{job="weir",instance="w:9185",state="degraded"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirDrainBlocked
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+              state: "blocked_dead_letter_full"
+            exp_annotations:
+              summary: "weir drain BLOCKED on w:9185 — dead-letter dir full"
+              description: "The dead-letter directory hit its cap; ALL drain activity is paused and the WAB will accumulate on disk. Free dead-letter space or raise dead_letter_max_bytes, then the drain resumes automatically."
+              runbook: "docs/monitoring.md#weirdrainblocked"
+      - eval_time: 10m
+        alertname: WeirDrainStopped
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+              state: "stopped"
+            exp_annotations:
+              summary: "weir drain STOPPED on w:9185 — nothing is being delivered"
+              description: "The drain supervisor has exited and will not restart itself. Records are still acked and buffered durably, but the WAB grows until the disk fills. Restart the daemon; check the logs for a repeated drain panic or a dead-letter open failure. On a deliberate shutdown this clears when the instance stops being scraped."
+              runbook: "docs/monitoring.md#weirdrainstopped"
+      - eval_time: 10m
+        alertname: WeirSinkDown
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+              state: "down"
+            exp_annotations:
+              summary: "weir sink reporting unhealthy on w:9185"
+              description: "The configured sink reports itself unhealthy. The WAB keeps buffering durably (no data loss), but delivery is stalled. Check the downstream system."
+              runbook: "docs/monitoring.md#weirsinkdown"
+      - eval_time: 10m
+        alertname: WeirSinkDegraded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: WeirSinkDegraded
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+              state: "degraded"
+            exp_annotations:
+              summary: "weir sink reporting DEGRADED on w:9185"
+              description: "The configured sink reports itself degraded (reachable but not fully healthy). The WAB keeps buffering durably, but delivery may be impaired. Check the downstream system; correlate with WeirSegmentStranded / WeirDeadLettered."
+              runbook: "docs/monitoring.md#weirsinkdegraded"
+
+  - interval: 1m
+    name: a healthy drain trips none of the gauge rules
+    input_series:
+      - series: 'weir_drain_state{job="weir",instance="w:9185",state="blocked_dead_letter_full"}'
+        values: "0x20"
+      - series: 'weir_drain_state{job="weir",instance="w:9185",state="stopped"}'
+        values: "0x20"
+      - series: 'weir_drain_state{job="weir",instance="w:9185",state="draining"}'
+        values: "1x20"
+      - series: 'weir_sink_health{job="weir",instance="w:9185",state="down"}'
+        values: "0x20"
+      - series: 'weir_sink_health{job="weir",instance="w:9185",state="degraded"}'
+        values: "0x20"
+      - series: 'weir_sink_health{job="weir",instance="w:9185",state="healthy"}'
+        values: "1x20"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WeirDrainBlocked
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WeirDrainStopped
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WeirSinkDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WeirSinkDegraded
+        exp_alerts: []
+
+  - interval: 1m
+    name: one durability event fires its rule
+    input_series:
+      - series: 'weir_wab_fsync_failures_total{job="weir",instance="w:9185"}'
+        values: "0 0 1 1 1 1 1 1"
+      - series: 'weir_wab_flusher_panics_total{job="weir",instance="w:9185"}'
+        values: "0 0 1 1 1 1 1 1"
+      - series: 'weir_ack_timeout_total{job="weir",instance="w:9185"}'
+        values: "0 0 1 1 1 1 1 1"
+      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
+        values: "0 0 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WeirFsyncFailure
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir fsync FAILED on w:9185 — durability hazard"
+              description: "fdatasync returned an error: a record could not be guaranteed on stable storage. The producer was Nacked (no false ack — DST-verified), so no data was silently lost, but the disk/filesystem needs investigation."
+              runbook: "docs/monitoring.md#weirfsyncfailure"
+      - eval_time: 5m
+        alertname: WeirFlusherPanic
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir WAB flusher panicked on w:9185"
+              description: "A flusher thread panicked. The supervisor respawns it up to 10× (linear backoff) then takes the shard permanently offline (Nack-everything until restart). Repeated panics = a logical bug; capture the panic log."
+              runbook: "docs/monitoring.md#weirflusherpanic"
+      - eval_time: 5m
+        alertname: WeirAckTimeout
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir ack timed out on w:9185 — flusher may be wedged"
+              description: "A record's ack never fired within the timeout without a panic — the classic wedged-flusher signature (e.g. a stuck fsync). Check fsync latency and the flusher threads."
+              runbook: "docs/monitoring.md#weiracktimeout"
+      - eval_time: 5m
+        alertname: WeirSegmentQuarantined
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir quarantined a corrupt segment on w:9185"
+              description: "Crash recovery found a segment with bad magic, an unknown format version, or a CRC mismatch and moved it to the quarantine directory. Data-integrity event — inspect the quarantined file."
+              runbook: "docs/monitoring.md#weirsegmentquarantined"
+
+  - interval: 1m
+    name: a quiet daemon trips no durability rule
+    input_series:
+      - series: 'weir_wab_fsync_failures_total{job="weir",instance="w:9185"}'
+        values: "0x15"
+      - series: 'weir_wab_flusher_panics_total{job="weir",instance="w:9185"}'
+        values: "0x15"
+      - series: 'weir_ack_timeout_total{job="weir",instance="w:9185"}'
+        values: "0x15"
+      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
+        values: "0x15"
+      - series: 'up{job="weir",instance="w:9185"}'
+        values: "1x15"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WeirFsyncFailure
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WeirFlusherPanic
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WeirAckTimeout
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WeirSegmentQuarantined
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WeirInstanceDown
+        exp_alerts: []
+
+  - interval: 1m
+    name: a scrape target that goes away fires WeirInstanceDown
+    input_series:
+      - series: 'up{job="weir",instance="w:9185"}'
+        values: "1 1 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WeirInstanceDown
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir instance w:9185 is down"
+              description: "Prometheus cannot scrape weir's /metrics. The daemon is unreachable or dead — producers are likely failing to connect."
+              runbook: "docs/monitoring.md#weirinstancedown"
+
+  - interval: 1m
+    name: stranded segments and dead-lettered records fire
+    input_series:
+      - series: 'weir_drain_segments_stranded_total{job="weir",instance="w:9185"}'
+        values: "0 0 1 1 1 1 1 1"
+      - series: 'weir_sink_commit_records_total{job="weir",instance="w:9185",outcome="dead_lettered"}'
+        values: "0 0 5 5 5 5 5 5"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WeirSegmentStranded
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir stranded a WAB segment on w:9185 — delivery paused"
+              description: "The drain exhausted sink_max_retries of TRANSIENT sink failures on a segment and left it on disk. The data is durable (no loss), but delivery is paused. Fix the sink (correlate with WeirSinkDown); the drain re-drains stranded segments automatically when the sink recovers (watch weir_drain_segments_resumed_total), or on restart."
+              runbook: "docs/monitoring.md#weirsegmentstranded"
+      - eval_time: 5m
+        alertname: WeirDeadLettered
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              outcome: "dead_lettered"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir is dead-lettering records on w:9185"
+              description: "The sink permanently rejected records (e.g. a 4xx). They are written to the dead-letter directory for manual handling, not retried. Inspect the dead-letter files + the sink's rejection reason."
+              runbook: "docs/monitoring.md#weirdeadlettered"
+
+  - interval: 1m
+    name: committed records do not fire the dead-letter rule
+    input_series:
+      - series: 'weir_sink_commit_records_total{job="weir",instance="w:9185",outcome="committed"}'
+        values: "0+100x15"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WeirDeadLettered
+        exp_alerts: []
+
+  - interval: 1m
+    name: queue depth under the threshold does not fire
+    input_series:
+      - series: 'weir_queue_depth{job="weir",instance="w:9185"}'
+        values: "49000x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirQueueSaturation
+        exp_alerts: []
+
+  - interval: 1m
+    name: a saturated queue fires
+    input_series:
+      - series: 'weir_queue_depth{job="weir",instance="w:9185"}'
+        values: "60000x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirQueueSaturation
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir queue depth sustained high on w:9185 (60000)"
+              description: "The work queue is backing up — the WAB flushers can't keep pace with ingest (usually storage pressure). Correlate with fsync latency. Producers see backpressure (slower acks)."
+              runbook: "docs/monitoring.md#weirqueuesaturation"
+
+  - interval: 1m
+    name: a rejected peer fires; three TLS failures stay under the threshold
+    input_series:
+      - series: 'weir_connection_rejected_peer_uid_total{job="weir",instance="w:9185"}'
+        values: "0 0 1 1 1 1 1 1"
+      - series: 'weir_tls_handshake_failures_total{job="weir",instance="w:9185"}'
+        values: "0 0 3 3 3 3 3 3"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WeirUnauthorizedConnections
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir rejected connections by peer-UID on w:9185"
+              description: "A process whose UID is not allowed tried to connect over the Unix socket and was rejected by the SO_PEERCRED check. Either a misconfigured producer (wrong user) or an unauthorized client."
+              runbook: "docs/monitoring.md#weirunauthorizedconnections"
+      - eval_time: 5m
+        alertname: WeirTlsHandshakeFailures
+        exp_alerts: []
+
+  - interval: 1m
+    name: a TLS handshake flood fires
+    input_series:
+      - series: 'weir_tls_handshake_failures_total{job="weir",instance="w:9185"}'
+        values: "0+10x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirTlsHandshakeFailures
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir TLS handshake failures on w:9185"
+              description: "(tls feature) Repeated mutual-TLS handshake failures — client-cert expiry/rotation, a CA mismatch, or a probe hitting the TCP port. Check the client certificates and the CA bundle."
+              runbook: "docs/monitoring.md#weirtlshandshakefailures"
