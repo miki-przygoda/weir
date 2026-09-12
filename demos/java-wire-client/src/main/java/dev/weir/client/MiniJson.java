@@ -125,7 +125,26 @@ public final class MiniJson {
         if (num.contains(".") || num.contains("e") || num.contains("E")) {
             return Double.parseDouble(num);
         }
-        return Long.parseLong(num);
+        try {
+            return Long.parseLong(num);
+        } catch (NumberFormatException signed) {
+            // A u64 above Long.MAX_VALUE is a legitimate wire value, not bad
+            // input: RecordCoordinate's `index` is a u64, and the tracked
+            // conformance vectors exercise u64::MAX (18446744073709551615).
+            // Long.parseLong rejects it, so this class could not read
+            // wire_v1_tracked_vectors.json at all.
+            //
+            // parseUnsignedLong keeps the bits; callers read them back with
+            // Long.toUnsignedString / Long.compareUnsigned, which is how a u64
+            // is handled everywhere else in this client. BigInteger is the
+            // last resort for a number genuinely outside u64 -- no weir field
+            // is that wide, so reaching it means the document is not ours.
+            try {
+                return Long.parseUnsignedLong(num);
+            } catch (NumberFormatException unsigned) {
+                return new java.math.BigInteger(num);
+            }
+        }
     }
 
     private void expect(String token) {
