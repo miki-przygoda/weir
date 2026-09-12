@@ -18,15 +18,15 @@ import {
   crc,
   encodeFrame,
   nackReasonName,
+  maxResponsePayload,
+  decodeCoordinate,
+  MAX_TRACKED_ACK_PAYLOAD,
+  type RecordCoordinate,
 } from "./wire.ts";
 
-/**
- * Every response THIS client can receive is <= 2 bytes; a larger declared len
- * is a desync. It never sends PushTracked (0x06), so AckTracked (0x07) and its
- * up-to-298-byte coordinate are out of scope -- cap by message type if that
- * changes.
- */
-const MAX_RESPONSE_PAYLOAD = 2;
+// The cap now moves with the message type (see maxResponsePayload in wire.ts):
+// this client sends PushTracked, so AckTracked's up-to-298-byte coordinate is
+// in scope for exactly that one frame type and for nothing else.
 
 export class WireError extends Error {
   // Explicit field (parameter properties don't survive Node strip-only mode).
@@ -56,16 +56,41 @@ export class NackError extends WireError {
   get isTransient(): boolean {
     return this.reason === NackReason.InternalError;
   }
+
+  /**
+   * True when this Nack is a daemon that predates PushTracked (0x06).
+   *
+   * The wire cannot distinguish that from any other unknown message type, so
+   * only the caller knows which question it asked -- this is meaningful solely
+   * on the reply to a pushTracked(). Do not retry on this connection: the
+   * daemon closes it. Open a new one and use push().
+   */
+  get meansNoTrackedSupport(): boolean {
+    return this.reason === NackReason.UnknownMessage;
+  }
 }
 
 export interface PushResult {
   acked: true;
 }
 
-interface Pending {
-  resolve: (r: PushResult) => void;
-  reject: (e: Error) => void;
-}
+/**
+ * A queued request, discriminated by what it asked for.
+ *
+ * This used to be one shape whose resolve took a PushResult, and dispatch
+ * resolved an Ack and a HealthCheckResponse identically with `{acked:true}`.
+ * There was nowhere to put a coordinate, and no way to express "this pending
+ * wanted one and got a bare Ack".
+ *
+ * The alternative -- widening PushResult to carry an optional coordinate --
+ * was rejected: it makes a tracked caller null-check something that is never
+ * absent on success, which is exactly the shape that invites ignoring a missing
+ * coordinate. A distinct message type exists because the REQUEST determines the
+ * response shape; the queue should encode the same invariant.
+ */
+type Pending =
+  | { kind: "push"; resolve: (r: PushResult) => void; reject: (e: Error) => void }
+  | { kind: "tracked"; resolve: (c: RecordCoordinate) => void; reject: (e: Error) => void };
 
 export interface ClientOpts {
   socketPath: string;
@@ -129,10 +154,19 @@ export class WeirClient {
         return this.fail(new WireError("response: bad header CRC (desync)", true));
       }
       const payloadLen = this.buf.readUInt32LE(8);
-      // Cap the response payload before allocating (spec checklist).
-      if (payloadLen > MAX_RESPONSE_PAYLOAD) {
+      // Cap before allocating (spec checklist), by the type the header
+      // declares. The header CRC has already been verified above, so the type
+      // byte is trustworthy at this point -- checking the cap against an
+      // unverified byte would let a flipped bit widen the bound.
+      const declaredType = this.buf.readUInt8(5);
+      const cap = maxResponsePayload(declaredType);
+      if (payloadLen > cap) {
         return this.fail(
-          new WireError(`response: payload_len ${payloadLen} > ${MAX_RESPONSE_PAYLOAD} (desync)`, true),
+          new WireError(
+            `response: payload_len ${payloadLen} > ${cap} for message_type ` +
+              `0x${declaredType.toString(16)} (desync)`,
+            true,
+          ),
         );
       }
       const total = HEADER_LEN + payloadLen + 4;
@@ -160,8 +194,37 @@ export class WeirClient {
     switch (messageType) {
       case MessageType.Ack:
       case MessageType.HealthCheckResponse:
+        if (pending.kind === "tracked") {
+          // A bare Ack in reply to a PushTracked is an error, not a success.
+          // The request determines the response shape, so an Ack here means the
+          // peer did not understand what was asked -- and resolving it would
+          // report a coordinate that does not exist.
+          pending.reject(
+            new WireError(
+              "daemon answered a PushTracked with a bare Ack; the record may be " +
+                "durable but its coordinate is unknown",
+              true,
+            ),
+          );
+          return;
+        }
         pending.resolve({ acked: true });
         return;
+      case MessageType.AckTracked: {
+        if (pending.kind !== "tracked") {
+          // An AckTracked for a request that never asked to be tracked is a
+          // desync: the queue and the wire disagree about what is in flight.
+          return this.fail(
+            new WireError("response: AckTracked for an untracked request (desync)", true),
+          );
+        }
+        try {
+          pending.resolve(decodeCoordinate(payload));
+        } catch (e) {
+          pending.reject(e as Error);
+        }
+        return;
+      }
       case MessageType.Nack: {
         const reason = payload.length > 0 ? payload.readUInt8(0) : NackReason.InternalError;
         const daemonVersion =
@@ -180,29 +243,48 @@ export class WeirClient {
     }
   }
 
+  /**
+   * Queue a request whose reply is a plain Ack (or HealthCheckResponse).
+   *
+   * `kind` is what lets dispatch tell an expected Ack from one that answers a
+   * question it was not asked.
+   */
   private send(frame: Buffer): Promise<PushResult> {
+    return this.enqueue<PushResult>(frame, (resolve, reject) => ({
+      kind: "push",
+      resolve,
+      reject,
+    }));
+  }
+
+  /** Queue a request whose reply carries a coordinate. */
+  private sendTracked(frame: Buffer): Promise<RecordCoordinate> {
+    return this.enqueue<RecordCoordinate>(frame, (resolve, reject) => ({
+      kind: "tracked",
+      resolve,
+      reject,
+    }));
+  }
+
+  private enqueue<T>(
+    frame: Buffer,
+    make: (resolve: (v: T) => void, reject: (e: Error) => void) => Pending,
+  ): Promise<T> {
     if (this.connClosed || !this.sock) {
       return Promise.reject(this.closeErr ?? new WireError("not connected", true));
     }
-    return new Promise<PushResult>((resolve, reject) => {
-      const pending: Pending = { resolve, reject };
+    return new Promise<T>((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
       if (this.opts.timeoutMs) {
         timer = setTimeout(() => {
           this.fail(new WireError(`request timed out after ${this.opts.timeoutMs}ms`, true));
         }, this.opts.timeoutMs);
       }
-      const wrap: Pending = {
-        resolve: (r) => {
-          if (timer) clearTimeout(timer);
-          resolve(r);
-        },
-        reject: (e) => {
-          if (timer) clearTimeout(timer);
-          reject(e);
-        },
+      const clear = <A,>(f: (a: A) => void) => (a: A) => {
+        if (timer) clearTimeout(timer);
+        f(a);
       };
-      this.queue.push(wrap);
+      this.queue.push(make(clear(resolve), clear(reject)));
       this.sock!.write(frame);
     });
   }
@@ -211,6 +293,25 @@ export class WeirClient {
   push(payload: Buffer | string, durability: Durability = Durability.Durable): Promise<PushResult> {
     const body = typeof payload === "string" ? Buffer.from(payload, "utf8") : payload;
     return this.send(encodeFrame(body, { messageType: MessageType.Push, durability }));
+  }
+
+  /**
+   * Push a record and learn where it landed.
+   *
+   * Identical to push() in every other respect -- same tiers, same caps, same
+   * Nack reasons -- but answered with an AckTracked carrying the coordinate.
+   * A daemon predating the type answers Nack(UnknownMessage) and closes the
+   * connection; `NackError.meansNoTrackedSupport` names that case. Open a new
+   * connection and use push().
+   */
+  pushTracked(
+    payload: Buffer | string,
+    durability: Durability = Durability.Durable,
+  ): Promise<RecordCoordinate> {
+    const body = typeof payload === "string" ? Buffer.from(payload, "utf8") : payload;
+    return this.sendTracked(
+      encodeFrame(body, { messageType: MessageType.PushTracked, durability }),
+    );
   }
 
   /** Liveness probe — zero-length HealthCheck frame. */
