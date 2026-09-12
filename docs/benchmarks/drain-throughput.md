@@ -88,9 +88,42 @@ between a suite that can detect a regression and one that cannot.
 *flattens* curves", from `bulk / (bulk - excluded)` = 1000/751. Its 249-of-1,000
 observation reproduces exactly, but the sink also *overshoots* the target
 between 1 ms polls by a similar amount — head exclusion and tail overshoot are
-one batch-granularity effect with opposite signs. Measured in the window: 996,
-not 751. So the numerator error is **0.4%** on NDJSON and **negative** on
-`per_record`.
+one batch-granularity effect with opposite signs. Measured in the window across seven
+runs: 847-1045, not 751 — an error from **-4.3% to +18.1%**, scattered either
+side of zero rather than a systematic overstatement. See the table below.
+
+**Across three hosts and seven runs, the numerator error is scattered, not
+systematic.** Every post-fix observation collected on 2026-09-12 — macOS (2),
+beast (3), CI (2):
+
+| Scenario | `excluded_before_t0` | `delivered_records` | what the old numerator did |
+|---|---|---|---|
+| `drain_http_ndjson` | 200–249 | 847–1045 | **−4.3% to +18.1%** |
+| `drain_http_per_record` | 1–19 | 1000–1074 | −6.9% to 0.0% |
+| `drain_slow_sink_1ms_conc16` | 1–16 | 498–513 | −2.5% to +0.4% |
+
+Both quantities take a small set of values rather than a stable one, because
+both are governed by the 100-record sink batch: NDJSON delivers in 100-record
+POSTs, so a large and variable slice lands between two 1 ms polls at each end of
+the window, while per-record delivery puts almost nothing there (1–19 records).
+That is why the exclusion is big only on NDJSON — and why it does not become a
+33% overstatement: the overshoot past the target offsets it by a similar,
+independently varying amount, so the net swings either side of zero.
+
+So the sweep's observation was sound and its inference was not. Deriving the
+error from the excluded head alone gives 1000/751 = 1.33x; measuring both ends of
+the window gives a spread from −4.3% to +18.1% on the same scenario, centred near
+zero. A correction that large and that one-directional was never there to find.
+
+Two further notes on reading the table. `drain_slow_sink_1ms_conc16` reports
+`wall_ms` 45 on beast and 45–47 on CI: a 1 ms-delay sink at concurrency 16 is
+rate-limited largely independently of the host, which is why removing the retry
+backoff from its window collapsed its spread so sharply. And CI's NDJSON window
+is 4–5 ms, *narrower* than beast's 8–11 ms, with a correspondingly higher rate
+(195,586–234,123). That is not a faster drain: the confirm path calls `sync_all`,
+an honest `fdatasync` to a SATA SSD on beast and much cheaper on virtualised
+runner storage — the same reason every row here records `wab_backing()`. It makes
+the quantisation worse on CI, not better.
 
 **NDJSON remains unfit for a Linux conclusion**, and this fix does not change
 that. Its window is 8–11 ms against a 1 ms poll — about eight ticks — with
