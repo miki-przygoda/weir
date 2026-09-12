@@ -20,7 +20,12 @@ import {
   nackReasonName,
 } from "./wire.ts";
 
-/** Every weir response payload is <= 2 bytes; a larger declared len is a desync. */
+/**
+ * Every response THIS client can receive is <= 2 bytes; a larger declared len
+ * is a desync. It never sends PushTracked (0x06), so AckTracked (0x07) and its
+ * up-to-298-byte coordinate are out of scope -- cap by message type if that
+ * changes.
+ */
 const MAX_RESPONSE_PAYLOAD = 2;
 
 export class WireError extends Error {

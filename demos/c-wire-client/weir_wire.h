@@ -26,7 +26,10 @@
 /* MAX_PAYLOAD_HARD_CAP — absolute ceiling across all code paths (16 MiB). */
 #define WEIR_MAX_PAYLOAD_HARD_CAP  (16u * 1024u * 1024u)
 
-/* Response payloads are <= 2 bytes; never allocate an attacker-chosen size. */
+/* Every response THIS client can receive is <= 2 bytes -- it never sends
+ * PushTracked (0x06), so it never receives AckTracked (0x07), which carries a
+ * coordinate of up to 298. Cap by message type if that changes. Never
+ * allocate an attacker-chosen size. */
 #define WEIR_MAX_RESPONSE_PAYLOAD  2
 
 /* MessageType bytes (docs: "Message types"). */
