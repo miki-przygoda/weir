@@ -31,7 +31,7 @@ record" baseline:
 
 - **Push records** (one, ten, or a stream) and watch tokens flow
   Producer → Socket → WAB → fsync → Ack, then drain in **batches** to the sink.
-- **Toggle the durability tier** (Sync / Batched / Buffered) and see the effect
+- **Toggle the durability tier** (Durable / Buffered) and see the effect
   on ack latency and on what survives a crash.
 - **Crash the daemon** mid-flight and **Restart** to watch unconfirmed WAB
   segments replay — the visual proof of *"an ack is never a false ack."*
@@ -39,10 +39,20 @@ record" baseline:
   commits (the N→1 compression), and records lost on crash.
 
 It's a *simulation*, not the daemon (no Unix-socket daemon in a browser), but the
-model follows weir's real semantics. Latency figures are rounded from the
-project's CI benchmarks (Sync/Batched ≈ 0.36 ms ack, Buffered ≈ 0.07 ms); the
-naive baseline models a synchronous insert + commit round-trip (~8 ms), one
-commit per record.
+model follows weir's real semantics.
+
+Latency figures come from the operator-run captures README.md publishes with
+their hardware and fsync primitive named — **not** from CI. `docs/benchmarks/environments.md`
+forbids citing `latest.md`/`history.md` for an external claim, and this bundle is
+the most external artifact in the tree. A `Durable` ack is one fsync, so it is
+the disk's number: ~1.5 ms on a SATA SSD with an honest Linux `fdatasync`, and
+~133 µs on a Mac NVMe, where macOS uses `F_BARRIERFSYNC` — a write barrier
+rather than a full flush, and not power-loss safe. The simulation uses the
+honest Linux figure. `Buffered` is ~19 µs on the same box.
+
+The naive baseline (~8 ms, one commit per record) is **modelled**, not measured:
+a synchronous remote insert + commit round-trip. It is not a weir benchmark
+figure — adjust it mentally for your own database.
 
 ## Hosting / integration
 
