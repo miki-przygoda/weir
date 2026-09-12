@@ -68,8 +68,8 @@ weir-server --socket-path /tmp/weir-demo/weir.sock \
             --wab-dir /tmp/weir-demo/wab --metrics-port 19102
 
 <span class="c"># HealthCheck probe, then N records at a durability tier:</span>
-./telemetry /tmp/weir-demo/weir.sock 8 sync
-./telemetry /tmp/weir-demo/weir.sock 5 batched
+./telemetry /tmp/weir-demo/weir.sock 8 durable
+./telemetry /tmp/weir-demo/weir.sock 5 buffered
 
 <span class="c"># exercise the error paths (5 PASS):</span>
 ./negative /tmp/weir-demo/weir.sock</pre>

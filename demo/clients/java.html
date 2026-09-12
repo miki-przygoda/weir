@@ -30,7 +30,7 @@
   <div class="hero">
     <p class="role"><a href="../examples.html">← Example projects</a></p>
     <h1>Java <span class="accent">· weir wire client</span></h1>
-    <p class="tag"><strong>An enterprise audit-event logger.</strong> A self-contained JDK producer that speaks the weir v1 wire protocol over a Unix domain socket — built from the spec, <em>zero weir-crate deps</em>, only the JDK standard library (no Maven, no Gradle, no third-party jars) — writing each audit event at <code class="inline">Sync</code> durability, so the producer only proceeds once the record is fsynced.</p>
+    <p class="tag"><strong>An enterprise audit-event logger.</strong> A self-contained JDK producer that speaks the weir v1 wire protocol over a Unix domain socket — built from the spec, <em>zero weir-crate deps</em>, only the JDK standard library (no Maven, no Gradle, no third-party jars) — writing each audit event at <code class="inline">Durable</code> durability, so the producer only proceeds once the record is fsynced.</p>
     <div class="chips" style="gap:8px">
       <span class="chip wire">30/30 conformance vectors</span>
       <span class="chip wire">byte-exact</span>
@@ -43,7 +43,7 @@
     <div class="panel-title">What it is</div>
     <div class="panel-body">
       <p>A clean polyglot Java implementation of the wire, written straight from <code class="inline">docs/wire_protocol.md</code> with no dependency on any weir crate — exactly what a skeptical enterprise team would write to integrate a JVM service with weir without pulling in a Rust toolchain. It uses <code class="inline">UnixDomainSocketAddress</code> + <code class="inline">SocketChannel</code> (JDK 21+) for the transport and <code class="inline">java.util.zip.CRC32</code> for the CRC.</p>
-      <p style="margin-bottom:0">The domain is enterprise event logging: <code class="inline">AuditEventProducer</code> streams structured JSON audit events to weir at <em>Sync</em> durability — so an <code class="inline">Ack</code> means "on stable storage", the guarantee a compliance auditor cares about.</p>
+      <p style="margin-bottom:0">The domain is enterprise event logging: <code class="inline">AuditEventProducer</code> streams structured JSON audit events to weir at <em>Durable</em> durability — so an <code class="inline">Ack</code> means "on stable storage", the guarantee a compliance auditor cares about.</p>
     </div>
   </div>
 

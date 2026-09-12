@@ -78,10 +78,10 @@ curl -s localhost:8787/api/users</pre>
   <div class="panel">
     <div class="panel-title">src/wire.ts <span class="pt-right">frame encode — 16-byte header + payload + CRC32</span></div>
     <div class="panel-body">
-<pre class="code"><span class="c">// Encode a frame. Defaults to a Push at Sync durability.</span>
+<pre class="code"><span class="c">// Encode a frame. Defaults to a Push at Durable durability.</span>
 <span class="k">export function</span> <span class="f">encodeFrame</span>(payload: <span class="t">Buffer</span>, opts: <span class="t">EncodeOpts</span> = {}): <span class="t">Buffer</span> {
   <span class="k">const</span> messageType = opts.messageType ?? MessageType.Push;
-  <span class="k">const</span> durability = opts.durability ?? Durability.Sync;
+  <span class="k">const</span> durability = opts.durability ?? Durability.Durable;
   <span class="k">const</span> flags = opts.flags ?? <span class="t">0</span>;
 
   <span class="k">const</span> frame = <span class="t">Buffer</span>.<span class="f">allocUnsafe</span>(HEADER_LEN + payload.length + <span class="t">4</span>);
