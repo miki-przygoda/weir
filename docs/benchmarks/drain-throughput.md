@@ -57,10 +57,9 @@ cross-scenario ratios further down compare across both.
 observed, and every row emits `excluded_before_t0` and `wakeup_ms` so it states
 its own basis.
 
-**What the correction is worth, measured.** On beast — Linux 7.0.0, 4 CPUs,
-ext4 `rw,relatime` on a Samsung SSD 850 EVO 250 GB (SATA, non-rotational), honest
-`fdatasync`; drive write-cache state requires sudo and is **undisclosed** —
-three iterations of v3.0.0, and the pre-fix number recovered exactly from the
+**What the correction is worth, measured.** On beast — Intel Core i9-9900K
+(8c/16t), 31 GiB, Linux 7.0.0, ext4 `rw,relatime` on a Samsung SSD 850 EVO
+250 GB (SATA, non-rotational), honest `fdatasync` — three iterations of v3.0.0, and the pre-fix number recovered exactly from the
 same runs' `wall_ms` + `wakeup_ms` + the known `bulk()` constant, which makes
 the comparison paired rather than run-against-run:
 
@@ -69,6 +68,17 @@ the comparison paired rather than run-against-run:
 | `drain_http_per_record` | 30,623 / 30,635 / 27,139 | 31,580 / 31,600 / 31,803 | 1.13x → **1.007x** |
 | `drain_slow_sink_1ms_conc16` | 8,475 / 9,804 / 8,621 | 11,008 / 11,012 / 11,034 | 1.16x → **1.002x** |
 | `drain_http_ndjson` | 67,842 / 106,358 / 118,710 | 80,385 / 86,056 / 100,518 | 1.75x → 1.25x |
+
+Two properties of this box that no benchmark file here has recorded, both of
+which change how its numbers should be read. The kernel boots with
+**`isolcpus=2-7,10-15`**, so twelve of the sixteen logical CPUs are held out of
+the default scheduler and an unpinned process is confined to four (`0,1,8,9`) —
+which is why `nproc` reports 4 while `nproc --all` reports 16. weir's worker pool
+pins from core 2 upward (`WORKER_CORE_START`), i.e. into the isolated range, so
+the daemon's workers get uncontended cores while the test harness and client do
+not. And the **drive's write-cache state requires sudo and is undisclosed**,
+which matters for a `Durable` claim on SATA hardware even though this file
+measures the `Buffered` fill path.
 
 The reconstruction checks out against this file's own history: the pre-fix
 `drain_slow_sink_1ms_conc16` median of 8,621 sits beside the `linux-ssd` median
