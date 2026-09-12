@@ -122,7 +122,9 @@ public final class ConformanceRunner {
     }
 
     private static boolean isClientEmittable(Wire.MessageType mt) {
-        return mt == Wire.MessageType.PUSH || mt == Wire.MessageType.HEALTH_CHECK;
+        return mt == Wire.MessageType.PUSH
+            || mt == Wire.MessageType.HEALTH_CHECK
+            || mt == Wire.MessageType.PUSH_TRACKED;
     }
 
     private static String toSpecName(Wire.MessageType mt) {
@@ -132,6 +134,8 @@ public final class ConformanceRunner {
             case NACK: return "Nack";
             case HEALTH_CHECK: return "HealthCheck";
             case HEALTH_CHECK_RESPONSE: return "HealthCheckResponse";
+            case PUSH_TRACKED: return "PushTracked";
+            case ACK_TRACKED: return "AckTracked";
             default: return mt.name();
         }
     }

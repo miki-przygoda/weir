@@ -50,13 +50,51 @@ public final class Wire {
      */
     public static final int MAX_RESPONSE_PAYLOAD = 2;
 
+    /**
+     * RecordCoordinate layout (spec, "AckTracked payload"):
+     * <pre>
+     *   0   1   coordinate_version (0x01)
+     *   1   8   index        u64 LE, 1-based within the segment
+     *   9  32   record_id    SHA-256
+     *  41   2   segment_len  u16 LE
+     *  43 var   segment      UTF-8, &lt;= 255 bytes
+     * </pre>
+     */
+    public static final byte COORDINATE_VERSION = 1;
+    public static final int COORDINATE_FIXED_LEN = 1 + 8 + 32 + 2;
+    public static final int MAX_SEGMENT_NAME_LEN = 255;
+
+    /** The largest AckTracked payload, and the only reason the cap is not just 2. */
+    public static final int MAX_TRACKED_ACK_PAYLOAD = COORDINATE_FIXED_LEN + MAX_SEGMENT_NAME_LEN;
+
+    /**
+     * Cap for a response of this type, applied before any allocation.
+     *
+     * <p>{@code AckTracked} is the only weir response whose payload exceeds two
+     * bytes, so the bound is widened for exactly that type. Widening it for
+     * anything else would let a desynced peer use a stray type byte to unlock a
+     * bigger read.
+     */
+    public static int maxResponsePayload(int messageTypeByte) {
+        return (messageTypeByte & 0xFF) == (MessageType.ACK_TRACKED.code & 0xFF)
+                ? MAX_TRACKED_ACK_PAYLOAD
+                : MAX_RESPONSE_PAYLOAD;
+    }
+
     /** Message type bytes (see spec "Message types" table). */
     public enum MessageType {
         PUSH((byte) 0x01),
         ACK((byte) 0x02),
         NACK((byte) 0x03),
         HEALTH_CHECK((byte) 0x04),
-        HEALTH_CHECK_RESPONSE((byte) 0x05);
+        HEALTH_CHECK_RESPONSE((byte) 0x05),
+        /**
+         * Additive within wire v1: message-type bytes 0x08-0xFF are reserved
+         * for exactly this, so WIRE_VERSION stays 1 and the 30 frozen vectors
+         * are untouched. A daemon predating these answers Nack(UnknownMessage).
+         */
+        PUSH_TRACKED((byte) 0x06),
+        ACK_TRACKED((byte) 0x07);
 
         public final byte code;
 

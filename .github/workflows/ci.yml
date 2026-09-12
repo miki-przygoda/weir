@@ -121,6 +121,7 @@ jobs:
           cd demos/java-wire-client
           javac -d out $(find src -name '*.java')
           java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
+          java -cp out dev.weir.client.TrackedConformanceRunner ../../docs/conformance/wire_v1_tracked_vectors.json
       - name: TypeScript demo client conformance
         run: cd demos/ts-wire-client && node src/conformance.ts && node src/conformance_tracked.ts
 
