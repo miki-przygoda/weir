@@ -42,12 +42,22 @@ dashboard JSON (pick your Prometheus datasource on import). **Turnkey demo:**
 `cd deploy/monitoring && docker compose up --build`, then open Grafana at
 `http://localhost:3000`.
 
-**See an alert actually fire.** The demo's opt-in `chaos` profile
-(`docker compose --profile chaos up`) deliberately drives a permanently-failing
-sink, a full dead-letter dir, and peer-UID rejections — so you can watch
-`WeirDeadLettered`, `WeirDrainBlocked`, `WeirSinkDown`, and
-`WeirUnauthorizedConnections` go red and rehearse the runbook below against a
-live signal before you need it in anger.
+**See what an alert does before you need it in anger.** The rules are unit
+tested — `promtool test rules deploy/prometheus/weir-alerts_test.yml` pins every
+rule in both directions and runs in about a second, so you can read the suite to
+see exactly which series state produces which alert.
+
+The demo's opt-in `chaos` profile (`docker compose --profile chaos up`)
+deliberately drives a permanently-failing sink, a full dead-letter dir, and
+peer-UID rejections. **It will not make the shipped alerts go red, and this
+document used to claim otherwise.** Every rule selects `job=~"weir"`, PromQL
+matchers are fully anchored, and the chaos instance is scraped as
+`job="weir-chaos"` (`deploy/monitoring/prometheus.yml`), so it matches no rule —
+which is deliberate, so an idle chaos profile does not trip `WeirInstanceDown`
+(`deploy/monitoring/README.md`). To watch a rule fire against live data, scrape
+the failing instance under a job name the rules match. Note also that
+`WeirSinkDown` is unreachable from that profile regardless: the failmock returns
+400, and `sink/http.rs:645` maps any client error to `Degraded`, not `Down`.
 
 Alert selectors assume a `job="weir"` scrape job — adjust `job=~"weir"` to match
 your scrape config.
@@ -123,6 +133,39 @@ thresholds: measured p99.9 is ~2.4 ms on NVMe and ~6 ms on a SATA SSD — set
 If latency is *normal for your medium*, raise the threshold rather than chase it.
 
 ### Drain / dead-letter
+
+#### WeirDrainNotConfirming
+Segments are entering the WAB and none are leaving it. **This is the only rule
+here that can see a wedged drain**, so treat it as authoritative even when every
+other drain signal looks healthy.
+
+`weir_drain_state` and `weir_sink_health` are written *only* by the drain thread
+(`drain/mod.rs`). When that thread wedges they freeze at their last value, so
+`WeirDrainBlocked`, `WeirDrainStopped`, `WeirSinkDown` and `WeirSinkDegraded` are
+all silent in exactly the incident they exist for, and `weir-readiness.sh` prints
+`READY` throughout. This rule rests on `weir_wab_segments_total` instead — a
+counter incremented by the WAB flusher (`sealed`) and by the drain's confirm path
+(`confirmed`) — so neither side depends on the drain publishing its own health.
+
+**Respond:** do not start from the gauges, they are lying by omission. Check
+whether the drain thread is alive and what it is blocked on, then the sink.
+`weir_wab_bytes_on_disk` is a useful second opinion: it is written by the main
+poll task rather than the drain, so it stays live during a wedge and should be
+climbing.
+
+**Two shapes of this rule are wrong**, both documented in the rule's own comment.
+A raw `sealed - confirmed` difference is blind after a restart-with-replay, since
+recovery replays segments sealed by the previous process and `confirmed` can
+restart far above `sealed` — measured at 417 segments of headroom, roughly
+104 GiB at the default `wab_segment_max_bytes`. And `-` rather than `unless`
+silently never fires on a daemon that has not yet confirmed anything, because the
+`wab_segments` family is not pre-initialised and `{state="confirmed"}` does not
+exist at all. Both cases are pinned in `weir-alerts_test.yml`.
+
+**Blind spot:** an idle daemon. No seals means no left-hand series, so a drain
+that is wedged while nothing is being produced does not fire — correctly, since
+nothing is at risk, but it means this rule confirms a wedge rather than ruling
+one out.
 
 #### WeirDrainBlocked
 The dead-letter directory hit its cap; **all** drain activity is paused and the
