@@ -26,7 +26,7 @@ for — see [platform support](docs/platform-support.md#durability-by-platform))
 wire format + Rust API under SemVer
 
 *Latency and throughput figures are deliberately not quoted here. Every published
-run — 2.1.0 as of 2026-09-08
+run — 3.0.0 as of 2026-09-10
 ([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
 [`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner, and
 this project's own rule is that external performance claims cite an operator-run
