@@ -16,6 +16,19 @@ const (
 	WireVersion       = 1
 	HeaderLen         = 16
 	MaxPayloadHardCap = 16 * 1024 * 1024 // 16 MiB
+
+	// MaxResponsePayload bounds what a peer's declared length can make this
+	// client allocate. Every response a client that never sends PushTracked
+	// (0x06) can receive is at most two bytes: Ack carries none, Nack one or
+	// two, HealthCheckResponse one. MaxPayloadHardCap is the cap on a record
+	// being SENT -- using it on the receive path let a desynced or hostile peer
+	// make this client allocate 16 MiB off a single header field. See
+	// docs/wire_protocol.md, "Response sizes", and the Rust reference's
+	// max_response_payload_len, which keys the cap on the message type.
+	//
+	// If this client ever sends PushTracked, AckTracked (0x07) carries up to
+	// 298 bytes and this must become a per-type function, not a constant.
+	MaxResponsePayload = 2
 )
 
 var magic = [4]byte{'W', 'E', 'I', 'R'} // 0x57 0x45 0x49 0x52

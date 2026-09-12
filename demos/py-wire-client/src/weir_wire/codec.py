@@ -30,6 +30,17 @@ WIRE_VERSION = 1
 HEADER_LEN = 16
 MAX_PAYLOAD_HARD_CAP = 16 * 1024 * 1024  # 16 MiB, from the spec
 
+# Cap on a RESPONSE payload, which is not the cap on a record being sent.
+# Every response a client that never sends PushTracked (0x06) can receive is at
+# most two bytes: Ack carries none, Nack one or two, HealthCheckResponse one
+# (docs/wire_protocol.md, "Response sizes"). Reading a response against
+# MAX_PAYLOAD_HARD_CAP -- or against nothing at all, as this client did -- lets
+# a desynced or hostile peer choose an allocation off one header field.
+#
+# If this client ever sends PushTracked, AckTracked (0x07) carries up to 298
+# bytes and this must become a per-type lookup, not a constant.
+MAX_RESPONSE_PAYLOAD = 2
+
 
 class MessageType(enum.IntEnum):
     PUSH = 0x01

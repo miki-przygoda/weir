@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from .codec import (
     HEADER_LEN,
     MAX_PAYLOAD_HARD_CAP,
+    MAX_RESPONSE_PAYLOAD,
     DecodeError,
     Durability,
     Frame,
@@ -105,11 +106,20 @@ class WeirClient:
     def _read_response_frame(self) -> Frame:
         """Frame one response off the wire per the spec's read recipe."""
         header = self._recv_exactly(HEADER_LEN)
-        # payload_len lives at bytes [8..12], little-endian u32.
+        # payload_len lives at bytes [8..12], little-endian u32. Bound it BEFORE
+        # reading the body: this client had no bound at all, so a peer declaring
+        # 8 MiB got an 8 MiB read that only the socket timeout ended.
         payload_len = int.from_bytes(header[8:12], "little")
+        if payload_len > MAX_RESPONSE_PAYLOAD:
+            raise DecodeError(
+                "PayloadTooLarge",
+                f"response declared payload_len {payload_len} > "
+                f"{MAX_RESPONSE_PAYLOAD} (desync or hostile peer)",
+            )
         rest = self._recv_exactly(payload_len + 4)
-        # Hand the codec exactly one frame.
-        return decode_frame(header + rest)
+        # Hand the codec exactly one frame, with the response cap -- not the
+        # send-side default -- so the two checks cannot disagree.
+        return decode_frame(header + rest, max_payload_bytes=MAX_RESPONSE_PAYLOAD)
 
     def _request(self, frame_bytes: bytes) -> Frame:
         assert self._sock is not None, "call connect() first"
