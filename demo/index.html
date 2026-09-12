@@ -31,11 +31,12 @@
     <h1>weir <span class="accent">// live demo</span></h1>
     <p class="role">durable write buffer · interactive simulation</p>
     <p class="tag">A durable write buffer — as fast as a direct insert at the producer, but crash-safe and N→1 on the database.</p>
+    <p class="tag" style="opacity:.72">A <code class="inline">Durable</code> ack is one fsync, so it is your disk's number, not weir's: 133&nbsp;µs on a Mac NVMe, where macOS uses <code class="inline">F_BARRIERFSYNC</code> — a write <em>barrier</em>, not a full flush, and not power-loss safe — and ~1.5&nbsp;ms on a SATA SSD with an honest Linux <code class="inline">fdatasync</code>. The simulation below uses the honest number.</p>
     <div class="metrics">
-      <span><span class="mk">Buffered ack p50</span><b>~69 µs</b></span>
-      <span><span class="mk">durable Sync ack p50</span><b>~364 µs</b></span>
+      <span><span class="mk">Buffered ack p50</span><b>~19 µs</b></span>
+      <span><span class="mk">Durable ack p50</span><b>133 µs – 1.5 ms</b></span>
       <span><span class="mk">commit compression</span><b>N→1</b></span>
-      <span><span class="mk">false acks across crash</span><b>0</b></span>
+      <span><span class="mk">false acks at Durable</span><b>0</b></span>
     </div>
     <div class="cta">
       <a href="#sim" class="primary">▶ Run the simulation</a>
@@ -71,8 +72,7 @@
     <div class="group">
       <span class="label">Durability</span>
       <span class="seg" id="tierSeg">
-        <button data-tier="Sync" class="sel" title="fsync before ACK — durable before the producer is told 'ok'.">Sync</button>
-        <button data-tier="Batched" title="Written before ACK; one group fsync per batch. Durable before ACK, fewer fsyncs.">Batched</button>
+        <button data-tier="Durable" class="sel" title="Written and group-fsynced at the batch boundary before the ACK. An acked record is on disk.">Durable</button>
         <button data-tier="Buffered" title="ACK after the in-memory write only. Fastest — but a crash can lose the not-yet-fsynced window.">Buffered</button>
       </span>
     </div>
@@ -152,12 +152,16 @@
        latencies are drawn from a long-tailed distribution (hence the avg / p99 / max):</p>
     <ul>
       <li><b>The first hop is the same in both lanes</b> — getting the record off the producer. The
-        stacks diverge after it: weir does a fast <em>local</em> fsync and acks (~0.4 ms Sync); the
+        stacks diverge after it: weir does a <em>local</em> fsync and acks (~1.5 ms Durable on this
+        storage); the
         naive path blocks on the <em>remote</em> commit round-trip (~8 ms). Same database, so weir's
         drain commit costs the same as a naive commit — but one trip carries the whole batch.</li>
-      <li><b>Sync</b> — <code class="inline">fsync</code> before the ack; zero acked-record loss on crash.</li>
-      <li><b>Batched</b> — written before the ack, one group <code class="inline">fsync</code> per batch; still
-        durable before the ack, far fewer fsyncs.</li>
+      <li><b>Durable</b> — written and <code class="inline">fdatasync</code>ed via the batch-boundary group
+        fsync before the ack; zero acked-record loss on crash. weir&nbsp;1.x split this into
+        <code class="inline">Sync</code> and <code class="inline">Batched</code>; both moved onto the same group
+        fsync, at which point the distinction stopped existing, and 2.0 collapsed them. Wire byte
+        <code class="inline">0x02</code> is retired and permanently reserved — a 1.x producer that still
+        sends it gets a <code class="inline">Durable</code> record, and the encoder never emits it.</li>
       <li><b>Buffered</b> — ack after the in-memory write only; fastest, but a crash can lose the
         not-yet-fsynced window (shown as lost — weir is honest about the tradeoff).</li>
       <li><b>Crash recovery</b> — on restart weir replays every sealed-but-unconfirmed segment, so
@@ -174,7 +178,7 @@
   <div class="grid cols-3">
     <div class="card">
       <h3>Durable before ack</h3>
-      <p class="card-sub" style="margin:0">An ack means the record is on disk (fsynced for Sync/Batched) and replays after a crash. Never a false ack.</p>
+      <p class="card-sub" style="margin:0">An ack at the <code class="inline">Durable</code> tier means the record is on disk and replays after a crash. Never a false ack.</p>
     </div>
     <div class="card">
       <h3>N→1 commits</h3>
@@ -228,9 +232,16 @@
 "use strict";
 (function(){
   // ---- modeled real latencies (µs) ----
-  const WEIR_ACK_US = { Sync:364, Batched:364, Buffered:69 };  // local durable-write cost
+  // Single-connection p50 for one local fsync, from the figures README.md
+  // publishes with their hardware and fsync primitive named. Durable is a SATA
+  // SSD with an honest Linux fdatasync (~1.4-1.5 ms); on a Mac NVMe, where the
+  // primitive is F_BARRIERFSYNC -- a write barrier, not a full flush -- the same
+  // tier is ~133-152 us. The slower, honest number is used here because it is
+  // the configuration in which this page's "never a false ack" line is true.
+  // NOT a CI figure: environments.md forbids citing latest.md externally.
+  const WEIR_ACK_US = { Durable:1500, Buffered:19 };
   const NAIVE_COMMIT_US = 8000;                                 // remote insert+commit round trip
-  const TIER_COLOR = { Sync:"#38bdf8", Batched:"#a78bfa", Buffered:"#4ade80" };  // hr2 tier palette
+  const TIER_COLOR = { Durable:"#38bdf8", Buffered:"#4ade80" };  // hr2 tier palette
 
   // ---- hr2 canvas palette ----
   const C_NODE_FILL="#1c1c1c", C_NODE_STROKE="#3a3a3a", C_NODE_DOWN="#f87171",
@@ -282,7 +293,7 @@
   const segNode={x:520,y:yD,label:"segment"}, drainNode={x:710,y:yD,label:"drain"}, dbNode={x:DBX,y:yD,label:"Database"};
 
   // ---- state ----
-  let tier = "Sync", daemonUp = true, streaming = false;
+  let tier = "Durable", daemonUp = true, streaming = false;
   let tNow = 0, lastFrame = null, recId = 0;
   const records = [];
   let wab = [];                 // {id, durable, color}
@@ -357,7 +368,7 @@
           metrics.ackW++; metrics.latW.push(r.ackUs);
           r.durable = (r.tier!=="Buffered");
           if(r.tier==="Buffered") log(`ack #${r.id} (buffered, not yet fsynced)`, "ev-ack");
-          else log(`${r.tier==="Sync"?"fsync":"group fsync"} → ack #${r.id} (durable)`, "ev-fsync");
+          else log(`group fsync → ack #${r.id} (durable)`, "ev-fsync");
           wab.push({ id:r.id, durable:r.durable, color:r.color, ackUs:r.ackUs, ackAnim:tNow });
         }
       } else if(r.stage==="ack"){
@@ -552,7 +563,7 @@
       document.querySelectorAll("#tierSeg button").forEach(x=>x.classList.remove("sel"));
       b.classList.add("sel"); b.parentElement.style.setProperty("--tier", TIER_COLOR[tier]); };
   });
-  document.querySelector('#tierSeg button.sel').parentElement.style.setProperty("--tier", TIER_COLOR.Sync);
+  document.querySelector('#tierSeg button.sel').parentElement.style.setProperty("--tier", TIER_COLOR.Durable);
 
   log("ready — push some records; compare the two stacks, then try Crash daemon + Restart.");
   requestAnimationFrame(frame);
