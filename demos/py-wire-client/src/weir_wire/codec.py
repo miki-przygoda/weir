@@ -37,9 +37,33 @@ MAX_PAYLOAD_HARD_CAP = 16 * 1024 * 1024  # 16 MiB, from the spec
 # MAX_PAYLOAD_HARD_CAP -- or against nothing at all, as this client did -- lets
 # a desynced or hostile peer choose an allocation off one header field.
 #
-# If this client ever sends PushTracked, AckTracked (0x07) carries up to 298
-# bytes and this must become a per-type lookup, not a constant.
+# This client now sends PushTracked, so the cap is a per-type lookup -- see
+# max_response_payload().
 MAX_RESPONSE_PAYLOAD = 2
+
+# RecordCoordinate wire layout (docs/wire_protocol.md, "AckTracked payload"):
+#   0   1   coordinate_version (0x01)
+#   1   8   index        u64 LE, 1-based within the segment
+#   9  32   record_id    SHA-256
+#  41   2   segment_len  u16 LE
+#  43 var   segment      UTF-8, <= 255 bytes
+COORDINATE_VERSION = 1
+COORDINATE_FIXED_LEN = 1 + 8 + 32 + 2
+MAX_SEGMENT_NAME_LEN = 255
+MAX_TRACKED_ACK_PAYLOAD = COORDINATE_FIXED_LEN + MAX_SEGMENT_NAME_LEN  # 298
+
+
+def max_response_payload(message_type: int) -> int:
+    """Cap for a response of this type, checked before any allocation.
+
+    AckTracked is the only weir response whose payload exceeds two bytes, so the
+    bound is widened for exactly that frame and for nothing else -- a desynced
+    peer cannot use a stray type byte to unlock a bigger read, because an
+    unexpected type is a desync the caller rejects anyway.
+    """
+    if message_type == MessageType.ACK_TRACKED:
+        return MAX_TRACKED_ACK_PAYLOAD
+    return MAX_RESPONSE_PAYLOAD
 
 
 class MessageType(enum.IntEnum):
@@ -48,6 +72,11 @@ class MessageType(enum.IntEnum):
     NACK = 0x03
     HEALTH_CHECK = 0x04
     HEALTH_CHECK_RESPONSE = 0x05
+    # Additive within wire v1: message-type bytes 0x08-0xFF are reserved for
+    # exactly this, so WIRE_VERSION stays 1 and the 30 frozen vectors are
+    # untouched. A daemon that predates these answers Nack(UnknownMessage).
+    PUSH_TRACKED = 0x06
+    ACK_TRACKED = 0x07
 
 
 class Durability(enum.IntEnum):
@@ -117,6 +146,76 @@ class DecodeError(Exception):
     def __init__(self, tag: str, detail: str = ""):
         self.tag = tag
         super().__init__(detail or tag)
+
+
+@dataclass(frozen=True)
+class RecordCoordinate:
+    """Where a tracked record landed in the buffer.
+
+    An address, not a sequence. Other producers interleave in the same segment,
+    so one producer's indices have holes by construction -- the spec is explicit
+    that this does not provide gap-free numbering. `segment` is an opaque,
+    stable address rather than a filesystem path, and `record_id` is the same
+    digest the daemon hands a sink as its per-record idempotency key, which is
+    what lets a producer correlate what it sent with what arrived.
+    """
+
+    segment: str
+    index: int  # u64, 1-based within the segment
+    record_id: bytes  # 32-byte SHA-256
+
+    def record_id_hex(self) -> str:
+        return self.record_id.hex()
+
+
+class CoordinateError(Exception):
+    """Raised by decode_coordinate. `.tag` matches the conformance vector names."""
+
+    def __init__(self, tag: str, detail: str = ""):
+        self.tag = tag
+        super().__init__(detail or tag)
+
+
+def decode_coordinate(buf: bytes) -> RecordCoordinate:
+    """Decode exactly one RecordCoordinate.
+
+    The version byte leads so the layout can grow inside wire v1: a reader that
+    meets a version it does not know must REJECT, never parse a prefix it has
+    never seen. The buffer must be exactly one coordinate for the same reason --
+    a trailing byte means the two ends disagree about the layout, and quietly
+    using the prefix is how that disagreement becomes a wrong address.
+    """
+    if len(buf) < COORDINATE_FIXED_LEN:
+        raise CoordinateError(
+            "Truncated", f"need at least {COORDINATE_FIXED_LEN} bytes, got {len(buf)}"
+        )
+    version = buf[0]
+    if version != COORDINATE_VERSION:
+        raise CoordinateError("UnsupportedVersion", f"coordinate version {version}")
+
+    (index,) = struct.unpack_from("<Q", buf, 1)
+    record_id = bytes(buf[9:41])
+    (segment_len,) = struct.unpack_from("<H", buf, 41)
+
+    if segment_len > MAX_SEGMENT_NAME_LEN:
+        raise CoordinateError(
+            "SegmentTooLong", f"segment_len {segment_len} > {MAX_SEGMENT_NAME_LEN}"
+        )
+    expected = COORDINATE_FIXED_LEN + segment_len
+    if len(buf) < expected:
+        raise CoordinateError("Truncated", f"need {expected} bytes, got {len(buf)}")
+    if len(buf) != expected:
+        raise CoordinateError(
+            "LengthMismatch", f"{len(buf) - expected} trailing byte(s) after the coordinate"
+        )
+
+    raw = buf[COORDINATE_FIXED_LEN:expected]
+    try:
+        segment = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CoordinateError("SegmentNotUtf8", str(exc)) from exc
+
+    return RecordCoordinate(segment=segment, index=index, record_id=record_id)
 
 
 def decode_frame(buf: bytes, max_payload_bytes: int = MAX_PAYLOAD_HARD_CAP) -> Frame:

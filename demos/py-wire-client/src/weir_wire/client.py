@@ -19,6 +19,10 @@ from .codec import (
     HEADER_LEN,
     MAX_PAYLOAD_HARD_CAP,
     MAX_RESPONSE_PAYLOAD,
+    CoordinateError,
+    RecordCoordinate,
+    decode_coordinate,
+    max_response_payload,
     DecodeError,
     Durability,
     Frame,
@@ -55,6 +59,17 @@ class NackError(WeirError):
             r.value for r in permanent
         }
         super().__init__(f"Nack: {self.reason}")
+
+    @property
+    def means_no_tracked_support(self) -> bool:
+        """True when this Nack is a daemon that predates PushTracked (0x06).
+
+        The wire cannot distinguish that from any other unknown type, so the
+        caller has to: it is only meaningful on the reply to a push_tracked().
+        Do not retry on this connection -- the daemon closes it. Open a new one
+        and fall back to push().
+        """
+        return self.reason == NackReason.UNKNOWN_MESSAGE
 
 
 class ConnectionClosed(WeirError):
@@ -110,38 +125,76 @@ class WeirClient:
         # reading the body: this client had no bound at all, so a peer declaring
         # 8 MiB got an 8 MiB read that only the socket timeout ended.
         payload_len = int.from_bytes(header[8:12], "little")
-        if payload_len > MAX_RESPONSE_PAYLOAD:
+        # Cap by the type the header declares: AckTracked carries a coordinate
+        # of up to 298 bytes, every other response at most two. Widening the
+        # bound for one frame type is not the same as removing it.
+        cap = max_response_payload(header[5])
+        if payload_len > cap:
             raise DecodeError(
                 "PayloadTooLarge",
                 f"response declared payload_len {payload_len} > "
-                f"{MAX_RESPONSE_PAYLOAD} (desync or hostile peer)",
+                f"{cap} for message_type {header[5]:#04x} (desync or hostile peer)",
             )
         rest = self._recv_exactly(payload_len + 4)
-        # Hand the codec exactly one frame, with the response cap -- not the
-        # send-side default -- so the two checks cannot disagree.
-        return decode_frame(header + rest, max_payload_bytes=MAX_RESPONSE_PAYLOAD)
+        # Hand the codec exactly one frame, with the same cap, so the two checks
+        # cannot disagree.
+        return decode_frame(header + rest, max_payload_bytes=cap)
 
     def _request(self, frame_bytes: bytes) -> Frame:
         assert self._sock is not None, "call connect() first"
         self._sock.sendall(frame_bytes)
         return self._read_response_frame()
 
-    def push(
-        self, payload: bytes, durability: Durability = Durability.DURABLE
-    ) -> PushResult:
+    def _send_record(self, message_type: MessageType, payload: bytes, durability: Durability):
+        """Shared guards + round trip for Push and PushTracked.
+
+        Rejected locally rather than on the wire: an empty payload and an
+        over-cap one are both certain Nacks, and a Nack closes the connection,
+        so catching them here keeps a usable client.
+        """
         if not payload:
             raise ValueError("weir rejects zero-length Push payloads (EmptyPayload)")
         if len(payload) > MAX_PAYLOAD_HARD_CAP:
             raise ValueError(
                 f"payload {len(payload)} > MAX_PAYLOAD_HARD_CAP {MAX_PAYLOAD_HARD_CAP}"
             )
-        frame = encode_frame(MessageType.PUSH, durability, payload)
-        resp = self._request(frame)
-        if resp.message_type == MessageType.ACK:
-            return PushResult(acked=True, durability_used=durability)
+        resp = self._request(encode_frame(message_type, durability, payload))
         if resp.message_type == MessageType.NACK:
             reason = resp.payload[0] if resp.payload else NackReason.INTERNAL_ERROR
             raise NackError(reason)
+        return resp
+
+    def push(
+        self, payload: bytes, durability: Durability = Durability.DURABLE
+    ) -> PushResult:
+        resp = self._send_record(MessageType.PUSH, payload, durability)
+        if resp.message_type == MessageType.ACK:
+            return PushResult(acked=True, durability_used=durability)
+        raise WeirError(f"unexpected response message_type {resp.message_type!r}")
+
+    def push_tracked(
+        self, payload: bytes, durability: Durability = Durability.DURABLE
+    ) -> RecordCoordinate:
+        """Push a record and learn where it landed.
+
+        Identical to push() in every respect but the reply: same tiers, same
+        caps, same Nack reasons. A daemon that predates the type answers
+        Nack(UnknownMessage) and closes, which surfaces as NackError with
+        .means_no_tracked_support set -- open a new connection and use push().
+
+        A bare Ack in reply is an error, not a success. The request determines
+        the response shape, so an Ack here means the peer did not understand
+        what was asked and treating it as success would report a push as
+        tracked when no coordinate exists.
+        """
+        resp = self._send_record(MessageType.PUSH_TRACKED, payload, durability)
+        if resp.message_type == MessageType.ACK_TRACKED:
+            return decode_coordinate(resp.payload)
+        if resp.message_type == MessageType.ACK:
+            raise WeirError(
+                "daemon answered a PushTracked with a bare Ack; the record may be "
+                "durable but its coordinate is unknown"
+            )
         raise WeirError(f"unexpected response message_type {resp.message_type!r}")
 
     def health_check(self) -> bool:
