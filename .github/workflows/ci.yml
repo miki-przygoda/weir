@@ -113,6 +113,7 @@ jobs:
       - run: python3 docs/conformance/run_vectors.py
       - run: python3 demos/py-wire-client/tests/test_conformance.py
       - run: python3 demos/py-wire-client/tests/test_response_cap.py
+      - run: python3 demos/py-wire-client/tests/test_tracked.py
       - run: cd demos/go-wire-client && go test ./...
       - run: cd demos/c-wire-client && make check
       - name: Java demo client conformance
