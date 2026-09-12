@@ -33,7 +33,7 @@ they are two selectable tiers today.
 
 > See [latest.md](benchmarks/latest.md) for the full tables and
 > [history.md](benchmarks/history.md) for the trend over time. The figures
-> below are rounded from one averaged CI run (v2.1.0, 2026-09-08, 5 passes per
+> below are rounded from one averaged CI run (v3.0.0, 2026-09-10, 5 passes per
 > deadline, `shard_count=4`, `batch_size=64`). **This index is hand-maintained
 > and is not regenerated** — `deploy/avg_benchmarks.py` writes `latest.md` and
 > appends to `history.md`, and says so at its own line 9. When the two disagree,
@@ -48,15 +48,15 @@ they are two selectable tiers today.
 
 | Scenario | Concurrency | RPS | ±σ across the 5 passes |
 |----------|---|-----|-----|
-| Single thread, Buffered | 1 | ~13,100 | ±160 |
-| Single thread, Durable | 1 | ~2,400 | ±91 |
-| Thundering herd, Buffered | 64 | ~47,200 | ±1,673 |
-| Saturation ceiling, Buffered | 48 | ~96,200 | not sampled |
-| Saturation ceiling, Durable | 48 | ~43,200 | not sampled |
+| Single thread, Buffered | 1 | ~12,200 | ±94 |
+| Single thread, Durable | 1 | ~2,700 | ±52 |
+| Thundering herd, Buffered | 64 | ~48,600 | ±1,840 |
+| Saturation ceiling, Buffered | 48 | ~100,000 | not sampled |
+| Saturation ceiling, Durable | 48 | ~44,700 | not sampled |
 
 > **The single-thread rows are latency reciprocals, not ceilings.** Read down
 > the `Durable` rows: the same tier, on the same runner, in the same run set,
-> does ~2,400 rec/s on one connection and ~43,200 across 48 — **18×**. Nothing
+> does ~2,700 rec/s on one connection and ~44,700 across 48 — **17×**. Nothing
 > about the daemon changed between those two rows.
 >
 > `Durable` is a group commit at the batch boundary

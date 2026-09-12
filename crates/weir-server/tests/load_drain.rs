@@ -63,13 +63,28 @@ use weir_testkit::{free_port, weir_server};
 // delivery rate in one column is precisely the confusion this file exists to
 // end.
 
-fn emit_delivery(scenario: &str, records: usize, elapsed: Duration) {
+// `delivered_records` is the count observed DURING `wall_ms`, never the size of
+// the backlog. The two are different numbers and reporting the second over the
+// first is what overstated every rate this file has ever published:
+// `excluded_before_t0` is that gap, emitted so a published row carries its own
+// basis instead of needing a sweep to reconstruct it. Only
+// `measure_backlog_drain` may call this — it is the one place that observes both
+// endpoints of the window.
+fn emit_delivery(
+    scenario: &str,
+    records: usize,
+    elapsed: Duration,
+    excluded_before_t0: usize,
+    wakeup: Duration,
+) {
     let rps = records as f64 / elapsed.as_secs_f64();
     println!(
         "BENCH: {{\"scenario\":\"{scenario}\",\"delivered_records\":{records},\
-         \"wall_ms\":{},\"delivered_rps\":{},\"wab\":\"{}\"}}",
+         \"wall_ms\":{},\"delivered_rps\":{},\"excluded_before_t0\":{excluded_before_t0},\
+         \"wakeup_ms\":{},\"wab\":\"{}\"}}",
         elapsed.as_millis(),
         rps as u64,
+        wakeup.as_millis(),
         wab_backing(),
     );
 }
@@ -402,13 +417,25 @@ fn fill(srv: &weir_testkit::WeirServer, n: usize) {
 /// start of the measurement an actual event, so the number means one thing:
 /// records per second out of a full buffer.
 ///
-/// Returns `(elapsed_for_bulk, requests_issued_during_delivery)`.
+/// This helper **emits the BENCH line itself**, and that is deliberate. The
+/// numerator used to be chosen by the caller (`bulk(RECORDS)`) while the window
+/// was computed here, so the two could disagree and nothing could notice —
+/// which is exactly what happened. Both now come from the same observation, and
+/// `emit_delivery` documents that it may only be called from here.
+///
+/// `before_flip` runs after the backlog is built and before the sink is let
+/// through, for scenarios that need to arm a delay that must not slow the
+/// refusals during the fill.
+///
+/// Returns `requests_issued_during_delivery`.
 fn measure_backlog_drain(
+    scenario: &str,
     srv: &weir_testkit::WeirServer,
     sink: &MockSink,
     records: usize,
     timeout: Duration,
-) -> (Duration, usize) {
+    before_flip: impl FnOnce(),
+) -> usize {
     fill(srv, records);
     assert_eq!(
         sink.delivered(),
@@ -417,6 +444,7 @@ fn measure_backlog_drain(
     );
 
     let requests_before = sink.requests();
+    before_flip();
     sink.set_failing(false);
 
     // Start the clock at the FIRST delivered record, not at the flip. Between
@@ -425,17 +453,42 @@ fn measure_backlog_drain(
     // throughput.
     let wakeup = sink.await_first_delivery(timeout);
     let t0 = Instant::now();
+    // Read the counter in the same breath as the clock. `await_first_delivery`
+    // polls on a 1 ms sleep and one NDJSON POST carries up to
+    // `sink_max_batch_size` records, so by the time it returns, hundreds can
+    // already be out the door. Those records were delivered BEFORE this window
+    // and must not be counted inside it.
+    let delivered_at_t0 = sink.delivered();
+    assert!(
+        delivered_at_t0 < bulk(records),
+        "the whole measured backlog ({}) was delivered before the clock started \
+         ({delivered_at_t0} records); there is no window left to measure — raise \
+         RECORDS for this scenario",
+        bulk(records)
+    );
+
     sink.await_delivery(bulk(records), timeout);
+    // Counter before clock, at both ends of the window. A record landing
+    // between the two reads is then excluded from the numerator while its time
+    // still counts in the denominator, so the residual error understates the
+    // rate. Reading the clock first would bias it upward, which is the same
+    // mistake this helper exists to stop making.
+    let delivered_at_end = sink.delivered();
     let elapsed = t0.elapsed();
+    let measured = delivered_at_end - delivered_at_t0;
+
     println!(
-        "    (drain woke {} ms after the sink recovered; excluded from the rate)",
+        "    (drain woke {} ms after the sink recovered; excluded from the rate. \
+         {delivered_at_t0} records were already delivered at t0 and are excluded \
+         from the numerator too)",
         wakeup.as_millis()
     );
+    emit_delivery(scenario, measured, elapsed, delivered_at_t0, wakeup);
 
     // Correctness, separate from the rate: nothing may be dropped on the way to
     // the sink. No other test in either load suite checks this.
     sink.await_delivery(records, Duration::from_secs(60));
-    (elapsed, sink.requests() - requests_before)
+    sink.requests() - requests_before
 }
 
 /// Baseline: default HTTP sink, one POST per record.
@@ -451,8 +504,14 @@ fn drain_throughput_http_per_record() {
         .env("WEIR_SINK_HTTP_BATCH", "none")
         .start();
 
-    let (elapsed, requests) = measure_backlog_drain(&srv, &sink, RECORDS, Duration::from_secs(180));
-    emit_delivery("drain_http_per_record", bulk(RECORDS), elapsed);
+    let requests = measure_backlog_drain(
+        "drain_http_per_record",
+        &srv,
+        &sink,
+        RECORDS,
+        Duration::from_secs(180),
+        || {},
+    );
 
     assert!(
         requests >= RECORDS,
@@ -476,8 +535,14 @@ fn drain_throughput_http_ndjson() {
         .env("WEIR_SINK_HTTP_BATCH", "ndjson")
         .start();
 
-    let (elapsed, requests) = measure_backlog_drain(&srv, &sink, RECORDS, Duration::from_secs(180));
-    emit_delivery("drain_http_ndjson", bulk(RECORDS), elapsed);
+    let requests = measure_backlog_drain(
+        "drain_http_ndjson",
+        &srv,
+        &sink,
+        RECORDS,
+        Duration::from_secs(180),
+        || {},
+    );
 
     assert!(
         requests < RECORDS,
@@ -502,16 +567,24 @@ fn drain_under_slow_sink() {
         .env("WEIR_SINK_HTTP_CONCURRENCY", "16")
         .start();
 
-    // The delay applies to the delivery window only — a 1 ms pause on each of
-    // the refusals would just slow the backlog build-up down.
-    fill(&srv, RECORDS);
-    sink.set_delay(Duration::from_millis(1));
-    sink.set_failing(false);
-
-    let elapsed = sink.await_delivery(bulk(RECORDS), Duration::from_secs(240));
-    emit_delivery("drain_slow_sink_1ms_conc16", bulk(RECORDS), elapsed);
-
-    sink.await_delivery(RECORDS, Duration::from_secs(120));
+    // The delay is armed after the backlog is built and before the sink is let
+    // through: a 1 ms pause on each of the refusals would only slow the
+    // build-up down.
+    //
+    // Adopting `measure_backlog_drain` is also what puts this scenario on the
+    // same basis as its two table neighbours. It used to start its clock at the
+    // flip, so its window included the drain's retry backoff — time in which no
+    // record is delivered at all — while theirs excluded it. Three rows were
+    // published side by side on two opposite biases: these understated, those
+    // overstated.
+    let _ = measure_backlog_drain(
+        "drain_slow_sink_1ms_conc16",
+        &srv,
+        &sink,
+        RECORDS,
+        Duration::from_secs(240),
+        || sink.set_delay(Duration::from_millis(1)),
+    );
 }
 
 /// Ingest must be unaffected by a sink outage — the separation is weir's entire

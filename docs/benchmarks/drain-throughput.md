@@ -38,7 +38,99 @@ Common to all three:
 | Daemon | `bench_preset`: 4 shards, 4 workers, ingest batch 64 |
 | Sharding | **Inert in this suite.** Shard is assigned per *connection* (`crates/weir-server/src/socket/mod.rs:210`) and the fill opens one client (`tests/load_drain.rs:374-379`), so every record lands on one shard whatever `shard_count` says. |
 | Sink batch size | `sink_max_batch_size` = 100, the default (`crates/weir-server/src/config/mod.rs:721`), never overridden here. The "batch 64" above is the *ingest* coalescing knob — a different setting. |
-| Timed window | **The sealed half of the fill**, not all of it — `bulk(n) = n/2` (`tests/load_drain.rs:335-345`). Only whole rotated segments seal, so timing the tail would fold up to a second of idle-seal timer into a throughput number. Each scenario asserts separately that the full count arrives, so the tail is checked for correctness without polluting the rate. A published rate for `drain_http_ndjson` therefore covers 1,000 delivered records out of a 2,000-record fill. |
+| Timed window | **Superseded basis — see [the 2026-09-12 correction](#2026-09-12--the-rows-above-were-computed-on-two-different-bases).** **The sealed half of the fill**, not all of it — `bulk(n) = n/2` (`tests/load_drain.rs:335-345`). Only whole rotated segments seal, so timing the tail would fold up to a second of idle-seal timer into a throughput number. Each scenario asserts separately that the full count arrives, so the tail is checked for correctness without polluting the rate. A published rate for `drain_http_ndjson` therefore covers 1,000 delivered records out of a 2,000-record fill. |
+
+## 2026-09-12 — the rows above were computed on two different bases
+
+Every rate below this line is on a **superseded basis**, and the three scenarios
+did not share it.
+
+`drain_throughput_http_{per_record,ndjson}` started the clock at the first
+delivered record but divided by the full `bulk(RECORDS)`, counting records
+delivered *before* the window inside it. `drain_under_slow_sink` never adopted
+that helper: it started the clock at the moment the sink was let through, so its
+window included the drain's exponential retry backoff — time in which no record
+is delivered at all. The first error overstates, the second understates, and the
+cross-scenario ratios further down compare across both.
+
+`tests/load_drain.rs` now computes the numerator where the window's endpoints are
+observed, and every row emits `excluded_before_t0` and `wakeup_ms` so it states
+its own basis.
+
+**What the correction is worth, measured.** On beast — Linux 7.0.0, 4 CPUs,
+ext4 `rw,relatime` on a Samsung SSD 850 EVO 250 GB (SATA, non-rotational), honest
+`fdatasync`; drive write-cache state requires sudo and is **undisclosed** —
+three iterations of v3.0.0, and the pre-fix number recovered exactly from the
+same runs' `wall_ms` + `wakeup_ms` + the known `bulk()` constant, which makes
+the comparison paired rather than run-against-run:
+
+| Scenario | pre-fix (3 runs) | post-fix (3 runs) | run-to-run spread |
+|---|---|---|---|
+| `drain_http_per_record` | 30,623 / 30,635 / 27,139 | 31,580 / 31,600 / 31,803 | 1.13x → **1.007x** |
+| `drain_slow_sink_1ms_conc16` | 8,475 / 9,804 / 8,621 | 11,008 / 11,012 / 11,034 | 1.16x → **1.002x** |
+| `drain_http_ndjson` | 67,842 / 106,358 / 118,710 | 80,385 / 86,056 / 100,518 | 1.75x → 1.25x |
+
+The reconstruction checks out against this file's own history: the pre-fix
+`drain_slow_sink_1ms_conc16` median of 8,621 sits beside the `linux-ssd` median
+of **8,826** published above from a different release. So **that published row
+understates by about 25%** — post-fix the same scenario on the same box is
+11,012.
+
+**The gain is precision, not accuracy.** Post-fix `slow_sink` reports `wall_ms`
+45, `delivered_records` 498 and `excluded_before_t0` 16 — identical on all three
+runs; only `wakeup_ms` moved (14, 6, 13). The delivery is deterministic and the
+old basis was folding 6–14 ms of unrelated backoff into a 45 ms window. Rows that
+moved 13–16% between identical runs now move 0.2–0.7%, which is the difference
+between a suite that can detect a regression and one that cannot.
+
+**The numerator error was small, and a prior claim about it was wrong.** The
+2026-09-05 sweep put it at "~33% overstatement ... worst at the fast end, so it
+*flattens* curves", from `bulk / (bulk - excluded)` = 1000/751. Its 249-of-1,000
+observation reproduces exactly, but the sink also *overshoots* the target
+between 1 ms polls by a similar amount — head exclusion and tail overshoot are
+one batch-granularity effect with opposite signs. Measured in the window across seven
+runs: 847-1045, not 751 — an error from **-4.3% to +18.1%**, scattered either
+side of zero rather than a systematic overstatement. See the table below.
+
+**Across three hosts and seven runs, the numerator error is scattered, not
+systematic.** Every post-fix observation collected on 2026-09-12 — macOS (2),
+beast (3), CI (2):
+
+| Scenario | `excluded_before_t0` | `delivered_records` | what the old numerator did |
+|---|---|---|---|
+| `drain_http_ndjson` | 200–249 | 847–1045 | **−4.3% to +18.1%** |
+| `drain_http_per_record` | 1–19 | 1000–1074 | −6.9% to 0.0% |
+| `drain_slow_sink_1ms_conc16` | 1–16 | 498–513 | −2.5% to +0.4% |
+
+Both quantities take a small set of values rather than a stable one, because
+both are governed by the 100-record sink batch: NDJSON delivers in 100-record
+POSTs, so a large and variable slice lands between two 1 ms polls at each end of
+the window, while per-record delivery puts almost nothing there (1–19 records).
+That is why the exclusion is big only on NDJSON — and why it does not become a
+33% overstatement: the overshoot past the target offsets it by a similar,
+independently varying amount, so the net swings either side of zero.
+
+So the sweep's observation was sound and its inference was not. Deriving the
+error from the excluded head alone gives 1000/751 = 1.33x; measuring both ends of
+the window gives a spread from −4.3% to +18.1% on the same scenario, centred near
+zero. A correction that large and that one-directional was never there to find.
+
+Two further notes on reading the table. `drain_slow_sink_1ms_conc16` reports
+`wall_ms` 45 on beast and 45–47 on CI: a 1 ms-delay sink at concurrency 16 is
+rate-limited largely independently of the host, which is why removing the retry
+backoff from its window collapsed its spread so sharply. And CI's NDJSON window
+is 4–5 ms, *narrower* than beast's 8–11 ms, with a correspondingly higher rate
+(195,586–234,123). That is not a faster drain: the confirm path calls `sync_all`,
+an honest `fdatasync` to a SATA SSD on beast and much cheaper on virtualised
+runner storage — the same reason every row here records `wab_backing()`. It makes
+the quantisation worse on CI, not better.
+
+**NDJSON remains unfit for a Linux conclusion**, and this fix does not change
+that. Its window is 8–11 ms against a 1 ms poll — about eight ticks — with
+`excluded_before_t0` of 200–249 and overshoot quantised to the 100-record sink
+batch. At `RECORDS = 2000` the scenario is measuring quantisation on a box where
+the drain is this fast, and it should be resized before the NDJSON-concurrency
+question is answered on it.
 
 ## Results
 

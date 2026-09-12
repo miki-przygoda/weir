@@ -55,7 +55,8 @@ func (c *Client) readFrame() (Frame, error) {
 		return Frame{}, ErrHeaderCrcMismatch
 	}
 	plen := binary.LittleEndian.Uint32(hdr[8:12])
-	if plen > MaxPayloadHardCap {
+	// Bound the RESPONSE, not a record: see MaxResponsePayload.
+	if plen > MaxResponsePayload {
 		return Frame{}, ErrPayloadTooLarge
 	}
 	rest := make([]byte, int(plen)+4)

@@ -85,13 +85,13 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 # docs/security/socket-bind.md. Running them in parallel produces ~66 spurious
 # PermissionDenied failures and leaves proptest-regressions/ unwritable.
 cargo test --workspace --exclude weir-server
-cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener
+cargo test -p weir-server --lib --test system --test docs_drift --test load --test load_tls --test tls_client --test tls_listener
 cargo test -p weir-server --bins -- --test-threads=1
 
 # The same three, across the full feature matrix (compiles + runs the
 # clickhouse-sink and tls test code the default set never builds).
 cargo test --workspace --exclude weir-server --all-features
-cargo test -p weir-server --lib --test system --test load --test load_tls --test tls_client --test tls_listener --all-features
+cargo test -p weir-server --lib --test system --test docs_drift --test load --test load_tls --test tls_client --test tls_listener --all-features
 cargo test -p weir-server --bins --all-features -- --test-threads=1
 
 # Wire-protocol conformance: the vectors' own reference codec, plus the five

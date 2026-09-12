@@ -42,7 +42,9 @@ public final class Wire {
 
     /**
      * Maximum payload length we will allocate for a *response*. Per the spec's
-     * producer checklist, every weir response payload is at most 2 bytes
+     * producer checklist, every response THIS client can receive is at most 2
+     * bytes -- it never sends PushTracked (0x06), so it never receives
+     * AckTracked (0x07), whose coordinate payload reaches 298 bytes
      * (Ack/HCR = 0, Nack = 1, VersionMismatch = 2). A larger declared length on
      * a response is a desync or a non-weir peer.
      */

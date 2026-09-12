@@ -114,7 +114,8 @@ public final class WeirClient implements AutoCloseable {
     /**
      * Reads exactly one response frame off the wire, doing its own framing.
      * Caps the declared response payload at {@link Wire#MAX_RESPONSE_PAYLOAD}
-     * before allocating, per the spec checklist (responses are <= 2 bytes).
+     * before allocating, per the spec checklist (responses this client can
+     * receive are <= 2 bytes; AckTracked, which it never asks for, is 298).
      */
     private Frame readResponse() throws IOException {
         byte[] header = readExactly(Wire.HEADER_LEN);
