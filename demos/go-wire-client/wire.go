@@ -5,9 +5,11 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"unicode/utf8"
 )
 
 // ---- Wire constants (from wire_protocol.md) ----
@@ -42,10 +44,19 @@ const (
 	MsgNack                MessageType = 0x03
 	MsgHealthCheck         MessageType = 0x04
 	MsgHealthCheckResponse MessageType = 0x05
+	// Additive within wire v1: message-type bytes 0x08-0xFF are reserved for
+	// exactly this, so WIRE_VERSION stays 1 and the 30 frozen vectors are
+	// untouched. A daemon predating these answers Nack(UnknownMessage).
+	MsgPushTracked MessageType = 0x06
+	MsgAckTracked  MessageType = 0x07
 )
 
 func (m MessageType) String() string {
 	switch m {
+	case MsgPushTracked:
+		return "PushTracked"
+	case MsgAckTracked:
+		return "AckTracked"
 	case MsgPush:
 		return "Push"
 	case MsgAck:
@@ -180,6 +191,18 @@ func EncodePush(payload []byte, d Durability) []byte {
 	})
 }
 
+// EncodePushTracked is a Push that also asks where the record landed. Identical
+// to EncodePush but for the message type; the daemon answers AckTracked.
+func EncodePushTracked(payload []byte, d Durability) []byte {
+	return EncodeFrame(Frame{
+		Version:     WireVersion,
+		MessageType: MsgPushTracked,
+		Durability:  d,
+		Flags:       0,
+		Payload:     payload,
+	})
+}
+
 // EncodeHealthCheck builds a zero-payload HealthCheck (Durable filler by convention).
 func EncodeHealthCheck() []byte {
 	return EncodeFrame(Frame{
@@ -197,13 +220,21 @@ var (
 	ErrBadMagic           = errors.New("BadMagic")
 	ErrVersionMismatch    = errors.New("VersionMismatch")
 	ErrUnknownMessageType = errors.New("UnknownMessageType")
-	ErrUnknownDurability  = errors.New("UnknownDurability")
-	ErrHeaderCrcMismatch  = errors.New("HeaderCrcMismatch")
-	ErrPayloadCrcMismatch = errors.New("PayloadCrcMismatch")
-	ErrTruncatedFrame     = errors.New("TruncatedFrame")
-	ErrPayloadTooLarge    = errors.New("PayloadTooLarge")
-	ErrReservedFlagsSet   = errors.New("ReservedFlagsSet")
-	ErrTrailingBytes      = errors.New("TrailingBytes")
+
+	// RecordCoordinate rejection tags, named after the conformance vectors the
+	// way the frame errors above are.
+	ErrCoordTruncated      = errors.New("Truncated")
+	ErrCoordUnsupportedVer = errors.New("UnsupportedVersion")
+	ErrCoordSegmentTooLong = errors.New("SegmentTooLong")
+	ErrCoordLengthMismatch = errors.New("LengthMismatch")
+	ErrCoordSegmentNotUtf8 = errors.New("SegmentNotUtf8")
+	ErrUnknownDurability   = errors.New("UnknownDurability")
+	ErrHeaderCrcMismatch   = errors.New("HeaderCrcMismatch")
+	ErrPayloadCrcMismatch  = errors.New("PayloadCrcMismatch")
+	ErrTruncatedFrame      = errors.New("TruncatedFrame")
+	ErrPayloadTooLarge     = errors.New("PayloadTooLarge")
+	ErrReservedFlagsSet    = errors.New("ReservedFlagsSet")
+	ErrTrailingBytes       = errors.New("TrailingBytes")
 )
 
 // DecodeFrame decodes a buffer that MUST be exactly one frame, mirroring the
@@ -235,7 +266,8 @@ func DecodeFrame(buf []byte) (Frame, error) {
 	// 4. Header field parsing
 	mt := MessageType(buf[5])
 	switch mt {
-	case MsgPush, MsgAck, MsgNack, MsgHealthCheck, MsgHealthCheckResponse:
+	case MsgPush, MsgAck, MsgNack, MsgHealthCheck, MsgHealthCheckResponse,
+		MsgPushTracked, MsgAckTracked:
 	default:
 		return Frame{}, ErrUnknownMessageType
 	}
@@ -276,4 +308,93 @@ func DecodeFrame(buf []byte) (Frame, error) {
 		Flags:       buf[7],
 		Payload:     out,
 	}, nil
+}
+
+// ---- RecordCoordinate (AckTracked payload) ----
+
+const (
+	// Layout (docs/wire_protocol.md, "AckTracked payload"):
+	//   0   1   coordinate_version (0x01)
+	//   1   8   index        u64 LE, 1-based within the segment
+	//   9  32   record_id    SHA-256
+	//  41   2   segment_len  u16 LE
+	//  43 var   segment      UTF-8, <= 255 bytes
+	CoordinateVersion  uint8 = 1
+	CoordinateFixedLen       = 1 + 8 + 32 + 2
+	MaxSegmentNameLen        = 255
+
+	// MaxTrackedAckPayload is the largest AckTracked payload, and the only
+	// reason the response cap is not simply 2.
+	MaxTrackedAckPayload = CoordinateFixedLen + MaxSegmentNameLen // 298
+)
+
+// RecordCoordinate is where a tracked record landed in the buffer.
+//
+// An address, not a sequence: other producers interleave in the same segment,
+// so one producer's indices have holes by construction. Segment is an opaque,
+// stable address rather than a filesystem path, and RecordID is the same digest
+// the daemon hands a sink as its per-record idempotency key.
+type RecordCoordinate struct {
+	Segment  string
+	Index    uint64 // 1-based within the segment
+	RecordID [32]byte
+}
+
+// RecordIDHex renders RecordID the way the HTTP sink's Idempotency-Key does.
+func (c RecordCoordinate) RecordIDHex() string {
+	return hex.EncodeToString(c.RecordID[:])
+}
+
+// maxResponsePayload bounds a response of this type before any allocation.
+//
+// AckTracked is the only weir response whose payload exceeds two bytes, so the
+// bound is widened for exactly that type. Widening it for anything else would
+// let a desynced peer use a stray type byte to unlock a bigger read.
+func maxResponsePayload(mt MessageType) int {
+	if mt == MsgAckTracked {
+		return MaxTrackedAckPayload
+	}
+	return MaxResponsePayload
+}
+
+// DecodeCoordinate decodes exactly one RecordCoordinate.
+//
+// The version byte leads so the layout can grow inside wire v1, which only
+// works if a reader meeting an unknown version REJECTS rather than parsing a
+// prefix it has never seen. The buffer must be exactly one coordinate for the
+// same reason: a trailing byte means the two ends disagree about the layout,
+// and quietly using the prefix is how that becomes a wrong address.
+func DecodeCoordinate(buf []byte) (RecordCoordinate, error) {
+	if len(buf) < CoordinateFixedLen {
+		return RecordCoordinate{}, ErrCoordTruncated
+	}
+	if buf[0] != CoordinateVersion {
+		return RecordCoordinate{}, ErrCoordUnsupportedVer
+	}
+
+	var c RecordCoordinate
+	c.Index = binary.LittleEndian.Uint64(buf[1:9])
+	copy(c.RecordID[:], buf[9:41])
+	segLen := int(binary.LittleEndian.Uint16(buf[41:43]))
+
+	if segLen > MaxSegmentNameLen {
+		return RecordCoordinate{}, ErrCoordSegmentTooLong
+	}
+	want := CoordinateFixedLen + segLen
+	if len(buf) < want {
+		return RecordCoordinate{}, ErrCoordTruncated
+	}
+	if len(buf) != want {
+		return RecordCoordinate{}, ErrCoordLengthMismatch
+	}
+
+	raw := buf[CoordinateFixedLen:want]
+	// Go's []byte -> string conversion does NOT validate UTF-8; it would
+	// happily produce a string full of invalid bytes. The spec commits to
+	// rejecting a non-UTF-8 segment, so validate explicitly.
+	if !utf8.Valid(raw) {
+		return RecordCoordinate{}, ErrCoordSegmentNotUtf8
+	}
+	c.Segment = string(raw)
+	return c, nil
 }

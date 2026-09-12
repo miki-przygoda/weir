@@ -36,6 +36,11 @@ export const MessageType = {
   Nack: 0x03,
   HealthCheck: 0x04,
   HealthCheckResponse: 0x05,
+  // Additive within wire v1: message-type bytes 0x08-0xFF are reserved for
+  // exactly this, so WIRE_VERSION stays 1 and the 30 frozen vectors are
+  // untouched. A daemon predating these answers Nack(UnknownMessage).
+  PushTracked: 0x06,
+  AckTracked: 0x07,
 } as const;
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
 
@@ -156,6 +161,27 @@ export type DecodeErrorTag =
   | "PayloadCrcMismatch"
   | "TrailingBytes";
 
+/**
+ * Coordinate rejection tags, a separate union from DecodeErrorTag because a
+ * coordinate is a payload shape rather than a frame: the same bytes are a
+ * perfectly valid frame whose payload happens not to be a coordinate.
+ */
+export type CoordinateErrorTag =
+  | "Truncated"
+  | "UnsupportedVersion"
+  | "SegmentTooLong"
+  | "LengthMismatch"
+  | "SegmentNotUtf8";
+
+export class CoordinateError extends Error {
+  tag: CoordinateErrorTag;
+  constructor(tag: CoordinateErrorTag, detail?: string) {
+    super(detail !== undefined ? `${tag}: ${detail}` : tag);
+    this.name = "CoordinateError";
+    this.tag = tag;
+  }
+}
+
 export class DecodeError extends Error {
   // Explicit fields, not constructor parameter properties: parameter properties
   // are non-erasable TS syntax and throw under Node strip-only mode.
@@ -175,6 +201,8 @@ const VALID_MESSAGE_TYPES = new Set<number>([
   MessageType.Nack,
   MessageType.HealthCheck,
   MessageType.HealthCheckResponse,
+  MessageType.PushTracked,
+  MessageType.AckTracked,
 ]);
 
 const VALID_DURABILITY = new Set<number>([
@@ -243,4 +271,105 @@ export function decodeFrame(
   if (crc(payload) !== payloadCrc) throw new DecodeError("PayloadCrcMismatch");
 
   return { version, messageType, durability, flags, payloadLen, payload };
+}
+
+// ---- RecordCoordinate (the AckTracked payload) ----
+
+/**
+ * Layout (docs/wire_protocol.md, "AckTracked payload"):
+ *   0   1   coordinate_version (0x01)
+ *   1   8   index        u64 LE, 1-based within the segment
+ *   9  32   record_id    SHA-256
+ *  41   2   segment_len  u16 LE
+ *  43 var   segment      UTF-8, <= 255 bytes
+ */
+export const COORDINATE_VERSION = 1;
+export const COORDINATE_FIXED_LEN = 1 + 8 + 32 + 2;
+export const MAX_SEGMENT_NAME_LEN = 255;
+export const MAX_TRACKED_ACK_PAYLOAD = COORDINATE_FIXED_LEN + MAX_SEGMENT_NAME_LEN; // 298
+
+/**
+ * Where a tracked record landed in the buffer.
+ *
+ * An address, not a sequence: other producers interleave in the same segment,
+ * so one producer's indices have holes by construction. `segment` is an opaque,
+ * stable address rather than a filesystem path, and `recordId` is the same
+ * digest the daemon hands a sink as its per-record idempotency key.
+ *
+ * `index` is a bigint, not a number. It is a u64, and Number.MAX_SAFE_INTEGER
+ * is 2^53-1 -- a plain number silently rounds the top of the range.
+ */
+export interface RecordCoordinate {
+  segment: string;
+  index: bigint;
+  recordId: Buffer;
+}
+
+export function recordIdHex(c: RecordCoordinate): string {
+  return c.recordId.toString("hex");
+}
+
+/**
+ * Cap for a response that carries no coordinate. Every response a client that
+ * never sends PushTracked (0x06) can receive is at most two bytes: Ack carries
+ * none, Nack one or two, HealthCheckResponse one.
+ */
+export const MAX_RESPONSE_PAYLOAD = 2;
+
+/**
+ * Cap for a response of this type, applied before any allocation.
+ *
+ * AckTracked is the only weir response whose payload exceeds two bytes, so the
+ * bound is widened for exactly that type. Widening it for anything else would
+ * let a desynced peer use a stray type byte to unlock a bigger read.
+ */
+export function maxResponsePayload(messageType: number): number {
+  return messageType === MessageType.AckTracked ? MAX_TRACKED_ACK_PAYLOAD : MAX_RESPONSE_PAYLOAD;
+}
+
+/**
+ * Decode exactly one RecordCoordinate.
+ *
+ * The version byte leads so the layout can grow inside wire v1, which only
+ * works if a reader meeting an unknown version REJECTS rather than parsing a
+ * prefix it has never seen. The buffer must be exactly one coordinate for the
+ * same reason: a trailing byte means the two ends disagree about the layout,
+ * and quietly using the prefix is how that becomes a wrong address.
+ */
+export function decodeCoordinate(buf: Buffer): RecordCoordinate {
+  if (buf.length < COORDINATE_FIXED_LEN) {
+    throw new CoordinateError("Truncated", `${buf.length} < ${COORDINATE_FIXED_LEN}`);
+  }
+  const version = buf.readUInt8(0);
+  if (version !== COORDINATE_VERSION) {
+    throw new CoordinateError("UnsupportedVersion", `version ${version}`);
+  }
+
+  const index = buf.readBigUInt64LE(1);
+  const recordId = Buffer.from(buf.subarray(9, 41));
+  const segmentLen = buf.readUInt16LE(41);
+
+  if (segmentLen > MAX_SEGMENT_NAME_LEN) {
+    throw new CoordinateError("SegmentTooLong", `${segmentLen} > ${MAX_SEGMENT_NAME_LEN}`);
+  }
+  const want = COORDINATE_FIXED_LEN + segmentLen;
+  if (buf.length < want) {
+    throw new CoordinateError("Truncated", `${buf.length} < ${want}`);
+  }
+  if (buf.length !== want) {
+    throw new CoordinateError("LengthMismatch", `${buf.length - want} trailing byte(s)`);
+  }
+
+  const raw = buf.subarray(COORDINATE_FIXED_LEN, want);
+  // Buffer.toString("utf8") SUBSTITUTES U+FFFD for invalid sequences rather
+  // than throwing, so it cannot be used to detect a non-UTF-8 segment. A fatal
+  // TextDecoder is what actually rejects.
+  let segment: string;
+  try {
+    segment = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+  } catch (e) {
+    throw new CoordinateError("SegmentNotUtf8", (e as Error).message);
+  }
+
+  return { segment, index, recordId };
 }

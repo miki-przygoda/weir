@@ -12,8 +12,8 @@ runnable reference integrations.
 
 These five demos implement the **weir v1 wire protocol from the spec alone** —
 each in a different language, with **no dependency on any weir crate** — and every
-one reproduces all **30 frozen conformance vectors byte-exact**, and the Python
-client additionally passes the **33 tracked-extension checks** covering
+one reproduces all **30 frozen conformance vectors byte-exact**, and the Python, Go and TypeScript
+clients additionally pass the **tracked-extension checks** covering
 `PushTracked`/`AckTracked` and the `RecordCoordinate` codec. A client that does
 not implement the tracked extension is still fully conformant — that is what
 "additive within wire v1" means, and `docs/conformance.md` says so explicitly —
@@ -50,10 +50,10 @@ the source of truth. Override the path with the `WEIR_CONFORMANCE_VECTORS` env v
 | Project | Lang | What it is | Offline conformance | Tracked push |
 |---------|------|------------|---------------------|---|
 | [`py-wire-client/`](py-wire-client/) | Python (stdlib) | From-scratch producer + codec; runnable `examples/produce.py` + `scripts/run_daemon.sh`. | `python3 tests/test_conformance.py` | ✅ `tests/test_tracked.py` |
-| [`go-wire-client/`](go-wire-client/) | Go (stdlib) | Producer + codec + a 15-case adversarial live harness (every Nack reason + connection-close). | `go test ./...` | — |
+| [`go-wire-client/`](go-wire-client/) | Go (stdlib) | Producer + codec + a 15-case adversarial live harness (every Nack reason + connection-close). | `go test ./...` | ✅ `go test -run TestTracked` |
 | [`c-wire-client/`](c-wire-client/) | C (C11, POSIX) | Zero-dep, warning-clean (`-Wall -Wextra -Wpedantic -Wconversion`); embedded/systems angle. | `make check` | — |
 | [`java-wire-client/`](java-wire-client/) | Java (JDK 21+) | Stdlib-only (`UnixDomainSocketAddress` + `CRC32`); enterprise/JVM angle. | `javac -d out $(find src -name '*.java') && java -cp out dev.weir.client.ConformanceRunner` | — |
-| [`ts-wire-client/`](ts-wire-client/) | TypeScript/Node | Zero runtime deps; runs `.ts` on stock Node; end-to-end HTTP→wire→WAB example. | `node src/conformance.ts` | — |
+| [`ts-wire-client/`](ts-wire-client/) | TypeScript/Node | Zero runtime deps; runs `.ts` on stock Node; end-to-end HTTP→wire→WAB example. | `node src/conformance.ts` | ✅ `node src/conformance_tracked.ts` |
 
 Run instructions are in each project's own README. The offline conformance suites
 need no daemon; the live harnesses start a daemon with an isolated socket/wab/port.
