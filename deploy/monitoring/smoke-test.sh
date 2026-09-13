@@ -71,8 +71,32 @@ gt() { python3 -c "import sys;sys.exit(0 if float('$1')>float('$2') else 1)" 2>/
 
 echo "── weir monitoring smoke test ─────────────────────────────────────────────"
 echo "[setup] bringing the stack up (idempotent, builds if needed)...${PROFILE_ARGS:+ profiles:$PROFILE_ARGS}"
+# Capture rather than discard. This used to be `>/dev/null 2>&1`, so a failure
+# here surfaced as the four words "docker compose up failed" and nothing else --
+# not diagnosable from a CI log, and it cost a real diagnosis: a job died on an
+# image pull and the reason was unrecoverable from the output. Compose stays
+# quiet on success, where its output is pure noise.
+compose_log="$(mktemp)"
 # shellcheck disable=SC2086
-docker compose $PROFILE_ARGS up -d --build --wait >/dev/null 2>&1 || { echo "  docker compose up failed"; exit 1; }
+if ! docker compose $PROFILE_ARGS up -d --build --wait >"$compose_log" 2>&1; then
+  echo "  docker compose up failed:"
+  # The tail, not the whole log: most of it is build progress, and compose
+  # reports the actual error last -- whether that is a failed build step, an
+  # unavailable port, or an image that cannot be pulled. Say how much was
+  # dropped rather than truncating silently.
+  total=$(wc -l <"$compose_log" | tr -d ' ')
+  if [ "$total" -gt 60 ]; then
+    echo "    (last 60 of $total lines; full log: $compose_log)"
+    tail -60 "$compose_log" | sed 's/^/    /'
+    # Deliberately NOT removed: a CI run that fails here should leave the whole
+    # log behind for whoever reads the job afterwards.
+  else
+    sed 's/^/    /' "$compose_log"
+    rm -f "$compose_log"
+  fi
+  exit 1
+fi
+rm -f "$compose_log"
 # Prometheus loads its scrape config at startup. If it was already running from a
 # previous `up`, the bind-mounted prometheus.yml may now be newer (e.g. the
 # levels/chaos jobs were just added by passing --profile). Force a live reload so
