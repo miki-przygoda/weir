@@ -115,7 +115,7 @@ jobs:
       - run: python3 demos/py-wire-client/tests/test_response_cap.py
       - run: python3 demos/py-wire-client/tests/test_tracked.py
       - run: cd demos/go-wire-client && go test ./...
-      - run: cd demos/c-wire-client && make check
+      - run: cd demos/c-wire-client && make check && make check-tracked
       - name: Java demo client conformance
         run: |
           cd demos/java-wire-client

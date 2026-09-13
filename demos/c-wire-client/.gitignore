@@ -1,0 +1,12 @@
+# Compiled outputs of this client's Makefile.
+#
+# None of these was ignored before, which is how a macOS Mach-O
+# `conformance_tracked` reached a commit: `git add demos/c-wire-client` swept up
+# an untracked, unignored binary. A committed binary breaks CI in a way that
+# looks nothing like its cause — the Linux runner checks the Mach-O out, make
+# sees it newer than its sources and skips the rebuild, and the run dies with
+# "Exec format error". `act` reproduced exactly that locally.
+conformance
+conformance_tracked
+telemetry
+negative

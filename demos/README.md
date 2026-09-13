@@ -12,13 +12,22 @@ runnable reference integrations.
 
 These five demos implement the **weir v1 wire protocol from the spec alone** —
 each in a different language, with **no dependency on any weir crate** — and every
-one reproduces all **30 frozen conformance vectors byte-exact**, and the Python, Go, TypeScript and Java
-clients additionally pass the **tracked-extension checks** covering
-`PushTracked`/`AckTracked` and the `RecordCoordinate` codec. A client that does
-not implement the tracked extension is still fully conformant — that is what
-"additive within wire v1" means, and `docs/conformance.md` says so explicitly —
-so the column above records which ones do rather than implying the others are
-behind. Together they're the
+one reproduces all **30 frozen conformance vectors byte-exact**, and **all five** additionally
+pass the tracked-extension checks covering `PushTracked`/`AckTracked` and the
+`RecordCoordinate` codec. A client that does *not* implement the tracked
+extension would still be fully conformant — that is what "additive within wire
+v1" means, and `docs/conformance.md` says so explicitly — so the column above
+records support rather than compliance.
+
+Implementing the extension five times was worth it for what it caught. Three of
+the five languages mishandle the top of the u64 range by default, and the
+vectors exercise `u64::MAX` precisely: Go's and TypeScript's JSON decoders both
+round it to `18446744073709552000`, and Java's `Long.parseLong` throws outright.
+Three of the five also fail to reject invalid UTF-8 without being told to — Go's
+`[]byte`→`string`, TypeScript's `Buffer.toString` and Java's
+`new String(bytes, UTF_8)` all substitute or accept where the spec requires a
+rejection. None of that is visible from Rust, where a `u64` is a `u64` and
+`from_utf8` returns a `Result`. Together they're the
 proof that weir's wire is a complete, language-neutral contract: you can talk to a
 weir daemon from anything that can open a socket and compute a CRC32.
 
@@ -51,7 +60,7 @@ the source of truth. Override the path with the `WEIR_CONFORMANCE_VECTORS` env v
 |---------|------|------------|---------------------|---|
 | [`py-wire-client/`](py-wire-client/) | Python (stdlib) | From-scratch producer + codec; runnable `examples/produce.py` + `scripts/run_daemon.sh`. | `python3 tests/test_conformance.py` | ✅ `tests/test_tracked.py` |
 | [`go-wire-client/`](go-wire-client/) | Go (stdlib) | Producer + codec + a 15-case adversarial live harness (every Nack reason + connection-close). | `go test ./...` | ✅ `go test -run TestTracked` |
-| [`c-wire-client/`](c-wire-client/) | C (C11, POSIX) | Zero-dep, warning-clean (`-Wall -Wextra -Wpedantic -Wconversion`); embedded/systems angle. | `make check` | — |
+| [`c-wire-client/`](c-wire-client/) | C (C11, POSIX) | Zero-dep, warning-clean (`-Wall -Wextra -Wpedantic -Wconversion`); embedded/systems angle. | `make check` | ✅ `make check-tracked` |
 | [`java-wire-client/`](java-wire-client/) | Java (JDK 21+) | Stdlib-only (`UnixDomainSocketAddress` + `CRC32`); enterprise/JVM angle. | `javac -d out $(find src -name '*.java') && java -cp out dev.weir.client.ConformanceRunner` | ✅ `TrackedConformanceRunner` |
 | [`ts-wire-client/`](ts-wire-client/) | TypeScript/Node | Zero runtime deps; runs `.ts` on stock Node; end-to-end HTTP→wire→WAB example. | `node src/conformance.ts` | ✅ `node src/conformance_tracked.ts` |
 
