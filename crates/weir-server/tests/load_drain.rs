@@ -528,7 +528,19 @@ fn drain_throughput_http_per_record() {
 /// shared CI hardware rather than a measurement.
 #[test]
 fn drain_throughput_http_ndjson() {
-    const RECORDS: usize = 2_000;
+    // 20,000 rather than 2,000, because this scenario was measuring its own
+    // quantisation. NDJSON delivers in POSTs of `sink_max_batch_size` (100 by
+    // default) and `await_delivery` polls on a 1 ms sleep, so both ends of the
+    // window move in ~100-record steps. At 2,000 the timed window was 4-5 ms on
+    // a CI runner and 8-11 ms on an operator box -- four to eleven poll ticks --
+    // and three identical iterations spread 1.75x. The other two scenarios,
+    // whose windows are 31-45 ms, spread 1.007x and 1.002x over the same runs.
+    //
+    // Ten times the records makes the window ~10x wider without changing what
+    // is measured: `bulk()` still times only the sealed portion, and the
+    // per-record and slow-sink scenarios are deliberately left at their sizes,
+    // which are already wide enough.
+    const RECORDS: usize = 20_000;
     let sink = MockSink::start();
     sink.set_failing(true);
     let srv = daemon("drain_ndjson", &sink)
