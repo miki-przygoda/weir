@@ -65,6 +65,27 @@ starts it with `network="host"`, so compose services come up as siblings and
 their published ports resolve from inside the job. Verified by bringing up MinIO
 from within a runner container and reaching it on `127.0.0.1:19000`.
 
+**That same `network="host"` means these jobs compete for your machine's ports.**
+`monitoring` publishes Grafana on `127.0.0.1:3000`, which is also where a local
+Rails or Next.js dev server sits by default, and compose fails the whole stack
+when the bind is refused:
+
+```
+docker compose up failed:
+  (last 60 of 152 lines; full log: /tmp/tmp.utY8gixiIL)
+  ...
+  Error response from daemon: ports are not available: exposing port TCP
+  127.0.0.1:3000 -> 127.0.0.1:0: bind: address already in use
+```
+
+Free the port (`lsof -nP -iTCP:3000 -sTCP:LISTEN`) and re-run. This is a local
+collision, not a CI failure — on a GitHub runner nothing else holds the port.
+
+That the cause is *readable at all* is recent: `smoke-test.sh` used to send
+compose's stdout and stderr to `/dev/null`, so every failure of this job — a
+refused port, a failed build, an image that no longer exists — surfaced
+identically as the four words `docker compose up failed`.
+
 **When a CI job is split or renamed, re-check this table.** The `windows` row is
 the worked example: 2.0.5 dropped the Windows `weir-server` target and moved the
 mTLS-client guarantee into a job of its own. The new job inherited no "cannot
