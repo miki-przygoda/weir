@@ -3291,6 +3291,24 @@ fn clickhouse_sink_end_to_end() {
     );
 }
 
+/// Like [`parse_metric`] but for a value rendered as a float.
+///
+/// A histogram's `_sum` is exposed as `20.0`, which `parse_metric`'s `u64`
+/// parse rejects — returning its not-found sentinel of 0. That silent 0 is
+/// indistinguishable from "the metric is absent", which cost a debugging cycle:
+/// the implementation was correct and the test was reading it wrong.
+fn parse_metric_f64(body: &str, prefix: &str) -> f64 {
+    for line in body.lines() {
+        if line.starts_with(prefix)
+            && let Some(val) = line.split_whitespace().next_back()
+            && let Ok(n) = val.parse()
+        {
+            return n;
+        }
+    }
+    f64::NAN
+}
+
 fn parse_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
         if line.starts_with(prefix)
@@ -3748,4 +3766,83 @@ fn s3_sink_an_unreachable_endpoint_strands_rather_than_dead_letters() {
         excerpt()
     );
     handle.shutdown();
+}
+
+/// Every `Durable` record is covered by exactly one group fsync, and the
+/// histogram says how many records each one covered.
+///
+/// This is the fsync amortisation factor, measured rather than modelled. Until
+/// it existed, nothing in the tree observed it — `grep group_commit` returned
+/// nothing — and the case for wire-level batching rests entirely on it being
+/// low in real deployments. A6's premise is falsifiable only with this number.
+///
+/// The invariant asserted here is stronger than "the metric exists": the SUM of
+/// the observations must equal the number of `Durable` records pushed. Every
+/// record is covered by exactly one group fsync, so a sum that drifts means
+/// either a record was fsynced twice (the amortisation is being overcounted) or
+/// one was never covered (which would be a false-ack hazard, not a metrics bug).
+#[test]
+fn group_commit_histogram_counts_every_durable_record_exactly_once() {
+    const N: u32 = 50;
+
+    let srv = weir_server!("group_commit").start();
+    let mut client = srv.client();
+
+    let read_count = |name: &str| -> u64 { parse_metric(&srv.scrape_metrics(), name) };
+    let read_sum =
+        |name: &str| -> f64 { parse_metric_f64(&srv.scrape_metrics(), name) };
+
+    let count_before = read_count("weir_wab_group_commit_records_count");
+    let sum_before = read_sum("weir_wab_group_commit_records_sum");
+
+    // Buffered must not contribute: it acks on the memory write, before any
+    // fsync, so it is covered by no group commit at all.
+    for i in 0..N {
+        client
+            .push(format!("buf-{i}").as_bytes(), Durability::Buffered)
+            .expect("buffered push");
+    }
+    assert_eq!(
+        read_sum("weir_wab_group_commit_records_sum"),
+        sum_before,
+        "a Buffered record was counted into a group commit; Buffered acks \
+         before any fsync and must contribute nothing"
+    );
+
+    for i in 0..N {
+        client
+            .push(format!("dur-{i}").as_bytes(), Durability::Durable)
+            .expect("durable push");
+    }
+
+    let count_after = read_count("weir_wab_group_commit_records_count");
+    let sum_after = read_sum("weir_wab_group_commit_records_sum");
+
+    assert_eq!(
+        sum_after - sum_before,
+        f64::from(N),
+        "the group-commit histogram must account for every Durable record \
+         exactly once: pushed {N}, observed {}",
+        sum_after - sum_before
+    );
+    assert!(
+        count_after > count_before,
+        "no group commit was observed at all for {N} Durable records"
+    );
+
+    // The amortisation factor itself. On a serial single connection each record
+    // is its own group commit, so this is ~1.0 — which is precisely the
+    // measurement A6's case depends on. Asserted as a range rather than a point
+    // so the test states the shape without becoming a timing flake.
+    let fsyncs = count_after - count_before;
+    let per_fsync = (sum_after - sum_before) / fsyncs as f64;
+    println!(
+        "BENCH: {{\"scenario\":\"group_commit_serial_one_connection\",\
+         \"records\":{N},\"group_commits\":{fsyncs},\"records_per_fsync\":{per_fsync:.3}}}"
+    );
+    assert!(
+        (1.0..=f64::from(N)).contains(&per_fsync),
+        "records per group commit was {per_fsync}, outside 1..={N} — one fsync \
+         cannot cover fewer than one record nor more than were pushed"
+    );
 }

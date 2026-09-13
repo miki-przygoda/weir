@@ -992,6 +992,13 @@ fn flush_batch(
     // empty and we skip the now-redundant fsync.)
     if !pending_acks.is_empty() {
         let ok = fsync_observed(writer, shard_id, metrics, coalesce_hint);
+        // This one fsync just covered exactly this many records. Observed here
+        // rather than inferred from a ratio of two counters, because those two
+        // counters move on different paths and their quotient would silently
+        // include records that rotated out and were never part of this commit.
+        metrics
+            .wab_group_commit_records
+            .observe(pending_acks.len() as f64);
         #[cfg(feature = "bench-trace")]
         for enqueued_at in pending_ts {
             metrics
