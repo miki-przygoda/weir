@@ -66,6 +66,58 @@ public final class WeirClient implements AutoCloseable {
         return interpret(response);
     }
 
+    /**
+     * Pushes a record and returns where it landed.
+     *
+     * <p>Identical to {@link #push} in every other respect — same tiers, same
+     * caps, same Nack reasons — but answered with an {@code AckTracked} carrying
+     * the coordinate. A daemon predating the type answers
+     * {@code Nack(UnknownMessage)} and closes;
+     * {@link ProtocolException#meansNoTrackedSupport()} names that case. Open a
+     * new connection and use {@link #push}.
+     */
+    public RecordCoordinate pushTracked(byte[] payload, Wire.Durability durability)
+            throws IOException {
+        if (payload.length == 0) {
+            throw new ProtocolException(
+                "a zero-length PushTracked is rejected with Nack(EmptyPayload); "
+                + "use healthCheck() to probe liveness without a payload");
+        }
+        writeFrame(new Frame(Wire.MessageType.PUSH_TRACKED, durability, payload));
+        Frame response = readResponse();
+        return interpretTracked(response);
+    }
+
+    private RecordCoordinate interpretTracked(Frame response) {
+        switch (response.messageType) {
+            case ACK_TRACKED:
+                try {
+                    return RecordCoordinate.decode(response.payload);
+                } catch (RecordCoordinate.CoordinateException e) {
+                    throw new ProtocolException(
+                        "AckTracked payload is not a coordinate: " + e.getMessage());
+                }
+            case NACK:
+                if (response.payload.length < 1) {
+                    throw new ProtocolException("Nack frame carried an empty payload");
+                }
+                int raw = response.payload[0] & 0xFF;
+                throw ProtocolException.nack(Wire.NackReason.fromByte(raw), raw);
+            case ACK:
+                // A bare Ack is an error, not a success. The request determines
+                // the response shape, so an Ack here means the peer did not
+                // understand what was asked -- returning success would report a
+                // coordinate that does not exist.
+                throw new ProtocolException(
+                    "daemon answered a PushTracked with a bare Ack; the record may be "
+                    + "durable but its coordinate is unknown");
+            default:
+                throw new ProtocolException(
+                    "unexpected response message_type for a PushTracked: "
+                    + response.messageType);
+        }
+    }
+
     /** Sends a HealthCheck and returns the HealthCheckResponse. */
     public Frame healthCheck() throws IOException {
         Frame request = new Frame(Wire.MessageType.HEALTH_CHECK, Wire.Durability.DURABLE, new byte[0]);
@@ -113,9 +165,9 @@ public final class WeirClient implements AutoCloseable {
 
     /**
      * Reads exactly one response frame off the wire, doing its own framing.
-     * Caps the declared response payload at {@link Wire#MAX_RESPONSE_PAYLOAD}
-     * before allocating, per the spec checklist (responses this client can
-     * receive are <= 2 bytes; AckTracked, which it never asks for, is 298).
+     * Caps the declared response payload before allocating, per the spec
+     * checklist, by the type the header declares: AckTracked carries a
+     * coordinate of up to 298 bytes, every other response at most two.
      */
     private Frame readResponse() throws IOException {
         byte[] header = readExactly(Wire.HEADER_LEN);
@@ -134,11 +186,24 @@ public final class WeirClient implements AutoCloseable {
         }
 
         ByteBuffer hb = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
+
+        // Verify the header CRC BEFORE choosing a cap from the type byte. The
+        // cap is now per-type, so an unverified type byte could widen the bound
+        // a flipped bit later fails anyway -- bounded at 296 bytes, but the
+        // reference client decodes the full header first and this should match.
+        long headerCrc = Frame.crc32(header, 0, 12);
+        if (headerCrc != Integer.toUnsignedLong(hb.getInt(12))) {
+            throw new ProtocolException(Frame.DecodeError.HEADER_CRC_MISMATCH,
+                "response header CRC mismatch");
+        }
+
         long payloadLen = Integer.toUnsignedLong(hb.getInt(8));
-        if (payloadLen > Wire.MAX_RESPONSE_PAYLOAD) {
+        int cap = Wire.maxResponsePayload(header[5] & 0xFF);
+        if (payloadLen > cap) {
             throw new ProtocolException(
                 "response declared payload_len " + payloadLen
-                + " > MAX_RESPONSE_PAYLOAD " + Wire.MAX_RESPONSE_PAYLOAD
+                + " > " + cap + " for message_type 0x"
+                + Integer.toHexString(header[5] & 0xFF)
                 + " (desync or non-weir peer)");
         }
 

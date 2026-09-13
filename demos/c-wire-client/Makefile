@@ -3,10 +3,17 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 LIB_SRC  = weir_wire.c weir_conn.c
 
-all: conformance telemetry negative
+all: conformance conformance_tracked telemetry negative
 
 conformance: conformance.c weir_wire.c weir_wire.h
 	$(CC) $(CFLAGS) -o $@ conformance.c weir_wire.c
+
+# A second binary, not a branch in conformance.c: that scanner is sized and
+# shaped for the frozen file (its array locator, its 1024-byte object buffer and
+# its 256-byte hex buffer all assume it). Keeping them separate means the frozen
+# set's green light cannot be disturbed by tracked-file churn.
+conformance_tracked: conformance_tracked.c weir_wire.c weir_wire.h
+	$(CC) $(CFLAGS) -o $@ conformance_tracked.c weir_wire.c
 
 telemetry: telemetry.c $(LIB_SRC) weir_wire.h weir_conn.h
 	$(CC) $(CFLAGS) -o $@ telemetry.c $(LIB_SRC)
@@ -20,7 +27,11 @@ VECTORS ?= ../../docs/conformance/wire_v1_vectors.json
 check: conformance
 	./conformance "$(VECTORS)"
 
-clean:
-	rm -f conformance telemetry negative
+TRACKED_VECTORS ?= ../../docs/conformance/wire_v1_tracked_vectors.json
+check-tracked: conformance_tracked
+	./conformance_tracked "$(TRACKED_VECTORS)"
 
-.PHONY: all check clean
+clean:
+	rm -f conformance conformance_tracked telemetry negative
+
+.PHONY: all check check-tracked clean

@@ -83,7 +83,7 @@ weir_result weir_recv_response(int fd, weir_response *resp) {
       | ((uint32_t)tail[resp->hdr.payload_len + 2] << 16)
       | ((uint32_t)tail[resp->hdr.payload_len + 3] << 24);
     uint32_t got = weir_crc32(tail, resp->hdr.payload_len);
-    if (want != got) return WEIR_ERR_BAD_HEADER_CRC; /* reuse: bad CRC */
+    if (want != got) return WEIR_ERR_BAD_PAYLOAD_CRC;
 
     memcpy(resp->payload, tail, resp->hdr.payload_len);
     resp->payload_len = resp->hdr.payload_len;
@@ -91,4 +91,61 @@ weir_result weir_recv_response(int fd, weir_response *resp) {
     resp->nack_reason = (resp->is_nack && resp->payload_len >= 1)
                           ? resp->payload[0] : 0;
     return WEIR_OK;
+}
+
+weir_result weir_recv_tracked_response(int fd, weir_tracked_response *resp) {
+    uint8_t hdr[WEIR_HEADER_LEN];
+    weir_result r = read_exact(fd, hdr, WEIR_HEADER_LEN);
+    if (r != WEIR_OK) return r;
+
+    r = weir_decode_resp_header(hdr, &resp->hdr);
+    if (r != WEIR_OK) return r;
+
+    /* The wider read lives HERE, on this function's stack, so a program that
+     * never pushes tracked pays nothing for it. */
+    uint8_t tail[WEIR_MAX_TRACKED_ACK_PAYLOAD + WEIR_CRC_LEN];
+    size_t tail_len = resp->hdr.payload_len + WEIR_CRC_LEN;
+    if (tail_len > sizeof tail) return WEIR_ERR_RESP_TOO_LARGE;
+    r = read_exact(fd, tail, tail_len);
+    if (r != WEIR_OK) return r;
+
+    uint32_t want =
+        (uint32_t)tail[resp->hdr.payload_len]
+      | ((uint32_t)tail[resp->hdr.payload_len + 1] << 8)
+      | ((uint32_t)tail[resp->hdr.payload_len + 2] << 16)
+      | ((uint32_t)tail[resp->hdr.payload_len + 3] << 24);
+    uint32_t got = weir_crc32(tail, resp->hdr.payload_len);
+    if (want != got) return WEIR_ERR_BAD_PAYLOAD_CRC;
+
+    resp->is_nack = (resp->hdr.message_type == WEIR_MSG_NACK);
+    resp->nack_reason = (resp->is_nack && resp->hdr.payload_len >= 1) ? tail[0] : 0;
+
+    if (resp->is_nack) {
+        /* UnknownMessage here means the daemon predates PushTracked. The wire
+         * cannot distinguish that from any other unknown type; only the caller
+         * knows which question it asked, which is why this is decided here and
+         * not in the decoder. */
+        return resp->nack_reason == WEIR_NACK_UNKNOWN_MESSAGE
+             ? WEIR_ERR_TRACKED_UNSUPPORTED
+             : WEIR_OK;
+    }
+    if (resp->hdr.message_type == WEIR_MSG_ACK) {
+        return WEIR_ERR_TRACKED_BARE_ACK;
+    }
+    if (resp->hdr.message_type != WEIR_MSG_ACK_TRACKED) {
+        return WEIR_ERR_BAD_MAGIC; /* not a reply shape we asked for */
+    }
+    return weir_decode_coordinate(tail, resp->hdr.payload_len, &resp->coord);
+}
+
+weir_result weir_push_tracked(int fd, const uint8_t *payload, size_t payload_len,
+                              weir_durability dur, weir_tracked_response *resp) {
+    uint8_t frame[WEIR_HEADER_LEN + 4096 + WEIR_CRC_LEN];
+    size_t frame_len = 0;
+    weir_result r = weir_encode_push_tracked(payload, payload_len, dur,
+                                             frame, sizeof frame, &frame_len);
+    if (r != WEIR_OK) return r;
+    r = weir_send_all(fd, frame, frame_len);
+    if (r != WEIR_OK) return r;
+    return weir_recv_tracked_response(fd, resp);
 }

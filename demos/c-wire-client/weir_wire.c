@@ -62,21 +62,107 @@ static void write_header(uint8_t *h, weir_msg_type mt, weir_durability dur,
     put_u32_le(h + 12, weir_crc32(h, 12)); /* header CRC over [0..12) */
 }
 
-weir_result weir_encode_push(weir_durability dur,
-                             const uint8_t *payload, size_t payload_len,
-                             uint8_t *out, size_t out_cap, size_t *out_len) {
+/* Push and PushTracked differ only in the type byte; share the guards so they
+ * cannot drift apart. */
+static weir_result encode_record(weir_msg_type mt, weir_durability dur,
+                                 const uint8_t *payload, size_t payload_len,
+                                 uint8_t *out, size_t out_cap, size_t *out_len) {
     if (payload_len == 0) return WEIR_ERR_EMPTY_PAYLOAD;
     if (payload_len > WEIR_MAX_PAYLOAD_HARD_CAP) return WEIR_ERR_PAYLOAD_TOO_LARGE;
 
     size_t total = WEIR_HEADER_LEN + payload_len + WEIR_CRC_LEN;
     if (out_cap < total) return WEIR_ERR_BUF_TOO_SMALL;
 
-    write_header(out, WEIR_MSG_PUSH, dur, (uint32_t)payload_len);
+    write_header(out, mt, dur, (uint32_t)payload_len);
     memcpy(out + WEIR_HEADER_LEN, payload, payload_len);
     put_u32_le(out + WEIR_HEADER_LEN + payload_len,
                weir_crc32(payload, payload_len));
 
     if (out_len) *out_len = total;
+    return WEIR_OK;
+}
+
+weir_result weir_encode_push(weir_durability dur,
+                             const uint8_t *payload, size_t payload_len,
+                             uint8_t *out, size_t out_cap, size_t *out_len) {
+    return encode_record(WEIR_MSG_PUSH, dur, payload, payload_len,
+                         out, out_cap, out_len);
+}
+
+weir_result weir_encode_push_tracked(const uint8_t *payload, size_t payload_len,
+                                     weir_durability dur,
+                                     uint8_t *out, size_t out_cap, size_t *out_len) {
+    return encode_record(WEIR_MSG_PUSH_TRACKED, dur, payload, payload_len,
+                         out, out_cap, out_len);
+}
+
+size_t weir_max_response_payload(uint8_t message_type) {
+    return message_type == WEIR_MSG_ACK_TRACKED
+         ? (size_t)WEIR_MAX_TRACKED_ACK_PAYLOAD
+         : (size_t)WEIR_MAX_RESPONSE_PAYLOAD;
+}
+
+/*
+ * Strict UTF-8 validation. C has none in its standard library, and the spec
+ * commits to rejecting a non-UTF-8 segment, so it has to be written out.
+ *
+ * Rejects overlong encodings, surrogates (U+D800..U+DFFF) and anything above
+ * U+10FFFF -- all three are sequences a permissive decoder would accept and a
+ * conformant one must not.
+ */
+static int utf8_valid(const uint8_t *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        uint8_t c = s[i];
+        size_t need;
+        uint32_t cp;
+        if (c < 0x80u) { i++; continue; }
+        else if ((c & 0xE0u) == 0xC0u) { need = 1; cp = c & 0x1Fu; }
+        else if ((c & 0xF0u) == 0xE0u) { need = 2; cp = c & 0x0Fu; }
+        else if ((c & 0xF8u) == 0xF0u) { need = 3; cp = c & 0x07u; }
+        else return 0;                       /* 0x80-0xBF lead, or 0xF8+ */
+        if (i + need >= n) return 0;         /* continuation bytes run past the end */
+        for (size_t k = 1; k <= need; k++) {
+            uint8_t cc = s[i + k];
+            if ((cc & 0xC0u) != 0x80u) return 0;
+            cp = (cp << 6) | (uint32_t)(cc & 0x3Fu);
+        }
+        if (need == 1 && cp < 0x80u) return 0;        /* overlong */
+        if (need == 2 && cp < 0x800u) return 0;       /* overlong */
+        if (need == 3 && cp < 0x10000u) return 0;     /* overlong */
+        if (cp >= 0xD800u && cp <= 0xDFFFu) return 0; /* surrogate */
+        if (cp > 0x10FFFFu) return 0;                 /* out of range */
+        i += need + 1;
+    }
+    return 1;
+}
+
+weir_result weir_decode_coordinate(const uint8_t *buf, size_t len,
+                                   weir_coordinate *out) {
+    if (len < (size_t)WEIR_COORDINATE_FIXED_LEN) return WEIR_ERR_COORD_TRUNCATED;
+    if (buf[0] != WEIR_COORDINATE_VERSION)       return WEIR_ERR_COORD_BAD_VERSION;
+
+    uint64_t index = 0;
+    for (int i = 7; i >= 0; i--) index = (index << 8) | buf[1 + i];
+
+    size_t seg_len = (size_t)buf[41] | ((size_t)buf[42] << 8);
+    if (seg_len > (size_t)WEIR_MAX_SEGMENT_NAME_LEN) {
+        return WEIR_ERR_COORD_SEGMENT_TOO_LONG;
+    }
+    size_t want = (size_t)WEIR_COORDINATE_FIXED_LEN + seg_len;
+    if (len < want) return WEIR_ERR_COORD_TRUNCATED;
+    if (len != want) return WEIR_ERR_COORD_LENGTH_MISMATCH;
+
+    const uint8_t *seg = buf + WEIR_COORDINATE_FIXED_LEN;
+    if (!utf8_valid(seg, seg_len)) return WEIR_ERR_COORD_NOT_UTF8;
+
+    if (out) {
+        memcpy(out->segment, seg, seg_len);
+        out->segment[seg_len] = '\0';
+        out->segment_len = seg_len;
+        out->index = index;
+        memcpy(out->record_id, buf + 9, 32);
+    }
     return WEIR_OK;
 }
 
@@ -106,7 +192,10 @@ weir_result weir_decode_resp_header(const uint8_t hdr[WEIR_HEADER_LEN],
     if (want != got) return WEIR_ERR_BAD_HEADER_CRC;
 
     uint32_t plen = get_u32_le(hdr + 8);
-    if (plen > WEIR_MAX_RESPONSE_PAYLOAD) return WEIR_ERR_RESP_TOO_LARGE;
+    /* Cap by the type the header declares. Safe to trust hdr[5] here: the
+     * header CRC was verified three lines up, so the type byte cannot have been
+     * flipped into unlocking a bigger read. */
+    if ((size_t)plen > weir_max_response_payload(hdr[5])) return WEIR_ERR_RESP_TOO_LARGE;
 
     if (out) {
         out->version      = hdr[4];

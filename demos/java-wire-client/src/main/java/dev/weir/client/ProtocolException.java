@@ -61,4 +61,16 @@ public final class ProtocolException extends RuntimeException {
     public boolean isRetryable() {
         return nackReason == Wire.NackReason.INTERNAL_ERROR;
     }
+
+    /**
+     * True when this Nack is a daemon that predates {@code PushTracked} (0x06).
+     *
+     * <p>The wire cannot distinguish that from any other unknown message type,
+     * so only the caller knows which question it asked — this is meaningful
+     * solely on the reply to a {@code pushTracked()}. Do not retry on this
+     * connection: the daemon closes it. Open a new one and use {@code push()}.
+     */
+    public boolean meansNoTrackedSupport() {
+        return nackReason == Wire.NackReason.UNKNOWN_MESSAGE;
+    }
 }
