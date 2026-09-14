@@ -77,6 +77,13 @@ fn message_type_name(mt: MessageType) -> &'static str {
         MessageType::HealthCheckResponse => "HealthCheckResponse",
         MessageType::PushTracked => "PushTracked",
         MessageType::AckTracked => "AckTracked",
+        MessageType::PushBatch => "PushBatch",
+        MessageType::AckBatch => "AckBatch",
+        // MessageType is #[non_exhaustive] since 4.0, because a new message
+        // type is additive on the wire (bytes 0x08-0xFF are reserved) and
+        // should be additive in the API too. A vector naming a type this build
+        // does not know is a real failure, not something to render as "unknown".
+        other => panic!("conformance: unmapped MessageType variant {other:?}"),
     }
 }
 

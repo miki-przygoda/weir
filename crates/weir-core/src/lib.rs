@@ -23,6 +23,7 @@
 //! is its executable reference (see `tests/reference_frames.rs`).
 #![deny(missing_docs)]
 
+pub mod batch;
 pub mod coordinate;
 pub mod durability;
 pub mod envelope;
@@ -31,6 +32,11 @@ pub mod nack;
 pub mod payload;
 pub mod version;
 
+pub use batch::{
+    ACK_BATCH_HEADER_LEN, ACK_BATCH_VERSION, BATCH_HEADER_LEN, BATCH_VERSION, BatchError,
+    MAX_ACK_BATCH_PAYLOAD_LEN, MAX_BATCH_RECORDS_HARD_CAP, bitmap_bit, decode_ack_batch,
+    decode_batch_body, encode_ack_batch, encode_batch_body,
+};
 pub use coordinate::{
     COORDINATE_FIXED_LEN, COORDINATE_VERSION, CoordinateError, MAX_SEGMENT_NAME_LEN,
     MAX_TRACKED_ACK_PAYLOAD_LEN, RecordCoordinate,
