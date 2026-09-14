@@ -1118,6 +1118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let tcp_config = TcpConfig {
                         max_connections: config.max_connections,
                         max_payload_bytes: config.max_payload_bytes,
+                        max_batch_records: config.max_batch_records,
                         shard_count: config.shard_count,
                         shutdown_timeout_secs: config.shutdown_timeout_secs,
                         connection_read_timeout_secs: config.connection_read_timeout_secs,
@@ -1198,6 +1199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 socket_path: config.socket_path.clone(),
                 max_connections: config.max_connections,
                 max_payload_bytes: config.max_payload_bytes,
+                max_batch_records: config.max_batch_records,
                 shutdown_timeout_secs: config.shutdown_timeout_secs,
                 connection_read_timeout_secs: config.connection_read_timeout_secs,
                 shard_count: config.shard_count,

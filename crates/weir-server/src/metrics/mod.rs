@@ -244,6 +244,10 @@ pub(crate) struct Metrics {
     /// could check. An operator seeing values near `batch_size` is already
     /// getting the amortisation batching would buy.
     pub wab_group_commit_records: Histogram,
+    /// Records carried by one `PushBatch`, as accepted at ingest.
+    pub batch_records: Histogram,
+    /// `PushBatch` frames answered with at least one clear bit.
+    pub batch_partial: Counter<u64, AtomicU64>,
     /// WAB flusher thread panics. Once a flusher panics, its shard is offline
     /// (records routed to it receive Nack(InternalError)) until the daemon
     /// restarts — any non-zero value requires operator attention. Check logs
@@ -469,11 +473,29 @@ impl Metrics {
         // question this answers is an order of magnitude, not a percentile.
         let wab_group_commit_records = reg!(
             Histogram::new(
-                [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0].into_iter()
+                [
+                    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0
+                ]
+                .into_iter()
             ),
             "weir_wab_group_commit_records",
             "Records covered by one WAB group fsync (the fsync amortisation \
              factor; 1.0 means every record paid its own fsync)"
+        );
+        let batch_records = reg!(
+            Histogram::new(
+                [
+                    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0
+                ]
+                .into_iter()
+            ),
+            "weir_batch_records",
+            "Records carried by one PushBatch frame"
+        );
+        let batch_partial = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_batch_partial",
+            "PushBatch frames answered with at least one record not durable"
         );
         let wab_flusher_panics = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -680,6 +702,8 @@ impl Metrics {
             quarantine_bytes_on_disk,
             wab_fsync_duration,
             wab_group_commit_records,
+            batch_records,
+            batch_partial,
             wab_flusher_panics,
             drain_panics,
             wab_fsync_failures,

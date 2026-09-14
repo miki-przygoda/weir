@@ -16,6 +16,7 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         wab_max_bytes: env_parse("WEIR_WAB_MAX_BYTES")?,
         max_connections: env_parse("WEIR_MAX_CONNECTIONS")?,
         max_payload_bytes: env_parse("WEIR_MAX_PAYLOAD_BYTES")?,
+        max_batch_records: env_parse("WEIR_MAX_BATCH_RECORDS")?,
         metrics_port: env_parse("WEIR_METRICS_PORT")?,
         metrics_bind: env_string("WEIR_METRICS_BIND")?,
         metrics_max_connections: env_parse("WEIR_METRICS_MAX_CONNECTIONS")?,

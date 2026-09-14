@@ -218,6 +218,7 @@ pub(crate) struct PartialConfig {
     pub wab_compression_level: Option<i32>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
+    pub max_batch_records: Option<usize>,
     pub metrics_port: Option<u16>,
     pub metrics_bind: Option<String>,
     pub metrics_max_connections: Option<usize>,
@@ -404,6 +405,7 @@ pub struct Config {
     pub wab_compression_level: i32,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
+    pub max_batch_records: usize,
     pub metrics_port: u16,
     /// IP address the metrics HTTP endpoint binds to. Default `127.0.0.1`
     /// — localhost-only so an operator who runs weir on a multi-tenant host
@@ -741,6 +743,16 @@ impl Config {
         check_range("max_connections", max_connections, 1, 512)?;
 
         let max_payload_bytes = merge!(max_payload_bytes).unwrap_or(MAX_PAYLOAD_HARD_CAP);
+        // 1024 by default; the hard cap of 2048 keeps the AckBatch reply inside
+        // the 298-byte response bound weir already has, so no client gains a new
+        // maximum to allocate for.
+        let max_batch_records = merge!(max_batch_records).unwrap_or(1024);
+        check_range(
+            "max_batch_records",
+            max_batch_records,
+            1,
+            weir_core::MAX_BATCH_RECORDS_HARD_CAP,
+        )?;
         if max_payload_bytes == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "max_payload_bytes",
@@ -1107,6 +1119,7 @@ impl Config {
             wab_compression_level,
             max_connections,
             max_payload_bytes,
+            max_batch_records,
             metrics_port,
             metrics_bind,
             metrics_max_connections,

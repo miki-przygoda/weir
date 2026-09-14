@@ -831,6 +831,8 @@ fn metrics_all_families_registered() {
         "weir_wab_record_stored_bytes",
         "weir_wab_fsync_duration_seconds",
         "weir_wab_group_commit_records",
+        "weir_batch_records",
+        "weir_batch_partial",
         "weir_wab_flusher_panics",
         "weir_wab_fsync_failures",
         "weir_wab_cap_rejections",
@@ -3844,5 +3846,177 @@ fn group_commit_histogram_counts_every_durable_record_exactly_once() {
         (1.0..=f64::from(N)).contains(&per_fsync),
         "records per group commit was {per_fsync}, outside 1..={N} — one fsync \
          cannot cover fewer than one record nor more than were pushed"
+    );
+}
+
+/// Reads exactly one response frame off a raw stream: header, then
+/// `payload_len + 4`.
+fn read_one_frame(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> (weir_core::MessageType, Vec<u8>) {
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    stream
+        .read_exact(&mut header)
+        .expect("read response header");
+    let plen = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    let mut rest = vec![0u8; plen + 4];
+    stream.read_exact(&mut rest).expect("read response payload");
+    let mt = weir_core::MessageType::try_from(header[5]).expect("known response type");
+    (mt, rest[..plen].to_vec())
+}
+
+/// A `PushBatch` is answered once, with a bitmap that says every record landed.
+///
+/// This is the end-to-end shape of A6: N records in one frame, one reply, and
+/// the per-record counters moving by N rather than by one — a per-frame `.inc()`
+/// would undercount by up to the batch size and silently break every rate panel,
+/// the fsync-amortisation panel that divides by this counter, and the readiness
+/// script that gates on it.
+#[test]
+fn a_push_batch_is_answered_with_a_bitmap_and_counts_every_record() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Durability, Envelope, Header, MessageType};
+
+    const N: usize = 10;
+
+    let srv = weir_server!("batch_ok").start();
+    let accepted_before = parse_metric(
+        &srv.scrape_metrics(),
+        "weir_records_accepted_total{tier=\"durable\"}",
+    );
+
+    let records: Vec<Vec<u8>> = (0..N)
+        .map(|i| format!("batched-{i}").into_bytes())
+        .collect();
+    let body =
+        weir_core::encode_batch_body(&records.iter().map(|r| r.as_slice()).collect::<Vec<_>>());
+    let frame = Envelope::new(
+        Header::new(MessageType::PushBatch, Durability::Durable, 0),
+        body,
+    )
+    .encode();
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("connect");
+    stream.write_all(&frame).expect("write PushBatch");
+    let (mt, payload) = read_one_frame(&mut stream);
+
+    assert_eq!(
+        mt,
+        MessageType::AckBatch,
+        "a PushBatch must be answered with an AckBatch"
+    );
+    let accepted = weir_core::decode_ack_batch(&payload, N).expect("decode the bitmap");
+    assert_eq!(
+        accepted,
+        vec![true; N],
+        "every record of a healthy batch must be durable"
+    );
+
+    // The additive property: an ordinary Push still works on the same
+    // connection, after a batch. A producer is never forced to choose.
+    let plain = Envelope::new(
+        Header::new(MessageType::Push, Durability::Durable, 0),
+        b"plain".to_vec(),
+    )
+    .encode();
+    stream.write_all(&plain).expect("write Push");
+    let (mt, _) = read_one_frame(&mut stream);
+    assert_eq!(
+        mt,
+        MessageType::Ack,
+        "a plain Push after a batch must still be acked"
+    );
+
+    let accepted_after = parse_metric(
+        &srv.scrape_metrics(),
+        "weir_records_accepted_total{tier=\"durable\"}",
+    );
+    assert_eq!(
+        accepted_after - accepted_before,
+        (N + 1) as u64,
+        "records_accepted must move by RECORDS ({} batched + 1 plain), not by \
+         frames — a per-frame inc() would have moved it by 2",
+        N
+    );
+}
+
+/// A malformed sub-record rejects the whole frame and closes the connection.
+///
+/// This is what lets the `AckBatch` bitmap carry no reason bytes. Every
+/// per-record *validation* failure is permanent, and permanent errors close the
+/// connection exactly as a malformed single `Push` does — so by the time a
+/// bitmap is sent at all, every bit it can clear is a transient runtime failure
+/// that means "retry".
+#[test]
+fn a_batch_containing_an_empty_record_is_rejected_whole_and_closes() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream as RawStream,
+    };
+    use weir_core::{Durability, Envelope, Header, MessageType, NackReason};
+
+    let srv = weir_server!("batch_empty_rec").start();
+
+    // Hand-built: encode_batch_body would happily encode it, but the daemon
+    // must reject it — an empty record cannot be represented in a WAB segment,
+    // where a zero payload_len is the end-of-records sentinel.
+    let body = weir_core::encode_batch_body(&[b"fine", b"", b"also fine"]);
+    let frame = Envelope::new(
+        Header::new(MessageType::PushBatch, Durability::Durable, 0),
+        body,
+    )
+    .encode();
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("connect");
+    stream.write_all(&frame).expect("write PushBatch");
+    let (mt, payload) = read_one_frame(&mut stream);
+
+    assert_eq!(
+        mt,
+        MessageType::Nack,
+        "a malformed batch must Nack, not answer with a bitmap"
+    );
+    assert_eq!(
+        payload.first().copied(),
+        Some(NackReason::EmptyPayload as u8),
+        "the reason must name what was wrong with the record, not a generic error"
+    );
+
+    // Permanent ⇒ closed, same as any other malformed frame.
+    let mut buf = [0u8; 1];
+    assert!(
+        matches!(stream.read(&mut buf), Ok(0) | Err(_)),
+        "a permanent rejection must close the connection"
+    );
+}
+
+/// A declared record count over the cap is refused before anything is reserved.
+#[test]
+fn a_batch_over_the_record_cap_is_refused() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Durability, Envelope, Header, MessageType, NackReason};
+
+    let srv = weir_server!("batch_over_cap")
+        .extra_config("max_batch_records = 4\n")
+        .start();
+
+    let records: Vec<Vec<u8>> = (0..8).map(|i| format!("r{i}").into_bytes()).collect();
+    let body =
+        weir_core::encode_batch_body(&records.iter().map(|r| r.as_slice()).collect::<Vec<_>>());
+    let frame = Envelope::new(
+        Header::new(MessageType::PushBatch, Durability::Durable, 0),
+        body,
+    )
+    .encode();
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("connect");
+    stream.write_all(&frame).expect("write PushBatch");
+    let (mt, payload) = read_one_frame(&mut stream);
+    assert_eq!(mt, MessageType::Nack);
+    assert_eq!(
+        payload.first().copied(),
+        Some(NackReason::PayloadTooLarge as u8),
+        "an over-cap batch is too large, and the producer's remedy is to send less"
     );
 }

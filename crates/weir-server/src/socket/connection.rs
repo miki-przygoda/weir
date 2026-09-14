@@ -21,7 +21,7 @@ use weir_sink_sdk::RecordId;
 
 use crate::{
     metrics::{Metrics, NackLabel, NackReason as MetricNack, TierLabel, TierValue},
-    models::WorkUnit,
+    models::{AckOutcome, WorkUnit},
     queue::QueueSender,
 };
 
@@ -59,6 +59,12 @@ pub struct ConnectionConfig {
     /// Cap applied before allocation: `min(config.max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
     /// The field already holds the effective minimum so no further clamping is needed here.
     pub max_payload_bytes: usize,
+    /// Ceiling on records in one `PushBatch`.
+    ///
+    /// A safety bound, not a tuning knob: `record_count` is a `u16`, so without
+    /// it a ~320 KiB frame could declare 65,535 records, all targeting the one
+    /// queue partition its connection is pinned to.
+    pub max_batch_records: usize,
     /// Deadline applied to each `read_exact` phase of a frame — the 16-byte
     /// header, the payload, and the 4-byte CRC are each bounded by this value.
     /// It is a whole-phase deadline, not a strict per-byte idle timer: a client
@@ -387,6 +393,97 @@ where
                 )
                 .await?;
             }
+            MessageType::PushBatch => {
+                let tv = durability_to_tier(header.durability());
+
+                // Same placement and same reasoning as the single-record arm:
+                // after the frame is fully read and CRC-verified, before
+                // anything counts as accepted. One check admits the whole
+                // batch, which is a widening of the cap's sampling window
+                // worth knowing about — see `max_batch_records`.
+                if over_wab_cap(&config) {
+                    send_nack(
+                        stream.get_mut(),
+                        WireNack::InternalError,
+                        &[],
+                        config.read_timeout,
+                    )
+                    .await?;
+                    metrics.wab_cap_rejections.inc();
+                    metrics
+                        .records_nack
+                        .get_or_create(&NackLabel {
+                            tier: tv,
+                            reason: MetricNack::internal_error,
+                        })
+                        .inc();
+                    continue;
+                }
+
+                // Parse AFTER the payload CRC, which step 5 already verified.
+                // That ordering means a *corrupted* count can never be acted
+                // on — but it is not the safety argument, because a hostile
+                // peer computes a valid CRC over whatever it likes. The caps
+                // below are the safety argument, and they are checked before
+                // anything is reserved.
+                let records = match weir_core::decode_batch_body(
+                    payload.as_ref(),
+                    config.max_batch_records,
+                    config.max_payload_bytes,
+                ) {
+                    Ok(records) => records,
+                    Err(e) => {
+                        // A framing or per-record validation failure is a
+                        // PERMANENT protocol error, so it rejects the whole
+                        // frame and closes the connection — exactly what a
+                        // malformed single Push does today. That is what lets
+                        // the AckBatch bitmap carry no reason bytes: every bit
+                        // it can ever clear is a transient runtime failure.
+                        tracing::warn!(error = %e, "rejecting a malformed PushBatch");
+                        let reason = match e {
+                            weir_core::BatchError::EmptyRecord { .. } => WireNack::EmptyPayload,
+                            weir_core::BatchError::TooManyRecords { .. }
+                            | weir_core::BatchError::RecordTooLarge { .. } => {
+                                WireNack::PayloadTooLarge
+                            }
+                            _ => WireNack::BadBatchFraming,
+                        };
+                        send_nack(stream.get_mut(), reason, &[], config.read_timeout).await?;
+                        metrics
+                            .records_nack
+                            .get_or_create(&NackLabel {
+                                tier: tv,
+                                reason: MetricNack::internal_error,
+                            })
+                            .inc();
+                        return Ok(());
+                    }
+                };
+
+                // inc_by, not inc. These are per-RECORD counters; incrementing
+                // once per frame would undercount by up to the batch size and
+                // silently break every rate panel, the fsync-amortisation panel
+                // that divides by this counter, and weir-readiness.sh. Worse,
+                // mixing per-batch accepted with per-record ack makes the
+                // documented `accepted - ack` in-flight gap go negative.
+                metrics
+                    .records_accepted
+                    .get_or_create(&TierLabel { tier: tv.clone() })
+                    .inc_by(records.len() as u64);
+
+                handle_push_batch(
+                    stream.get_mut(),
+                    queue_tx.clone(),
+                    header.durability(),
+                    &records,
+                    tv,
+                    config.shard_id,
+                    config.ack_timeout,
+                    config.read_timeout,
+                    &metrics,
+                )
+                .await?;
+            }
             MessageType::HealthCheck => {
                 write_all_timeout(
                     stream.get_mut(),
@@ -430,7 +527,10 @@ where
 /// Whether a message type is one of the two push variants — the frames that
 /// carry a record and must therefore obey the empty-payload guard.
 fn is_push(mt: MessageType) -> bool {
-    matches!(mt, MessageType::Push | MessageType::PushTracked)
+    matches!(
+        mt,
+        MessageType::Push | MessageType::PushTracked | MessageType::PushBatch
+    )
 }
 
 // 8 args — clippy's threshold is 7. Grouping these into a `PushCtx`
@@ -575,6 +675,139 @@ where
             Ok(())
         }
     }
+}
+
+/// Enqueues every record of a `PushBatch` and answers once with an `AckBatch`.
+///
+/// # One deadline for the whole batch
+///
+/// The single-record path spends up to `QUEUE_PUSH_TIMEOUT` (5 s) enqueueing
+/// and then up to `ACK_TIMEOUT` (30 s) waiting. Applied per record that is 35 s
+/// × N — nearly ten hours for a 1024-record batch, all of it holding one of the
+/// connection semaphore's permits, and none of it racing shutdown. So the batch
+/// gets ONE budget: every record is enqueued first, then all the acks are
+/// awaited together under a single `ACK_TIMEOUT`. Records unresolved when it
+/// expires report as not-durable, which is the honest answer — their outcome is
+/// genuinely unknown, and the wire contract already says a clear bit means
+/// "retry, and expect it may nonetheless have been written".
+///
+/// # Why a failed enqueue mid-batch is not all-or-nothing
+///
+/// Once record *k* is in the queue it cannot be recalled — `QueueSender` has no
+/// removal — so it *will* be written and acked. If enqueueing *k+1* then fails,
+/// records `0..k` have real outcomes this handler is obliged to report. It stops
+/// enqueueing, marks the rest not-durable, and waits for the ones already in
+/// flight. Reporting the whole batch as failed would be a lie about records that
+/// are about to become durable.
+#[allow(clippy::too_many_arguments)]
+async fn handle_push_batch<S>(
+    stream: &mut S,
+    queue_tx: QueueSender<WorkUnit>,
+    durability: Durability,
+    records: &[&[u8]],
+    tv: TierValue,
+    shard_id: u32,
+    ack_timeout: Duration,
+    write_timeout: Duration,
+    metrics: &Arc<Metrics>,
+) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let n = records.len();
+    let mut receivers: Vec<Option<tokio::sync::oneshot::Receiver<AckOutcome>>> =
+        Vec::with_capacity(n);
+    let partition_key = shard_id as usize;
+
+    for record in records {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let unit = WorkUnit {
+            shard_id,
+            payload: weir_core::Payload::from(*record),
+            durability,
+            wants_coordinate: false,
+            ack_tx,
+            #[cfg(feature = "bench-trace")]
+            enqueued_at: std::time::Instant::now(),
+        };
+
+        match queue_tx.try_push(partition_key, unit) {
+            Ok(()) => receivers.push(Some(ack_rx)),
+            Err(unit) => {
+                // The partition is full. Fall back to the blocking path exactly
+                // as the single-record handler does, but only for this record —
+                // a whole batch must not serialise N blocking waits.
+                let tx = queue_tx.clone();
+                let pushed = task::spawn_blocking(move || {
+                    tx.push_timeout(partition_key, unit, QUEUE_PUSH_TIMEOUT)
+                })
+                .await
+                .map_err(io::Error::other)?;
+                if pushed.is_ok() {
+                    receivers.push(Some(ack_rx));
+                } else {
+                    // Stop here: a saturated queue will not drain within this
+                    // frame, and every further attempt costs another 5 s.
+                    receivers.push(None);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Records never enqueued are definitively not durable.
+    let enqueued = receivers.len();
+    receivers.resize_with(n, || None);
+
+    let deadline = tokio::time::Instant::now() + ack_timeout;
+    let mut accepted = vec![false; n];
+    let mut acked = 0u64;
+    let mut timed_out = false;
+
+    for (i, rx) in receivers.into_iter().enumerate() {
+        let Some(rx) = rx else { continue };
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(outcome)) if outcome.durable => {
+                accepted[i] = true;
+                acked += 1;
+            }
+            // Flusher acked false, or dropped the sender (a panic).
+            Ok(_) => {}
+            Err(_elapsed) => {
+                // The shared budget is spent. Everything still outstanding is
+                // unknown, and unknown reports as not-durable.
+                timed_out = true;
+                break;
+            }
+        }
+    }
+    if timed_out {
+        metrics.ack_timeout.inc();
+    }
+
+    let nacked = n as u64 - acked;
+    if acked > 0 {
+        metrics
+            .records_ack
+            .get_or_create(&TierLabel { tier: tv.clone() })
+            .inc_by(acked);
+    }
+    if nacked > 0 {
+        metrics
+            .records_nack
+            .get_or_create(&NackLabel {
+                tier: tv,
+                reason: MetricNack::internal_error,
+            })
+            .inc_by(nacked);
+    }
+    metrics.batch_records.observe(n as f64);
+    if nacked > 0 {
+        metrics.batch_partial.inc();
+    }
+    debug_assert!(enqueued <= n);
+
+    send_ack_batch(stream, &accepted, write_timeout).await
 }
 
 /// Whether the WAB cap is currently rejecting pushes.
@@ -735,6 +968,16 @@ async fn send_ack_tracked<S: AsyncWrite + Unpin>(
     write_all_timeout(stream, &frame, write_timeout).await
 }
 
+async fn send_ack_batch<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    accepted: &[bool],
+    write_timeout: Duration,
+) -> io::Result<()> {
+    let header = Header::new(MessageType::AckBatch, Durability::Durable, 0);
+    let frame = Envelope::new(header, weir_core::encode_ack_batch(accepted)).encode();
+    write_all_timeout(stream, &frame, write_timeout).await
+}
+
 async fn send_ack<S: AsyncWrite + Unpin>(
     stream: &mut S,
     write_timeout: Duration,
@@ -761,6 +1004,7 @@ mod tests {
     fn test_cfg() -> ConnectionConfig {
         ConnectionConfig {
             max_payload_bytes: MAX_PAYLOAD_HARD_CAP,
+            max_batch_records: 1024,
             read_timeout: Duration::from_secs(30),
             ack_timeout: Duration::from_secs(30),
             shard_id: 0,
