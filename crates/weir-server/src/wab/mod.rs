@@ -30,7 +30,7 @@ use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::{AckOutcome, Batch, RecordSlot};
 use clock::{BlockingClock, RealClock};
 use recovery::{check_confirmed, recover_open_segments};
-use segment::{FsSegmentStore, SegmentStore, ShardWriter};
+use segment::{FsSegmentStore, SegmentStore, ShardWriter, WriteFailure};
 use weir_core::Durability;
 use weir_wab::format::{Compression, EXT_SEALED, SEGMENT_FOOTER_LEN};
 
@@ -899,16 +899,33 @@ fn flush_batch(
 
             // write_record returns Some(sealed_path) when the segment rotated.
             let Ok(rotation) = writer.write_record(&unit.payload) else {
-                // The active segment was dropped. Records already collected
-                // for it (pending_acks) are now in an abandoned, un-fsynced
-                // file — Nack them rather than let the group fsync below
-                // falsely ack them. Records in already-rotated (sealed +
-                // fsynced) segments are durable and untouched.
-                for pending in pending_acks.drain(..) {
-                    pending.resolve(false);
+                // Why the write failed decides who else is affected, and it
+                // used to be inferred rather than asked.
+                //
+                // SegmentDropped: records already collected for that segment
+                // (pending_acks) are in an abandoned, un-fsynced file — Nack
+                // them rather than let the group fsync below falsely ack them.
+                // Records in already-rotated (sealed + fsynced) segments are
+                // durable and untouched.
+                //
+                // RecordRejected: the segment was never dropped. The record was
+                // refused before anything was written — an empty payload, or a
+                // compression failure — and the comment on that path says so
+                // itself ("the segment stays clean"). Nacking its neighbours
+                // would be worse than useless: they ARE on disk, the group
+                // fsync below still covers them, and the drain still delivers
+                // them. Their producers would retry records the sink already
+                // has. And since pending_acks is shared across every connection
+                // on this shard, the producers punished need not be the one
+                // that sent the bad record.
+                if writer.last_write_failure() == WriteFailure::SegmentDropped {
+                    for pending in pending_acks.drain(..) {
+                        pending.resolve(false);
+                    }
+                    #[cfg(feature = "bench-trace")]
+                    pending_ts.clear();
                 }
-                #[cfg(feature = "bench-trace")]
-                pending_ts.clear();
+                // The record that failed is nacked either way.
                 let _ = unit.ack_tx.send(AckOutcome::failed());
                 continue;
             };

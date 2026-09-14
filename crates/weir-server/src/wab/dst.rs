@@ -1515,6 +1515,53 @@ mod tests {
         (acks, ledger, drain_paths, env)
     }
 
+    /// A record the WAB REJECTS must not nack the records already written
+    /// beside it.
+    ///
+    /// `flush_batch`'s failure arm drains `pending_acks` and resolves every one
+    /// `false`, on the premise stated in its own comment: "The active segment
+    /// was dropped." That premise is false for the *rejection* paths.
+    /// `ShardWriter::write_record` returns `Err` for an empty payload (and for a
+    /// zstd failure) **before** it clears `self.active`, so the segment is
+    /// untouched and still open — pinned by
+    /// `a_rejected_record_leaves_the_active_segment_usable` in `segment.rs`.
+    ///
+    /// The consequence is not a lost ack but a DUPLICATE DELIVERY. The earlier
+    /// records really are written; the group fsync below still covers them; the
+    /// drain still ships them to the sink. Their producers were told "not
+    /// durable", so at-least-once has them retry, and the sink sees both copies.
+    /// And because `pending_acks` carries no connection identity, the producers
+    /// punished can be different connections from the one that sent the bad
+    /// record.
+    ///
+    /// Unreachable from ingest today, which rejects zero-length payloads. A6
+    /// makes it reachable the moment a sub-record inside a batch is not
+    /// validated at ingest, which is why this is a prerequisite rather than a
+    /// follow-up.
+    #[test]
+    fn a_rejected_record_does_not_nack_the_records_written_beside_it() {
+        let payloads = vec![
+            b"first".to_vec(),
+            b"second".to_vec(),
+            Vec::new(), // rejected by the WAB's own boundary check
+            b"fourth".to_vec(),
+        ];
+        // Large segment: no rotation, so every surviving record shares one
+        // active segment and one group fsync. No faults — the only error is the
+        // deliberate rejection.
+        let (acks, _ledger, _paths, _env) = drive_rotating_batch(&[], payloads, 1 << 20);
+
+        assert_eq!(
+            acks,
+            vec![true, true, false, true],
+            "a rejected record must nack ONLY itself. Got {acks:?}: the records \
+             written before it were nacked too, although their segment was never \
+             dropped — they are on disk, they will be group-fsynced, and the \
+             drain will deliver them. Their producers were told otherwise and \
+             will retry, so the sink sees each of them twice."
+        );
+    }
+
     /// Rotation ack-fate (the `durable_acks` branch of `flush_batch`): records in
     /// a segment that ROTATED (sealed + fsynced) mid-batch ack `true` and stay
     /// durable EVEN IF the next active segment's group fsync then fails. Three

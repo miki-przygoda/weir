@@ -530,9 +530,43 @@ pub(crate) struct ShardWriter {
     /// disk — zstd frames are self-describing for decompression — so it lives
     /// here and never reaches `SegmentStore`.
     compression_level: i32,
+    /// Why the most recent `write_record` failed — set on every `Err` path so
+    /// the caller can distinguish a refused record from a dropped segment
+    /// instead of inferring it. `None` between failures.
+    last_write_failure: Option<WriteFailure>,
+}
+
+/// Why a `ShardWriter::write_record` call failed — specifically, whether the
+/// active segment survived it.
+///
+/// `flush_batch` nacks every record collected for the active segment when a
+/// write fails, which is correct only when that segment was actually dropped.
+/// Two paths reject a record and leave the segment open and healthy, and
+/// inferring "dropped" from "returned Err" nacks records that are on disk and
+/// will be delivered — an ack that contradicts the delivery, and duplicate
+/// delivery once the producer retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteFailure {
+    /// The record was refused; the active segment is untouched and still open.
+    /// Nack this record alone.
+    RecordRejected,
+    /// The active segment was dropped. Records already collected for it are in
+    /// an abandoned, un-fsynced file and must be nacked.
+    SegmentDropped,
 }
 
 impl ShardWriter {
+    /// Classification of the most recent `write_record` failure.
+    ///
+    /// Defaults to `SegmentDropped` when unset, because that is the
+    /// conservative reading: nacking a record that was in fact durable is
+    /// at-least-once (harmless, per the wire contract), whereas acking one that
+    /// was not is a false ack — the single thing weir must never do.
+    pub(crate) fn last_write_failure(&self) -> WriteFailure {
+        self.last_write_failure
+            .unwrap_or(WriteFailure::SegmentDropped)
+    }
+
     /// Construct over an injected [`SegmentStore`] — the sole filesystem
     /// boundary, so every segment creation, rotation, fsync, seal, and
     /// counter-scan flows through it. Production injects [`FsSegmentStore`] at
@@ -558,6 +592,7 @@ impl ShardWriter {
             active_opened_at: Instant::now(),
             active_path: None,
             active_records: 0,
+            last_write_failure: None,
             store,
             metrics,
             compression,
@@ -600,6 +635,9 @@ impl ShardWriter {
         // WAB's own boundary check, and WabSegment keeps its copy as defence in
         // depth for any caller that bypasses ShardWriter.
         if payload.is_empty() {
+            // A rejection, not a segment failure: this returns before
+            // `ensure_open`, so the active segment is untouched and still open.
+            self.last_write_failure = Some(WriteFailure::RecordRejected);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "empty payload cannot be represented in a WAB segment",
@@ -615,12 +653,18 @@ impl ShardWriter {
             Compression::None => Cow::Borrowed(payload),
             Compression::Zstd => Cow::Owned(
                 zstd::bulk::compress(payload, self.compression_level).map_err(|e| {
+                    // Same class: the comment above this match already says
+                    // "the segment stays clean".
+                    self.last_write_failure = Some(WriteFailure::RecordRejected);
                     io::Error::other(format!("failed to compress a WAB record: {e}"))
                 })?,
             ),
         };
 
-        self.ensure_open()?;
+        if let Err(e) = self.ensure_open() {
+            self.last_write_failure = Some(WriteFailure::SegmentDropped);
+            return Err(e);
+        }
         if let Err(e) = self
             .active
             .as_mut()
@@ -629,6 +673,7 @@ impl ShardWriter {
         {
             // The segment is poisoned (or its create() left it half-headered).
             // Drop it so the next write opens a fresh segment.
+            self.last_write_failure = Some(WriteFailure::SegmentDropped);
             self.active = None;
             self.active_path = None;
             return Err(e);
@@ -949,6 +994,64 @@ mod tests {
         let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
         let err = seg.write_record(b"").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_rejected_record_leaves_the_active_segment_usable() {
+        // `flush_batch` nacks every record in `pending_acks` when
+        // `write_record` returns Err, on the premise stated in its own comment:
+        // "The active segment was dropped."
+        //
+        // That premise is FALSE for the rejection paths. An empty payload (and
+        // a zstd failure) returns before `self.active = None`, so the segment is
+        // untouched and still open — its already-written records are real, will
+        // be group-fsynced, and WILL be drained to the sink. Nacking them tells
+        // their producers otherwise, and at-least-once turns those retries into
+        // duplicate deliveries.
+        //
+        // Unreachable today only because ingest rejects zero-length payloads.
+        // Batching makes it reachable the moment a sub-record is not validated
+        // at ingest, which is why this is a prerequisite for A6 rather than a
+        // follow-up.
+        let dir = tmp_dir("rejected_intact");
+        let metrics = Arc::new(Metrics::new().0);
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            1024 * 1024,
+            metrics,
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+
+        w.write_record(b"before").expect("first record");
+        let path_before = w.active_path.clone();
+        assert!(path_before.is_some(), "a segment should be open");
+
+        let err = w
+            .write_record(b"")
+            .expect_err("an empty record must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // The distinction that matters: was the segment dropped, or merely the
+        // record refused?
+        assert!(
+            w.active.is_some(),
+            "an empty record was REJECTED, but the writer reports its segment \
+             dropped. flush_batch reads that as 'the active segment is gone' and \
+             nacks every record already written to it — records that are in fact \
+             durable and will be delivered."
+        );
+        assert_eq!(
+            w.active_path, path_before,
+            "the rejection opened a different segment; the first record's \
+             ordinal would no longer mean what was reported"
+        );
+
+        w.write_record(b"after")
+            .expect("the segment must still accept records");
         fs::remove_dir_all(dir).ok();
     }
 

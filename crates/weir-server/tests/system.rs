@@ -830,6 +830,7 @@ fn metrics_all_families_registered() {
         "weir_wab_record_logical_bytes",
         "weir_wab_record_stored_bytes",
         "weir_wab_fsync_duration_seconds",
+        "weir_wab_group_commit_records",
         "weir_wab_flusher_panics",
         "weir_wab_fsync_failures",
         "weir_wab_cap_rejections",
@@ -3789,8 +3790,7 @@ fn group_commit_histogram_counts_every_durable_record_exactly_once() {
     let mut client = srv.client();
 
     let read_count = |name: &str| -> u64 { parse_metric(&srv.scrape_metrics(), name) };
-    let read_sum =
-        |name: &str| -> f64 { parse_metric_f64(&srv.scrape_metrics(), name) };
+    let read_sum = |name: &str| -> f64 { parse_metric_f64(&srv.scrape_metrics(), name) };
 
     let count_before = read_count("weir_wab_group_commit_records_count");
     let sum_before = read_sum("weir_wab_group_commit_records_sum");
