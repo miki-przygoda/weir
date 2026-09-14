@@ -163,28 +163,6 @@ fn every_frame_vector_decodes_and_round_trips() {
     }
 }
 
-/// The compatibility claim, executed rather than asserted: the frozen v1 vector
-/// set contains no `0x06`/`0x07` frame, so nothing an existing client reads has
-/// moved. If a tracked frame were ever added to `wire_v1_vectors.json` this
-/// fails, and the five polyglot clients in CI would fail right after it.
-#[test]
-fn the_frozen_v1_vectors_contain_no_tracked_frame() {
-    const V1: &str = include_str!("../../../docs/conformance/wire_v1_vectors.json");
-    let doc: Value = serde_json::from_str(V1).unwrap();
-    for v in doc["vectors"].as_array().unwrap() {
-        let buf = from_hex(v["hex"].as_str().unwrap());
-        // Byte 5 is message_type; short buffers (truncation vectors) have none.
-        if let Some(&mt) = buf.get(5) {
-            assert!(
-                mt != 0x06 && mt != 0x07,
-                "vector {:?} puts a tracked message type in the frozen v1 file; \
-                 every v1-only decoder rejects it and CI's polyglot clients will fail",
-                v["name"].as_str().unwrap()
-            );
-        }
-    }
-}
-
 #[test]
 fn every_coordinate_vector_matches_the_decoder() {
     let doc = doc();

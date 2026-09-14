@@ -1,0 +1,240 @@
+{
+  "wire_version": 1,
+  "batch_version": 1,
+  "ack_batch_version": 1,
+  "batch_header_len": 3,
+  "ack_batch_header_len": 3,
+  "max_batch_records_hard_cap": 2048,
+  "max_ack_batch_payload_len": 259,
+  "bitmap_bit_order": "LSB-first within each byte: bit i is byte i/8, mask 1 << (i%8)",
+  "description": "Conformance vectors for the batch extension to the weir v1 wire protocol: message types PushBatch (0x08) and AckBatch (0x09), the length-prefixed record body, and the positional bitmap reply. Kept apart from wire_v1_vectors.json, which is frozen and is read by decoders that know only message types 0x01..0x05 \u2014 such a decoder is CORRECT to reject an 0x08 frame and stays conformant by ignoring this file. 'frame_vectors' are complete frames; 'body_vectors' are bare PushBatch bodies; 'ack_vectors' are bare AckBatch payloads, each with the record count the client sent, which a decoder must be given because a bitmap alone cannot say which batch it answers.",
+  "frame_vectors": [
+    {
+      "name": "push_batch_three",
+      "notes": "PushBatch of three records at Durable durability. The header is a v1 header in every byte but the message type (0x08) and the CRC that covers it \u2014 which is the whole claim of additivity: a v1 reader's header parse is unchanged, and only the type dispatch is new.",
+      "hex": "57454952010801001d000000c597483c01030005000000616c70686104000000626574610500000067616d6d61a246d796",
+      "decode": "ok",
+      "message_type": "PushBatch",
+      "durability": "Durable",
+      "flags": 0,
+      "payload_hex": "01030005000000616c70686104000000626574610500000067616d6d61"
+    },
+    {
+      "name": "push_batch_buffered",
+      "notes": "PushBatch at Buffered durability. The tier applies to every record in the batch; there is no per-record tier, because a batch shares one ack.",
+      "hex": "57454952010803001d000000ce36807101030005000000616c70686104000000626574610500000067616d6d61a246d796",
+      "decode": "ok",
+      "message_type": "PushBatch",
+      "durability": "Buffered",
+      "flags": 0,
+      "payload_hex": "01030005000000616c70686104000000626574610500000067616d6d61"
+    },
+    {
+      "name": "ack_batch_three_all_ok",
+      "notes": "The daemon's reply to `push_batch_three`: all three accepted. The durability byte is fixed filler (0x01) exactly as on a plain Ack.",
+      "hex": "57454952010901000400000064842eb7010300078393da05",
+      "decode": "ok",
+      "message_type": "AckBatch",
+      "durability": "Durable",
+      "flags": 0,
+      "payload_hex": "01030007"
+    },
+    {
+      "name": "ack_batch_at_the_hard_cap",
+      "notes": "The largest AckBatch that exists: 2048 records, 259 payload bytes. This vector is what pins the claim the hard cap was chosen for \u2014 259 is under the 298-byte AckTracked payload, so batching introduces no new largest response and no client gains a new allocation bound. If the cap is ever raised past that, this vector fails.",
+      "hex": "574549520109010003010000ead63b2b010008ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff97c38746",
+      "decode": "ok",
+      "message_type": "AckBatch",
+      "durability": "Durable",
+      "flags": 0,
+      "payload_hex": "010008ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    }
+  ],
+  "body_vectors": [
+    {
+      "name": "body_three_records",
+      "notes": "The body carried by `push_batch_three`: version, u16 count, then each record as a u32 little-endian length followed by its bytes.",
+      "hex": "01030005000000616c70686104000000626574610500000067616d6d61",
+      "decode": "ok",
+      "records_hex": [
+        "616c706861",
+        "62657461",
+        "67616d6d61"
+      ]
+    },
+    {
+      "name": "body_single_record",
+      "notes": "Boundary: N=1. Structurally legal and worth no special case \u2014 a batch of one is a batch, and a client that degrades it to a plain Push is making an optimisation, not obeying the protocol.",
+      "hex": "01010004000000736f6c6f",
+      "decode": "ok",
+      "records_hex": [
+        "736f6c6f"
+      ]
+    },
+    {
+      "name": "reject_body_truncated",
+      "notes": "Shorter than the fixed prefix every body has. Rejected before any field offset is interpreted.",
+      "hex": "0103",
+      "decode": "Truncated"
+    },
+    {
+      "name": "reject_body_unknown_version",
+      "notes": "Leading version byte is 0x02. The version leads so the body can grow inside wire v1: a reader meeting a layout it does not know must reject rather than parse a prefix of a layout it has never seen.",
+      "hex": "02030005000000616c70686104000000626574610500000067616d6d61",
+      "decode": "UnsupportedVersion"
+    },
+    {
+      "name": "reject_body_empty_batch",
+      "notes": "Declares zero records. Not a no-op to be tolerated \u2014 nothing legitimate produces one, so it is a framing disagreement and is refused.",
+      "hex": "010000",
+      "decode": "EmptyBatch"
+    },
+    {
+      "name": "reject_body_too_many_records",
+      "notes": "Declares 2049 records in a body of 3 bytes. The rejection must happen on the DECLARED count, before any allocation is sized by it \u2014 that is the whole point of checking the cap before the walk, and this vector cannot pass any implementation that reserves first and validates after.",
+      "hex": "010108",
+      "decode": "TooManyRecords"
+    },
+    {
+      "name": "reject_body_empty_record",
+      "notes": "Record 1 declares length 0. The WAB uses a zero payload_len as its end-of-records sentinel and cannot represent an empty record, so this is refused at the edge rather than deeper where the sentinel would be ambiguous.",
+      "hex": "01030005000000616c706861000000000500000067616d6d61",
+      "decode": "EmptyRecord"
+    },
+    {
+      "name": "reject_body_truncated_record",
+      "notes": "Record 0 declares 64 bytes but the body holds 5. The length prefix is peer-chosen and must be checked against what is actually present.",
+      "hex": "01010040000000616c706861",
+      "decode": "TruncatedRecord"
+    },
+    {
+      "name": "reject_body_record_over_the_payload_cap",
+      "notes": "Record 0 declares 16777217 bytes in a body that carries none of them. The vector is deliberately tiny: it pins the ORDER of the checks, because the cap must be tested before the body is consulted. An implementation that checked `cursor + len > body.len()` first would reject this as TruncatedRecord, which is a different and less informative answer, and would have computed `cursor + len` on a peer-chosen length first.",
+      "hex": "01010001000001",
+      "decode": "RecordTooLarge"
+    },
+    {
+      "name": "reject_body_more_records_than_declared",
+      "notes": "Declares 2 records and carries 3. A decoder that stopped at the declared count would silently drop the third; the extra bytes mean the two ends disagree about the body, so the frame is refused.",
+      "hex": "01020005000000616c70686104000000626574610500000067616d6d61",
+      "decode": "LengthMismatch"
+    },
+    {
+      "name": "reject_body_fewer_records_than_declared",
+      "notes": "Declares 4 records and carries 3. The walk ends at the body's end having found fewer than declared.",
+      "hex": "01040005000000616c70686104000000626574610500000067616d6d61",
+      "decode": "LengthMismatch"
+    }
+  ],
+  "ack_vectors": [
+    {
+      "name": "ack_all_accepted_n3",
+      "notes": "The payload carried by `ack_batch_three_all_ok`. Three set bits in one byte: 0b00000111.",
+      "hex": "01030007",
+      "decode": "ok",
+      "expected": 3,
+      "accepted": [
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "name": "ack_all_rejected_n3",
+      "notes": "Every bit clear. A clear bit is the WEAK statement: not durable as of this reply, retry, and expect it may nonetheless have been written. Only a set bit inherits the crown invariant.",
+      "hex": "01030000",
+      "decode": "ok",
+      "expected": 3,
+      "accepted": [
+        false,
+        false,
+        false
+      ]
+    },
+    {
+      "name": "ack_bitmap_asymmetric_n9",
+      "notes": "The vector this file exists for. N=9 with records 0, 2 and 8 accepted encodes as bytes 05 01 under weir's LSB-first convention and a0 80 under MSB-first. Every vector with N<=8, and every symmetric pattern at any N, encodes IDENTICALLY under both conventions and would pass against an inverted implementation \u2014 which produces a well-formed frame, valid CRCs and correct length, that reports failures as successes. N>8 forces the byte order to show, and the asymmetric pattern forces the bit order to show. Both are needed; neither alone is sufficient.",
+      "hex": "0109000501",
+      "decode": "ok",
+      "expected": 9,
+      "accepted": [
+        true,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "ack_exactly_one_byte_n8",
+      "notes": "Boundary: N=8 fills the byte exactly, so there are no padding bits and the padding rule has nothing to check. The adjacent N=9 case above is where it starts mattering.",
+      "hex": "010800aa",
+      "decode": "ok",
+      "expected": 8,
+      "accepted": [
+        false,
+        true,
+        false,
+        true,
+        false,
+        true,
+        false,
+        true
+      ]
+    },
+    {
+      "name": "ack_at_the_hard_cap",
+      "notes": "The payload of `ack_batch_at_the_hard_cap`: 2048 records, all accepted, 259 bytes.",
+      "hex": "010008ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "decode": "ok",
+      "expected": 2048,
+      "accepted_all": true
+    },
+    {
+      "name": "reject_ack_truncated",
+      "notes": "Shorter than the fixed prefix.",
+      "hex": "0103",
+      "decode": "Truncated",
+      "expected": 3
+    },
+    {
+      "name": "reject_ack_unknown_version",
+      "notes": "Leading version byte is 0x02.",
+      "hex": "02030001",
+      "decode": "UnsupportedVersion",
+      "expected": 3
+    },
+    {
+      "name": "reject_ack_empty",
+      "notes": "Declares zero records.",
+      "hex": "010000",
+      "decode": "EmptyBatch",
+      "expected": 0
+    },
+    {
+      "name": "reject_ack_count_disagrees_with_request",
+      "notes": "The payload declares 3 but the client sent 4. A bitmap is the first weir response whose meaning depends on client-held state \u2014 an Ack says 'your last record' and an AckTracked carries its own coordinate, but a bitmap is meaningless without knowing which batch it answers. Since ceil(N/8) is not injective (N=1017..1024 all give 131 bytes), the echoed count is the only thing that can catch a desync.",
+      "hex": "01030007",
+      "decode": "LengthMismatch",
+      "expected": 4
+    },
+    {
+      "name": "reject_ack_bitmap_too_short",
+      "notes": "Declares 9 records but carries one bitmap byte where ceil(9/8)=2 are required.",
+      "hex": "01090001",
+      "decode": "LengthMismatch",
+      "expected": 9
+    },
+    {
+      "name": "reject_ack_padding_bits_set",
+      "notes": "N=9, so byte 1 holds one used bit and seven padding bits; bit 1 of that byte is set. Ignoring padding would make popcount(bitmap) == N \u2014 the obvious way to ask 'did the whole batch succeed' \u2014 silently wrong.",
+      "hex": "0109000503",
+      "decode": "PaddingNotZero",
+      "expected": 9
+    }
+  ]
+}
