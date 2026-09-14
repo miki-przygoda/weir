@@ -703,6 +703,36 @@ mod tests {
         std::env::temp_dir().join(format!("weir_sock_{label}_{}.sock", std::process::id()))
     }
 
+    /// A scratch directory whose mode does not depend on the process umask.
+    ///
+    /// `create_dir_all` applies the process umask, and `bind_hardened` holds
+    /// umask 0o177 process-wide for the duration of its `bind(2)`. A test that
+    /// creates a directory inside that window gets mode 0o600 — a directory
+    /// with no execute bit, so every file created under it fails EACCES. The
+    /// umask lock serialises the tests that bind, but it cannot serialise the
+    /// rest of the crate's tests against them.
+    ///
+    /// Worse, the failure persists: these paths are pid-scoped, `create_dir_all`
+    /// is a no-op on an existing directory, and a run that fails leaves the
+    /// 0o600 directory behind, so every later run that reuses the pid fails at
+    /// the same line for a reason that is no longer present. Removing first is
+    /// what stops a poisoned directory from being inherited.
+    ///
+    /// The mode is set by `chmod` AFTER creation, not by `DirBuilder::mode`:
+    /// `mkdir(2)` masks its mode argument through the umask unconditionally, so
+    /// a requested 0o700 still lands as 0o600 inside the window. `chmod(2)`
+    /// takes no mask, which makes it the only umask-independent way to get the
+    /// mode asked for. `umask_immune_dir_ignores_a_hostile_process_umask` holds
+    /// this distinction down — it fails against the `DirBuilder::mode` version.
+    fn umask_immune_dir(label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("weir_{label}_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     /// Serialises any test that mutates the process umask. umask is
     /// process-global; without this, parallel tests interleave and see
     /// each other's saved/restored values.
@@ -1062,6 +1092,35 @@ mod tests {
     /// Uses `rename(src, dst)` which atomically replaces dst's inode with
     /// src's, guaranteeing a distinct inode (unlike remove+recreate, where
     /// the filesystem may immediately reuse the inode number on tmpfs/ext4).
+    /// The scratch-directory helper must survive the umask `bind_hardened`
+    /// holds, because that is the exact condition it exists to defend against.
+    ///
+    /// Asserting only `create` succeeded would pass with the bug present:
+    /// `create_dir_all` under umask 0o177 succeeds too, and yields a directory
+    /// that is unusable rather than absent. The mode and a real file write are
+    /// what distinguish the two.
+    #[test]
+    #[cfg(unix)]
+    fn umask_immune_dir_ignores_a_hostile_process_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let restore = UmaskGuard(umask_set(0o177));
+
+        let dir = umask_immune_dir("umask_immune_probe");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "umask 0o177 masked the directory down to {mode:#o}; \
+             DirBuilder::mode is not being applied"
+        );
+        std::fs::write(dir.join("probe"), b"x")
+            .expect("a directory without its execute bit cannot hold files");
+
+        drop(restore);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     #[cfg(unix)]
     fn stat_at_dir_observes_inode_swap() {
@@ -1069,8 +1128,7 @@ mod tests {
         // without this lock a concurrent umask=0o177 sibling could perturb the
         // files this test creates and make it flake under parallelism (#14).
         let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("weir_stat_at_dir_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = umask_immune_dir("stat_at_dir");
         let name = std::ffi::OsString::from("entry");
         let entry_path = dir.join(&name);
         let other_path = dir.join("other");
@@ -1127,8 +1185,7 @@ mod tests {
 
         let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
 
-        let dir = std::env::temp_dir().join(format!("weir_swap_pressure_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = umask_immune_dir("swap_pressure");
         let target = dir.join("weir.sock");
         let decoy = dir.join("decoy.sock");
 
