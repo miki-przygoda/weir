@@ -10,9 +10,43 @@
 use std::io::{self, Read, Write};
 
 use weir_core::{
-    Durability, Envelope, HEADER_LEN, Header, MAX_PAYLOAD_HARD_CAP, MAX_TRACKED_ACK_PAYLOAD_LEN,
-    MessageType, NackReason, RecordCoordinate,
+    Durability, Envelope, HEADER_LEN, Header, MAX_ACK_BATCH_PAYLOAD_LEN,
+    MAX_BATCH_RECORDS_HARD_CAP, MAX_PAYLOAD_HARD_CAP, MAX_TRACKED_ACK_PAYLOAD_LEN, MessageType,
+    NackReason, RecordCoordinate, decode_ack_batch, encode_batch_body,
 };
+
+/// Per-record outcomes for a [`push_batch`](WeirClient::push_batch).
+///
+/// `accepted[i]` is `true` when record `i` is durable at the requested tier.
+///
+/// **A cleared bit does not mean the record was never written.** It means *not
+/// durable as of this reply* — retry it, and expect it may nonetheless have been
+/// committed, because weir is at-least-once. A set bit inherits the crown
+/// invariant and is the strong statement; a cleared bit is the weak one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BatchOutcome {
+    /// One entry per record, in the order they were sent.
+    pub accepted: Vec<bool>,
+}
+
+impl BatchOutcome {
+    /// Whether every record in the batch is durable.
+    #[must_use]
+    pub fn all_accepted(&self) -> bool {
+        self.accepted.iter().all(|&ok| ok)
+    }
+
+    /// Indices of the records that are not durable, in order — the set to retry.
+    #[must_use]
+    pub fn rejected_indices(&self) -> Vec<usize> {
+        self.accepted
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &ok)| (!ok).then_some(i))
+            .collect()
+    }
+}
 
 /// The largest payload the *v1 response set* carries: `Ack` and
 /// `HealthCheckResponse` are empty, `Nack` is one reason byte, and
@@ -35,6 +69,10 @@ const MAX_RESPONSE_PAYLOAD_LEN: usize = 2;
 fn max_response_payload_len(message_type: MessageType) -> usize {
     match message_type {
         MessageType::AckTracked => MAX_TRACKED_ACK_PAYLOAD_LEN,
+        // The bitmap is bounded by MAX_BATCH_RECORDS_HARD_CAP, chosen so this
+        // stays under MAX_TRACKED_ACK_PAYLOAD_LEN — weir's largest response
+        // payload does not grow, so no allocation guard anywhere is weakened.
+        MessageType::AckBatch => MAX_ACK_BATCH_PAYLOAD_LEN,
         _ => MAX_RESPONSE_PAYLOAD_LEN,
     }
 }
@@ -415,12 +453,14 @@ impl<S: Read + Write> WeirClient<S> {
         let header = Header::new(message_type, durability, 0);
         let frame = Envelope::new(header, payload).encode();
 
-        if let Err(write_err) = self.stream.write_all(&frame) {
-            // The write failed partway. The daemon may have Nacked (e.g. a payload
-            // over its configured cap) and closed the connection before we finished
-            // streaming — its Nack can already be sitting in our receive buffer.
-            // Read it so the caller sees the real reason instead of a broken-pipe.
-            // Either way the connection is now dead.
+        self.send_frame(&frame)
+    }
+
+    /// Writes one frame and reads its reply, with the recovery every caller
+    /// needs: a daemon that Nacks and closes mid-write leaves its reason in our
+    /// receive buffer, and surfacing that beats a bare broken-pipe.
+    fn send_frame(&mut self, frame: &[u8]) -> Result<Envelope, ClientError> {
+        if let Err(write_err) = self.stream.write_all(frame) {
             if let Ok(resp) = self.read_response()
                 && resp.header().message_type() == MessageType::Nack
             {
@@ -474,6 +514,106 @@ impl<S: Read + Write> WeirClient<S> {
             .default_durability
             .ok_or(ClientError::NoDefaultDurability)?;
         self.push(payload, d)
+    }
+
+    /// [`push_tracked`][Self::push_tracked] at the connection's default
+    /// durability tier.
+    ///
+    /// Returns [`ClientError::NoDefaultDurability`] if no default was set.
+    /// Pushes N records in one round trip and reports each one's fate.
+    ///
+    /// Returns a [`BatchOutcome`] whose `accepted[i]` says whether record `i` is
+    /// durable at the requested tier. **A partial result is `Ok`, not `Err`** —
+    /// [`ClientError`] describes the *connection*, and after a partial batch the
+    /// connection is fine. Inspect the outcome; do not assume success from `Ok`.
+    ///
+    /// # What a cleared bit means
+    ///
+    /// Not *"this record was never written"*. It means **not durable as of this
+    /// reply — retry it, and expect that it may nonetheless have been written**.
+    /// weir is at-least-once, and a record whose ack timed out may still be
+    /// committed by the flusher afterwards. A set bit is the strong statement
+    /// (it inherits the crown invariant: acked ⇒ durable); a cleared bit is the
+    /// weak one. Building exactly-once retry on cleared bits does not work.
+    ///
+    /// Every *validation* failure — an empty record, one over the cap, a framing
+    /// disagreement — rejects the whole frame with a `Nack` and closes the
+    /// connection, exactly as a malformed single push does. So a bitmap only
+    /// ever reports transient, retryable failures.
+    ///
+    /// A daemon predating `PushBatch` answers `Nack(UnknownMessage)` and closes;
+    /// that surfaces as a poisoning [`ClientError`], so reconnect and use
+    /// [`push`](WeirClient::push).
+    #[must_use = "a batch can partially succeed; inspect `accepted` or call \
+                  `all_accepted()` — discarding it hides which records need retrying"]
+    pub fn push_batch(
+        &mut self,
+        records: &[impl AsRef<[u8]>],
+        durability: Durability,
+    ) -> Result<BatchOutcome, ClientError> {
+        self.ensure_usable()?;
+
+        // Local guards, before any bytes are sent. Each of these would be a
+        // Nack-and-close at the daemon, which would poison this client; refusing
+        // here keeps the connection usable, mirroring `send_record`.
+        if records.is_empty() {
+            return Err(ClientError::EmptyPayload);
+        }
+        if records.len() > MAX_BATCH_RECORDS_HARD_CAP {
+            return Err(ClientError::PayloadTooLarge {
+                len: records.len(),
+                limit: MAX_BATCH_RECORDS_HARD_CAP,
+            });
+        }
+        let slices: Vec<&[u8]> = records.iter().map(AsRef::as_ref).collect();
+        for s in &slices {
+            if s.is_empty() {
+                return Err(ClientError::EmptyPayload);
+            }
+            if s.len() > MAX_PAYLOAD_HARD_CAP {
+                return Err(ClientError::PayloadTooLarge {
+                    len: s.len(),
+                    limit: MAX_PAYLOAD_HARD_CAP,
+                });
+            }
+        }
+
+        let body = encode_batch_body(&slices);
+        let header = Header::new(MessageType::PushBatch, durability, 0);
+        let frame = Envelope::new(header, body).encode();
+        let resp = self.send_frame(&frame)?;
+
+        match resp.header().message_type() {
+            MessageType::AckBatch => {
+                let accepted = decode_ack_batch(resp.payload(), slices.len()).map_err(|e| {
+                    // The frame was well-formed and fully consumed, so the
+                    // stream is in sync — but a reply this build cannot read
+                    // is a version skew every later batch would hit again.
+                    // Poison so the caller reconnects.
+                    self.poisoned = true;
+                    ClientError::Protocol(format!("malformed AckBatch payload: {e}"))
+                })?;
+                Ok(BatchOutcome { accepted })
+            }
+            // A bare Ack means the peer did not understand what was asked. The
+            // request determines the response shape, so treating this as success
+            // would report N records durable on the strength of a reply that
+            // describes one.
+            MessageType::Ack => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(
+                    "daemon answered a PushBatch with a bare Ack; the records may be \
+                     durable but their individual outcomes are unknown"
+                        .to_string(),
+                ))
+            }
+            other => {
+                self.poisoned = true;
+                Err(ClientError::Protocol(format!(
+                    "unexpected response to a PushBatch: {other:?}"
+                )))
+            }
+        }
     }
 
     /// [`push_tracked`][Self::push_tracked] at the connection's default

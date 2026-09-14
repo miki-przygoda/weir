@@ -4020,3 +4020,62 @@ fn a_batch_over_the_record_cap_is_refused() {
         "an over-cap batch is too large, and the producer's remedy is to send less"
     );
 }
+
+/// The Rust client's `push_batch` against a real daemon, end to end.
+#[test]
+fn the_client_can_push_a_batch_and_read_every_outcome() {
+    let srv = weir_server!("client_batch").start();
+    let mut client = srv.client();
+
+    let records: Vec<Vec<u8>> = (0..25)
+        .map(|i| format!("client-batch-{i}").into_bytes())
+        .collect();
+    let outcome = client
+        .push_batch(&records, Durability::Durable)
+        .expect("push_batch");
+
+    assert_eq!(outcome.accepted.len(), records.len());
+    assert!(
+        outcome.all_accepted(),
+        "a healthy daemon must accept every record; rejected: {:?}",
+        outcome.rejected_indices()
+    );
+    assert!(outcome.rejected_indices().is_empty());
+
+    // The client stays usable for ordinary pushes afterwards — the batch path
+    // must not poison a connection it shares.
+    client
+        .push(b"after", Durability::Durable)
+        .expect("plain push after a batch");
+    assert!(!client.is_poisoned());
+}
+
+/// A batch the client can tell is invalid never reaches the wire.
+///
+/// The daemon would Nack and close, poisoning the connection. Refusing locally
+/// keeps it usable, mirroring the single-record guards — and `is_recoverable`
+/// stays the exact complement of `is_poisoned`, which the crate promises.
+#[test]
+fn the_client_refuses_a_locally_invalid_batch_without_poisoning() {
+    let srv = weir_server!("client_batch_guard").start();
+    let mut client = srv.client();
+
+    let with_empty: Vec<&[u8]> = vec![b"ok", b"", b"fine"];
+    let err = client
+        .push_batch(&with_empty, Durability::Durable)
+        .expect_err("an empty record must be refused");
+    assert!(
+        err.is_recoverable(),
+        "a local guard must not poison: {err:?}"
+    );
+    assert!(!client.is_poisoned());
+
+    let empty: Vec<&[u8]> = vec![];
+    assert!(client.push_batch(&empty, Durability::Durable).is_err());
+    assert!(!client.is_poisoned());
+
+    // Still usable.
+    client
+        .push(b"still works", Durability::Durable)
+        .expect("push after refusals");
+}
