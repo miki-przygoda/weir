@@ -15,6 +15,21 @@ protocol** below.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`MessageType` becomes `#[non_exhaustive]`.** Adding that attribute to a
+  public enum is itself a breaking change to a published crate's Rust API: a
+  downstream exhaustive `match` on it no longer compiles without a wildcard arm.
+  Under this file's own rule that requires a major bump, so the next release is
+  **4.0.0**, not a minor.
+
+  It is worth the break precisely once. A new message type is additive on the
+  wire — bytes `0x0A`–`0xFF` are reserved and an unknown one draws
+  `Nack(UnknownMessage)` — but it was *not* additive in the Rust API, which is
+  what forced 3.0.0 when `PushTracked`/`AckTracked` were added. With
+  `#[non_exhaustive]` in place, 4.0.0 is the last major release a new message
+  type ever forces.
+
 ### Added
 
 - **Wire-level batching: `PushBatch` (`0x08`) / `AckBatch` (`0x09`).** N records
@@ -22,8 +37,8 @@ protocol** below.
   — `WIRE_VERSION` stays 1, the 30 frozen conformance vectors are byte-identical,
   and a daemon or client that does not implement it answers or receives
   `Nack(UnknownMessage)`, which is an actionable permanent error rather than a
-  misparse. `MessageType` is `#[non_exhaustive]` as of 3.0.0, so adding these
-  variants is not itself breaking.
+  misparse. The Rust-API cost of the two new variants is covered by the
+  `#[non_exhaustive]` change above, which ships in the same release.
 
   `weir-client` gains `push_batch`, returning a `BatchOutcome` rather than
   `Result<(), _>`: a batch can partially succeed, and a caller that wants to
