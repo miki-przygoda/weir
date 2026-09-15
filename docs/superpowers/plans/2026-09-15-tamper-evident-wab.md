@@ -812,12 +812,22 @@ pub fn chain_segment(path: &Path, prev: ChainHead) -> Result<Sidecar, AttestErro
 
 **Verified:** `SegmentFooterMeta` has `record_count: u64`, `data_bytes: u64`, `file_crc32: u32` and `sealed_at: i64` (`crates/weir-wab/src/format.rs:438-455`). `verification.footer.sealed_at` is correct as written.
 
-- [ ] **Step 4: Run and watch it pass**
+- [ ] **Step 4: Declare the module in `lib.rs`**
+
+Without this the file is never compiled and every test in it silently does not exist.
+
+```rust
+pub mod verify;
+
+pub use verify::{chain_segment, segment_name_for};
+```
+
+- [ ] **Step 5: Run and watch it pass**
 
 Run: `cargo test -p weir-attest`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/weir-attest/src/verify.rs crates/weir-attest/src/lib.rs
@@ -1096,7 +1106,7 @@ It must:
 - for `verify`: call `verify_segment` on each and aggregate;
 - emit one structured line per segment on `seal`, in the anchor format:
   `weir.attest.head shard=3 segment=shard_03/seg_00000007.wab.sealed records=1234 head=<64 hex>`
-- honour `--json` if `weir-ctl` has a global `--json` flag (check `main.rs`; match the existing convention exactly).
+- honour the **existing global `--json` flag**: `crates/weir-ctl/src/main.rs:38` defines `json: bool` on the top-level `Cli`, read at `:225` as `let json = cli.json;` and threaded into every `cmd_*` call as a trailing `json` argument (see `:227`, `:233`, `:236`). Your `cmd_attest_*` functions take the same trailing `json: bool` and follow the same output convention.
 
 **Exit codes:** `0` all verified, `1` any divergence, `2` any segment unreadable or sidecar undecodable. Distinct because a cron job must alert differently on "tampered" and "I could not check".
 
@@ -1141,9 +1151,11 @@ A quiet case (flat counter, `exp_alerts: []`) and a firing case. **This is manda
 
 **Do not assert any annotation containing a float-derived value.** A previous test pinned `49.96ms`, which renders `49.95ms` on amd64 and turned CI red.
 
-- [ ] **Step 3: Add the runbook heading**
+- [ ] **Step 3: Add the runbook heading — and ONLY the heading**
 
-`docs/monitoring.md` needs a `#### WeirAttestVerifyFailed` heading, or `every_alert_runbook_anchor_resolves_to_a_heading` fails.
+`docs/monitoring.md` needs a `#### WeirAttestVerifyFailed` heading with its remediation text, or `every_alert_runbook_anchor_resolves_to_a_heading` fails in Task 10.
+
+**Boundary with Task 9, so the two do not collide in the same file:** this task owns the `#### WeirAttestVerifyFailed` runbook heading and nothing else in `docs/monitoring.md`. Task 9 owns the separate prose section describing `weir-ctl attest` and the anchoring requirement, and must NOT re-add this heading.
 
 - [ ] **Step 4: Verify on both architectures**
 
@@ -1224,7 +1236,9 @@ Move the **Signed audit log** row out of "Out of scope" and replace it with an a
 
 - [ ] **Step 2: Add the monitoring section**
 
-`#### WeirAttestVerifyFailed` with the runbook, plus a short section describing `weir-ctl attest` and the anchoring requirement — a chain nobody observed off-host is not evidence.
+A prose section describing `weir-ctl attest` and the anchoring requirement — a chain nobody observed off-host is not evidence.
+
+**Do NOT add the `#### WeirAttestVerifyFailed` heading here.** Task 7 already added it; adding it again produces a duplicate heading and a confusing runbook link target.
 
 - [ ] **Step 3: Write the CHANGELOG entry**
 
