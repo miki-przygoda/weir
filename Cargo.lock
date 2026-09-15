@@ -2690,6 +2690,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "weir-attest"
+version = "3.0.0"
+dependencies = [
+ "crc32fast",
+ "sha2 0.10.9",
+ "weir-core",
+ "weir-sink-sdk",
+ "weir-wab",
+]
+
+[[package]]
 name = "weir-client"
 version = "3.0.0"
 dependencies = [

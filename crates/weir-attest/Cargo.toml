@@ -1,0 +1,21 @@
+[package]
+name = "weir-attest"
+description = "Tamper-evident hash chain over sealed weir WAB segments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["weir", "audit", "integrity", "hash-chain", "tamper-evident"]
+categories = ["cryptography", "filesystem"]
+
+[dependencies]
+weir-core = { workspace = true }
+weir-wab = { workspace = true }
+# RecordId is the chain's input. It lives in the sink SDK because the drain
+# hands it to sinks as an idempotency key; that is exactly why it is the right
+# input here — the chain becomes verifiable against the downstream's own rows.
+weir-sink-sdk = { workspace = true }
+sha2 = "0.10"
+crc32fast = "1.4"
