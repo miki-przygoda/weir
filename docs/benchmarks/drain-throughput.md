@@ -253,22 +253,40 @@ rig — which is the standing argument for preferring beast for anything where t
 daemon's own cost is the question.
 
 Within-configuration spread is 1.04-1.48x. **Between configurations it reaches
-6.3x on the same scenario.** Any single headline number for this suite is a
-number about a machine.
+5.3x on the same scenario** (`drain_http_ndjson`, linux-tmpfs ÷ mac). Any single
+headline number for this suite is a number about a machine.
+
+The 6.3x this previously claimed was never a same-scenario figure — 6.28x is
+NDJSON-vs-per-record *within* linux-tmpfs, quoted further down. No pair of
+same-scenario medians has ever produced it, on either basis.
 
 ## What the storage does
 
 The `sync_all` on the confirm path is the whole story, and it was worth two
 separate measurements to see it.
 
+> **Mixed basis, and the left column is the worst kind.** `linux-ssd ÷ mac`
+> divides a ⚠ superseded Linux median by a current mac one, so each figure is a
+> ratio between two different measurement bases and is quoted here only because
+> deleting it would leave the section below it unsupported. Treat the left column
+> as indicative of direction, not of magnitude, until Linux is re-measured. The
+> right column is superseded ÷ superseded, so it is at least self-consistent.
+>
+> These were **not recomputed when the mac rows were re-measured on 2026-09-15**
+> — the whole column still divided by the old mac medians, which is how a 1.77x
+> stood where the same numbers give 1.11x. Recomputed below.
+
 | Scenario | linux-ssd ÷ mac | linux-tmpfs ÷ linux-ssd |
 |---|---:|---:|
-| `drain_http_ndjson` | **2.60x** | **2.25x** |
-| `drain_http_per_record` | 1.18x | 1.32x |
-| `drain_slow_sink_1ms_conc16` | 1.77x | 0.86x |
+| `drain_http_ndjson` | **2.36x** | **2.25x** |
+| `drain_http_per_record` | 1.21x | 1.32x |
+| `drain_slow_sink_1ms_conc16` | 1.11x | 0.86x |
 
-**A 4-core SATA-SSD Linux box beats a 16-core M3 Max on every scenario**, by
-2.60x on NDJSON. This is the predicted result and it confirms the diagnosis:
+**A SATA-SSD Linux box beats an M3 Max on every scenario**, by
+2.36x on NDJSON. (Not "a 4-core box beats a 16-core" — that phrasing survived
+here for two hundred lines after the Environments note above corrected it.
+`nproc` reports 4 on beast only because `isolcpus=2-7,10-15` holds twelve of its
+sixteen logical CPUs out of the default scheduler.) This is the predicted result and it confirms the diagnosis:
 macOS `sync_all` is `F_FULLFSYNC`, measured at 3,965 µs against 238 µs for the
 `F_BARRIERFSYNC` used for record data. It is also why a 2-vCPU CI runner
 previously beat an M3 Max here. **Nothing about the drain is slower on Apple
@@ -278,14 +296,17 @@ silicon; the confirm is.**
 the ext4 figure is mostly a storage number. The drain's own ceiling, with the
 filesystem taken out, is **~238,000 rec/s**.
 
-**Per-record mode barely notices any of it** — 1.18x from macOS to Linux, 1.32x
+**Per-record mode barely notices any of it** — 1.21x from macOS to Linux, 1.32x
 from SATA to RAM. It is bounded by per-request HTTP cost, not by the WAB. That
 is a genuinely useful separation: the two scenarios are measuring different
 bottlenecks, and only one of them is the buffer.
 
 **`drain_slow_sink` shows no storage sensitivity at all.** Its tmpfs range
 (7,430-11,032) *contains* its ext4 range (8,659-9,517); the 0.86x median ratio
-is inside that overlap and should not be read as tmpfs being slower. Bounded by
+is inside that overlap and should not be read as tmpfs being slower. The
+`linux-ssd ÷ mac` figure for this row fell from 1.77x to 1.11x on re-measure,
+which is not a change in the machines — it is the 60.5% the mac row had been
+understated by, arriving in the ratio. Bounded by
 the 1 ms sink delay and concurrency, exactly as the scenario intends. It is the
 only one of the three currently measuring what its name claims.
 
@@ -390,15 +411,19 @@ What does survive intact: any argument that prioritised work on the grounds
 that **weir's own delivery code** constrains the system needs remaking from
 scratch. The constraint is the sink, not the drain.
 
-**NDJSON's advantage is not a fixed ratio.** It is 1.67x on mac, **3.69x** on
+**NDJSON's advantage is not a fixed ratio.** It is 1.89x on mac, **3.69x** on
 linux-ssd, **6.28x** on linux-tmpfs. It grows as the confirm gets cheaper,
 because batching amortises the per-batch confirm as much as the per-request
 network cost. Publishing one number for it — as this file previously did, first
-1.25x then 1.67x — was wrong in kind, not just in value.
+1.25x then 1.67x — was wrong in kind, not just in value. (The mac figure is
+1.89x rather than the 1.67x published before 2026-09-15, for the same reason
+every mac-derived ratio moved: the re-measure.)
 
-**Concurrency at a 1 ms sink gives 8.8x on Linux**, against 5.0x on mac and a
-~1,000 rec/s serial cap. Closer to the concurrency setting of 16 than the mac
-figure suggested, still sub-linear.
+**Concurrency at a 1 ms sink gives 8.8x on Linux**, against 8.0x on mac and a
+~1,000 rec/s serial cap. Both are closer to the concurrency setting of 16 than
+the old mac figure of 5.0x suggested, and both are still sub-linear — the two
+platforms agree far better on the corrected basis than they appeared to on the
+old one.
 
 **The NDJSON window is now very short.** 1,000 delivered records in ~4 ms on
 tmpfs. `delivered_rps` is computed from `Duration::as_secs_f64()`, so this is
