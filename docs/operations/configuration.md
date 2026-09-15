@@ -776,6 +776,38 @@ max-size payload at once). On memory-constrained hosts, lower
 `max_payload_bytes` and/or `max_connections` accordingly. See the
 [threat model](../security/threat-model.md).
 
+#### `max_batch_records`
+
+- **Type**: usize
+- **Default**: `1024`
+- **Range**: 1 to `MAX_BATCH_RECORDS_HARD_CAP` (2048, compile-time)
+- **CLI**: `--max-batch-records <n>`
+- **Env**: `WEIR_MAX_BATCH_RECORDS`
+- **TOML**: `max_batch_records`
+
+Maximum number of records a single `PushBatch` frame may declare. Applies only
+to the optional batch extension; a daemon that never receives a `PushBatch` is
+unaffected by this knob.
+
+**Effect**: a `PushBatch` declaring more than this is rejected with a `Nack`
+before anything is sized by the declared count, and the connection is closed.
+The rejection happens on the *declared* number, not on what the frame actually
+carries — which is the point: `record_count` is a u16, so a ~320 KiB frame could
+otherwise declare 65,535 records, all of them targeting the single partition the
+connection is pinned to.
+
+The 2048 hard cap is compiled into `weir-core` and cannot be exceeded at runtime;
+raising the config value above it is a startup error. That number is not
+arbitrary — it is the largest cap for which the `AckBatch` reply (3 bytes plus
+`ceil(N/8)` of bitmap = 259 bytes) still fits under the 298-byte `AckTracked`
+bound weir already publishes, so batching introduces no new largest response and
+no client gains a new allocation maximum.
+
+**When to tune**: lower it alongside `max_payload_bytes` on memory-constrained
+hosts — the two multiply, since a batch of N records each up to
+`max_payload_bytes` is one frame. Raising it toward 2048 trades a larger
+worst-case frame for fewer round trips.
+
 ---
 
 ### Metrics endpoint

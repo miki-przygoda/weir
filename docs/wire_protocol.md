@@ -42,14 +42,17 @@ Total frame size: `16 + payload_len + 4` bytes.
 | 0x05 | HealthCheckResponse   | daemon → client  |
 | 0x06 | PushTracked           | client → daemon  |
 | 0x07 | AckTracked            | daemon → client  |
+| 0x08 | PushBatch             | client → daemon  |
+| 0x09 | AckBatch              | daemon → client  |
 
-`PushTracked` / `AckTracked` are an **optional, additive** pair — see
-[Tracked push](#tracked-push--pushtracked--acktracked). A client that does not
-implement them is fully conformant and is unaffected by their existence: it
-never sends `0x06`, so it never receives an `0x07`, and its `Push` still gets
-the same 20-byte `Ack` it always did.
+`PushTracked` / `AckTracked` and `PushBatch` / `AckBatch` are **optional,
+additive** pairs — see [Tracked push](#tracked-push--pushtracked--acktracked)
+and [Batch push](#batch-push--pushbatch--ackbatch). A client that does not
+implement a pair is fully conformant and is unaffected by its existence: it
+never sends the request byte, so it never receives the reply byte, and its
+`Push` still gets the same 20-byte `Ack` it always did.
 
-Message-type bytes `0x08`–`0xFF` are unassigned. A daemon rejects an
+Message-type bytes `0x0A`–`0xFF` are unassigned. A daemon rejects an
 unrecognised one with `Nack(UnknownMessage 0x08)` and closes the connection —
 which is also how a client discovers that a daemon predates a type it wanted to
 use.
@@ -116,7 +119,7 @@ than assume a specific meaning.
 header-CRC validation but the daemon will not act on the message: either the
 `message_type` or `durability` byte is unrecognised (typically version skew), **or
 the `message_type` is a valid daemon→client type** (`Ack` `0x02`, `Nack` `0x03`,
-`HealthCheckResponse` `0x05`, or `AckTracked` `0x07`) that a client must only
+`HealthCheckResponse` `0x05`, `AckTracked` `0x07`, or `AckBatch` `0x09`) that a client must only
 ever *receive*, never *send*. All of these are **permanent** protocol errors. It is distinct from
 `InternalError`: the daemon **closes** the connection after an `UnknownMessage`,
 and retrying the identical frame will not succeed (so a client must not retry on
@@ -275,6 +278,118 @@ These bytes are asserted against the encoder by
 
 ---
 
+## Batch push — `PushBatch` / `AckBatch`
+
+A `Push` costs one round trip per record. `PushBatch` carries N records in one
+frame and `AckBatch` answers all of them at once, with a **positional bitmap**
+saying which were accepted.
+
+`PushBatch` is a `Push` in every other respect: same durability tiers, same
+flags, same header, same CRC coverage. The tier applies to the whole batch —
+there is no per-record tier, because a batch shares one reply.
+
+### `PushBatch` body
+
+| Offset | Size | Field               |
+|--------|------|---------------------|
+| 0      | 1    | `batch_version` = `0x01` |
+| 1      | 2    | `record_count` — u16 LE |
+| 3      | var  | `record_count` entries, each a u32 LE length followed by that many bytes |
+
+The version byte leads for the same reason it does in a record coordinate: the
+body can then grow *inside* wire v1, which only works if a reader meeting a
+version it does not know **rejects** the frame instead of parsing a prefix of a
+layout it has never seen.
+
+**Validation order is normative.** A decoder must, in this order: check the
+fixed prefix is present; check the version; reject `record_count == 0`; check
+`record_count` against the cap **before sizing anything by it**; then walk the
+entries, checking each declared length against the per-record cap **before
+adding it to the cursor**. The frame's payload CRC has already been verified by
+the time the body is parsed and it contributes nothing to these checks — a
+hostile peer computes a perfectly valid CRC over a body declaring 65,535 records
+in three bytes.
+
+`record_count` is capped at **2048** (`MAX_BATCH_RECORDS_HARD_CAP`). This is a
+safety bound, not a tuning knob: `record_count` is a u16, so a ~320 KiB frame
+could otherwise declare 65,535 records, all of them targeting the single
+partition the connection is pinned to. A daemon may configure a lower cap
+(`max_batch_records`); it may never configure a higher one.
+
+### `AckBatch` payload
+
+| Offset | Size | Field               |
+|--------|------|---------------------|
+| 0      | 1    | `ack_batch_version` = `0x01` |
+| 1      | 2    | `record_count` — u16 LE, echoing the `PushBatch` it answers |
+| 3      | var  | bitmap, `ceil(N / 8)` bytes |
+
+**Bit `i` is byte `i / 8`, mask `1 << (i % 8)` — LSB-first within each byte.**
+
+This is the single most dangerous under-specification in the protocol, and it
+is stated here once so every implementation can refer to the same sentence. A
+reader using the opposite convention produces a **well-formed** frame — header
+CRC valid, payload CRC valid, `payload_len` correct — whose meaning is
+inverted, reporting failures as successes. No checksum, length check or cap
+detects it. The conformance vector `ack_bitmap_asymmetric_n9` exists precisely
+to catch it: every pattern with N ≤ 8, and every symmetric pattern at any N,
+encodes identically under both conventions.
+
+Padding bits in the final byte **must be zero**, and a decoder must reject a
+payload where they are not. Tolerating them would make `popcount(bitmap) == N` —
+the obvious way to ask "did the whole batch succeed" — silently wrong.
+
+A decoder must also check the echoed `record_count` against the count it sent.
+An `AckBatch` is the first weir response whose meaning depends on client-held
+state: an `Ack` says "your last record" and an `AckTracked` carries its own
+coordinate, but a bitmap is meaningless without knowing which batch it answers.
+`ceil(N/8)` is not injective — N of 1017 through 1024 all yield 131 bytes — so
+the echoed count is the only thing that can catch a desync.
+
+### What a bit means
+
+> **Bit 1 ⇒ the record is durable at the requested tier.**
+> **Bit 0 ⇒ not durable as of this reply: retry it, and expect that it may
+> nonetheless have been written.**
+
+The asymmetry is deliberate and must be carried into any documentation of this
+frame. A set bit is a strong statement that inherits weir's crown invariant — an
+ack is never a false ack. A clear bit is a weak one, meaning exactly what a
+single-record `Nack(InternalError)` already means: at-least-once. A reader who
+treats clear bits as "definitely not written" will build exactly-once retry on a
+foundation that does not support it.
+
+### Why a bare bitmap is enough
+
+Every sub-record is validated at **ingest**, before any record of the batch is
+enqueued. A validation failure — an empty record, one over `max_payload_bytes`,
+a framing disagreement — rejects the **whole frame** with a plain `Nack` carrying
+its reason, and closes the connection, under the existing "permanent protocol
+error ⇒ close" contract.
+
+So by the time an `AckBatch` is sent at all, every possible per-record failure is
+a *runtime* one — WAB cap, queue refusal, a write or fsync that did not succeed,
+an ack deadline — and every one of those is `InternalError`, which this protocol
+already defines as the sole transient reason. A clear bit therefore needs no
+reason byte to be actionable.
+
+### Negotiation
+
+There is none, and none is needed — the same story as tracked push. A client
+sends `PushBatch`; a daemon that predates it replies `Nack(UnknownMessage)` and
+closes. That reply means "this daemon does not support batching"; fall back to
+one `Push` per record.
+
+### Conformance
+
+The batch vectors live in
+[`conformance/wire_v1_batch_vectors.json`](conformance/wire_v1_batch_vectors.json)
+— a **third** file, separate from both the frozen v1 vectors and the tracked
+ones, for the reason given in
+[`conformance.md`](conformance.md#the-tracked-push-extension--a-second-separate-file).
+
+---
+
 ## Frame decode order (server-side)
 
 The server decodes in this order to minimise DoS surface. **This order is mandatory and must not be changed.**
@@ -380,12 +495,18 @@ honouring an attacker-chosen length would allocate an arbitrary buffer.
 | `HealthCheckResponse`  | 0           |                                       |
 | `Nack`                 | 2           | 1 reason byte; 2 for `VersionMismatch`|
 | `AckTracked`           | 298         | one record coordinate                 |
+| `AckBatch`             | 259         | 3-byte prefix + bitmap at the 2048 cap|
 
-A client that does not implement tracked pushes never sends a `PushTracked`, so
-it can never receive an `AckTracked` — **≤ 2 bytes remains the correct cap for
-every response it can see**, exactly as before. This is the read-side mirror of
-the send-path cap and is also enumerated in the
-[producer checklist](#minimum-producer-checklist).
+A client that implements neither optional pair never sends a `PushTracked` or a
+`PushBatch`, so it can never receive an `AckTracked` or an `AckBatch` — **≤ 2
+bytes remains the correct cap for every response it can see**, exactly as
+before. This is the read-side mirror of the send-path cap and is also enumerated
+in the [producer checklist](#minimum-producer-checklist).
+
+298 is still the largest response weir sends. That is not a coincidence: the
+2048-record cap on a batch was chosen to keep `AckBatch` under the bound
+`AckTracked` already set, so implementing batching gives a client no new
+allocation maximum to size a buffer for.
 
 ### When the server keeps the connection open
 
@@ -393,6 +514,7 @@ the send-path cap and is also enumerated in the
 |-------|-----------|
 | Push → Ack | open |
 | PushTracked → AckTracked | open |
+| PushBatch → AckBatch | open — including when some records' bits are clear; a per-record failure is a runtime condition, not a protocol error |
 | Push → Nack(InternalError) | open — covers transient daemon-side conditions: queue saturation, ack timeout, a non-durable write (write/fsync error), or the daemon's `wab_max_bytes` cap rejecting because its write-ahead buffer is full. The record's durable outcome is **unknown** for the first three (the producer should retry); a cap rejection is definitively *not* durable, but it is not distinguishable on the wire — the daemon's `weir_wab_cap_rejections_total` metric is what separates it, so a producer treats all four the same way and retries. |
 | HealthCheck → HealthCheckResponse | open |
 
@@ -550,11 +672,14 @@ A non-Rust client that satisfies the following is wire-compatible:
 - [ ] **Caps the response `payload_len` before allocating, per response type.**
       `Ack`/`HealthCheckResponse` = 0; `Nack` = 1, except `VersionMismatch` = 2.
       If — and only if — you send `PushTracked`, an `AckTracked` may carry up to
-      298 bytes; a client that does not send `PushTracked` keeps **≤ 2 bytes** as
-      the cap for every response it can receive. A larger declared length on a
-      *response* is a desync or a non-weir peer — treat it as a protocol error
-      and close the connection rather than allocating an attacker-chosen buffer.
-      (This mirrors the send-path cap below.)
+      298 bytes; if — and only if — you send `PushBatch`, an `AckBatch` may carry
+      up to 259. A client that sends neither keeps **≤ 2 bytes** as the cap for
+      every response it can receive. Widen the cap for the reply type you
+      actually asked for and for nothing else: a blanket widening lets a
+      desynced peer use a stray type byte to unlock a bigger read. A larger
+      declared length on a *response* is a desync or a non-weir peer — treat it
+      as a protocol error and close the connection rather than allocating an
+      attacker-chosen buffer. (This mirrors the send-path cap below.)
 - [ ] Verifies the response header magic, version, and CRC before
       consuming the payload.
 - [ ] Treats response `message_type == Nack` as failure; decodes the
@@ -613,10 +738,12 @@ wrong. Two such growth points exist, both already reserved by this document:
 
 - **Nack reason bytes `0x0A`–`0xFF`** — a client surfaces an unrecognised reason
   rather than assuming a meaning.
-- **Message-type bytes `0x08`–`0xFF`** — a daemon (or client) that does not know
+- **Message-type bytes `0x0A`–`0xFF`** — a daemon (or client) that does not know
   a type rejects it with `UnknownMessage`, which is an actionable, permanent
   error rather than a misparse.
 
-`PushTracked` (`0x06`) / `AckTracked` (`0x07`) were added this way. No byte a v1
-client reads or writes changed, and the frozen vectors in
-`conformance/wire_v1_vectors.json` are untouched.
+`PushTracked` (`0x06`) / `AckTracked` (`0x07`) and `PushBatch` (`0x08`) /
+`AckBatch` (`0x09`) were added this way. No byte a v1 client reads or writes
+changed, and the frozen vectors in `conformance/wire_v1_vectors.json` are
+untouched — a guard in `conformance.rs` asserts that file carries no type byte
+above `0x05`, so the claim is executed rather than promised.
