@@ -415,3 +415,137 @@ tests:
               summary: "weir TLS handshake failures on w:9185"
               description: "(tls feature) Repeated mutual-TLS handshake failures — client-cert expiry/rotation, a CA mismatch, or a probe hitting the TCP port. Check the client certificates and the CA bundle."
               runbook: "docs/monitoring.md#weirtlshandshakefailures"
+
+  # ── The three rules that had no test in either direction ────────────────────
+  #
+  # They shipped unguarded: each could be inverted, neutered or deleted outright
+  # and `promtool test rules` stayed green, because nothing asserted a rule has a
+  # test. `every_alert_rule_has_a_unit_test` in crates/weir-server/tests/docs_drift.rs
+  # now closes that, and these are the tests it was missing.
+
+  - interval: 1m
+    name: fsync p99.9 below the warning threshold does not fire
+    input_series:
+      # histogram_quantile over a single +Inf-terminated bucket set. Every
+      # observation lands in le=0.005, so p99.9 is ~5ms — under the 20ms warning
+      # and well under the 100ms critical.
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.005"}'
+        values: "0+100x15"
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="+Inf"}'
+        values: "0+100x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: WeirFsyncLatencyHigh
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: WeirFsyncLatencyCritical
+        exp_alerts: []
+
+  # The humanised figures below (49.96ms, 499.6ms) are what histogram_quantile
+  # interpolates WITHIN the bucket, not the bucket bound -- which is the point of
+  # asserting the rendered summary rather than just the alert name: it pins the
+  # operator-visible string, interpolation included.
+  - interval: 1m
+    name: sustained fsync p99.9 above 20ms fires the warning but not the critical
+    input_series:
+      # All observations in le=0.05 (50ms): over the 20ms warning, under the
+      # 100ms critical. The two thresholds are asserted apart so that collapsing
+      # one into the other cannot pass.
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.005"}'
+        values: "0+0x15"
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.05"}'
+        values: "0+100x15"
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="+Inf"}'
+        values: "0+100x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: WeirFsyncLatencyHigh
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir fsync p99.9 high on w:9185 (49.96ms)"
+              description: "Sustained fsync latency above the storage baseline. weir is fsync-bound, so this directly caps durable throughput. Check storage contention, a failing disk, or network-attached storage (NFS/EFS make fdatasync 5-50× slower)."
+              runbook: "docs/monitoring.md#weirfsynclatency"
+      - eval_time: 12m
+        alertname: WeirFsyncLatencyCritical
+        exp_alerts: []
+
+  - interval: 1m
+    name: fsync p99.9 above 100ms fires the critical
+    input_series:
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.05"}'
+        values: "0+0x15"
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.5"}'
+        values: "0+100x15"
+      - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="+Inf"}'
+        values: "0+100x15"
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: WeirFsyncLatencyCritical
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir fsync p99.9 CRITICAL on w:9185 (499.6ms)"
+              description: "fsync latency is an order of magnitude above any healthy local SSD. Durable-tier throughput is collapsing. Likely a failing disk or saturated/remote storage."
+              runbook: "docs/monitoring.md#weirfsynclatency"
+
+  - interval: 1m
+    name: a flat nack counter does not fire
+    input_series:
+      # Flat, not absent: the rule is `rate(...) > 0`, and a counter that never
+      # moves must read as healthy rather than as missing data.
+      - series: 'weir_records_nack_total{job="weir",instance="w:9185",tier="durable",reason="internal_error"}'
+        values: "7+0x10"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: WeirHighNackRate
+        exp_alerts: []
+
+  - interval: 1m
+    name: any sustained nack rate fires
+    input_series:
+      - series: 'weir_records_nack_total{job="weir",instance="w:9185",tier="durable",reason="internal_error"}'
+        values: "0+3x10"
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: WeirHighNackRate
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir is Nacking records on w:9185"
+              description: "Producers are being told records were NOT accepted durably. Causes: a shard taken offline by repeated flusher panics, fsync failures, or sustained backpressure. At-least-once means producers should retry — but a sustained rate needs investigation."
+              runbook: "docs/monitoring.md#weirhighnackrate"
+
+  # ── The non-firing halves these two rules were missing ──────────────────────
+  #
+  # Both had a firing test and no quiet one. A firing-only test cannot catch the
+  # more corrosive failure — a rule that fires constantly — which is exactly what
+  # this file's header claims the suite prevents.
+
+  - interval: 1m
+    name: a flat stranded-segment counter does not fire
+    input_series:
+      # Flat, not absent. `increase(...) > 0` over a counter that never moves
+      # must read as healthy; an inverted threshold would fire here.
+      - series: 'weir_drain_segments_stranded_total{job="weir",instance="w:9185"}'
+        values: "4+0x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: WeirSegmentStranded
+        exp_alerts: []
+
+  - interval: 1m
+    name: no peer-UID rejections does not fire
+    input_series:
+      - series: 'weir_connection_rejected_peer_uid_total{job="weir",instance="w:9185"}'
+        values: "0+0x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: WeirUnauthorizedConnections
+        exp_alerts: []
