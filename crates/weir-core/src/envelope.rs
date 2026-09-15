@@ -32,8 +32,20 @@ const HEADER_CRC_COVERAGE: usize = 12;
 pub const MIN_FRAME_LEN: usize = HEADER_LEN + 4;
 
 /// Wire message types. Values are fixed; changing them requires a WIRE_VERSION bump.
+///
+/// `#[non_exhaustive]`, since 4.0. It was left exhaustive on the reasoning
+/// recorded in `nack.rs` — that changing this enum "requires a `WIRE_VERSION`
+/// bump (a major event)" — and 3.0 disproved that by adding `PushTracked` and
+/// `AckTracked` with `WIRE_VERSION` unchanged, because message-type bytes
+/// `0x08`-`0xFF` are reserved for additive growth. Every such addition was
+/// therefore forcing a major release of the published Rust API for a change the
+/// wire did not consider breaking at all. Closing that costs one break, once.
+///
+/// Downstream matches need a wildcard arm from here on. That is the point: a new
+/// message type is additive on the wire and should be additive in the API too.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessageType {
     /// Producer → daemon: a record to durably buffer.
     Push = 0x01,
@@ -62,6 +74,24 @@ pub enum MessageType {
     /// whose payload exceeds two bytes, and only ever sent in reply to a
     /// [`PushTracked`](MessageType::PushTracked).
     AckTracked = 0x07,
+    /// Producer → daemon: N records in one frame, answered once with
+    /// [`AckBatch`](MessageType::AckBatch).
+    ///
+    /// Additive the same way [`PushTracked`](MessageType::PushTracked) was: a
+    /// producer built against an earlier wire never emits this byte, so it never
+    /// receives the reply, and a daemon that predates it answers
+    /// [`UnknownMessage`](crate::NackReason::UnknownMessage) — a permanent,
+    /// connection-closing error that names the version skew rather than
+    /// misparsing.
+    PushBatch = 0x08,
+    /// Daemon → producer: one reply for a whole [`PushBatch`](MessageType::PushBatch),
+    /// carrying a positional bitmap of per-record outcomes.
+    ///
+    /// **Bit `i` is LSB-first** within each byte and means record `i` is durable
+    /// at the requested tier; a clear bit means *not durable as of this reply —
+    /// retry, and expect it may nonetheless have been written*. See
+    /// [`crate::batch`] for why a clear bit needs no reason byte.
+    AckBatch = 0x09,
 }
 
 /// Error returned when a byte does not map to a known MessageType.
@@ -88,6 +118,8 @@ impl TryFrom<u8> for MessageType {
             0x05 => Ok(MessageType::HealthCheckResponse),
             0x06 => Ok(MessageType::PushTracked),
             0x07 => Ok(MessageType::AckTracked),
+            0x08 => Ok(MessageType::PushBatch),
+            0x09 => Ok(MessageType::AckBatch),
             v => Err(UnknownMessageType(v)),
         }
     }
@@ -537,8 +569,30 @@ mod tests {
     #[test]
     fn message_type_try_from_rejects_unknown() {
         assert!(MessageType::try_from(0x00).is_err());
-        assert!(MessageType::try_from(0x08).is_err());
+        // 0x08/0x09 became PushBatch/AckBatch in 4.0; 0x0A is the first
+        // unassigned byte now. This assertion moves each time the additive
+        // space is used, which is the point — it pins where the boundary is.
+        assert!(MessageType::try_from(0x0A).is_err());
         assert!(MessageType::try_from(0xff).is_err());
+    }
+
+    /// The byte range `0x08`-`0xFF` is what makes a new message type additive
+    /// within wire v1, so the assigned set must stay a contiguous prefix with no
+    /// accidental gaps or overlaps.
+    #[test]
+    fn the_assigned_message_type_bytes_are_contiguous_from_one() {
+        let assigned: Vec<u8> = (0u8..=u8::MAX)
+            .filter(|b| MessageType::try_from(*b).is_ok())
+            .collect();
+        assert_eq!(
+            assigned,
+            (0x01u8..=0x09).collect::<Vec<u8>>(),
+            "assigned message-type bytes should be 0x01..=0x09 with no holes"
+        );
+        // 0xFF must stay unassigned: the frozen vector
+        // `reject_unknown_message_type` pins it to UnknownMessageType, and
+        // changing a frozen vector is what the freeze forbids.
+        assert!(MessageType::try_from(0xFF).is_err());
     }
 
     #[test]
@@ -553,6 +607,8 @@ mod tests {
             MessageType::HealthCheckResponse,
             MessageType::PushTracked,
             MessageType::AckTracked,
+            MessageType::PushBatch,
+            MessageType::AckBatch,
         ] {
             assert_eq!(MessageType::try_from(u8::from(mt)).unwrap(), mt);
         }

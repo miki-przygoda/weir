@@ -24,6 +24,7 @@ struct RawServer {
     wab_max_bytes: Option<u64>,
     max_connections: Option<usize>,
     max_payload_bytes: Option<usize>,
+    max_batch_records: Option<usize>,
     metrics_port: Option<u16>,
     metrics_bind: Option<String>,
     metrics_max_connections: Option<usize>,
@@ -107,6 +108,7 @@ const BASE_SERVER_KEYS: &[&str] = &[
     "wab_max_bytes",
     "max_connections",
     "max_payload_bytes",
+    "max_batch_records",
     "metrics_port",
     "metrics_bind",
     "metrics_max_connections",
@@ -228,6 +230,7 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             wab_max_bytes: s.wab_max_bytes,
             max_connections: s.max_connections,
             max_payload_bytes: s.max_payload_bytes,
+            max_batch_records: s.max_batch_records,
             metrics_port: s.metrics_port,
             metrics_bind: s.metrics_bind,
             metrics_max_connections: s.metrics_max_connections,
@@ -368,8 +371,8 @@ mod tests {
     /// whether parsing fails.
     #[test]
     fn read_tolerates_feature_gated_and_unknown_keys() {
-        let dir = std::env::temp_dir().join(format!("weir_filecfg_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir("filecfg");
+        crate::testutil::mkdir_p(&dir);
         let path = dir.join("weir.toml");
         std::fs::write(
             &path,

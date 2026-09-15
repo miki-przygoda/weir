@@ -62,6 +62,8 @@ pub struct TcpConfig {
     /// Per-connection payload cap in bytes. Effective cap is
     /// `min(max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
     pub max_payload_bytes: usize,
+    /// Ceiling on records in one `PushBatch`; see `SocketConfig`.
+    pub max_batch_records: usize,
     /// Total number of WAB shards; new connections are assigned a shard_id
     /// round-robin (counter % shard_count).
     pub shard_count: usize,
@@ -114,6 +116,9 @@ pub async fn run(
         .min(weir_core::MAX_PAYLOAD_HARD_CAP);
     let conn_cfg_template = ConnectionConfig {
         max_payload_bytes: effective_cap,
+        max_batch_records: config
+            .max_batch_records
+            .min(weir_core::MAX_BATCH_RECORDS_HARD_CAP),
         read_timeout: Duration::from_secs(config.connection_read_timeout_secs),
         ack_timeout: crate::socket::connection::ACK_TIMEOUT,
         shard_id: 0, // overridden per connection below

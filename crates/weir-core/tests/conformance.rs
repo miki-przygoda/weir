@@ -77,6 +77,13 @@ fn message_type_name(mt: MessageType) -> &'static str {
         MessageType::HealthCheckResponse => "HealthCheckResponse",
         MessageType::PushTracked => "PushTracked",
         MessageType::AckTracked => "AckTracked",
+        MessageType::PushBatch => "PushBatch",
+        MessageType::AckBatch => "AckBatch",
+        // MessageType is #[non_exhaustive] since 4.0, because a new message
+        // type is additive on the wire (bytes 0x08-0xFF are reserved) and
+        // should be additive in the API too. A vector naming a type this build
+        // does not know is a real failure, not something to render as "unknown".
+        other => panic!("conformance: unmapped MessageType variant {other:?}"),
     }
 }
 
@@ -184,4 +191,39 @@ fn retired_batched_byte_decodes_but_never_round_trips() {
         0x01,
         "re-encoding must canonicalise to 0x01"
     );
+}
+
+/// The frozen set carries no extension frame — the compatibility claim for
+/// every extension, executed rather than asserted.
+///
+/// It lives here, with the frozen set, rather than in an extension's own suite:
+/// the claim is a property of *this* file, it must survive any extension being
+/// removed, and one general guard beats one per extension that someone has to
+/// remember to add.
+///
+/// Stated as `<= 0x05` rather than as a list of the types assigned today, so a
+/// future extension is covered the day its byte is assigned rather than the day
+/// someone remembers to widen this. `0xFF` is the single exception, and a
+/// deliberate one: `reject_unknown_message_type` is this file's worked example
+/// of an unassigned byte, and `0xFF` is pinned as permanently unassigned by
+/// `weir-core`'s envelope tests.
+///
+/// If this ever fails, the five polyglot demo clients in CI fail right after
+/// it — they implement `0x01..=0x05` and are *correct* to reject anything else.
+#[test]
+fn the_frozen_v1_vectors_contain_no_extension_frame() {
+    let doc: Value = serde_json::from_str(VECTORS_JSON).unwrap();
+    for v in doc["vectors"].as_array().unwrap() {
+        let buf = from_hex(v["hex"].as_str().unwrap());
+        // Byte 5 is message_type; short buffers (truncation vectors) have none.
+        if let Some(&mt) = buf.get(5) {
+            assert!(
+                mt <= 0x05 || mt == 0xFF,
+                "vector {:?} puts extension message type {mt:#04x} in the frozen \
+                 v1 file; every v1-only decoder rejects it, and the polyglot \
+                 clients in CI will fail",
+                v["name"].as_str().unwrap()
+            );
+        }
+    }
 }

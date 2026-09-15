@@ -140,8 +140,8 @@ mod tests {
     fn confirmed_sidecar_is_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("weir_f10_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir("f10");
+        crate::testutil::mkdir_p(&dir);
         let path = dir.join("seg_00000000.wab.confirmed");
 
         write_confirmed_durably(&path, b"sidecar-bytes").unwrap();

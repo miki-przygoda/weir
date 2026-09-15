@@ -830,6 +830,9 @@ fn metrics_all_families_registered() {
         "weir_wab_record_logical_bytes",
         "weir_wab_record_stored_bytes",
         "weir_wab_fsync_duration_seconds",
+        "weir_wab_group_commit_records",
+        "weir_batch_records",
+        "weir_batch_partial",
         "weir_wab_flusher_panics",
         "weir_wab_fsync_failures",
         "weir_wab_cap_rejections",
@@ -3291,6 +3294,24 @@ fn clickhouse_sink_end_to_end() {
     );
 }
 
+/// Like [`parse_metric`] but for a value rendered as a float.
+///
+/// A histogram's `_sum` is exposed as `20.0`, which `parse_metric`'s `u64`
+/// parse rejects — returning its not-found sentinel of 0. That silent 0 is
+/// indistinguishable from "the metric is absent", which cost a debugging cycle:
+/// the implementation was correct and the test was reading it wrong.
+fn parse_metric_f64(body: &str, prefix: &str) -> f64 {
+    for line in body.lines() {
+        if line.starts_with(prefix)
+            && let Some(val) = line.split_whitespace().next_back()
+            && let Ok(n) = val.parse()
+        {
+            return n;
+        }
+    }
+    f64::NAN
+}
+
 fn parse_metric(body: &str, prefix: &str) -> u64 {
     for line in body.lines() {
         if line.starts_with(prefix)
@@ -3748,4 +3769,313 @@ fn s3_sink_an_unreachable_endpoint_strands_rather_than_dead_letters() {
         excerpt()
     );
     handle.shutdown();
+}
+
+/// Every `Durable` record is covered by exactly one group fsync, and the
+/// histogram says how many records each one covered.
+///
+/// This is the fsync amortisation factor, measured rather than modelled. Until
+/// it existed, nothing in the tree observed it — `grep group_commit` returned
+/// nothing — and the case for wire-level batching rests entirely on it being
+/// low in real deployments. A6's premise is falsifiable only with this number.
+///
+/// The invariant asserted here is stronger than "the metric exists": the SUM of
+/// the observations must equal the number of `Durable` records pushed. Every
+/// record is covered by exactly one group fsync, so a sum that drifts means
+/// either a record was fsynced twice (the amortisation is being overcounted) or
+/// one was never covered (which would be a false-ack hazard, not a metrics bug).
+#[test]
+fn group_commit_histogram_counts_every_durable_record_exactly_once() {
+    const N: u32 = 50;
+
+    let srv = weir_server!("group_commit").start();
+    let mut client = srv.client();
+
+    let read_count = |name: &str| -> u64 { parse_metric(&srv.scrape_metrics(), name) };
+    let read_sum = |name: &str| -> f64 { parse_metric_f64(&srv.scrape_metrics(), name) };
+
+    let count_before = read_count("weir_wab_group_commit_records_count");
+    let sum_before = read_sum("weir_wab_group_commit_records_sum");
+
+    // Buffered must not contribute: it acks on the memory write, before any
+    // fsync, so it is covered by no group commit at all.
+    for i in 0..N {
+        client
+            .push(format!("buf-{i}").as_bytes(), Durability::Buffered)
+            .expect("buffered push");
+    }
+    assert_eq!(
+        read_sum("weir_wab_group_commit_records_sum"),
+        sum_before,
+        "a Buffered record was counted into a group commit; Buffered acks \
+         before any fsync and must contribute nothing"
+    );
+
+    for i in 0..N {
+        client
+            .push(format!("dur-{i}").as_bytes(), Durability::Durable)
+            .expect("durable push");
+    }
+
+    let count_after = read_count("weir_wab_group_commit_records_count");
+    let sum_after = read_sum("weir_wab_group_commit_records_sum");
+
+    assert_eq!(
+        sum_after - sum_before,
+        f64::from(N),
+        "the group-commit histogram must account for every Durable record \
+         exactly once: pushed {N}, observed {}",
+        sum_after - sum_before
+    );
+    assert!(
+        count_after > count_before,
+        "no group commit was observed at all for {N} Durable records"
+    );
+
+    // The amortisation factor itself. On a serial single connection each record
+    // is its own group commit, so this is ~1.0 — which is precisely the
+    // measurement A6's case depends on. Asserted as a range rather than a point
+    // so the test states the shape without becoming a timing flake.
+    let fsyncs = count_after - count_before;
+    let per_fsync = (sum_after - sum_before) / fsyncs as f64;
+    println!(
+        "BENCH: {{\"scenario\":\"group_commit_serial_one_connection\",\
+         \"records\":{N},\"group_commits\":{fsyncs},\"records_per_fsync\":{per_fsync:.3}}}"
+    );
+    assert!(
+        (1.0..=f64::from(N)).contains(&per_fsync),
+        "records per group commit was {per_fsync}, outside 1..={N} — one fsync \
+         cannot cover fewer than one record nor more than were pushed"
+    );
+}
+
+/// Reads exactly one response frame off a raw stream: header, then
+/// `payload_len + 4`.
+fn read_one_frame(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> (weir_core::MessageType, Vec<u8>) {
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    stream
+        .read_exact(&mut header)
+        .expect("read response header");
+    let plen = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    let mut rest = vec![0u8; plen + 4];
+    stream.read_exact(&mut rest).expect("read response payload");
+    let mt = weir_core::MessageType::try_from(header[5]).expect("known response type");
+    (mt, rest[..plen].to_vec())
+}
+
+/// A `PushBatch` is answered once, with a bitmap that says every record landed.
+///
+/// This is the end-to-end shape of A6: N records in one frame, one reply, and
+/// the per-record counters moving by N rather than by one — a per-frame `.inc()`
+/// would undercount by up to the batch size and silently break every rate panel,
+/// the fsync-amortisation panel that divides by this counter, and the readiness
+/// script that gates on it.
+#[test]
+fn a_push_batch_is_answered_with_a_bitmap_and_counts_every_record() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Durability, Envelope, Header, MessageType};
+
+    const N: usize = 10;
+
+    let srv = weir_server!("batch_ok").start();
+    let accepted_before = parse_metric(
+        &srv.scrape_metrics(),
+        "weir_records_accepted_total{tier=\"durable\"}",
+    );
+
+    let records: Vec<Vec<u8>> = (0..N)
+        .map(|i| format!("batched-{i}").into_bytes())
+        .collect();
+    let body =
+        weir_core::encode_batch_body(&records.iter().map(|r| r.as_slice()).collect::<Vec<_>>());
+    let frame = Envelope::new(
+        Header::new(MessageType::PushBatch, Durability::Durable, 0),
+        body,
+    )
+    .encode();
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("connect");
+    stream.write_all(&frame).expect("write PushBatch");
+    let (mt, payload) = read_one_frame(&mut stream);
+
+    assert_eq!(
+        mt,
+        MessageType::AckBatch,
+        "a PushBatch must be answered with an AckBatch"
+    );
+    let accepted = weir_core::decode_ack_batch(&payload, N).expect("decode the bitmap");
+    assert_eq!(
+        accepted,
+        vec![true; N],
+        "every record of a healthy batch must be durable"
+    );
+
+    // The additive property: an ordinary Push still works on the same
+    // connection, after a batch. A producer is never forced to choose.
+    let plain = Envelope::new(
+        Header::new(MessageType::Push, Durability::Durable, 0),
+        b"plain".to_vec(),
+    )
+    .encode();
+    stream.write_all(&plain).expect("write Push");
+    let (mt, _) = read_one_frame(&mut stream);
+    assert_eq!(
+        mt,
+        MessageType::Ack,
+        "a plain Push after a batch must still be acked"
+    );
+
+    let accepted_after = parse_metric(
+        &srv.scrape_metrics(),
+        "weir_records_accepted_total{tier=\"durable\"}",
+    );
+    assert_eq!(
+        accepted_after - accepted_before,
+        (N + 1) as u64,
+        "records_accepted must move by RECORDS ({} batched + 1 plain), not by \
+         frames — a per-frame inc() would have moved it by 2",
+        N
+    );
+}
+
+/// A malformed sub-record rejects the whole frame and closes the connection.
+///
+/// This is what lets the `AckBatch` bitmap carry no reason bytes. Every
+/// per-record *validation* failure is permanent, and permanent errors close the
+/// connection exactly as a malformed single `Push` does — so by the time a
+/// bitmap is sent at all, every bit it can clear is a transient runtime failure
+/// that means "retry".
+#[test]
+fn a_batch_containing_an_empty_record_is_rejected_whole_and_closes() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream as RawStream,
+    };
+    use weir_core::{Durability, Envelope, Header, MessageType, NackReason};
+
+    let srv = weir_server!("batch_empty_rec").start();
+
+    // Hand-built: encode_batch_body would happily encode it, but the daemon
+    // must reject it — an empty record cannot be represented in a WAB segment,
+    // where a zero payload_len is the end-of-records sentinel.
+    let body = weir_core::encode_batch_body(&[b"fine", b"", b"also fine"]);
+    let frame = Envelope::new(
+        Header::new(MessageType::PushBatch, Durability::Durable, 0),
+        body,
+    )
+    .encode();
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("connect");
+    stream.write_all(&frame).expect("write PushBatch");
+    let (mt, payload) = read_one_frame(&mut stream);
+
+    assert_eq!(
+        mt,
+        MessageType::Nack,
+        "a malformed batch must Nack, not answer with a bitmap"
+    );
+    assert_eq!(
+        payload.first().copied(),
+        Some(NackReason::EmptyPayload as u8),
+        "the reason must name what was wrong with the record, not a generic error"
+    );
+
+    // Permanent ⇒ closed, same as any other malformed frame.
+    let mut buf = [0u8; 1];
+    assert!(
+        matches!(stream.read(&mut buf), Ok(0) | Err(_)),
+        "a permanent rejection must close the connection"
+    );
+}
+
+/// A declared record count over the cap is refused before anything is reserved.
+#[test]
+fn a_batch_over_the_record_cap_is_refused() {
+    use std::{io::Write, os::unix::net::UnixStream as RawStream};
+    use weir_core::{Durability, Envelope, Header, MessageType, NackReason};
+
+    let srv = weir_server!("batch_over_cap")
+        .extra_config("max_batch_records = 4\n")
+        .start();
+
+    let records: Vec<Vec<u8>> = (0..8).map(|i| format!("r{i}").into_bytes()).collect();
+    let body =
+        weir_core::encode_batch_body(&records.iter().map(|r| r.as_slice()).collect::<Vec<_>>());
+    let frame = Envelope::new(
+        Header::new(MessageType::PushBatch, Durability::Durable, 0),
+        body,
+    )
+    .encode();
+
+    let mut stream = RawStream::connect(&srv.socket_path).expect("connect");
+    stream.write_all(&frame).expect("write PushBatch");
+    let (mt, payload) = read_one_frame(&mut stream);
+    assert_eq!(mt, MessageType::Nack);
+    assert_eq!(
+        payload.first().copied(),
+        Some(NackReason::PayloadTooLarge as u8),
+        "an over-cap batch is too large, and the producer's remedy is to send less"
+    );
+}
+
+/// The Rust client's `push_batch` against a real daemon, end to end.
+#[test]
+fn the_client_can_push_a_batch_and_read_every_outcome() {
+    let srv = weir_server!("client_batch").start();
+    let mut client = srv.client();
+
+    let records: Vec<Vec<u8>> = (0..25)
+        .map(|i| format!("client-batch-{i}").into_bytes())
+        .collect();
+    let outcome = client
+        .push_batch(&records, Durability::Durable)
+        .expect("push_batch");
+
+    assert_eq!(outcome.accepted.len(), records.len());
+    assert!(
+        outcome.all_accepted(),
+        "a healthy daemon must accept every record; rejected: {:?}",
+        outcome.rejected_indices()
+    );
+    assert!(outcome.rejected_indices().is_empty());
+
+    // The client stays usable for ordinary pushes afterwards — the batch path
+    // must not poison a connection it shares.
+    client
+        .push(b"after", Durability::Durable)
+        .expect("plain push after a batch");
+    assert!(!client.is_poisoned());
+}
+
+/// A batch the client can tell is invalid never reaches the wire.
+///
+/// The daemon would Nack and close, poisoning the connection. Refusing locally
+/// keeps it usable, mirroring the single-record guards — and `is_recoverable`
+/// stays the exact complement of `is_poisoned`, which the crate promises.
+#[test]
+fn the_client_refuses_a_locally_invalid_batch_without_poisoning() {
+    let srv = weir_server!("client_batch_guard").start();
+    let mut client = srv.client();
+
+    let with_empty: Vec<&[u8]> = vec![b"ok", b"", b"fine"];
+    let err = client
+        .push_batch(&with_empty, Durability::Durable)
+        .expect_err("an empty record must be refused");
+    assert!(
+        err.is_recoverable(),
+        "a local guard must not poison: {err:?}"
+    );
+    assert!(!client.is_poisoned());
+
+    let empty: Vec<&[u8]> = vec![];
+    assert!(client.push_batch(&empty, Durability::Durable).is_err());
+    assert!(!client.is_poisoned());
+
+    // Still usable.
+    client
+        .push(b"still works", Durability::Durable)
+        .expect("push after refusals");
 }

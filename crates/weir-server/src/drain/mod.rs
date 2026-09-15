@@ -1770,7 +1770,7 @@ mod tests {
         // Pre-fill the dead-letter dir past the cap so the first permanent
         // rejection has nowhere to go and the drain parks in the blocked wait.
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -2461,15 +2461,15 @@ mod tests {
     }
 
     fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("weir_drain_{label}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir(&format!("drain_{label}"));
+        crate::testutil::mkdir_p(&dir);
         dir
     }
 
     fn make_sealed_segment(dir: &Path, shard_id: u16, payloads: &[&[u8]]) -> PathBuf {
         // Put sealed segments in a shard subdirectory so confirmed_path works.
         let shard_dir = dir.join("shard_00");
-        std::fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
         let path = segment_path(&shard_dir, 1);
         let mut seg = WabSegment::create(&path, shard_id, Compression::None).unwrap();
         for p in payloads {
@@ -2865,7 +2865,7 @@ mod tests {
     fn corrupt_segment_open_is_preserved_not_deleted() {
         let dir = tmp_dir("b2_corrupt");
         let shard_dir = dir.join("shard_00");
-        std::fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
         // A file with bad magic → SegmentReader::open errors (InvalidData),
         // standing in for any non-NotFound open failure (transient or corrupt).
         let seg = segment_path(&shard_dir, 1);
@@ -2986,7 +2986,7 @@ mod tests {
     fn drain_survives_sink_panic_and_keeps_delivering() {
         let dir = tmp_dir("b7_panic");
         let shard_dir = dir.join("shard_00");
-        std::fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
         let mk = |counter: u64, payload: &[u8]| {
             let p = segment_path(&shard_dir, counter);
             let mut s = WabSegment::create(&p, 0, Compression::None).unwrap();
@@ -3090,7 +3090,7 @@ mod tests {
         // Two segments (distinct counters) so each respawn has a fresh segment to
         // panic on.
         let shard_dir = dir.join("shard_00");
-        std::fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
         let mk = |counter: u64, payload: &[u8]| {
             let p = segment_path(&shard_dir, counter);
             let mut s = WabSegment::create(&p, 0, Compression::None).unwrap();
@@ -3361,7 +3361,7 @@ mod tests {
         // Block the .confirmed write: put a directory where the sidecar file would
         // go, so File::create fails deterministically.
         let confirmed = get_confirmed_path(&sealed);
-        std::fs::create_dir_all(&confirmed).unwrap();
+        crate::testutil::mkdir_p(&confirmed);
 
         let metrics = noop_metrics();
         super::confirmed::confirm_and_delete(&sealed, 1, &metrics);
@@ -3968,7 +3968,7 @@ mod tests {
     fn multiple_segments_second_processed_after_first_exhausts_retries() {
         let dir = tmp_dir("two_segs");
         let shard_dir = dir.join("shard_00");
-        std::fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         let seg1_active = segment_path(&shard_dir, 1);
         let mut s1 = WabSegment::create(&seg1_active, 0, Compression::None).unwrap();
@@ -4085,7 +4085,7 @@ mod tests {
         let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
 
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -4166,7 +4166,7 @@ mod tests {
         let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
 
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -4216,7 +4216,7 @@ mod tests {
         let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
 
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         let blocking_file = dl_dir.join("dl_00000001.wab.sealed");
         std::fs::write(&blocking_file, vec![0u8; 200]).unwrap();
 
@@ -4287,7 +4287,7 @@ mod tests {
         // Pre-fill the dead-letter dir past the (tight) cap so the first permanent
         // reject of B blocks rather than dead-letters.
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         let blocking_file = dl_dir.join("dl_00000001.wab.sealed");
         std::fs::write(&blocking_file, vec![0u8; 200]).unwrap();
 
@@ -4376,7 +4376,7 @@ mod tests {
         let sealed = make_sealed_segment(&dir, 0, &[b"r"]);
 
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -4415,7 +4415,7 @@ mod tests {
         let sealed = make_sealed_segment(&dir, 0, &[b"r"]);
 
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         let blocking_file = dl_dir.join("dl_00000001.wab.sealed");
         std::fs::write(&blocking_file, vec![0u8; 200]).unwrap();
 
@@ -4899,7 +4899,7 @@ mod tests {
         let sealed = make_sealed_segment(&dir, 0, &[b"r"]);
 
         let dl_dir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
 
         let (tx, rx) = crossbeam_channel::unbounded();

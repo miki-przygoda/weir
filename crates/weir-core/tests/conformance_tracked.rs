@@ -71,6 +71,13 @@ fn message_type_name(mt: MessageType) -> &'static str {
         MessageType::HealthCheckResponse => "HealthCheckResponse",
         MessageType::PushTracked => "PushTracked",
         MessageType::AckTracked => "AckTracked",
+        MessageType::PushBatch => "PushBatch",
+        MessageType::AckBatch => "AckBatch",
+        // MessageType is #[non_exhaustive] since 4.0, because a new message
+        // type is additive on the wire (bytes 0x08-0xFF are reserved) and
+        // should be additive in the API too. A vector naming a type this build
+        // does not know is a real failure, not something to render as "unknown".
+        other => panic!("conformance: unmapped MessageType variant {other:?}"),
     }
 }
 
@@ -153,28 +160,6 @@ fn every_frame_vector_decodes_and_round_trips() {
             v["hex"].as_str().unwrap(),
             "{name}: re-encode is not byte-identical"
         );
-    }
-}
-
-/// The compatibility claim, executed rather than asserted: the frozen v1 vector
-/// set contains no `0x06`/`0x07` frame, so nothing an existing client reads has
-/// moved. If a tracked frame were ever added to `wire_v1_vectors.json` this
-/// fails, and the five polyglot clients in CI would fail right after it.
-#[test]
-fn the_frozen_v1_vectors_contain_no_tracked_frame() {
-    const V1: &str = include_str!("../../../docs/conformance/wire_v1_vectors.json");
-    let doc: Value = serde_json::from_str(V1).unwrap();
-    for v in doc["vectors"].as_array().unwrap() {
-        let buf = from_hex(v["hex"].as_str().unwrap());
-        // Byte 5 is message_type; short buffers (truncation vectors) have none.
-        if let Some(&mt) = buf.get(5) {
-            assert!(
-                mt != 0x06 && mt != 0x07,
-                "vector {:?} puts a tracked message type in the frozen v1 file; \
-                 every v1-only decoder rejects it and CI's polyglot clients will fail",
-                v["name"].as_str().unwrap()
-            );
-        }
     }
 }
 

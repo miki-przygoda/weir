@@ -37,6 +37,8 @@ VECTORS = pathlib.Path(__file__).with_name("wire_v1_vectors.json")
 # only message types 0x01..0x05 stays conformant by ignoring it. See
 # `wire_v1_tracked_vectors.json` and the TRACKED section near the bottom.
 TRACKED_VECTORS = pathlib.Path(__file__).with_name("wire_v1_tracked_vectors.json")
+# The batch extension, likewise in its own file and for the same reason.
+BATCH_VECTORS = pathlib.Path(__file__).with_name("wire_v1_batch_vectors.json")
 
 MAGIC = b"WEIR"
 WIRE_VERSION = 1
@@ -50,6 +52,13 @@ MT = {0x01: "Push", 0x02: "Ack", 0x03: "Nack", 0x04: "HealthCheck", 0x05: "Healt
 # `wire_v1_vectors.json` decodes exactly what a v1-only client decodes; the
 # tracked pass below merges the two tables.
 TRACKED_MT = {0x06: "PushTracked", 0x07: "AckTracked"}
+# The batch types, kept out of `MT` for the same reason.
+BATCH_MT = {0x08: "PushBatch", 0x09: "AckBatch"}
+BATCH_VERSION = 1
+ACK_BATCH_VERSION = 1
+BATCH_HEADER_LEN = 1 + 2
+ACK_BATCH_HEADER_LEN = 1 + 2
+MAX_BATCH_RECORDS_HARD_CAP = 2048
 # Decode-side: the wire byte's canonical tier name. 0x01 and 0x02 both
 # canonicalise to "Durable" — 0x02 is the retired `Batched` byte, permissively
 # accepted per docs/wire_protocol.md and crates/weir-core/src/durability.rs.
@@ -57,7 +66,11 @@ DUR = {0x01: "Durable", 0x02: "Durable", 0x03: "Buffered"}
 MT_REV = {v: k for k, v in MT.items()}
 # Encode-side table covering both passes. `MT_REV` stays v1-only for anyone who
 # copies it as the definition of the frozen set.
-ALL_MT_REV = {**MT_REV, **{v: k for k, v in TRACKED_MT.items()}}
+ALL_MT_REV = {
+    **MT_REV,
+    **{v: k for k, v in TRACKED_MT.items()},
+    **{v: k for k, v in BATCH_MT.items()},
+}
 # Encode-side: canonical tier name back to its ONE canonical wire byte. NOT
 # derived from DUR (which is many-to-one for 0x01/0x02) — a conformant encoder
 # only ever emits 0x01 for Durable, never the retired 0x02. Vectors that decode
@@ -187,7 +200,193 @@ def encode_coordinate(segment: str, index: int, record_id_hex: str) -> bytes:
     )
 
 
+def decode_batch_body(body: bytes, max_records: int, max_record_len: int):
+    """Reference decoder for a PushBatch body. Returns (reason, records).
+
+    The check ORDER is part of the contract, not an implementation detail: the
+    declared count is validated against the cap BEFORE anything is sized by it,
+    and a record's declared length is checked against the cap BEFORE it is added
+    to the cursor. A hostile peer computes a perfectly valid CRC over a body
+    declaring 65,535 records in three bytes, so the CRC contributes nothing here.
+    """
+    if len(body) < BATCH_HEADER_LEN:
+        return "Truncated", None
+    if body[0] != BATCH_VERSION:
+        return "UnsupportedVersion", None
+    declared = int.from_bytes(body[1:3], "little")
+    if declared == 0:
+        return "EmptyBatch", None
+    cap = min(max_records, MAX_BATCH_RECORDS_HARD_CAP)
+    if declared > cap:
+        return "TooManyRecords", None
+
+    records = []
+    cursor = BATCH_HEADER_LEN
+    record_cap = min(max_record_len, 16 * 1024 * 1024)
+    while cursor < len(body):
+        index = len(records)
+        if cursor + 4 > len(body):
+            return "TruncatedRecord", None
+        n = int.from_bytes(body[cursor:cursor + 4], "little")
+        cursor += 4
+        if n == 0:
+            return "EmptyRecord", None
+        if n > record_cap:
+            return "RecordTooLarge", None
+        if cursor + n > len(body):
+            return "TruncatedRecord", None
+        if index == declared:
+            return "LengthMismatch", None
+        records.append(body[cursor:cursor + n])
+        cursor += n
+    if len(records) != declared or cursor != len(body):
+        return "LengthMismatch", None
+    return "ok", records
+
+
+def encode_batch_body(records) -> bytes:
+    out = bytearray([BATCH_VERSION])
+    out += len(records).to_bytes(2, "little")
+    for r in records:
+        out += len(r).to_bytes(4, "little")
+        out += r
+    return bytes(out)
+
+
+def decode_ack_batch(payload: bytes, expected: int):
+    """Reference decoder for an AckBatch payload. Returns (reason, accepted).
+
+    `expected` is the count the client sent. A bitmap is the first weir response
+    whose meaning depends on client-held state, and ceil(N/8) is not injective —
+    N of 1017 through 1024 all give 131 bytes — so the echoed count is the only
+    thing that can catch a desync.
+
+    Bit i is byte i//8 at mask 1 << (i % 8): LSB-first. Getting this backwards
+    produces a well-formed frame with the opposite meaning, which is why the
+    vectors include an asymmetric N=9 case.
+    """
+    if len(payload) < ACK_BATCH_HEADER_LEN:
+        return "Truncated", None
+    if payload[0] != ACK_BATCH_VERSION:
+        return "UnsupportedVersion", None
+    declared = int.from_bytes(payload[1:3], "little")
+    if declared == 0:
+        return "EmptyBatch", None
+    if declared != expected:
+        return "LengthMismatch", None
+    want = ACK_BATCH_HEADER_LEN + (declared + 7) // 8
+    if len(payload) != want:
+        return "LengthMismatch", None
+    used = declared % 8
+    if used and payload[-1] & ~((1 << used) - 1) & 0xFF:
+        return "PaddingNotZero", None
+    bits = payload[ACK_BATCH_HEADER_LEN:]
+    return "ok", [bool(bits[i // 8] & (1 << (i % 8))) for i in range(declared)]
+
+
+def encode_ack_batch(accepted) -> bytes:
+    bits = bytearray((len(accepted) + 7) // 8)
+    for i, ok in enumerate(accepted):
+        if ok:
+            bits[i // 8] |= 1 << (i % 8)
+    return bytes([ACK_BATCH_VERSION]) + len(accepted).to_bytes(2, "little") + bytes(bits)
+
+
 # ── HARNESS (no need to touch) ─────────────────────────────────────────────────
+
+def check_batch() -> tuple:
+    """Runs the batch-extension vectors. Returns (passed, failed)."""
+    if not BATCH_VECTORS.exists():
+        return 0, 0
+    doc = json.loads(BATCH_VECTORS.read_text())
+    cap = 16 * 1024 * 1024
+    types = {**MT, **BATCH_MT}
+    passed = failed = 0
+
+    for v in doc["frame_vectors"]:
+        buf = bytes.fromhex(v["hex"])
+        reason, fields = decode_frame(buf, cap, types)
+        if reason != v["decode"]:
+            print(f"FAIL {v['name']}: decode = {reason!r}, expected {v['decode']!r}")
+            failed += 1
+            continue
+        mismatch = next(
+            (
+                f"{k}={fields[k]!r} != {v[k]!r}"
+                for k in ("message_type", "durability", "flags", "payload_hex")
+                if fields[k] != v[k]
+            ),
+            None,
+        )
+        if mismatch:
+            print(f"FAIL {v['name']}: decoded field {mismatch}")
+            failed += 1
+            continue
+        payload = bytes.fromhex(v["payload_hex"])
+        re_encoded = encode_frame(
+            v["message_type"], v["durability"], v["flags"], payload
+        ).hex()
+        if re_encoded != v["hex"]:
+            print(f"FAIL {v['name']}: re-encode\n  got {re_encoded}\n  exp {v['hex']}")
+            failed += 1
+            continue
+        # The compatibility claim, checked rather than asserted: a v1-ONLY
+        # decoder must reject these, and as an unknown message type.
+        v1_reason, _ = decode_frame(buf, cap)
+        if v1_reason != "UnknownMessageType":
+            print(
+                f"FAIL {v['name']}: a v1-only decoder returned {v1_reason!r}, "
+                "expected 'UnknownMessageType'"
+            )
+            failed += 1
+            continue
+        passed += 1
+
+    for v in doc["body_vectors"]:
+        buf = bytes.fromhex(v["hex"])
+        reason, records = decode_batch_body(buf, MAX_BATCH_RECORDS_HARD_CAP, cap)
+        if reason != v["decode"]:
+            print(f"FAIL {v['name']}: body decode = {reason!r}, expected {v['decode']!r}")
+            failed += 1
+            continue
+        if reason == "ok":
+            got = [r.hex() for r in records]
+            if got != v["records_hex"]:
+                print(f"FAIL {v['name']}: records\n  got {got}\n  exp {v['records_hex']}")
+                failed += 1
+                continue
+            if encode_batch_body(records).hex() != v["hex"]:
+                print(f"FAIL {v['name']}: body re-encode is not byte-identical")
+                failed += 1
+                continue
+        passed += 1
+
+    for v in doc["ack_vectors"]:
+        buf = bytes.fromhex(v["hex"])
+        reason, accepted = decode_ack_batch(buf, v["expected"])
+        if reason != v["decode"]:
+            print(f"FAIL {v['name']}: ack decode = {reason!r}, expected {v['decode']!r}")
+            failed += 1
+            continue
+        if reason == "ok":
+            want = v.get("accepted")
+            if want is None:
+                want = [v["accepted_all"]] * v["expected"]
+            if accepted != want:
+                print(
+                    f"FAIL {v['name']}: verdicts disagree — if this is the N=9 "
+                    "asymmetric vector, the bitmap bit order is inverted"
+                )
+                failed += 1
+                continue
+            if encode_ack_batch(accepted).hex() != v["hex"]:
+                print(f"FAIL {v['name']}: ack re-encode is not byte-identical")
+                failed += 1
+                continue
+        passed += 1
+
+    return passed, failed
+
 
 def check_tracked() -> tuple:
     """Runs the tracked-extension vectors. Returns (passed, failed)."""
@@ -322,7 +521,15 @@ def main() -> int:
             f"{t_passed}/{t_total} tracked-extension vectors passed"
             + (f", {t_failed} FAILED" if t_failed else " — all good")
         )
-    return 1 if (failed or t_failed) else 0
+
+    b_passed, b_failed = check_batch()
+    if b_passed or b_failed:
+        b_total = b_passed + b_failed
+        print(
+            f"{b_passed}/{b_total} batch-extension vectors passed"
+            + (f", {b_failed} FAILED" if b_failed else " — all good")
+        )
+    return 1 if (failed or t_failed or b_failed) else 0
 
 
 if __name__ == "__main__":

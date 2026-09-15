@@ -97,9 +97,11 @@ weir_result weir_encode_push_tracked(const uint8_t *payload, size_t payload_len,
 }
 
 size_t weir_max_response_payload(uint8_t message_type) {
-    return message_type == WEIR_MSG_ACK_TRACKED
-         ? (size_t)WEIR_MAX_TRACKED_ACK_PAYLOAD
-         : (size_t)WEIR_MAX_RESPONSE_PAYLOAD;
+    switch (message_type) {
+        case WEIR_MSG_ACK_TRACKED: return (size_t)WEIR_MAX_TRACKED_ACK_PAYLOAD;
+        case WEIR_MSG_ACK_BATCH:   return (size_t)WEIR_MAX_ACK_BATCH_PAYLOAD;
+        default:                   return (size_t)WEIR_MAX_RESPONSE_PAYLOAD;
+    }
 }
 
 /*
@@ -248,4 +250,130 @@ const char *weir_result_str(weir_result r) {
         case WEIR_ERR_RESERVED_FLAGS:   return "reserved flags set";
         default:                        return "unknown";
     }
+}
+
+/*
+ * ── Batch extension (PushBatch 0x08 / AckBatch 0x09) ─────────────────────────
+ *
+ * Written from docs/wire_protocol.md and checked against
+ * docs/conformance/wire_v1_batch_vectors.json. Nothing here is ported from the
+ * Rust reference: an independent implementation is the only thing that catches
+ * an under-specified format, and this one has a bug class no checksum detects
+ * -- a bitmap written with the opposite bit order is a well-formed frame, valid
+ * CRCs and correct length, that reports failures as successes.
+ *
+ * Bit i lives in byte i / 8 at mask 1 << (i % 8): LSB-first.
+ */
+
+weir_result weir_encode_batch_body(const weir_batch_record *records, size_t count,
+                                   uint8_t *out, size_t out_cap, size_t *out_len) {
+    size_t need = WEIR_BATCH_HEADER_LEN;
+    for (size_t i = 0; i < count; i++) {
+        need += 4 + records[i].len;
+    }
+    if (out_cap < need) return WEIR_ERR_BUF_TOO_SMALL;
+
+    size_t p = 0;
+    out[p++] = WEIR_BATCH_VERSION;
+    out[p++] = (uint8_t)(count & 0xFF);
+    out[p++] = (uint8_t)((count >> 8) & 0xFF);
+    for (size_t i = 0; i < count; i++) {
+        uint32_t n = (uint32_t)records[i].len;
+        out[p++] = (uint8_t)(n & 0xFF);
+        out[p++] = (uint8_t)((n >> 8) & 0xFF);
+        out[p++] = (uint8_t)((n >> 16) & 0xFF);
+        out[p++] = (uint8_t)((n >> 24) & 0xFF);
+        if (records[i].len) memcpy(out + p, records[i].data, records[i].len);
+        p += records[i].len;
+    }
+    *out_len = p;
+    return WEIR_OK;
+}
+
+weir_result weir_decode_batch_body(const uint8_t *body, size_t body_len,
+                                   size_t max_records, size_t max_record_len,
+                                   weir_batch_record *out, size_t out_cap,
+                                   size_t *out_count) {
+    if (body_len < WEIR_BATCH_HEADER_LEN) return WEIR_ERR_BATCH_TRUNCATED;
+    if (body[0] != WEIR_BATCH_VERSION)    return WEIR_ERR_BATCH_BAD_VERSION;
+
+    size_t declared = (size_t)body[1] | ((size_t)body[2] << 8);
+    if (declared == 0) return WEIR_ERR_BATCH_EMPTY;
+    size_t cap = max_records < (size_t)WEIR_MAX_BATCH_RECORDS
+               ? max_records : (size_t)WEIR_MAX_BATCH_RECORDS;
+    if (declared > cap) return WEIR_ERR_BATCH_TOO_MANY;
+    /* Only now is `declared` a number this client chose the bound for, so only
+     * now may it be compared against the caller's array. */
+    if (declared > out_cap) return WEIR_ERR_BUF_TOO_SMALL;
+
+    size_t record_cap = max_record_len < (size_t)WEIR_MAX_PAYLOAD_HARD_CAP
+                      ? max_record_len : (size_t)WEIR_MAX_PAYLOAD_HARD_CAP;
+    size_t found = 0, cursor = WEIR_BATCH_HEADER_LEN;
+    while (cursor < body_len) {
+        if (cursor + 4 > body_len) return WEIR_ERR_BATCH_TRUNC_RECORD;
+        size_t n = (size_t)body[cursor]
+                 | ((size_t)body[cursor + 1] << 8)
+                 | ((size_t)body[cursor + 2] << 16)
+                 | ((size_t)body[cursor + 3] << 24);
+        cursor += 4;
+        if (n == 0)           return WEIR_ERR_BATCH_EMPTY_RECORD;
+        if (n > record_cap)   return WEIR_ERR_BATCH_RECORD_TOO_LARGE;
+        if (cursor + n > body_len) return WEIR_ERR_BATCH_TRUNC_RECORD;
+        /* Stop before overrunning the declared count, so a body carrying more
+         * records than it declares is a mismatch rather than a silent drop. */
+        if (found == declared) return WEIR_ERR_BATCH_LENGTH_MISMATCH;
+        out[found].data = body + cursor;
+        out[found].len  = n;
+        found++;
+        cursor += n;
+    }
+    if (found != declared || cursor != body_len) return WEIR_ERR_BATCH_LENGTH_MISMATCH;
+    *out_count = found;
+    return WEIR_OK;
+}
+
+weir_result weir_encode_ack_batch(const uint8_t *accepted, size_t count,
+                                  uint8_t *out, size_t out_cap, size_t *out_len) {
+    size_t need = (size_t)WEIR_ACK_BATCH_HEADER_LEN + (count + 7) / 8;
+    if (out_cap < need) return WEIR_ERR_BUF_TOO_SMALL;
+    memset(out, 0, need);
+    out[0] = WEIR_ACK_BATCH_VERSION;
+    out[1] = (uint8_t)(count & 0xFF);
+    out[2] = (uint8_t)((count >> 8) & 0xFF);
+    for (size_t i = 0; i < count; i++) {
+        if (accepted[i]) {
+            out[WEIR_ACK_BATCH_HEADER_LEN + i / 8] |= (uint8_t)(1u << (i % 8));
+        }
+    }
+    *out_len = need;
+    return WEIR_OK;
+}
+
+weir_result weir_decode_ack_batch(const uint8_t *payload, size_t payload_len,
+                                  size_t expected,
+                                  uint8_t *out, size_t out_cap) {
+    if (payload_len < WEIR_ACK_BATCH_HEADER_LEN) return WEIR_ERR_BATCH_TRUNCATED;
+    if (payload[0] != WEIR_ACK_BATCH_VERSION)    return WEIR_ERR_BATCH_BAD_VERSION;
+
+    size_t declared = (size_t)payload[1] | ((size_t)payload[2] << 8);
+    if (declared == 0)        return WEIR_ERR_BATCH_EMPTY;
+    if (declared != expected) return WEIR_ERR_BATCH_LENGTH_MISMATCH;
+    if (payload_len != (size_t)WEIR_ACK_BATCH_HEADER_LEN + (declared + 7) / 8) {
+        return WEIR_ERR_BATCH_LENGTH_MISMATCH;
+    }
+    if (declared > out_cap) return WEIR_ERR_BUF_TOO_SMALL;
+
+    /* Padding bits must be zero. Ignoring them would make popcount == N -- the
+     * obvious way to ask "did the whole batch succeed" -- silently wrong. */
+    size_t used = declared % 8;
+    if (used != 0) {
+        uint8_t mask = (uint8_t)~(uint8_t)((1u << used) - 1u);
+        if (payload[payload_len - 1] & mask) return WEIR_ERR_BATCH_PADDING_NOT_ZERO;
+    }
+
+    const uint8_t *bits = payload + WEIR_ACK_BATCH_HEADER_LEN;
+    for (size_t i = 0; i < declared; i++) {
+        out[i] = (bits[i / 8] & (uint8_t)(1u << (i % 8))) ? 1u : 0u;
+    }
+    return WEIR_OK;
 }

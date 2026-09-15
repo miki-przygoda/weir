@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   CoordinateError,
+  MAX_ACK_BATCH_PAYLOAD,
   MAX_RESPONSE_PAYLOAD,
   MAX_TRACKED_ACK_PAYLOAD,
   MessageType,
@@ -141,13 +142,26 @@ function run(path: string): number {
     "the cap is widened for AckTracked",
     maxResponsePayload(MessageType.AckTracked) === MAX_TRACKED_ACK_PAYLOAD,
   );
-  for (const mt of [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xff]) {
-    check(
-      `the cap stays ${MAX_RESPONSE_PAYLOAD} for type 0x${mt.toString(16)}`,
-      maxResponsePayload(mt) === MAX_RESPONSE_PAYLOAD,
-      "a non-AckTracked type unlocked the wider bound",
-    );
+  // Swept over ALL 256 type bytes, not over a list of the types that exist
+  // today. The list this replaced held 0x01-0x06 and 0xff, so when AckBatch
+  // (0x09) was given a wider cap the check still passed while the property it
+  // named had quietly become false.
+  const widened = new Map<number, number>([
+    [MessageType.AckTracked, MAX_TRACKED_ACK_PAYLOAD],
+    [MessageType.AckBatch, MAX_ACK_BATCH_PAYLOAD],
+  ]);
+  const wrongCaps: string[] = [];
+  for (let mt = 0; mt <= 0xff; mt++) {
+    const want = widened.get(mt) ?? MAX_RESPONSE_PAYLOAD;
+    if (maxResponsePayload(mt) !== want) {
+      wrongCaps.push(`0x${mt.toString(16)}: ${maxResponsePayload(mt)} != ${want}`);
+    }
   }
+  check(
+    "the cap is widened for exactly the types that need it",
+    wrongCaps.length === 0,
+    wrongCaps.join(", "),
+  );
   for (const v of doc.frame_vectors) {
     if (v.message_type !== "AckTracked") continue;
     const n = v.payload_hex.length / 2;

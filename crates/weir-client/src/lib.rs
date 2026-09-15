@@ -126,7 +126,7 @@
 /// feature alone rather than on the platform.
 mod client;
 
-pub use client::{ClientError, DefaultTransport, WeirClient};
+pub use client::{BatchOutcome, ClientError, DefaultTransport, WeirClient};
 
 #[cfg(unix)]
 mod unix;

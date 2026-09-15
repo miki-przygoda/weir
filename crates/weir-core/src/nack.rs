@@ -51,6 +51,15 @@ pub enum NackReason {
     /// (which could mean a producer believed a semantic flag took effect when it
     /// did not). Permanent; the daemon closes the connection (F52).
     ReservedFlagsSet = 0x09,
+    /// A `PushBatch` body could not be parsed: bad batch version, zero records,
+    /// a record length that disagrees with the body, or trailing bytes.
+    ///
+    /// `0x0B`, not `0x0A`. `0x0A` is this tree's worked example of an
+    /// *unassigned* reason — a `try_from` test asserts it errors, a client test
+    /// asserts it surfaces as `UnknownNack(0x0A)`, four polyglot clients branch
+    /// on `>= 0x0A`, and the frozen vector `nack_reserved_reason` IS `0x0A`.
+    /// Assigning it would break a frozen vector, which the freeze forbids.
+    BadBatchFraming = 0x0B,
 }
 
 impl NackReason {
@@ -78,6 +87,7 @@ impl NackReason {
             NackReason::EmptyPayload => "empty_payload",
             NackReason::UnknownMessage => "unknown_message",
             NackReason::ReservedFlagsSet => "reserved_flags_set",
+            NackReason::BadBatchFraming => "bad_batch_framing",
         }
     }
 
@@ -105,6 +115,7 @@ impl NackReason {
             "empty_payload" => Some(NackReason::EmptyPayload),
             "unknown_message" => Some(NackReason::UnknownMessage),
             "reserved_flags_set" => Some(NackReason::ReservedFlagsSet),
+            "bad_batch_framing" => Some(NackReason::BadBatchFraming),
             _ => None,
         }
     }
@@ -129,6 +140,7 @@ impl std::fmt::Display for NackReason {
             NackReason::EmptyPayload => "empty payload (not representable)",
             NackReason::UnknownMessage => "unknown message type or durability byte",
             NackReason::ReservedFlagsSet => "reserved flags byte was non-zero",
+            NackReason::BadBatchFraming => "batch body could not be parsed",
         };
         write!(f, "{msg}")
     }
@@ -166,6 +178,7 @@ impl TryFrom<u8> for NackReason {
             0x07 => Ok(NackReason::EmptyPayload),
             0x08 => Ok(NackReason::UnknownMessage),
             0x09 => Ok(NackReason::ReservedFlagsSet),
+            0x0B => Ok(NackReason::BadBatchFraming),
             v => Err(UnknownNackReason(v)),
         }
     }

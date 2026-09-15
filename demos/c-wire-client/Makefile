@@ -3,7 +3,7 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 LIB_SRC  = weir_wire.c weir_conn.c
 
-all: conformance conformance_tracked telemetry negative
+all: conformance conformance_tracked conformance_batch telemetry negative
 
 conformance: conformance.c weir_wire.c weir_wire.h
 	$(CC) $(CFLAGS) -o $@ conformance.c weir_wire.c
@@ -14,6 +14,12 @@ conformance: conformance.c weir_wire.c weir_wire.h
 # set's green light cannot be disturbed by tracked-file churn.
 conformance_tracked: conformance_tracked.c weir_wire.c weir_wire.h
 	$(CC) $(CFLAGS) -o $@ conformance_tracked.c weir_wire.c
+
+# A third binary, for the reason there is a second: each scanner is sized and
+# shaped for one file. This one's arrays are "frame_vectors"/"body_vectors"/
+# "ack_vectors" and its largest object is 1626 bytes.
+conformance_batch: conformance_batch.c weir_wire.c weir_wire.h
+	$(CC) $(CFLAGS) -o $@ conformance_batch.c weir_wire.c
 
 telemetry: telemetry.c $(LIB_SRC) weir_wire.h weir_conn.h
 	$(CC) $(CFLAGS) -o $@ telemetry.c $(LIB_SRC)
@@ -31,7 +37,11 @@ TRACKED_VECTORS ?= ../../docs/conformance/wire_v1_tracked_vectors.json
 check-tracked: conformance_tracked
 	./conformance_tracked "$(TRACKED_VECTORS)"
 
-clean:
-	rm -f conformance conformance_tracked telemetry negative
+BATCH_VECTORS ?= ../../docs/conformance/wire_v1_batch_vectors.json
+check-batch: conformance_batch
+	./conformance_batch "$(BATCH_VECTORS)"
 
-.PHONY: all check check-tracked clean
+clean:
+	rm -f conformance conformance_tracked conformance_batch telemetry negative
+
+.PHONY: all check check-tracked check-batch clean

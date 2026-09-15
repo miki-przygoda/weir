@@ -52,6 +52,9 @@ pub struct SocketConfig {
     /// Per-connection payload cap in bytes. Effective cap is
     /// `min(max_payload_bytes, MAX_PAYLOAD_HARD_CAP)`.
     pub max_payload_bytes: usize,
+    /// Ceiling on records in one `PushBatch`. Effective cap is
+    /// `min(max_batch_records, MAX_BATCH_RECORDS_HARD_CAP)`.
+    pub max_batch_records: usize,
     /// How long to wait for in-flight connections to finish after the shutdown
     /// signal is received before aborting them.
     pub shutdown_timeout_secs: u64,
@@ -119,6 +122,9 @@ pub async fn run(
         .min(weir_core::MAX_PAYLOAD_HARD_CAP);
     let conn_cfg_template = ConnectionConfig {
         max_payload_bytes: effective_cap,
+        max_batch_records: config
+            .max_batch_records
+            .min(weir_core::MAX_BATCH_RECORDS_HARD_CAP),
         read_timeout: Duration::from_secs(config.connection_read_timeout_secs),
         ack_timeout: crate::socket::connection::ACK_TIMEOUT,
         shard_id: 0, // overridden per connection below
@@ -697,9 +703,23 @@ mod tests {
         std::env::temp_dir().join(format!("weir_sock_{label}_{}.sock", std::process::id()))
     }
 
+    /// A scratch directory whose mode does not depend on the process umask.
+    ///
+    /// Delegates to the crate-wide helper: the rule has exactly one
+    /// implementation, and `testutil::scratch_dir` carries the full reasoning.
+    /// These tests are both the cause of the umask window and among its victims,
+    /// so they use the same helper as everything else rather than a local copy.
+    fn umask_immune_dir(label: &str) -> PathBuf {
+        crate::testutil::scratch_dir(label)
+    }
+
     /// Serialises any test that mutates the process umask. umask is
     /// process-global; without this, parallel tests interleave and see
     /// each other's saved/restored values.
+    ///
+    /// It cannot serialise this module's tests against the REST of the crate's,
+    /// which is why every test directory goes through
+    /// [`crate::testutil::scratch_dir`].
     fn umask_test_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(Default::default)
@@ -710,6 +730,7 @@ mod tests {
             socket_path: path,
             max_connections: 16,
             max_payload_bytes: weir_core::MAX_PAYLOAD_HARD_CAP,
+            max_batch_records: 1024,
             shutdown_timeout_secs: 5,
             connection_read_timeout_secs: 30,
             shard_count: 1,
@@ -831,7 +852,7 @@ mod tests {
             std::process::id(),
             line!()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let target = dir.join("real.sock");
         {
             let _real = std::os::unix::net::UnixListener::bind(&target).unwrap();
@@ -1000,7 +1021,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("weir_ww_parent_{}_{}", std::process::id(), line!()));
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let path = dir.join("weir.sock");
         let listener = bind_hardened(&path).expect("bind must succeed despite loose parent");
@@ -1031,7 +1052,7 @@ mod tests {
             std::env::temp_dir().join(format!("weir_parent_symlink_base_{}", std::process::id()));
         let real_parent = base.join("real");
         let link_parent = base.join("link");
-        std::fs::create_dir_all(&real_parent).unwrap();
+        crate::testutil::mkdir_p(&real_parent);
         std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
         let path = link_parent.join("weir.sock");
 
@@ -1055,6 +1076,35 @@ mod tests {
     /// Uses `rename(src, dst)` which atomically replaces dst's inode with
     /// src's, guaranteeing a distinct inode (unlike remove+recreate, where
     /// the filesystem may immediately reuse the inode number on tmpfs/ext4).
+    /// The scratch-directory helper must survive the umask `bind_hardened`
+    /// holds, because that is the exact condition it exists to defend against.
+    ///
+    /// Asserting only `create` succeeded would pass with the bug present:
+    /// `create_dir_all` under umask 0o177 succeeds too, and yields a directory
+    /// that is unusable rather than absent. The mode and a real file write are
+    /// what distinguish the two.
+    #[test]
+    #[cfg(unix)]
+    fn umask_immune_dir_ignores_a_hostile_process_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let restore = UmaskGuard(umask_set(0o177));
+
+        let dir = umask_immune_dir("umask_immune_probe");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "umask 0o177 masked the directory down to {mode:#o}; \
+             DirBuilder::mode is not being applied"
+        );
+        std::fs::write(dir.join("probe"), b"x")
+            .expect("a directory without its execute bit cannot hold files");
+
+        drop(restore);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     #[cfg(unix)]
     fn stat_at_dir_observes_inode_swap() {
@@ -1062,8 +1112,7 @@ mod tests {
         // without this lock a concurrent umask=0o177 sibling could perturb the
         // files this test creates and make it flake under parallelism (#14).
         let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("weir_stat_at_dir_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = umask_immune_dir("stat_at_dir");
         let name = std::ffi::OsString::from("entry");
         let entry_path = dir.join(&name);
         let other_path = dir.join("other");
@@ -1120,8 +1169,7 @@ mod tests {
 
         let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
 
-        let dir = std::env::temp_dir().join(format!("weir_swap_pressure_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = umask_immune_dir("swap_pressure");
         let target = dir.join("weir.sock");
         let decoy = dir.join("decoy.sock");
 

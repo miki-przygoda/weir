@@ -255,14 +255,27 @@ int main(int argc, char **argv) {
     for_each_object(doc, "frame_vectors", on_frame);
     for_each_object(doc, "coordinate_vectors", on_coord);
 
-    /* The cap is widened for AckTracked and for nothing else. */
+    /* The cap is widened for exactly the types that need it.
+     *
+     * Swept over ALL 256 type bytes rather than over a list of the types that
+     * exist today. The list this replaced held 0x01-0x06 and 0xFF, so when
+     * AckBatch (0x09) was given a wider cap the check still passed while the
+     * property it named -- "only AckTracked is widened" -- had quietly become
+     * false. A sweep states the property over the whole space and cannot go
+     * stale as bytes are assigned. */
     check(weir_max_response_payload(WEIR_MSG_ACK_TRACKED)
               == (size_t)WEIR_MAX_TRACKED_ACK_PAYLOAD,
           "response cap", "AckTracked did not get the wider bound");
-    const uint8_t others[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xFF};
-    for (size_t i = 0; i < sizeof others; i++) {
-        check(weir_max_response_payload(others[i]) == (size_t)WEIR_MAX_RESPONSE_PAYLOAD,
-              "response cap", "a non-AckTracked type unlocked the wider bound");
+    for (int b = 0; b <= 0xFF; b++) {
+        size_t want = (size_t)WEIR_MAX_RESPONSE_PAYLOAD;
+        if (b == WEIR_MSG_ACK_TRACKED) want = (size_t)WEIR_MAX_TRACKED_ACK_PAYLOAD;
+        if (b == WEIR_MSG_ACK_BATCH)   want = (size_t)WEIR_MAX_ACK_BATCH_PAYLOAD;
+        if (weir_max_response_payload((uint8_t)b) != want) {
+            char msg[128];
+            snprintf(msg, sizeof msg, "type %#04x has the wrong response cap", (unsigned)b);
+            check(0, "response cap", msg);
+            break;
+        }
     }
 
     /* The shared response struct must NOT have grown: a program that never

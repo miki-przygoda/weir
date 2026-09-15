@@ -52,17 +52,34 @@ COORDINATE_FIXED_LEN = 1 + 8 + 32 + 2
 MAX_SEGMENT_NAME_LEN = 255
 MAX_TRACKED_ACK_PAYLOAD = COORDINATE_FIXED_LEN + MAX_SEGMENT_NAME_LEN  # 298
 
+# AckBatch wire layout (docs/wire_protocol.md, "AckBatch payload"):
+#   0   1   ack_batch_version (0x01)
+#   1   2   record_count  u16 LE, echoing the PushBatch it answers
+#   3 var   bitmap        ceil(N/8) bytes, LSB-first within each byte
+#
+# The hard cap is 2048 so this payload stays under MAX_TRACKED_ACK_PAYLOAD:
+# batching introduces no new largest response, so this client's biggest
+# allocation is unchanged by implementing it.
+BATCH_VERSION = 1
+ACK_BATCH_VERSION = 1
+BATCH_HEADER_LEN = 1 + 2
+ACK_BATCH_HEADER_LEN = 1 + 2
+MAX_BATCH_RECORDS_HARD_CAP = 2048
+MAX_ACK_BATCH_PAYLOAD = ACK_BATCH_HEADER_LEN + (MAX_BATCH_RECORDS_HARD_CAP + 7) // 8  # 259
+
 
 def max_response_payload(message_type: int) -> int:
     """Cap for a response of this type, checked before any allocation.
 
-    AckTracked is the only weir response whose payload exceeds two bytes, so the
-    bound is widened for exactly that frame and for nothing else -- a desynced
-    peer cannot use a stray type byte to unlock a bigger read, because an
-    unexpected type is a desync the caller rejects anyway.
+    Widened for exactly the two response types whose payload can exceed two
+    bytes, and for nothing else -- a desynced peer must not be able to use a
+    stray type byte to unlock a bigger read, because an unexpected type is a
+    desync the caller rejects anyway.
     """
     if message_type == MessageType.ACK_TRACKED:
         return MAX_TRACKED_ACK_PAYLOAD
+    if message_type == MessageType.ACK_BATCH:
+        return MAX_ACK_BATCH_PAYLOAD
     return MAX_RESPONSE_PAYLOAD
 
 
@@ -77,6 +94,8 @@ class MessageType(enum.IntEnum):
     # untouched. A daemon that predates these answers Nack(UnknownMessage).
     PUSH_TRACKED = 0x06
     ACK_TRACKED = 0x07
+    PUSH_BATCH = 0x08
+    ACK_BATCH = 0x09
 
 
 class Durability(enum.IntEnum):
@@ -273,3 +292,130 @@ def decode_frame(buf: bytes, max_payload_bytes: int = MAX_PAYLOAD_HARD_CAP) -> F
         raise DecodeError("PayloadCrcMismatch")
 
     return Frame(message_type=message_type, durability=dur_byte, flags=flags, payload=payload)
+
+
+# ── Batch extension (PushBatch 0x08 / AckBatch 0x09) ──────────────────────────
+#
+# Implemented from docs/wire_protocol.md and checked against
+# docs/conformance/wire_v1_batch_vectors.json. Nothing here is ported from the
+# Rust reference: an independent implementation is the only thing that catches
+# an under-specified format, and this one has a bug class no checksum detects --
+# a bitmap written with the opposite bit order is a well-formed frame, valid
+# CRCs and correct length, that reports failures as successes.
+#
+# Bit i lives in byte i // 8 at mask 1 << (i % 8): LSB-first.
+
+
+class BatchError(DecodeError):
+    """A PushBatch body or AckBatch payload that could not be decoded.
+
+    The message is the conformance-vector tag, so a failure names the vector
+    that pins it.
+    """
+
+
+def encode_batch_body(records: "list[bytes]") -> bytes:
+    """A PushBatch body: version, u16 count, then u32-length-prefixed records."""
+    out = bytearray([BATCH_VERSION])
+    out += len(records).to_bytes(2, "little")
+    for r in records:
+        out += len(r).to_bytes(4, "little")
+        out += r
+    return bytes(out)
+
+
+def decode_batch_body(
+    body: bytes,
+    max_records: int = MAX_BATCH_RECORDS_HARD_CAP,
+    max_record_len: int = MAX_PAYLOAD_HARD_CAP,
+) -> "list[bytes]":
+    """Parse a PushBatch body.
+
+    The check ORDER is part of the contract. The declared count is validated
+    against the cap BEFORE anything is sized by it, and a record's declared
+    length is checked against the cap BEFORE it is added to the cursor. The
+    frame's payload CRC has already passed by this point and proves nothing
+    here: a hostile peer computes a perfectly valid CRC over a body declaring
+    65,535 records in three bytes.
+    """
+    if len(body) < BATCH_HEADER_LEN:
+        raise BatchError("Truncated")
+    if body[0] != BATCH_VERSION:
+        raise BatchError("UnsupportedVersion")
+    declared = int.from_bytes(body[1:3], "little")
+    if declared == 0:
+        raise BatchError("EmptyBatch")
+    cap = min(max_records, MAX_BATCH_RECORDS_HARD_CAP)
+    if declared > cap:
+        raise BatchError("TooManyRecords")
+
+    record_cap = min(max_record_len, MAX_PAYLOAD_HARD_CAP)
+    records: "list[bytes]" = []
+    cursor = BATCH_HEADER_LEN
+    while cursor < len(body):
+        if cursor + 4 > len(body):
+            raise BatchError("TruncatedRecord")
+        n = int.from_bytes(body[cursor:cursor + 4], "little")
+        cursor += 4
+        if n == 0:
+            raise BatchError("EmptyRecord")
+        if n > record_cap:
+            raise BatchError("RecordTooLarge")
+        if cursor + n > len(body):
+            raise BatchError("TruncatedRecord")
+        # Stop before overrunning the declared count, so a body carrying more
+        # records than it declares is a mismatch rather than a silent drop.
+        if len(records) == declared:
+            raise BatchError("LengthMismatch")
+        records.append(body[cursor:cursor + n])
+        cursor += n
+
+    if len(records) != declared or cursor != len(body):
+        raise BatchError("LengthMismatch")
+    return records
+
+
+def encode_ack_batch(accepted: "list[bool]") -> bytes:
+    """An AckBatch payload from per-record outcomes.
+
+    Padding bits in the final byte are left zero, which the decoder requires.
+    """
+    bits = bytearray((len(accepted) + 7) // 8)
+    for i, ok in enumerate(accepted):
+        if ok:
+            bits[i // 8] |= 1 << (i % 8)
+    return bytes([ACK_BATCH_VERSION]) + len(accepted).to_bytes(2, "little") + bytes(bits)
+
+
+def decode_ack_batch(payload: bytes, expected: int) -> "list[bool]":
+    """Parse an AckBatch payload into per-record outcomes.
+
+    `expected` is the count this client sent. A bitmap is the first weir
+    response whose meaning depends on client-held state -- an Ack says "your
+    last record" and an AckTracked carries its own coordinate, but a bitmap is
+    meaningless without knowing which batch it answers. ceil(N/8) is not
+    injective (N of 1017 through 1024 all give 131 bytes), so the echoed count
+    is the only thing that can catch a desync.
+
+    A set bit means the record is durable at the requested tier and inherits
+    weir's crown invariant. A CLEAR bit is the weak statement: not durable as of
+    this reply, retry it, and expect it may nonetheless have been written.
+    """
+    if len(payload) < ACK_BATCH_HEADER_LEN:
+        raise BatchError("Truncated")
+    if payload[0] != ACK_BATCH_VERSION:
+        raise BatchError("UnsupportedVersion")
+    declared = int.from_bytes(payload[1:3], "little")
+    if declared == 0:
+        raise BatchError("EmptyBatch")
+    if declared != expected:
+        raise BatchError("LengthMismatch")
+    if len(payload) != ACK_BATCH_HEADER_LEN + (declared + 7) // 8:
+        raise BatchError("LengthMismatch")
+    # Padding bits must be zero. Ignoring them would make popcount == N -- the
+    # obvious way to ask "did the whole batch succeed" -- silently wrong.
+    used = declared % 8
+    if used and payload[-1] & ~((1 << used) - 1) & 0xFF:
+        raise BatchError("PaddingNotZero")
+    bits = payload[ACK_BATCH_HEADER_LEN:]
+    return [bool(bits[i // 8] & (1 << (i % 8))) for i in range(declared)]

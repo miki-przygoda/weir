@@ -15,6 +15,86 @@ protocol** below.
 
 ## [Unreleased]
 
+### Added
+
+- **Wire-level batching: `PushBatch` (`0x08`) / `AckBatch` (`0x09`).** N records
+  in one frame, answered once with a positional bitmap. Additive within wire v1
+  — `WIRE_VERSION` stays 1, the 30 frozen conformance vectors are byte-identical,
+  and a daemon or client that does not implement it answers or receives
+  `Nack(UnknownMessage)`, which is an actionable permanent error rather than a
+  misparse. `MessageType` is `#[non_exhaustive]` as of 3.0.0, so adding these
+  variants is not itself breaking.
+
+  `weir-client` gains `push_batch`, returning a `BatchOutcome` rather than
+  `Result<(), _>`: a batch can partially succeed, and a caller that wants to
+  retry needs to know *which* records to retry. It is `#[must_use]`, so the
+  partial case cannot be dropped by writing `let _ =`.
+
+  **A set bit inherits the crown invariant; a clear bit does not.** Bit 1 means
+  the record is durable at the requested tier. Bit 0 means *not durable as of
+  this reply* — retry it, and expect that it may nonetheless have been written,
+  exactly as a single-record `Nack(InternalError)` already means. Treating clear
+  bits as "definitely not written" builds exactly-once retry on a foundation
+  that does not support it.
+
+  The bitmap is **LSB-first**: bit `i` is byte `i / 8`, mask `1 << (i % 8)`. This
+  is the one bug in the feature that nothing detects — a reader using the
+  opposite convention produces a well-formed frame, valid CRCs and correct
+  length, that reports failures as successes. `ack_bitmap_asymmetric_n9` exists
+  to catch it, since every pattern with N ≤ 8 and every symmetric pattern at any
+  N encodes identically under both conventions.
+
+  The 2048-record hard cap was chosen so the `AckBatch` reply (259 bytes) stays
+  under the 298-byte `AckTracked` bound weir already published: **batching
+  introduces no new largest response**, so no client gains a new allocation
+  maximum. `max_batch_records` (default 1024) may lower it, never raise it.
+
+- **26 batch conformance vectors** in a third file,
+  `docs/conformance/wire_v1_batch_vectors.json`, with a generator, a Rust suite,
+  a pure-Python codec in `run_vectors.py`, and an independent implementation in
+  **all five polyglot demo clients** — C, Go, Java, Python and TypeScript. None
+  of the six is ported from the Rust reference, which is the only way a bitmap
+  convention can actually be checked rather than agreed with itself.
+
+- **`weir_batch_records`** (histogram) and **`weir_batch_partial`** (counter) for
+  the batch path, and **`weir_wab_group_commit_records`** (histogram) for the
+  fsync amortisation factor — the number that says whether a slow producer is
+  round-trip-bound or fsync-bound, and therefore whether batching or concurrency
+  is the answer.
+
+### Fixed
+
+- **A failed record in a WAB batch nacked innocent records alongside it.**
+  `flush_batch` drained all pending acks as failures whenever the segment write
+  returned an error, without distinguishing "this record was rejected, the
+  segment is intact" from "the segment is gone". An empty payload or a zstd
+  failure in one record therefore nacked every other record in the same group
+  commit. Those records had not failed, and since a nack is at-least-once the
+  producer retries them — so the visible symptom was duplicate delivery, not
+  loss. Writes now classify their failure, and only a dropped segment fails the
+  whole group.
+
+- **The frozen-vectors guard could go stale.** The check that no extension frame
+  reaches `wire_v1_vectors.json` enumerated the message types that existed when
+  it was written; it now asserts nothing above `0x05` (plus the deliberate
+  `0xFF` example), so the next extension is covered the day its byte is assigned.
+  The same enumeration bug was present in all five polyglot clients' response-cap
+  guards, which iterated `{0x01…0x06, 0xFF}` and would have passed while a newly
+  assigned type had the wrong cap; they now sweep all 256 bytes.
+
+- **A committed macOS binary.** `demos/go-wire-client/weir-wire-client`, a 3.4 MB
+  arm64 Mach-O, had been tracked since `e023a14`. Its sibling `c-wire-client`
+  had a `.gitignore` written after exactly this accident, describing how a
+  committed binary breaks a Linux CI runner; the Go directory had none. Now
+  untracked and ignored.
+
+- **A parallel-test flake that could fail 89 tests at once.**
+  `bind_hardened` holds `umask 0o177` process-wide for its `bind(2)`, and any
+  test creating a directory inside that window got mode `0o600` — no execute
+  bit, so everything under it failed `EACCES`. The pid-scoped scratch
+  directories then *persisted* with the bad mode, making a transient race
+  permanently reproducible for any later run that reused the pid.
+
 ## [3.0.0] - 2026-09-10
 
 Three capabilities the idea fleet found weir could not do, one P0 data-loss fix

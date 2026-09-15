@@ -163,6 +163,9 @@ pub(super) fn parse_from(
         max_payload_bytes: pargs
             .opt_value_from_str("--max-payload-bytes")
             .map_err(pico_err)?,
+        max_batch_records: pargs
+            .opt_value_from_str("--max-batch-records")
+            .map_err(pico_err)?,
         metrics_port: pargs
             .opt_value_from_str("--metrics-port")
             .map_err(pico_err)?,
