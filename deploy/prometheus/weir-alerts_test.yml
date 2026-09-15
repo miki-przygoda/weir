@@ -441,22 +441,27 @@ tests:
         alertname: WeirFsyncLatencyCritical
         exp_alerts: []
 
-  # The humanised figures below (49.96ms, 499.6ms) are what histogram_quantile
-  # interpolates WITHIN the bucket, not the bucket bound -- which is the point of
-  # asserting the rendered summary rather than just the alert name: it pins the
-  # operator-visible string, interpolation included.
+  # The bucket counts below are chosen so the 99.9th percentile lands EXACTLY on
+  # a bucket boundary: 999 observations at or under `le`, 1000 in total, so
+  # rank = 0.999 * 1000 = 999 = the cumulative count at that bucket and
+  # histogram_quantile returns the bound itself rather than interpolating into
+  # it. That matters because these tests assert the rendered summary, which
+  # contains the value -- and an interpolated one is float arithmetic that
+  # rounds differently per architecture. The first version of this test pinned
+  # "49.96ms", which is what arm64 produces; CI's amd64 produces "49.95ms" and
+  # the job failed. Landing on the boundary gives "50ms" everywhere.
   - interval: 1m
     name: sustained fsync p99.9 above 20ms fires the warning but not the critical
     input_series:
-      # All observations in le=0.05 (50ms): over the 20ms warning, under the
-      # 100ms critical. The two thresholds are asserted apart so that collapsing
-      # one into the other cannot pass.
+      # 999 of every 1000 observations at or under le=0.05 (50ms): over the 20ms
+      # warning, under the 100ms critical. The two thresholds are asserted apart
+      # so that collapsing one into the other cannot pass.
       - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.005"}'
         values: "0+0x15"
       - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.05"}'
-        values: "0+100x15"
+        values: "0+999x15"
       - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="+Inf"}'
-        values: "0+100x15"
+        values: "0+1000x15"
     alert_rule_test:
       - eval_time: 12m
         alertname: WeirFsyncLatencyHigh
@@ -465,7 +470,7 @@ tests:
               instance: "w:9185"
               severity: "warning"
             exp_annotations:
-              summary: "weir fsync p99.9 high on w:9185 (49.96ms)"
+              summary: "weir fsync p99.9 high on w:9185 (50ms)"
               description: "Sustained fsync latency above the storage baseline. weir is fsync-bound, so this directly caps durable throughput. Check storage contention, a failing disk, or network-attached storage (NFS/EFS make fdatasync 5-50× slower)."
               runbook: "docs/monitoring.md#weirfsynclatency"
       - eval_time: 12m
@@ -478,9 +483,9 @@ tests:
       - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.05"}'
         values: "0+0x15"
       - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="0.5"}'
-        values: "0+100x15"
+        values: "0+999x15"
       - series: 'weir_wab_fsync_duration_seconds_bucket{job="weir",instance="w:9185",le="+Inf"}'
-        values: "0+100x15"
+        values: "0+1000x15"
     alert_rule_test:
       - eval_time: 7m
         alertname: WeirFsyncLatencyCritical
@@ -489,7 +494,7 @@ tests:
               instance: "w:9185"
               severity: "critical"
             exp_annotations:
-              summary: "weir fsync p99.9 CRITICAL on w:9185 (499.6ms)"
+              summary: "weir fsync p99.9 CRITICAL on w:9185 (500ms)"
               description: "fsync latency is an order of magnitude above any healthy local SSD. Durable-tier throughput is collapsing. Likely a failing disk or saturated/remote storage."
               runbook: "docs/monitoring.md#weirfsynclatency"
 
