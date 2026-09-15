@@ -217,7 +217,7 @@
     },
     {
       "name": "reject_ack_count_disagrees_with_request",
-      "notes": "The payload declares 3 but the client sent 4. A bitmap is the first weir response whose meaning depends on client-held state \u2014 an Ack says 'your last record' and an AckTracked carries its own coordinate, but a bitmap is meaningless without knowing which batch it answers. Since ceil(N/8) is not injective (N=1017..1024 all give 131 bytes), the echoed count is the only thing that can catch a desync.",
+      "notes": "The payload declares 3 but the client sent 4. A bitmap is the first weir response whose meaning depends on client-held state \u2014 an Ack says 'your last record' and an AckTracked carries its own coordinate, but a bitmap is meaningless without knowing which batch it answers. Since ceil(N/8) is not injective (N=1017..1024 all give 128 bitmap bytes), the echoed count is the only thing that can catch a desync.",
       "hex": "01030007",
       "decode": "LengthMismatch",
       "expected": 4
