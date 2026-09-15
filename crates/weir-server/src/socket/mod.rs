@@ -705,37 +705,21 @@ mod tests {
 
     /// A scratch directory whose mode does not depend on the process umask.
     ///
-    /// `create_dir_all` applies the process umask, and `bind_hardened` holds
-    /// umask 0o177 process-wide for the duration of its `bind(2)`. A test that
-    /// creates a directory inside that window gets mode 0o600 — a directory
-    /// with no execute bit, so every file created under it fails EACCES. The
-    /// umask lock serialises the tests that bind, but it cannot serialise the
-    /// rest of the crate's tests against them.
-    ///
-    /// Worse, the failure persists: these paths are pid-scoped, `create_dir_all`
-    /// is a no-op on an existing directory, and a run that fails leaves the
-    /// 0o600 directory behind, so every later run that reuses the pid fails at
-    /// the same line for a reason that is no longer present. Removing first is
-    /// what stops a poisoned directory from being inherited.
-    ///
-    /// The mode is set by `chmod` AFTER creation, not by `DirBuilder::mode`:
-    /// `mkdir(2)` masks its mode argument through the umask unconditionally, so
-    /// a requested 0o700 still lands as 0o600 inside the window. `chmod(2)`
-    /// takes no mask, which makes it the only umask-independent way to get the
-    /// mode asked for. `umask_immune_dir_ignores_a_hostile_process_umask` holds
-    /// this distinction down — it fails against the `DirBuilder::mode` version.
+    /// Delegates to the crate-wide helper: the rule has exactly one
+    /// implementation, and `testutil::scratch_dir` carries the full reasoning.
+    /// These tests are both the cause of the umask window and among its victims,
+    /// so they use the same helper as everything else rather than a local copy.
     fn umask_immune_dir(label: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("weir_{label}_{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        dir
+        crate::testutil::scratch_dir(label)
     }
 
     /// Serialises any test that mutates the process umask. umask is
     /// process-global; without this, parallel tests interleave and see
     /// each other's saved/restored values.
+    ///
+    /// It cannot serialise this module's tests against the REST of the crate's,
+    /// which is why every test directory goes through
+    /// [`crate::testutil::scratch_dir`].
     fn umask_test_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(Default::default)
@@ -868,7 +852,7 @@ mod tests {
             std::process::id(),
             line!()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let target = dir.join("real.sock");
         {
             let _real = std::os::unix::net::UnixListener::bind(&target).unwrap();
@@ -1037,7 +1021,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("weir_ww_parent_{}_{}", std::process::id(), line!()));
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let path = dir.join("weir.sock");
         let listener = bind_hardened(&path).expect("bind must succeed despite loose parent");
@@ -1068,7 +1052,7 @@ mod tests {
             std::env::temp_dir().join(format!("weir_parent_symlink_base_{}", std::process::id()));
         let real_parent = base.join("real");
         let link_parent = base.join("link");
-        std::fs::create_dir_all(&real_parent).unwrap();
+        crate::testutil::mkdir_p(&real_parent);
         std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
         let path = link_parent.join("weir.sock");
 

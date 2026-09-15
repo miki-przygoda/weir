@@ -371,8 +371,8 @@ mod tests {
     /// whether parsing fails.
     #[test]
     fn read_tolerates_feature_gated_and_unknown_keys() {
-        let dir = std::env::temp_dir().join(format!("weir_filecfg_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir("filecfg");
+        crate::testutil::mkdir_p(&dir);
         let path = dir.join("weir.toml");
         std::fs::write(
             &path,

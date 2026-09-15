@@ -1300,8 +1300,8 @@ mod tests {
     use std::fs;
 
     fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("weir_cfg_{label}_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir(&format!("cfg_{label}"));
+        crate::testutil::mkdir_p(&dir);
         dir
     }
 

@@ -12,6 +12,10 @@ mod sink;
 // is exactly why the mistake was invisible.
 #[cfg(unix)]
 mod socket;
+// Also under `dst`: the simulation harness is compiled into a non-test build
+// by that feature, and it needs the same umask-immune scratch directories.
+#[cfg(any(test, feature = "dst"))]
+mod testutil;
 mod wab;
 mod worker;
 
@@ -1363,12 +1367,12 @@ mod wab_bytes_tests {
     /// skipped, or their bytes would be double-counted against their own gauges.
     #[test]
     fn compute_wab_bytes_skips_dead_letter_and_quarantine() {
-        let root = std::env::temp_dir().join(format!("weir_g15_{}", std::process::id()));
+        let root = crate::testutil::scratch_dir("g15");
         let shard = root.join("shard_00");
         let dl = root.join("dead_letter");
         let q = root.join("quarantine");
         for d in [&shard, &dl, &q] {
-            std::fs::create_dir_all(d).unwrap();
+            crate::testutil::mkdir_p(d);
         }
         // 100 live shard bytes; 999 in dead_letter; 999 in quarantine.
         std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
@@ -1394,8 +1398,8 @@ mod wab_bytes_tests {
     /// The hole is upstream of that guard, in the value this function produces.
     #[test]
     fn an_unreadable_wab_dir_is_not_reported_as_empty() {
-        let empty = std::env::temp_dir().join(format!("weir_scanfail_ok_{}", std::process::id()));
-        std::fs::create_dir_all(&empty).unwrap();
+        let empty = crate::testutil::scratch_dir("scanfail_ok");
+        crate::testutil::mkdir_p(&empty);
         let unreadable = empty.join("no_such_wab_dir");
         assert!(!unreadable.exists(), "the failure case must actually fail");
 

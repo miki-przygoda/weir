@@ -170,8 +170,8 @@ mod tests {
     use super::*;
 
     fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("weir_dl_{label}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir(&format!("dl_{label}"));
+        crate::testutil::mkdir_p(&dir);
         dir
     }
 
@@ -224,7 +224,7 @@ mod tests {
         // counter is reserved up front the retry uses a fresh counter and succeeds.
         let dir = tmp_dir("poison");
         let dldir = dir.join("dead_letter");
-        std::fs::create_dir_all(&dldir).unwrap();
+        crate::testutil::mkdir_p(&dldir);
         std::fs::write(dldir.join("dl_00000001.wab"), b"partial").unwrap();
 
         // Model the in-run state right after the failure (counter not yet past

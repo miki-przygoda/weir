@@ -588,6 +588,24 @@ pub enum Scenario {
         records: usize,
         corrupt_index: usize,
     },
+    /// One record in a group commit is rejected by the writer while the segment
+    /// stays intact; every other record in the same commit must still be acked.
+    ///
+    /// The rejection is a real one, not an injected fault: an empty payload is
+    /// refused by `ShardWriter` before the segment is touched, because the WAB
+    /// uses a zero `payload_len` as its end-of-records sentinel and cannot
+    /// represent one. That makes this the cheapest faithful model of the
+    /// "record rejected, segment intact" case — the other being a zstd failure,
+    /// which needs no separate scenario because the writer classifies both the
+    /// same way.
+    ///
+    /// The distinction is load-bearing. `flush_batch` used to drain every
+    /// pending ack as a failure on *any* write error, so one bad record nacked
+    /// every innocent record sharing its group commit. Those records had not
+    /// failed, and a nack is at-least-once, so the producer retried them: the
+    /// symptom was duplicate delivery rather than loss, which is why it survived
+    /// a crown-invariant suite that only ever asks whether an ack was false.
+    RejectedRecordInBatch { records: usize, reject_index: usize },
 }
 
 /// A fully specified, reproducible run. Serialises to a `tests/dst_seeds/*.json`
@@ -649,6 +667,16 @@ impl SimSpec {
                 records,
                 corrupt_index,
             } => run_mid_file_corruption(self.seed, *records, *corrupt_index),
+            Scenario::RejectedRecordInBatch {
+                records,
+                reject_index,
+            } => run_rejected_record_in_batch(
+                self.seed,
+                &self.faults,
+                *records,
+                *reject_index,
+                self.compression(),
+            ),
         }
     }
 }
@@ -752,8 +780,7 @@ static SIM_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 impl SimEnv {
     fn new(label: &str) -> Self {
         let n = SIM_DIR_COUNTER.fetch_add(1, SeqCst);
-        let wab_dir =
-            std::env::temp_dir().join(format!("weir_dst_{label}_{}_{n}", std::process::id()));
+        let wab_dir = crate::testutil::scratch_dir(&format!("dst_{label}_{n}"));
         let _ = std::fs::remove_dir_all(&wab_dir);
         super::create_dir_private(wab_dir.clone()).expect("create wab_dir");
         super::create_dir_private(wab_dir.join("shard_00")).expect("create shard_00");
@@ -844,6 +871,26 @@ fn drive_sync_flusher(
     records: usize,
     compression: Compression,
 ) -> FlushOutcome {
+    drive_sync_flusher_with(seed, faults, records, compression, |_, payload| payload)
+}
+
+/// `drive_sync_flusher`, with a hook that may rewrite each record's payload
+/// before it is sent.
+///
+/// The hook exists so a scenario can drive a payload the writer will *reject*
+/// (an empty one) without inventing a fault for it. Injecting a fault would
+/// model the rejection; this reaches the real guard in `ShardWriter`, which is
+/// the code whose classification is under test.
+///
+/// `payloads` records what was actually sent, so a rewritten record is checked
+/// against the bytes that reached the writer rather than the ones the RNG made.
+fn drive_sync_flusher_with(
+    seed: u64,
+    faults: &[Fault],
+    records: usize,
+    compression: Compression,
+    mut rewrite: impl FnMut(usize, Vec<u8>) -> Vec<u8>,
+) -> FlushOutcome {
     let env = SimEnv::new("sync_flush");
     let sim_faults = SimFaults::from_faults(faults);
     let ledger = Ledger::default();
@@ -862,7 +909,7 @@ fn drive_sync_flusher(
     let mut ack_rxs = Vec::with_capacity(records);
     let mut units = Vec::with_capacity(records);
     for i in 0..records {
-        let payload = rng.unique_payload(i as u64);
+        let payload = rewrite(i, rng.unique_payload(i as u64));
         let (ack_tx, ack_rx) = oneshot::channel();
         ack_rxs.push(ack_rx);
         units.push(make_unit(payload.clone(), Durability::Durable, ack_tx));
@@ -913,6 +960,67 @@ fn drive_sync_flusher(
         fsync_failed: sim_faults.any_fsync_failed(),
         env,
         compression,
+    }
+}
+
+/// Scenario — one rejected record must not take its group commit down with it.
+///
+/// Drives `records` Durable units where `reject_index` carries an empty payload.
+/// `ShardWriter` refuses that before touching the segment, so the segment is
+/// intact and every other record in the commit is durable and must be acked.
+///
+/// This is the simulation-level guard for the classification `flush_batch` makes
+/// between "this record was rejected" and "the segment is gone". Against the
+/// unclassified version every record in the batch comes back `false`, so
+/// `i_rejected_record_does_not_nack_its_neighbours` fails at `records - 1`
+/// records rather than at zero — the assertion names the count precisely so the
+/// failure says which of the two behaviours it saw.
+fn run_rejected_record_in_batch(
+    seed: u64,
+    faults: &[Fault],
+    records: usize,
+    reject_index: usize,
+    compression: Compression,
+) -> SimReport {
+    assert!(records >= 2, "the scenario needs a neighbour to protect");
+    assert!(reject_index < records, "reject_index out of range");
+
+    let out = drive_sync_flusher_with(seed, faults, records, compression, |i, payload| {
+        if i == reject_index {
+            Vec::new()
+        } else {
+            payload
+        }
+    });
+
+    // The rejected record must be nacked: an empty record cannot be represented
+    // in the WAB, so acking it would be a false ack.
+    assert_invariant(seed, "i_rejected_record_is_nacked", !out.acks[reject_index]);
+
+    // ...and every other record in the same group commit must be acked, because
+    // the segment was never touched by the rejection.
+    let neighbours_acked = out
+        .acks
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != reject_index)
+        .filter(|&(_, &acked)| acked)
+        .count();
+    assert_invariant(
+        seed,
+        "i_rejected_record_does_not_nack_its_neighbours",
+        neighbours_acked == records - 1,
+    );
+
+    // The crown invariant still applies to everything that WAS acked.
+    assert_acked_records_durable(seed, &out);
+
+    out.env.cleanup();
+    SimReport {
+        seed,
+        acks: out.acks,
+        fsync_failed: out.fsync_failed,
+        ..Default::default()
     }
 }
 
@@ -1437,6 +1545,47 @@ mod tests {
     }
 
     /// Sanity: with no fault, the same flush acks every record `true`.
+    /// One rejected record must not nack the records sharing its group commit.
+    ///
+    /// Against the pre-fix `flush_batch` — which drained every pending ack as a
+    /// failure on any write error — all four records come back `false` and the
+    /// neighbour assertion fails. The rejected record is nacked either way, so
+    /// asserting only that would pass with the bug present.
+    #[test]
+    fn a_rejected_record_does_not_nack_its_neighbours() {
+        for reject_index in 0..4 {
+            let report = Sim::new(0xA6_0000 + reject_index as u64)
+                .scenario(Scenario::RejectedRecordInBatch {
+                    records: 4,
+                    reject_index,
+                })
+                .run();
+            assert!(
+                !report.acks[reject_index],
+                "the empty record must be nacked"
+            );
+            assert_eq!(
+                report.acks.iter().filter(|&&a| a).count(),
+                3,
+                "three innocent records must survive a rejection at index {reject_index}"
+            );
+        }
+    }
+
+    /// The same, with compression on: a zstd segment classifies a rejection the
+    /// same way, and the empty-payload guard fires before the codec is reached.
+    #[test]
+    fn a_rejected_record_does_not_nack_its_neighbours_when_compressed() {
+        let report = Sim::new(0xA6_00FF)
+            .compressed(true)
+            .scenario(Scenario::RejectedRecordInBatch {
+                records: 6,
+                reject_index: 2,
+            })
+            .run();
+        assert_eq!(report.acks.iter().filter(|&&a| a).count(), 5);
+    }
+
     #[test]
     fn sync_flush_without_fault_acks_all() {
         let report = Sim::new(0x5EED_0002)

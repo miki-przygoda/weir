@@ -913,9 +913,8 @@ mod tests {
     use std::fs;
 
     fn tmp_dir(label: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("weir_recovery_{label}_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir(&format!("recovery_{label}"));
+        crate::testutil::mkdir_p(&dir);
         dir
     }
 
@@ -1067,7 +1066,7 @@ mod tests {
         use crate::wab::segment::{WabSegment, segment_path};
         let dir = tmp_dir("seal_counter_replay");
         let shard_dir = dir.join("shard_00");
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         // seg 1: sealed by the "previous process" — already counted there.
         let mut seg =
@@ -1524,7 +1523,7 @@ mod tests {
         use std::io::Write;
         let wab_dir = tmp_dir("recover_isolate_corrupt");
         let shard_dir = wab_dir.join("shard_00");
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         // Segment 1: valid then magic-corrupted → recover_segment quarantines + Errs.
         let corrupt = segment_path(&shard_dir, 1);
@@ -1575,7 +1574,7 @@ mod tests {
         use crate::wab::segment::{WabSegment, segment_path};
         let wab_dir = tmp_dir("recover_multi");
         let shard_dir = wab_dir.join("shard_00");
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         // Two unsealed segments in one shard, distinct counters. Recovery
         // iterates read_dir, so this exercises the sort that makes the seal
@@ -1620,7 +1619,7 @@ mod tests {
 
         // A real shard with an active segment — recovery MUST seal this one.
         let shard_dir = wab_dir.join("shard_00");
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
         let shard_seg = segment_path(&shard_dir, 1);
         WabSegment::create(&shard_seg, 0, Compression::None)
             .unwrap()
@@ -1630,7 +1629,7 @@ mod tests {
         // A torn (still-active) dead-letter segment, segment-format so that
         // WITHOUT the skip recovery would re-seal it.
         let dl_dir = wab_dir.join("dead_letter");
-        fs::create_dir_all(&dl_dir).unwrap();
+        crate::testutil::mkdir_p(&dl_dir);
         let dl_seg = dl_dir.join("dl_00000001.wab");
         WabSegment::create(&dl_seg, 0, Compression::None)
             .unwrap()
@@ -2182,8 +2181,8 @@ mod tests {
         let wab_dir = tmp_dir("quarantine_crossshard");
         let shard0 = wab_dir.join("shard_00");
         let shard1 = wab_dir.join("shard_01");
-        fs::create_dir_all(&shard0).unwrap();
-        fs::create_dir_all(&shard1).unwrap();
+        crate::testutil::mkdir_p(&shard0);
+        crate::testutil::mkdir_p(&shard1);
 
         let seg0 = shard0.join("seg_00000001.wab");
         let seg1 = shard1.join("seg_00000001.wab");
@@ -2215,7 +2214,7 @@ mod tests {
         // shard+counter must get a distinct name, not overwrite the first.
         let wab_dir = tmp_dir("quarantine_recurrence");
         let shard0 = wab_dir.join("shard_00");
-        fs::create_dir_all(&shard0).unwrap();
+        crate::testutil::mkdir_p(&shard0);
 
         let seg = shard0.join("seg_00000001.wab");
         fs::write(&seg, b"first-corrupt").unwrap();
@@ -2614,7 +2613,7 @@ mod tests {
         // `weir-ctl quarantine`. So: quarantined counter up, failed counter flat.
         let dir = tmp_dir("recovery_quarantined_not_failed");
         let shard_dir = dir.join("shard_00");
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         let path = crate::wab::segment::segment_path(&shard_dir, 1);
         fs::write(&path, b"nope").unwrap();
@@ -2650,7 +2649,7 @@ mod tests {
         // recover_segment propagates it rather than routing to quarantine.
         let dir = tmp_dir("recovery_failed_left_in_place");
         let shard_dir = dir.join("shard_00");
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         let path = crate::wab::segment::segment_path(&shard_dir, 1);
         fs::create_dir(&path).unwrap();

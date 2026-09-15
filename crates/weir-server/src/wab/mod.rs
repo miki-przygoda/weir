@@ -226,14 +226,26 @@ fn run_with_panic_supervision<F, B, C>(
 
 /// Creates a directory (and all parents) with mode `0o700` on Unix.
 /// On non-Unix platforms falls back to `create_dir_all` with the process umask.
+///
+/// The mode is applied by `chmod` **after** creation, not by `DirBuilder::mode`.
+/// `mkdir(2)` masks its mode argument through the process umask unconditionally,
+/// so the `DirBuilder` form does not deliver what this function's name promises
+/// — it delivers `0o700 & !umask`. With the `0o077` umask `main` sets that
+/// happens to be `0o700`, which is why this was invisible; under the `0o177`
+/// that `socket::bind_hardened` holds process-wide for the duration of its
+/// `bind(2)`, the same call yields `0o600` — a directory with no execute bit,
+/// which nothing can be created inside. `chmod(2)` takes no mask, so it is the
+/// only way to make the promise unconditional.
+///
+/// Only the leaf is chmod-ed; parents created along the way keep whatever the
+/// umask gave them, exactly as before. The leaf is the directory weir's
+/// privacy claim is about.
 pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&path)
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
     }
     #[cfg(not(unix))]
     {
@@ -1123,8 +1135,8 @@ mod tests {
     use weir_core::{MAX_PAYLOAD_HARD_CAP, Payload};
 
     fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("weir_wab_{label}_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir(&format!("wab_{label}"));
+        crate::testutil::mkdir_p(&dir);
         dir
     }
 
@@ -1250,7 +1262,7 @@ mod tests {
         // once one exists.
         let dir = tmp_dir("replay_consumer");
         let shard_dir = shard_dir_path(&dir, 0);
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         const N: u64 = 300; // > the bounded(256) drain channel capacity
         for i in 1..=N {
@@ -1303,7 +1315,7 @@ mod tests {
         let dir = tmp_dir("replay_orphan_shards");
         for s in 0..4u16 {
             let shard_dir = shard_dir_path(&dir, s as usize);
-            fs::create_dir_all(&shard_dir).unwrap();
+            crate::testutil::mkdir_p(&shard_dir);
             let path = segment_path(&shard_dir, 1);
             let mut seg = WabSegment::create(&path, s, Compression::None).unwrap();
             seg.write_record(b"orphaned").unwrap();
@@ -1342,7 +1354,7 @@ mod tests {
         use crate::wab::format::{build_confirmed, confirmed_path_for};
         let dir = tmp_dir("replay_skip_confirmed");
         let shard_dir = shard_dir_path(&dir, 0);
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         // seg 1: sealed AND confirmed (delivered last run; segment not yet deleted).
         let p1 = segment_path(&shard_dir, 1);
@@ -1395,7 +1407,7 @@ mod tests {
 
         // shard_00: two unconfirmed sealed segments (counters 1 and 2).
         let sd0 = shard_dir_path(&dir, 0);
-        fs::create_dir_all(&sd0).unwrap();
+        crate::testutil::mkdir_p(&sd0);
         let s0_1 = {
             let mut s = WabSegment::create(&segment_path(&sd0, 1), 0, Compression::None).unwrap();
             s.write_record(b"a").unwrap();
@@ -1409,7 +1421,7 @@ mod tests {
 
         // shard_01: one CONFIRMED (must be skipped) + one unconfirmed sealed.
         let sd1 = shard_dir_path(&dir, 1);
-        fs::create_dir_all(&sd1).unwrap();
+        crate::testutil::mkdir_p(&sd1);
         let s1_confirmed = {
             let mut s = WabSegment::create(&segment_path(&sd1, 1), 1, Compression::None).unwrap();
             s.write_record(b"done").unwrap();
@@ -1424,7 +1436,7 @@ mod tests {
 
         // shard_05: an "orphaned" dir whose index would be >= a small configured count.
         let sd5 = shard_dir_path(&dir, 5);
-        fs::create_dir_all(&sd5).unwrap();
+        crate::testutil::mkdir_p(&sd5);
         let s5_1 = {
             let mut s = WabSegment::create(&segment_path(&sd5, 1), 5, Compression::None).unwrap();
             s.write_record(b"orphan").unwrap();

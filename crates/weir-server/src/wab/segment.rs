@@ -895,8 +895,8 @@ mod tests {
     use std::fs;
 
     pub(crate) fn tmp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("weir_seg_{label}_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testutil::scratch_dir(&format!("seg_{label}"));
+        crate::testutil::mkdir_p(&dir);
         dir
     }
 
@@ -1467,7 +1467,7 @@ mod tests {
         let root = tmp_dir("coord_drift");
         let shard_dir = root.join("shard_00");
         let _ = fs::remove_dir_all(&shard_dir);
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         // 48 bytes rotates after roughly two of these records, so the run spans
         // several segments and exercises both the rotated and still-open arms of
@@ -1562,7 +1562,7 @@ mod tests {
         let root = tmp_dir("coord_index");
         let shard_dir = root.join("shard_00");
         let _ = fs::remove_dir_all(&shard_dir);
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         let mut writer = ShardWriter::new_with_store(
             0,
@@ -1608,7 +1608,7 @@ mod tests {
         let root = tmp_dir("coord_addr");
         let shard_dir = root.join("shard_07");
         let _ = fs::remove_dir_all(&shard_dir);
-        fs::create_dir_all(&shard_dir).unwrap();
+        crate::testutil::mkdir_p(&shard_dir);
 
         let mut writer = ShardWriter::new_with_store(
             7,
@@ -1730,7 +1730,7 @@ mod tests {
     #[test]
     fn shard_writer_compresses_records_and_they_read_back() {
         let dir = tmp_dir("shard_writer_zstd");
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let mut w = ShardWriter::new_with_store(
             0,
             dir.clone(),
@@ -1767,7 +1767,7 @@ mod tests {
     #[test]
     fn shard_writer_without_compression_writes_a_v1_header() {
         let dir = tmp_dir("shard_writer_v1");
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let mut w = ShardWriter::new_with_store(
             0,
             dir.clone(),
@@ -1797,7 +1797,7 @@ mod tests {
         // since a zero payload_len IS the end-of-records sentinel. The check
         // must therefore happen on the PLAINTEXT, above the codec.
         let dir = tmp_dir("empty_before_codec");
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let mut w = ShardWriter::new_with_store(
             0,
             dir.clone(),
@@ -1823,7 +1823,7 @@ mod tests {
         // A ratio you cannot see is a ratio you cannot tune. Assert both sides
         // move, and that compression actually shrinks the stored side.
         let dir = tmp_dir("ratio_counters");
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let metrics = Arc::new(Metrics::new().0);
         let mut w = ShardWriter::new_with_store(
             0,
@@ -1851,7 +1851,7 @@ mod tests {
     #[test]
     fn ratio_counters_are_equal_when_compression_is_off() {
         let dir = tmp_dir("ratio_counters_off");
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let metrics = Arc::new(Metrics::new().0);
         let mut w = ShardWriter::new_with_store(
             0,
@@ -1875,7 +1875,7 @@ mod tests {
     fn a_rejected_record_moves_neither_counter() {
         // An empty payload is refused above the codec; nothing should be counted.
         let dir = tmp_dir("ratio_counters_rejected");
-        std::fs::create_dir_all(&dir).unwrap();
+        crate::testutil::mkdir_p(&dir);
         let metrics = Arc::new(Metrics::new().0);
         let mut w = ShardWriter::new_with_store(
             0,
