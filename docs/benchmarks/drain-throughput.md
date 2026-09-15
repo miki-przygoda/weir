@@ -1,6 +1,6 @@
 # Drain throughput — the first delivery-side numbers
 
-**Date:** 2026-09-05 (Linux added) · **Version:** 2.0.5 · **Suite:** `crates/weir-server/tests/load_drain.rs`
+**Date:** 2026-09-05 (Linux) · 2026-09-15 (mac re-measured on the corrected basis) · **Version:** 2.0.5 (Linux rows) · 3.0.0 (mac rows) · **Suite:** `crates/weir-server/tests/load_drain.rs`
 
 Until this release every published weir number described **ingest**: how fast the
 daemon accepts records and gets them into the WAB. The load suite's own module
@@ -38,7 +38,7 @@ Common to all three:
 | Daemon | `bench_preset`: 4 shards, 4 workers, ingest batch 64 |
 | Sharding | **Inert in this suite.** Shard is assigned per *connection* (`crates/weir-server/src/socket/mod.rs:210`) and the fill opens one client (`tests/load_drain.rs:374-379`), so every record lands on one shard whatever `shard_count` says. |
 | Sink batch size | `sink_max_batch_size` = 100, the default (`crates/weir-server/src/config/mod.rs:721`), never overridden here. The "batch 64" above is the *ingest* coalescing knob — a different setting. |
-| Timed window | **Superseded basis — see [the 2026-09-12 correction](#2026-09-12--the-rows-above-were-computed-on-two-different-bases).** **The sealed half of the fill**, not all of it — `bulk(n) = n/2` (`tests/load_drain.rs:335-345`). Only whole rotated segments seal, so timing the tail would fold up to a second of idle-seal timer into a throughput number. Each scenario asserts separately that the full count arrives, so the tail is checked for correctness without polluting the rate. A published rate for `drain_http_ndjson` therefore covers 1,000 delivered records out of a 2,000-record fill. |
+| Timed window | **From the first delivered record to the target count, with the numerator counted over the same interval** — see [the 2026-09-12 correction](#2026-09-12--the-rows-above-were-computed-on-two-different-bases). The target is **the sealed half of the fill**, `bulk(n) = n/2` (`tests/load_drain.rs:350-360`): only whole rotated segments seal, so timing the tail would fold up to a second of idle-seal timer into a throughput number. Each scenario separately asserts the full count arrives, so the tail is checked for correctness without polluting the rate. The two **Linux rows below predate this** and are marked superseded. |
 
 ## 2026-09-12 — the rows above were computed on two different bases
 
@@ -172,22 +172,85 @@ cost from filesystem cost panicked every scenario before a record was pushed —
 `load_drain.rs` did not. The `linux-tmpfs` column below is the first data it has
 ever produced.
 
-Median of five consecutive runs, with the full range:
+Median of five consecutive runs, with the full range.
 
-| Scenario | | min | **median** | max | spread |
-|---|---|---:|---:|---:|---|
-| `drain_http_ndjson` | mac | 36,695 | **40,710** | 42,412 | 1.16x |
-| | linux-ssd | 105,332 | **105,909** | 118,819 | 1.13x |
-| | linux-tmpfs | 237,225 | **238,573** | 315,527 | 1.33x |
-| `drain_http_per_record` | mac | 21,428 | **24,381** | 27,782 | 1.30x |
-| | linux-ssd | 25,652 | **28,719** | 30,675 | 1.20x |
-| | linux-tmpfs | 36,596 | **37,991** | 38,001 | 1.04x |
-| `drain_slow_sink_1ms_conc16` | mac | 4,732 | **4,977** | 5,436 | 1.15x |
-| | linux-ssd | 8,659 | **8,826** | 9,517 | 1.10x |
-| | linux-tmpfs | 7,430 | **7,570** | 11,032 | 1.48x |
+**Mixed basis — read the marker on every row.** The `mac` rows were re-measured
+on 2026-09-15 on the corrected basis described in
+[the 2026-09-12 correction](#2026-09-12--the-rows-above-were-computed-on-two-different-bases).
+The two Linux rows have **not** been re-measured and are still on the superseded
+basis; they are kept rather than deleted because they are the only figures that
+exist for those configurations, and they are marked so nobody quotes them as
+current.
+
+| Scenario | | min | **median** | max | spread | basis |
+|---|---|---:|---:|---:|---|---|
+| `drain_http_ndjson` | mac | 41,867 | **44,928** | 46,907 | 1.12x | current |
+| | linux-ssd | 105,332 | **105,909** | 118,819 | 1.13x | ⚠ superseded |
+| | linux-tmpfs | 237,225 | **238,573** | 315,527 | 1.33x | ⚠ superseded |
+| `drain_http_per_record` | mac | 21,279 | **23,746** | 29,467 | 1.38x | current |
+| | linux-ssd | 25,652 | **28,719** | 30,675 | 1.20x | ⚠ superseded |
+| | linux-tmpfs | 36,596 | **37,991** | 38,001 | 1.04x | ⚠ superseded |
+| `drain_slow_sink_1ms_conc16` | mac | 7,715 | **7,990** | 8,250 | 1.07x | current |
+| | linux-ssd | 8,659 | **8,826** | 9,517 | 1.10x | ⚠ superseded |
+| | linux-tmpfs | 7,430 | **7,570** | 11,032 | 1.48x | ⚠ superseded |
 
 All figures rec/s. Ingest of the 2,000-record backlog, for scale: **176 ms** on
 mac, **77 ms** linux-ssd, **41 ms** linux-tmpfs.
+
+### What re-measuring the mac column changed
+
+Only one of the three scenarios moved for the reason the correction predicts:
+
+| Scenario | superseded median | current median | change |
+|---|---:|---:|---|
+| `drain_slow_sink_1ms_conc16` | 4,977 | **7,990** | **+60.5%** |
+| `drain_http_per_record` | 24,381 | **23,746** | −2.6% |
+| `drain_http_ndjson` | 40,710 | **44,928** | *not comparable* |
+
+`drain_slow_sink` is the scenario that never adopted the shared helper: its clock
+started when the sink was let through, so the drain's retry backoff sat inside
+the window. On this machine that backoff is `wakeup_ms` ≈ 30 against a window of
+≈ 62 ms, so roughly a third of the old window was time in which nothing was
+delivered. **+60.5% is the size of that mistake on mac** — larger than the
++28% the same scenario showed on beast, because beast's wakeup is a smaller
+fraction of its window. The old row understated; it did not overstate.
+
+`drain_http_per_record` barely moved, which is the expected result: it already
+started its clock at first delivery, so the only correction available to it was
+the numerator, and §"The numerator error was small" measured that at −4.3% to
++18.1% scattered either side of zero.
+
+**`drain_http_ndjson` is not comparable to its superseded row**, and the table
+says "not comparable" rather than a percentage for that reason. Commit `24767fe`
+resized the scenario from 2,000 to 20,000 records on 2026-09-13 — the old
+version was measuring its own poll quantisation, since NDJSON delivers in POSTs
+of `sink_max_batch_size` (100) while `await_delivery` polls on 1 ms. The two
+numbers describe different experiments, not the same experiment on two bases.
+
+### Conditions, disclosed
+
+The first attempt at this re-measurement was thrown away. The machine had been
+running the repo's own `deploy/monitoring` compose stack since 2026-09-13 —
+including a loadgen pushing ≈ 59 rec/s into a containerised weir — for about two
+days. Its effect is visible and worth recording, because it is the kind of thing
+that quietly ruins a benchmark:
+
+| Scenario | spread with loadgen | spread after stopping it |
+|---|---|---|
+| `drain_http_ndjson` | 1.85x | **1.12x** |
+| `drain_http_per_record` | 1.90x | **1.38x** |
+| `drain_slow_sink_1ms_conc16` | 1.11x | **1.07x** |
+
+Medians moved little (ndjson 41,942 → 44,928); the *dispersion* is what it
+destroyed, and dispersion is what decides whether the suite can detect a
+regression. After stopping it, `drain_http_ndjson` delivered exactly 9,960
+records on all five runs.
+
+The published runs were taken with Docker empty (`docker ps` → 0 containers) and
+a 1-minute load average of 3.5–5.6 on a 16-core machine, the remainder being a
+browser and the desktop compositor. That is a working laptop, not an isolated
+rig — which is the standing argument for preferring beast for anything where the
+daemon's own cost is the question.
 
 Within-configuration spread is 1.04-1.48x. **Between configurations it reaches
 6.3x on the same scenario.** Any single headline number for this suite is a
@@ -276,6 +339,16 @@ For scale, the five CI runs *before* the harness fix median 8,093 rec/s on
 change in the runner.
 
 ## What changed in the conclusions
+
+> **Basis note (2026-09-15).** Everything in this section is computed from the
+> **linux-ssd** NDJSON figure of 105,909 rec/s, which the Results table now
+> marks ⚠ superseded — it predates the window correction and has not been
+> re-measured, because the box has been unavailable. The direction of the error
+> is known from the paired beast comparison above: `slow_sink` *understated* and
+> the numerator error on the other two was ±small and scattered, so the ratios
+> below are unlikely to move by enough to change which side of 1.0 they sit on.
+> They are nonetheless one-significant-figure claims resting on a superseded
+> row, and should be recomputed when Linux is re-measured.
 
 **"Delivery is the narrower half" stays withdrawn — but it is not simply
 false, and the previous wording here overstated the case.** The original claim
