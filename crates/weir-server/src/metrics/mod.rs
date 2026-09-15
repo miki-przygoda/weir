@@ -56,6 +56,7 @@ pub enum NackReason {
     empty_payload,
     unknown_message,
     reserved_flags_set,
+    bad_batch_framing,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -801,6 +802,7 @@ impl Metrics {
             NackReason::empty_payload,
             NackReason::unknown_message,
             NackReason::reserved_flags_set,
+            NackReason::bad_batch_framing,
         ] {
             // get_or_create returns a guard; binding it to `_` is enough — the
             // series is registered at 0 by the lookup itself.

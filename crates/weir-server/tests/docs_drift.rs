@@ -24,6 +24,7 @@ const PEER: &str = include_str!("../src/socket/peer.rs");
 const HISTORY: &str = include_str!("../../../docs/benchmarks/history.md");
 const MONITORING: &str = include_str!("../../../docs/monitoring.md");
 const ALERTS: &str = include_str!("../../../deploy/prometheus/weir-alerts.yml");
+const ALERTS_TEST: &str = include_str!("../../../deploy/prometheus/weir-alerts_test.yml");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -418,15 +419,95 @@ fn every_alert_runbook_anchor_resolves_to_a_heading() {
         }
     }
 
-    assert!(
-        count >= 15,
-        "found only {count} runbook annotations; weir-alerts.yml has eighteen \n\
-         rules and every one should carry a link to its remediation"
+    // Every rule, not "at least fifteen". The old floor was three below the
+    // rule count, so three annotations could vanish without failing this.
+    let rule_count = ALERTS.matches("- alert:").count();
+    assert_eq!(
+        count, rule_count,
+        "weir-alerts.yml has {rule_count} rules but {count} runbook annotations; \n\
+         every rule must carry a link to its remediation"
     );
     assert!(
         unresolved.is_empty(),
         "these alert runbook anchors do not resolve to a `#### ` heading in \n\
          docs/monitoring.md: {unresolved:?}\n\n\
          An operator following the link from a firing alert lands nowhere."
+    );
+}
+
+/// Every alert rule must have a `promtool` unit test.
+///
+/// Three rules shipped with no test in either direction —
+/// `WeirFsyncLatencyHigh`, `WeirFsyncLatencyCritical` and `WeirHighNackRate` —
+/// while `ci.yml`, `weir-alerts_test.yml`'s own header and `docs/monitoring.md`
+/// all stated that the suite "pins every rule in both directions". It did not,
+/// and nothing could tell: `promtool test rules` checks the assertions that
+/// exist, so a rule with no assertions passes, and deleting those three rules
+/// outright left the CI gate green.
+///
+/// This is the same shape as the response-cap guards in the five polyglot
+/// clients and the `NackReason` label guard: a claim about a whole set, checked
+/// by enumerating part of it. The fix is the same — derive the set and compare.
+#[test]
+fn every_alert_rule_has_a_unit_test() {
+    let defined: Vec<&str> = ALERTS
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("- alert: "))
+        .map(str::trim)
+        .collect();
+    assert!(
+        defined.len() >= 18,
+        "found only {} rules in weir-alerts.yml; the file has shrunk and this \n\
+         guard is no longer reading it correctly",
+        defined.len()
+    );
+
+    // Both directions, because that is what ci.yml, this suite's own header and
+    // docs/monitoring.md all claim. A firing-only test cannot catch the more
+    // corrosive failure — a rule that fires constantly — and two rules had
+    // exactly that gap while the claim stood.
+    //
+    // An entry is "non-firing" when its `alertname:` is followed by
+    // `exp_alerts: []`, and "firing" when it is followed by a populated block.
+    let mut firing = Vec::new();
+    let mut quiet = Vec::new();
+    let mut lines = ALERTS_TEST.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(name) = line.trim().strip_prefix("alertname: ") else {
+            continue;
+        };
+        let name = name.trim();
+        // The next `exp_alerts:` line decides which list this entry joins.
+        for following in lines.by_ref() {
+            let t = following.trim();
+            if let Some(rest) = t.strip_prefix("exp_alerts:") {
+                if rest.trim() == "[]" {
+                    quiet.push(name);
+                } else {
+                    firing.push(name);
+                }
+                break;
+            }
+        }
+    }
+
+    let missing: Vec<String> = defined
+        .iter()
+        .filter_map(|name| match (firing.contains(name), quiet.contains(name)) {
+            (true, true) => None,
+            (true, false) => Some(format!("{name} (no non-firing test)")),
+            (false, true) => Some(format!("{name} (no firing test)")),
+            (false, false) => Some(format!("{name} (no test at all)")),
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these alert rules are not pinned in both directions: {missing:?}\n\n\
+         A rule with no test can be inverted, neutered or deleted and \n\
+         `promtool test rules` still reports SUCCESS — which is how three \n\
+         shipped untested, and two more firing-only, while ci.yml, this suite's \n\
+         header and docs/monitoring.md all said every rule was pinned in both \n\
+         directions."
     );
 }

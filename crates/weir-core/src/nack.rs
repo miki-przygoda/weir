@@ -15,9 +15,17 @@
 // rationale on its decode-side twin DecodeError. Adding it later would itself be
 // breaking, so it lands before 1.x ships. The wire stays forward-compatible
 // regardless: an unknown byte surfaces as ClientError::UnknownNack(u8), not a
-// new variant. MessageType/Durability are deliberately left exhaustive because
-// changing them requires a WIRE_VERSION bump (a major event); that does not
-// apply here.
+// new variant.
+//
+// `MessageType` USED to be left exhaustive here on the grounds that "changing
+// them requires a WIRE_VERSION bump (a major event)". Both halves of that were
+// wrong and are now disproved by the tree: 3.0 added PushTracked/AckTracked and
+// 4.0 added PushBatch/AckBatch, all with WIRE_VERSION still 1, because a new
+// message type is additive on the wire exactly as a new reason byte is. What it
+// was NOT is additive in the Rust API, which is what forced 3.0.0 — so
+// `MessageType` carries `#[non_exhaustive]` too as of 4.0.0. `Durability` stays
+// exhaustive on its own merits: 0x02 is retired, no tier is planned, and
+// matching a tier exhaustively against a config string is a legitimate use.
 #[non_exhaustive]
 pub enum NackReason {
     /// Frame did not start with the `b"WEIR"` magic.
@@ -228,11 +236,20 @@ mod tests {
 
     #[test]
     fn from_for_u8_is_inverse_of_try_from_and_display_is_nonempty() {
-        for byte in 0x01u8..=0x09 {
-            let r = NackReason::try_from(byte).unwrap();
+        // Swept, not ranged: `0x01..=0x09` stopped covering the type when
+        // BadBatchFraming was assigned 0x0B, and the assigned set is not
+        // contiguous (0x0A is permanently reserved as the frozen vectors'
+        // worked "unknown reason" example).
+        let mut seen = 0;
+        for byte in 0x00u8..=0xFF {
+            let Ok(r) = NackReason::try_from(byte) else {
+                continue;
+            };
+            seen += 1;
             assert_eq!(u8::from(r), byte);
-            assert!(!r.to_string().is_empty());
+            assert!(!r.to_string().is_empty(), "{r:?} has an empty Display");
         }
+        assert!(seen >= 10, "the sweep decoded only {seen} reasons");
         // Usable as a std error.
         let _: &dyn std::error::Error = &NackReason::BadMagic;
     }
@@ -266,7 +283,14 @@ mod tests {
         // Drift guard: these strings MUST match the daemon's private metrics
         // `NackReason` label enum (weir-server/src/metrics/mod.rs) exactly, so an
         // ops consumer can map a wire NackReason to the metric label it queries.
-        // If a variant is added or renamed, update both this test and the server.
+        //
+        // This list is a spelling pin and nothing more — it asserts the exact
+        // strings an operator types into a dashboard query. It is NOT the guard
+        // that catches a missing variant: a hand-written list cannot, which is
+        // how `BadBatchFraming` was added to the enum while this test, the
+        // server's label enum and its pre-registration sweep all stayed at nine
+        // entries. `metric_label_round_trips_for_every_variant` below sweeps the
+        // byte space and is what actually holds the set closed.
         assert_eq!(NackReason::BadMagic.as_metric_label(), "bad_magic");
         assert_eq!(
             NackReason::VersionMismatch.as_metric_label(),
@@ -294,18 +318,54 @@ mod tests {
             NackReason::ReservedFlagsSet.as_metric_label(),
             "reserved_flags_set"
         );
+        assert_eq!(
+            NackReason::BadBatchFraming.as_metric_label(),
+            "bad_batch_framing"
+        );
     }
 
     #[test]
     fn metric_label_round_trips_for_every_variant() {
-        for byte in 0x01u8..=0x09 {
-            let r = NackReason::try_from(byte).unwrap();
+        // Swept over the whole byte space, not over `0x01..=0x09`.
+        //
+        // That range was written when 0x09 was the last assigned reason, and it
+        // silently stopped covering the type the moment `BadBatchFraming`
+        // (0x0B) was assigned — so the new variant's label, Display and
+        // round-trip all shipped untested by a test whose name promises "every
+        // variant". Sweeping every byte and testing whichever ones decode means
+        // the next reason is covered the day its byte is assigned rather than
+        // the day someone remembers to widen a range.
+        //
+        // Note the gap this also documents: 0x0A is permanently unassigned,
+        // pinned as the worked "unknown reason" example by the frozen vector
+        // `nack_reserved_reason`, so the assigned set is NOT contiguous.
+        let mut seen = 0;
+        for byte in 0x00u8..=0xFF {
+            let Ok(r) = NackReason::try_from(byte) else {
+                continue;
+            };
+            seen += 1;
             assert_eq!(
                 NackReason::from_metric_label(r.as_metric_label()),
                 Some(r),
-                "metric label for {r:?} did not round-trip"
+                "metric label for {r:?} ({byte:#04x}) did not round-trip"
+            );
+            assert!(
+                !r.as_metric_label().is_empty(),
+                "{r:?} ({byte:#04x}) has no metric label"
             );
         }
+        assert!(
+            seen >= 10,
+            "the sweep decoded only {seen} reasons; it is no longer reaching the \
+             assigned set"
+        );
+        assert!(
+            NackReason::try_from(0x0A).is_err(),
+            "0x0A must stay unassigned — the frozen vector nack_reserved_reason \
+             pins it as the worked example of an unknown reason byte"
+        );
+
         // An unknown label maps to None.
         assert_eq!(NackReason::from_metric_label("not_a_reason"), None);
         assert_eq!(NackReason::from_metric_label(""), None);
