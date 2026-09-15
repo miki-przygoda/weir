@@ -532,7 +532,15 @@ pub(crate) struct ShardWriter {
     compression_level: i32,
     /// Why the most recent `write_record` failed — set on every `Err` path so
     /// the caller can distinguish a refused record from a dropped segment
-    /// instead of inferring it. `None` between failures.
+    /// instead of inferring it.
+    ///
+    /// Reset to `None` on every success, which is load-bearing rather than
+    /// tidiness. A stale value outlives the failure that set it, and a stale
+    /// `RecordRejected` read on a later *dropped-segment* failure tells
+    /// `flush_batch` to spare records that were never fsynced — a false ack.
+    /// Clearing on success means any path that forgets to classify falls back
+    /// to [`last_write_failure`](ShardWriter::last_write_failure)'s conservative
+    /// `SegmentDropped` default instead of to the previous answer.
     last_write_failure: Option<WriteFailure>,
 }
 
@@ -700,10 +708,33 @@ impl ShardWriter {
             .as_ref()
             .is_some_and(|s| s.should_rotate(self.segment_max_bytes));
         if should_rotate {
-            let sealed = self.active.take().unwrap().seal()?;
+            // `take()` has already removed the segment, so a seal failure here
+            // is definitionally SegmentDropped — and `seal` begins with
+            // `finalize_to_disk`, the durability commit point, so the records
+            // it covered were never fsynced.
+            //
+            // Classifying it explicitly is not belt-and-braces. Without it this
+            // path left `last_write_failure` holding whatever the LAST failure
+            // set, and a stale `RecordRejected` here tells `flush_batch` to
+            // spare `pending_acks` — which the group fsync then acks `true`,
+            // because `fsync_current` no-ops when `active` is `None`. That is a
+            // false ack at the Durable tier.
+            let sealed = match self.active.take().unwrap().seal() {
+                Ok(sealed) => sealed,
+                Err(e) => {
+                    self.last_write_failure = Some(WriteFailure::SegmentDropped);
+                    // Cleared on this path too: leaving it pointing at a segment
+                    // that no longer exists is the same "state not updated on
+                    // the error path" mistake one line down.
+                    self.active_path = None;
+                    return Err(e);
+                }
+            };
             self.active_path = None;
+            self.last_write_failure = None;
             return Ok(Some(sealed));
         }
+        self.last_write_failure = None;
         Ok(None)
     }
 
@@ -1224,6 +1255,125 @@ mod tests {
         fn seal(self: Box<Self>) -> io::Result<PathBuf> {
             self.inner.seal()
         }
+    }
+
+    /// A store whose `seal()` always fails. Writes and fsyncs pass through.
+    ///
+    /// The DST harness has `Fault::SealFails`, but it drives the whole flusher
+    /// thread; the bug below lives in `ShardWriter`'s own state and needs a bare
+    /// writer to reach deterministically.
+    struct FailingSealStore;
+
+    impl SegmentStore for FailingSealStore {
+        fn create(
+            &self,
+            path: &Path,
+            shard_id: u16,
+            compression: Compression,
+        ) -> io::Result<Box<dyn SegmentHandle>> {
+            let inner = WabSegment::create(path, shard_id, compression)?;
+            Ok(Box::new(FailingSealHandle { inner }))
+        }
+
+        fn segment_counters(&self, dir: &Path) -> io::Result<Vec<u64>> {
+            FsSegmentStore.segment_counters(dir)
+        }
+    }
+
+    struct FailingSealHandle {
+        inner: WabSegment,
+    }
+
+    impl SegmentHandle for FailingSealHandle {
+        fn write_record(&mut self, stored: &[u8]) -> io::Result<()> {
+            self.inner.write_record(stored)
+        }
+        fn fsync(&self) -> io::Result<()> {
+            self.inner.fsync()
+        }
+        fn should_rotate(&self, max_bytes: u64) -> bool {
+            self.inner.should_rotate(max_bytes)
+        }
+        fn seal(self: Box<Self>) -> io::Result<PathBuf> {
+            Err(io::Error::other(
+                "injected seal failure (ENOSPC at finalize)",
+            ))
+        }
+    }
+
+    /// A rejected record must not disarm the nack for a LATER dropped segment.
+    ///
+    /// `last_write_failure` used to be set on four of `write_record`'s five
+    /// `Err` paths and never cleared on success, so a single `RecordRejected`
+    /// armed the shard for the life of the process: the next rotation whose
+    /// `seal()` failed returned `Err` while the field still said
+    /// `RecordRejected`. `flush_batch` reads that to mean "the segment is
+    /// intact, spare its neighbours", the group fsync then no-ops because
+    /// `active` was already taken, and every record collected for that segment
+    /// is acked `true` — having never been fsynced. A false ack at the Durable
+    /// tier, which is the one outcome weir exists to prevent.
+    ///
+    /// The assertion is on the classification rather than on an ack, because
+    /// this is the level the bug lives at; `flush_batch`'s use of it is covered
+    /// by the DST scenarios.
+    #[test]
+    fn a_rejected_record_does_not_disarm_the_nack_for_a_later_dropped_segment() {
+        let dir = tmp_dir("stale_classification");
+        let mut w = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            // Tiny, so the second write rotates and must seal.
+            64,
+            Arc::new(Metrics::new().0),
+            Arc::new(FailingSealStore),
+            Compression::None,
+            1,
+        );
+
+        // 1. A rejection that leaves the segment intact. This is the real
+        //    production trigger via a zstd failure; an empty payload reaches the
+        //    same classification without needing to break the compressor.
+        w.write_record(b"")
+            .expect_err("an empty payload must be refused");
+        assert_eq!(
+            w.last_write_failure(),
+            WriteFailure::RecordRejected,
+            "the empty-payload path must classify as a rejection"
+        );
+
+        // 2. A successful write must clear it. Without this the stale value
+        //    survives to step 3 even once that path classifies correctly.
+        w.write_record(b"a record long enough to matter")
+            .expect("write");
+        assert_eq!(
+            w.last_write_failure(),
+            WriteFailure::SegmentDropped,
+            "after a SUCCESSFUL write the field must be unset, so the accessor \
+             falls back to its conservative default rather than to the last failure"
+        );
+
+        // 3. Rotate into a seal that fails. The segment is gone and its records
+        //    were never fsynced, so this must read as SegmentDropped.
+        let err = w
+            .write_record(b"another record long enough to force the rotation")
+            .expect_err("the injected seal failure must surface");
+        assert!(
+            err.to_string().contains("injected seal failure"),
+            "expected the seal failure, got: {err}"
+        );
+        assert_eq!(
+            w.last_write_failure(),
+            WriteFailure::SegmentDropped,
+            "a failed rotation seal drops the segment; reporting RecordRejected \
+             here tells flush_batch to spare records that were never fsynced"
+        );
+        assert!(
+            w.active_path.is_none(),
+            "a failed seal must not leave active_path pointing at a segment \
+             that no longer exists"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
