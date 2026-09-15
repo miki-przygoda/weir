@@ -23,6 +23,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "src"))
 
 from weir_wire.codec import (  # noqa: E402
+    MAX_ACK_BATCH_PAYLOAD,
     MAX_PAYLOAD_HARD_CAP,
     MAX_RESPONSE_PAYLOAD,
     MAX_TRACKED_ACK_PAYLOAD,
@@ -146,14 +147,24 @@ def run() -> int:
             payload_len <= MAX_TRACKED_ACK_PAYLOAD,
             f"{payload_len} > {MAX_TRACKED_ACK_PAYLOAD}",
         )
+    # Swept over ALL 256 type bytes, not over a list of the types that exist
+    # today. A list stops covering the type space the moment a byte is assigned:
+    # this check enumerated 0x01-0x06 and 0xFF, so when AckBatch (0x09) was
+    # given a wider cap the check still passed while the property it names had
+    # quietly become false.
+    widened = {
+        int(MessageType.ACK_TRACKED): MAX_TRACKED_ACK_PAYLOAD,
+        int(MessageType.ACK_BATCH): MAX_ACK_BATCH_PAYLOAD,
+    }
+    wrong = [
+        f"{mt:#04x}: {max_response_payload(mt)} != {widened.get(mt, MAX_RESPONSE_PAYLOAD)}"
+        for mt in range(0x100)
+        if max_response_payload(mt) != widened.get(mt, MAX_RESPONSE_PAYLOAD)
+    ]
     check(
-        "the cap is widened for AckTracked only",
-        max_response_payload(int(MessageType.ACK_TRACKED)) == MAX_TRACKED_ACK_PAYLOAD
-        and all(
-            max_response_payload(mt) == MAX_RESPONSE_PAYLOAD
-            for mt in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xFF)
-        ),
-        "a non-AckTracked type unlocked the wider bound",
+        "the cap is widened for exactly the types that need it",
+        not wrong,
+        f"wrong caps: {wrong}",
     )
 
     # ── The compatibility claim, made executable ──────────────────────────

@@ -31,6 +31,13 @@ const (
 	// If this client ever sends PushTracked, AckTracked (0x07) carries up to
 	// 298 bytes and this must become a per-type function, not a constant.
 	MaxResponsePayload = 2
+
+	// MaxAckBatchPayload bounds an AckBatch (0x09): a 3-byte prefix plus a
+	// bitmap for the 2048-record hard cap. Deliberately under the 298-byte
+	// AckTracked bound, so implementing batching introduces no new largest
+	// response and this client's biggest allocation is unchanged.
+	MaxBatchRecordsHardCap = 2048
+	MaxAckBatchPayload     = 3 + (MaxBatchRecordsHardCap+7)/8 // 259
 )
 
 var magic = [4]byte{'W', 'E', 'I', 'R'} // 0x57 0x45 0x49 0x52
@@ -49,6 +56,8 @@ const (
 	// untouched. A daemon predating these answers Nack(UnknownMessage).
 	MsgPushTracked MessageType = 0x06
 	MsgAckTracked  MessageType = 0x07
+	MsgPushBatch   MessageType = 0x08
+	MsgAckBatch    MessageType = 0x09
 )
 
 func (m MessageType) String() string {
@@ -57,6 +66,10 @@ func (m MessageType) String() string {
 		return "PushTracked"
 	case MsgAckTracked:
 		return "AckTracked"
+	case MsgPushBatch:
+		return "PushBatch"
+	case MsgAckBatch:
+		return "AckBatch"
 	case MsgPush:
 		return "Push"
 	case MsgAck:
@@ -267,7 +280,7 @@ func DecodeFrame(buf []byte) (Frame, error) {
 	mt := MessageType(buf[5])
 	switch mt {
 	case MsgPush, MsgAck, MsgNack, MsgHealthCheck, MsgHealthCheckResponse,
-		MsgPushTracked, MsgAckTracked:
+		MsgPushTracked, MsgAckTracked, MsgPushBatch, MsgAckBatch:
 	default:
 		return Frame{}, ErrUnknownMessageType
 	}
@@ -351,8 +364,11 @@ func (c RecordCoordinate) RecordIDHex() string {
 // bound is widened for exactly that type. Widening it for anything else would
 // let a desynced peer use a stray type byte to unlock a bigger read.
 func maxResponsePayload(mt MessageType) int {
-	if mt == MsgAckTracked {
+	switch mt {
+	case MsgAckTracked:
 		return MaxTrackedAckPayload
+	case MsgAckBatch:
+		return MaxAckBatchPayload
 	}
 	return MaxResponsePayload
 }

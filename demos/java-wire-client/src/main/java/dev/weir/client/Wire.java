@@ -64,21 +64,46 @@ public final class Wire {
     public static final int COORDINATE_FIXED_LEN = 1 + 8 + 32 + 2;
     public static final int MAX_SEGMENT_NAME_LEN = 255;
 
-    /** The largest AckTracked payload, and the only reason the cap is not just 2. */
+    /** The largest AckTracked payload, and one of two reasons the cap is not just 2. */
     public static final int MAX_TRACKED_ACK_PAYLOAD = COORDINATE_FIXED_LEN + MAX_SEGMENT_NAME_LEN;
+
+    /**
+     * AckBatch wire layout (spec "AckBatch payload"):
+     *
+     * <pre>
+     *   0   1   ack_batch_version (0x01)
+     *   1   2   record_count  u16 LE, echoing the PushBatch it answers
+     *   3 var   bitmap        ceil(N/8) bytes, LSB-first within each byte
+     * </pre>
+     *
+     * <p>The 2048 hard cap is chosen so this payload stays under
+     * {@link #MAX_TRACKED_ACK_PAYLOAD}: batching introduces no new largest
+     * response, so this client's biggest allocation is unchanged by it.
+     */
+    public static final byte BATCH_VERSION = 1;
+    public static final byte ACK_BATCH_VERSION = 1;
+    public static final int BATCH_HEADER_LEN = 1 + 2;
+    public static final int ACK_BATCH_HEADER_LEN = 1 + 2;
+    public static final int MAX_BATCH_RECORDS_HARD_CAP = 2048;
+    public static final int MAX_ACK_BATCH_PAYLOAD =
+            ACK_BATCH_HEADER_LEN + (MAX_BATCH_RECORDS_HARD_CAP + 7) / 8; // 259
 
     /**
      * Cap for a response of this type, applied before any allocation.
      *
-     * <p>{@code AckTracked} is the only weir response whose payload exceeds two
-     * bytes, so the bound is widened for exactly that type. Widening it for
-     * anything else would let a desynced peer use a stray type byte to unlock a
-     * bigger read.
+     * <p>Widened for exactly the two response types whose payload can exceed
+     * two bytes, and for nothing else: a desynced peer must not be able to use
+     * a stray type byte to unlock a bigger read.
      */
     public static int maxResponsePayload(int messageTypeByte) {
-        return (messageTypeByte & 0xFF) == (MessageType.ACK_TRACKED.code & 0xFF)
-                ? MAX_TRACKED_ACK_PAYLOAD
-                : MAX_RESPONSE_PAYLOAD;
+        int b = messageTypeByte & 0xFF;
+        if (b == (MessageType.ACK_TRACKED.code & 0xFF)) {
+            return MAX_TRACKED_ACK_PAYLOAD;
+        }
+        if (b == (MessageType.ACK_BATCH.code & 0xFF)) {
+            return MAX_ACK_BATCH_PAYLOAD;
+        }
+        return MAX_RESPONSE_PAYLOAD;
     }
 
     /** Message type bytes (see spec "Message types" table). */
@@ -94,7 +119,9 @@ public final class Wire {
          * are untouched. A daemon predating these answers Nack(UnknownMessage).
          */
         PUSH_TRACKED((byte) 0x06),
-        ACK_TRACKED((byte) 0x07);
+        ACK_TRACKED((byte) 0x07),
+        PUSH_BATCH((byte) 0x08),
+        ACK_BATCH((byte) 0x09);
 
         public final byte code;
 

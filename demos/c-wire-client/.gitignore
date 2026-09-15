@@ -8,5 +8,6 @@
 # "Exec format error". `act` reproduced exactly that locally.
 conformance
 conformance_tracked
+conformance_batch
 telemetry
 negative

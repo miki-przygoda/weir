@@ -116,11 +116,25 @@ public final class TrackedConformanceRunner {
         check("the cap is widened for AckTracked",
               Wire.maxResponsePayload(0x07) == Wire.MAX_TRACKED_ACK_PAYLOAD,
               "got " + Wire.maxResponsePayload(0x07));
-        for (int mt : new int[] {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xFF}) {
-            check(String.format("the cap stays %d for type 0x%02x", Wire.MAX_RESPONSE_PAYLOAD, mt),
-                  Wire.maxResponsePayload(mt) == Wire.MAX_RESPONSE_PAYLOAD,
-                  "a non-AckTracked type unlocked the wider bound");
+        // Swept over ALL 256 type bytes, not over a list of the types that
+        // exist today. The list this replaced held 0x01-0x06 and 0xFF, so when
+        // AckBatch (0x09) was given a wider cap the check still passed while
+        // the property it named had quietly become false.
+        StringBuilder wrongCaps = new StringBuilder();
+        for (int mt = 0; mt <= 0xFF; mt++) {
+            int want = Wire.MAX_RESPONSE_PAYLOAD;
+            if (mt == (Wire.MessageType.ACK_TRACKED.code & 0xFF)) {
+                want = Wire.MAX_TRACKED_ACK_PAYLOAD;
+            } else if (mt == (Wire.MessageType.ACK_BATCH.code & 0xFF)) {
+                want = Wire.MAX_ACK_BATCH_PAYLOAD;
+            }
+            if (Wire.maxResponsePayload(mt) != want) {
+                wrongCaps.append(String.format(" 0x%02x:%d!=%d",
+                        mt, Wire.maxResponsePayload(mt), want));
+            }
         }
+        check("the cap is widened for exactly the types that need it",
+              wrongCaps.length() == 0, wrongCaps.toString());
 
         // ---- A record holding a byte[] needs value semantics ----
         // The compiler-generated equals/hashCode use array IDENTITY, so two

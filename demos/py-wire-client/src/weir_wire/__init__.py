@@ -8,15 +8,23 @@ from .client import (
     WeirError,
 )
 from .codec import (
+    MAX_ACK_BATCH_PAYLOAD,
+    MAX_BATCH_RECORDS_HARD_CAP,
     MAX_PAYLOAD_HARD_CAP,
     WIRE_VERSION,
+    BatchError,
     DecodeError,
     Durability,
     Frame,
     MessageType,
     NackReason,
+    decode_ack_batch,
+    decode_batch_body,
     decode_frame,
+    encode_ack_batch,
+    encode_batch_body,
     encode_frame,
+    max_response_payload,
 )
 
 __all__ = [
@@ -34,4 +42,12 @@ __all__ = [
     "NackReason",
     "WIRE_VERSION",
     "MAX_PAYLOAD_HARD_CAP",
+    "encode_batch_body",
+    "decode_batch_body",
+    "encode_ack_batch",
+    "decode_ack_batch",
+    "BatchError",
+    "MAX_BATCH_RECORDS_HARD_CAP",
+    "MAX_ACK_BATCH_PAYLOAD",
+    "max_response_payload",
 ]

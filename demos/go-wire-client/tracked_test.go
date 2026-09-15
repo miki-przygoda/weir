@@ -174,16 +174,26 @@ func TestTrackedIndexSurvivesU64Max(t *testing.T) {
 }
 
 // The response cap is what tracked push actually changes on the read path.
-func TestTrackedResponseCapIsWidenedForAckTrackedOnly(t *testing.T) {
-	if got := maxResponsePayload(MsgAckTracked); got != MaxTrackedAckPayload {
-		t.Errorf("AckTracked cap = %d, want %d", got, MaxTrackedAckPayload)
+//
+// The sweep is over ALL 256 type bytes, not over a list of the types that exist
+// today. A list stops covering the type space the moment a byte is assigned:
+// this guard enumerated 0x01-0x06 and 0xFF, so when AckBatch (0x09) was given a
+// wider cap the guard still passed while the property it names -- "only
+// AckTracked is widened" -- had quietly become false. A sweep states the
+// property over the whole space and cannot go stale.
+func TestResponseCapIsWidenedForExactlyTheTypesThatNeedIt(t *testing.T) {
+	widened := map[MessageType]int{
+		MsgAckTracked: MaxTrackedAckPayload,
+		MsgAckBatch:   MaxAckBatchPayload,
 	}
-	for _, mt := range []MessageType{
-		MsgPush, MsgAck, MsgNack, MsgHealthCheck, MsgHealthCheckResponse,
-		MsgPushTracked, MessageType(0xff),
-	} {
-		if got := maxResponsePayload(mt); got != MaxResponsePayload {
-			t.Errorf("%s unlocked the wider cap (%d); only AckTracked may", mt, got)
+	for b := 0; b <= 0xFF; b++ {
+		mt := MessageType(b)
+		want, special := widened[mt]
+		if !special {
+			want = MaxResponsePayload
+		}
+		if got := maxResponsePayload(mt); got != want {
+			t.Errorf("type %#02x (%s): cap = %d, want %d", b, mt, got, want)
 		}
 	}
 

@@ -41,6 +41,8 @@ export const MessageType = {
   // untouched. A daemon predating these answers Nack(UnknownMessage).
   PushTracked: 0x06,
   AckTracked: 0x07,
+  PushBatch: 0x08,
+  AckBatch: 0x09,
 } as const;
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
 
@@ -203,6 +205,8 @@ const VALID_MESSAGE_TYPES = new Set<number>([
   MessageType.HealthCheckResponse,
   MessageType.PushTracked,
   MessageType.AckTracked,
+  MessageType.PushBatch,
+  MessageType.AckBatch,
 ]);
 
 const VALID_DURABILITY = new Set<number>([
@@ -289,6 +293,25 @@ export const MAX_SEGMENT_NAME_LEN = 255;
 export const MAX_TRACKED_ACK_PAYLOAD = COORDINATE_FIXED_LEN + MAX_SEGMENT_NAME_LEN; // 298
 
 /**
+ * AckBatch wire layout (docs/wire_protocol.md, "AckBatch payload"):
+ *
+ *     0   1   ack_batch_version (0x01)
+ *     1   2   record_count  u16 LE, echoing the PushBatch it answers
+ *     3 var   bitmap        ceil(N/8) bytes, LSB-first within each byte
+ *
+ * The 2048 hard cap is chosen so this payload stays under
+ * MAX_TRACKED_ACK_PAYLOAD: batching introduces no new largest response, so this
+ * client's biggest allocation is unchanged by implementing it.
+ */
+export const BATCH_VERSION = 1;
+export const ACK_BATCH_VERSION = 1;
+export const BATCH_HEADER_LEN = 1 + 2;
+export const ACK_BATCH_HEADER_LEN = 1 + 2;
+export const MAX_BATCH_RECORDS_HARD_CAP = 2048;
+export const MAX_ACK_BATCH_PAYLOAD =
+  ACK_BATCH_HEADER_LEN + Math.ceil(MAX_BATCH_RECORDS_HARD_CAP / 8); // 259
+
+/**
  * Where a tracked record landed in the buffer.
  *
  * An address, not a sequence: other producers interleave in the same segment,
@@ -319,12 +342,14 @@ export const MAX_RESPONSE_PAYLOAD = 2;
 /**
  * Cap for a response of this type, applied before any allocation.
  *
- * AckTracked is the only weir response whose payload exceeds two bytes, so the
- * bound is widened for exactly that type. Widening it for anything else would
- * let a desynced peer use a stray type byte to unlock a bigger read.
+ * Widened for exactly the two response types whose payload can exceed two
+ * bytes, and for nothing else: a desynced peer must not be able to use a stray
+ * type byte to unlock a bigger read.
  */
 export function maxResponsePayload(messageType: number): number {
-  return messageType === MessageType.AckTracked ? MAX_TRACKED_ACK_PAYLOAD : MAX_RESPONSE_PAYLOAD;
+  if (messageType === MessageType.AckTracked) return MAX_TRACKED_ACK_PAYLOAD;
+  if (messageType === MessageType.AckBatch) return MAX_ACK_BATCH_PAYLOAD;
+  return MAX_RESPONSE_PAYLOAD;
 }
 
 /**
@@ -372,4 +397,170 @@ export function decodeCoordinate(buf: Buffer): RecordCoordinate {
   }
 
   return { segment, index, recordId };
+}
+
+// ── Batch extension (PushBatch 0x08 / AckBatch 0x09) ─────────────────────────
+//
+// Implemented from docs/wire_protocol.md and checked against
+// docs/conformance/wire_v1_batch_vectors.json. Nothing here is ported from the
+// Rust reference: an independent implementation is the only thing that catches
+// an under-specified format, and this one has a bug class no checksum detects
+// — a bitmap written with the opposite bit order is a well-formed frame, valid
+// CRCs and correct length, that reports failures as successes.
+//
+// Bit i lives in byte i >> 3 at mask 1 << (i & 7): LSB-first.
+
+/** Why a PushBatch body or AckBatch payload could not be decoded. */
+export type BatchErrorKind =
+  | "Truncated"
+  | "UnsupportedVersion"
+  | "EmptyBatch"
+  | "TooManyRecords"
+  | "EmptyRecord"
+  | "RecordTooLarge"
+  | "TruncatedRecord"
+  | "LengthMismatch"
+  | "PaddingNotZero";
+
+/** `kind` matches the conformance-vector tags, so a failure names its vector. */
+export class BatchError extends Error {
+  // Explicit fields, not constructor parameter properties: parameter properties
+  // are non-erasable TS syntax and throw under Node strip-only mode, which is
+  // how CI runs this file.
+  kind: BatchErrorKind;
+  detail?: string;
+  constructor(kind: BatchErrorKind, detail?: string) {
+    super(detail ? `${kind}: ${detail}` : kind);
+    this.name = "BatchError";
+    this.kind = kind;
+    this.detail = detail;
+  }
+}
+
+/** A PushBatch body: version, u16 count, then u32-length-prefixed records. */
+export function encodeBatchBody(records: readonly Buffer[]): Buffer {
+  let n = BATCH_HEADER_LEN;
+  for (const r of records) n += 4 + r.length;
+  const out = Buffer.alloc(n);
+  out.writeUInt8(BATCH_VERSION, 0);
+  out.writeUInt16LE(records.length, 1);
+  let p = BATCH_HEADER_LEN;
+  for (const r of records) {
+    out.writeUInt32LE(r.length, p);
+    p += 4;
+    r.copy(out, p);
+    p += r.length;
+  }
+  return out;
+}
+
+/**
+ * Parse a PushBatch body into views of `body`.
+ *
+ * The check ORDER is part of the contract. The declared count is validated
+ * against the cap BEFORE anything is sized by it, and a record's declared
+ * length is checked against the cap BEFORE it is added to the cursor. The
+ * frame's payload CRC has already passed by this point and proves nothing here:
+ * a hostile peer computes a perfectly valid CRC over a body declaring 65,535
+ * records in three bytes.
+ */
+export function decodeBatchBody(
+  body: Buffer,
+  maxRecords: number = MAX_BATCH_RECORDS_HARD_CAP,
+  maxRecordLen: number = MAX_PAYLOAD_HARD_CAP,
+): Buffer[] {
+  if (body.length < BATCH_HEADER_LEN) {
+    throw new BatchError("Truncated", `${body.length} < ${BATCH_HEADER_LEN}`);
+  }
+  if (body.readUInt8(0) !== BATCH_VERSION) {
+    throw new BatchError("UnsupportedVersion", `version ${body.readUInt8(0)}`);
+  }
+  const declared = body.readUInt16LE(1);
+  if (declared === 0) throw new BatchError("EmptyBatch");
+  const cap = Math.min(maxRecords, MAX_BATCH_RECORDS_HARD_CAP);
+  if (declared > cap) throw new BatchError("TooManyRecords", `${declared} > ${cap}`);
+
+  const recordCap = Math.min(maxRecordLen, MAX_PAYLOAD_HARD_CAP);
+  const records: Buffer[] = [];
+  let cursor = BATCH_HEADER_LEN;
+  while (cursor < body.length) {
+    if (cursor + 4 > body.length) throw new BatchError("TruncatedRecord", `record ${records.length}`);
+    const n = body.readUInt32LE(cursor);
+    cursor += 4;
+    if (n === 0) throw new BatchError("EmptyRecord", `record ${records.length}`);
+    if (n > recordCap) throw new BatchError("RecordTooLarge", `record ${records.length}: ${n} > ${recordCap}`);
+    if (cursor + n > body.length) throw new BatchError("TruncatedRecord", `record ${records.length}`);
+    // Stop before overrunning the declared count, so a body carrying more
+    // records than it declares is a mismatch rather than a silent drop.
+    if (records.length === declared) {
+      throw new BatchError("LengthMismatch", `more than the declared ${declared}`);
+    }
+    records.push(body.subarray(cursor, cursor + n));
+    cursor += n;
+  }
+  if (records.length !== declared || cursor !== body.length) {
+    throw new BatchError("LengthMismatch", `declared ${declared}, found ${records.length}`);
+  }
+  return records;
+}
+
+/**
+ * An AckBatch payload from per-record outcomes.
+ * Padding bits in the final byte are left zero, which the decoder requires.
+ */
+export function encodeAckBatch(accepted: readonly boolean[]): Buffer {
+  const out = Buffer.alloc(ACK_BATCH_HEADER_LEN + Math.ceil(accepted.length / 8));
+  out.writeUInt8(ACK_BATCH_VERSION, 0);
+  out.writeUInt16LE(accepted.length, 1);
+  for (let i = 0; i < accepted.length; i++) {
+    if (accepted[i]) out[ACK_BATCH_HEADER_LEN + (i >> 3)] |= 1 << (i & 7);
+  }
+  return out;
+}
+
+/**
+ * Parse an AckBatch payload into per-record outcomes.
+ *
+ * `expected` is the count this client sent. A bitmap is the first weir response
+ * whose meaning depends on client-held state — an Ack says "your last record"
+ * and an AckTracked carries its own coordinate, but a bitmap is meaningless
+ * without knowing which batch it answers. ceil(N/8) is not injective (N of 1017
+ * through 1024 all give 131 bytes), so the echoed count is the only thing that
+ * can catch a desync.
+ *
+ * A set bit means the record is durable at the requested tier and inherits
+ * weir's crown invariant. A CLEAR bit is the weak statement: not durable as of
+ * this reply, retry it, and expect it may nonetheless have been written.
+ */
+export function decodeAckBatch(payload: Buffer, expected: number): boolean[] {
+  if (payload.length < ACK_BATCH_HEADER_LEN) {
+    throw new BatchError("Truncated", `${payload.length} < ${ACK_BATCH_HEADER_LEN}`);
+  }
+  if (payload.readUInt8(0) !== ACK_BATCH_VERSION) {
+    throw new BatchError("UnsupportedVersion", `version ${payload.readUInt8(0)}`);
+  }
+  const declared = payload.readUInt16LE(1);
+  if (declared === 0) throw new BatchError("EmptyBatch");
+  if (declared !== expected) {
+    throw new BatchError("LengthMismatch", `reply answers ${declared}, we sent ${expected}`);
+  }
+  const want = ACK_BATCH_HEADER_LEN + Math.ceil(declared / 8);
+  if (payload.length !== want) {
+    throw new BatchError("LengthMismatch", `${payload.length} bytes, need ${want}`);
+  }
+  // Padding bits must be zero. Ignoring them would make popcount === N — the
+  // obvious way to ask "did the whole batch succeed" — silently wrong.
+  const used = declared % 8;
+  if (used !== 0) {
+    const last = payload[payload.length - 1];
+    if ((last & ~((1 << used) - 1) & 0xff) !== 0) {
+      throw new BatchError("PaddingNotZero", `final byte ${last.toString(16)}`);
+    }
+  }
+  const bits = payload.subarray(ACK_BATCH_HEADER_LEN);
+  const out: boolean[] = new Array(declared);
+  for (let i = 0; i < declared; i++) {
+    out[i] = (bits[i >> 3] & (1 << (i & 7))) !== 0;
+  }
+  return out;
 }

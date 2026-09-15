@@ -45,6 +45,21 @@
 #define WEIR_MAX_TRACKED_ACK_PAYLOAD \
     (WEIR_COORDINATE_FIXED_LEN + WEIR_MAX_SEGMENT_NAME_LEN)  /* 298 */
 
+/* AckBatch layout (docs: "AckBatch payload"):
+ *   0   1   ack_batch_version (0x01)
+ *   1   2   record_count  u16 LE, echoing the PushBatch it answers
+ *   3 var   bitmap        ceil(N/8) bytes, LSB-first within each byte
+ *
+ * The 2048 hard cap is chosen so this stays under WEIR_MAX_TRACKED_ACK_PAYLOAD:
+ * batching introduces no new largest response, so no caller's buffer grows. */
+#define WEIR_BATCH_VERSION           1
+#define WEIR_ACK_BATCH_VERSION       1
+#define WEIR_BATCH_HEADER_LEN        (1 + 2)
+#define WEIR_ACK_BATCH_HEADER_LEN    (1 + 2)
+#define WEIR_MAX_BATCH_RECORDS       2048
+#define WEIR_MAX_ACK_BATCH_PAYLOAD \
+    (WEIR_ACK_BATCH_HEADER_LEN + (WEIR_MAX_BATCH_RECORDS + 7) / 8)  /* 259 */
+
 /* MessageType bytes (docs: "Message types"). */
 typedef enum {
     WEIR_MSG_PUSH                 = 0x01, /* client -> daemon */
@@ -56,7 +71,9 @@ typedef enum {
      * exactly this, so WIRE_VERSION stays 1 and the 30 frozen vectors are
      * untouched. A daemon predating these answers Nack(UnknownMessage). */
     WEIR_MSG_PUSH_TRACKED         = 0x06, /* client -> daemon */
-    WEIR_MSG_ACK_TRACKED          = 0x07  /* daemon -> client */
+    WEIR_MSG_ACK_TRACKED          = 0x07, /* daemon -> client */
+    WEIR_MSG_PUSH_BATCH           = 0x08, /* client -> daemon */
+    WEIR_MSG_ACK_BATCH            = 0x09  /* daemon -> client */
 } weir_msg_type;
 
 /* Where a tracked record landed. An ADDRESS, not a sequence: other producers
@@ -123,8 +140,75 @@ typedef enum {
     WEIR_ERR_TRACKED_UNSUPPORTED   = -16,
     /* A bare Ack in reply to a PushTracked: the peer did not understand the
      * request, so the record may be durable but its coordinate is unknown. */
-    WEIR_ERR_TRACKED_BARE_ACK      = -17
+    WEIR_ERR_TRACKED_BARE_ACK      = -17,
+    /* Batch rejection tags, matching the conformance vector names. */
+    WEIR_ERR_BATCH_TRUNCATED       = -19,
+    WEIR_ERR_BATCH_BAD_VERSION     = -20, /* UnsupportedVersion */
+    WEIR_ERR_BATCH_EMPTY           = -21, /* EmptyBatch */
+    WEIR_ERR_BATCH_TOO_MANY        = -22, /* TooManyRecords */
+    WEIR_ERR_BATCH_EMPTY_RECORD    = -23,
+    WEIR_ERR_BATCH_RECORD_TOO_LARGE= -24,
+    WEIR_ERR_BATCH_TRUNC_RECORD    = -25, /* TruncatedRecord */
+    WEIR_ERR_BATCH_LENGTH_MISMATCH = -26,
+    WEIR_ERR_BATCH_PADDING_NOT_ZERO= -27
 } weir_result;
+
+/* One record inside a decoded PushBatch body: a view INTO the caller's buffer,
+ * never a copy. Valid only while that buffer is. */
+typedef struct {
+    const uint8_t *data;
+    size_t         len;
+} weir_batch_record;
+
+/*
+ * Encode a PushBatch body: version, u16 count, then each record as a u32
+ * little-endian length followed by its bytes.
+ *
+ * Does NOT enforce the caps -- the decoder does, and the conformance suite
+ * needs to build deliberately-oversized bodies to check that it happens.
+ */
+weir_result weir_encode_batch_body(const weir_batch_record *records, size_t count,
+                                   uint8_t *out, size_t out_cap, size_t *out_len);
+
+/*
+ * Decode a PushBatch body into views of `body`.
+ *
+ * The check ORDER is part of the contract: the declared count is validated
+ * against the cap BEFORE it is used to size anything, and a record's declared
+ * length is checked against the cap BEFORE it is added to the cursor. The
+ * frame's payload CRC has already passed at this point and proves nothing here
+ * -- a hostile peer computes a perfectly valid CRC over a body declaring 65,535
+ * records in three bytes.
+ */
+weir_result weir_decode_batch_body(const uint8_t *body, size_t body_len,
+                                   size_t max_records, size_t max_record_len,
+                                   weir_batch_record *out, size_t out_cap,
+                                   size_t *out_count);
+
+/*
+ * Encode an AckBatch payload from per-record outcomes.
+ * Padding bits in the final byte are left zero, which the decoder requires.
+ */
+weir_result weir_encode_ack_batch(const uint8_t *accepted, size_t count,
+                                  uint8_t *out, size_t out_cap, size_t *out_len);
+
+/*
+ * Decode an AckBatch payload into per-record outcomes (1 = accepted).
+ *
+ * `expected` is the count this client sent. A bitmap is the first weir response
+ * whose meaning depends on client-held state -- an Ack says "your last record"
+ * and an AckTracked carries its own coordinate, but a bitmap is meaningless
+ * without knowing which batch it answers. ceil(N/8) is not injective (N of 1017
+ * through 1024 all give 131 bytes), so the echoed count is the only thing that
+ * can catch a desync.
+ *
+ * A set bit means durable at the requested tier and inherits weir's crown
+ * invariant. A CLEAR bit is the weak statement: not durable as of this reply,
+ * retry it, and expect it may nonetheless have been written.
+ */
+weir_result weir_decode_ack_batch(const uint8_t *payload, size_t payload_len,
+                                  size_t expected,
+                                  uint8_t *out, size_t out_cap);
 
 /* CRC-32 / ISO-3309 (zlib / crc32fast). poly 0x04C11DB7, refin/refout,
  * init 0xFFFFFFFF, xorout 0xFFFFFFFF. */

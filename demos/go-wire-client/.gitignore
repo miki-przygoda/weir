@@ -1,0 +1,8 @@
+# `go build` output, named after the module in go.mod.
+#
+# It was COMMITTED — a 3.4 MB macOS arm64 Mach-O reached the repo in e023a14,
+# because this directory had no .gitignore while its sibling in c-wire-client
+# did. That file exists precisely because the same accident happened there, and
+# its comment describes what a committed binary does to a Linux CI runner. A
+# policy written down in one client's directory does not protect the other four.
+weir-wire-client
