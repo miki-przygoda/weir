@@ -73,6 +73,18 @@ weir_result weir_recv_response(int fd, weir_response *resp) {
     /* Frame the rest: exactly payload_len + 4 CRC bytes. */
     uint8_t tail[WEIR_MAX_RESPONSE_PAYLOAD + WEIR_CRC_LEN];
     size_t tail_len = resp->hdr.payload_len + WEIR_CRC_LEN;
+    /* This buffer is sized for the 2-byte cap, and weir_decode_resp_header no
+     * longer enforces that cap -- it enforces the cap for the DECLARED TYPE,
+     * which is 298 for AckTracked and 259 for AckBatch. Without this check a
+     * conformant daemon's AckTracked overflows `tail` by 296 bytes, and it does
+     * not take a hostile peer: this client's own batch codec has no receiver of
+     * its own, so a program using it reads its AckBatch through this function.
+     *
+     * weir_recv_tracked_response has carried the identical guard since it was
+     * written; this one was left behind when the cap became per-type.
+     * Responses wider than this frame belong to the callers that allocate for
+     * them. */
+    if (tail_len > sizeof tail) return WEIR_ERR_RESP_TOO_LARGE;
     r = read_exact(fd, tail, tail_len);
     if (r != WEIR_OK) return r;
 
