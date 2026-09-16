@@ -22,9 +22,11 @@
 
 pub mod chain;
 pub mod sidecar;
+pub mod verify;
 
 pub use chain::{ChainHead, DOMAIN_SEP};
 pub use sidecar::{ATTEST_FORMAT_VERSION, ATTEST_MAGIC, Sidecar};
+pub use verify::{chain_segment, segment_name_for};
 
 /// Why an attest operation failed.
 #[derive(Debug)]
