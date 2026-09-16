@@ -456,7 +456,12 @@ fn every_workspace_member_is_in_the_docker_builder() {
         .map(|(list, _)| list)
         .expect("root Cargo.toml has a members array")
         .lines()
-        .filter_map(|l| l.trim().trim_end_matches(',').trim_matches('"').strip_prefix("crates/"))
+        .filter_map(|l| {
+            l.trim()
+                .trim_end_matches(',')
+                .trim_matches('"')
+                .strip_prefix("crates/")
+        })
         .filter(|n| !n.is_empty())
         .collect();
 
