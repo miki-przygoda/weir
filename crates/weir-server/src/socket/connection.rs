@@ -449,11 +449,23 @@ where
                             _ => WireNack::BadBatchFraming,
                         };
                         send_nack(stream.get_mut(), reason, &[], config.read_timeout).await?;
+                        // The metric label must be the reason that went out on the
+                        // wire. It used to be `internal_error` unconditionally,
+                        // which is the single reason the protocol defines as
+                        // TRANSIENT — while every branch above is permanent and
+                        // closes the connection two lines down. A client with a
+                        // broken batch encoder would have driven the counter
+                        // operators read as daemon saturation, and no dashboard
+                        // could have told the two apart.
                         metrics
                             .records_nack
                             .get_or_create(&NackLabel {
                                 tier: tv,
-                                reason: MetricNack::internal_error,
+                                reason: match reason {
+                                    WireNack::EmptyPayload => MetricNack::empty_payload,
+                                    WireNack::PayloadTooLarge => MetricNack::payload_too_large,
+                                    _ => MetricNack::bad_batch_framing,
+                                },
                             })
                             .inc();
                         return Ok(());

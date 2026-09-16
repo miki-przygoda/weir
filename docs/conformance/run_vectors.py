@@ -263,7 +263,7 @@ def decode_ack_batch(payload: bytes, expected: int):
 
     `expected` is the count the client sent. A bitmap is the first weir response
     whose meaning depends on client-held state, and ceil(N/8) is not injective —
-    N of 1017 through 1024 all give 131 bytes — so the echoed count is the only
+    N of 1017 through 1024 all give 128 bitmap bytes — so the echoed count is the only
     thing that can catch a desync.
 
     Bit i is byte i//8 at mask 1 << (i % 8): LSB-first. Getting this backwards

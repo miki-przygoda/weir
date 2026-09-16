@@ -343,7 +343,8 @@ A decoder must also check the echoed `record_count` against the count it sent.
 An `AckBatch` is the first weir response whose meaning depends on client-held
 state: an `Ack` says "your last record" and an `AckTracked` carries its own
 coordinate, but a bitmap is meaningless without knowing which batch it answers.
-`ceil(N/8)` is not injective — N of 1017 through 1024 all yield 131 bytes — so
+`ceil(N/8)` is not injective — N of 1017 through 1024 all yield 128 bitmap
+bytes, a 131-byte payload — so
 the echoed count is the only thing that can catch a desync.
 
 ### What a bit means
