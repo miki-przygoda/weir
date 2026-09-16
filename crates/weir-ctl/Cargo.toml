@@ -21,6 +21,9 @@ weir-client = { workspace = true }
 # segments using the SAME parser the daemon uses, without pulling in the
 # daemon's async/sink dep tree.
 weir-wab = { workspace = true }
+# The chain lives in its own crate so the daemon's ack path never pays for it;
+# weir-ctl is where an operator drives it from.
+weir-attest = { workspace = true }
 # clap with derive for the subcommand surface + env for the WEIR_WAB_DIR
 # fallback on --wab-dir. The proc-macro build cost is already paid elsewhere in
 # the workspace (serde derive, etc.).

@@ -27,6 +27,7 @@ COPY crates/weir-sink-s3/Cargo.toml  crates/weir-sink-s3/Cargo.toml
 COPY crates/weir-ctl/Cargo.toml      crates/weir-ctl/Cargo.toml
 COPY crates/weir-testkit/Cargo.toml  crates/weir-testkit/Cargo.toml
 COPY crates/weir-rs/Cargo.toml       crates/weir-rs/Cargo.toml
+COPY crates/weir-attest/Cargo.toml   crates/weir-attest/Cargo.toml
 
 # Stub sources so Cargo can resolve the workspace and compile dependencies.
 RUN mkdir -p \
@@ -38,7 +39,8 @@ RUN mkdir -p \
         crates/weir-sink-s3/src \
         crates/weir-ctl/src \
         crates/weir-testkit/src \
-        crates/weir-rs/src && \
+        crates/weir-rs/src \
+        crates/weir-attest/src && \
     echo 'fn main(){}' > crates/weir-server/src/main.rs && \
     echo 'fn main(){}' > crates/weir-ctl/src/main.rs && \
     touch \
@@ -48,7 +50,8 @@ RUN mkdir -p \
         crates/weir-sink-sdk/src/lib.rs \
         crates/weir-sink-s3/src/lib.rs \
         crates/weir-testkit/src/lib.rs \
-        crates/weir-rs/src/lib.rs
+        crates/weir-rs/src/lib.rs \
+        crates/weir-attest/src/lib.rs
 
 # --locked enforces that Cargo.lock is used verbatim; cargo refuses to update
 # it during the build. Without --locked, a transient lockfile-resolution issue

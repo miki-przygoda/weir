@@ -26,6 +26,7 @@ canonical CRC is `zlib.crc32` (IEEE / ISO-3309, the same polynomial as Go's
 `hash/crc32.IEEETable` and Java's `java.util.zip.CRC32`) — NOT CRC-32C.
 """
 
+import hashlib
 import json
 import pathlib
 import struct
@@ -39,6 +40,10 @@ VECTORS = pathlib.Path(__file__).with_name("wire_v1_vectors.json")
 TRACKED_VECTORS = pathlib.Path(__file__).with_name("wire_v1_tracked_vectors.json")
 # The batch extension, likewise in its own file and for the same reason.
 BATCH_VECTORS = pathlib.Path(__file__).with_name("wire_v1_batch_vectors.json")
+# weir-attest's chain construction — a different protocol entirely (a hash
+# chain over sealed segments, not a wire frame), kept in its own file and
+# checked by its own section near the bottom.
+ATTEST_VECTORS = pathlib.Path(__file__).with_name("attest_v1_vectors.json")
 
 MAGIC = b"WEIR"
 WIRE_VERSION = 1
@@ -388,6 +393,100 @@ def check_batch() -> tuple:
     return passed, failed
 
 
+# ── ATTEST: weir-attest's chain construction ────────────────────────────────
+#
+# Not a wire frame: a hash chain over sealed WAB segments. Written out here
+# independently of `gen_attest_vectors.py` — this is a THIRD implementation of
+# the same formula (Rust's `weir-attest`, the generator that produced the
+# frozen vectors, and this checker), so a bug shared only by the generator and
+# the Rust code would still need to be reproduced a third time, by hand, in a
+# script that never imports either, to slip past every check in this repo.
+
+ATTEST_DOMAIN_SEP = b"weir-attest-v1"
+
+
+def attest_record_id(segment: str, index: int, payload: bytes) -> bytes:
+    """RecordId = SHA256(len(segment) u64 LE ++ segment ++ index u64 LE ++
+    len(payload) u64 LE ++ payload). `index` is 1-based."""
+    h = hashlib.sha256()
+    h.update(len(segment.encode()).to_bytes(8, "little"))
+    h.update(segment.encode())
+    h.update(index.to_bytes(8, "little"))
+    h.update(len(payload).to_bytes(8, "little"))
+    h.update(payload)
+    return h.digest()
+
+
+def attest_chain_origin(prev_head: bytes, format_version: int, shard_id: int,
+                         created_at: int, segment_name: str) -> bytes:
+    """H0 = SHA256(domain_sep ++ prev_head ++ format_version(1) ++
+    shard_id u16 LE ++ created_at i64 LE ++ len(segment_name) u64 LE ++
+    segment_name)."""
+    h = hashlib.sha256()
+    h.update(ATTEST_DOMAIN_SEP)
+    h.update(prev_head)
+    h.update(bytes([format_version]))
+    h.update(shard_id.to_bytes(2, "little"))
+    h.update(created_at.to_bytes(8, "little", signed=True))
+    name = segment_name.encode()
+    h.update(len(name).to_bytes(8, "little"))
+    h.update(name)
+    return h.digest()
+
+
+def attest_chain_step(prev_head: bytes, rid: bytes) -> bytes:
+    """Hi = SHA256(H(i-1) ++ RecordId_i)."""
+    return hashlib.sha256(prev_head + rid).digest()
+
+
+def check_attest() -> tuple:
+    """Runs the attest chain vectors. Returns (passed, failed)."""
+    if not ATTEST_VECTORS.exists():
+        return 0, 0
+    doc = json.loads(ATTEST_VECTORS.read_text())
+    if doc.get("domain_sep_hex") != ATTEST_DOMAIN_SEP.hex():
+        print("FAIL attest: domain_sep_hex in the vectors file does not match this checker's")
+        return 0, 1
+
+    passed = failed = 0
+    for v in doc["vectors"]:
+        name = v["name"]
+        prev_head = bytes.fromhex(v["prev_head"])
+        head = attest_chain_origin(
+            prev_head, v["format_version"], v["shard_id"], v["created_at"], v["segment_name"]
+        )
+        if head.hex() != v["h0"]:
+            print(f"FAIL {name}: H0 = {head.hex()}, expected {v['h0']}")
+            failed += 1
+            continue
+
+        divergence = None
+        for i, (record_hex, want_rid, want_h) in enumerate(
+            zip(v["records_hex"], v["record_ids_hex"], v["h_i"]), start=1
+        ):
+            rid = attest_record_id(v["segment_name"], i, bytes.fromhex(record_hex))
+            if rid.hex() != want_rid:
+                print(f"FAIL {name}: RecordId at index {i} = {rid.hex()}, expected {want_rid}")
+                divergence = True
+                break
+            head = attest_chain_step(head, rid)
+            if head.hex() != want_h:
+                print(f"FAIL {name}: H_{i} = {head.hex()}, expected {want_h}")
+                divergence = True
+                break
+        if divergence:
+            failed += 1
+            continue
+
+        if head.hex() != v["head"]:
+            print(f"FAIL {name}: final head = {head.hex()}, expected {v['head']}")
+            failed += 1
+            continue
+        passed += 1
+
+    return passed, failed
+
+
 def check_tracked() -> tuple:
     """Runs the tracked-extension vectors. Returns (passed, failed)."""
     if not TRACKED_VECTORS.exists():
@@ -529,7 +628,16 @@ def main() -> int:
             f"{b_passed}/{b_total} batch-extension vectors passed"
             + (f", {b_failed} FAILED" if b_failed else " — all good")
         )
-    return 1 if (failed or t_failed or b_failed) else 0
+
+    a_passed, a_failed = check_attest()
+    if a_passed or a_failed:
+        a_total = a_passed + a_failed
+        print(
+            f"{a_passed}/{a_total} attest-chain vectors passed"
+            + (f", {a_failed} FAILED" if a_failed else " — all good")
+        )
+
+    return 1 if (failed or t_failed or b_failed or a_failed) else 0
 
 
 if __name__ == "__main__":

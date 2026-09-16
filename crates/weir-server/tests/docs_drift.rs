@@ -435,6 +435,114 @@ fn every_alert_runbook_anchor_resolves_to_a_heading() {
     );
 }
 
+/// Every workspace member must appear in the Docker builder's manifest list.
+///
+/// `deploy/docker/Dockerfile` copies each member's `Cargo.toml` individually and
+/// creates a stub source for it, so Cargo can resolve the workspace before the
+/// real sources are copied. A member missing from that list does not degrade —
+/// the image build fails outright with "failed to load manifest for workspace
+/// member", and it fails in the `docker` workflow, which the Rust gate does not
+/// run.
+///
+/// The Dockerfile's own comment records this happening when `weir-sink-s3`
+/// landed. It happened again when `weir-attest` landed, because a comment is a
+/// note to a human and this is a set-membership property. Deriving the set from
+/// the workspace manifest is what actually holds it closed.
+#[test]
+fn every_workspace_member_is_in_the_docker_builder() {
+    const ROOT_MANIFEST: &str = include_str!("../../../Cargo.toml");
+    const DOCKERFILE: &str = include_str!("../../../deploy/docker/Dockerfile");
+
+    // The `members = [...]` array, as literal `crates/<name>` entries.
+    let members: Vec<&str> = ROOT_MANIFEST
+        .split_once("members = [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(list, _)| list)
+        .expect("root Cargo.toml has a members array")
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .trim_end_matches(',')
+                .trim_matches('"')
+                .strip_prefix("crates/")
+        })
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    assert!(
+        members.len() >= 9,
+        "found only {} workspace members; this guard is no longer reading the \n\
+         manifest correctly",
+        members.len()
+    );
+
+    // Three obligations, each checked against the region of the Dockerfile that
+    // actually carries it. A bare `DOCKERFILE.contains("crates/<name>/src")` is
+    // satisfied by the `touch` list on its own, so deleting a crate's `mkdir -p`
+    // entry — the exact break this guard exists to catch — slipped straight
+    // through the first version of this check.
+    let stub_run = {
+        let (_, rest) = DOCKERFILE
+            .split_once("RUN mkdir -p")
+            .expect("Dockerfile stubs sources with a `RUN mkdir -p` block");
+        // The block runs until the first line that does not continue with `\`.
+        let mut end = rest.len();
+        let mut at = 0;
+        for line in rest.lines() {
+            at += line.len() + 1;
+            if !line.trim_end().ends_with('\\') {
+                end = at.min(rest.len());
+                break;
+            }
+        }
+        &rest[..end]
+    };
+
+    // `mkdir -p` takes every member; the source stub after it is an `echo`ed
+    // `main.rs` for the two binaries and a `touch`ed `lib.rs` for the libraries.
+    let (mkdir_list, source_stubs) = stub_run
+        .split_once("echo ")
+        .expect("stub block writes a binary stub with `echo`");
+
+    let mkdir_entries: Vec<&str> = mkdir_list
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_end_matches('\\')
+                .trim()
+                .trim_end_matches("&&")
+                .trim()
+        })
+        .filter(|l| l.starts_with("crates/"))
+        .collect();
+
+    let mut missing: Vec<String> = Vec::new();
+    for name in &members {
+        if !DOCKERFILE.contains(&format!("COPY crates/{name}/Cargo.toml")) {
+            missing.push(format!("{name}: no `COPY crates/{name}/Cargo.toml` line"));
+        }
+        let dir = format!("crates/{name}/src");
+        if !mkdir_entries.iter().any(|e| *e == dir) {
+            missing.push(format!("{name}: not in the `RUN mkdir -p` list"));
+        }
+        let lib = format!("crates/{name}/src/lib.rs");
+        let main = format!("crates/{name}/src/main.rs");
+        if !source_stubs.contains(&lib) && !source_stubs.contains(&main) {
+            missing.push(format!("{name}: no stub `lib.rs` or `main.rs`"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "deploy/docker/Dockerfile is missing entries for workspace members:\n  \
+         {}\n\n\
+         The image build fails with \"failed to load manifest for workspace \n\
+         member\" — and it fails in the `docker` workflow, which `cargo test` \n\
+         does not exercise.",
+        missing.join("\n  ")
+    );
+}
+
 /// Every alert rule must have a `promtool` unit test.
 ///
 /// Three rules shipped with no test in either direction —

@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "1.3.1"
+version = "3.0.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "weir-server"
-version = "1.3.1"
+version = "3.0.0"
 dependencies = [
  "core_affinity",
  "crc32fast",
@@ -2413,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "weir-sink-sdk"
-version = "1.3.1"
+version = "3.0.0"
 dependencies = [
  "sha2 0.10.9",
  "weir-core",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "weir-wab"
-version = "1.3.1"
+version = "3.0.0"
 dependencies = [
  "crc32fast",
  "weir-core",

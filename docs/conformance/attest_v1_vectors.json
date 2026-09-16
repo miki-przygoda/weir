@@ -1,0 +1,127 @@
+{
+  "domain_sep_hex": "776569722d6174746573742d7631",
+  "description": "Conformance vectors for weir-attest's chain construction: H0 = SHA256(domain_sep ++ prev_head ++ format_version ++ shard_id LE u16 ++ created_at LE i64 ++ len(segment_name) LE u64 ++ segment_name), RecordId = SHA256(len(segment) LE u64 ++ segment ++ index LE u64 ++ len(payload) LE u64 ++ payload) with a 1-based index, and Hi = SHA256(H(i-1) ++ RecordId_i). Generated independently of crates/weir-attest \u2014 this file computes every hash from the spec using stdlib hashlib, sharing no code and no constants by import with the Rust implementation it checks.",
+  "vectors": [
+    {
+      "name": "single_record_chain",
+      "notes": "The smallest possible chain: one record. Pins H0 and a single chain_step together \u2014 get either the domain separator, the header field order, or the fold wrong and this already fails, before any multi-record vector below gets a chance to.",
+      "prev_head": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format_version": 1,
+      "shard_id": 0,
+      "created_at": 0,
+      "segment_name": "shard_00/seg_00000001.wab.sealed",
+      "records_hex": [
+        "736f6c6f"
+      ],
+      "record_ids_hex": [
+        "3132e705d9c8518ea009e6416b44748c0e1f845cdebbe375dc8c4567b97f7047"
+      ],
+      "h0": "f6bc1d07ff4b0a93ecc6fa567ee9da39d5f002d4f422c4150c07c8ef0be353cd",
+      "h_i": [
+        "d46abe750ad385157aeb5f1dfa15a4b3fe453afd1913f5d7f4af83907470328a"
+      ],
+      "head": "d46abe750ad385157aeb5f1dfa15a4b3fe453afd1913f5d7f4af83907470328a"
+    },
+    {
+      "name": "three_record_chain",
+      "notes": "Three records folded in sequence. Pins that h_1, h_2 and the final head (h_3) are each SHA256(previous head ++ that record's RecordId) computed in order \u2014 not three independent digests, and not folded out of order.",
+      "prev_head": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format_version": 1,
+      "shard_id": 7,
+      "created_at": 1700000000000000000,
+      "segment_name": "shard_07/seg_00000001.wab.sealed",
+      "records_hex": [
+        "616c706861",
+        "62657461",
+        "67616d6d61"
+      ],
+      "record_ids_hex": [
+        "d7dced98185b2952a637ebf9dedd9f914966f7b6cb35891d352ef42982d14cf6",
+        "6c69bdcafc63f370b7b636d3da84f6409f21abdda63d77312df6c208fe43a80c",
+        "8b9b0b90c2ec60dd057f05c00b6b173ca0137e88c9c21a1b94dbd72d5a63db66"
+      ],
+      "h0": "864a06d57415792d47513ec7bd72957db82ac75363bca507809a89457c22e476",
+      "h_i": [
+        "57aa90765771e0df6f70f0b339c99128a60fd708b3e7869fa51664c6d183bf15",
+        "74818fc1aab6a9f6ea28361758a6ce4a0e677a50a0be9cc09bcc42375f1c6f73",
+        "6e8cbc60873ffad4b66fc7b9eb3eaae79f71e7232d653ade65b16e4d5e2afc42"
+      ],
+      "head": "6e8cbc60873ffad4b66fc7b9eb3eaae79f71e7232d653ade65b16e4d5e2afc42"
+    },
+    {
+      "name": "three_record_chain_different_segment_name",
+      "notes": "Identical prev_head, header and three records as 'three_record_chain' \u2014 only segment_name changes (\u2026seg_00000001 -> \u2026seg_00000002). Both H0 (which folds the name directly) and every RecordId (which folds the segment a record was read from) depend on it, so the head MUST differ. Catches an implementation that forgets to fold the segment name into H0, or that computes RecordId without it.",
+      "prev_head": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format_version": 1,
+      "shard_id": 7,
+      "created_at": 1700000000000000000,
+      "segment_name": "shard_07/seg_00000002.wab.sealed",
+      "records_hex": [
+        "616c706861",
+        "62657461",
+        "67616d6d61"
+      ],
+      "record_ids_hex": [
+        "1826c3811267ed886e13ca062b69db7b77c13693eedf46f304fc4e4108447128",
+        "3def6b21089ce5b0eab6be5aa855dc77b293a8f2e87dd1ea990f77f4fe728f73",
+        "0f33dea6103dbc529c05f5ec9b8d19cb3e562e1752f23fcea163808901478e7d"
+      ],
+      "h0": "cb706002a1ea504313f28400082687c8b6181eeb0f57f48420395699c405d452",
+      "h_i": [
+        "3743557f5e422ae192a4aeec09389ae82b640d4258ce032f9eff705dc0263ced",
+        "c86874addf47fde3dbdcb4e7ae02bc123e3ba7ca70aaa922c1b6fca9be7a5b9f",
+        "90437711ff44d4f058ee40c1c57dfc83458f2a93138b6b3332fcc7eb639cd18e"
+      ],
+      "head": "90437711ff44d4f058ee40c1c57dfc83458f2a93138b6b3332fcc7eb639cd18e"
+    },
+    {
+      "name": "three_record_chain_reordered",
+      "notes": "Identical prev_head, header, segment_name and three records as 'three_record_chain' \u2014 only the ORDER changes (a rotation: gamma, alpha, beta). RecordId's index is a record's 1-based POSITION within the segment, so reordering reassigns every index as well as the fold order; the resulting head must differ both from 'three_record_chain' and from what an implementation would get if it reordered the fold but forgot to recompute each record's index for its new position.",
+      "prev_head": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format_version": 1,
+      "shard_id": 7,
+      "created_at": 1700000000000000000,
+      "segment_name": "shard_07/seg_00000001.wab.sealed",
+      "records_hex": [
+        "67616d6d61",
+        "616c706861",
+        "62657461"
+      ],
+      "record_ids_hex": [
+        "31d7c7b364289754ef044dba58b6930b4f0daaac9190068a3c17b2e615bdf8f4",
+        "aaa3d3da9c5cef970645e7ec0823dbdd5f2f88790a3cb6ffaeba7906b4466cb7",
+        "25b12b36e47f7bb8aed9eeb739a85cc0ce26b2de1d366d5bca2acde56e0254c0"
+      ],
+      "h0": "864a06d57415792d47513ec7bd72957db82ac75363bca507809a89457c22e476",
+      "h_i": [
+        "cf9ccd9c57f664a91290dcebc42ce0a46eb2c10244ff612eb3464239a728c6a6",
+        "c255b6c69a8b20bbb1d7cb63530a7ff7fe661074273d660d9f8be4cc360ccd8e",
+        "df28e551df0298d7b07bcbb3c7b5bb84bdbb973251a2c747fec439c424a404d0"
+      ],
+      "head": "df28e551df0298d7b07bcbb3c7b5bb84bdbb973251a2c747fec439c424a404d0"
+    },
+    {
+      "name": "nonzero_prev_head",
+      "notes": "prev_head is a non-zero, non-repeating 32-byte pattern (bytes 0x00..0x1f) rather than ChainHead::ORIGIN, so an implementation that silently hardcodes the origin as H0's predecessor fails here even though every vector above it (all origin-rooted) would still pass. shard_id is 0x1234, whose little-endian encoding (34 12) is not a palindrome, and created_at is -1 (all-ones once sign-extended to 8 bytes) \u2014 both chosen so a byte-order mistake or an unsigned-i64 mistake changes the digest rather than coincidentally matching.",
+      "prev_head": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "format_version": 1,
+      "shard_id": 4660,
+      "created_at": -1,
+      "segment_name": "shard_ab/seg_00000009.wab.sealed",
+      "records_hex": [
+        "64656c7461",
+        "657073696c6f6e"
+      ],
+      "record_ids_hex": [
+        "50f9fc3bcb4d1266d8f0ce293467ab357f58f9e53346fdcbdf64766f05cc4ae5",
+        "000f36de46c1a9314e79ef1b6e5d5890a243a82a53944963d1f953ce36617bbd"
+      ],
+      "h0": "7c789859ca27630dabd0a5f89aea23e706fb6ca6bd2d01210f6d373c5664e0d7",
+      "h_i": [
+        "aaf037af07107b58bc043a271b72c99bd1f23056c3a11153545270848516182e",
+        "73eb509d7a1ee07bef986e9606bf4927066c3fbacefc85c4d79023c64a80398b"
+      ],
+      "head": "73eb509d7a1ee07bef986e9606bf4927066c3fbacefc85c4d79023c64a80398b"
+    }
+  ]
+}

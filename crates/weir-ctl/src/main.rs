@@ -15,6 +15,8 @@ use weir_client::WeirClient;
 use weir_core::{Durability, Payload};
 use weir_wab::SegmentReader;
 
+mod attest;
+
 /// Default daemon Unix socket. Override with `--socket`.
 const DEFAULT_SOCKET: &str = "/run/weir/weir.sock";
 /// Default `/metrics` endpoint. Override with `--addr`. Matches the daemon's
@@ -85,6 +87,63 @@ enum Command {
     /// records exist nowhere else — this is how you get them back.
     #[command(subcommand)]
     Quarantine(QuarantineCommand),
+    /// Chain and verify sealed segments — tamper evidence for the buffer.
+    ///
+    /// A CRC catches accidental corruption; it does not catch an edit, because
+    /// an editor recomputes it. This chains each sealed segment so an edit is
+    /// detectable, PROVIDED the head was observed off-host (see `attest head`).
+    #[command(subcommand)]
+    Attest(AttestCommand),
+}
+
+/// Subcommands under `weir-ctl attest`.
+#[derive(Subcommand)]
+enum AttestCommand {
+    /// Chain every sealed segment that has no sidecar yet.
+    ///
+    /// Prints one `weir.attest.head shard=<n> segment=<name> records=<n>
+    /// head=<hex>` anchor line per NEWLY chained segment. Under `--json` this
+    /// is still one compact JSON object PER LINE (with an added `"event"`
+    /// field), not the usual pretty end-of-run blob other `weir-ctl --json`
+    /// commands print: the anchor line's whole purpose is to be captured
+    /// off-host as each segment is chained, and batching it would lose every
+    /// line not yet printed if the process died partway through a run.
+    Seal {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+        /// Limit to one shard.
+        #[arg(long)]
+        shard: Option<u16>,
+    },
+    /// Recompute every chain and compare it to its sidecar.
+    ///
+    /// Unlike `seal`/`head`, `--json` here prints ONE pretty JSON object
+    /// summarising the whole run (same convention as `segments`/`dl list`) —
+    /// verify has nothing to anchor off-host mid-run, so there is no reason
+    /// to stream it.
+    Verify {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+        /// Limit to one shard.
+        #[arg(long)]
+        shard: Option<u16>,
+        /// Also write node_exporter textfile-collector metrics here.
+        #[arg(long)]
+        metrics_file: Option<PathBuf>,
+    },
+    /// Print the newest chain head per shard, for anchoring off-host.
+    ///
+    /// Re-prints the same `weir.attest.head` anchor line(s) `seal` would have
+    /// printed when it last chained each shard's newest segment — including
+    /// the same one-compact-object-per-line `--json` shape, for the same
+    /// reason (see `seal`).
+    Head {
+        /// Path to the daemon's WAB directory.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: PathBuf,
+    },
 }
 
 /// Subcommands under `weir-ctl dl`.
@@ -223,7 +282,7 @@ fn parse_durability(s: &str) -> Result<Durability, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
-    let result = match cli.command {
+    let result: Result<(), String> = match cli.command {
         Command::Health { socket } => cmd_health(&socket, json),
         Command::Push {
             payload,
@@ -254,6 +313,22 @@ fn main() -> ExitCode {
                 yes,
             } => cmd_quarantine_requeue(&wab_dir, &socket, durability, yes, json),
         },
+        Command::Attest(AttestCommand::Seal { wab_dir, shard }) => {
+            attest::cmd_attest_seal(&wab_dir, shard, json)
+        }
+        Command::Attest(AttestCommand::Head { wab_dir }) => attest::cmd_attest_head(&wab_dir, json),
+        Command::Attest(AttestCommand::Verify {
+            wab_dir,
+            shard,
+            metrics_file,
+        }) => {
+            // `verify` reports a tri-state outcome a cron job must alert on
+            // differently (verified / tampered / could-not-check), which the
+            // shared Ok(())→SUCCESS, Err(_)→FAILURE mapping below cannot
+            // express — it returns its own ExitCode directly instead of
+            // flowing through `result`.
+            return attest::cmd_attest_verify(&wab_dir, shard, metrics_file.as_deref(), json);
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

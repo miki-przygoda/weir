@@ -289,6 +289,177 @@ after a cert rotation suggests the new certs aren't trusted;
 `weir_tls_config_reloads_total{outcome="ok"}` confirms whether a SIGHUP
 reload landed (and `outcome="failed"` that it was rejected).
 
+### Integrity / tamper evidence
+
+`weir-ctl attest` hash-chains **sealed** WAB segments so "was this segment
+edited after it was written?" becomes an answerable question. It runs outside
+the daemon entirely — no cost on the ack path, no `FORMAT_VERSION` bump, no
+touch to the frozen conformance vectors. Three subcommands:
+
+```
+weir-ctl attest seal   --wab-dir /var/lib/weir/wab [--shard N]   # chain any sealed segment lacking a sidecar
+weir-ctl attest verify --wab-dir /var/lib/weir/wab [--shard N]   # recompute the chain and compare
+weir-ctl attest head   --wab-dir /var/lib/weir/wab               # print the newest head per shard, for anchoring
+```
+
+`seal` writes a `<segment>.wab.sealed.attest` sidecar per sealed segment,
+chaining each record's already-frozen `RecordId` into a running SHA-256 and
+linking the segment's start hash to the previous segment's head. `verify`
+re-reads every byte and recomputes the chain from nothing — seconds on a
+256 MiB segment, so it is an audit operation, not a health check, and must
+never be wired into a readiness probe.
+
+**Records in an active, unsealed segment are not chained at all** — only
+`seal` puts anything into the chain, and it only ever sees sealed segments.
+That window is bounded by the seal cadence:
+[`wab_segment_max_bytes`](operations/configuration.md#wab_segment_max_bytes)
+and
+[`wab_segment_max_age_secs`](operations/configuration.md#wab_segment_max_age_secs)
+are what close it. An operator who needs the window tighter lowers those, at
+the usual cost of smaller/more-frequent segments.
+
+**A `.attest` sidecar sitting next to the segment it protects is not evidence
+by itself.** Anyone able to rewrite the segment can recompute a sidecar that
+matches it, in the same motion. The chain only becomes evidence once its head
+has been observed somewhere the editor does not control — in practice, the
+line `attest seal` prints to its own stdout: `weir.attest.head` (shard,
+segment name, record count, the 64-hex head).
+
+**Be precise about what that line is.** It is a plain `println!` to a CLI
+process's stdout — not a `tracing` event, not timestamped, not leveled, and
+not shipped anywhere by itself. Nothing daemon-side is involved: the daemon
+never runs `seal` and never sees this line. It becomes an anchor only once
+**the operator** captures that stdout and ships it off-host — before anyone
+with write access to the WAB directory could edit both the segment and its
+sidecar to match. A `.attest` file with no independent, off-host record of
+what its head used to say is a number, not an audit trail.
+
+**Nothing here runs automatically or lives in the daemon — including `seal`
+itself.** `seal` is the command that does the actual work: it is the only
+one that writes `.attest` sidecars and the only one that prints the anchor
+line. `verify` only ever checks what `seal` has already produced. Wiring up
+`verify` alone (a mistake this page previously invited) means every segment
+reports `MISSING_SIDECAR`, `weir_attest_verify_failures` sits at `0` forever,
+and the feature has attested **nothing** — a clean-looking dashboard for a
+WAB nobody has ever chained. Both commands need a schedule, and `seal`'s
+needs its stdout captured, not just its exit code checked.
+
+A systemd timer pair that runs both, with `seal`'s stdout landing in the
+journal (forward that to your log pipeline the way you already ship the
+daemon's own journal output):
+
+```ini
+# /etc/systemd/system/weir-attest-seal.service
+[Unit]
+Description=weir-attest: chain newly sealed WAB segments
+
+[Service]
+Type=oneshot
+User=weir
+ExecStart=/usr/local/bin/weir-ctl attest seal --wab-dir /var/lib/weir/wab
+# StandardOutput=journal is what makes the weir.attest.head anchor line reach
+# your log pipeline at all. Without this (or an equivalent `| systemd-cat` /
+# `| logger` redirect), the line is printed once and discarded the moment
+# this process exits — the chain would have no off-host anchor.
+StandardOutput=journal
+StandardError=journal
+```
+
+```ini
+# /etc/systemd/system/weir-attest-seal.timer
+[Unit]
+Description=Run weir-attest seal periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+```ini
+# /etc/systemd/system/weir-attest-verify.service
+[Unit]
+Description=weir-attest: verify the sealed WAB chain
+
+[Service]
+Type=oneshot
+User=weir
+ExecStart=/usr/local/bin/weir-ctl attest verify --wab-dir /var/lib/weir/wab \
+  --metrics-file /var/lib/node_exporter/textfile_collector/weir_attest.prom
+StandardOutput=journal
+StandardError=journal
+```
+
+```ini
+# /etc/systemd/system/weir-attest-verify.timer
+[Unit]
+Description=Run weir-attest verify periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target
+```
+
+Offset `verify`'s cadence after `seal`'s (as above), not tighter than it —
+`verify` against segments `seal` has not reached yet just reports them as
+`MISSING_SIDECAR`, but there is no reason to burn the full-reread cost (§
+above) checking segments nothing has chained yet. The cron equivalent, for a
+host not on systemd — with the same requirement to explicitly capture
+stdout, since cron only mails it if `MAILTO` is configured and mail delivery
+actually works, and `logger` is the portable way to land it in syslog/
+journald regardless of that:
+
+```cron
+*/5  * * * *  weir  /usr/local/bin/weir-ctl attest seal   --wab-dir /var/lib/weir/wab 2>&1 | logger -t weir-attest-seal
+*/15 * * * *  weir  /usr/local/bin/weir-ctl attest verify --wab-dir /var/lib/weir/wab --metrics-file /var/lib/node_exporter/textfile_collector/weir_attest.prom 2>&1 | logger -t weir-attest-verify
+```
+
+Its exit codes distinguish the failure mode for that job: `0` every segment
+verified, `1` at least one segment's chain diverged from what was recomputed,
+or its recorded link to its predecessor did not match reality (tampering, or
+corruption past what CRC32 catches), `2` at least one segment could not even
+be checked (missing/unreadable segment, undecodable sidecar). Script the
+cron job to alert differently on `1` than on `2` — treat `2` as "unknown,"
+not "clean." And watch `weir_attest_missing_sidecar` (below) alongside the
+exit code: a nonzero, non-falling value there over time means `seal` isn't
+running or isn't keeping up — the one failure mode the three-outcome exit
+code above cannot surface, because `verify` against a WAB directory nobody
+has ever sealed exits `0` too.
+
+#### WeirAttestVerifyFailed
+`weir_attest_verify_failures` does **not** come from the daemon — the
+daemon is not involved in this feature at all. It's written by a cron/timer
+running `weir-ctl attest verify --metrics-file`, via the node_exporter
+textfile collector. A firing alert means either a sealed WAB segment no
+longer matches its recorded hash chain, or a segment's recorded link to its
+predecessor no longer matches what that predecessor actually produced (a
+**broken link** — reported as `BROKEN_LINK` in `verify`'s text output —
+which is what deleting or substituting a whole segment out of a chain looks
+like). Reclaiming the *oldest* segments is not this: retention removes them
+continuously, the oldest survivor is reported as a chain origin instead, and
+`weir_attest_chain_origins` is where that shows up. A broken link always
+names a boundary between two segments that are both still on disk.
+
+**This is an integrity incident, not a durability one.** The records were
+acked and fsynced correctly at the time; the bytes on disk (or the set of
+segments present) have since stopped matching what was chained. Do **not**
+delete anything.
+
+**Respond:** compare the chain head against what was captured off-host from
+`seal`'s stdout (the `weir.attest.head` line — see *Integrity / tamper
+evidence* above for what that line is and is not), then run
+`weir-ctl attest verify --wab-dir <dir>` to see which segment diverged, or
+which segment boundary's link broke. Exit codes distinguish the failure
+mode: `0` every segment verified with no broken links, `1` at least one
+segment diverged or one link broke (tampered), `2` at least one segment
+could not even be checked (unreadable segment or undecodable sidecar) —
+treat `2` as "unknown," not "clean."
+
 ---
 
 ## Capacity: surviving a sink outage
@@ -416,6 +587,23 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown after the grace period. |
 | `weir_tls_handshake_failures_total` | counter | (tls) Mutual-TLS handshake failures. |
 | `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. |
+
+### Integrity / tamper evidence (weir-attest)
+
+> **Unlike every other row on this page, these do not come from the daemon's
+> `/metrics`.** They are written by a cron-run `weir-ctl attest verify
+> --metrics-file <path>` onto the node_exporter textfile collector — see
+> [Integrity / tamper evidence](#integrity--tamper-evidence) above for the
+> full picture, **including that `verify` alone attests nothing: `seal` must
+> be scheduled too.** All four are gauges, overwritten wholesale on each run,
+> not counters: they carry no `_total` suffix on purpose.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `weir_attest_segments` | gauge | Sealed segments examined by the last `weir-ctl attest verify` run. |
+| `weir_attest_verify_failures` | gauge | Segments that diverged, or whose recorded link to their predecessor did not match reality (a broken link — see above), or that could not be verified in the last run. **Must be 0** — a firing alert here is an integrity incident, not a durability one. See [`WeirAttestVerifyFailed`](#weirattestverifyfailed). |
+| `weir_attest_chain_origins` | gauge | Segments observed with no chain predecessor in the last run — the first segment of a shard, the oldest to survive **retention** (`confirm_and_delete` reclaims drained sealed segments continuously, so this is the steady-state case, not a rare one), one whose predecessor was quarantined, or one whose sidecar declares itself an origin. **Never counted as a failure.** Verify cannot tell a reclaimed predecessor from a deleted one — after either, the predecessor is simply gone — so an origin is not evidence of tampering and an *unexpected* origin is; only your own record of a shard's history distinguishes them. Alert on this **changing unexpectedly** (a jump with no reclamation or quarantine behind it), not on it being nonzero. |
+| `weir_attest_missing_sidecar` | gauge | Sealed segments with no `.attest` sidecar in the last run — `seal` has never chained them. **Not** counted in `weir_attest_verify_failures` (a missing sidecar is not tampering by itself — and since the *next* segment's `prev_head` commits to this one's content, verify recomputes the head of a sidecar-less segment and still checks that link, so deleting a sidecar to hide an edit breaks the chain rather than erasing it) — but a nonzero, non-falling value here over time means `seal` isn't running or isn't keeping up, which the other three metrics cannot tell you: a WAB directory nobody has ever sealed reports `verify_failures 0` forever. |
 
 ### Compression ratio
 

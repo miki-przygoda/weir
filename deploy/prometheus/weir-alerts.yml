@@ -237,3 +237,30 @@ groups:
           summary: "weir TLS handshake failures on {{ $labels.instance }}"
           description: "(tls feature) Repeated mutual-TLS handshake failures — client-cert expiry/rotation, a CA mismatch, or a probe hitting the TCP port. Check the client certificates and the CA bundle."
           runbook: "docs/monitoring.md#weirtlshandshakefailures"
+
+  # ── Integrity / tamper evidence ─────────────────────────────────────────────
+  - name: weir-integrity
+    rules:
+      # weir_attest_verify_failures does NOT come from the daemon's own
+      # /metrics — the daemon is not involved in this feature at all. It is
+      # written by a cron/timer running `weir-ctl attest verify --metrics-file`
+      # via the node_exporter textfile collector, so unlike every other rule in
+      # this file it carries no `job=~"weir"` selector: that job label belongs
+      # to the daemon's scrape target, not the cron job's.
+      #
+      # This is a GAUGE, rewritten whole on every cron run (never a counter —
+      # see `metrics_body` in crates/weir-ctl/src/attest.rs), so the rule
+      # matches on the raw value rather than `increase()`. A prior draft used
+      # `increase(...[15m]) > 0`, which only stays true for the ~15m window
+      # right after a 0→N transition: a gauge that goes to 1 and then HOLDS at
+      # 1 across every subsequent cron run shows zero increase and the alert
+      # goes quiet — while the segment is still tampered. `> 0` on the gauge
+      # itself keeps firing for as long as the incident is unresolved.
+      - alert: WeirAttestVerifyFailed
+        expr: weir_attest_verify_failures > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir attest verification FAILED on {{ $labels.instance }}"
+          description: "A sealed WAB segment no longer matches its recorded hash chain. This is an integrity incident, not a durability one: the records were acked and fsynced correctly, and the bytes on disk have since stopped matching what was chained. Do not delete the segment. Compare the chain head against the value your log pipeline recorded at seal time, and run `weir-ctl attest verify --wab-dir <dir>` for the diverging segment."
+          runbook: "docs/monitoring.md#weirattestverifyfailed"
