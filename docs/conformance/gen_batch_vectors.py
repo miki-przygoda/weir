@@ -324,7 +324,7 @@ bad_ack(
     "response whose meaning depends on client-held state — an Ack says 'your "
     "last record' and an AckTracked carries its own coordinate, but a bitmap is "
     "meaningless without knowing which batch it answers. Since ceil(N/8) is not "
-    "injective (N=1017..1024 all give 131 bytes), the echoed count is the only "
+    "injective (N=1017..1024 all give 128 bitmap bytes), the echoed count is the only "
     "thing that can catch a desync.",
     ack(3, [0, 1, 2]), 4, "LengthMismatch",
 )
