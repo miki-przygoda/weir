@@ -6,12 +6,22 @@
 //!
 //! Two things here are load-bearing rather than incidental:
 //!
-//! - **Chain order.** Segments within a shard are always processed sorted by
-//!   file name, so each segment's `prev_head` is genuinely its predecessor's
-//!   head. Chaining out of order would still produce a chain that verifies
-//!   against itself — `verify_segment` only checks a segment against its own
-//!   recorded `prev_head`, never against a sibling — but it would not mean
-//!   anything: a reordered or substituted segment would go undetected.
+//! - **Chain order, checked on both ends.** Segments within a shard are
+//!   always processed sorted by file name, so each segment's `prev_head` is
+//!   genuinely its predecessor's head. `seal` builds that order. `verify`
+//!   must check it too, and used not to: `weir_attest::verify_segment` only
+//!   confirms a segment is internally self-consistent with the `prev_head`
+//!   recorded in **its own** sidecar — a value an attacker who deletes or
+//!   substitutes a whole neighbouring segment never has to touch. Without an
+//!   independent check, removing `seg_00000002.wab.sealed` and its `.attest`
+//!   from the middle of a chained shard verified clean: `seg_00000003` still
+//!   matched *its own* recorded `prev_head`, and nothing compared that value
+//!   against what the actual, surviving predecessor produced.
+//!   `cmd_attest_verify` closes that gap by carrying its own running head
+//!   across the same name-sorted list `seal` uses and comparing it to each
+//!   segment's recorded `prev_head` before trusting it; a mismatch is a
+//!   **broken link**, reported by segment boundary and counted as a failure
+//!   distinct from a per-segment `Diverged`.
 //! - **The `weir.attest.head` line.** The `.attest` sidecar can be rewritten
 //!   by anyone who can rewrite the segment next to it (see `weir-attest`'s
 //!   crate docs). The line `seal` prints to stdout is the only thing that
@@ -96,13 +106,79 @@ fn sealed_segments_in(shard_dir: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
-/// Best-effort read of an existing sidecar's `prev_head`, used only to feed
-/// the `weir_attest_chain_origins` metric. `None` on any failure to
-/// read or decode — a decode failure surfaces separately, as an `errors`
-/// entry from `verify_segment` itself; this helper never duplicates it.
-fn sidecar_prev_head(seg: &Path) -> Option<ChainHead> {
+/// Best-effort decode of an existing sidecar. `None` on any failure to read or
+/// decode — a decode failure surfaces separately, as an `errors` entry from
+/// `verify_segment` itself; this helper never duplicates it.
+///
+/// Used for the `weir_attest_chain_origins` metric AND, in `cmd_attest_verify`,
+/// for the inter-segment link cross-check (`prev_head` compared against the
+/// actual running head, not just decoded for display) — see the module docs'
+/// "Chain order" note for why that check exists at all.
+fn read_sidecar(seg: &Path) -> Option<Sidecar> {
     let bytes = std::fs::read(sidecar_path(seg)).ok()?;
-    Sidecar::decode(&bytes).ok().map(|s| s.prev_head)
+    Sidecar::decode(&bytes).ok()
+}
+
+/// Writes the `.attest` sidecar durably: explicit `0o600` regardless of the
+/// process umask, plus an fsync of both the file's contents and its parent
+/// directory's entry.
+///
+/// Mirrors `weir-server`'s `.wab.confirmed` sidecar
+/// (`drain/confirmed.rs::write_confirmed_durably`, not reachable from this
+/// crate — different crate, and `pub(super)` there — so re-implemented rather
+/// than shared): a plain `fs::write` relies on the umask alone for the mode
+/// (world/group-readable under any umask other than `0o077`) and makes no
+/// durability claim at all. A torn `.attest` sidecar is not a soft failure
+/// here either — `Sidecar::decode` checks length before it ever reaches the
+/// CRC, so a partially-written file fails to decode outright, and
+/// `verify_segment` maps that straight to `Err` (exit 2, "could not check"),
+/// not to the softer `MissingSidecar` a genuinely absent sidecar gets.
+fn write_sidecar_durably(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("create {}: {e}", path.display()))?
+    };
+    #[cfg(not(unix))]
+    let mut f =
+        std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+
+    f.write_all(bytes)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("sync {}: {e}", path.display()))?; // sidecar contents durable
+    fsync_parent_dir(path).map_err(|e| format!("sync parent of {}: {e}", path.display()))?; // sidecar dirent durable
+    Ok(())
+}
+
+/// Fsyncs the parent directory of `path` so a preceding create of that entry
+/// is durable across a crash: POSIX only guarantees a file's own `fsync`
+/// (`sync_all`) covers its *data* — the directory *entry* that links it into
+/// its parent needs a separate fsync on the directory itself. Opening a
+/// directory read-only and syncing its fd flushes its entries on Linux and
+/// macOS.
+///
+/// Mirrors `weir-server`'s `wab::segment::fsync_parent_dir` byte for byte
+/// (not reachable from here — different crate, `pub(crate)` there). No-op on
+/// Windows, matching that implementation: the fsync-based durability model
+/// here is Unix-first, and opening a directory as a `File` is not portable.
+#[cfg(not(windows))]
+fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fsync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The anchor line's fields as a JSON object, for `--json`.
@@ -180,8 +256,7 @@ pub(crate) fn cmd_attest_seal(
             }
             let sidecar =
                 chain_segment(&seg, prev).map_err(|e| format!("chain {}: {e}", seg.display()))?;
-            std::fs::write(&sp, sidecar.encode())
-                .map_err(|e| format!("write {}: {e}", sp.display()))?;
+            write_sidecar_durably(&sp, &sidecar.encode())?;
             emit_attest_head_line(&sidecar, json);
             prev = sidecar.head;
             chained += 1;
@@ -238,6 +313,22 @@ struct DivergedEntry {
     actual: String,
 }
 
+/// One broken inter-segment link found by `cmd_attest_verify`'s own
+/// cross-segment check (see the module docs' "Chain order" note) — distinct
+/// from a [`DivergedEntry`]. A `Diverged` segment failed its OWN sidecar's
+/// self-consistency check (its content no longer matches what it itself
+/// claims). A broken link means the segment IS internally self-consistent —
+/// its content matches its recorded `prev_head`/`head` — but that recorded
+/// `prev_head` does not match what the actual, name-sorted predecessor in
+/// this shard produced: exactly what deleting or substituting a whole
+/// segment looks like to every check that only ever looks at one segment
+/// at a time.
+struct BrokenLinkEntry {
+    segment: String,
+    expected: String,
+    actual: String,
+}
+
 /// The machine-readable form of `attest verify`'s report. Always the same
 /// shape regardless of outcome — a consumer parses one schema whether the run
 /// was clean, found tampering, or hit an unreadable segment; the exit code,
@@ -247,6 +338,7 @@ fn verify_report_json(
     segments_total: u64,
     verified: u64,
     diverged: &[DivergedEntry],
+    broken_links: &[BrokenLinkEntry],
     missing_sidecar: &[String],
     errors: &[String],
 ) -> serde_json::Value {
@@ -261,19 +353,31 @@ fn verify_report_json(
             })
         })
         .collect();
+    let broken_links_json: Vec<serde_json::Value> = broken_links
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "segment": b.segment,
+                "expected_prev": b.expected,
+                "actual_prev": b.actual,
+            })
+        })
+        .collect();
     serde_json::json!({
         "wab_dir": wab_dir.display().to_string(),
         "segments_total": segments_total,
         "verified": verified,
         "diverged": diverged_json,
+        "broken_links": broken_links_json,
         "missing_sidecar": missing_sidecar,
         "errors": errors,
     })
 }
 
 /// The human-readable form of `attest verify`'s report: one line per problem
-/// (a diverged segment, a missing sidecar, an unreadable segment), then a
-/// summary line with the totals a cron job's log would want.
+/// (a diverged segment, a broken inter-segment link, a missing sidecar, an
+/// unreadable segment), then a summary line with the totals a cron job's log
+/// would want.
 ///
 /// When `segments_total` is `0` and nothing went wrong enumerating the WAB
 /// directory, the summary line is replaced with an explicit "nothing to
@@ -292,6 +396,7 @@ fn verify_report_text(
     segments_total: u64,
     verified: u64,
     diverged: &[DivergedEntry],
+    broken_links: &[BrokenLinkEntry],
     missing_sidecar: &[String],
     errors: &[String],
 ) -> String {
@@ -312,6 +417,12 @@ fn verify_report_text(
             d.segment, d.expected, d.actual
         ));
     }
+    for b in broken_links {
+        out.push_str(&format!(
+            "BROKEN_LINK {} expected_prev={} actual_prev={}\n",
+            b.segment, b.expected, b.actual
+        ));
+    }
     for m in missing_sidecar {
         out.push_str(&format!("MISSING_SIDECAR {m}\n"));
     }
@@ -319,9 +430,10 @@ fn verify_report_text(
         out.push_str(&format!("ERROR {e}\n"));
     }
     out.push_str(&format!(
-        "{}: segments={segments_total} verified={verified} diverged={} missing_sidecar={} errors={}\n",
+        "{}: segments={segments_total} verified={verified} diverged={} broken_links={} missing_sidecar={} errors={}\n",
         wab_dir.display(),
         diverged.len(),
+        broken_links.len(),
         missing_sidecar.len(),
         errors.len()
     ));
@@ -330,7 +442,7 @@ fn verify_report_text(
 
 /// The node_exporter textfile-collector body for `--metrics-file`.
 ///
-/// All three are `gauge`s: each run overwrites the file with this run's
+/// All four are `gauge`s: each run overwrites the file with this run's
 /// snapshot rather than accumulating, so the value can legitimately go down
 /// between scrapes (e.g. segments pruned, or a shard added). Deliberately
 /// named *without* a `_total` suffix — Prometheus reserves that for
@@ -338,17 +450,35 @@ fn verify_report_text(
 /// steady between runs silently stops firing on a persisting incident (see
 /// `WeirAttestVerifyFailed` in `deploy/prometheus/weir-alerts.yml`, which
 /// alerts on the raw gauge value instead).
-fn metrics_body(segments_total: u64, verify_failures: u64, chain_origins: u64) -> String {
+///
+/// `weir_attest_missing_sidecar` exists to answer a question none of the
+/// other three can: whether `seal` has ever actually run. A WAB directory
+/// nobody has ever sealed reports `weir_attest_segments 0` and
+/// `weir_attest_verify_failures 0` forever — indistinguishable, at the
+/// metrics layer, from "everything is clean" — because `MissingSidecar` is
+/// deliberately excluded from `verify_failures` (a missing sidecar is not
+/// tampering). This gauge is the distinguishing signal: nonzero and not
+/// falling means `seal` isn't running, or isn't keeping up, not that nothing
+/// is wrong.
+fn metrics_body(
+    segments_total: u64,
+    verify_failures: u64,
+    chain_origins: u64,
+    missing_sidecar: u64,
+) -> String {
     format!(
         "# HELP weir_attest_segments Sealed segments examined by the last weir-ctl attest verify run.\n\
          # TYPE weir_attest_segments gauge\n\
          weir_attest_segments {segments_total}\n\
-         # HELP weir_attest_verify_failures Segments that diverged or could not be verified in the last run.\n\
+         # HELP weir_attest_verify_failures Segments that diverged, had a broken chain link, or could not be verified in the last run.\n\
          # TYPE weir_attest_verify_failures gauge\n\
          weir_attest_verify_failures {verify_failures}\n\
          # HELP weir_attest_chain_origins Segments observed with no chain predecessor in the last run.\n\
          # TYPE weir_attest_chain_origins gauge\n\
-         weir_attest_chain_origins {chain_origins}\n"
+         weir_attest_chain_origins {chain_origins}\n\
+         # HELP weir_attest_missing_sidecar Sealed segments with no .attest sidecar in the last run — seal has never chained them; not tampering by itself.\n\
+         # TYPE weir_attest_missing_sidecar gauge\n\
+         weir_attest_missing_sidecar {missing_sidecar}\n"
     )
 }
 
@@ -362,6 +492,7 @@ fn write_metrics_file(
     segments_total: u64,
     verify_failures: u64,
     chain_origins: u64,
+    missing_sidecar: u64,
 ) -> Result<(), String> {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -372,7 +503,12 @@ fn write_metrics_file(
         .and_then(|n| n.to_str())
         .unwrap_or("weir_attest.prom");
     let tmp_path = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let body = metrics_body(segments_total, verify_failures, chain_origins);
+    let body = metrics_body(
+        segments_total,
+        verify_failures,
+        chain_origins,
+        missing_sidecar,
+    );
     {
         let mut f = std::fs::File::create(&tmp_path)
             .map_err(|e| format!("create {}: {e}", tmp_path.display()))?;
@@ -387,14 +523,18 @@ fn write_metrics_file(
 }
 
 /// `weir-ctl attest verify`: recompute every sealed segment's chain and
-/// compare it to its `.attest` sidecar.
+/// compare it to its `.attest` sidecar — AND check that each sidecar's
+/// recorded `prev_head` actually matches its predecessor, not just that the
+/// segment agrees with itself (see the module docs' "Chain order" note).
 ///
 /// Returns its exit code directly (rather than the crate's usual
 /// `Result<(), String>`) because a cron job must alert differently on three
 /// distinct outcomes:
 ///
-/// - `0` — every segment verified.
-/// - `1` — at least one [`Verdict::Diverged`] — tampering.
+/// - `0` — every segment verified, with no broken links.
+/// - `1` — at least one [`Verdict::Diverged`], or at least one broken
+///   inter-segment link (a segment whose recorded `prev_head` does not match
+///   its actual predecessor's head) — both are tampering.
 /// - `2` — at least one segment could not even be checked: `verify_segment`
 ///   returned `Err` (unreadable segment, undecodable sidecar), or the WAB
 ///   directory itself could not be enumerated. A structurally corrupt segment
@@ -405,11 +545,22 @@ fn write_metrics_file(
 /// [`Verdict::MissingSidecar`] is neither: a segment nobody has run `seal` on
 /// yet is not evidence of tampering, so it does not move the exit code off
 /// `0` by itself (unless something else in the run does) — it is reported in
-/// the output and counted, not treated as a failure. Likewise, a WAB
-/// directory with sealed segments to check that verify all clean is
-/// reported distinctly from one with NOTHING to check at all — the latter
-/// says so explicitly (see [`verify_report_text`]) rather than presenting an
-/// empty run as "everything verified".
+/// the output, counted, and fed to the `weir_attest_missing_sidecar` gauge,
+/// not treated as a failure. Likewise, a WAB directory with sealed segments
+/// to check that verify all clean is reported distinctly from one with
+/// NOTHING to check at all — the latter says so explicitly (see
+/// [`verify_report_text`]) rather than presenting an empty run as "everything
+/// verified".
+///
+/// The inter-segment link check walks the same name-sorted list per shard
+/// that [`cmd_attest_seal`] walks, carrying its own running `expected` head
+/// (an `Option` — `None` once a segment has no decodable sidecar to read a
+/// head from, so exactly the one boundary immediately after a gap is left
+/// unchecked rather than falsely flagged; every segment after that resyncs
+/// from its own sidecar). This is deliberately independent of
+/// `weir_attest::verify_segment`, which only ever compares a segment against
+/// the `prev_head` recorded in *its own* sidecar — a value co-located with,
+/// and rewritable by, whoever can rewrite the segment itself.
 ///
 /// `--json` here prints ONE pretty JSON object summarising the whole run
 /// (`print_json`, same convention as `segments`/`dl list`) — unlike
@@ -435,6 +586,7 @@ pub(crate) fn cmd_attest_verify(
     let mut verified: u64 = 0;
     let mut chain_origins: u64 = 0;
     let mut diverged: Vec<DivergedEntry> = Vec::new();
+    let mut broken_links: Vec<BrokenLinkEntry> = Vec::new();
     let mut missing_sidecar: Vec<String> = Vec::new();
 
     for dir in &dirs {
@@ -445,13 +597,44 @@ pub(crate) fn cmd_attest_verify(
                 continue;
             }
         };
+        // The head this shard's chain SHOULD be at right now, mirroring
+        // `cmd_attest_seal`'s own `prev` walk over the identical name-sorted
+        // list — reset to `ORIGIN` at the start of every shard, exactly as
+        // `seal` resets its `prev`.
+        let mut expected_head: Option<ChainHead> = Some(ChainHead::ORIGIN);
         for seg in segments {
             segments_total += 1;
             let name = segment_name_for(&seg);
+            let decoded = read_sidecar(&seg);
+
+            if let Some(expected) = expected_head
+                && let Some(sidecar) = decoded.as_ref()
+                && sidecar.prev_head != expected
+            {
+                // Legitimate for the FIRST segment of a shard: `expected`
+                // starts at `ORIGIN` there too, so a genuine first segment's
+                // `prev_head == ORIGIN` matches and never reaches here. A
+                // chain origin recorded by any LATER segment — or any
+                // segment whose recorded predecessor does not match the
+                // actual, surviving one (deletion, substitution) — does
+                // reach here, which is exactly the boundary this check
+                // exists to name.
+                broken_links.push(BrokenLinkEntry {
+                    segment: name.clone(),
+                    expected: expected.to_hex(),
+                    actual: sidecar.prev_head.to_hex(),
+                });
+            }
+            // Advance regardless of the outcome above: once a segment's own
+            // sidecar has been read, its recorded `head` is what a correctly
+            // functioning chain's next segment must cite as `prev_head` —
+            // that holds whether or not THIS segment's link just checked out.
+            expected_head = decoded.as_ref().map(|s| s.head);
+
             match verify_segment(&seg) {
                 Ok(Verdict::Verified) => {
                     verified += 1;
-                    if sidecar_prev_head(&seg) == Some(ChainHead::ORIGIN) {
+                    if decoded.as_ref().map(|s| s.prev_head) == Some(ChainHead::ORIGIN) {
                         chain_origins += 1;
                     }
                 }
@@ -460,7 +643,7 @@ pub(crate) fn cmd_attest_verify(
                     expected,
                     actual,
                 }) => {
-                    if sidecar_prev_head(&seg) == Some(ChainHead::ORIGIN) {
+                    if decoded.as_ref().map(|s| s.prev_head) == Some(ChainHead::ORIGIN) {
                         chain_origins += 1;
                     }
                     diverged.push(DivergedEntry {
@@ -485,12 +668,19 @@ pub(crate) fn cmd_attest_verify(
     }
 
     // Mirrors the exit-code split: a "failure" here is exactly what pushes the
-    // exit code off 0 — diverged (tampered) and errors (could not check).
-    // `MissingSidecar` is deliberately excluded (see the function docs).
-    let verify_failures = diverged.len() as u64 + errors.len() as u64;
+    // exit code off 0 — diverged content, a broken inter-segment link (both
+    // tampering), and errors (could not check). `MissingSidecar` is
+    // deliberately excluded (see the function docs).
+    let verify_failures = diverged.len() as u64 + broken_links.len() as u64 + errors.len() as u64;
 
     if let Some(path) = metrics_file
-        && let Err(e) = write_metrics_file(path, segments_total, verify_failures, chain_origins)
+        && let Err(e) = write_metrics_file(
+            path,
+            segments_total,
+            verify_failures,
+            chain_origins,
+            missing_sidecar.len() as u64,
+        )
     {
         errors.push(format!("metrics file: {e}"));
     }
@@ -501,6 +691,7 @@ pub(crate) fn cmd_attest_verify(
             segments_total,
             verified,
             &diverged,
+            &broken_links,
             &missing_sidecar,
             &errors,
         ));
@@ -512,6 +703,7 @@ pub(crate) fn cmd_attest_verify(
                 segments_total,
                 verified,
                 &diverged,
+                &broken_links,
                 &missing_sidecar,
                 &errors,
             )
@@ -520,7 +712,7 @@ pub(crate) fn cmd_attest_verify(
 
     if !errors.is_empty() {
         ExitCode::from(2)
-    } else if !diverged.is_empty() {
+    } else if !diverged.is_empty() || !broken_links.is_empty() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -722,6 +914,8 @@ mod tests {
         assert!(body.contains("weir_attest_segments 1"));
         assert!(body.contains("weir_attest_verify_failures 0"));
         assert!(body.contains("weir_attest_chain_origins 1"));
+        assert!(body.contains("# TYPE weir_attest_missing_sidecar gauge"));
+        assert!(body.contains("weir_attest_missing_sidecar 0"));
         // No leftover temp file: the write-then-rename must not leak its
         // staging file next to the final one.
         let leftover = std::fs::read_dir(scratch.path())
@@ -875,7 +1069,7 @@ mod tests {
             "an empty WAB directory is not a failure"
         );
 
-        let text = verify_report_text(scratch.path(), 0, 0, &[], &[], &[]);
+        let text = verify_report_text(scratch.path(), 0, 0, &[], &[], &[], &[]);
         assert!(
             text.contains("nothing to verify"),
             "an empty run must say so explicitly rather than print zeroed counters \
@@ -895,10 +1089,40 @@ mod tests {
             0,
             &[],
             &[],
+            &[],
             &["shard_00: read failed".to_string()],
         );
         assert!(!text.contains("nothing to verify"));
         assert!(text.contains("ERROR shard_00: read failed"));
+    }
+
+    #[test]
+    fn verify_report_text_names_the_broken_link_boundary() {
+        // The report must name WHICH segment's predecessor did not match, and
+        // both the expected and actual `prev_head` values — a boolean
+        // "something is wrong" leaves the operator nowhere to start.
+        let scratch = Scratch::new("broken_link_text");
+        let text = verify_report_text(
+            scratch.path(),
+            3,
+            2,
+            &[],
+            &[BrokenLinkEntry {
+                segment: "shard_00/seg_00000002.wab.sealed".to_string(),
+                expected: "aa".repeat(32),
+                actual: ChainHead::ORIGIN.to_hex(),
+            }],
+            &[],
+            &[],
+        );
+        assert!(
+            text.contains("BROKEN_LINK shard_00/seg_00000002.wab.sealed expected_prev=aaaa"),
+            "the report must name the boundary segment and both heads: {text:?}"
+        );
+        assert!(
+            text.contains("broken_links=1"),
+            "the summary line must total broken links separately from divergences: {text:?}"
+        );
     }
 
     #[test]
@@ -932,5 +1156,152 @@ mod tests {
             ExitCode::from(2),
             "errors (could-not-check) must outrank a divergence in the exit code"
         );
+    }
+
+    #[test]
+    fn missing_sidecar_gauge_reflects_unattested_segments() {
+        // FIX 2's whole point: an operator who only ever wires up `verify`
+        // (never `seal`) must be able to tell "nothing has been attested"
+        // apart from "everything is clean" — both otherwise read as
+        // `verify_failures 0`.
+        let scratch = Scratch::new("missing_sidecar_gauge");
+        let shard = scratch.path().join("shard_00");
+        write_segment(&shard.join("seg_00000000.wab.sealed"), 0, &[b"a"]);
+        // No `cmd_attest_seal` call at all.
+
+        let metrics_path = scratch.path().join("weir_attest.prom");
+        let code = cmd_attest_verify(scratch.path(), None, Some(&metrics_path), false);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "an unattested segment is not tampering by itself"
+        );
+
+        let body = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(
+            body.contains("weir_attest_missing_sidecar 1"),
+            "a segment nobody ever sealed must show up in this gauge even \
+             though verify_failures stays 0: {body}"
+        );
+        assert!(body.contains("weir_attest_verify_failures 0"));
+    }
+
+    #[test]
+    fn a_clean_multi_segment_shard_verifies_with_no_broken_links() {
+        let scratch = Scratch::new("clean_multi_segment");
+        let shard = scratch.path().join("shard_00");
+        write_segment(&shard.join("seg_00000000.wab.sealed"), 0, &[b"a"]);
+        write_segment(&shard.join("seg_00000001.wab.sealed"), 0, &[b"b"]);
+        write_segment(&shard.join("seg_00000002.wab.sealed"), 0, &[b"c"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        let code = cmd_attest_verify(scratch.path(), None, None, false);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "an intact, correctly-chained multi-segment shard must verify cleanly"
+        );
+    }
+
+    #[test]
+    fn deleting_a_middle_segment_reports_a_broken_link_and_exits_one() {
+        // The reviewed gap this fix closes: `cmd_attest_verify` used to seed
+        // its per-segment check entirely from that segment's OWN recorded
+        // `prev_head` — a value an attacker who deletes a whole segment (and
+        // its sidecar) never has to touch on the survivors. Reproduces the
+        // demonstrated bug exactly: delete the middle segment and its
+        // `.attest` from a 3-segment chain and confirm it no longer verifies
+        // clean.
+        let scratch = Scratch::new("delete_middle");
+        let shard = scratch.path().join("shard_00");
+        let seg0 = shard.join("seg_00000000.wab.sealed");
+        let seg1 = shard.join("seg_00000001.wab.sealed");
+        let seg2 = shard.join("seg_00000002.wab.sealed");
+        write_segment(&seg0, 0, &[b"a"]);
+        write_segment(&seg1, 0, &[b"b"]);
+        write_segment(&seg2, 0, &[b"c"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, None, false),
+            ExitCode::SUCCESS
+        );
+
+        // Delete the middle segment AND its sidecar. seg2's sidecar still
+        // (honestly) records seg1's real head as its `prev_head` — but seg1
+        // no longer exists for that to be compared against.
+        std::fs::remove_file(&seg1).unwrap();
+        std::fs::remove_file(sidecar_path(&seg1)).unwrap();
+
+        let metrics_path = scratch.path().join("weir_attest.prom");
+        let code = cmd_attest_verify(scratch.path(), None, Some(&metrics_path), false);
+        assert_eq!(
+            code,
+            ExitCode::from(1),
+            "deleting a whole segment from the middle of a chain must be \
+             reported as a broken link and exit 1, not verify clean"
+        );
+        let body = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(
+            !body.contains("weir_attest_verify_failures 0"),
+            "a broken link must be reflected in weir_attest_verify_failures: {body}"
+        );
+    }
+
+    #[test]
+    fn swapping_two_sealed_segments_contents_breaks_the_chain_and_is_caught() {
+        // Physically swap the byte content of two already-chained segments —
+        // their `.attest` sidecars stay exactly where they were. "The heads
+        // no longer chain" literally: whichever check catches it first (the
+        // per-segment content check, since `RecordId` commits to the segment
+        // name and content, or this fix's inter-segment link check), this
+        // must not verify clean.
+        let scratch = Scratch::new("swap_contents");
+        let shard = scratch.path().join("shard_00");
+        let seg0 = shard.join("seg_00000000.wab.sealed");
+        let seg1 = shard.join("seg_00000001.wab.sealed");
+        write_segment(&seg0, 0, &[b"one"]);
+        write_segment(&seg1, 0, &[b"two"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, None, false),
+            ExitCode::SUCCESS
+        );
+
+        let bytes0 = std::fs::read(&seg0).unwrap();
+        let bytes1 = std::fs::read(&seg1).unwrap();
+        std::fs::write(&seg0, &bytes1).unwrap();
+        std::fs::write(&seg1, &bytes0).unwrap();
+
+        let code = cmd_attest_verify(scratch.path(), None, None, false);
+        assert_ne!(
+            code,
+            ExitCode::SUCCESS,
+            "swapping two segments' content so the recorded chain no longer \
+             matches reality must not verify clean"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_writes_the_sidecar_with_mode_0600() {
+        // The sidecar must be daemon-private regardless of the process
+        // umask — mirrors weir-server's `.wab.confirmed` sidecar and its own
+        // mode test in `drain/confirmed.rs`.
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("sidecar_mode");
+        let shard = scratch.path().join("shard_00");
+        let seg = shard.join("seg_00000000.wab.sealed");
+        write_segment(&seg, 0, &[b"a"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+
+        let mode = std::fs::metadata(sidecar_path(&seg))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "sidecar mode {mode:#o} != 0o600");
     }
 }
