@@ -289,6 +289,27 @@ after a cert rotation suggests the new certs aren't trusted;
 `weir_tls_config_reloads_total{outcome="ok"}` confirms whether a SIGHUP
 reload landed (and `outcome="failed"` that it was rejected).
 
+### Integrity / tamper evidence
+
+#### WeirAttestVerifyFailed
+`weir_attest_verify_failures_total` does **not** come from the daemon — the
+daemon is not involved in this feature at all. It's written by a cron/timer
+running `weir-ctl attest verify --metrics-file`, via the node_exporter
+textfile collector. A firing alert means a sealed WAB segment no longer
+matches its recorded hash chain.
+
+**This is an integrity incident, not a durability one.** The records were
+acked and fsynced correctly at the time; the bytes on disk have since stopped
+matching what was chained. Do **not** delete the segment.
+
+**Respond:** compare the chain head against what your log pipeline recorded
+off-host at seal time (the `weir.attest.head` structured log line), then run
+`weir-ctl attest verify --wab-dir <dir>` to see which segment diverged. Exit
+codes distinguish the failure mode: `0` every segment verified, `1` at least
+one segment diverged (tampered), `2` at least one segment could not even be
+checked (unreadable segment or undecodable sidecar) — treat `2` as "unknown,"
+not "clean."
+
 ---
 
 ## Capacity: surviving a sink outage

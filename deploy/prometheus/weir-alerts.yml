@@ -237,3 +237,21 @@ groups:
           summary: "weir TLS handshake failures on {{ $labels.instance }}"
           description: "(tls feature) Repeated mutual-TLS handshake failures — client-cert expiry/rotation, a CA mismatch, or a probe hitting the TCP port. Check the client certificates and the CA bundle."
           runbook: "docs/monitoring.md#weirtlshandshakefailures"
+
+  # ── Integrity / tamper evidence ─────────────────────────────────────────────
+  - name: weir-integrity
+    rules:
+      # weir_attest_verify_failures_total does NOT come from the daemon's own
+      # /metrics — the daemon is not involved in this feature at all. It is
+      # written by a cron/timer running `weir-ctl attest verify --metrics-file`
+      # via the node_exporter textfile collector, so unlike every other rule in
+      # this file it carries no `job=~"weir"` selector: that job label belongs
+      # to the daemon's scrape target, not the cron job's.
+      - alert: WeirAttestVerifyFailed
+        expr: increase(weir_attest_verify_failures_total[15m]) > 0
+        for: 0m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir attest verification FAILED on {{ $labels.instance }}"
+          description: "A sealed WAB segment no longer matches its recorded hash chain. This is an integrity incident, not a durability one: the records were acked and fsynced correctly, and the bytes on disk have since stopped matching what was chained. Do not delete the segment. Compare the chain head against the value your log pipeline recorded at seal time, and run `weir-ctl attest verify --wab-dir <dir>` for the diverging segment."
+          runbook: "docs/monitoring.md#weirattestverifyfailed"

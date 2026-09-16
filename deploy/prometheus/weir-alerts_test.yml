@@ -415,3 +415,35 @@ tests:
               summary: "weir TLS handshake failures on w:9185"
               description: "(tls feature) Repeated mutual-TLS handshake failures — client-cert expiry/rotation, a CA mismatch, or a probe hitting the TCP port. Check the client certificates and the CA bundle."
               runbook: "docs/monitoring.md#weirtlshandshakefailures"
+
+  # weir_attest_verify_failures_total is written by a cron job running
+  # `weir-ctl attest verify --metrics-file` (node_exporter textfile collector),
+  # never by the daemon -- hence a `job` unrelated to the daemon's `job="weir"`
+  # scrape target, matching the rule's deliberate lack of a job selector.
+  - interval: 1m
+    name: a tampered segment fires WeirAttestVerifyFailed
+    input_series:
+      - series: 'weir_attest_verify_failures_total{job="node_exporter",instance="attest-cron:9100"}'
+        values: "0 0 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WeirAttestVerifyFailed
+        exp_alerts:
+          - exp_labels:
+              instance: "attest-cron:9100"
+              job: "node_exporter"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir attest verification FAILED on attest-cron:9100"
+              description: "A sealed WAB segment no longer matches its recorded hash chain. This is an integrity incident, not a durability one: the records were acked and fsynced correctly, and the bytes on disk have since stopped matching what was chained. Do not delete the segment. Compare the chain head against the value your log pipeline recorded at seal time, and run `weir-ctl attest verify --wab-dir <dir>` for the diverging segment."
+              runbook: "docs/monitoring.md#weirattestverifyfailed"
+
+  - interval: 1m
+    name: a clean attest run does not fire WeirAttestVerifyFailed
+    input_series:
+      - series: 'weir_attest_verify_failures_total{job="node_exporter",instance="attest-cron:9100"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WeirAttestVerifyFailed
+        exp_alerts: []
