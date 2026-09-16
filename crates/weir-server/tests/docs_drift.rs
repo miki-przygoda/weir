@@ -430,3 +430,58 @@ fn every_alert_runbook_anchor_resolves_to_a_heading() {
          An operator following the link from a firing alert lands nowhere."
     );
 }
+
+/// Every workspace member must appear in the Docker builder's manifest list.
+///
+/// `deploy/docker/Dockerfile` copies each member's `Cargo.toml` individually and
+/// creates a stub source for it, so Cargo can resolve the workspace before the
+/// real sources are copied. A member missing from that list does not degrade —
+/// the image build fails outright with "failed to load manifest for workspace
+/// member", and it fails in the `docker` workflow, which the Rust gate does not
+/// run.
+///
+/// The Dockerfile's own comment records this happening when `weir-sink-s3`
+/// landed. It happened again when `weir-attest` landed, because a comment is a
+/// note to a human and this is a set-membership property. Deriving the set from
+/// the workspace manifest is what actually holds it closed.
+#[test]
+fn every_workspace_member_is_in_the_docker_builder() {
+    const ROOT_MANIFEST: &str = include_str!("../../../Cargo.toml");
+    const DOCKERFILE: &str = include_str!("../../../deploy/docker/Dockerfile");
+
+    // The `members = [...]` array, as literal `crates/<name>` entries.
+    let members: Vec<&str> = ROOT_MANIFEST
+        .split_once("members = [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(list, _)| list)
+        .expect("root Cargo.toml has a members array")
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').trim_matches('"').strip_prefix("crates/"))
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    assert!(
+        members.len() >= 9,
+        "found only {} workspace members; this guard is no longer reading the \n\
+         manifest correctly",
+        members.len()
+    );
+
+    let missing: Vec<&&str> = members
+        .iter()
+        .filter(|name| {
+            let manifest = format!("crates/{name}/Cargo.toml");
+            let stub = format!("crates/{name}/src");
+            !DOCKERFILE.contains(&manifest) || !DOCKERFILE.contains(&stub)
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these workspace members are missing from deploy/docker/Dockerfile's \n\
+         manifest-copy or stub-source list: {missing:?}\n\n\
+         The image build fails with \"failed to load manifest for workspace \n\
+         member\" — and it fails in the `docker` workflow, which `cargo test` \n\
+         does not exercise."
+    );
+}
