@@ -131,6 +131,33 @@ jobs:
           node src/conformance_tracked.ts
           node src/conformance_batch.ts
 
+  # fuzz/ and chaos/ are standalone Cargo workspaces on purpose (see the
+  # comments atop fuzz/Cargo.toml and chaos/Cargo.toml): the fuzz crate needs
+  # a nightly toolchain and pulls in weir-server, and the chaos harness is
+  # Linux-only, needs root, and depends on device-mapper tooling. Neither is
+  # a member of the root workspace, so a plain `cargo build`/`cargo test`
+  # from the repo root never touches them -- the three fuzz targets
+  # (envelope_parse, wab_confirmed, wab_segment_header) and the two chaos
+  # binaries (recorder, loadgen) could silently stop compiling and nothing
+  # would notice. This job compiles both, in place, from inside their own
+  # directories -- it does NOT add either to the root `members` list, and it
+  # does NOT run either suite: an actual fuzz run needs a time budget, and an
+  # actual chaos run needs root and device-mapper tooling, neither of which
+  # belongs in a per-PR gate. See CONTRIBUTING.md for how to run them for real.
+  harnesses:
+    name: harnesses (fuzz + chaos compile)
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Fuzz targets still compile
+        run: cd fuzz && cargo +nightly build --all-targets
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Chaos harness still compiles
+        run: cd chaos && cargo check --all-targets
+
   test:
     runs-on: ubuntu-latest
     needs: lint

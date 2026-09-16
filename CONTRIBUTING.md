@@ -178,7 +178,12 @@ bash deploy/run-sink-integration-tests.sh
 deploy/monitoring/smoke-test.sh --teardown
 
 # Fuzzing the trust-boundary parsers (needs nightly Rust + cargo-fuzz).
-# Targets live in fuzz/fuzz_targets/ — see docs/testing/fuzzing.md.
+# Targets live in fuzz/fuzz_targets/ — see docs/testing/fuzzing.md. `fuzz/` is
+# a standalone workspace (see fuzz/Cargo.toml), so it is exempt from the
+# "these run in their own CI jobs" claim above: the `harnesses` CI job only
+# COMPILES the three targets (cargo +nightly build --all-targets), which
+# catches a target that stops building. It does not run any of them --
+# actually fuzzing needs a time budget you choose, so that stays manual:
 cargo +nightly fuzz run envelope_parse
 ```
 
