@@ -26,7 +26,7 @@ pub mod verify;
 
 pub use chain::{ChainHead, DOMAIN_SEP};
 pub use sidecar::{ATTEST_FORMAT_VERSION, ATTEST_MAGIC, Sidecar};
-pub use verify::{chain_segment, segment_name_for};
+pub use verify::{Verdict, chain_segment, segment_name_for, sidecar_path, verify_segment};
 
 /// Why an attest operation failed.
 #[derive(Debug)]
