@@ -28,14 +28,40 @@ use weir_attest::{
 };
 use weir_wab::SegmentState;
 
+/// Parses the numeric shard id out of a `shard_NN` directory name, or `None`
+/// for anything else (including the daemon's reserved `quarantine/` and
+/// `dead_letter/` subdirs).
+///
+/// Mirrors `weir-server`'s `wab::segment::shard_id_from_path` (`pub(crate)`
+/// there, so re-derived rather than imported — different crate). Needed for
+/// ordering, not just filtering: `shard_{id:02}` is a MINIMUM width, so past
+/// `shard_99` a plain lexicographic sort would put `shard_100` before
+/// `shard_20` (P2-F3, already fixed twice in `weir-server`: `wab/mod.rs` and
+/// `wab/recovery.rs`).
+fn shard_id_from_dir_name(path: &Path) -> Option<usize> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("shard_")?
+        .parse()
+        .ok()
+}
+
 /// Shard directories under `wab_dir`, optionally narrowed to one shard id,
-/// sorted by name.
+/// in ascending numeric shard order (see [`shard_id_from_dir_name`]).
 ///
 /// Mirrors the walk `scan_segments` (in `main.rs`) uses for `weir-ctl
-/// segments`: every subdirectory other than `dead_letter` is a shard
-/// directory. The daemon names them `shard_NN` (`weir-server`'s
-/// `shard_dir_path`), which is what a `--shard` filter reconstructs directly
-/// rather than scanning for it.
+/// segments`, plus the daemon's own reserved-subdir exclusion
+/// (`weir-server`'s `wab/mod.rs` and `wab/recovery.rs` both skip
+/// `quarantine` and `dead_letter` for the same reason): every OTHER
+/// subdirectory is a shard directory, named `shard_NN` by the daemon
+/// (`weir-server`'s `shard_dir_path`), which is what a `--shard` filter
+/// reconstructs directly rather than scanning for it.
+///
+/// Excluding `quarantine` here is load-bearing, not cosmetic: it is one flat
+/// directory shared by every shard's parked forensic copies, so chaining it
+/// as if it were a shard would link segments from DIFFERENT shards into one
+/// meaningless cross-shard chain, and would write a `.attest` sidecar inside
+/// a directory whose entire purpose is pristine, untouched copies.
 fn shard_dirs(wab_dir: &Path, shard: Option<u16>) -> Result<Vec<PathBuf>, String> {
     if let Some(id) = shard {
         return Ok(vec![wab_dir.join(format!("shard_{id:02}"))]);
@@ -46,9 +72,14 @@ fn shard_dirs(wab_dir: &Path, shard: Option<u16>) -> Result<Vec<PathBuf>, String
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("dead_letter"))
+        .filter(|p| {
+            !matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some("dead_letter") | Some("quarantine")
+            )
+        })
         .collect();
-    dirs.sort();
+    dirs.sort_by_key(|p| shard_id_from_dir_name(p));
     Ok(dirs)
 }
 
@@ -90,9 +121,16 @@ fn attest_head_json(sidecar: &Sidecar) -> serde_json::Value {
 /// existing one), in exactly the same shape both times so an operator or log
 /// shipper can treat them identically.
 ///
-/// Deliberately a single, compact line under `--json` too — this is a log
-/// line meant to be captured and diffed off-host, not a pretty-printed
-/// report, so it does not go through this crate's usual `print_json`.
+/// Deliberately a single, compact object under `--json` too, PRINTED
+/// IMMEDIATELY per segment — a deliberate divergence from this crate's usual
+/// `--json` convention (one pretty end-of-run blob via `print_json`, as
+/// `attest verify` itself still uses). Batching these into one blob at the
+/// end would mean a process killed partway through a `seal` run loses the
+/// anchor for every segment it had already chained but not yet reported —
+/// exactly the evidence this line exists to preserve. So: compact, one
+/// object per line, flushed as each segment is chained, with an added
+/// `"event"` field (beyond the four named fields) so a line is self
+/// describing if merged into a broader JSON log stream.
 fn emit_attest_head_line(sidecar: &Sidecar, json: bool) {
     if json {
         let value = attest_head_json(sidecar);
@@ -236,37 +274,58 @@ fn verify_report_json(
 /// The human-readable form of `attest verify`'s report: one line per problem
 /// (a diverged segment, a missing sidecar, an unreadable segment), then a
 /// summary line with the totals a cron job's log would want.
-fn print_verify_report_text(
+///
+/// When `segments_total` is `0` and nothing went wrong enumerating the WAB
+/// directory, the summary line is replaced with an explicit "nothing to
+/// verify" line instead: `segments=0 verified=0 ... exit 0` on its own reads
+/// as "everything verified", when the truth is "there was nothing to check"
+/// — the same distinction `cmd_segments` and `cmd_attest_seal` already make
+/// for their own empty cases. A non-empty `errors` (e.g. the WAB directory
+/// itself could not be read) is deliberately NOT covered by that early
+/// message: that case already explains itself via its `ERROR` line(s) and
+/// exits non-zero.
+///
+/// Built as a `String` (rather than printing directly) so the exact wording
+/// is unit-testable without capturing stdout.
+fn verify_report_text(
     wab_dir: &Path,
     segments_total: u64,
     verified: u64,
     diverged: &[DivergedEntry],
     missing_sidecar: &[String],
     errors: &[String],
-) {
+) -> String {
+    if segments_total == 0 && errors.is_empty() {
+        return format!(
+            "no sealed segments found under {} — nothing to verify\n",
+            wab_dir.display()
+        );
+    }
+    let mut out = String::new();
     for d in diverged {
         let at = d
             .at_record
             .map(|n| n.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        println!(
-            "DIVERGED {} at_record={at} expected={} actual={}",
+        out.push_str(&format!(
+            "DIVERGED {} at_record={at} expected={} actual={}\n",
             d.segment, d.expected, d.actual
-        );
+        ));
     }
     for m in missing_sidecar {
-        println!("MISSING_SIDECAR {m}");
+        out.push_str(&format!("MISSING_SIDECAR {m}\n"));
     }
     for e in errors {
-        println!("ERROR {e}");
+        out.push_str(&format!("ERROR {e}\n"));
     }
-    println!(
-        "{}: segments={segments_total} verified={verified} diverged={} missing_sidecar={} errors={}",
+    out.push_str(&format!(
+        "{}: segments={segments_total} verified={verified} diverged={} missing_sidecar={} errors={}\n",
         wab_dir.display(),
         diverged.len(),
         missing_sidecar.len(),
         errors.len()
-    );
+    ));
+    out
 }
 
 /// The node_exporter textfile-collector body for `--metrics-file`.
@@ -343,7 +402,17 @@ fn write_metrics_file(
 /// [`Verdict::MissingSidecar`] is neither: a segment nobody has run `seal` on
 /// yet is not evidence of tampering, so it does not move the exit code off
 /// `0` by itself (unless something else in the run does) — it is reported in
-/// the output and counted, not treated as a failure.
+/// the output and counted, not treated as a failure. Likewise, a WAB
+/// directory with sealed segments to check that verify all clean is
+/// reported distinctly from one with NOTHING to check at all — the latter
+/// says so explicitly (see [`verify_report_text`]) rather than presenting an
+/// empty run as "everything verified".
+///
+/// `--json` here prints ONE pretty JSON object summarising the whole run
+/// (`print_json`, same convention as `segments`/`dl list`) — unlike
+/// `seal`/`head`, which stream one compact object per segment (see
+/// [`emit_attest_head_line`]). `verify` has nothing that must survive a
+/// mid-run crash to remain evidence, so there is no reason to stream it.
 pub(crate) fn cmd_attest_verify(
     wab_dir: &Path,
     shard: Option<u16>,
@@ -433,13 +502,16 @@ pub(crate) fn cmd_attest_verify(
             &errors,
         ));
     } else {
-        print_verify_report_text(
-            wab_dir,
-            segments_total,
-            verified,
-            &diverged,
-            &missing_sidecar,
-            &errors,
+        print!(
+            "{}",
+            verify_report_text(
+                wab_dir,
+                segments_total,
+                verified,
+                &diverged,
+                &missing_sidecar,
+                &errors,
+            )
         );
     }
 
@@ -712,6 +784,150 @@ mod tests {
             )
             .exists(),
             "a shard excluded by --shard must be left untouched"
+        );
+    }
+
+    #[test]
+    fn shard_dirs_excludes_quarantine_and_dead_letter() {
+        let scratch = Scratch::new("shard_dirs_exclude");
+        std::fs::create_dir_all(scratch.path().join("shard_00")).unwrap();
+        std::fs::create_dir_all(scratch.path().join("shard_01")).unwrap();
+        std::fs::create_dir_all(scratch.path().join("quarantine")).unwrap();
+        std::fs::create_dir_all(scratch.path().join("dead_letter")).unwrap();
+
+        let dirs = shard_dirs(scratch.path(), None).unwrap();
+        let names: Vec<String> = dirs
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["shard_00", "shard_01"],
+            "quarantine/ and dead_letter/ must never be treated as shard directories"
+        );
+    }
+
+    #[test]
+    fn shard_dirs_sorts_numerically_not_lexicographically() {
+        // P2-F3: `shard_{id:02}` is a MINIMUM width, so past shard_99 a plain
+        // lexicographic sort would put "shard_100" before "shard_20". This
+        // codebase has already fixed the identical bug twice in weir-server
+        // (wab/mod.rs, wab/recovery.rs); `weir-ctl` must not reintroduce it.
+        let scratch = Scratch::new("shard_dirs_numeric");
+        for id in [20, 100, 3] {
+            std::fs::create_dir_all(scratch.path().join(format!("shard_{id:02}"))).unwrap();
+        }
+        let dirs = shard_dirs(scratch.path(), None).unwrap();
+        let ids: Vec<Option<usize>> = dirs.iter().map(|p| shard_id_from_dir_name(p)).collect();
+        assert_eq!(
+            ids,
+            vec![Some(3), Some(20), Some(100)],
+            "shard directories must sort in ascending NUMERIC shard order"
+        );
+    }
+
+    #[test]
+    fn seal_does_not_chain_a_segment_parked_in_quarantine() {
+        // Reproduces the review finding: quarantine/ is one flat directory
+        // shared by every shard's forensic copies. Treating it as a shard
+        // would chain segments from DIFFERENT shards into one meaningless
+        // chain, and would write a `.attest` sidecar into a directory whose
+        // entire purpose is pristine, untouched copies.
+        let scratch = Scratch::new("seal_quarantine");
+        let real = scratch
+            .path()
+            .join("shard_00")
+            .join("seg_00000000.wab.sealed");
+        write_segment(&real, 0, &[b"a"]);
+        // Named the way weir-server's quarantine actually does:
+        // `shard_NN__seg_....wab.sealed`, flattened into one directory.
+        let quarantined = scratch
+            .path()
+            .join("quarantine")
+            .join("shard_00__seg_00000001.wab.sealed");
+        write_segment(&quarantined, 0, &[b"b"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+
+        assert!(
+            sidecar_path(&real).exists(),
+            "the real shard segment must still be chained"
+        );
+        assert!(
+            !sidecar_path(&quarantined).exists(),
+            "a segment parked in quarantine/ must never get a `.attest` sidecar"
+        );
+    }
+
+    #[test]
+    fn verify_on_an_empty_wab_dir_says_so_and_exits_zero() {
+        // segments=0 verified=0 ... exit 0 reads as "everything verified" when
+        // the truth is "nothing was there to check" — these must be
+        // distinguishable in the report, not just in the (identical) exit code.
+        let scratch = Scratch::new("verify_empty");
+        let code = cmd_attest_verify(scratch.path(), None, None, false);
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "an empty WAB directory is not a failure"
+        );
+
+        let text = verify_report_text(scratch.path(), 0, 0, &[], &[], &[]);
+        assert!(
+            text.contains("nothing to verify"),
+            "an empty run must say so explicitly rather than print zeroed counters \
+             that read as success: {text:?}"
+        );
+    }
+
+    #[test]
+    fn verify_report_text_does_not_claim_nothing_to_verify_when_it_actually_errored() {
+        // segments_total can be 0 AND errors non-empty at once (e.g. the WAB
+        // directory itself could not be enumerated) — that case must keep its
+        // ERROR line(s), not get swallowed by the "nothing to verify" message.
+        let scratch = Scratch::new("verify_empty_but_errored");
+        let text = verify_report_text(
+            scratch.path(),
+            0,
+            0,
+            &[],
+            &[],
+            &["shard_00: read failed".to_string()],
+        );
+        assert!(!text.contains("nothing to verify"));
+        assert!(text.contains("ERROR shard_00: read failed"));
+    }
+
+    #[test]
+    fn diverged_and_unreadable_together_exit_two_not_one() {
+        // The brief's priority check: when a run has BOTH a tampered segment
+        // AND an unreadable one, "could not check everything" must win over
+        // "found tampering" — downgrading to exit 1 would tell a cron job
+        // the run was merely tampered when part of it could not be verified
+        // at all.
+        let scratch = Scratch::new("mixed_outcomes");
+        let shard = scratch.path().join("shard_00");
+        let tampered = shard.join("seg_00000000.wab.sealed");
+        let corrupt = shard.join("seg_00000001.wab.sealed");
+        write_segment(&tampered, 0, &[b"one", b"two"]);
+        write_segment(&corrupt, 0, &[b"three"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, None, false),
+            ExitCode::SUCCESS
+        );
+
+        // Tamper the first segment's content, sidecar untouched.
+        write_segment(&tampered, 0, &[b"one", b"XXX"]);
+        // Corrupt the second segment's bytes outright, sidecar untouched.
+        std::fs::write(&corrupt, b"not a real segment").unwrap();
+
+        let code = cmd_attest_verify(scratch.path(), None, None, false);
+        assert_eq!(
+            code,
+            ExitCode::from(2),
+            "errors (could-not-check) must outrank a divergence in the exit code"
         );
     }
 }

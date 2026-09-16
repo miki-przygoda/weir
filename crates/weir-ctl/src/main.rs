@@ -100,6 +100,14 @@ enum Command {
 #[derive(Subcommand)]
 enum AttestCommand {
     /// Chain every sealed segment that has no sidecar yet.
+    ///
+    /// Prints one `weir.attest.head shard=<n> segment=<name> records=<n>
+    /// head=<hex>` anchor line per NEWLY chained segment. Under `--json` this
+    /// is still one compact JSON object PER LINE (with an added `"event"`
+    /// field), not the usual pretty end-of-run blob other `weir-ctl --json`
+    /// commands print: the anchor line's whole purpose is to be captured
+    /// off-host as each segment is chained, and batching it would lose every
+    /// line not yet printed if the process died partway through a run.
     Seal {
         /// Path to the daemon's WAB directory.
         #[arg(long, env = "WEIR_WAB_DIR")]
@@ -109,6 +117,11 @@ enum AttestCommand {
         shard: Option<u16>,
     },
     /// Recompute every chain and compare it to its sidecar.
+    ///
+    /// Unlike `seal`/`head`, `--json` here prints ONE pretty JSON object
+    /// summarising the whole run (same convention as `segments`/`dl list`) —
+    /// verify has nothing to anchor off-host mid-run, so there is no reason
+    /// to stream it.
     Verify {
         /// Path to the daemon's WAB directory.
         #[arg(long, env = "WEIR_WAB_DIR")]
@@ -121,6 +134,11 @@ enum AttestCommand {
         metrics_file: Option<PathBuf>,
     },
     /// Print the newest chain head per shard, for anchoring off-host.
+    ///
+    /// Re-prints the same `weir.attest.head` anchor line(s) `seal` would have
+    /// printed when it last chained each shard's newest segment — including
+    /// the same one-compact-object-per-line `--json` shape, for the same
+    /// reason (see `seal`).
     Head {
         /// Path to the daemon's WAB directory.
         #[arg(long, env = "WEIR_WAB_DIR")]
