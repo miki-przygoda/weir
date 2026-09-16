@@ -1134,9 +1134,20 @@ git commit -m "feat(ctl): weir-ctl attest seal|verify|head"
 
 - [ ] **Step 1: Add the rule**
 
+**Correction made during implementation (Task 7 fix round):** the `expr` below
+originally called `increase()` on the metric's counter-style name (with the
+suffix this design later dropped — see §5 of the design spec and
+`metrics_body` in `crates/weir-ctl/src/attest.rs`). That metric is actually a
+**gauge**, rewritten whole on every cron run rather than accumulated — never
+a counter, which is also why the suffix was wrong and got dropped.
+`increase()` on a gauge that goes to 1 and then *holds* at 1 across every
+subsequent cron run shows zero increase after one evaluation window, and the
+alert goes quiet while the segment is still tampered. The corrected rule
+matches the raw gauge value instead:
+
 ```yaml
       - alert: WeirAttestVerifyFailed
-        expr: increase(weir_attest_verify_failures_total[15m]) > 0
+        expr: weir_attest_verify_failures > 0
         for: 0m
         labels: { severity: critical }
         annotations:

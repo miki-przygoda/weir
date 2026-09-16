@@ -97,7 +97,7 @@ fn sealed_segments_in(shard_dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// Best-effort read of an existing sidecar's `prev_head`, used only to feed
-/// the `weir_attest_chain_origins_total` metric. `None` on any failure to
+/// the `weir_attest_chain_origins` metric. `None` on any failure to
 /// read or decode — a decode failure surfaces separately, as an `errors`
 /// entry from `verify_segment` itself; this helper never duplicates it.
 fn sidecar_prev_head(seg: &Path) -> Option<ChainHead> {
@@ -330,22 +330,25 @@ fn verify_report_text(
 
 /// The node_exporter textfile-collector body for `--metrics-file`.
 ///
-/// All three are `gauge`s, not `counter`s, despite the `_total` naming: each
-/// run overwrites the file with this run's snapshot rather than accumulating,
-/// so the value can legitimately go down between scrapes (e.g. segments
-/// pruned, or a shard added). `_total` here means "count observed this run",
-/// matching how batch/cron jobs commonly name textfile-collector gauges.
+/// All three are `gauge`s: each run overwrites the file with this run's
+/// snapshot rather than accumulating, so the value can legitimately go down
+/// between scrapes (e.g. segments pruned, or a shard added). Deliberately
+/// named *without* a `_total` suffix — Prometheus reserves that for
+/// monotonic counters, and `increase()`/`rate()` on a gauge that merely holds
+/// steady between runs silently stops firing on a persisting incident (see
+/// `WeirAttestVerifyFailed` in `deploy/prometheus/weir-alerts.yml`, which
+/// alerts on the raw gauge value instead).
 fn metrics_body(segments_total: u64, verify_failures: u64, chain_origins: u64) -> String {
     format!(
-        "# HELP weir_attest_segments_total Sealed segments examined by the last weir-ctl attest verify run.\n\
-         # TYPE weir_attest_segments_total gauge\n\
-         weir_attest_segments_total {segments_total}\n\
-         # HELP weir_attest_verify_failures_total Segments that diverged or could not be verified in the last run.\n\
-         # TYPE weir_attest_verify_failures_total gauge\n\
-         weir_attest_verify_failures_total {verify_failures}\n\
-         # HELP weir_attest_chain_origins_total Segments observed with no chain predecessor in the last run.\n\
-         # TYPE weir_attest_chain_origins_total gauge\n\
-         weir_attest_chain_origins_total {chain_origins}\n"
+        "# HELP weir_attest_segments Sealed segments examined by the last weir-ctl attest verify run.\n\
+         # TYPE weir_attest_segments gauge\n\
+         weir_attest_segments {segments_total}\n\
+         # HELP weir_attest_verify_failures Segments that diverged or could not be verified in the last run.\n\
+         # TYPE weir_attest_verify_failures gauge\n\
+         weir_attest_verify_failures {verify_failures}\n\
+         # HELP weir_attest_chain_origins Segments observed with no chain predecessor in the last run.\n\
+         # TYPE weir_attest_chain_origins gauge\n\
+         weir_attest_chain_origins {chain_origins}\n"
     )
 }
 
@@ -715,10 +718,10 @@ mod tests {
         assert_eq!(code, ExitCode::SUCCESS);
 
         let body = std::fs::read_to_string(&metrics_path).unwrap();
-        assert!(body.contains("# TYPE weir_attest_segments_total gauge"));
-        assert!(body.contains("weir_attest_segments_total 1"));
-        assert!(body.contains("weir_attest_verify_failures_total 0"));
-        assert!(body.contains("weir_attest_chain_origins_total 1"));
+        assert!(body.contains("# TYPE weir_attest_segments gauge"));
+        assert!(body.contains("weir_attest_segments 1"));
+        assert!(body.contains("weir_attest_verify_failures 0"));
+        assert!(body.contains("weir_attest_chain_origins 1"));
         // No leftover temp file: the write-then-rename must not leak its
         // staging file next to the final one.
         let leftover = std::fs::read_dir(scratch.path())

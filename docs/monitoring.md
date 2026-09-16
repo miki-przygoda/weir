@@ -292,7 +292,7 @@ reload landed (and `outcome="failed"` that it was rejected).
 ### Integrity / tamper evidence
 
 #### WeirAttestVerifyFailed
-`weir_attest_verify_failures_total` does **not** come from the daemon — the
+`weir_attest_verify_failures` does **not** come from the daemon — the
 daemon is not involved in this feature at all. It's written by a cron/timer
 running `weir-ctl attest verify --metrics-file`, via the node_exporter
 textfile collector. A firing alert means a sealed WAB segment no longer

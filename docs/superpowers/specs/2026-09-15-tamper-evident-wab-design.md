@@ -242,12 +242,21 @@ not be silently dropped:
 
   | Metric | Type | Meaning |
   |---|---|---|
-  | `weir_attest_segments_total` | counter | segments chained |
-  | `weir_attest_verify_failures_total` | counter | **must be 0**; a firing alert here is an integrity incident |
-  | `weir_attest_chain_origins_total` | counter | segments chained with no predecessor (§3.2) |
+  | `weir_attest_segments` | gauge | segments examined by the last verify run |
+  | `weir_attest_verify_failures` | gauge | **must be 0**; a firing alert here is an integrity incident |
+  | `weir_attest_chain_origins` | gauge | segments observed with no predecessor in the last run (§3.2) |
   | `weir_attest_lag_seconds` | gauge | seal-to-attest delay; the §6.1 window, observable |
 
-  A new alert rule pairs with `verify_failures_total`, and — per the guard added
+  All three (bar `lag_seconds`, which has no carrier yet — see §6.1) are
+  `gauge`s written by a short-lived `weir-ctl attest verify --metrics-file`
+  cron run that overwrites the textfile-collector file wholesale each time —
+  never counters, and deliberately named without a `_total` suffix so they
+  don't read as one. An alert rule built on `increase()` over such a gauge
+  only stays true for one evaluation window after a 0→N transition and then
+  goes quiet even while the incident persists; the rule matches the raw gauge
+  value instead (`weir_attest_verify_failures > 0`).
+
+  A new alert rule pairs with `verify_failures`, and — per the guard added
   this release — it must ship with a `promtool` test in **both** directions and a
   runbook anchor that resolves.
 
