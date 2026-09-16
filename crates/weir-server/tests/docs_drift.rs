@@ -472,21 +472,69 @@ fn every_workspace_member_is_in_the_docker_builder() {
         members.len()
     );
 
-    let missing: Vec<&&str> = members
-        .iter()
-        .filter(|name| {
-            let manifest = format!("crates/{name}/Cargo.toml");
-            let stub = format!("crates/{name}/src");
-            !DOCKERFILE.contains(&manifest) || !DOCKERFILE.contains(&stub)
+    // Three obligations, each checked against the region of the Dockerfile that
+    // actually carries it. A bare `DOCKERFILE.contains("crates/<name>/src")` is
+    // satisfied by the `touch` list on its own, so deleting a crate's `mkdir -p`
+    // entry — the exact break this guard exists to catch — slipped straight
+    // through the first version of this check.
+    let stub_run = {
+        let (_, rest) = DOCKERFILE
+            .split_once("RUN mkdir -p")
+            .expect("Dockerfile stubs sources with a `RUN mkdir -p` block");
+        // The block runs until the first line that does not continue with `\`.
+        let mut end = rest.len();
+        let mut at = 0;
+        for line in rest.lines() {
+            at += line.len() + 1;
+            if !line.trim_end().ends_with('\\') {
+                end = at.min(rest.len());
+                break;
+            }
+        }
+        &rest[..end]
+    };
+
+    // `mkdir -p` takes every member; the source stub after it is an `echo`ed
+    // `main.rs` for the two binaries and a `touch`ed `lib.rs` for the libraries.
+    let (mkdir_list, source_stubs) = stub_run
+        .split_once("echo ")
+        .expect("stub block writes a binary stub with `echo`");
+
+    let mkdir_entries: Vec<&str> = mkdir_list
+        .lines()
+        .map(|l| {
+            l.trim()
+                .trim_end_matches('\\')
+                .trim()
+                .trim_end_matches("&&")
+                .trim()
         })
+        .filter(|l| l.starts_with("crates/"))
         .collect();
+
+    let mut missing: Vec<String> = Vec::new();
+    for name in &members {
+        if !DOCKERFILE.contains(&format!("COPY crates/{name}/Cargo.toml")) {
+            missing.push(format!("{name}: no `COPY crates/{name}/Cargo.toml` line"));
+        }
+        let dir = format!("crates/{name}/src");
+        if !mkdir_entries.iter().any(|e| *e == dir) {
+            missing.push(format!("{name}: not in the `RUN mkdir -p` list"));
+        }
+        let lib = format!("crates/{name}/src/lib.rs");
+        let main = format!("crates/{name}/src/main.rs");
+        if !source_stubs.contains(&lib) && !source_stubs.contains(&main) {
+            missing.push(format!("{name}: no stub `lib.rs` or `main.rs`"));
+        }
+    }
 
     assert!(
         missing.is_empty(),
-        "these workspace members are missing from deploy/docker/Dockerfile's \n\
-         manifest-copy or stub-source list: {missing:?}\n\n\
+        "deploy/docker/Dockerfile is missing entries for workspace members:\n  \
+         {}\n\n\
          The image build fails with \"failed to load manifest for workspace \n\
          member\" — and it fails in the `docker` workflow, which `cargo test` \n\
-         does not exercise."
+         does not exercise.",
+        missing.join("\n  ")
     );
 }
