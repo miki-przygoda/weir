@@ -2694,6 +2694,7 @@ name = "weir-attest"
 version = "3.0.0"
 dependencies = [
  "crc32fast",
+ "serde_json",
  "sha2 0.10.9",
  "weir-core",
  "weir-sink-sdk",
