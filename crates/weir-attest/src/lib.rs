@@ -21,8 +21,10 @@
 #![deny(missing_docs)]
 
 pub mod chain;
+pub mod sidecar;
 
 pub use chain::{ChainHead, DOMAIN_SEP};
+pub use sidecar::{ATTEST_FORMAT_VERSION, ATTEST_MAGIC, Sidecar};
 
 /// Why an attest operation failed.
 #[derive(Debug)]
@@ -37,6 +39,18 @@ pub enum AttestError {
     BadHexDigit,
     /// Underlying I/O failure.
     Io(std::io::Error),
+    /// Sidecar magic did not match.
+    BadMagic,
+    /// Sidecar layout version is one this build cannot parse.
+    UnsupportedSidecarVersion {
+        /// The version byte seen.
+        version: u8,
+    },
+    /// Sidecar is shorter than its fixed prefix, or its declared name runs past
+    /// the end.
+    TruncatedSidecar,
+    /// Sidecar CRC did not match its contents.
+    SidecarCrcMismatch,
 }
 
 impl std::fmt::Display for AttestError {
@@ -47,6 +61,12 @@ impl std::fmt::Display for AttestError {
             }
             Self::BadHexDigit => write!(f, "chain head contains a non-hex character"),
             Self::Io(e) => write!(f, "io: {e}"),
+            Self::BadMagic => write!(f, "not a weir attest sidecar (bad magic)"),
+            Self::UnsupportedSidecarVersion { version } => {
+                write!(f, "unsupported attest sidecar version {version:#04x}")
+            }
+            Self::TruncatedSidecar => write!(f, "attest sidecar is truncated"),
+            Self::SidecarCrcMismatch => write!(f, "attest sidecar CRC mismatch"),
         }
     }
 }
