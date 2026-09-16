@@ -91,7 +91,29 @@ Threats the daemon defends against:
 | Unauthenticated remote TCP producers (`--features tls`) | Mutual TLS with CA-signed client cert required. Anonymous clients rejected at handshake; increments `weir_tls_handshake_failures_total{reason="no_client_cert"}`. |
 | TLS-handshake slowloris on TCP path (`--features tls`) | `tls_handshake_timeout_secs` (default 10s) bounds handshake duration. The connection cap semaphore permit is held across the handshake, so a flood of stalled TCP connections is bounded by `max_connections`. Increments `weir_tls_handshake_failures_total{reason="timeout"}`. |
 | Plaintext TCP fallback | Setting `tcp_bind` without a valid TLS config is a fatal startup error. The daemon never opens a plaintext TCP socket. |
-| Tamper evidence for sealed WAB segments | `weir-attest` hash-chains every sealed segment (`weir-ctl attest seal\|verify\|head`) over each record's already-frozen `RecordId`, linked to the previous segment's chain head. Catches: offline tampering (a segment copied to backup, archive, or another host and edited there), a different UID on the same host, an edit made on a shared or network filesystem where `weir-wab`'s own guarantees are already documented not to hold, and silent corruption that happens to pass CRC32 (a 32-bit checksum recomputes cleanly in microseconds after an edit; a SHA-256 chain does not). The honest one-line description is "prove a sealed buffer was not edited after the fact" — see [monitoring.md](../monitoring.md#integrity--tamper-evidence) for the anchoring requirement this depends on, without which a chain is not evidence at all. |
+
+## Tamper evidence — operator-run, not a daemon defense
+
+**This is not a threat the daemon defends against.** Everything in the table
+above runs inside the daemon process, unattended. What follows is a separate
+tool the operator must schedule and anchor themselves — it is listed on its
+own so it is never mistaken for one of the guarantees above.
+
+`weir-attest` hash-chains every **sealed** WAB segment (`weir-ctl attest
+seal|verify|head`) over each record's already-frozen `RecordId`, linked to
+the previous segment's chain head. Catches: offline tampering (a segment
+copied to backup, archive, or another host and edited there), a different UID
+on the same host, an edit made on a shared or network filesystem where
+`weir-wab`'s own guarantees are already documented not to hold, and silent
+corruption that happens to pass CRC32 (a 32-bit checksum recomputes cleanly
+in microseconds after an edit; a SHA-256 chain does not). The honest one-line
+description is "prove a sealed buffer was not edited after the fact" — and it
+holds only if the operator has actually wired up the cron/timer and the
+off-host log shipping described in
+[monitoring.md](../monitoring.md#integrity--tamper-evidence). A `.attest`
+sidecar nobody ever ran `verify` against, or whose head was never observed
+off-host, is not evidence of anything — it is inert until an operator makes
+it otherwise.
 
 ## Out of scope (current non-goals)
 
@@ -105,7 +127,7 @@ deliberate architectural choices; others are future work.
 | Privilege drop | Daemon runs as whatever user invoked it. There is no built-in `setuid`/`setgid` to a dedicated `weir` user. Operators are expected to launch under the desired user (e.g. via systemd `User=weir`). |
 | Linux capabilities / seccomp | Not applied. Operators should sandbox the binary externally if needed (systemd `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX`, `PrivateTmp=yes`, `ProtectSystem=strict`, etc.). |
 | Encrypted at-rest WAB | WAB segments are plaintext on disk. Use filesystem-level encryption (LUKS / dm-crypt) if payloads are sensitive. |
-| Non-repudiation / signed audit log | The hash chain above (`weir-attest`) is not a signature. It proves internal consistency and, via an off-host anchor, consistency with what was already observed — it proves nothing about *who* wrote a record, and signing remains a possible follow-up, not something shipped. It also does not defend against a process running as the daemon UID: that is already out of scope above and unchanged here — such a process can rewrite the segment, the `.attest` sidecar, and the anchor's own log line in one motion. **Detection only, never prevention:** nothing stops the write, and a chain whose head was never observed off-host is not evidence of anything. |
+| Non-repudiation / signed audit log | The hash chain described above ("Tamper evidence — operator-run, not a daemon defense") is not a signature. It proves internal consistency and, via an off-host anchor, consistency with what was already observed — it proves nothing about *who* wrote a record, and signing remains a possible follow-up, not something shipped. It also does not defend against a process running as the daemon UID: that is already out of scope above and unchanged here — such a process can rewrite the segment, the `.attest` sidecar, and the anchor's own log line in one motion. **Detection only, never prevention:** nothing stops the write, and a chain whose head was never observed off-host is not evidence of anything. |
 | Sink-side authorization | Sinks (HTTP / MySQL / Postgres / ClickHouse, plus the built-in `noop`) carry their own credentials to the downstream system; weir does not pass through producer identity. Authorization to the downstream is the sink's / operator's responsibility. |
 | Concurrent-write protection on socket path | Two daemon instances pointed at the same `socket_path` will race. Operator's responsibility (one daemon per socket). |
 | Resource accounting per-client | All connections share the same `max_connections` budget. No per-uid quotas. A misbehaving client can consume up to the global cap. |

@@ -205,6 +205,11 @@ weir-ctl attest verify <wab-dir> [--shard N]   # recompute and compare
 weir-ctl attest head   <wab-dir> --shard N     # print the current head, for anchoring
 ```
 
+**This block is illustrative pseudo-syntax, not the shipped CLI.** As
+implemented, `<wab-dir>` is the flag `--wab-dir` (not positional) on every
+subcommand, and `head` takes no `--shard` — it prints the newest head for
+every shard. See `docs/monitoring.md` for the real invocations.
+
 `verify` is the command that matters. On mismatch it reports **the first
 divergent record index**, not just a boolean — a verifier that says only "this
 segment is bad" leaves the operator with a 256 MiB file and no next step.

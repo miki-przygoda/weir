@@ -297,9 +297,9 @@ the daemon entirely — no cost on the ack path, no `FORMAT_VERSION` bump, no
 touch to the frozen conformance vectors. Three subcommands:
 
 ```
-weir-ctl attest seal   <wab-dir> [--shard N]   # chain any sealed segment lacking a sidecar
-weir-ctl attest verify <wab-dir> [--shard N]   # recompute the chain and compare
-weir-ctl attest head   <wab-dir> --shard N     # print the current head, for anchoring
+weir-ctl attest seal   --wab-dir /var/lib/weir/wab [--shard N]   # chain any sealed segment lacking a sidecar
+weir-ctl attest verify --wab-dir /var/lib/weir/wab [--shard N]   # recompute the chain and compare
+weir-ctl attest head   --wab-dir /var/lib/weir/wab               # print the newest head per shard, for anchoring
 ```
 
 `seal` writes a `<segment>.wab.sealed.attest` sidecar per sealed segment,
@@ -308,6 +308,15 @@ linking the segment's start hash to the previous segment's head. `verify`
 re-reads every byte and recomputes the chain from nothing — seconds on a
 256 MiB segment, so it is an audit operation, not a health check, and must
 never be wired into a readiness probe.
+
+**Records in an active, unsealed segment are not chained at all** — only
+`seal` puts anything into the chain, and it only ever sees sealed segments.
+That window is bounded by the seal cadence:
+[`wab_segment_max_bytes`](operations/configuration.md#wab_segment_max_bytes)
+and
+[`wab_segment_max_age_secs`](operations/configuration.md#wab_segment_max_age_secs)
+are what close it. An operator who needs the window tighter lowers those, at
+the usual cost of smaller/more-frequent segments.
 
 **A `.attest` sidecar sitting next to the segment it protects is not evidence
 by itself.** Anyone able to rewrite the segment can recompute a sidecar that
@@ -477,6 +486,21 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown after the grace period. |
 | `weir_tls_handshake_failures_total` | counter | (tls) Mutual-TLS handshake failures. |
 | `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. |
+
+### Integrity / tamper evidence (weir-attest)
+
+> **Unlike every other row on this page, these do not come from the daemon's
+> `/metrics`.** They are written by a cron-run `weir-ctl attest verify
+> --metrics-file <path>` onto the node_exporter textfile collector — see
+> [Integrity / tamper evidence](#integrity--tamper-evidence) above for the
+> full picture. All three are gauges, overwritten wholesale on each run, not
+> counters: they carry no `_total` suffix on purpose.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `weir_attest_segments` | gauge | Sealed segments examined by the last `weir-ctl attest verify` run. |
+| `weir_attest_verify_failures` | gauge | Segments that diverged or could not be verified in the last run. **Must be 0** — a firing alert here is an integrity incident, not a durability one. See [`WeirAttestVerifyFailed`](#weirattestverifyfailed). |
+| `weir_attest_chain_origins` | gauge | Segments observed with no chain predecessor in the last run — expected for the first segment of a shard, or one whose predecessor was quarantined; unexpected otherwise. |
 
 ### Compression ratio
 
