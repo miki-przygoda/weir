@@ -130,6 +130,30 @@ protocol** below.
   unchained until the next seal. Publish order is now
   `core → wab → sink-sdk → attest → sink-s3 → client → rs → server → ctl`.
 
+- **Tracked push in all five polyglot demo clients.** `PushTracked`/`AckTracked`
+  went onto the wire in 3.0.0 with only a Rust implementation; C, Go, Java,
+  Python and TypeScript now speak it too. Each was written from
+  `docs/wire_protocol.md` rather than ported from the Rust client, which is the
+  only way a spec gets checked rather than agreed with itself. Two of them
+  needed what their standard libraries do not provide: C ships no UTF-8
+  validator, and Java has no unsigned 64-bit integer, so a segment index above
+  `Long.MAX_VALUE` arrives negative — the conformance vectors exercise
+  `u64::MAX` precisely so that cannot be forgotten quietly.
+
+- **`WeirDrainNotConfirming`, and the first alert-state assertions this repo has
+  ever had.** Seventeen rules shipped without a single one being demonstrated to
+  fire: `promtool check rules` only parses, and nothing in `deploy/` or
+  `.github/` had ever read `ALERTS` or queried Alertmanager. The new rule closes
+  a real hole — the four existing drain rules all read `weir_drain_state` or
+  `weir_sink_health`, both written *only* by the drain thread, so when that
+  thread wedges they freeze at their last healthy-looking value and every one of
+  them stays silent. `WeirDrainNotConfirming` compares two counters that
+  different threads write: it fires when segments are still being *sealed* at a
+  nonzero rate while none are being *confirmed*. A wedged drain thread cannot
+  fake that, because it is not the thread doing the sealing. The `monitoring` job's
+  comment claiming it "validates the dashboard, alert rules, and the image build
+  end to end" is corrected rather than left making the claim.
+
 ### Fixed
 
 - **A failed record in a WAB batch nacked innocent records alongside it.**
@@ -162,6 +186,83 @@ protocol** below.
   bit, so everything under it failed `EACCES`. The pid-scoped scratch
   directories then *persisted* with the bad mode, making a transient race
   permanently reproducible for any later run that reused the pid.
+
+- **A stale write classification could produce a false ack.** This is a
+  crown-invariant defect: at the `Durable` tier an ack must never be a false
+  ack. `write_record` has five `Err` paths; four set `last_write_failure` and
+  the rotation path — `self.active.take().unwrap().seal()?` — set nothing,
+  while the field was never cleared on success. The classification therefore
+  outlived the failure that produced it. One `RecordRejected` (a zstd failure
+  in production) latched the field for the life of the shard's `ShardWriter`,
+  which lives as long as the process; a later write that rotated and whose
+  `seal()` then failed had already had its segment `take()`n and never reached
+  the durability commit point, but `flush_batch` read the stale
+  `RecordRejected` as "the segment is intact, spare its neighbours" and left
+  `pending_acks` un-nacked. Those records were acked and were not on stable
+  storage. Every success path now clears the field, and the rotation path sets
+  `SegmentDropped`.
+
+- **A stack buffer overflow in the C demo client.** `weir_recv_response` read
+  `payload_len + 4` bytes into a 6-byte `tail` buffer with no bound check.
+  Correct until 3.0, when the response cap became dependent on the declared
+  message type (298 for `AckTracked`, later 259 for `AckBatch`); the sibling
+  `weir_recv_tracked_response` was widened to match and this caller was not.
+  **No hostile peer is required** — a conformant daemon's `AckTracked`
+  overflows it, and the client now ships a batch codec with no receiver of its
+  own, so a program following its own API reads an `AckBatch` through this
+  function. Reproduced under AddressSanitizer with a well-formed 298-byte
+  `AckTracked`: `WRITE of size 302`.
+
+- **A peer's declared `payload_len` could choose the client's allocation.** Two
+  of the five polyglot clients bounded a *response* payload by the cap on a
+  *record being sent*, or by nothing at all. Against a fake daemon answering
+  with a well-formed Nack header declaring 8 MiB and then sending no body,
+  Python peaked at 8,389,574 bytes allocated and Go at a TotalAlloc delta of
+  8,442,992 — both off one 4-byte header field, before a single byte of body
+  arrived. The declared length is now bounded by the cap for its own message
+  type first, in every client.
+
+- **`create_dir_private` did not deliver the mode it promises.**
+  `DirBuilder::mode(0o700)` is masked by the process umask like any other
+  `mkdir(2)`; only `chmod(2)` is umask-independent. Under the daemon's own
+  `umask 0o177` the directory came out `0o600` — no execute bit — so nothing
+  under it could be traversed. The mode is now applied with an explicit `chmod`
+  after creation.
+
+- **A permanent batch rejection was counted as a transient one.** The metric
+  conflated "this record will never be accepted" with "try again", which is the
+  distinction an operator uses to decide whether to page.
+
+- **`rustls` 0.23.45 for RUSTSEC-2026-0285.**
+
+- **The doc-drift guards ran in no CI job at all.** 3.0.0 advertised ten guards
+  "each with a test that fails without the fix" while `grep -rn docs_drift
+  .github/ scripts/ deploy/` returned nothing anywhere — the `test` job
+  enumerates targets explicitly and `docs_drift` was in neither its default nor
+  its `--all-features` line. Two of the ten were red on `main` at the time (both
+  stale benchmark vintages). The vintages are corrected and the target is wired
+  into both lines, so the mechanism built to stop published claims going stale
+  is itself now executed. A guard is theatre until it is wired.
+
+- **Alert rules that no test could distinguish from a deleted rule.**
+  `WeirFsyncLatencyHigh`, `WeirFsyncLatencyCritical` and `WeirHighNackRate`
+  shipped with no assertion in either direction, and two more were pinned only
+  in the firing direction: `promtool test rules` checks the assertions that
+  exist, so a rule with none passes, and deleting those three outright left the
+  gate green. All five are now pinned both ways, and
+  `every_alert_rule_has_a_unit_test` derives the rule set from the rules file so
+  the next rule is covered the day it is added. The fsync tests had also pinned
+  a quantile that rounds differently per architecture — `49.96ms` on arm64
+  against `49.95ms` on amd64 — and now land on a bucket boundary instead.
+
+- **Every workspace member must appear in the Docker builder.** Adding a member
+  without updating `deploy/docker/Dockerfile` fails the image build outright, in
+  the `docker` workflow that the Rust gate never runs. It had happened twice.
+  `every_workspace_member_is_in_the_docker_builder` now derives the member set
+  from the root manifest and checks each of the three obligations — the `COPY`
+  line, the `mkdir -p` list, and the source stub — against the region of the
+  Dockerfile that carries it, rather than against the file as a whole.
+
 
 ## [3.0.0] - 2026-09-10
 
