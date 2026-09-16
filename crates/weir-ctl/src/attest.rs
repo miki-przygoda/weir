@@ -553,14 +553,28 @@ fn write_metrics_file(
 /// verified".
 ///
 /// The inter-segment link check walks the same name-sorted list per shard
-/// that [`cmd_attest_seal`] walks, carrying its own running `expected` head
-/// (an `Option` — `None` once a segment has no decodable sidecar to read a
-/// head from, so exactly the one boundary immediately after a gap is left
-/// unchecked rather than falsely flagged; every segment after that resyncs
-/// from its own sidecar). This is deliberately independent of
-/// `weir_attest::verify_segment`, which only ever compares a segment against
-/// the `prev_head` recorded in *its own* sidecar — a value co-located with,
-/// and rewritable by, whoever can rewrite the segment itself.
+/// that [`cmd_attest_seal`] walks, carrying its own running `expected` head.
+/// This is deliberately independent of `weir_attest::verify_segment`, which
+/// only ever compares a segment against the `prev_head` recorded in *its own*
+/// sidecar — a value co-located with, and rewritable by, whoever can rewrite
+/// the segment itself.
+///
+/// Two properties of that walk are load-bearing, and both were once wrong:
+///
+/// - It starts at `None`, not `ORIGIN`. The oldest SURVIVING segment of a
+///   shard has no predecessor to be checked against, because retention
+///   reclaimed it; treating that as a broken link made the critical alert
+///   fire permanently in every retaining deployment. Spec 3.2 reports it as a
+///   chain origin instead, and concedes that only the operator's own record
+///   of a shard's history separates an expected origin from an unexpected
+///   one. A segment whose sidecar declares itself an origin is treated the
+///   same way, which is what keeps a quarantine gap from failing the run.
+/// - A segment with no sidecar does not reset `expected` to `None`. Its head
+///   is recomputed from the predecessor just observed and carried forward, so
+///   the successor's `prev_head` — which commits to this segment's content —
+///   still gets checked. Resetting discarded that, and `rm <segment>.attest`
+///   next to an edited segment was enough to turn a detected divergence into
+///   a clean exit. Deleting a sidecar breaks the link; it does not erase it.
 ///
 /// `--json` here prints ONE pretty JSON object summarising the whole run
 /// (`print_json`, same convention as `segments`/`dl list`) — unlike
@@ -597,55 +611,87 @@ pub(crate) fn cmd_attest_verify(
                 continue;
             }
         };
-        // The head this shard's chain SHOULD be at right now, mirroring
-        // `cmd_attest_seal`'s own `prev` walk over the identical name-sorted
-        // list — reset to `ORIGIN` at the start of every shard, exactly as
-        // `seal` resets its `prev`.
-        let mut expected_head: Option<ChainHead> = Some(ChainHead::ORIGIN);
+        // The head this shard's chain SHOULD be at right now — `None` until a
+        // predecessor has actually been OBSERVED in this run.
+        //
+        // Seeding this with `ORIGIN` is what made every retaining deployment
+        // report a permanent broken link. `confirm_and_delete` reclaims sealed
+        // segments continuously, so the oldest SURVIVING segment cites a real
+        // predecessor head that is no longer on disk, and no shard past its
+        // first reclamation ever matched `ORIGIN` again. Spec 3.2 settles it:
+        // a segment whose predecessor is missing "is reported as a chain
+        // origin rather than as a failure ... only the operator's own record
+        // of the shard's history can distinguish them". That record is the
+        // off-host anchor, not this walk — which cannot tell retention from
+        // deletion, because after either one the predecessor is simply gone.
+        let mut expected_head: Option<ChainHead> = None;
         for seg in segments {
             segments_total += 1;
             let name = segment_name_for(&seg);
             let decoded = read_sidecar(&seg);
 
+            // A chain origin: no predecessor was observed (the first segment
+            // of a shard, or the oldest to survive reclamation or a quarantine
+            // gap), or the sidecar declares itself one. Counted, never failed —
+            // an origin is not evidence of tampering, an *unexpected* origin
+            // is, and only the operator's own history can tell those apart.
+            // `weir_attest_chain_origins` is what they alert on for that.
+            let declares_origin = decoded.as_ref().map(|s| s.prev_head) == Some(ChainHead::ORIGIN);
+            if expected_head.is_none() || declares_origin {
+                chain_origins += 1;
+            }
+
             if let Some(expected) = expected_head
                 && let Some(sidecar) = decoded.as_ref()
+                && !declares_origin
                 && sidecar.prev_head != expected
             {
-                // Legitimate for the FIRST segment of a shard: `expected`
-                // starts at `ORIGIN` there too, so a genuine first segment's
-                // `prev_head == ORIGIN` matches and never reaches here. A
-                // chain origin recorded by any LATER segment — or any
-                // segment whose recorded predecessor does not match the
-                // actual, surviving one (deletion, substitution) — does
-                // reach here, which is exactly the boundary this check
-                // exists to name.
+                // Reached only when a predecessor was observed in THIS run, so
+                // `expected` is a fact about what is on disk rather than an
+                // assumption about what used to be there. Deletion or
+                // substitution WITHIN the observed window still lands here.
                 broken_links.push(BrokenLinkEntry {
                     segment: name.clone(),
                     expected: expected.to_hex(),
                     actual: sidecar.prev_head.to_hex(),
                 });
             }
-            // Advance regardless of the outcome above: once a segment's own
-            // sidecar has been read, its recorded `head` is what a correctly
+
+            // Advance. With a sidecar, its recorded `head` is what a correctly
             // functioning chain's next segment must cite as `prev_head` —
-            // that holds whether or not THIS segment's link just checked out.
-            expected_head = decoded.as_ref().map(|s| s.head);
+            // whether or not THIS segment's link just checked out.
+            //
+            // With NO sidecar, recompute this segment's head from the
+            // predecessor just observed and carry that forward. Dropping to
+            // `None` here discarded the one check that still worked: the
+            // successor's `prev_head` commits to this segment's content, so
+            // deleting a tampered segment's sidecar turned a detected
+            // divergence into `exit 0`. Deleting a sidecar must BREAK the
+            // link, not erase it.
+            expected_head = match (decoded.as_ref(), expected_head) {
+                (Some(sidecar), _) => Some(sidecar.head),
+                (None, Some(prev)) => match chain_segment(&seg, prev) {
+                    Ok(recomputed) => Some(recomputed.head),
+                    // Structurally unreadable, so the next boundary is
+                    // genuinely uncheckable. "Could not check" is the exit-2
+                    // category — the same one a corrupt segment WITH a sidecar
+                    // already lands in; silently passing it off as nothing
+                    // worse than a missing sidecar is the bug being fixed.
+                    Err(e) => {
+                        errors.push(format!("{name}: {e}"));
+                        None
+                    }
+                },
+                (None, None) => None,
+            };
 
             match verify_segment(&seg) {
-                Ok(Verdict::Verified) => {
-                    verified += 1;
-                    if decoded.as_ref().map(|s| s.prev_head) == Some(ChainHead::ORIGIN) {
-                        chain_origins += 1;
-                    }
-                }
+                Ok(Verdict::Verified) => verified += 1,
                 Ok(Verdict::Diverged {
                     at_record,
                     expected,
                     actual,
                 }) => {
-                    if decoded.as_ref().map(|s| s.prev_head) == Some(ChainHead::ORIGIN) {
-                        chain_origins += 1;
-                    }
                     diverged.push(DivergedEntry {
                         segment: name,
                         at_record,
@@ -1303,5 +1349,126 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "sidecar mode {mode:#o} != 0o600");
+    }
+
+    #[test]
+    fn reclaiming_the_oldest_segment_leaves_a_chain_origin_not_a_broken_link() {
+        // `confirm_and_delete` removes sealed segments once they have drained,
+        // so in any deployment with retention the oldest SURVIVING segment
+        // cites a `prev_head` whose segment is gone. Seeding the walk with
+        // `ORIGIN` made that a broken link in every shard, permanently —
+        // training operators to ignore the one alert that means tampering.
+        // Spec 3.2: a segment whose predecessor is missing is "reported as a
+        // chain origin rather than as a failure".
+        let scratch = Scratch::new("reclaim_oldest");
+        let shard = scratch.path().join("shard_00");
+        let seg0 = shard.join("seg_00000000.wab.sealed");
+        write_segment(&seg0, 0, &[b"a"]);
+        write_segment(&shard.join("seg_00000001.wab.sealed"), 0, &[b"b"]);
+        write_segment(&shard.join("seg_00000002.wab.sealed"), 0, &[b"c"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, None, false),
+            ExitCode::SUCCESS
+        );
+
+        // Retention reclaims the oldest segment, sidecar and all.
+        std::fs::remove_file(&seg0).unwrap();
+        std::fs::remove_file(sidecar_path(&seg0)).unwrap();
+
+        let metrics_path = scratch.path().join("weir_attest.prom");
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, Some(&metrics_path), false),
+            ExitCode::SUCCESS,
+            "reclaiming the oldest segment is normal operation and must not be \
+             reported as an integrity failure"
+        );
+        let body = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(
+            body.contains("weir_attest_verify_failures 0"),
+            "reclamation must leave verify_failures at 0: {body}"
+        );
+        assert!(
+            body.contains("weir_attest_chain_origins 1"),
+            "the oldest surviving segment is a chain origin and must be counted \
+             as one — an unexpected origin is what an operator alerts on, and \
+             that signal only works if expected ones land here too: {body}"
+        );
+    }
+
+    #[test]
+    fn deleting_a_tampered_segments_sidecar_does_not_mute_the_divergence() {
+        // The sidecar sits next to the segment, so whoever can edit one can
+        // unlink the other. Dropping `expected_head` to `None` at a
+        // sidecar-less segment discarded the successor's `prev_head` — which
+        // commits to this segment's content — so `rm seg.attest` turned a
+        // detected divergence into `exit 0`. Deleting a sidecar must BREAK the
+        // link, not erase it.
+        let scratch = Scratch::new("tamper_then_unlink_sidecar");
+        let shard = scratch.path().join("shard_00");
+        let seg1 = shard.join("seg_00000001.wab.sealed");
+        write_segment(&shard.join("seg_00000000.wab.sealed"), 0, &[b"a"]);
+        write_segment(&seg1, 0, &[b"b"]);
+        write_segment(&shard.join("seg_00000002.wab.sealed"), 0, &[b"c"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, None, false),
+            ExitCode::SUCCESS
+        );
+
+        // Tamper with the middle segment, then delete the evidence beside it.
+        write_segment(&seg1, 0, &[b"TAMPERED"]);
+        std::fs::remove_file(sidecar_path(&seg1)).unwrap();
+
+        let metrics_path = scratch.path().join("weir_attest.prom");
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, Some(&metrics_path), false),
+            ExitCode::from(1),
+            "deleting a tampered segment's sidecar must not reduce the run to a \
+             clean exit — the next segment still commits to the real head"
+        );
+        let body = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(
+            !body.contains("weir_attest_verify_failures 0"),
+            "the tamper must still reach weir_attest_verify_failures: {body}"
+        );
+    }
+
+    #[test]
+    fn deleting_an_intact_segments_sidecar_is_still_not_treated_as_tampering() {
+        // The other direction of the same fix, and the one that keeps it
+        // honest: recomputing a sidecar-less segment's head must CONFIRM the
+        // successor's `prev_head` when the content is untouched. A missing
+        // sidecar over intact bytes stays a reporting matter, not an integrity
+        // failure — otherwise the fix above just trades a permanent false
+        // positive for a different one.
+        let scratch = Scratch::new("unlink_sidecar_intact");
+        let shard = scratch.path().join("shard_00");
+        let seg1 = shard.join("seg_00000001.wab.sealed");
+        write_segment(&shard.join("seg_00000000.wab.sealed"), 0, &[b"a"]);
+        write_segment(&seg1, 0, &[b"b"]);
+        write_segment(&shard.join("seg_00000002.wab.sealed"), 0, &[b"c"]);
+
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        std::fs::remove_file(sidecar_path(&seg1)).unwrap();
+
+        let metrics_path = scratch.path().join("weir_attest.prom");
+        assert_eq!(
+            cmd_attest_verify(scratch.path(), None, Some(&metrics_path), false),
+            ExitCode::SUCCESS,
+            "an unlinked sidecar over unmodified content must not be reported \
+             as tampering"
+        );
+        let body = std::fs::read_to_string(&metrics_path).unwrap();
+        assert!(
+            body.contains("weir_attest_missing_sidecar 1"),
+            "it must still be counted as a missing sidecar: {body}"
+        );
+        assert!(
+            body.contains("weir_attest_verify_failures 0"),
+            "and must not be counted as a verify failure: {body}"
+        );
     }
 }

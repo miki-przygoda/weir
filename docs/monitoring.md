@@ -440,7 +440,10 @@ longer matches its recorded hash chain, or a segment's recorded link to its
 predecessor no longer matches what that predecessor actually produced (a
 **broken link** — reported as `BROKEN_LINK` in `verify`'s text output —
 which is what deleting or substituting a whole segment out of a chain looks
-like).
+like). Reclaiming the *oldest* segments is not this: retention removes them
+continuously, the oldest survivor is reported as a chain origin instead, and
+`weir_attest_chain_origins` is where that shows up. A broken link always
+names a boundary between two segments that are both still on disk.
 
 **This is an integrity incident, not a durability one.** The records were
 acked and fsynced correctly at the time; the bytes on disk (or the set of
@@ -599,8 +602,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 |---|---|---|
 | `weir_attest_segments` | gauge | Sealed segments examined by the last `weir-ctl attest verify` run. |
 | `weir_attest_verify_failures` | gauge | Segments that diverged, or whose recorded link to their predecessor did not match reality (a broken link — see above), or that could not be verified in the last run. **Must be 0** — a firing alert here is an integrity incident, not a durability one. See [`WeirAttestVerifyFailed`](#weirattestverifyfailed). |
-| `weir_attest_chain_origins` | gauge | Segments observed with no chain predecessor in the last run — expected for the first segment of a shard, or one whose predecessor was quarantined; unexpected otherwise (and, if unexpected, caught as a broken link and counted in `weir_attest_verify_failures` too). |
-| `weir_attest_missing_sidecar` | gauge | Sealed segments with no `.attest` sidecar in the last run — `seal` has never chained them. **Not** counted in `weir_attest_verify_failures` (a missing sidecar is not tampering by itself) — but a nonzero, non-falling value here over time means `seal` isn't running or isn't keeping up, which the other three metrics cannot tell you: a WAB directory nobody has ever sealed reports `verify_failures 0` forever. |
+| `weir_attest_chain_origins` | gauge | Segments observed with no chain predecessor in the last run — the first segment of a shard, the oldest to survive **retention** (`confirm_and_delete` reclaims drained sealed segments continuously, so this is the steady-state case, not a rare one), one whose predecessor was quarantined, or one whose sidecar declares itself an origin. **Never counted as a failure.** Verify cannot tell a reclaimed predecessor from a deleted one — after either, the predecessor is simply gone — so an origin is not evidence of tampering and an *unexpected* origin is; only your own record of a shard's history distinguishes them. Alert on this **changing unexpectedly** (a jump with no reclamation or quarantine behind it), not on it being nonzero. |
+| `weir_attest_missing_sidecar` | gauge | Sealed segments with no `.attest` sidecar in the last run — `seal` has never chained them. **Not** counted in `weir_attest_verify_failures` (a missing sidecar is not tampering by itself — and since the *next* segment's `prev_head` commits to this one's content, verify recomputes the head of a sidecar-less segment and still checks that link, so deleting a sidecar to hide an edit breaks the chain rather than erasing it) — but a nonzero, non-falling value here over time means `seal` isn't running or isn't keeping up, which the other three metrics cannot tell you: a WAB directory nobody has ever sealed reports `verify_failures 0` forever. |
 
 ### Compression ratio
 
