@@ -77,6 +77,49 @@ protocol** below.
   round-trip-bound or fsync-bound, and therefore whether batching or concurrency
   is the answer.
 
+- **`weir-attest`: a hash chain over sealed WAB segments, and `weir-ctl attest
+  seal|verify|head` to drive it.** What it proves, in one line: a sealed
+  buffer was not edited after the fact. That covers offline tampering (a
+  segment copied to backup, archive, or another host and edited there), a
+  different UID on the same host, an edit made on a shared or network
+  filesystem where `weir-wab`'s own docs already say the guarantees do not
+  hold, and silent corruption that happens to pass CRC32 — a 32-bit checksum
+  recomputes cleanly in microseconds after an edit; a SHA-256 chain over each
+  record's already-frozen `RecordId` does not. It is an audit and compliance
+  property, not tamper-*prevention*.
+
+  What it does not prove: authorship. A hash chain is not a signature, and
+  non-repudiation stays explicitly out of scope. It does not defend against a
+  process running as the daemon UID either — already out of scope in the
+  threat model, and nothing here changes that: such a process can rewrite the
+  segment, the `.attest` sidecar, and the log line that announces its head, in
+  one motion. Nothing here stops a write; this is detection, after the fact,
+  and only once the anchor below has actually been observed — never
+  prevention.
+
+  **A sidecar sitting next to the segment it protects is not evidence.**
+  Anyone who can edit the segment can recompute the sidecar to match. The
+  chain becomes evidence only once its head has left the host: the structured
+  log line `weir.attest.head` is the anchor, and it is only as good as your
+  log pipeline's shipping latency. The three companion gauges
+  (`weir_attest_segments`, `weir_attest_verify_failures`,
+  `weir_attest_chain_origins`) are written by a `weir-ctl attest verify
+  --metrics-file` cron/timer job onto the node_exporter textfile collector,
+  never by the daemon, and deliberately carry no `_total` suffix — they are
+  gauges overwritten wholesale on each run, not counters, so an
+  `increase()`-based alert would go quiet one evaluation window into a
+  standing incident. Exit codes distinguish `0` (verified), `1` (a chain
+  diverged — tampering or corruption), and `2` (could not even check), so the
+  cron job can page differently on "tampered" than on "I could not tell."
+
+  Ships as a ninth published crate, `weir-attest`, built as a consumer of
+  `weir-wab`'s already-public `SegmentReader` / `verify_sealed_segment`
+  surface: no daemon change, no `FORMAT_VERSION` bump, no migration, no touch
+  to the ack path or the frozen conformance vectors — chaining happens after a
+  segment is sealed, which is exactly why records in an *active* segment stay
+  unchained until the next seal. Publish order is now
+  `core → wab → sink-sdk → attest → sink-s3 → client → rs → server → ctl`.
+
 ### Fixed
 
 - **A failed record in a WAB batch nacked innocent records alongside it.**

@@ -291,6 +291,46 @@ reload landed (and `outcome="failed"` that it was rejected).
 
 ### Integrity / tamper evidence
 
+`weir-ctl attest` hash-chains **sealed** WAB segments so "was this segment
+edited after it was written?" becomes an answerable question. It runs outside
+the daemon entirely — no cost on the ack path, no `FORMAT_VERSION` bump, no
+touch to the frozen conformance vectors. Three subcommands:
+
+```
+weir-ctl attest seal   <wab-dir> [--shard N]   # chain any sealed segment lacking a sidecar
+weir-ctl attest verify <wab-dir> [--shard N]   # recompute the chain and compare
+weir-ctl attest head   <wab-dir> --shard N     # print the current head, for anchoring
+```
+
+`seal` writes a `<segment>.wab.sealed.attest` sidecar per sealed segment,
+chaining each record's already-frozen `RecordId` into a running SHA-256 and
+linking the segment's start hash to the previous segment's head. `verify`
+re-reads every byte and recomputes the chain from nothing — seconds on a
+256 MiB segment, so it is an audit operation, not a health check, and must
+never be wired into a readiness probe.
+
+**A `.attest` sidecar sitting next to the segment it protects is not evidence
+by itself.** Anyone able to rewrite the segment can recompute a sidecar that
+matches it, in the same motion. The chain only becomes evidence once its head
+has been observed somewhere the editor does not control — in practice, the
+structured log line `weir.attest.head` (shard, segment name, record count,
+the 64-hex head), emitted at seal time and shipped off-host by your log
+pipeline before anyone with write access to the WAB directory could have
+edited both the segment and its sidecar to match. A `.attest` file with no
+independent, off-host record of what its head used to say is a number, not
+an audit trail.
+
+Nothing here runs automatically or lives in the daemon. Wire
+`weir-ctl attest verify --wab-dir <dir> --metrics-file <path>` behind a
+cron job or systemd timer — on whatever cadence trades verification cost
+against detection latency — writing to the node_exporter textfile collector.
+Its exit codes distinguish the failure mode for that job: `0` every segment
+verified, `1` at least one segment's chain diverged from what was recomputed
+(tampering, or corruption past what CRC32 catches), `2` at least one segment
+could not even be checked (missing/unreadable segment, undecodable sidecar).
+Script the cron job to alert differently on `1` than on `2` — treat `2` as
+"unknown," not "clean."
+
 #### WeirAttestVerifyFailed
 `weir_attest_verify_failures` does **not** come from the daemon — the
 daemon is not involved in this feature at all. It's written by a cron/timer

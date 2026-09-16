@@ -7,12 +7,13 @@ wire envelope decoder reads every byte off an unauthenticated socket
 connection. A panic or unbounded allocation in either parser turns
 into a denial-of-service vector.
 
-This directory ships a `cargo-fuzz` setup with two targets:
+This directory ships a `cargo-fuzz` setup with three targets:
 
 | Target | Function under test | Why fuzz it |
 | --- | --- | --- |
 | `wab_confirmed` | `weir_server::wab::format::parse_confirmed` | Parses the on-disk `.confirmed` sidecar. Reached at startup by the drain's directory scan and at runtime when the drain writes confirmation records. |
 | `envelope_parse` | `weir_core::Envelope::decode` | Decodes the wire-format envelope from every push the daemon accepts. Every connected client gets to feed this function arbitrary bytes. |
+| `wab_segment_header` | `weir_server::wab::format::parse_segment_header` | Parses the header of every `.wab`/`.wab.sealed` file — read at daemon startup (crash recovery's directory scan) and on every drain, so attacker-controlled bytes after a host compromise reach it directly. Exists because format v2 added version-routing and a flags-byte validation v1 never had. |
 
 The existing proptest harness in `crates/weir-core/tests/reference_frames.rs`
 covers *round-tripping* — encode → decode of valid envelopes always
@@ -71,11 +72,19 @@ The corpus directories are gitignored — each invocation of
 
 ## CI integration
 
-Not wired up. cargo-fuzz needs nightly Rust which would make
-GitHub Actions jobs slower to start and adds a different toolchain
-to the CI matrix. A reasonable starter shape — a 60-second smoke fuzz
-on each PR — would live in `.github/workflows/fuzz-smoke.yml` and is
-a clean follow-up when someone wants it.
+**Compiled, not run.** The `harnesses` job in `.github/workflows/ci.yml`
+builds every fuzz target on nightly Rust (`cd fuzz && cargo +nightly build
+--all-targets`) on every push, alongside a `cargo check --all-targets` of the
+`chaos` harness. That catches a target that no longer compiles — the state
+this doc used to describe, when nothing built these targets at all — but it
+does not run libFuzzer for a single iteration. A target that builds clean and
+panics on the first input fed to it still passes this job.
+
+Actually fuzzing — even the 60-second smoke run above — still needs
+nightly's sanitizer plumbing and a real time budget, and is not wired into
+CI. It stays a manual step: `cd fuzz && cargo +nightly fuzz run <target> --
+-max_total_time=60`. A scheduled or PR-triggered fuzz run is still a real
+follow-up; the compile check does not substitute for it.
 
 ## What's deliberately NOT fuzzed (yet)
 
