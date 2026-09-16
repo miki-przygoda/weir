@@ -92,25 +92,35 @@ protocol** below.
   non-repudiation stays explicitly out of scope. It does not defend against a
   process running as the daemon UID either — already out of scope in the
   threat model, and nothing here changes that: such a process can rewrite the
-  segment, the `.attest` sidecar, and the log line that announces its head, in
-  one motion. Nothing here stops a write; this is detection, after the fact,
-  and only once the anchor below has actually been observed — never
-  prevention.
+  segment, the `.attest` sidecar, and the stdout line that announces its
+  head, in one motion. Nothing here stops a write; this is detection, after
+  the fact, and only once the anchor below has actually been observed —
+  never prevention.
 
   **A sidecar sitting next to the segment it protects is not evidence.**
   Anyone who can edit the segment can recompute the sidecar to match. The
-  chain becomes evidence only once its head has left the host: the structured
-  log line `weir.attest.head` is the anchor, and it is only as good as your
-  log pipeline's shipping latency. The three companion gauges
+  chain becomes evidence only once its head has left the host. The anchor is
+  a plain line, `weir.attest.head`, that `weir-ctl attest seal` prints to its
+  own stdout — not a `tracing` event, not timestamped, and not shipped
+  anywhere on its own; the daemon is never involved, and it is only as good
+  as whatever the operator does to capture and ship that stdout off-host
+  (`systemd-cat`, `logger`, a unit with `StandardOutput=journal` — see
+  `docs/monitoring.md` for a schedule that runs `seal` at all, not just
+  `verify`, since `verify` alone attests nothing). The four companion gauges
   (`weir_attest_segments`, `weir_attest_verify_failures`,
-  `weir_attest_chain_origins`) are written by a `weir-ctl attest verify
-  --metrics-file` cron/timer job onto the node_exporter textfile collector,
-  never by the daemon, and deliberately carry no `_total` suffix — they are
-  gauges overwritten wholesale on each run, not counters, so an
-  `increase()`-based alert would go quiet one evaluation window into a
-  standing incident. Exit codes distinguish `0` (verified), `1` (a chain
-  diverged — tampering or corruption), and `2` (could not even check), so the
-  cron job can page differently on "tampered" than on "I could not tell."
+  `weir_attest_chain_origins`, `weir_attest_missing_sidecar`) are written by
+  a `weir-ctl attest verify --metrics-file` cron/timer job onto the
+  node_exporter textfile collector, never by the daemon, and deliberately
+  carry no `_total` suffix — they are gauges overwritten wholesale on each
+  run, not counters, so an `increase()`-based alert would go quiet one
+  evaluation window into a standing incident. `weir_attest_missing_sidecar`
+  exists specifically so "nobody ever ran `seal`" is distinguishable from
+  "everything is clean" — both otherwise read as `verify_failures 0` forever.
+  Exit codes distinguish `0` (verified, no broken links), `1` (a chain
+  diverged, or a segment's recorded link to its predecessor did not match
+  reality — tampering or corruption either way), and `2` (could not even
+  check), so the cron job can page differently on "tampered" than on "I
+  could not tell."
 
   Ships as a ninth published crate, `weir-attest`, built as a consumer of
   `weir-wab`'s already-public `SegmentReader` / `verify_sealed_segment`
