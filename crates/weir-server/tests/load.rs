@@ -41,12 +41,22 @@
 //!   `docs/benchmarks/drain-throughput.md`.
 //!
 //!   That file used to say "delivery is the narrower half", and this caveat
-//!   repeated it. It is false: the drain sustains 105,909 rec/s NDJSON on a
-//!   4-core Linux box, several times a single client's ingest. The original
-//!   comparison put a drain figure that was measuring `F_FULLFSYNC` against an
-//!   ingest figure measured differently. A ceiling here is still not a ceiling
-//!   end-to-end — but because the two paths are measured against different
-//!   sinks, not because delivery is the constraint.
+//!   repeated it. It is withdrawn — but the replacement this caveat carried was
+//!   wrong three ways over, and is not repeated here. It quoted 105,909 rec/s,
+//!   a figure `drain-throughput.md` now marks superseded; it called beast a
+//!   "4-core Linux box", which is what `nproc` reports only because
+//!   `isolcpus=2-7,10-15` holds twelve of its sixteen logical CPUs out of the
+//!   scheduler; and "several times a single client's ingest" is the
+//!   cross-machine comparison `environments.md` forbids, which against the same
+//!   box's own ingest is 2.1x at one connection and 0.68x — *narrower* —
+//!   against concurrent `Buffered`.
+//!
+//!   What survives: the original comparison put a drain figure measuring
+//!   `F_FULLFSYNC` against an ingest figure measured differently, so it did not
+//!   support its conclusion. A ceiling here is still not a ceiling end-to-end,
+//!   because the two paths are measured against different sinks. For the
+//!   numbers themselves, read `drain-throughput.md` and check the basis column
+//!   rather than quoting a figure from here.
 //! - **`thundering_herd_*` is warmup-dominated.** Those scenarios spawn N threads
 //!   that each push a fixed count with no warmup, so connection/thread setup
 //!   dominates short runs and the throughput swings run-to-run (observed up to
