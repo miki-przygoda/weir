@@ -2696,7 +2696,6 @@ dependencies = [
  "crc32fast",
  "serde_json",
  "sha2 0.10.9",
- "weir-core",
  "weir-sink-sdk",
  "weir-wab",
 ]

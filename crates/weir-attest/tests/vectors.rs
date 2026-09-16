@@ -10,7 +10,7 @@
 //! would pass against a broken digest exactly as happily as a correct one.
 
 use weir_attest::chain::{chain_origin, chain_step};
-use weir_attest::{ChainHead, DOMAIN_SEP};
+use weir_attest::{ChainHead, DOMAIN_SEP, chain_segment};
 use weir_sink_sdk::{Payload, RecordId};
 use weir_wab::format::{
     SEGMENT_HEADER_LEN, SEGMENT_MAGIC, SegmentHeaderMeta, parse_segment_header,
@@ -146,4 +146,96 @@ fn every_vector_reproduces_h0_every_h_i_and_the_final_head() {
             "{name}: final head mismatch"
         );
     }
+}
+
+/// The test above pins the raw hash construction (`chain_origin`/`chain_step`)
+/// against the vector's numbers directly, by handing it every input field by
+/// field. That is precise, but it means `chain_segment` itself — the crate's
+/// real, public entry point, which derives the segment name from a **path**
+/// and the header fields from a **file's own bytes** rather than taking them
+/// as arguments — is never actually called by the conformance suite. A
+/// `chain_segment` that switched to a 0-based record index, or that derived
+/// the chained name from the bare file name instead of
+/// `shard_NN/seg_........wab.sealed`, would not fail a single assertion above:
+/// every vector supplies `segment_name`/`records_hex` explicitly and would
+/// keep matching regardless of what the real code path does with a path on
+/// disk.
+///
+/// This test closes that gap: it builds a real, well-formed sealed segment ON
+/// DISK — same header/record/sentinel/footer layout `weir-wab` writes, same
+/// approach `weir-attest`'s own `verify.rs` test module and `weir-ctl`'s
+/// attest tests use — whose path, header fields, and payload match the frozen
+/// `single_record_chain` vector exactly, then runs `chain_segment` on it and
+/// asserts the resulting head equals that vector's `head`. A regression in
+/// how `chain_segment` derives its inputs from the path/file, rather than in
+/// the hash construction itself, can only be caught here.
+#[test]
+fn chain_segment_reproduces_the_single_record_chain_vector_end_to_end() {
+    let doc = doc();
+    let vectors = doc["vectors"].as_array().unwrap();
+    let v = vectors
+        .iter()
+        .find(|v| v["name"].as_str() == Some("single_record_chain"))
+        .expect("single_record_chain vector must exist in the frozen vectors file");
+
+    let segment_name = v["segment_name"].as_str().unwrap(); // "shard_00/seg_00000001.wab.sealed"
+    let format_version = v["format_version"].as_u64().unwrap() as u8;
+    let shard_id = v["shard_id"].as_u64().unwrap() as u16;
+    let created_at = v["created_at"].as_i64().unwrap();
+    let records_hex = v["records_hex"].as_array().unwrap();
+
+    let dir = std::env::temp_dir().join(format!("weir_attest_vectors_e2e_{}", std::process::id()));
+    let path = dir.join(segment_name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    // Raw header bytes, deliberately NOT `weir_wab::format::build_segment_header`
+    // — that stamps the current wall-clock time into `created_at`, and this
+    // vector is pinned to a fixed value (0). Same byte layout `header()` above
+    // parses, just written to a real file instead of only into memory.
+    let mut header = [0u8; SEGMENT_HEADER_LEN];
+    header[0..4].copy_from_slice(&SEGMENT_MAGIC);
+    header[4] = format_version;
+    header[5] = 0; // flags — Compression::None under v1, which every vector uses.
+    header[6..8].copy_from_slice(&shard_id.to_le_bytes());
+    header[8..16].copy_from_slice(&created_at.to_le_bytes());
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&header);
+    let mut data_bytes = 0u64;
+    for r in records_hex {
+        let payload = from_hex(r.as_str().unwrap());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        data_bytes += payload.len() as u64;
+    }
+    let file_crc = crc32fast::hash(&bytes);
+    bytes.extend_from_slice(&[0u8; 4]); // SENTINEL
+    let mut footer = [0u8; 32];
+    footer[0..8].copy_from_slice(&(records_hex.len() as u64).to_le_bytes());
+    footer[8..16].copy_from_slice(&data_bytes.to_le_bytes());
+    footer[16..20].copy_from_slice(&file_crc.to_le_bytes());
+    footer[20..28].copy_from_slice(&1i64.to_le_bytes()); // sealed_at — not a chain input.
+    bytes.extend_from_slice(&footer);
+
+    std::fs::write(&path, &bytes).unwrap();
+
+    let prev_head = ChainHead::from_hex(v["prev_head"].as_str().unwrap())
+        .expect("vector prev_head must be valid hex");
+    let sidecar = chain_segment(&path, prev_head)
+        .expect("chain_segment must succeed against a well-formed sealed segment");
+
+    assert_eq!(
+        sidecar.head.to_hex(),
+        v["head"].as_str().unwrap(),
+        "chain_segment's real path-and-file-driven code path must reproduce \
+         the frozen vector's head, not just the hand-fed hash construction"
+    );
+    assert_eq!(
+        sidecar.segment_name, segment_name,
+        "chain_segment must derive the shard-qualified name from the path"
+    );
+    assert_eq!(sidecar.record_count, records_hex.len() as u64);
+
+    std::fs::remove_dir_all(&dir).ok();
 }

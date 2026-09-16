@@ -105,7 +105,7 @@
 
     <div class="card">
       <h3>weir-attest</h3>
-      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip dim">deps: weir-core + weir-wab + weir-sink-sdk</span></div>
+      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip dim">deps: weir-wab + weir-sink-sdk</span></div>
       <p class="card-sub">Hash-chains <b>sealed</b> WAB segments over each record's already-frozen <code class="inline">RecordId</code>, so a segment edited after sealing no longer recomputes to its recorded chain head. The honest one-line description: <em>proves a sealed buffer was not edited after the fact</em> — an audit property, not a signature and not tamper-prevention.</p>
       <p class="card-sub" style="margin:0"><b>Reach for it when</b> you need offline-tamper evidence — a segment copied to backup and edited there, a different UID on the same host, a shared filesystem, or corruption that happens to pass CRC32. It does not defend against a process running as the daemon UID, and a sidecar nobody observed off-host is not evidence — see the docs for the anchoring requirement. Driven by <code class="inline">weir-ctl attest seal|verify|head</code>; the daemon is never involved.</p>
       <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/monitoring.html#integrity--tamper-evidence">→ docs</a></p>
