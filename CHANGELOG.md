@@ -13,7 +13,7 @@ protocol** below.
 
 ---
 
-## [Unreleased]
+## [4.0.0] - 2026-09-17
 
 ### Breaking
 
@@ -3289,6 +3289,7 @@ The five commits making up this pass:
 
 ---
 
+[4.0.0]: https://github.com/miki-przygoda/weir/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/miki-przygoda/weir/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/miki-przygoda/weir/compare/v2.0.5...v2.1.0
 [2.0.5]: https://github.com/miki-przygoda/weir/compare/v2.0.4...v2.0.5
