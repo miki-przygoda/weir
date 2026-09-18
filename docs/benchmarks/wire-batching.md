@@ -104,9 +104,26 @@ changes.
   defaulting to per-record — the end-to-end win is **1.0x**. Batching the wire
   does not make a per-record HTTP sink faster.
 - **Not a large-payload result.** 5-byte records measure per-record overhead,
-  which is exactly what batching removes; the advantage shrinks as payloads
-  grow. See the payload sweep in
-  `crates/weir-server/tests/research.rs`.
+  which is exactly what batching removes, so the advantage shrinks as payloads
+  grow. Measured on the same box (`research.rs`'s payload sweep, same build and
+  run):
+
+  | payload | `Durable` batch ÷ single | `Buffered` batch ÷ single | `Buffered` batched MiB/s |
+  |---:|---:|---:|---:|
+  | 5 B | **139x** | 20.3x | 4.8 |
+  | 64 B | 130x | 18.3x | 54.4 |
+  | 512 B | 99x | 10.5x | 242.3 |
+  | 4 KiB | 19x | 3.9x | 523.8 |
+  | 32 KiB | 26x | 1.6x | 957.5 |
+  | 64 KiB | **13x** | **1.26x** | 1,133.5 |
+
+  The advantage decays toward 1.0; it does not invert. (An apparent inversion —
+  batched `Buffered` losing to unbatched above 32 KiB — showed up on a macOS
+  *debug* build and did not survive release-on-beast, where batched leads at
+  every size.) Two things follow for a deployment: quoting the 189x headline for
+  records of a few KiB overstates it by an order of magnitude, and unbatched
+  `Buffered` at 64 KiB already moves 898 MiB/s, so the per-record overhead
+  batching removes is no longer what binds.
 - **Not a sizing rule.** §8 warns that A6 multiplies the rate at which the WAB
   outruns the single drain thread, against a `wab_max_bytes` that defaults to 0
   (disabled), and says A6 must not ship without a recommended value. It shipped
