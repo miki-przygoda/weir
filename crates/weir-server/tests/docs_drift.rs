@@ -167,7 +167,11 @@ fn the_external_claim_rule_names_captures_that_exist() {
         .expect("environments.md must define what an external claim may cite");
     let section = section.split("\n## ").next().unwrap();
 
-    for cited in ["snapshot-2026-06-13-beast.md", "phase3-results.md"] {
+    for cited in [
+        "snapshot-2026-06-13-beast.md",
+        "phase3-results.md",
+        "bare-metal.md",
+    ] {
         assert!(
             section.contains(cited),
             "the citation rule does not name {cited}, one of the operator-run \n\
@@ -187,6 +191,41 @@ fn the_external_claim_rule_names_captures_that_exist() {
         section.contains("Never") && section.contains("latest.md"),
         "the citation rule must still forbid citing latest.md — CI rows for one \n\
          released version span 1.45x with no code change between them"
+    );
+
+    // Existing is not the same as holding numbers. `bare-metal.md` existed for
+    // the whole life of the project while saying "awaiting first capture", which
+    // is exactly the state that made the old citation rule unsatisfiable. Now
+    // that it is named as citable, pin the capture itself: the env header the
+    // file's own rules call mandatory ("a bare-metal run without this header is
+    // not a bare-metal result") plus a result table to go with it.
+    let bare_metal = std::fs::read_to_string(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/benchmarks"
+        ))
+        .join("bare-metal.md"),
+    )
+    .expect("bare-metal.md must be readable");
+    // Every marker below must be one the *scaffold* cannot satisfy. The first
+    // version of this check also required "Captured:", "CPU:" and "Kernel:",
+    // and all three passed on the empty file -- they appear in this document's
+    // own "Environment annotations" template, as `Captured: <UTC timestamp>`.
+    // Three of four assertions proved nothing, which is the failure this
+    // codebase keeps finding: a claim about a set, checked on the part of it
+    // that happens to be easy.
+    for required in ["single_thread_sync", "SATURATED", "Host: beast"] {
+        assert!(
+            bare_metal.contains(required),
+            "environments.md names bare-metal.md as an operator-run capture a \n\
+             claim may cite, but that file has no `{required}` — it is back to \n\
+             being a scaffold, and the citation rule is unsatisfiable again"
+        );
+    }
+    assert!(
+        !bare_metal.contains("awaiting first capture"),
+        "bare-metal.md still carries its `awaiting first capture` status while \n\
+         environments.md lists it as citable"
     );
 }
 
