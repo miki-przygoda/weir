@@ -33,7 +33,7 @@ they are two selectable tiers today.
 
 > See [latest.md](benchmarks/latest.md) for the full tables and
 > [history.md](benchmarks/history.md) for the trend over time. The figures
-> below are rounded from one averaged CI run (v3.0.0, 2026-09-10, 5 passes per
+> below are rounded from one averaged CI run (v4.0.0, 2026-09-17, 5 passes per
 > deadline, `shard_count=4`, `batch_size=64`). **This index is hand-maintained
 > and is not regenerated** — `deploy/avg_benchmarks.py` writes `latest.md` and
 > appends to `history.md`, and says so at its own line 9. When the two disagree,
@@ -48,24 +48,31 @@ they are two selectable tiers today.
 
 | Scenario | Concurrency | RPS | ±σ across the 5 passes |
 |----------|---|-----|-----|
-| Single thread, Buffered | 1 | ~12,200 | ±94 |
-| Single thread, Durable | 1 | ~2,700 | ±52 |
-| Thundering herd, Buffered | 64 | ~48,600 | ±1,840 |
-| Saturation ceiling, Buffered | 48 | ~100,000 | not sampled |
-| Saturation ceiling, Durable | 48 | ~44,700 | not sampled |
+| Single thread, Buffered | 1 | ~15,100 | ±4,089 |
+| Single thread, Durable | 1 | ~1,500 | ±489 |
+| Thundering herd, Buffered | 64 | ~24,800 | ±19,636 |
+| Saturation ceiling, Buffered | 48 | ~116,300 | not sampled |
+| Saturation ceiling, Durable | 48 | ~17,400 | not sampled |
 
 > **The single-thread rows are latency reciprocals, not ceilings.** Read down
 > the `Durable` rows: the same tier, on the same runner, in the same run set,
-> does ~2,700 rec/s on one connection and ~44,700 across 48 — **17×**. Nothing
+> does ~1,500 rec/s on one connection and ~17,400 across 48 — **12×**. Nothing
 > about the daemon changed between those two rows.
 >
 > `Durable` is a group commit at the batch boundary
 > (`crates/weir-core/src/durability.rs`), and the daemon acks frame N before
 > reading frame N+1 on a connection
 > (`crates/weir-server/src/socket/connection.rs`). One synchronous producer
-> therefore pays one fsync per record and is bound by fsync *latency*: 1 ÷ 2,400
-> = 417 µs, which is that run's `Durable` mean of 428 µs. Concurrency is what
-> fills a batch, and a filled batch is what amortises the fsync.
+> therefore pays one fsync per record and is bound by fsync *latency*: 1 ÷ 1,500
+> = 667 µs, which sits between that run's `Durable` p50 of 359 µs and its mean
+> of 1.0 ms. Concurrency is what fills a batch, and a filled batch is what
+> amortises the fsync.
+>
+> That the mean sits so far above the median is this runner, not the daemon:
+> the same run reports a `Durable` p99 of 22.4 ms against a p50 of 359 µs — a
+> 62× ratio. The bare-metal capture taken the same week reports 1.1 ms and
+> 3.7 ms for the same two statistics, a ratio of 3.4×. Both measure weir; only
+> one of them is measuring weir *alone*.
 >
 > So a single-thread figure answers "how fast can one caller push-and-wait on
 > this hardware", and only a concurrent figure answers "how much can the daemon
@@ -83,9 +90,9 @@ rows below are the same tier measured twice, not two tiers.
 
 | Tier (scenario tag) | p50 | p99 |
 |------|-----|-----|
-| Buffered | ~73 µs | ~149 µs |
-| Durable (`Sync` tag) | ~384 µs | ~933 µs |
-| Durable (`Batched` tag, historical) | ~389 µs | ~946 µs |
+| Buffered | ~56 µs | ~96 µs |
+| Durable (`Sync` tag) | ~359 µs | ~22.4 ms |
+| Durable (`Batched` tag, historical) | ~366 µs | ~44.0 ms |
 
 *Numbers above are approximate CI figures (sandboxed GitHub runners), not a baseline.
 Exact figures are in [latest.md](benchmarks/latest.md); for claims on named
@@ -99,9 +106,14 @@ hardware see [bare-metal.md](benchmarks/bare-metal.md).*
 CI rows.** On one machine, across a single change, a >10% drop in single-thread
 throughput or a >20% rise in `Durable`-tier p99 (the `Sync`-tagged scenario in
 CI output) is worth investigating before merging. The run-to-run noise floor of
-the bare-metal surface these thresholds are meant for has never been measured —
-[bare-metal.md](benchmarks/bare-metal.md) still has no capture — so treat them
-as provisional until it is.
+the bare-metal surface these thresholds are meant for was measured on
+2026-09-18: across four back-to-back captures on beast, on a byte-identical
+measurement path,
+single-thread `Sync` throughput moved 1.8% and `Sync` p99 did not move at the
+precision published, so 10% and 20% both sit well above the noise. See
+[bare-metal.md](benchmarks/bare-metal.md) for the full spread — including the
+two scenarios whose run-to-run range exceeds 10% and so cannot be gated at
+all.
 
 They are **not** usable against [history.md](benchmarks/history.md). Consecutive
 CI runs of the *same released version* there span 1,926–2,783 single-thread
