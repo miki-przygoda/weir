@@ -476,9 +476,25 @@ divergence is listed here.
    `weir_wab_group_commit_records` measured 1.00 records per fsync at one
    producer and 6.40 median at 8 producers / 1 shard, against a gate of
    `0.6 × 256 ≈ 154`. Nothing came close, so the premise survived its own
-   falsification test. These are macOS figures and therefore a **lower bound**;
-   no A6 throughput number has been published, because the beast run that would
-   justify one has not happened.
+   falsification test.
+
+   **Measured on beast, 2026-09-18** (`docs/benchmarks/wire-batching.md`): the
+   macOS figures were *not* a lower bound in the direction assumed. Beast reads
+   5.22 records per fsync at 8 producers and 16.58 at 32, against macOS's 7.89
+   and 30.91 — worse, not better, because the ceiling is structural rather than
+   timing-dependent. One record per connection is in flight at a time, so a
+   group fsync covers at most `connections-per-shard` records and beast attains
+   only 52-65% of even that. Reaching 154 by concurrency needs ~300 producers on
+   one shard; one producer using `push_batch` reaches 232.
+
+   The throughput number §9 refused to state without measurement is
+   **165,546 rec/s** at a 1024-record frame, against a re-measured same-box
+   control of 878 — **189x**. At the `batch_size = 256` configuration §9
+   actually modelled it is 108,868 rec/s, which is **outside** that section's
+   own ±40% band of 42,000-98,000. The model was conservative. Batched
+   `Buffered`, which §9 recorded as never measured, is 975,492 rec/s against
+   49,360 unbatched — 19.8x, confirming that the 49,725 figure earlier notes
+   called a ceiling was a latency reciprocal and low by an order of magnitude.
 3. **Bitmap**, as proposed in §6.2.
 4. **LSB-first, padding bits must be zero**, and a decoder must reject a payload
    where they are not — otherwise `popcount(bitmap) == N` is silently wrong.
