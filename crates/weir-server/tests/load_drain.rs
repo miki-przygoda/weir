@@ -984,10 +984,23 @@ fn wab_plateau_is_record_bound_or_byte_bound() {
 /// plateau_segments ~= 256 (drain channel) + shard_count (one open segment each)
 /// ```
 ///
-/// which for the preset's four shards predicts 260 against 258.1-260.3
-/// measured. An earlier revision of this comment guessed "64 per shard", which
-/// gives the same 256 for this preset and the wrong answer for every other
-/// `shard_count`.
+/// **That `+ shard_count` term is wrong**, and
+/// `the_plateau_law_predicts_the_shard_count_sweep` is what killed it: the
+/// plateau reads 259.0 segments at `shard_count` 1, 4 and 8 alike -- the same
+/// 16,975,368 bytes to the byte. Shard count does not enter it, because these
+/// scenarios push from **one connection**, which lands on one shard, so the
+/// number of open segments in play never varies with how many shards exist.
+///
+/// What survives is the flat part: **~259 segments, of which 256 is the drain
+/// channel**. The remaining ~3 are in flight and not separately accounted for
+/// here. A configuration with producers on every shard would be needed before
+/// anything about shard count could be claimed at all.
+///
+/// Two guesses have now been fitted to this number and both were wrong -- "64
+/// per shard", and "256 + shard_count" -- each of which reproduces the measured
+/// 256-ish at `shard_count = 4` and disagrees everywhere else. The measured
+/// invariant is the result; the arithmetic that happens to match it at one
+/// configuration is not.
 ///
 /// **And it does not rescue the default.** `wab_segment_max_bytes` defaults to
 /// 256 MiB (`config/mod.rs`), so ~259 segments is ~66 GB: on any realistic disk
@@ -1047,6 +1060,71 @@ fn what_sets_the_wab_plateau() {
              \"delivered\":{}}}",
             peak / seg_bytes,
             sink.delivered(),
+        );
+        srv.shutdown();
+    }
+}
+
+/// Tests the plateau law's prediction rather than restating it.
+///
+/// `what_sets_the_wab_plateau` proposed
+/// `plateau_segments ~= 256 (drain channel) + shard_count`, from
+/// `main.rs`'s `bounded::<PathBuf>(256)` plus one open segment per shard. That
+/// was derived at a single `shard_count` of 4, where it is indistinguishable
+/// from "64 per shard" and from a flat 260. Sweeping the shard count separates
+/// all three: the law predicts 257, 260 and 264 for 1, 4 and 8 shards, "64 per
+/// shard" predicts 65, 260 and 520, and a flat constant predicts 260 throughout.
+#[test]
+#[ignore = "operator-run; ~5 minutes"]
+fn the_plateau_law_predicts_the_shard_count_sweep() {
+    const SHARD_COUNTS: &[usize] = &[1, 4, 8];
+    const SEGMENT_BYTES_SMALL: &str = "65536";
+    const RUN_SECS: u64 = 25;
+
+    for &shards in SHARD_COUNTS {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(50));
+
+        let srv = daemon("r_shard", &sink)
+            .shard_count(shards)
+            .env("WEIR_WAB_SEGMENT_MAX_BYTES", SEGMENT_BYTES_SMALL)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let wab_bytes = || -> f64 {
+            srv.scrape_metrics()
+                .lines()
+                .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+                .and_then(|l| l.split_whitespace().next_back())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        let batch: Vec<&[u8]> = vec![PAYLOAD; 256];
+        let started = Instant::now();
+        let mut peak = 0.0f64;
+        let mut next_sample = Duration::from_millis(500);
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            if started.elapsed() >= next_sample {
+                peak = peak.max(wab_bytes());
+                next_sample += Duration::from_millis(500);
+            }
+        }
+
+        let seg: f64 = SEGMENT_BYTES_SMALL.parse().expect("segment size");
+        let observed = peak / seg;
+        let predicted = 256.0 + shards as f64;
+        println!(
+            "\nBENCH: {{\"scenario\":\"plateau_vs_shards\",\"shard_count\":{shards},\
+             \"plateau_bytes\":{peak:.0},\"plateau_segments\":{observed:.1},\
+             \"predicted_segments\":{predicted:.0},\"error_segments\":{:.1}}}",
+            observed - predicted,
         );
         srv.shutdown();
     }
