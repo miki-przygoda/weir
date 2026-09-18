@@ -650,3 +650,136 @@ fn ingest_survives_a_sink_outage_and_every_record_arrives() {
         "every acked record must reach the sink exactly once after recovery"
     );
 }
+
+// ── The sizing rule A6 shipped without ─────────────────────────────────────
+
+/// How fast the WAB grows when ingest outruns the sink, and whether that rate
+/// is predictable from the two rates and the stored record size.
+///
+/// **Why this exists.** §8 of the A6 design is unambiguous:
+///
+/// > There is **one** drain thread for the whole daemon; delivery does not
+/// > scale with `shard_count` while ingest does. A6 multiplies the rate at
+/// > which the WAB outruns the drain by ~100x, against a `wab_max_bytes` that
+/// > **defaults to 0 (disabled)**. A6 must not ship without a recommended
+/// > value and a sizing rule.
+///
+/// A6 shipped in 4.0.0. There is no recommended value and no sizing rule. This
+/// measures the input to one: it runs a producer flat out against a sink held
+/// to a known rate, samples `weir_wab_bytes_on_disk` as the backlog builds, and
+/// reports observed growth beside the growth predicted by
+/// `(ingest_rps - drain_rps) x stored_bytes_per_record`. If the two agree, an
+/// operator can size `wab_max_bytes` from a burst duration and two rates they
+/// already know, without running this.
+///
+/// Deliberately *not* asserted. The point is the number, and a threshold here
+/// would be a guess about a machine.
+#[test]
+#[ignore = "operator-run; ~5 minutes"]
+fn wab_growth_when_ingest_outruns_the_sink() {
+    // Per-request delays for the sink, in ms. In NDJSON mode each request
+    // carries up to `sink_max_batch_size` records, so this sets a rate rather
+    // than a per-record cost: 100 records per request at 10 ms is ~10k rec/s.
+    const SINK_DELAYS_MS: &[u64] = &[2, 10, 50];
+    const SAMPLE_MS: u64 = 500;
+    const RUN_SECS: u64 = 20;
+
+    for &delay_ms in SINK_DELAYS_MS {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(delay_ms));
+
+        let srv = daemon("r_size", &sink)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let read = |name: &str| -> f64 {
+            let body = srv.scrape_metrics();
+            for line in body.lines() {
+                if line.starts_with(name)
+                    && let Some(v) = line.split_whitespace().next_back()
+                    && let Ok(n) = v.parse()
+                {
+                    return n;
+                }
+            }
+            f64::NAN
+        };
+
+        let batch: Vec<&[u8]> = vec![PAYLOAD; 256];
+        let started = Instant::now();
+        let mut pushed: u64 = 0;
+        let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (t, wab_bytes, delivered)
+        let mut next_sample = Duration::from_millis(SAMPLE_MS);
+
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            pushed += batch.len() as u64;
+
+            if started.elapsed() >= next_sample {
+                let t = started.elapsed().as_secs_f64();
+                let wab = read("weir_wab_bytes_on_disk");
+                let delivered = sink.delivered() as f64;
+                // One line per sample. A first version reported only a growth
+                // rate between two chosen samples and produced 0 B/s while
+                // ingest outran the drain 3:1 -- which is not a rate, it is a
+                // plateau the two-point estimate could not see. The curve is
+                // the result; the summary below is a convenience.
+                println!(
+                    "\nBENCH: {{\"scenario\":\"wab_growth_sample\",\
+                     \"sink_delay_ms\":{delay_ms},\"t_s\":{t:.2},\
+                     \"wab_bytes\":{wab:.0},\"delivered\":{delivered:.0},\
+                     \"pushed\":{pushed}}}"
+                );
+                samples.push((t, wab, delivered));
+                next_sample += Duration::from_millis(SAMPLE_MS);
+            }
+        }
+        let elapsed = started.elapsed();
+
+        // Growth over the middle of the run: the first samples include the
+        // drain starting up and the last include whatever the final segment is
+        // doing, and neither is the steady state being sized for.
+        let n = samples.len();
+        let (a, b) = (samples[n / 4], samples[n - 1 - n / 8]);
+        let observed_growth = (b.1 - a.1) / (b.0 - a.0);
+        let drain_rps = (b.2 - a.2) / (b.0 - a.0);
+        let ingest_rps = pushed as f64 / elapsed.as_secs_f64();
+
+        // Bytes on disk per record, from the daemon rather than from sizeof.
+        // `weir_wab_record_stored_bytes` is a COUNTER, so it exposes `_total`
+        // and no `_sum`/`_count`; reading the histogram names returns the
+        // not-found sentinel and every derived figure becomes NaN.
+        let stored_total = read("weir_wab_record_stored_bytes_total");
+        let per_record = stored_total / pushed as f64;
+        let predicted_growth = (ingest_rps - drain_rps) * per_record;
+
+        println!(
+            "\nBENCH: {{\"scenario\":\"wab_growth\",\"sink_delay_ms\":{delay_ms},\
+             \"ingest_rps\":{ingest_rps:.0},\"drain_rps\":{drain_rps:.0},\
+             \"stored_bytes_per_record\":{per_record:.1},\
+             \"observed_growth_bytes_s\":{observed_growth:.0},\
+             \"predicted_growth_bytes_s\":{predicted_growth:.0},\
+             \"model_error\":{:.3},\"wab_bytes_min\":{:.0},\
+             \"wab_bytes_max\":{:.0},\"wab_bytes_final\":{:.0},\
+             \"samples\":{},\"pushed\":{pushed}}}",
+            if predicted_growth.abs() > 1.0 {
+                observed_growth / predicted_growth
+            } else {
+                f64::NAN
+            },
+            samples.iter().map(|s| s.1).fold(f64::INFINITY, f64::min),
+            samples
+                .iter()
+                .map(|s| s.1)
+                .fold(f64::NEG_INFINITY, f64::max),
+            b.1,
+            n,
+        );
+        srv.shutdown();
+    }
+}
