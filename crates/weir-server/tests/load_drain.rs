@@ -973,9 +973,21 @@ fn wab_plateau_is_record_bound_or_byte_bound() {
 /// | 65,536 | 16,975,368 | 259.0 |
 /// | 262,144 | 67,650,696 | 258.1 |
 ///
-/// **It is a segment count: ~259, invariant while the byte figure moves 8x.**
-/// That is ~256 sealed -- 64 per shard across the preset's four shards -- plus
-/// the open ones.
+/// **It is a segment count: ~259, invariant while the byte figure moves 8x**,
+/// and the constant is in the tree. `main.rs` wires the WAB to the drain with
+/// `crossbeam_channel::bounded::<PathBuf>(256)` -- one **global** channel of
+/// sealed-segment paths, not one per shard. When the drain falls behind it
+/// fills, the writer's blocking send stalls, and that is what reaches the
+/// producer as backpressure. The law is therefore
+///
+/// ```text
+/// plateau_segments ~= 256 (drain channel) + shard_count (one open segment each)
+/// ```
+///
+/// which for the preset's four shards predicts 260 against 258.1-260.3
+/// measured. An earlier revision of this comment guessed "64 per shard", which
+/// gives the same 256 for this preset and the wrong answer for every other
+/// `shard_count`.
 ///
 /// **And it does not rescue the default.** `wab_segment_max_bytes` defaults to
 /// 256 MiB (`config/mod.rs`), so ~259 segments is ~66 GB: on any realistic disk
