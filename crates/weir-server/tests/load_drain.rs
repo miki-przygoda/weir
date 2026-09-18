@@ -856,3 +856,88 @@ fn recovery_time_vs_backlog_size() {
         srv.shutdown();
     }
 }
+
+/// Is the WAB's plateau under sustained overload bounded by records or by bytes?
+///
+/// `wab_growth_when_ingest_outruns_the_sink` found that the buffer does not grow
+/// without limit when ingest outruns the drain: it climbs to ~17 MB and stops,
+/// after which the producer advances at exactly the drain rate. That is
+/// backpressure reaching the producer, and it is the opposite of what A6 §8
+/// worried about — but the *mechanism* was not established. The backlog at the
+/// plateau came to ~64,000 records in all three configurations, against a
+/// `QUEUE_CAPACITY` of 65,536, which is a correlation and not a cause.
+///
+/// This separates the two candidates without touching weir. Hold the sink to one
+/// rate and sweep the payload:
+///
+/// - **record-bound** (the bounded queue): plateau *record count* stays near
+///   constant and plateau *bytes* scale with the payload.
+/// - **byte-bound** (a disk or segment limit): plateau *bytes* stay near
+///   constant and the record count falls as the payload grows.
+///
+/// The two predictions diverge by 64x across this sweep, so one run decides it.
+#[test]
+#[ignore = "operator-run; ~4 minutes"]
+fn wab_plateau_is_record_bound_or_byte_bound() {
+    const PAYLOAD_SIZES: &[usize] = &[64, 256, 1_024, 4_096];
+    const RUN_SECS: u64 = 25;
+    const SINK_DELAY_MS: u64 = 50;
+
+    for &size in PAYLOAD_SIZES {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(SINK_DELAY_MS));
+
+        let srv = daemon("r_plateau", &sink)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let wab_bytes = || -> f64 {
+            srv.scrape_metrics()
+                .lines()
+                .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+                .and_then(|l| l.split_whitespace().next_back())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        let payload = vec![b'x'; size];
+        let batch: Vec<&[u8]> = vec![payload.as_slice(); 256];
+        let started = Instant::now();
+        let mut pushed: u64 = 0;
+        let mut peak = 0.0f64;
+        let mut next_sample = Duration::from_millis(500);
+
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            pushed += batch.len() as u64;
+            // Sample on the clock, not on a record count. Keying off
+            // `pushed % 25_600` meant the 4 KiB case -- which only reaches
+            // ~10k records in the window -- never sampled at all and reported a
+            // plateau of 0, the one payload where the answer mattered most.
+            if started.elapsed() >= next_sample {
+                peak = peak.max(wab_bytes());
+                next_sample += Duration::from_millis(500);
+            }
+        }
+
+        let delivered = sink.delivered() as u64;
+        let backlog = pushed.saturating_sub(delivered);
+        println!(
+            "\nBENCH: {{\"scenario\":\"wab_plateau\",\"payload_bytes\":{size},\
+             \"plateau_bytes\":{peak:.0},\"backlog_records\":{backlog},\
+             \"plateau_bytes_per_record\":{:.1},\"pushed\":{pushed},\
+             \"delivered\":{delivered}}}",
+            if backlog > 0 {
+                peak / backlog as f64
+            } else {
+                f64::NAN
+            },
+        );
+        srv.shutdown();
+    }
+}

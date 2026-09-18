@@ -48,6 +48,38 @@ fn emit(fields: &str) {
     println!("\nBENCH: {{{fields}}}");
 }
 
+/// Applies `WEIR_BENCH_WAB_DIR` if set, the same knob `tests/load_drain.rs`
+/// uses, so an experiment can be pointed at a different filesystem.
+///
+/// This is what makes the sustained experiments falsifiable. They found a
+/// strictly periodic oscillation in `Durable` throughput on a SATA SSD -- ~880
+/// rec/s at ~1.09 ms fsync alternating with ~179 rec/s at ~5.56 ms on a ~4.5
+/// minute cycle -- which is either something weir does or something the storage
+/// does. Re-running the identical code against a RAM disk answers that: if the
+/// oscillation survives, it is weir; if it disappears, it is the disk.
+fn with_wab_dir(b: weir_testkit::WeirServerBuilder, tag: &str) -> weir_testkit::WeirServerBuilder {
+    match std::env::var("WEIR_BENCH_WAB_DIR") {
+        Ok(d) if !d.is_empty() => {
+            let dir = std::path::PathBuf::from(d).join(tag);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)
+                .unwrap_or_else(|e| panic!("WEIR_BENCH_WAB_DIR: create {}: {e}", dir.display()));
+            b.wab_dir(dir)
+        }
+        _ => b,
+    }
+}
+
+/// Names the storage every result line, because a number from this suite is
+/// meaningless without it.
+fn wab_backing() -> &'static str {
+    if std::env::var_os("WEIR_BENCH_WAB_DIR").is_some() {
+        "external"
+    } else {
+        "default"
+    }
+}
+
 // ── E2: does sustained Durable load degrade the fsync path? ────────────────
 
 /// Samples one `Durable` producer's throughput and the daemon's own fsync
@@ -72,7 +104,7 @@ fn sustained_durable_throughput_over_time() {
     let total = Duration::from_secs(env_u64("WEIR_RESEARCH_SECS", 1800));
     let sample = Duration::from_secs(env_u64("WEIR_RESEARCH_SAMPLE_SECS", 30));
 
-    let srv = weir_server!("r_sustain").bench_preset().start();
+    let srv = with_wab_dir(weir_server!("r_sustain").bench_preset(), "r_sustain").start();
     let mut client = srv.client();
 
     let fsync_mean_us = |body: &str| -> f64 {
@@ -98,6 +130,7 @@ fn sustained_durable_throughput_over_time() {
 
         if window_start.elapsed() >= sample {
             let elapsed = window_start.elapsed();
+            let wab = wab_backing();
             prev = srv.scrape_metrics();
             let sum = parse_metric_f64(&prev, "weir_wab_fsync_duration_seconds_sum");
             let count = parse_metric_f64(&prev, "weir_wab_fsync_duration_seconds_count");
@@ -106,7 +139,7 @@ fn sustained_durable_throughput_over_time() {
             // hide exactly the drift this test is looking for.
             let window_fsync_us = (sum - prev_sum) / (count - prev_count) * 1e6;
             emit(&format!(
-                "\"scenario\":\"sustained_durable\",\
+                "\"scenario\":\"sustained_durable\",\"wab\":\"{wab}\",\
                  \"elapsed_s\":{:.0},\"rps\":{:.0},\
                  \"fsync_window_us\":{:.1},\"fsync_cumulative_us\":{:.1},\
                  \"wab_bytes\":{:.0},\"wab_segments\":{:.0}",
@@ -134,7 +167,7 @@ fn sustained_buffered_throughput_over_time() {
     let total = Duration::from_secs(env_u64("WEIR_RESEARCH_SECS", 1800));
     let sample = Duration::from_secs(env_u64("WEIR_RESEARCH_SAMPLE_SECS", 30));
 
-    let srv = weir_server!("r_sustainb").bench_preset().start();
+    let srv = with_wab_dir(weir_server!("r_sustainb").bench_preset(), "r_sustainb").start();
     let mut client = srv.client();
 
     let started = Instant::now();
@@ -149,9 +182,10 @@ fn sustained_buffered_throughput_over_time() {
 
         if window_start.elapsed() >= sample {
             let elapsed = window_start.elapsed();
+            let wab = wab_backing();
             let body = srv.scrape_metrics();
             emit(&format!(
-                "\"scenario\":\"sustained_buffered\",\
+                "\"scenario\":\"sustained_buffered\",\"wab\":\"{wab}\",\
                  \"elapsed_s\":{:.0},\"rps\":{:.0},\
                  \"wab_bytes\":{:.0},\"wab_segments\":{:.0}",
                 started.elapsed().as_secs_f64(),
