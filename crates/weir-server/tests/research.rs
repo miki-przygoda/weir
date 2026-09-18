@@ -267,3 +267,100 @@ fn payload_size_sweep() {
         }
     }
 }
+
+// ── E6: what does turning on zstd actually cost? ───────────────────────────
+
+/// Throughput, bytes on disk and the achieved compression ratio, with WAB
+/// compression off and at three zstd levels.
+///
+/// `wab_compression` defaults to off, and the tradeoff for turning it on is
+/// undocumented in any number: it trades CPU on the ack path — which is inside
+/// the `Durable` latency an operator cares about — for bytes on disk, which is
+/// what decides how long a buffer survives an outage. weir already exposes both
+/// halves (`weir_wab_record_logical_bytes_total` against
+/// `weir_wab_record_stored_bytes_total`), so the ratio is measured rather than
+/// assumed from the corpus.
+///
+/// **Read the two halves of the result differently.** The *throughput* column is
+/// the trustworthy one: it measures CPU per byte on the ack path and does not
+/// care what the bytes are. The *ratio* column is only as honest as the corpus,
+/// and this corpus is not honest — the large record is 27 copies of one JSON
+/// line, so it reports ~29x where real 4 KiB records will report low single
+/// digits. Treat the ratio as an upper bound and measure your own data.
+///
+/// The reason the sweep exists at all is that the answer inverts across it.
+/// Measured on macOS: at 149-byte records zstd level 1 costs **59%** of
+/// throughput for a 1.15x ratio, which reads as "do not turn this on"; at
+/// 4 KiB it costs **0.1%** (25,674 rec/s against 25,698 uncompressed), which
+/// reads as "turn it on". A verdict from either size alone is a verdict about
+/// that size.
+#[test]
+#[ignore = "operator-run; ~5 minutes"]
+fn compression_cost_and_benefit() {
+    const LEVELS: &[(&str, i32)] = &[("none", 0), ("zstd", 1), ("zstd", 3), ("zstd", 9)];
+    const RECORDS: usize = 20_000;
+    // Record size is swept because the answer depends on it more than on the
+    // level: zstd has a window to work with at 4 KiB and almost nothing at
+    // 150 bytes, so a verdict taken at one size is a verdict about that size.
+    const REPEATS: &[usize] = &[1, 27];
+
+    for &repeat in REPEATS {
+        for &(codec, level) in LEVELS {
+            let tag = "r_zstd";
+            let mut b = with_wab_dir(weir_server!(tag).bench_preset().batch_size(256), tag)
+                .extra_config(format!("wab_compression       = \"{codec}\""));
+            if codec != "none" {
+                b = b.extra_config(format!("wab_compression_level = {level}"));
+            }
+            let srv = b.start();
+            let mut client = srv.client();
+
+            // JSON-shaped and ~200 bytes: repetitive enough to compress like real
+            // telemetry, varied enough not to flatter the codec.
+            let record = |i: usize| -> Vec<u8> {
+                let one = format!(
+                    "{{\"ts\":\"2026-09-19T00:{:02}:{:02}Z\",\"host\":\"beast\",\
+                 \"svc\":\"weir-research\",\"seq\":{i},\"level\":\"info\",\
+                 \"msg\":\"sustained write probe for compression measurement\"}}",
+                    i % 60,
+                    (i / 60) % 60
+                );
+                // `repeat` copies of a varying line: ~149 B at 1 and ~4 KiB at 27,
+                // still JSON-shaped and still not a run of one byte.
+                one.repeat(repeat).into_bytes()
+            };
+
+            let batch: Vec<Vec<u8>> = (0..256).map(record).collect();
+            let t0 = Instant::now();
+            for _ in 0..(RECORDS / 256) {
+                let out = client
+                    .push_batch(&batch, Durability::Durable)
+                    .expect("push_batch");
+                assert!(out.all_accepted(), "{codec}/{level}: batch not accepted");
+            }
+            let elapsed = t0.elapsed();
+
+            let body = srv.scrape_metrics();
+            let logical = parse_metric_f64(&body, "weir_wab_record_logical_bytes_total");
+            let stored = parse_metric_f64(&body, "weir_wab_record_stored_bytes_total");
+            let sent = (RECORDS / 256) * 256;
+            emit(&format!(
+                "\"scenario\":\"compression\",\"codec\":\"{codec}\",\"level\":{level},\
+             \"record_bytes\":{:.0},\
+             \"records\":{sent},\"wall_ms\":{},\"throughput_rps\":{:.0},\
+             \"logical_bytes\":{logical:.0},\"stored_bytes\":{stored:.0},\
+             \"ratio\":{:.3},\"wab_bytes_on_disk\":{:.0}",
+                logical / sent as f64,
+                elapsed.as_millis(),
+                sent as f64 / elapsed.as_secs_f64(),
+                if stored > 0.0 {
+                    logical / stored
+                } else {
+                    f64::NAN
+                },
+                parse_metric_f64(&body, "weir_wab_bytes_on_disk"),
+            ));
+            srv.shutdown();
+        }
+    }
+}
