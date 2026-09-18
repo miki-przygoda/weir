@@ -862,8 +862,10 @@ fn recovery_time_vs_backlog_size() {
 /// `wab_growth_when_ingest_outruns_the_sink` found that the buffer does not grow
 /// without limit when ingest outruns the drain: it climbs to ~17 MB and stops,
 /// after which the producer advances at exactly the drain rate. That is
-/// backpressure reaching the producer, and it is the opposite of what A6 §8
-/// worried about — but the *mechanism* was not established. The backlog at the
+/// backpressure reaching the producer -- but read `what_sets_the_wab_plateau`
+/// before concluding anything comforting from it: the ceiling is a *segment
+/// count*, and these scenarios pin segments to 64 KiB where the shipped
+/// default is 256 MiB. The mechanism was not established here. The backlog at the
 /// plateau came to ~64,000 records in all three configurations, against a
 /// `QUEUE_CAPACITY` of 65,536, which is a correlation and not a cause.
 ///
@@ -937,6 +939,102 @@ fn wab_plateau_is_record_bound_or_byte_bound() {
             } else {
                 f64::NAN
             },
+        );
+        srv.shutdown();
+    }
+}
+
+/// What sets the ~17 MB ceiling the WAB stops at under sustained overload?
+///
+/// `wab_plateau_is_record_bound_or_byte_bound` established that the ceiling is
+/// bytes and not queue slots: across a 64x payload sweep the plateau held
+/// between 16.92 and 17.06 MB — a spread of 1.008x — while the backlog record
+/// count moved 57x. So the bound is not `QUEUE_CAPACITY`.
+///
+/// The remaining candidates are a byte limit and a *segment count* limit that
+/// merely looks like one, since these scenarios pin `wab_segment_max_bytes` to
+/// 64 KiB and 17 MB is suspiciously close to 256 segments of it. Sweeping the
+/// segment size separates them:
+///
+/// - **segment-count-bound**: the plateau scales with `wab_segment_max_bytes`.
+/// - **byte-bound**: the plateau stays at ~17 MB regardless.
+///
+/// This matters to an operator rather than being trivia. If it is a segment
+/// count, the buffer a deployment actually gets is
+/// `count x shard_count x wab_segment_max_bytes`, and the default segment size
+/// — not `wab_max_bytes` — is the knob that sets how much burst weir absorbs
+/// before it pushes back.
+///
+/// **Measured (2026-09-18, macOS, 256-byte records, 50 ms sink):**
+///
+/// | `wab_segment_max_bytes` | plateau bytes | plateau segments |
+/// |---|---|---|
+/// | 32,768 | 8,529,480 | 260.3 |
+/// | 65,536 | 16,975,368 | 259.0 |
+/// | 262,144 | 67,650,696 | 258.1 |
+///
+/// **It is a segment count: ~259, invariant while the byte figure moves 8x.**
+/// That is ~256 sealed -- 64 per shard across the preset's four shards -- plus
+/// the open ones.
+///
+/// **And it does not rescue the default.** `wab_segment_max_bytes` defaults to
+/// 256 MiB (`config/mod.rs`), so ~259 segments is ~66 GB: on any realistic disk
+/// the filesystem fills long before this ceiling binds. A6 section 8's concern
+/// -- that A6 multiplies the rate at which the WAB outruns one drain thread,
+/// against a `wab_max_bytes` defaulting to 0 -- therefore stands at shipped
+/// defaults. The plateau is a property of small segments, not a safety net.
+#[test]
+#[ignore = "operator-run; ~5 minutes"]
+fn what_sets_the_wab_plateau() {
+    const SEGMENT_SIZES: &[&str] = &["32768", "65536", "262144"];
+    const RUN_SECS: u64 = 25;
+
+    for &seg in SEGMENT_SIZES {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(50));
+
+        let srv = daemon("r_seg", &sink)
+            .env("WEIR_WAB_SEGMENT_MAX_BYTES", seg)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let wab_bytes = || -> f64 {
+            srv.scrape_metrics()
+                .lines()
+                .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+                .and_then(|l| l.split_whitespace().next_back())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        let batch: Vec<&[u8]> = vec![PAYLOAD; 256];
+        let started = Instant::now();
+        let mut pushed: u64 = 0;
+        let mut peak = 0.0f64;
+        let mut next_sample = Duration::from_millis(500);
+
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            pushed += batch.len() as u64;
+            if started.elapsed() >= next_sample {
+                peak = peak.max(wab_bytes());
+                next_sample += Duration::from_millis(500);
+            }
+        }
+
+        let seg_bytes: f64 = seg.parse().expect("segment size");
+        println!(
+            "\nBENCH: {{\"scenario\":\"wab_plateau_vs_segment\",\
+             \"segment_max_bytes\":{seg},\"plateau_bytes\":{peak:.0},\
+             \"plateau_segments\":{:.1},\"pushed\":{pushed},\
+             \"delivered\":{}}}",
+            peak / seg_bytes,
+            sink.delivered(),
         );
         srv.shutdown();
     }
