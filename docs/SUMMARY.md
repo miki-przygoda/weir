@@ -34,6 +34,7 @@
     - [Bare-metal results](benchmarks/bare-metal.md)
     - [Per-version history](benchmarks/history.md)
     - [Drain throughput (delivery side)](benchmarks/drain-throughput.md)
+    - [Wire batching (A6) measured](benchmarks/wire-batching.md)
     - [Environments](benchmarks/environments.md)
     - [Batch-tuning sweep](benchmarks/batch-tuning.md)
     - [Agent count vs cores](benchmarks/agent-count-tuning.md)

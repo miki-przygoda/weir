@@ -13,6 +13,108 @@ protocol** below.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`docs/benchmarks/bare-metal.md` holds a capture, and the release gate it
+  describes is operable for the first time.** beast (i9-9900K, ext4 on a Samsung
+  850 EVO SATA SSD), weir 4.0.0, 2026-09-18. Until now `environments.md` said, in
+  its own words, that weir had "claimable numbers and no operable performance
+  gate" — the file had existed since the benchmark surfaces were split and had
+  never once been captured.
+
+- **The bare-metal thresholds are validated against a measured noise floor.**
+  `bare-metal.md` required "at least three back-to-back captures of identical
+  code" before its gates could bind; four were taken. Single-thread `Sync` moves
+  **1.8%** run to run against a 10% gate, `Sync` p99 reads 3.7 ms in all four
+  against a 20% gate, and both saturation ramps reproduce their drop counts
+  exactly (16 at 64 threads, 48 at 96). Two scenarios are now excluded from
+  gating because their own spread exceeds the threshold: `connection_churn`
+  (23.3%) and `thundering_herd_64_threads` at 2 ms (11.0%). `load.rs` already
+  warned about the second; the first is new, and is the widest spread in the
+  suite.
+
+- **The six ⚠ superseded Linux rows in `docs/benchmarks/drain-throughput.md` are
+  re-measured**, so every row in that table is on one basis for the first time
+  since the 2026-09-12 window correction, and every ratio derived from them has
+  been recomputed rather than carried forward. The correction's own prediction
+  held: `drain_slow_sink` was the scenario the old basis understated, by **+25.1%**
+  on ext4 and **+53.9%** on tmpfs, against the +60.5% the mac re-measure showed.
+  A numeric prediction that file made — that the superseded `linux-ssd` slow-sink
+  row understated by ~25% and would re-measure at 11,012 rec/s — lands at
+  **11,042**, 0.3% away.
+
+- **`crates/weir-server/tests/load_batch.rs`** — the A6 wire-batching throughput
+  harness, which did not exist. A6 shipped in 4.0.0 with its throughput modelled
+  and never measured, and the design doc said so explicitly: "no A6 throughput
+  number has been published, because the beast run that would justify one has not
+  happened." Operator-run, absent from CI by design, compile-guarded by the lint
+  job's `clippy --all-targets`.
+
+- **`docs/benchmarks/wire-batching.md` — A6's throughput, measured.** The design
+  document refused a second significant figure until someone ran it, and nobody
+  had. On beast: **165,546 rec/s** at a 1024-record frame against a same-box
+  unbatched `Durable` control of 878 — **189x**. At the `batch_size = 256`
+  configuration §9 actually modelled, 108,868 rec/s, which falls **outside** that
+  section's own ±40% band of 42,000-98,000: the model was conservative, not
+  optimistic. Batched `Buffered`, recorded there as never measured, is
+  **975,492 rec/s** against 49,360 unbatched — confirming that the 49,725 figure
+  earlier notes called a ceiling was a latency reciprocal and low by an order of
+  magnitude.
+
+- **A6's premise is confirmed structurally, not just numerically.** Records per
+  fsync reachable without wire batching is bounded by *connections per shard*,
+  because the daemon acks frame N before reading frame N+1 — so at most one
+  record per connection is ever in flight. Beast attains 5.22 at 8 producers and
+  16.58 at 32, only 52-65% of even that ceiling, and the fraction falls as
+  producers are added. Reaching the `0.6 × 256 ≈ 154` gate by concurrency needs
+  ~300 producers pinned to one shard; one producer using `push_batch` reaches
+  232. The earlier macOS figures were treated as a lower bound; they were not.
+
+- **`crates/weir-server/tests/research.rs`** — limit-finding experiments
+  (sustained-load fsync behaviour, payload-size sweep, recovery time against WAB
+  size). All `#[ignore]`; they answer open questions rather than gate anything.
+
+- **`docs_drift` now pins that `bare-metal.md` actually holds a capture**, not
+  merely that the file exists. `environments.md` lists it as citable, and that is
+  only defensible while it has numbers in it.
+
+### Fixed
+
+- **A bare-metal capture recorded no storage device.** `block_device_line()` took
+  the first six rows of `lsblk`, which on any host with snaps installed are all
+  loop devices — so the capture named `loop1`-`loop5` and not one real disk. The
+  storage is the single field `environments.md` requires a citation to disclose,
+  and the fsync primitive it implies is most of what a `Durable` number means.
+
+- **The bare-metal capture stamped itself "CI numbers, not a baseline. These come
+  from a shared 2-vCPU runner."** `avg_benchmarks.py` renders both `latest.md` and
+  the bare-metal capture and hardcoded the CI disclaimer, so weir's one citable
+  performance surface told the reader to discount it — on an i9-9900K. It also
+  stamped `Version: dev`, because the capture script never set `WEIR_VERSION`.
+  The renderer is now surface-aware; the CI path is byte-identical to before.
+
+- **The documented capture procedure destroyed the document.** `bare-metal.md`
+  said to run `run_bare_metal_bench.sh > docs/benchmarks/bare-metal.md`, which
+  replaces the whole file — deleting the regression policy, the capture procedure
+  and the environment annotations that make the numbers interpretable. The
+  capture now lives between explicit markers.
+
+- **`docs/benchmarks.md` and `README.md` cited v3.0.0 while `latest.md` was at
+  v4.0.0**, which `docs_drift` catches and which had gone unnoticed because the
+  `load` job regenerates `latest.md` and commits it with `[skip ci]` — so no CI
+  run ever saw the drift it introduced. Both refreshed, headline figures and the
+  reasoning that depends on them included, as that guard requires.
+
+- **`load_batch.rs` emitted `BENCH:` lines that `grep '^BENCH: '` could not
+  match.** Under the `--test-threads=1` the file itself mandates, libtest writes
+  `test <name> ... ` with no trailing newline, so the line arrives as
+  `test push_single_durable ... BENCH: {...}` and the project-wide extraction
+  used by `run_bare_metal_bench.sh`, the CI drain job and `avg_benchmarks.py`
+  silently captured nothing. `tests/load.rs` never hit this because nothing runs
+  it single-threaded.
+
 ## [4.0.0] - 2026-09-17
 
 ### Breaking

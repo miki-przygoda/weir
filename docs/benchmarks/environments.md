@@ -6,7 +6,7 @@ questions and have different regression gates.
 | Surface | Source | Catches | Gate |
 |--------|--------|---------|------|
 | [`latest.md`](latest.md), [`history.md`](history.md) | CI (`ubuntu-latest`, 2 vCPU) | Order-of-magnitude regressions: missing `#[inline]`, accidental allocation on the hot path, an O(n²) loop in the WAB encode | >10× drop or any scenario going from non-zero to zero |
-| [`bare-metal.md`](bare-metal.md) | Operator-run script, named hardware | Real performance regressions visible to a deployer | >10% drop in single-thread RPS, >20% increase in `Sync` p99, any saturation level regressing from `ok` to dropped I/O — **provisional:** no capture exists yet, so this surface's run-to-run noise floor is unmeasured and the thresholds are unvalidated |
+| [`bare-metal.md`](bare-metal.md) | Operator-run script, named hardware | Real performance regressions visible to a deployer | >10% drop in single-thread RPS, >20% increase in `Sync` p99, any saturation level regressing from `ok` to dropped I/O — **validated 2026-09-18** against four back-to-back captures on beast: single-thread `Sync` moves 1.8% run to run and the ramp reproduces its drop counts exactly, so both gates sit well above the noise. Two other scenarios exceed it and are **not** gateable — `connection_churn` (23.3%) and `thundering_herd_64_threads` at 2 ms (11.0%) — see that file |
 | [`drain-throughput.md`](drain-throughput.md) | Operator-run capture, `tests/load_drain.rs` — the same suite the CI `drain` job runs | Delivery-side (drain) regressions; every scenario above measures ingest only. Its published figures are a **first measurement whose methodology is under review** — see that file's caveat | No throughput gate. The CI `drain` job runs the suite on every push as a **correctness** gate (no record lost between the WAB and the sink across an outage) and retains its output as a build artifact, but does not compare rates to a threshold or write to this file. |
 
 The CI gate is below the noise floor of the bare-metal numbers and
@@ -29,13 +29,20 @@ figure was taken at. Captures in the tree that satisfy that today:
 | [`snapshot-2026-06-13-mac.md`](snapshot-2026-06-13-mac.md) | M3 Max, APFS on internal NVMe | The same, on a `F_BARRIERFSYNC` platform |
 | [`phase3-results.md`](phase3-results.md) | Both of the above | Where the time goes inside a `Durable` ack |
 | [`drain-throughput.md`](drain-throughput.md) | The beast box, three storage configs | Delivery-side rates — **first measurement, methodology under review** |
+| [`bare-metal.md`](bare-metal.md) | beast — i9-9900K, ext4 on a Samsung 850 EVO SATA SSD | Ingest, both tiers, latency percentiles and both saturation ramps, with a measured run-to-run noise floor |
+| [`wire-batching.md`](wire-batching.md) | The same beast box | `PushBatch` throughput against an unbatched control, and the fsync amortisation behind it |
 
-**[`bare-metal.md`](bare-metal.md) is a different thing and is still empty.** It
-is the *release gate* — a fixed script, on a fixed box, re-run per release so
-two versions are comparable. The snapshots above are point-in-time captures at
-named commits; they are citable, but they cannot gate a release because nothing
-re-runs them. Until `deploy/run_bare_metal_bench.sh` is run and its output
-lands, weir has claimable numbers and no operable performance gate.
+**[`bare-metal.md`](bare-metal.md) is the only one of these that is also the
+*release gate*.** A fixed script, on a fixed box, re-run per release so two
+versions are comparable. The other rows are point-in-time captures at named
+commits: citable, but unable to gate a release, because nothing re-runs them.
+
+It held no capture until 2026-09-18, which is why earlier revisions of this file
+said weir had claimable numbers and no operable gate. It now holds one — beast,
+weir 4.0.0 — taken alongside three further captures on a byte-identical
+measurement path. That four-capture spread is what makes the thresholds
+assertable rather than guessed, so the gate is operable for the metrics the
+spread covers; that file also names the two scenarios too noisy to gate.
 
 Earlier revisions of this file said external claims "must cite `bare-metal.md`".
 That was never satisfiable — the file has never held a capture — so in practice

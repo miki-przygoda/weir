@@ -6,43 +6,209 @@ regressions; they are **not** representative of the hardware weir is
 designed to run on, and they are not the numbers any performance claim
 should be made against.
 
-This page holds the numbers captured on a real machine with named
-hardware. They are intended to be the ship gate — but **there is no capture
-yet, so the gate is not operable and its thresholds below are unvalidated.**
+This page holds the numbers captured on a real machine with named hardware.
+It is the ship gate, and as of 2026-09-18 it is an **operable** one: the
+capture below is the first this file has ever held, and the run-to-run spread
+under it is measured rather than assumed, so its thresholds can be checked
+against the noise instead of hoped to exceed it.
 
-> **Status:** awaiting first capture. Run
-> `deploy/run_bare_metal_bench.sh`
-> on the target machine and replace this section with the script's
-> output.
->
-> **This being empty does not mean weir has no citable numbers.** It means it
-> has no *repeatable gate*. Point-in-time captures on named hardware do exist —
-> [`snapshot-2026-06-13-beast.md`](snapshot-2026-06-13-beast.md) (SATA SSD,
-> honest `fdatasync`), [`snapshot-2026-06-13-mac.md`](snapshot-2026-06-13-mac.md)
-> (NVMe, `F_BARRIERFSYNC`), [`phase3-results.md`](phase3-results.md) and
-> [`drain-throughput.md`](drain-throughput.md) — and
-> [`environments.md`](environments.md) lists what may be cited from them. What
-> those cannot do is gate a release: they were taken at fixed commits and
-> nothing re-runs them, so there is no before-and-after to compare a candidate
-> against.
+> Re-capture with `deploy/run_bare_metal_bench.sh` — see
+> [Capture procedure](#capture-procedure), which is **not** a whole-file
+> overwrite.
+
+## Latest capture
+
+<!-- BEGIN CAPTURE — replace everything to END CAPTURE with the script's output -->
+
+Captured: 2026-09-18 21:36:54 UTC
+Host: beast
+CPU: Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz — 16 logical cores, microcode 0xf8
+Memory: 32023 MiB
+Kernel: Linux 7.0.0-31-generic x86_64
+libc: glibc 2.39
+
+Storage (load-suite wab dirs land in /tmp):
+  Filesystem: ext4
+  Mount opts: rw,relatime
+  Block devices:
+```
+NAME    MODEL                     ROTA TRAN
+sda     Samsung SSD 860 EVO 1TB      0 sata
+sdb     ST4000DM006-2G5107           1 sata
+sdc     Samsung SSD 850 EVO 250GB    0 sata
+nvme0n1 Samsung SSD 970 EVO 500GB    0 nvme
+```
+
+Tunables:
+  Governor: schedutil
+  SMT: on
+  Turbo: <unavailable>
+  CPU mitigations: off
+  vm.dirty_background_bytes: 0
+  vm.dirty_bytes: 0
+  vm.dirty_expire_centisecs: 3000
+
+Run config: 5 passes × 2 deadlines (1 2 ms)
+
+---
+
+Version: 4.0.0  
+Last updated: 2026-09-18 21:36 UTC  
+Averaged over: 5 run(s) per deadline  
+Server config: `shard_count=4`, `batch_size=64`
+
+> **Operator-run capture on named hardware.** The environment header
+> above records the machine, its storage and its tunables; two captures
+> are comparable only if those match. This is the surface
+> `environments.md` permits an external claim to cite — unlike
+> `latest.md`, which is a shared-runner regression detector.
+
+## Throughput — deadline comparison
+
+| Scenario | RPS (1ms) | ±σ (1ms) | RPS (2ms) | ±σ (2ms) | d1ms/d2ms |
+|----------|---------|------- | ---------|------- | ---------|
+| single_thread_buffered | 44,741 | ±3,773 | 46,731 | ±1,885 | **0.96×** |
+| single_thread_sync | 843 | ±27 | 861 | ±5 | **0.98×** |
+| thundering_herd_8_threads | 1,746 | ±4 | 1,759 | ±29 | **0.99×** |
+| thundering_herd_32_threads | 6,071 | ±68 | 6,827 | ±237 | **0.89×** |
+| thundering_herd_64_threads | 11,213 | ±512 | 12,434 | ±864 | **0.90×** |
+| connection_churn | 8,519 | ±1,339 | 9,186 | ±774 | **0.93×** |
+| fire_and_forget_overload | 4,876 | ±228 | 4,723 | ±138 | **1.03×** |
+
+## Latency — single thread, `batch_deadline_ms=1`
+
+| Metric | Durable | Durable (batched) | Buffered |
+|--------|------- | ------- | -------|
+| Min | 1.0 ms | 1.0 ms | 17 µs |
+| Mean | 1.2 ms | 1.2 ms | 20 µs |
+| σ | 533 µs | 561 µs | 55 µs |
+| p50 | 1.1 ms | 1.0 ms | 19 µs |
+| p75 | 1.1 ms | 1.1 ms | 20 µs |
+| p95 | 1.3 ms | 1.4 ms | 25 µs |
+| p99 | 3.7 ms | 3.7 ms | 30 µs |
+| p99.9 | 5.5 ms | 6.2 ms | 39 µs |
+| Max | 5.9 ms | 7.7 ms | 2.5 ms |
+
+## Latency — single thread, `batch_deadline_ms=2`
+
+| Metric | Durable | Durable (batched) | Buffered |
+|--------|------- | ------- | -------|
+| Min | 1.0 ms | 1.0 ms | 17 µs |
+| Mean | 1.2 ms | 1.2 ms | 19 µs |
+| σ | 554 µs | 531 µs | 33 µs |
+| p50 | 1.1 ms | 1.0 ms | 19 µs |
+| p75 | 1.2 ms | 1.1 ms | 19 µs |
+| p95 | 1.5 ms | 1.3 ms | 23 µs |
+| p99 | 3.7 ms | 3.7 ms | 28 µs |
+| p99.9 | 4.7 ms | 5.5 ms | 41 µs |
+| Max | 5.2 ms | 6.1 ms | 1.5 ms |
+
+
+## Saturation Ramp — Buffered tier
+
+> Server started with `max_connections = 48`. Levels above 48 threads
+> trigger connection-cap exhaustion; the server must survive every level.
+
+| Threads | RPS (d1ms) | RPS (d2ms) | I/O drops | Status |
+|---------|-------- | --------|-----------|--------|
+| 8 | 116,008 | 115,955 | 0 | ok |
+| 16 | 156,850 | 156,341 | 0 | ok |
+| 32 | 193,287 | 193,025 | 0 | ok |
+| 48 | 209,446 | 209,035 | 0 | ok |
+| 64 | 209,786 | 207,759 | 16 | **SATURATED** ← |
+| 96 | 208,412 | 208,245 | 48 | SATURATED |
+
+## Saturation Ramp — Sync tier
+
+> Server started with `max_connections = 48`. Uses Sync durability to
+> stress the group-fsync path under escalating concurrency.
+
+| Threads | RPS (d1ms) | RPS (d2ms) | I/O drops | Status |
+|---------|-------- | --------|-----------|--------|
+| 8 | 1,737 | 1,747 | 0 | ok |
+| 16 | 3,473 | 4,028 | 0 | ok |
+| 32 | 6,211 | 7,094 | 0 | ok |
+| 48 | 9,165 | 10,693 | 0 | ok |
+| 64 | 9,210 | 10,834 | 16 | **SATURATED** ← |
+| 96 | 9,412 | 10,695 | 48 | SATURATED |
+
+---
+*Generated by `deploy/avg_benchmarks.py`*
+
+<!-- END CAPTURE -->
+
+## Run-to-run noise floor
+
+A threshold below the noise floor blocks releases on nothing, so before these
+gates were allowed to bind, the same code was captured **four times back to
+back** on an otherwise idle beast (2026-09-18, weir 4.0.0). The spread across
+those four captures is the smallest difference this surface can actually
+resolve.
+
+| Scenario | deadline | min | max | spread | against a 10% gate |
+|---|---|---:|---:|---:|---|
+| `connection_churn` | 1 ms | 7,695 | 9,487 | 1.233x | **exceeds it — not gateable** |
+| `thundering_herd_64_threads` | 2 ms | 12,434 | 13,807 | 1.110x | **exceeds it — not gateable** |
+| `connection_churn` | 2 ms | 8,742 | 9,551 | 1.093x | marginal (9.3%) |
+| `fire_and_forget_overload` | 2 ms | 4,625 | 4,956 | 1.072x | marginal (7.2%) |
+| `single_thread_buffered` | 1 ms | 44,741 | 46,760 | 1.045x | safe — gate is 2x the noise (4.5%) |
+| `thundering_herd_32_threads` | 1 ms | 5,878 | 6,071 | 1.033x | safe — gate is 3x the noise (3.3%) |
+| `thundering_herd_32_threads` | 2 ms | 6,827 | 7,043 | 1.032x | safe — gate is 3x the noise (3.2%) |
+| `fire_and_forget_overload` | 1 ms | 4,794 | 4,887 | 1.019x | safe — gate is 5x the noise (1.9%) |
+| `single_thread_sync` | 1 ms | 838 | 853 | 1.018x | safe — gate is 6x the noise (1.8%) |
+| `single_thread_buffered` | 2 ms | 46,135 | 46,731 | 1.013x | safe — gate is 8x the noise (1.3%) |
+| `thundering_herd_8_threads` | 2 ms | 1,737 | 1,759 | 1.013x | safe — gate is 8x the noise (1.3%) |
+| `single_thread_sync` | 2 ms | 851 | 861 | 1.012x | safe — gate is 9x the noise (1.2%) |
+| `thundering_herd_8_threads` | 1 ms | 1,729 | 1,746 | 1.010x | safe — gate is 10x the noise (1.0%) |
+| `thundering_herd_64_threads` | 1 ms | 11,192 | 11,281 | 1.008x | safe — gate is 13x the noise (0.8%) |
+
+Only one of the two ungateable rows was already known to be noisy.
+`tests/load.rs` says the `thundering_herd_*` scenarios are warmup-dominated,
+swing run to run, and should be read as a smoke test rather than a throughput
+gate, preferring the ramps as the stable baseline; the 11.0% measured here
+agrees with that warning and puts a number on it.
+
+`connection_churn` carries no such warning, and its 23.3% is a new result. It
+is the widest spread of any scenario in the suite — wider than the herd
+scenarios its own file singles out — and it is the only scenario whose timed
+work is dominated by repeated connect/disconnect rather than by pushing
+records. Nothing here establishes *why*; what it establishes is that the number
+cannot carry a 10% gate, and that `load.rs`'s advice about which scenarios are
+stable is incomplete.
+
+**Latency and the ramps are steadier than the throughput rows.** `Sync` p99 read
+3.7 ms in every one of the four captures, so the 20% gate has at least an order
+of magnitude of headroom at the precision published. Both saturation ramps
+reproduced *exactly*: `ok` through 48 threads, `SATURATED` at 64 with 16 dropped
+I/Os, and 48 dropped at 96 — identical counts in all four. A status regression
+there is signal, not noise.
+
+**This is what the CI surface cannot do.** [`history.md`](history.md) spans
+1,926–2,783 single-thread `Sync` RPS (1.45x) for one released version with no
+code change; beast spans 838–853 (1.018x) — the same measurement, ~25x tighter.
+Note also which way the absolute numbers go: CI reports *two to three times
+beast's* `Sync` throughput, on far weaker hardware, because a virtualised
+`fsync` is cheap and beast's `fdatasync` to a SATA SSD is honest. That is the
+single clearest argument for the citation rule in
+[`environments.md`](environments.md).
 
 ## Regression policy
 
 | Surface | Gate | Action on violation |
 |--------|------|---------------------|
-| CI `latest.md` | >10× drop on any scenario, or any scenario going from non-zero to zero | Block the PR; investigate before merge. |
-| Bare-metal `bare-metal.md` (this file) | >10% drop in single-thread RPS, >20% increase in `Sync` p99, or any saturation-ramp level regressing from `ok` to dropped I/O — **provisional, see below** | Block the release; investigate before tagging. |
+| CI [`latest.md`](latest.md) | >10× drop on any scenario, or any scenario going from non-zero to zero | Block the PR; investigate before merge. |
+| Bare-metal (this file) | >10% drop in single-thread RPS, >20% increase in `Sync` p99, or any saturation-ramp level regressing from `ok` to dropped I/O | Block the release; investigate before tagging. |
 
-**The bare-metal thresholds are not yet validated.** No capture exists, so this
-surface's run-to-run noise floor is unmeasured, and a threshold below the noise
-floor blocks releases on nothing. The only run-to-run evidence the project has is
-[`history.md`](history.md), where consecutive CI runs of the *same released
-version* span 1,926–2,783 single-thread `Sync` RPS (1.45×) and 610 µs – 1.2 ms
-`Sync` p99 (~2×) — both far outside 10% / 20%. A dedicated bench box should be
-much tighter than a shared CI runner, but that is an expectation, not a
-measurement. Before letting these numbers block a release, take **at least three
-back-to-back captures of identical code** and set the thresholds above the spread
-they show.
+**These thresholds are now validated for the metrics they name** — see the
+spread above. They are *not* valid for `connection_churn` or for
+`thundering_herd_64_threads` at a 2 ms deadline, whose own run-to-run ranges
+(23.3% and 11.0%) exceed the 10% threshold; a gate on either fires on noise.
+Compare those two by direction across several captures, or not at all.
+
+Re-validate the floor whenever the bench machine changes, the load suite's
+scenarios or sample counts change, or the capture starts landing on different
+storage. The spread is a property of the machine and the suite together, not a
+constant.
 
 The CI gate exists to catch the kind of mistake a code review wouldn't
 (a missing `#[inline]`, an accidental `Mutex` on the hot path, a
@@ -63,15 +229,23 @@ The script captures every piece of context needed to compare two runs:
 - Whether `mitigations=off`, SMT, and turbo are enabled
 
 It then runs the load suite 5× at each of `batch_deadline_ms ∈ {1, 2}`
-(same as CI), feeds the JSONL through `avg_benchmarks.py`, and writes
-the combined env-header + result tables to stdout.
+(same as CI), feeds the JSONL through `avg_benchmarks.py`, and writes the
+combined env-header + result tables to stdout.
 
 ```sh
 # On the target machine, after a clean build:
-deploy/run_bare_metal_bench.sh > docs/benchmarks/bare-metal.md
-git add docs/benchmarks/bare-metal.md
-git commit -m "bench: refresh bare-metal numbers"
+deploy/run_bare_metal_bench.sh > /tmp/weir-capture.md
 ```
+
+Then replace the region between the `BEGIN CAPTURE` and `END CAPTURE` markers
+above with that file's contents, minus its `# Bare-metal benchmark results`
+heading, and commit.
+
+> **Do not redirect the script over this file.** Earlier revisions documented
+> `run_bare_metal_bench.sh > docs/benchmarks/bare-metal.md`, which replaces the
+> whole document — deleting the regression policy, the measured noise floor,
+> this procedure and the environment annotations below, all of which are what
+> makes the capture interpretable. The script emits a capture, not this page.
 
 Re-capture after any of:
 
