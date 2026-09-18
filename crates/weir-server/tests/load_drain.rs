@@ -783,3 +783,76 @@ fn wab_growth_when_ingest_outruns_the_sink() {
         srv.shutdown();
     }
 }
+
+/// Time to recover across a hard restart, against the size of the backlog held
+/// at the moment of the crash.
+///
+/// An operator restarting a daemon that is holding a backlog has no published
+/// number for how long it is unavailable, and the answer scales with the buffer
+/// rather than being constant.
+///
+/// **This lives here, not in `tests/research.rs`, and that is the whole point.**
+/// The first version used `bench_preset`'s noop sink, which drains as fast as
+/// ingest fills — so the WAB was empty at kill time (`wab_bytes: 0` on every
+/// row) and it timed an empty daemon's startup: 160, 20 and 20 ms for
+/// nominally 64 MiB, 256 MiB and 512 MiB of backlog. A recovery benchmark whose
+/// answer does not vary with the thing it claims to vary with is measuring
+/// something else. Holding the sink failing is what makes a backlog exist.
+#[test]
+#[ignore = "operator-run; writes multi-hundred-MB WABs"]
+fn recovery_time_vs_backlog_size() {
+    const PAYLOAD_BYTES: usize = 1_024;
+    // 64 MiB, 256 MiB, 512 MiB of payload, ascending so a timeout on the
+    // largest still leaves the smaller results emitted.
+    const RECORD_COUNTS: &[usize] = &[64 * 1024, 256 * 1024, 512 * 1024];
+
+    for &records in RECORD_COUNTS {
+        let sink = MockSink::start();
+        // Down before the first record, and never let through: every segment
+        // stays sealed-awaiting-drain, which is the state a crash must recover.
+        sink.set_failing(true);
+
+        let mut srv = daemon("r_recov", &sink).start();
+        let payload = vec![b'x'; PAYLOAD_BYTES];
+        let mut client = srv.client();
+
+        let fill_start = Instant::now();
+        let batch: Vec<&[u8]> = vec![payload.as_slice(); 256];
+        for _ in 0..(records / 256) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record while filling");
+        }
+        let fill = fill_start.elapsed();
+
+        let body = srv.scrape_metrics();
+        let wab_bytes = body
+            .lines()
+            .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+            .and_then(|l| l.split_whitespace().next_back())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(f64::NAN);
+        assert!(
+            wab_bytes > 0.0,
+            "the WAB is empty at kill time, so this measures daemon startup and \
+             not recovery: the sink is draining when it was told to fail"
+        );
+
+        // SIGKILL, not a clean shutdown: a clean stop seals and flushes, which
+        // is the case an operator is not worried about.
+        srv.kill_ungracefully();
+        let restart = Instant::now();
+        srv.restart_in_place();
+        let ready = restart.elapsed();
+
+        println!(
+            "\nBENCH: {{\"scenario\":\"recovery\",\"records\":{records},\
+             \"payload_bytes\":{PAYLOAD_BYTES},\"wab_bytes\":{wab_bytes:.0},\
+             \"fill_ms\":{},\"ready_ms\":{}}}",
+            fill.as_millis(),
+            ready.as_millis(),
+        );
+        srv.shutdown();
+    }
+}
