@@ -826,17 +826,37 @@ fn recovery_time_vs_backlog_size() {
         }
         let fill = fill_start.elapsed();
 
-        let body = srv.scrape_metrics();
-        let wab_bytes = body
-            .lines()
-            .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
-            .and_then(|l| l.split_whitespace().next_back())
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(f64::NAN);
+        // Poll, do not snapshot. `Buffered` acks on the memory write, so the
+        // fill loop returns before the flusher has necessarily put anything on
+        // disk; reading the gauge on the instant the loop ends raced that and
+        // reported an empty WAB on beast while 64 MB was in flight.
+        let read_wab = || -> f64 {
+            srv.scrape_metrics()
+                .lines()
+                .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+                .and_then(|l| l.split_whitespace().next_back())
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(f64::NAN)
+        };
+        let settle = Instant::now();
+        let mut wab_bytes = read_wab();
+        while wab_bytes <= 0.0 && settle.elapsed() < Duration::from_secs(30) {
+            thread::sleep(Duration::from_millis(200));
+            wab_bytes = read_wab();
+        }
         assert!(
             wab_bytes > 0.0,
-            "the WAB is empty at kill time, so this measures daemon startup and \
-             not recovery: the sink is draining when it was told to fail"
+            "the WAB is still empty {:?} after filling {records} records, so this \
+             would measure daemon startup and not recovery. Either the sink is \
+             draining when it was told to fail, or the segments are being \
+             confirmed (the gauge excludes .wab.confirmed). Metrics:\n{}",
+            settle.elapsed(),
+            srv.scrape_metrics()
+                .lines()
+                .filter(|l| l.starts_with("weir_wab_") || l.starts_with("weir_drain_"))
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
 
         // SIGKILL, not a clean shutdown: a clean stop seals and flushes, which

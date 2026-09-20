@@ -17,6 +17,60 @@ protocol** below.
 
 ### Added
 
+- **Three benchmark documents from the overnight limit-finding runs**, each an
+  operator-run capture on named hardware and listed in `environments.md`:
+
+  - **`docs/benchmarks/sustained-load.md`** — what `Durable` does over hours
+    rather than seconds. One producer measures **877 rec/s** in a short run and
+    **352 rec/s** averaged over four and a half hours, because fsync latency
+    oscillates between 1,210 µs and 5,557 µs on a **272 s** cycle, spending 76%
+    of the time slow. It is steady state, not decay: no downward trend across
+    4.5 h. Three controls place it in the storage and not in weir — it vanishes
+    on tmpfs, vanishes at the `Buffered` tier, and does not reproduce at all on
+    APFS/NVMe (1.17x spread over 44 minutes against beast's 5.14x).
+
+  - **`docs/benchmarks/compression.md`** — what `wab_compression` costs and
+    buys, which **inverts with record size**. At ~150-byte records zstd level 1
+    costs 28% of throughput for 15% space. At ~4 KiB on a SATA SSD it is a **net
+    throughput win of 29%**, because compressing 4,011 bytes to ~137 leaves far
+    less for the flush to push; even level 9 beats no compression there. On
+    NVMe the same setting merely breaks even — the slower the storage, the more
+    compression wins.
+
+  - **`docs/benchmarks/buffering-and-recovery.md`** — how much burst weir
+    absorbs before backpressure reaches `push`, and what a restart costs.
+    Answers the sizing rule A6 §8 required and shipped without.
+
+- **The WAB's overload ceiling is characterised.** Ingest outrunning the drain
+  does not grow the buffer without limit: it settles at ~259 segments, after
+  which the producer advances at exactly the drain rate. The constant is
+  `main.rs`'s `crossbeam_channel::bounded::<PathBuf>(256)`. Three candidate
+  explanations were tested and two refuted — the bounded work queue (payload
+  sweep moves record count 57x at constant bytes) and a byte limit (segment
+  sweep moves bytes 8x at constant segment count) — and `shard_count` does not
+  enter it at all. **This does not make the default safe:**
+  `wab_segment_max_bytes` defaults to 256 MiB, so ~259 segments is ~66 GB and
+  the disk fills first.
+
+- **Restart cost against a held backlog**, which had no published number:
+  linear at ~0.19 ms per MiB on beast (536 MB back in 100 ms) and ~0.64 ms per
+  MiB on an M3 Max.
+
+### Fixed
+
+- **`recovery_time_vs_backlog_size` measured nothing on beast.** It scraped
+  `weir_wab_bytes_on_disk` the instant the fill loop returned, but `Buffered`
+  acks on the memory write, so the flusher had not necessarily put anything on
+  disk yet — the gauge read 0 and the test's own guard aborted it. It now polls
+  for a non-empty WAB and prints the WAB and drain metrics if it times out. The
+  guard was added in the first place because an earlier version silently timed
+  an empty daemon's startup; it fired correctly here.
+
+- **`docs/benchmarks.md` still described `drain-throughput.md` as mixed-basis**
+  with two superseded Linux rows. Those were re-measured on 2026-09-18 and the
+  file has been on a single basis since.
+
+
 - **`docs/benchmarks/bare-metal.md` holds a capture, and the release gate it
   describes is operable for the first time.** beast (i9-9900K, ext4 on a Samsung
   850 EVO SATA SSD), weir 4.0.0, 2026-09-18. Until now `environments.md` said, in
