@@ -195,7 +195,9 @@ def build_stage_md(stage_groups: dict[str, list[dict]]) -> str:
     return "\n".join(lines)
 
 
-def build_md(groups: dict[str, list[dict]], run_count: int, version: str) -> str:
+def build_md(
+    groups: dict[str, list[dict]], run_count: int, version: str, surface: str = "ci"
+) -> str:
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # Detect which deadlines are actually present in results.
@@ -205,19 +207,35 @@ def build_md(groups: dict[str, list[dict]], run_count: int, version: str) -> str
         if key in groups:
             present_deadlines.append(d)
 
+    bare_metal = surface == "bare-metal"
+    # The CI disclaimer is true of latest.md and false of a bare-metal capture.
+    # Emitting it on the one surface environments.md permits a claim to cite
+    # told the reader to discount the numbers the file exists to publish.
+    if bare_metal:
+        note = [
+            "> **Operator-run capture on named hardware.** The environment header",
+            "> above records the machine, its storage and its tunables; two captures",
+            "> are comparable only if those match. This is the surface",
+            "> `environments.md` permits an external claim to cite — unlike",
+            "> `latest.md`, which is a shared-runner regression detector.",
+        ]
+    else:
+        note = [
+            "> **CI numbers, not a baseline.** These come from a shared 2-vCPU runner.",
+            "> The same version's rows in `history.md` span ~1.45x on RPS and ~2x on",
+            "> p99 with no code change between them, so a ~10% move here is noise, not",
+            "> signal. Compare like-for-like on one machine before drawing a",
+            "> conclusion — see `environments.md` for which comparisons are valid.",
+        ]
     lines = [
         "# Benchmark Results",
         "",
         f"Version: {version}  ",
         f"Last updated: {now}  ",
-        f"Averaged over: {run_count} CI run(s) per deadline  ",
+        f"Averaged over: {run_count} {'run(s)' if bare_metal else 'CI run(s)'} per deadline  ",
         f"Server config: `shard_count=4`, `batch_size=64`",
         "",
-        "> **CI numbers, not a baseline.** These come from a shared 2-vCPU runner.",
-        "> The same version's rows in `history.md` span ~1.45x on RPS and ~2x on",
-        "> p99 with no code change between them, so a ~10% move here is noise, not",
-        "> signal. Compare like-for-like on one machine before drawing a",
-        "> conclusion — see `environments.md` for which comparisons are valid.",
+        *note,
         "",
     ]
 
@@ -617,7 +635,8 @@ def main():
     # so `latest.md` carried no version at all -- which is how the README's
     # "as of" line drifted two releases behind with nothing to catch it.
     version = os.environ.get("WEIR_VERSION", "dev")
-    md = build_md(groups, run_count, version) if groups else ""
+    surface = os.environ.get("WEIR_BENCH_SURFACE", "ci")
+    md = build_md(groups, run_count, version, surface) if groups else ""
     stage_md = build_stage_md(stage_groups)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)

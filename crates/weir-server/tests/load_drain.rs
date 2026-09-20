@@ -650,3 +650,482 @@ fn ingest_survives_a_sink_outage_and_every_record_arrives() {
         "every acked record must reach the sink exactly once after recovery"
     );
 }
+
+// ── The sizing rule A6 shipped without ─────────────────────────────────────
+
+/// How fast the WAB grows when ingest outruns the sink, and whether that rate
+/// is predictable from the two rates and the stored record size.
+///
+/// **Why this exists.** §8 of the A6 design is unambiguous:
+///
+/// > There is **one** drain thread for the whole daemon; delivery does not
+/// > scale with `shard_count` while ingest does. A6 multiplies the rate at
+/// > which the WAB outruns the drain by ~100x, against a `wab_max_bytes` that
+/// > **defaults to 0 (disabled)**. A6 must not ship without a recommended
+/// > value and a sizing rule.
+///
+/// A6 shipped in 4.0.0. There is no recommended value and no sizing rule. This
+/// measures the input to one: it runs a producer flat out against a sink held
+/// to a known rate, samples `weir_wab_bytes_on_disk` as the backlog builds, and
+/// reports observed growth beside the growth predicted by
+/// `(ingest_rps - drain_rps) x stored_bytes_per_record`. If the two agree, an
+/// operator can size `wab_max_bytes` from a burst duration and two rates they
+/// already know, without running this.
+///
+/// Deliberately *not* asserted. The point is the number, and a threshold here
+/// would be a guess about a machine.
+#[test]
+#[ignore = "operator-run; ~5 minutes"]
+fn wab_growth_when_ingest_outruns_the_sink() {
+    // Per-request delays for the sink, in ms. In NDJSON mode each request
+    // carries up to `sink_max_batch_size` records, so this sets a rate rather
+    // than a per-record cost: 100 records per request at 10 ms is ~10k rec/s.
+    const SINK_DELAYS_MS: &[u64] = &[2, 10, 50];
+    const SAMPLE_MS: u64 = 500;
+    const RUN_SECS: u64 = 20;
+
+    for &delay_ms in SINK_DELAYS_MS {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(delay_ms));
+
+        let srv = daemon("r_size", &sink)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let read = |name: &str| -> f64 {
+            let body = srv.scrape_metrics();
+            for line in body.lines() {
+                if line.starts_with(name)
+                    && let Some(v) = line.split_whitespace().next_back()
+                    && let Ok(n) = v.parse()
+                {
+                    return n;
+                }
+            }
+            f64::NAN
+        };
+
+        let batch: Vec<&[u8]> = vec![PAYLOAD; 256];
+        let started = Instant::now();
+        let mut pushed: u64 = 0;
+        let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (t, wab_bytes, delivered)
+        let mut next_sample = Duration::from_millis(SAMPLE_MS);
+
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            pushed += batch.len() as u64;
+
+            if started.elapsed() >= next_sample {
+                let t = started.elapsed().as_secs_f64();
+                let wab = read("weir_wab_bytes_on_disk");
+                let delivered = sink.delivered() as f64;
+                // One line per sample. A first version reported only a growth
+                // rate between two chosen samples and produced 0 B/s while
+                // ingest outran the drain 3:1 -- which is not a rate, it is a
+                // plateau the two-point estimate could not see. The curve is
+                // the result; the summary below is a convenience.
+                println!(
+                    "\nBENCH: {{\"scenario\":\"wab_growth_sample\",\
+                     \"sink_delay_ms\":{delay_ms},\"t_s\":{t:.2},\
+                     \"wab_bytes\":{wab:.0},\"delivered\":{delivered:.0},\
+                     \"pushed\":{pushed}}}"
+                );
+                samples.push((t, wab, delivered));
+                next_sample += Duration::from_millis(SAMPLE_MS);
+            }
+        }
+        let elapsed = started.elapsed();
+
+        // Growth over the middle of the run: the first samples include the
+        // drain starting up and the last include whatever the final segment is
+        // doing, and neither is the steady state being sized for.
+        let n = samples.len();
+        let (a, b) = (samples[n / 4], samples[n - 1 - n / 8]);
+        let observed_growth = (b.1 - a.1) / (b.0 - a.0);
+        let drain_rps = (b.2 - a.2) / (b.0 - a.0);
+        let ingest_rps = pushed as f64 / elapsed.as_secs_f64();
+
+        // Bytes on disk per record, from the daemon rather than from sizeof.
+        // `weir_wab_record_stored_bytes` is a COUNTER, so it exposes `_total`
+        // and no `_sum`/`_count`; reading the histogram names returns the
+        // not-found sentinel and every derived figure becomes NaN.
+        let stored_total = read("weir_wab_record_stored_bytes_total");
+        let per_record = stored_total / pushed as f64;
+        let predicted_growth = (ingest_rps - drain_rps) * per_record;
+
+        println!(
+            "\nBENCH: {{\"scenario\":\"wab_growth\",\"sink_delay_ms\":{delay_ms},\
+             \"ingest_rps\":{ingest_rps:.0},\"drain_rps\":{drain_rps:.0},\
+             \"stored_bytes_per_record\":{per_record:.1},\
+             \"observed_growth_bytes_s\":{observed_growth:.0},\
+             \"predicted_growth_bytes_s\":{predicted_growth:.0},\
+             \"model_error\":{:.3},\"wab_bytes_min\":{:.0},\
+             \"wab_bytes_max\":{:.0},\"wab_bytes_final\":{:.0},\
+             \"samples\":{},\"pushed\":{pushed}}}",
+            if predicted_growth.abs() > 1.0 {
+                observed_growth / predicted_growth
+            } else {
+                f64::NAN
+            },
+            samples.iter().map(|s| s.1).fold(f64::INFINITY, f64::min),
+            samples
+                .iter()
+                .map(|s| s.1)
+                .fold(f64::NEG_INFINITY, f64::max),
+            b.1,
+            n,
+        );
+        srv.shutdown();
+    }
+}
+
+/// Time to recover across a hard restart, against the size of the backlog held
+/// at the moment of the crash.
+///
+/// An operator restarting a daemon that is holding a backlog has no published
+/// number for how long it is unavailable, and the answer scales with the buffer
+/// rather than being constant.
+///
+/// **This lives here, not in `tests/research.rs`, and that is the whole point.**
+/// The first version used `bench_preset`'s noop sink, which drains as fast as
+/// ingest fills — so the WAB was empty at kill time (`wab_bytes: 0` on every
+/// row) and it timed an empty daemon's startup: 160, 20 and 20 ms for
+/// nominally 64 MiB, 256 MiB and 512 MiB of backlog. A recovery benchmark whose
+/// answer does not vary with the thing it claims to vary with is measuring
+/// something else. Holding the sink failing is what makes a backlog exist.
+#[test]
+#[ignore = "operator-run; writes multi-hundred-MB WABs"]
+fn recovery_time_vs_backlog_size() {
+    const PAYLOAD_BYTES: usize = 1_024;
+    // 64 MiB, 256 MiB, 512 MiB of payload, ascending so a timeout on the
+    // largest still leaves the smaller results emitted.
+    const RECORD_COUNTS: &[usize] = &[64 * 1024, 256 * 1024, 512 * 1024];
+
+    for &records in RECORD_COUNTS {
+        let sink = MockSink::start();
+        // Down before the first record, and never let through: every segment
+        // stays sealed-awaiting-drain, which is the state a crash must recover.
+        sink.set_failing(true);
+
+        let mut srv = daemon("r_recov", &sink).start();
+        let payload = vec![b'x'; PAYLOAD_BYTES];
+        let mut client = srv.client();
+
+        let fill_start = Instant::now();
+        let batch: Vec<&[u8]> = vec![payload.as_slice(); 256];
+        for _ in 0..(records / 256) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record while filling");
+        }
+        let fill = fill_start.elapsed();
+
+        let body = srv.scrape_metrics();
+        let wab_bytes = body
+            .lines()
+            .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+            .and_then(|l| l.split_whitespace().next_back())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(f64::NAN);
+        assert!(
+            wab_bytes > 0.0,
+            "the WAB is empty at kill time, so this measures daemon startup and \
+             not recovery: the sink is draining when it was told to fail"
+        );
+
+        // SIGKILL, not a clean shutdown: a clean stop seals and flushes, which
+        // is the case an operator is not worried about.
+        srv.kill_ungracefully();
+        let restart = Instant::now();
+        srv.restart_in_place();
+        let ready = restart.elapsed();
+
+        println!(
+            "\nBENCH: {{\"scenario\":\"recovery\",\"records\":{records},\
+             \"payload_bytes\":{PAYLOAD_BYTES},\"wab_bytes\":{wab_bytes:.0},\
+             \"fill_ms\":{},\"ready_ms\":{}}}",
+            fill.as_millis(),
+            ready.as_millis(),
+        );
+        srv.shutdown();
+    }
+}
+
+/// Is the WAB's plateau under sustained overload bounded by records or by bytes?
+///
+/// `wab_growth_when_ingest_outruns_the_sink` found that the buffer does not grow
+/// without limit when ingest outruns the drain: it climbs to ~17 MB and stops,
+/// after which the producer advances at exactly the drain rate. That is
+/// backpressure reaching the producer -- but read `what_sets_the_wab_plateau`
+/// before concluding anything comforting from it: the ceiling is a *segment
+/// count*, and these scenarios pin segments to 64 KiB where the shipped
+/// default is 256 MiB. The mechanism was not established here. The backlog at the
+/// plateau came to ~64,000 records in all three configurations, against a
+/// `QUEUE_CAPACITY` of 65,536, which is a correlation and not a cause.
+///
+/// This separates the two candidates without touching weir. Hold the sink to one
+/// rate and sweep the payload:
+///
+/// - **record-bound** (the bounded queue): plateau *record count* stays near
+///   constant and plateau *bytes* scale with the payload.
+/// - **byte-bound** (a disk or segment limit): plateau *bytes* stay near
+///   constant and the record count falls as the payload grows.
+///
+/// The two predictions diverge by 64x across this sweep, so one run decides it.
+#[test]
+#[ignore = "operator-run; ~4 minutes"]
+fn wab_plateau_is_record_bound_or_byte_bound() {
+    const PAYLOAD_SIZES: &[usize] = &[64, 256, 1_024, 4_096];
+    const RUN_SECS: u64 = 25;
+    const SINK_DELAY_MS: u64 = 50;
+
+    for &size in PAYLOAD_SIZES {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(SINK_DELAY_MS));
+
+        let srv = daemon("r_plateau", &sink)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let wab_bytes = || -> f64 {
+            srv.scrape_metrics()
+                .lines()
+                .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+                .and_then(|l| l.split_whitespace().next_back())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        let payload = vec![b'x'; size];
+        let batch: Vec<&[u8]> = vec![payload.as_slice(); 256];
+        let started = Instant::now();
+        let mut pushed: u64 = 0;
+        let mut peak = 0.0f64;
+        let mut next_sample = Duration::from_millis(500);
+
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            pushed += batch.len() as u64;
+            // Sample on the clock, not on a record count. Keying off
+            // `pushed % 25_600` meant the 4 KiB case -- which only reaches
+            // ~10k records in the window -- never sampled at all and reported a
+            // plateau of 0, the one payload where the answer mattered most.
+            if started.elapsed() >= next_sample {
+                peak = peak.max(wab_bytes());
+                next_sample += Duration::from_millis(500);
+            }
+        }
+
+        let delivered = sink.delivered() as u64;
+        let backlog = pushed.saturating_sub(delivered);
+        println!(
+            "\nBENCH: {{\"scenario\":\"wab_plateau\",\"payload_bytes\":{size},\
+             \"plateau_bytes\":{peak:.0},\"backlog_records\":{backlog},\
+             \"plateau_bytes_per_record\":{:.1},\"pushed\":{pushed},\
+             \"delivered\":{delivered}}}",
+            if backlog > 0 {
+                peak / backlog as f64
+            } else {
+                f64::NAN
+            },
+        );
+        srv.shutdown();
+    }
+}
+
+/// What sets the ~17 MB ceiling the WAB stops at under sustained overload?
+///
+/// `wab_plateau_is_record_bound_or_byte_bound` established that the ceiling is
+/// bytes and not queue slots: across a 64x payload sweep the plateau held
+/// between 16.92 and 17.06 MB — a spread of 1.008x — while the backlog record
+/// count moved 57x. So the bound is not `QUEUE_CAPACITY`.
+///
+/// The remaining candidates are a byte limit and a *segment count* limit that
+/// merely looks like one, since these scenarios pin `wab_segment_max_bytes` to
+/// 64 KiB and 17 MB is suspiciously close to 256 segments of it. Sweeping the
+/// segment size separates them:
+///
+/// - **segment-count-bound**: the plateau scales with `wab_segment_max_bytes`.
+/// - **byte-bound**: the plateau stays at ~17 MB regardless.
+///
+/// This matters to an operator rather than being trivia. If it is a segment
+/// count, the buffer a deployment actually gets is
+/// `count x shard_count x wab_segment_max_bytes`, and the default segment size
+/// — not `wab_max_bytes` — is the knob that sets how much burst weir absorbs
+/// before it pushes back.
+///
+/// **Measured (2026-09-18, macOS, 256-byte records, 50 ms sink):**
+///
+/// | `wab_segment_max_bytes` | plateau bytes | plateau segments |
+/// |---|---|---|
+/// | 32,768 | 8,529,480 | 260.3 |
+/// | 65,536 | 16,975,368 | 259.0 |
+/// | 262,144 | 67,650,696 | 258.1 |
+///
+/// **It is a segment count: ~259, invariant while the byte figure moves 8x**,
+/// and the constant is in the tree. `main.rs` wires the WAB to the drain with
+/// `crossbeam_channel::bounded::<PathBuf>(256)` -- one **global** channel of
+/// sealed-segment paths, not one per shard. When the drain falls behind it
+/// fills, the writer's blocking send stalls, and that is what reaches the
+/// producer as backpressure. The law is therefore
+///
+/// ```text
+/// plateau_segments ~= 256 (drain channel) + shard_count (one open segment each)
+/// ```
+///
+/// **That `+ shard_count` term is wrong**, and
+/// `the_plateau_law_predicts_the_shard_count_sweep` is what killed it: the
+/// plateau reads 259.0 segments at `shard_count` 1, 4 and 8 alike -- the same
+/// 16,975,368 bytes to the byte. Shard count does not enter it, because these
+/// scenarios push from **one connection**, which lands on one shard, so the
+/// number of open segments in play never varies with how many shards exist.
+///
+/// What survives is the flat part: **~259 segments, of which 256 is the drain
+/// channel**. The remaining ~3 are in flight and not separately accounted for
+/// here. A configuration with producers on every shard would be needed before
+/// anything about shard count could be claimed at all.
+///
+/// Two guesses have now been fitted to this number and both were wrong -- "64
+/// per shard", and "256 + shard_count" -- each of which reproduces the measured
+/// 256-ish at `shard_count = 4` and disagrees everywhere else. The measured
+/// invariant is the result; the arithmetic that happens to match it at one
+/// configuration is not.
+///
+/// **And it does not rescue the default.** `wab_segment_max_bytes` defaults to
+/// 256 MiB (`config/mod.rs`), so ~259 segments is ~66 GB: on any realistic disk
+/// the filesystem fills long before this ceiling binds. A6 section 8's concern
+/// -- that A6 multiplies the rate at which the WAB outruns one drain thread,
+/// against a `wab_max_bytes` defaulting to 0 -- therefore stands at shipped
+/// defaults. The plateau is a property of small segments, not a safety net.
+#[test]
+#[ignore = "operator-run; ~5 minutes"]
+fn what_sets_the_wab_plateau() {
+    const SEGMENT_SIZES: &[&str] = &["32768", "65536", "262144"];
+    const RUN_SECS: u64 = 25;
+
+    for &seg in SEGMENT_SIZES {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(50));
+
+        let srv = daemon("r_seg", &sink)
+            .env("WEIR_WAB_SEGMENT_MAX_BYTES", seg)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let wab_bytes = || -> f64 {
+            srv.scrape_metrics()
+                .lines()
+                .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+                .and_then(|l| l.split_whitespace().next_back())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        let batch: Vec<&[u8]> = vec![PAYLOAD; 256];
+        let started = Instant::now();
+        let mut pushed: u64 = 0;
+        let mut peak = 0.0f64;
+        let mut next_sample = Duration::from_millis(500);
+
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            pushed += batch.len() as u64;
+            if started.elapsed() >= next_sample {
+                peak = peak.max(wab_bytes());
+                next_sample += Duration::from_millis(500);
+            }
+        }
+
+        let seg_bytes: f64 = seg.parse().expect("segment size");
+        println!(
+            "\nBENCH: {{\"scenario\":\"wab_plateau_vs_segment\",\
+             \"segment_max_bytes\":{seg},\"plateau_bytes\":{peak:.0},\
+             \"plateau_segments\":{:.1},\"pushed\":{pushed},\
+             \"delivered\":{}}}",
+            peak / seg_bytes,
+            sink.delivered(),
+        );
+        srv.shutdown();
+    }
+}
+
+/// Tests the plateau law's prediction rather than restating it.
+///
+/// `what_sets_the_wab_plateau` proposed
+/// `plateau_segments ~= 256 (drain channel) + shard_count`, from
+/// `main.rs`'s `bounded::<PathBuf>(256)` plus one open segment per shard. That
+/// was derived at a single `shard_count` of 4, where it is indistinguishable
+/// from "64 per shard" and from a flat 260. Sweeping the shard count separates
+/// all three: the law predicts 257, 260 and 264 for 1, 4 and 8 shards, "64 per
+/// shard" predicts 65, 260 and 520, and a flat constant predicts 260 throughout.
+#[test]
+#[ignore = "operator-run; ~5 minutes"]
+fn the_plateau_law_predicts_the_shard_count_sweep() {
+    const SHARD_COUNTS: &[usize] = &[1, 4, 8];
+    const SEGMENT_BYTES_SMALL: &str = "65536";
+    const RUN_SECS: u64 = 25;
+
+    for &shards in SHARD_COUNTS {
+        let sink = MockSink::start();
+        sink.set_delay(Duration::from_millis(50));
+
+        let srv = daemon("r_shard", &sink)
+            .shard_count(shards)
+            .env("WEIR_WAB_SEGMENT_MAX_BYTES", SEGMENT_BYTES_SMALL)
+            .extra_config("sink_http_batch      = \"ndjson\"")
+            .extra_config("sink_max_batch_size  = 100")
+            .start();
+        let mut client = srv.client();
+
+        let wab_bytes = || -> f64 {
+            srv.scrape_metrics()
+                .lines()
+                .find(|l| l.starts_with("weir_wab_bytes_on_disk"))
+                .and_then(|l| l.split_whitespace().next_back())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(f64::NAN)
+        };
+
+        let batch: Vec<&[u8]> = vec![PAYLOAD; 256];
+        let started = Instant::now();
+        let mut peak = 0.0f64;
+        let mut next_sample = Duration::from_millis(500);
+        while started.elapsed() < Duration::from_secs(RUN_SECS) {
+            let out = client
+                .push_batch(&batch, Durability::Buffered)
+                .expect("push_batch");
+            assert!(out.all_accepted(), "ingest rejected a record mid-burst");
+            if started.elapsed() >= next_sample {
+                peak = peak.max(wab_bytes());
+                next_sample += Duration::from_millis(500);
+            }
+        }
+
+        let seg: f64 = SEGMENT_BYTES_SMALL.parse().expect("segment size");
+        let observed = peak / seg;
+        let predicted = 256.0 + shards as f64;
+        println!(
+            "\nBENCH: {{\"scenario\":\"plateau_vs_shards\",\"shard_count\":{shards},\
+             \"plateau_bytes\":{peak:.0},\"plateau_segments\":{observed:.1},\
+             \"predicted_segments\":{predicted:.0},\"error_segments\":{:.1}}}",
+            observed - predicted,
+        );
+        srv.shutdown();
+    }
+}

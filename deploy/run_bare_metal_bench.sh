@@ -134,7 +134,12 @@ mount_options() {
 
 block_device_line() {
   if command -v lsblk >/dev/null 2>&1; then
-    lsblk -d -o NAME,MODEL,ROTA,TRAN 2>/dev/null | awk 'NR==1 || NR<=6'
+    # Drop loop devices, do not just take the first few rows. On any host with
+    # snaps installed the loop devices sort first, so the previous `NR<=6`
+    # printed six of them and not one real disk -- discarding the single field
+    # environments.md requires a citation to disclose. Keep every physical
+    # device: which one backs the WAB is decided by the mount, reported above.
+    lsblk -d -o NAME,MODEL,ROTA,TRAN 2>/dev/null | awk 'NR == 1 || $1 !~ /^loop/'
   else
     echo "lsblk not available"
   fi
@@ -169,7 +174,14 @@ done
 
 # ── Render the tables via avg_benchmarks.py ───────────────────────────────────
 
-python3 deploy/avg_benchmarks.py "$JSONL" "$TABLES_MD" >/dev/null
+# Stamp the real version and tell the renderer which surface this is. The
+# defaults are "dev" and the CI disclaimer, both of which are wrong here: this
+# is an operator capture on named hardware, and emitting "CI numbers, not a
+# baseline -- a shared 2-vCPU runner" on it told the reader to discount the one
+# surface environments.md permits an external claim to cite.
+WEIR_VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)" \
+WEIR_BENCH_SURFACE=bare-metal \
+  python3 deploy/avg_benchmarks.py "$JSONL" "$TABLES_MD" >/dev/null
 
 # ── Emit the combined doc on stdout ───────────────────────────────────────────
 
