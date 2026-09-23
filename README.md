@@ -38,7 +38,13 @@ macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4–1.5 
 SATA SSD with an honest Linux `fdatasync`
 ([comparison](docs/benchmarks/snapshot-2026-06-13-comparison.md) measured 1.5 ms;
 [phase 3](docs/benchmarks/phase3-results.md) measured 1.4 ms on the same box —
-the spread is the storage, not the software). Measure on
+the spread is the storage, not the software). **Those are rested-disk figures.**
+Under sustained load on that same SATA SSD the fsync alternates between ~1.2 ms
+and ~5.6 ms on a ~4.5 minute cycle, spending 76% of the time in the slow state,
+which puts one producer's sustained `Durable` throughput at about 40% of its
+short-run figure — see
+[`sustained-load.md`](docs/benchmarks/sustained-load.md), which also shows the
+effect is the storage rather than weir. Measure on
 your own hardware: `cargo test -p weir-server --test load --release -- --nocapture`.*
 
 **▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only

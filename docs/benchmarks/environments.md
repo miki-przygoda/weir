@@ -31,6 +31,9 @@ figure was taken at. Captures in the tree that satisfy that today:
 | [`drain-throughput.md`](drain-throughput.md) | The beast box, three storage configs | Delivery-side rates — **first measurement, methodology under review** |
 | [`bare-metal.md`](bare-metal.md) | beast — i9-9900K, ext4 on a Samsung 850 EVO SATA SSD | Ingest, both tiers, latency percentiles and both saturation ramps, with a measured run-to-run noise floor |
 | [`wire-batching.md`](wire-batching.md) | The same beast box | `PushBatch` throughput against an unbatched control, and the fsync amortisation behind it |
+| [`sustained-load.md`](sustained-load.md) | beast, plus an M3 Max control | `Durable` over hours: the oscillation, its period, and the controls isolating it to the storage |
+| [`compression.md`](compression.md) | beast, plus an M3 Max control | What `wab_compression` costs and buys, against record size |
+| [`buffering-and-recovery.md`](buffering-and-recovery.md) | beast, plus an M3 Max control | Burst absorbed before backpressure, what bounds it, and restart time against a held backlog |
 
 **[`bare-metal.md`](bare-metal.md) is the only one of these that is also the
 *release gate*.** A fixed script, on a fixed box, re-run per release so two
