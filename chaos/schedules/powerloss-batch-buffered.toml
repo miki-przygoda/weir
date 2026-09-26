@@ -19,15 +19,28 @@
 #     writeback interval" reading of Phase 2 was a coincidence of that run's
 #     throughput.
 #
-# Both outcomes are informative and they are distinguishable, which is the whole
-# reason to run it. Measure the seconds from the ledger's own `t_micros` on the
-# lost set rather than dividing records by throughput — the division is what
-# produced the ~1.76 s figure in the first place and cannot be used to check it.
+# HOW TO READ IT, and what NOT to do. The ~1.76 s figure came from dividing the
+# record ceiling by that run's throughput, so the same division here cannot check
+# it — it would just restate the assumption. But the ledger does not need parsing
+# either, and a 100 GB `t_micros` pass would be wasted work: the test is a RATIO
+# across the two runs, and `episodes.jsonl` alone carries it.
 #
-# Caveat on that resolution: a batched call records ONE timestamp for all
-# `wire_batch_size` records in it, so `t_micros` is per-call, not per-record. At
-# 256 records a call that is ~1 ms of granularity against a ~1.8 s window —
-# irrelevant here, but it would matter if the window ever came out small.
+#   time-bound (one writeback interval W):   ceiling_batched / ceiling_unbatched
+#                                            == throughput_batched / throughput_unbatched
+#   count-bound (something in the flusher):  ceiling_batched ~= ceiling_unbatched,
+#                                            whatever the throughput
+#
+# Take `expected_loss` per episode for the ceiling (the MAX, not the mean — the
+# ceiling is what characterises the tier) and `acked_delta / steady_secs` for
+# throughput, against powerloss-buffered.toml's published 126,782. The two
+# predictions differ by whatever factor batching moves throughput, which on the
+# Durable pair was ~24x, so this is not a subtle discrimination.
+#
+# One resolution caveat, for anyone who does go to the ledger anyway: a batched
+# call records ONE timestamp for all `wire_batch_size` records in it, so
+# `t_micros` is per-call, not per-record. At 256 records that is ~1 ms of
+# granularity against a ~1.8 s window — irrelevant at this scale, but it would
+# matter if the window ever came out small.
 #
 # A result of exactly zero loss is INCONCLUSIVE, not green: see
 # report.powerloss_verdict(). It means the injector probably never bit, and the
