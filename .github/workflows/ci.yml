@@ -152,11 +152,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      # `--locked` is the point of these two steps as much as the compile is.
+      # Both harnesses are separate workspaces with their own Cargo.lock, and
+      # their locks pin the weir path deps BY VERSION -- so a workspace version
+      # bump leaves them stale, and without `--locked` cargo silently rewrites
+      # the lock in CI and passes. Both locks sat at 3.0.0 for the whole of
+      # 4.0.0 because of exactly that. With `--locked` a stale harness lock
+      # fails here instead. Verified by mutation: reverting either lock to
+      # 3.0.0 fails its step.
       - name: Fuzz targets still compile
-        run: cd fuzz && cargo +nightly build --all-targets
+        run: cd fuzz && cargo +nightly build --all-targets --locked
       - uses: dtolnay/rust-toolchain@stable
       - name: Chaos harness still compiles
-        run: cd chaos && cargo check --all-targets
+        run: cd chaos && cargo check --all-targets --locked
+      # The orchestrator IS the oracle -- I1/I2/I3, quiescence, the canary and
+      # the report's verdicts are all Python, and its 301-test suite had never
+      # run in CI: this job compiled the two Rust binaries and stopped there. So
+      # every guard in run.py/verify.py/report.py was only as good as whoever
+      # last remembered to run it by hand. Stdlib-only, ~3 s, no root, no
+      # device-mapper -- there was never a cost reason to leave it out. The one
+      # one test that builds a real loopback + dm stack skips itself when the
+      # machine cannot (see test_dm_stack._real_dm_unavailable -- it probes the
+      # tooling, not just euid, because `act` runs this job as root in a
+      # container where `losetup` has no loop devices). Verified non-vacuous by
+      # mutation: breaking a single assertion in test_verify.py fails this step.
+      - name: Chaos orchestrator unit tests (the oracle)
+        run: cd chaos/orchestrator && python3 -m unittest discover -p 'test_*.py'
 
   test:
     runs-on: ubuntu-latest

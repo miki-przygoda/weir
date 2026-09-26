@@ -185,6 +185,14 @@ deploy/monitoring/smoke-test.sh --teardown
 # catches a target that stops building. It does not run any of them --
 # actually fuzzing needs a time budget you choose, so that stays manual:
 cargo +nightly fuzz run envelope_parse
+
+# The chaos orchestrator's own unit suite — 301 tests, stdlib only, ~3 s, no
+# root and no device-mapper. This is the ORACLE: I1/I2/I3, quiescence, the
+# canary and the report's verdicts are all Python, so a change to any of them
+# should run this before it runs a real episode. It IS in the `harnesses` CI
+# job. An actual chaos RUN is the part that stays manual, because it needs root
+# and a real dm stack — see chaos/README.md.
+(cd chaos/orchestrator && python3 -m unittest discover -p 'test_*.py')
 ```
 
 ## Stability and what's frozen
