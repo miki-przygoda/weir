@@ -118,6 +118,74 @@ def disk_stop_reason(free, floor):
     )
 
 
+#: Every key this orchestrator reads, by table. A key absent from here is a
+#: TYPO, not a feature: nothing consumes it, so the run silently takes the
+#: default and reports green having measured something other than what the
+#: schedule says. That is the same class of harness lie `fault_kind` refuses an
+#: unknown fault *value* for, applied to the key names.
+#:
+#: The `weir` list is exactly what `Daemon.start` passes through to the daemon —
+#: NOT weir's whole config surface. The harness never writes a weir config file,
+#: so weir's own unknown-key advisory never sees a schedule typo and cannot
+#: catch it. When a run needs a weir knob that is not here, plumb it through
+#: `Daemon.start` and add it here in the same change; the two lists are meant to
+#: be read together.
+SCHEDULE_KEYS = {
+    None: {
+        "seed", "episodes", "max_duration_secs", "steady_lo_secs",
+        "steady_hi_secs", "quiescence_timeout_secs", "min_free_bytes",
+    },
+    "load": {
+        "threads", "record_size", "tier", "wire_batch_size",
+        "min_acked_per_episode", "min_delivered_per_episode",
+    },
+    "weir": {
+        "shard_count", "batch_size", "batch_deadline_ms",
+        "wab_segment_max_bytes", "wab_compression", "wab_compression_level",
+    },
+    "storage": {"size_mb", "dm_target"},
+    "faults": {"kind"},
+}
+
+
+def reject_unknown_schedule_keys(sched):
+    """Refuses a schedule containing a key nothing reads.
+
+    A misspelled key is the quietest failure this harness has. `wire_batch_size`
+    typed as `wire_batchsize` runs the whole schedule down the single-`push`
+    path, passes, and produces a report indistinguishable from a batched run
+    that worked — so the run would claim coverage of A6's batched ack path
+    having never sent one batch. Same for `dm_target`, where the silent default
+    is "no dm layer at all", and for anything under `[weir]`.
+
+    Raises on the first table with unknown keys, naming them and the table's
+    accepted set, because the fix is always "spell it correctly or plumb it
+    through".
+    """
+    tables = {k for k, v in sched.items() if isinstance(v, dict)}
+    unknown_tables = tables - set(SCHEDULE_KEYS)
+    if unknown_tables:
+        raise ValueError(
+            f"schedule has unknown table(s) {sorted(unknown_tables)}; "
+            f"accepted tables are {sorted(k for k in SCHEDULE_KEYS if k)}"
+        )
+    for table, accepted in SCHEDULE_KEYS.items():
+        if table is None:
+            present = {k for k, v in sched.items() if not isinstance(v, dict)}
+            where = "top level"
+        else:
+            present = set(sched.get(table) or {})
+            where = f"[{table}]"
+        unknown = present - accepted
+        if unknown:
+            raise ValueError(
+                f"schedule has unknown {where} key(s) {sorted(unknown)}: "
+                f"nothing reads them, so the run would silently take the "
+                f"default and report having measured something it did not. "
+                f"Accepted here: {sorted(accepted)}."
+            )
+
+
 def load_schedule(path):
     """Reads a schedule TOML.
 
@@ -145,6 +213,7 @@ def load_schedule(path):
     """
     with open(path, "rb") as f:
         sched = tomllib.load(f)
+    reject_unknown_schedule_keys(sched)
     if fault_kind(sched) == "power_loss":
         dm_target = sched.get("storage", {}).get("dm_target")
         if dm_target != "flakey":
@@ -189,6 +258,28 @@ def progress_floor_breached(delta_acked, delta_delivered, min_acked, min_deliver
     only strictly below does.
     """
     return delta_acked < min_acked or delta_delivered < min_delivered
+
+
+def frontier_slack_for(threads, wire_batch_size=1):
+    """I3's bound on how far a still-buffering loadgen thread may lag delivery.
+
+    `LEDGER_FLUSH_THRESHOLD` is the most records ONE thread can hold unflushed,
+    so `threads * threshold` is the worst case across all of them at once.
+
+    The `+ wire_batch_size - 1` is not slack for its own sake. loadgen checks
+    the threshold AFTER appending, so a batched thread appends
+    `wire_batch_size` rows in a single step and can come to rest at
+    `LEDGER_FLUSH_THRESHOLD + wire_batch_size - 1` unflushed. At
+    `wire_batch_size = 1` the term is zero and the bound is byte for byte what
+    every pre-batching run used. Under batching, a bound that is too small
+    reports I3 violations against a load generator that was merely still
+    buffering — a false P0, which is the one failure mode this harness must
+    never have.
+
+    Pure, and therefore testable without root or a live daemon, for the same
+    reason `progress_floor_breached` is.
+    """
+    return threads * (LEDGER_FLUSH_THRESHOLD + wire_batch_size - 1)
 
 
 def canary_verdict(before, during, after):
@@ -813,6 +904,13 @@ def main():
             "--record-size", str(sched["load"]["record_size"]),
             "--tier", sched["load"]["tier"],
             "--duration-secs", str(total_secs),
+            # A6's batched path. Named `wire_batch_size` and NOT `batch_size`,
+            # because [weir].batch_size already means the daemon group-commit
+            # size and conflating the two would silently change the wrong knob.
+            # Absent or 1 keeps the single-`push` call site,
+            # so every pre-existing schedule measures exactly what it measured
+            # before and stays comparable with the Phase 2 corpus.
+            "--batch-size", str(sched["load"].get("wire_batch_size", 1)),
         ], stdout=subprocess.DEVNULL, stderr=loadgen_log)
 
         # Read each log byte exactly once across the whole run.
@@ -820,12 +918,11 @@ def main():
         delivered_tail = verify.LogTailer(delivered_path)
         acc = verify.Accumulator(delivered_run_id=run_id)
         # Frontier slack (I3): bounds how far a still-buffering loadgen thread
-        # can lag the delivery log. LEDGER_FLUSH_THRESHOLD is loadgen's
-        # per-thread flush threshold — the most records one thread can hold
-        # unflushed before it is forced to write them — so
-        # `threads * LEDGER_FLUSH_THRESHOLD` is the worst case across all of
-        # them at once.
-        frontier_slack = sched["load"]["threads"] * LEDGER_FLUSH_THRESHOLD
+        # can lag the delivery log. The reasoning, including why batching widens
+        # it, lives on frontier_slack_for.
+        frontier_slack = frontier_slack_for(
+            sched["load"]["threads"], sched["load"].get("wire_batch_size", 1)
+        )
         # C2: the previous episode's CUMULATIVE totals, so the per-episode
         # DELTA (not the running total) is what gets judged against the
         # schedule's progress floors — and what the report renders.
