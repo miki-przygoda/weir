@@ -73,6 +73,31 @@ protocol** below.
 
 ### Fixed
 
+- **`Buffered`'s exposure ceiling was published in seconds, and the seconds are
+  not the invariant.** Phase 2 measured a ceiling of 126,782 records and rendered
+  it as "1.76 s of acknowledged writes" by dividing by that run's ~72,000 rec/s,
+  then described the bound as "one writeback interval" — a reading the same run
+  could not test. A batched `Buffered` power-loss run (747 episodes, canary `bit`
+  in 747/747, clean stop at `slack=0`) raised throughput 1.45x and measured a
+  record ceiling of **123,664** — unmoved, −2.5% — in **1.18 s**, against the
+  184,200 a time-bound ceiling predicts. So the ceiling is a quantity of data and
+  the duration is throughput-specific: a sizing rule of the form "budget for
+  1.76 s of acked writes" is wrong for any producer faster than that run.
+  `README.md`, `chaos/README.md` and the Phase 2 write-up now quote records and
+  say what the seconds depend on. The uniform distribution holds in both runs.
+  **Still open:** both runs used 256-byte records, so records and bytes are
+  proportional and indistinguishable; 123,664 × 256 B ≈ 31.7 MB has the shape of
+  a dirty-page limit, and the zstd comparison agrees, but a record-size sweep is
+  what would settle it.
+
+- **`chaos/README.md` said "any survivor is an anomaly", which `run.py` has never
+  done.** Quarantined segments under power loss are the documented correct
+  outcome — `drop_writes` tears the active segment and recovery parks the torn
+  tail rather than truncating it — and are exempted from the alarm while still
+  being recorded. A 747-episode `Buffered` run ended with 2,902 of them, ~3.9 per
+  episode: one per shard per cut. Non-empty active segments and dead-letter files
+  are never exempt, and the README now says all of that.
+
 - **A full WAB device manufactured a false durability violation against weir.**
   The chaos disk floor measured `run_dir` — the filesystem holding the two
   ledgers — and never the mounted test device holding the WAB, which is orders of

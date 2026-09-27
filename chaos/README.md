@@ -84,11 +84,21 @@ does not build this project.
 > [`docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`](../docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md).
 >
 > **Buffered's exposure is now a number, not prose.** Loss is uniformly
-> distributed between zero and one writeback interval — mean and stdev both
-> land within 2% of a uniform distribution's `max/2` and `max/√12` — with a
-> ceiling of **126,782 records (~1.76 s of acknowledged writes)** and a median
-> of 63,790 (~0.89 s). The ceiling, not the mean, is what characterises the
-> tier.
+> distributed between zero and the ceiling — mean and stdev both land within 2%
+> of a uniform distribution's `max/2` and `max/√12` — with a ceiling of
+> **126,782 records** and a median of 63,790. The ceiling, not the mean, is what
+> characterises the tier.
+>
+> **Read the ceiling in RECORDS, not in seconds.** This run rendered it as
+> "~1.76 s of acknowledged writes" by dividing by its own ~72,000 rec/s, and
+> called it "one writeback interval". The batched Buffered run
+> ([`powerloss-batch-buffered.toml`](schedules/powerloss-batch-buffered.toml),
+> 747 episodes, 2026-09-27) tested that reading by raising throughput 1.45x: the
+> record ceiling did **not** move (123,664 against 126,782) and the duration fell
+> to **1.18 s**. So the ceiling is a quantity of data and the seconds are
+> throughput-specific. Whether the invariant is records or bytes is still open —
+> both runs used 256-byte records, and 123,664 x 256 B is ~31.7 MB, which a
+> record-size sweep would settle.
 >
 > **What that run alone did NOT establish** — both since closed, and left here
 > because the sequence is the point: a Buffered run measures Buffered, and
@@ -213,7 +223,14 @@ last row of the report:
    failure counts as an anomaly rather than a violation;
 5. the WAB directory gets a **post-mortem** — surviving sealed segments,
    non-empty active segments, `quarantine/` and `dead_letter/` contents, with
-   paths and sizes. Any survivor is an anomaly. This evidence used to be
+   paths and sizes. A survivor is an anomaly *unless* it is a quarantined
+   segment under power loss, which is the documented correct outcome and is
+   exempted in `run.py` — `drop_writes` tears the active segment, recovery parks
+   the torn tail rather than truncating it, and flagging that would put an
+   anomaly on essentially every power-loss episode. A 747-episode Buffered run
+   ended with 2,902 such survivors, ~3.9 per episode: one per shard per cut.
+   Non-empty active segments and dead-letter files are never exempt. This
+   evidence used to be
    deleted, unread, by `stack.teardown()`.
 
 **The gate is zero FALSE violations, not "it ran".** Any violation at this
