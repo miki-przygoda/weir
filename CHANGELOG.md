@@ -116,6 +116,27 @@ protocol** below.
   scrapes `main()` to prove the guard is wired *and* measures the mount rather
   than `run_dir` — both failure modes mutation-verified.
 
+- **MinIO withdrew its public images and the `sink integration` job went red on
+  every PR.** Every tag on `quay.io/minio/{minio,mc}` now answers `401
+  UNAUTHORIZED` to an anonymous pull — including the release the test rig pinned —
+  and `docker.io/minio/minio` answers `object not found`. The job failed in 12 s,
+  before running one test. The rig now uses Bitnami's archive of the same MinIO
+  server, which matters more than it looks: these five tests are what hold weir's
+  **hand-rolled SigV4** to account, so an S3 mock that does not verify signatures
+  would leave the job green while testing nothing. Verified rather than assumed —
+  the replacement answers a deliberately bad signature with
+  `SignatureDoesNotMatch`, and all five `s3_sink` tests pass against it unchanged.
+
+- **The MinIO init container raced the server's startup.** Bitnami's entrypoint
+  starts MinIO, configures `mc` against it, then stops it and starts it again,
+  where the upstream image started once. `depends_on: service_healthy` is
+  therefore satisfiable by the first, throwaway instance, and the init container
+  was released into the ~1 s window where nothing was listening: the
+  anonymous-download policy went unset and four of the five `s3_sink` tests failed
+  in their LIST helper with a bare 403 that named no cause. The alias step now
+  retries, which removes the race whatever the server does, where a longer
+  `start_period` would only have made it rarer.
+
 - **`recovery_time_vs_backlog_size` measured nothing on beast.** It scraped
   `weir_wab_bytes_on_disk` the instant the fill loop returned, but `Buffered`
   acks on the memory write, so the flusher had not necessarily put anything on

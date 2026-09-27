@@ -81,11 +81,33 @@ services:
       start_period: 3s
 
   minio:
+    # WHY `bitnamilegacy` AND NOT `quay.io/minio/minio`. MinIO withdrew its
+    # public images: every tag on quay.io/minio/{minio,mc} now answers
+    # `401 UNAUTHORIZED` to an anonymous pull -- including the release this file
+    # used to pin -- and `docker.io/minio/minio` returns `object not found`. The
+    # `sink integration` job failed in 12 s on every PR as a result, before
+    # running one test. Bitnami's archive is the same MinIO server, so the suite
+    # keeps the power it had; that matters here more than usual, because these
+    # tests are what hold weir's HAND-ROLLED SigV4 to account, and swapping in an
+    # S3 mock that does not verify signatures would leave the job green while
+    # testing nothing. Verified, not assumed: this image answers a deliberately
+    # bad signature with `SignatureDoesNotMatch` (not merely 403), and all five
+    # `s3_sink` tests pass against it unchanged.
+    #
+    # `bitnamilegacy` is frozen and receives no updates. Acceptable for a
+    # CI-only rig that binds to loopback and holds no real data; it would not be
+    # acceptable in a deployment. If it is ever withdrawn too, the replacement
+    # must be held to the same bar -- enforce SigV4, pass all five tests -- and
+    # `adobe/s3mock` fails the first of those.
+    #
     # Pinned by tag like the other services here. Production deployments should
     # pin by digest; this is a test rig.
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: docker.io/bitnamilegacy/minio:2025.7.23
     container_name: weir-test-minio
-    command: server /data --console-address ":9001"
+    # No `command:`. Bitnami's entrypoint runs `minio server` against its own
+    # data directory; overriding it with the upstream image's
+    # `server /data --console-address` fights that for no gain, since only 9000
+    # is published and the console is never used.
     ports:
       # 127.0.0.1-only, same as the SQL services: the rig must never be
       # reachable off-host.
@@ -102,7 +124,7 @@ services:
       start_period: 3s
 
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: docker.io/bitnamilegacy/minio-client:2025.7.21
     container_name: weir-test-minio-init
     depends_on:
       minio:
@@ -111,9 +133,23 @@ services:
     # exists for the least-privilege test: a policy granting PutObject but not
     # ListBucket makes HeadBucket 403 while writes still succeed, which is the
     # case the sink maps to Degraded rather than Down.
+    # The alias set RETRIES, and that is not defensive padding. Bitnami's
+    # entrypoint starts MinIO, configures `mc` against it, then STOPS it and
+    # starts it again -- the upstream image started once. `depends_on:
+    # service_healthy` can therefore be satisfied by the first, throwaway
+    # instance, and this container gets released into the ~100 ms window where
+    # nothing is listening. Observed exactly once as `dial tcp ...:9000:
+    # connect: connection refused`, which left the anonymous-download policy
+    # unset and failed four of the five s3_sink tests in the LIST helper -- a
+    # 403 with no hint that the cause was a startup race. Retrying removes the
+    # race whatever the server does, which a longer `start_period` would only
+    # make less likely.
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 weirtest weirtestsecret &&
+      for i in $$(seq 1 60); do
+        mc alias set local http://minio:9000 weirtest weirtestsecret && break;
+        echo \"minio not serving yet, retrying ($$i/60)\"; sleep 1;
+      done &&
       mc mb --ignore-existing local/weir-test &&
       mc mb --ignore-existing local/weir-test-restricted &&
       mc anonymous set download local/weir-test &&
