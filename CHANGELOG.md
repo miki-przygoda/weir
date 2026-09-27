@@ -73,6 +73,24 @@ protocol** below.
 
 ### Fixed
 
+- **A full WAB device manufactured a false durability violation against weir.**
+  The chaos disk floor measured `run_dir` — the filesystem holding the two
+  ledgers — and never the mounted test device holding the WAB, which is orders of
+  magnitude smaller. Found on run `1813189325188119`: 1,189 batched `Durable`
+  power-loss episodes passed, then the 2 GiB device filled while the host still
+  had 153 GiB free, so the guard never fired. What followed was, in order —
+  weir hit `ENOSPC` copying a mid-file-corrupt segment into quarantine and
+  **refused to truncate it**, because the corrupt tail may hold acked-durable
+  records ("segment left UNTOUCHED for retry"), which is correct fail-closed
+  behaviour; recovery therefore never completed, the drain never settled, and the
+  episode hit its quiescence timeout; and the oracle ran I1 anyway and reported
+  the 25,577 records weir had deliberately **preserved** as records it had lost.
+  A new `device_stop_reason` floor watches the WAB mount (128 MiB default,
+  `min_free_device_bytes` per schedule) and stops between episodes, keeping the
+  final pass, the report and the WAB post-mortem. Seven tests, including one that
+  scrapes `main()` to prove the guard is wired *and* measures the mount rather
+  than `run_dir` — both failure modes mutation-verified.
+
 - **`recovery_time_vs_backlog_size` measured nothing on beast.** It scraped
   `weir_wab_bytes_on_disk` the instant the fill loop returned, but `Buffered`
   acks on the memory write, so the flusher had not necessarily put anything on

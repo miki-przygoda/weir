@@ -391,6 +391,92 @@ class TestUnknownScheduleKeysRefused(unittest.TestCase):
                 run.load_schedule(path)
 
 
+class TestWabDeviceFloor(unittest.TestCase):
+    """The WAB device is a separate, much smaller filesystem than the one
+    holding the ledgers, and the host floor cannot see it.
+
+    Regression for run 1813189325188119: 1,189 batched Durable power-loss
+    episodes passed, then the 2 GiB device filled while the host still had
+    ~150 GiB free. weir correctly refused to truncate a corrupt segment it could
+    not quarantine, recovery stalled, quiescence timed out, and I1 reported the
+    25,577 records weir had deliberately PRESERVED as records it had lost -- a
+    false P0 against weir for doing the right thing.
+    """
+
+    def test_a_full_device_stops_the_run(self):
+        reason = run.device_stop_reason(free=16 * 2**20, floor=128 * 2**20)
+        self.assertIsNotNone(reason)
+        self.assertIn("WAB device", reason)
+        self.assertIn("size_mb", reason, "must say how to fix it")
+
+    def test_a_roomy_device_does_not(self):
+        self.assertIsNone(
+            run.device_stop_reason(free=2 * 2**30, floor=128 * 2**20)
+        )
+
+    def test_exactly_at_the_floor_does_not_stop(self):
+        # Same boundary convention as progress_floor_breached and
+        # disk_stop_reason: only strictly below trips it.
+        floor = 128 * 2**20
+        self.assertIsNone(run.device_stop_reason(free=floor, floor=floor))
+        self.assertIsNotNone(run.device_stop_reason(free=floor - 1, floor=floor))
+
+    def test_a_zero_floor_disables_it(self):
+        self.assertIsNone(run.device_stop_reason(free=0, floor=0))
+
+    def test_it_is_a_SEPARATE_floor_from_the_host_one(self):
+        """The bug was one check doing duty for two filesystems. At the numbers
+        that actually occurred -- 150 GiB free on the host, 16 MiB free on the
+        device -- the host check passes and only this one fires. If these two
+        ever collapse into one call, this fails."""
+        host_free, device_free = 150 * 2**30, 16 * 2**20
+        self.assertIsNone(
+            run.disk_stop_reason(host_free, run.DEFAULT_MIN_FREE_BYTES),
+            "the host floor did not fire during the real failure, and must not "
+            "be what this relies on",
+        )
+        self.assertIsNotNone(
+            run.device_stop_reason(device_free, run.DEFAULT_MIN_FREE_DEVICE_BYTES)
+        )
+
+    def test_the_device_floor_is_actually_WIRED_INTO_the_episode_loop(self):
+        """A pure function nothing calls is theatre.
+
+        The call site is inside `main()`, which needs root and a real dm stack,
+        so the suite cannot execute it. Scrape for it instead -- the same
+        approach as the two CLI contract tests -- and require that it measures
+        `mount_point` and not `run_dir`, because measuring the wrong filesystem
+        is the entire original bug and would leave every test above passing.
+        """
+        run_py = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
+        with open(run_py) as f:
+            source = f.read()
+
+        start = source.index("def main(")
+        body = source[start:]
+        self.assertIn(
+            "device_stop_reason(", body,
+            "device_stop_reason is defined but main() never calls it",
+        )
+        call = body[body.index("device_stop_reason("):][:200]
+        self.assertIn(
+            "mount_point", call,
+            f"the device check must measure the WAB MOUNT, not the ledger "
+            f"filesystem -- measuring run_dir is the bug this exists for: {call!r}",
+        )
+        self.assertNotIn(
+            "disk_usage(run_dir)", call,
+            "the device check is measuring run_dir, which is the original defect",
+        )
+
+    def test_the_device_floor_is_smaller_than_the_host_floor(self):
+        # A 2 GiB device cannot satisfy a 5 GiB floor, so reusing the host
+        # constant would stop every run before episode 0.
+        self.assertLess(
+            run.DEFAULT_MIN_FREE_DEVICE_BYTES, run.DEFAULT_MIN_FREE_BYTES
+        )
+
+
 class TestSeededKiller(unittest.TestCase):
     def test_kill_delays_are_reproducible_from_the_seed(self):
         a = run.kill_delays(seed=42, count=10, lo=1.0, hi=5.0)

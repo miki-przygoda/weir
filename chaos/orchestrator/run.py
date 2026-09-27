@@ -78,6 +78,14 @@ def fault_kind(sched):
 DEFAULT_MIN_FREE_BYTES = 5 * 2**30
 
 
+#: Free bytes the WAB DEVICE refuses to drop below. A separate, much smaller
+#: floor than `DEFAULT_MIN_FREE_BYTES` because it guards a different filesystem
+#: for a different reason: the test device is deliberately tiny (`size_mb`,
+#: typically 2 GiB) and is the thing under test, not the thing recording the
+#: test. Override per schedule with `min_free_device_bytes`; 0 disables it.
+DEFAULT_MIN_FREE_DEVICE_BYTES = 128 * 2**20
+
+
 def _gib(n):
     return f"{n / 2**30:.1f} GiB"
 
@@ -134,6 +142,7 @@ SCHEDULE_KEYS = {
     None: {
         "seed", "episodes", "max_duration_secs", "steady_lo_secs",
         "steady_hi_secs", "quiescence_timeout_secs", "min_free_bytes",
+        "min_free_device_bytes",
     },
     "load": {
         "threads", "record_size", "tier", "wire_batch_size",
@@ -184,6 +193,50 @@ def reject_unknown_schedule_keys(sched):
                 f"default and report having measured something it did not. "
                 f"Accepted here: {sorted(accepted)}."
             )
+
+
+def device_stop_reason(free, floor):
+    """Why the run must stop because the WAB DEVICE is nearly full, or None.
+
+    `disk_stop_reason` guards the filesystem holding the two ledgers -- the
+    oracle's own input. This guards the mounted test device holding the WAB, and
+    it is a genuinely separate check because the two are separate filesystems
+    with wildly different sizes: a schedule's `size_mb = 2048` device can fill
+    while the host still has 150 GiB free, so the host floor never fires.
+
+    FOUND THE HARD WAY, run 1813189325188119 (2026-09-27). 1,189 batched Durable
+    power-loss episodes passed, then the 2 GiB device filled. Three things
+    followed, in order, and only the first was weir's:
+
+    1. weir hit ENOSPC trying to copy a mid-file-corrupt segment into quarantine
+       and REFUSED to truncate it, because the corrupt tail may hold
+       acked-durable records -- "segment left UNTOUCHED for retry". That is
+       correct, fail-closed behaviour: it chose to stop rather than risk loss.
+    2. Recovery therefore never completed, the drain never settled, and the
+       episode hit its quiescence timeout. The harness ran I1 anyway and
+       reported 25,577 acked-but-undelivered records as a DURABILITY VIOLATION,
+       when they were sitting intact on disk precisely because weir preserved
+       them.
+    3. The next episode's canary write raised an unhandled
+       `OSError: [Errno 28]`, killing the run without a final pass.
+
+    So a full test device does not merely end a run: it manufactures a false P0
+    against weir for doing the right thing. Stopping between episodes instead
+    keeps the final pass, the report and the WAB post-mortem.
+    """
+    if floor <= 0:
+        return None
+    if free >= floor:
+        return None
+    return (
+        f"WAB device free space {_gib(free)} is below the device floor of "
+        f"{_gib(floor)}. Stopping cleanly: a full WAB device makes weir refuse "
+        f"to truncate a corrupt segment it cannot quarantine -- correct, "
+        f"fail-closed behaviour -- which stalls recovery, times out quiescence, "
+        f"and makes I1 report the records weir deliberately PRESERVED as records "
+        f"it lost. Raise the schedule's `[storage].size_mb`, or set "
+        f"`min_free_device_bytes` to change this floor (0 disables it)."
+    )
 
 
 def load_schedule(path):
@@ -784,6 +837,9 @@ def main():
     # between-episode check below is the one that matters for a long soak;
     # this one just makes an already-doomed run fail in the first second.
     min_free_bytes = sched.get("min_free_bytes", DEFAULT_MIN_FREE_BYTES)
+    min_free_device_bytes = sched.get(
+        "min_free_device_bytes", DEFAULT_MIN_FREE_DEVICE_BYTES
+    )
     preflight = disk_stop_reason(shutil.disk_usage(run_dir).free, min_free_bytes)
     if preflight is not None:
         sys.exit(f"refusing to start: {preflight}")
@@ -953,6 +1009,18 @@ def main():
                 if disk_reason is not None:
                     print(
                         f"disk floor reached after {i} episodes: {disk_reason}",
+                        flush=True,
+                    )
+                    break
+                # The WAB device is a DIFFERENT filesystem from run_dir, orders
+                # of magnitude smaller, and the check above cannot see it.
+                device_reason = device_stop_reason(
+                    shutil.disk_usage(mount_point).free, min_free_device_bytes
+                )
+                if device_reason is not None:
+                    print(
+                        f"WAB device floor reached after {i} episodes: "
+                        f"{device_reason}",
                         flush=True,
                     )
                     break

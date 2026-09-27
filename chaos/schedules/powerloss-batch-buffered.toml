@@ -89,7 +89,19 @@ batch_deadline_ms = 2
 wab_segment_max_bytes = 8388608
 
 [storage]
-size_mb = 2048
+# 16 GiB, NOT the 2048 every other schedule uses, and the difference is measured
+# rather than cautious. Run 1813189325188119 (batched Durable, this schedule's
+# pair) filled a 2 GiB device after 1,189 episodes: batching raises ingest ~25x
+# while the HTTP sink drain does not keep up, so unconfirmed WAB segments
+# accumulate at roughly 1.7 MiB per episode. Buffered is not fsync-bound, so it
+# pushes harder still and would reach the same wall sooner.
+#
+# This is the one parameter that differs from powerloss-batch.toml beyond the
+# tier and the seed, and it is worth saying why it does not spoil the pair: the
+# exposure ceiling is set by writeback lag, which does not depend on how much
+# room the device has. What device size changes is whether the run survives long
+# enough to measure it.
+size_mb = 16384
 # The real fault, not the pass-through stand-in. `load_schedule()` refuses
 # `dm_target = "linear"` paired with `fault.kind = "power_loss"`: linear injects
 # nothing, so that pairing would report green having tested no power loss.
