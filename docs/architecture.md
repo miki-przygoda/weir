@@ -2,7 +2,7 @@
 
 ## Overview
 
-weir is a sink-agnostic write-ahead buffer daemon. Producers connect over a Unix socket, push records with an explicit durability tier, and receive an Ack after the record is durably stored. The daemon buffers records in a write-ahead buffer (WAB) on disk and forwards them to a pluggable sink.
+weir is a sink-agnostic write-ahead buffer daemon. Producers connect over a Unix socket — or, behind the `tls` feature, over TCP with mutual TLS — push records with an explicit durability tier, and receive an Ack after the record is durably stored. The daemon buffers records in a write-ahead buffer (WAB) on disk and forwards them to a pluggable sink.
 
 weir is extracted from HTDIP (Hardware-Tuned Data Ingestion Pipeline), a production system built for a Rails + MySQL stack. The WAB design, crash-recovery proof, and benchmark methodology carry over; the domain coupling, Rails integration, and MySQL-specific drain logic do not.
 
@@ -12,13 +12,16 @@ weir is extracted from HTDIP (Hardware-Tuned Data Ingestion Pipeline), a product
 
 ```
 Producer
-  │  Unix socket (weir wire protocol v1)
+  │  Unix socket, or TCP + mutual TLS (`tls` feature) — weir wire protocol v1
   ▼
 Socket layer          (async tokio, src/socket/)   [Unix only — #[cfg(unix)]]
+  │    src/socket/mod.rs  Unix accept loop
+  │    src/socket/tcp.rs  TCP accept loop   \  both feed the same
+  │    src/socket/tls.rs  mTLS handshake    /  handle_connection
   │  QueueSender::push_timeout  [crossing point: spawn_blocking]
   ▼
-Work queue            (bounded MPMC, src/queue.rs)
-  │  crossbeam_channel, QUEUE_CAPACITY = 65 536
+Work queue            (partitioned bounded channels, src/queue.rs)
+  │  one crossbeam sub-channel per worker; QUEUE_CAPACITY = 65 536 split across them
   ▼
 Worker pool           (std::thread, src/worker.rs)
   │  per-shard Batch channel (crossbeam Sender<Batch>) — direct, no bridge hop
@@ -67,17 +70,17 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 - Accepts connections up to `max_connections` (Semaphore-gated; over-cap streams are dropped immediately).
 - Assigns each accepted connection a `shard_id` round-robin (`accept_counter % shard_count`). Every WorkUnit pushed on that connection inherits the same shard_id, so a connection is pinned to one WAB flusher for its lifetime — no per-record routing decision on the hot path.
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
+- **A second transport lives in the same module**: `tcp.rs` + `tls.rs` (behind the `tls` feature) mirror the Unix accept loop — same global connection-limit semaphore, same round-robin shard assignment, and the same `handle_connection` — so everything below the accept loop is transport-agnostic. Operator setup is in [operations/tcp-mtls.md](operations/tcp-mtls.md). The `#[cfg(unix)]` gate above still applies: the module as a whole is Unix-only, TCP included.
 - `QueueSender::push_timeout` is used with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.
 - SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer receives a `CancellationToken` and drains the `JoinSet` before returning.
 
 ### Work queue (`src/queue.rs`)
 
-- Bounded MPMC `crossbeam_channel` with `QUEUE_CAPACITY = 65 536` slots.
+- **Partitioned, not a single shared channel.** `queue::new::<T>(partitions)` builds a fixed set of bounded `crossbeam_channel` sub-channels, one per partition, splitting `QUEUE_CAPACITY = 65 536` across them. Production calls `queue::new::<WorkUnit>(config.worker_count)` (`main.rs`), so there is one partition per worker — which is what lets each shard be owned by exactly one worker with no cross-worker contention.
 - `QueueSender` implements `Clone` so multiple socket handlers can push concurrently without shared mutable state.
-- `QueueSender::push` blocks the calling thread (intentional backpressure — stalls the socket handler rather than dropping records or allocating unboundedly).
-- `QueueSender::push_timeout` is used by the socket layer with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
-- Generic over `T`; the socket layer instantiates `Queue<WorkUnit>` without the queue module depending on `WorkUnit`.
+- **`try_push` and `push_timeout` are the production API**, both taking a `partition_key`. `push_timeout` is used by the socket layer with a 5-second deadline so a saturated or dead worker pool returns `Nack(InternalError)` to the client instead of holding the semaphore slot open indefinitely. A bare blocking `push` exists but is `#[cfg(test)]`-only, deliberately: an indefinite stall is not a behaviour the daemon should be able to reach.
+- Generic over `T`; the queue module never depends on `WorkUnit`. (There is no `Queue<T>` type — the halves are `QueueSender<T>` / `QueueReceiver<T>`.)
 
 ### Worker pool (`src/worker.rs`, `src/models.rs`)
 

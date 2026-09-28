@@ -10,7 +10,7 @@ crash-recovery re-commits actually de-duplicate via the schema's UNIQUE
 constraint (or, for ClickHouse, the per-batch
 `insert_deduplication_token`)?
 
-For that, we ship three `#[ignore]`-marked tests in
+For that, we ship `#[ignore]`-marked tests in
 `crates/weir-server/tests/system.rs`:
 
 - `mysql_sink_end_to_end` — pushes 100 Sync records, verifies the sink
@@ -24,10 +24,45 @@ For that, we ship three `#[ignore]`-marked tests in
   cargo feature (`#[cfg(feature = "clickhouse-sink")]`), so it only
   compiles when that feature is enabled.
 
-All three tests are `#[ignore]`-marked because they require a real
-backend reachable at `WEIR_TEST_MYSQL_URL` / `WEIR_TEST_POSTGRES_URL` /
-`WEIR_TEST_CLICKHOUSE_URL`. The runner script below brings up all three
-backends in containers and runs all three tests in one shot.
+### The S3 sink, against MinIO
+
+`weir-sink-s3` is exercised by a **five-test group** against a real
+S3 API, not a mock — deliberately, because the sink hand-rolls SigV4 and
+a mock that accepts any signature would leave the job green while testing
+nothing:
+
+- `s3_sink_end_to_end`
+- `s3_sink_replay_is_an_idempotent_overwrite` — pins replay stability.
+- `s3_sink_distinct_batches_of_identical_records_produce_distinct_objects`
+  — pins collision freedom. **Run these two as a group**: either alone
+  passes a broken key scheme (the first is equally true when the sink
+  overwrites its own data, the second when it duplicates on every replay).
+- `s3_sink_keeps_delivering_when_head_bucket_is_denied` — a
+  least-privilege IAM policy reads as Degraded, and a Degraded sink must
+  still drain.
+- `s3_sink_an_unreachable_endpoint_strands_rather_than_dead_letters`
+
+Gated behind the `s3-sink` cargo feature, and pointed at the rig by
+`WEIR_TEST_S3_ENDPOINT` plus `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+— the sink reads credentials from the environment as a production
+deployment would, so they never touch the generated config file.
+
+> **The MinIO image is not the upstream one.** MinIO withdrew its public
+> images: every tag on `quay.io/minio/{minio,mc}` now answers `401
+> UNAUTHORIZED` to an anonymous pull and `docker.io/minio/minio` answers
+> `object not found`. The rig uses `bitnamilegacy/minio`, which is the same
+> MinIO server, so SigV4 is still genuinely verified. See the comment in
+> `deploy/docker/test/docker-compose.yml` for the bar a future replacement
+> has to clear.
+
+### Why they are all gated
+
+Every test above is `#[ignore]`-marked because it needs a real backend:
+`WEIR_TEST_MYSQL_URL` / `WEIR_TEST_POSTGRES_URL` /
+`WEIR_TEST_CLICKHOUSE_URL` / `WEIR_TEST_S3_ENDPOINT`. The runner script
+below brings up **all four** backends in containers — MySQL, Postgres,
+ClickHouse and MinIO — and runs every one of these tests in one shot,
+nine in total plus `sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record`.
 
 ## Quick start
 

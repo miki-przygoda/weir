@@ -137,16 +137,16 @@ std::thread::<span class="f">spawn</span>(<span class="k">move</span> || {
     <h3>Custom sink</h3>
     <div class="chips"><span class="chip">weir-sink-sdk</span><span class="chip">weir-core</span></div>
     <p class="card-sub">Forward records to your own destination. Implement <code class="inline">Sink</code> against a frozen contract — and unit-test it with <b>no daemon and no runtime</b>. Each record ends up <em>committed</em> or <em>dead-lettered</em> (permanent rejection); a transient failure returns <code class="inline">Err</code> and the whole segment is retried.</p>
-<pre class="code"><span class="k">use</span> weir_sink_sdk::{<span class="t">Sink</span>, <span class="t">CommitResult</span>, <span class="t">Payload</span>, <span class="t">BasicSinkError</span>, <span class="t">SinkHealth</span>};
+<pre class="code"><span class="k">use</span> weir_sink_sdk::{<span class="t">Sink</span>, <span class="t">CommitResult</span>, <span class="t">SinkBatch</span>, <span class="t">BasicSinkError</span>, <span class="t">SinkHealth</span>};
 
 <span class="k">impl</span> <span class="t">Sink</span> <span class="k">for</span> <span class="t">MySink</span> {
-    <span class="k">type</span> <span class="t">Record</span> = <span class="t">Payload</span>;
-    <span class="k">type</span> <span class="t">Error</span>  = <span class="t">BasicSinkError</span>;
-    <span class="k">async fn</span> <span class="f">commit</span>(&amp;<span class="k">self</span>, batch: <span class="t">Vec</span>&lt;<span class="t">Payload</span>&gt;)
-        -&gt; <span class="t">Result</span>&lt;<span class="t">CommitResult</span>&lt;<span class="t">Payload</span>&gt;, <span class="t">BasicSinkError</span>&gt; {
+    <span class="k">type</span> <span class="t">Error</span> = <span class="t">BasicSinkError</span>;
+    <span class="k">async fn</span> <span class="f">commit</span>(&amp;<span class="k">self</span>, batch: <span class="t">SinkBatch</span>)
+        -&gt; <span class="t">Result</span>&lt;<span class="t">CommitResult</span>, <span class="t">BasicSinkError</span>&gt; {
         <span class="k">let mut</span> committed = <span class="t">Vec</span>::<span class="f">new</span>();
         <span class="k">let mut</span> dead = <span class="t">Vec</span>::<span class="f">new</span>();
-        <span class="k">for</span> rec <span class="k">in</span> batch {
+        <span class="c">// batch.dedup_token() instead, if your downstream can dedup</span>
+        <span class="k">for</span> rec <span class="k">in</span> batch.<span class="f">into_records</span>() {
             <span class="k">match</span> <span class="f">deliver</span>(rec.<span class="f">as_ref</span>()) {
                 <span class="t">Ok</span>(()) =&gt; committed.<span class="f">push</span>(rec),
                 <span class="t">Err</span>(why) =&gt; dead.<span class="f">push</span>((rec, why)),   <span class="c">// permanent → dead-letter</span>

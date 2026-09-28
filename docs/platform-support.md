@@ -44,7 +44,7 @@ the daemon starts. It will then **refuse every connection**.
 credential lookup as untrusted and drops the connection
 (`crates/weir-server/src/socket/mod.rs:184-195`) — correctly, since it cannot
 prove who the peer is — and `peer_uid_check` defaults to `true`
-(`crates/weir-server/src/config/mod.rs:749`). Every connection is refused, and
+(`crates/weir-server/src/config/mod.rs`). Every connection is refused, and
 `weir_connection_rejected_peer_uid_total` climbs.
 
 Setting `peer_uid_check = false` gets past it and gives up the defence-in-depth

@@ -14,10 +14,10 @@ contains no logic of its own — each module *is* the corresponding crate.
 
 | You want to…                       | Use                                                                          |
 |------------------------------------|------------------------------------------------------------------------------|
-| Just the wire-protocol types       | `weir-rs = "2.0"` → `weir_rs::core` (always on)                              |
-| Send records from your app         | `weir-rs = { version = "2.0", features = ["client"] }` → `weir_rs::client`   |
-| Build a custom sink                | `weir-rs = { version = "2.0", features = ["sink-sdk"] }` → `weir_rs::sink_sdk` |
-| Read on-disk WAB segments          | `weir-rs = { version = "2.0", features = ["wab"] }` → `weir_rs::wab`         |
+| Just the wire-protocol types       | `weir-rs = "4.0"` → `weir_rs::core` (always on)                              |
+| Send records from your app         | `weir-rs = { version = "4.0", features = ["client"] }` → `weir_rs::client`   |
+| Build a custom sink                | `weir-rs = { version = "4.0", features = ["sink-sdk"] }` → `weir_rs::sink_sdk` |
+| Read on-disk WAB segments          | `weir-rs = { version = "4.0", features = ["wab"] }` → `weir_rs::wab`         |
 | Run the daemon                     | `cargo install weir-server`                                                  |
 | Operate / inspect a running daemon | `cargo install weir-ctl`                                                     |
 
@@ -28,10 +28,11 @@ adds the mutual-TLS client — which, since 2.0.3, builds on Windows as well as 
 
 ```rust,ignore
 use weir_rs::client::WeirClient;
+use weir_rs::core::Durability;
 
 // Connect to the daemon's Unix socket and push a durably-buffered record.
-let client = WeirClient::connect("/run/weir/weir.sock")?;
-client.push(b"hello")?;
+let mut client = WeirClient::connect("/run/weir/weir.sock")?;
+client.push(b"hello", Durability::Durable)?;
 ```
 
 ## The crates behind the facade

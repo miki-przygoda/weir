@@ -242,8 +242,8 @@ See `deploy/systemd/README.md` for install, enable, and shutdown-tuning steps.
 
 ## `cargo install`
 
-> **Status:** published. All seven crates are on crates.io (2.0.4 as of
-> 2026-09-02). This works today:
+> **Status:** published. All nine crates are on crates.io (4.0.0 as of
+> 2026-09-17). This works today:
 
 ```bash
 cargo install weir-server

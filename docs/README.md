@@ -24,7 +24,7 @@ source.
 Two short docs to get you from zero to a running daemon with records flowing.
 
 - [**install.md**](getting-started/install.md) — Build from source,
-  container, or `cargo install` (lands with the 1.0 crates.io release).
+  container, or `cargo install` (all nine crates are published).
   Verification + uninstall.
 - [**quickstart.md**](getting-started/quickstart.md) — 5-minute hello
   world: run the daemon, push a record from a tiny Rust client,
@@ -134,14 +134,14 @@ test infrastructure that runs separately:
   RENAME / REWRITE), with notes on what each guards against. The
   reference document when adding or removing a system test.
 - [**testing/sink-integration.md**](testing/sink-integration.md) —
-  How to run the MySQL + Postgres end-to-end tests against real
-  databases via the docker-compose harness at
+  How to run the MySQL, Postgres, ClickHouse and S3/MinIO end-to-end
+  tests against real backends via the docker-compose harness at
   `deploy/docker/test/` (one-command runner:
   `bash deploy/run-sink-integration-tests.sh`).
 - [**testing/fuzzing.md**](testing/fuzzing.md) — `cargo-fuzz` setup
-  and target catalogue. Currently two coverage-guided targets
-  for the trust-boundary parsers (`wab_confirmed`,
-  `envelope_parse`); needs nightly Rust.
+  and target catalogue. Currently three coverage-guided targets
+  for the trust-boundary parsers (`wab_confirmed`, `envelope_parse`,
+  `wab_segment_header`); needs nightly Rust.
 
 ---
 

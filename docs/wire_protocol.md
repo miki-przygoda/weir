@@ -110,10 +110,18 @@ Byte 1: (VersionMismatch only) daemon's WIRE_VERSION
 | 0x07 | EmptyPayload      | none                                 |
 | 0x08 | UnknownMessage    | none                                 |
 | 0x09 | ReservedFlagsSet  | none                                 |
+| 0x0B | BadBatchFraming   | none                                 |
 
-Reason bytes `0x0A`–`0xFF` are reserved for future use; a client that receives
-an unrecognised reason byte should surface it (e.g. log the raw byte) rather
-than assume a specific meaning.
+**`0x0A` is skipped deliberately and is permanently unassigned.** It is this
+protocol's worked example of an unknown reason: the frozen conformance vector
+`nack_reserved_reason` *is* `0x0A`, four polyglot clients branch on `>= 0x0A`,
+and a client test asserts it surfaces as `UnknownNack(0x0A)`. Assigning it would
+break a frozen vector, which the freeze forbids — so `BadBatchFraming` took
+`0x0B`.
+
+The assigned set is therefore `0x01`–`0x09` and `0x0B`. Every other byte,
+including `0x0A`, is unassigned: a client that receives one should surface it
+(e.g. log the raw byte) rather than assume a specific meaning.
 
 `UnknownMessage` (`0x08`) is sent when a frame's header passes magic / version /
 header-CRC validation but the daemon will not act on the message: either the
@@ -363,10 +371,18 @@ foundation that does not support it.
 ### Why a bare bitmap is enough
 
 Every sub-record is validated at **ingest**, before any record of the batch is
-enqueued. A validation failure — an empty record, one over `max_payload_bytes`,
-a framing disagreement — rejects the **whole frame** with a plain `Nack` carrying
-its reason, and closes the connection, under the existing "permanent protocol
-error ⇒ close" contract.
+enqueued. A validation failure rejects the **whole frame** with a plain `Nack`
+carrying its reason, and closes the connection, under the existing "permanent
+protocol error ⇒ close" contract. The mapping is:
+
+| Body-decode failure | Nack reason |
+|---|---|
+| a zero-length record | `EmptyPayload` (`0x07`) |
+| more than `max_batch_records` records, or one over `max_payload_bytes` | `PayloadTooLarge` (`0x04`) |
+| anything else — bad batch version, `record_count == 0`, a record length that disagrees with the body, trailing bytes | **`BadBatchFraming` (`0x0B`)** |
+
+`BadBatchFraming` is the reason a client sees for most malformed `PushBatch`
+frames, so a client that implements batching must recognise `0x0B`.
 
 So by the time an `AckBatch` is sent at all, every possible per-record failure is
 a *runtime* one — WAB cap, queue refusal, a write or fsync that did not succeed,

@@ -127,7 +127,7 @@ separately only if you need the lower-level wire types directly.
 
 ```toml
 [dependencies]
-weir-client = "2.0"
+weir-client = "4.0"
 # Add `features = ["tls"]` for the TCP + mutual-TLS transport, which also
 # builds on Windows.
 # weir-core is only needed for the lower-level wire types, not a basic producer.
