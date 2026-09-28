@@ -15,7 +15,19 @@ protocol** below.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [4.0.1] - 2026-09-28
+
 ### Added
+
+- **`RELEASING.md`** — the release process was undocumented and lived only in one
+  maintainer's notes: the publish order, the fact that all seven `Cargo.toml`
+  version occurrences bump together (3.0.0 bumped one and needed a follow-up),
+  that `demo/version.js` is generated, that **all three** lockfiles need
+  refreshing because the harness steps now run `--locked`, and that publishing
+  must precede tagging. Includes a snippet that derives the publish order from
+  the dependency graph, so it cannot go stale silently.
 
 - **Three benchmark documents from the overnight limit-finding runs**, each an
   operator-run capture on named hardware and listed in `environments.md`:
@@ -72,6 +84,27 @@ protocol** below.
   plumbing) and `chaos/schedules/powerloss-batch.toml` (durability).
 
 ### Fixed
+
+- **The living docs had drifted from 4.0.0, in one case normatively.**
+  `wire_protocol.md`'s Nack table stopped at `0x09` and declared `0x0A`–`0xFF`
+  reserved, but `BadBatchFraming = 0x0B` is assigned and is what a client gets
+  for most malformed `PushBatch` frames — so a third-party client built from the
+  spec would treat a real reason byte as unknown. The table, the
+  `BatchError`→`NackReason` mapping and the reason `0x0A` must stay unassigned
+  (the frozen vector `nack_reserved_reason` *is* `0x0A`) are all documented now;
+  `conformance.md` names the remaining gap, that `0x0B` has no vector in any
+  file. Six crate READMEs were stale on crates.io, where they are the public
+  face: `weir-core` claimed "Frozen at 1.0 under SemVer" on a 4.0.0 crate,
+  `weir-rs` pinned `"2.0"` and shipped an example that did not compile,
+  `weir-client` was missing `push_tracked`/`push_batch`, `weir-server` omitted
+  the `s3` sink, `weir-wab` applied the 1.0 freeze to format v2, and `weir-ctl`
+  never gained `attest`. `SECURITY.md` still supported "the latest `1.x`";
+  `architecture.md` had no mention of the TCP+mTLS transport and described the
+  pre-partitioning work queue; `examples.html` taught the removed pre-2.0 `Sink`
+  trait; `c.html` claimed 112 conformance checks against a measured 114;
+  `test-audit.md` counted 44 tests against 70. Drifted line-number citations
+  were replaced with symbol references — `socket-bind.md`'s had moved ~250 lines,
+  which made a true claim read as false.
 
 - **`Buffered`'s exposure ceiling was published in seconds, and the seconds are
   not the invariant.** Phase 2 measured a ceiling of 126,782 records and rendered
@@ -270,8 +303,6 @@ protocol** below.
 - **`docs_drift` now pins that `bare-metal.md` actually holds a capture**, not
   merely that the file exists. `environments.md` lists it as citable, and that is
   only defensible while it has numbers in it.
-
-### Fixed
 
 - **A bare-metal capture recorded no storage device.** `block_device_line()` took
   the first six rows of `lsblk`, which on any host with snaps installed are all
@@ -3582,6 +3613,7 @@ The five commits making up this pass:
 
 ---
 
+[4.0.1]: https://github.com/miki-przygoda/weir/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/miki-przygoda/weir/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/miki-przygoda/weir/compare/v2.1.0...v3.0.0
 [2.1.0]: https://github.com/miki-przygoda/weir/compare/v2.0.5...v2.1.0

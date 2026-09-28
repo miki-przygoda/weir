@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "weir-client"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "crc32fast",
  "weir-core",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "weir-core"
-version = "4.0.0"
+version = "4.0.1"
 dependencies = [
  "bytes",
  "crc32fast",
