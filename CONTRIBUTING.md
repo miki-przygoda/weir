@@ -195,6 +195,12 @@ cargo +nightly fuzz run envelope_parse
 (cd chaos/orchestrator && python3 -m unittest discover -p 'test_*.py')
 ```
 
+## Releasing
+
+Cutting a release is its own checklist — publish order, the seven version
+occurrences that bump together, the three lockfiles, and publish-before-tag. See
+[`RELEASING.md`](RELEASING.md).
+
 ## Stability and what's frozen
 
 weir follows [Semantic Versioning](https://semver.org/). The **v1 wire
