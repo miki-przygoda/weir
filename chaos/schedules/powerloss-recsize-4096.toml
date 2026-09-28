@@ -1,0 +1,61 @@
+# Record-size sweep leg 3/3 — is `Buffered`'s exposure ceiling RECORDS or BYTES?
+#
+# powerloss-batch-buffered.toml settled that the ceiling is NOT a duration:
+# throughput rose 1.45x, the record ceiling did not move (123,664 vs 126,782) and
+# the window fell from 1.76 s to 1.18 s. What it could NOT settle is records vs
+# bytes, because it and its baseline both used 256-byte records, so the two are
+# proportional and indistinguishable.
+#
+# This sweep varies ONLY `record_size`. 123,664 x 256 B is ~31.7 MB, so:
+#
+#   record_size   bytes-bound predicts   records-bound predicts
+#           64          ~495,000 rec              ~124,000 rec
+#          256           123,664 rec  (MEASURED)  123,664 rec
+#         1024           ~31,000 rec              ~124,000 rec
+#         4096            ~7,700 rec              ~124,000 rec
+#
+# The two hypotheses differ by 4x at 64 B and 16x at 4096 B, so this does not
+# need a precise ceiling to separate them. **Read the 64 B leg first**: at 4096 B
+# the records hypothesis needs 124,000 x 4096 B = ~508 MB of dirty data inside a
+# ~1.2 s window, i.e. ~423 MB/s, which a SATA SSD can barely reach — so a low
+# ceiling there is weak evidence (it may just be bandwidth). At 64 B both
+# predictions are comfortably reachable and the gap is real.
+#
+# `encode_record` uses `saturating_sub`, so a `record_size` below the JSON
+# envelope (~50 B for a 16-digit run_id) silently yields ~50 B instead of what
+# the schedule asked for. 64 is above that floor; do not go lower without
+# checking `chaos/src/lib.rs`.
+#
+# Everything except `record_size` and the seed matches
+# powerloss-batch-buffered.toml, including the 16 GiB device (see its header for
+# why 2 GiB is not enough for a batched run).
+
+seed = 0xA6D03
+episodes = 320
+max_duration_secs = 5400
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 4096
+tier = "U"
+wire_batch_size = 256
+min_acked_per_episode = 100
+# Buffered under power loss is MEANT to lose records; Phase 1's floor of 100
+# would flag every correctly-behaving episode as "no progress".
+min_delivered_per_episode = 1
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 16384
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"
