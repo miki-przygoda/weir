@@ -170,6 +170,17 @@ cargo test -p weir-server --test load --release -- --nocapture
 # not only a number).
 cargo test -p weir-server --test load_drain --release -- --nocapture
 
+# A6 wire-batching throughput: PushBatch against single Push, same operating
+# point, so the amortisation is attributable. Nine scenarios; prints BENCH: lines.
+cargo test -p weir-server --test load_batch --release -- --nocapture
+
+# Limit-finding experiments rather than gates: sustained throughput over hours,
+# the compression cost/benefit curve, payload-size sweeps, recovery-vs-backlog.
+# All `#[ignore]`, operator-run, and they honour WEIR_RESEARCH_SECS /
+# WEIR_RESEARCH_SAMPLE_SECS / WEIR_BENCH_WAB_DIR.
+cargo test -p weir-server --test research --release -- --ignored --nocapture \
+  --test-threads=1 <test_name>
+
 # SQL sink end-to-end tests against real MySQL + Postgres (brings up and tears
 # down a docker-compose stack; needs ports 33306 / 55432 free).
 bash deploy/run-sink-integration-tests.sh
@@ -215,8 +226,11 @@ vectors in `docs/conformance/wire_v1_vectors.json` must still pass unchanged.
 **Additive** growth within v1 — a new Nack reason byte, a new message type — goes
 in its own vectors file rather than into that one: a decoder that does not
 implement the addition is *correct* to reject it, so putting the vector in the
-frozen file would fail five conformant clients at once. `PushTracked` /
-`AckTracked` are the worked example (`wire_v1_tracked_vectors.json`).
+frozen file would fail five conformant clients at once. There are two worked
+examples: `PushTracked` / `AckTracked` in `wire_v1_tracked_vectors.json`, and
+`PushBatch` / `AckBatch` in `wire_v1_batch_vectors.json` (4.0.0). A new Nack
+reason byte follows the same rule — `BadBatchFraming` (`0x0B`) is assigned and
+currently has no vector anywhere, which is a gap rather than a precedent.
 
 **Done in 2.0:** `Sink::Record` / the `SinkRecord` trait was an
 over-generalisation — the only implementation was the identity on `Payload`, and

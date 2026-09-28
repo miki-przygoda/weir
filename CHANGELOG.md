@@ -15,7 +15,34 @@ protocol** below.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **The benchmark vintage went stale the moment 4.0.1 landed, and the guard
+  caught it.** The `load` job regenerates `docs/benchmarks/latest.md` on every
+  push to `main` and commits it with `[skip ci]`, so the first PR after a release
+  always trips `docs_drift`'s vintage checks. `docs/benchmarks.md` now carries the
+  v4.0.1 figures rather than v4.0.0's — **and the prose that reasons from them**,
+  which is the part the guard exists to force: the single-thread-vs-48-thread gap
+  is still ~12x (3,670 → 43,000 rec/s), and 1 ÷ 3,670 = 273 µs still lands between
+  that run's `Durable` p50 of 259 µs and its mean of 283 µs. One claim had to be
+  rewritten rather than renumbered: the index said CI distorts the tail by 62x
+  (p99 22.4 ms over a p50 of 359 µs), but this run's p99/p50 is **2.2x** —
+  *tighter* than the bare-metal capture's 3.4x. The distortion moved outward, to a
+  7.6 ms p99.9, so the paragraph now says which percentile the noise lands on
+  varies between runs and is not a property of weir.
+
+- **The root markdown files had been missed by the 4.0.1 documentation sweep.**
+  That sweep partitioned `docs/`, the crate READMEs, the demo pages and the
+  security docs across six auditors, and the repo-root files fell between the
+  slices — so the single most-read file in the project went unchecked.
+  `README.md`'s status line still read "3.0 (stable), heading to 4.0.0", two
+  releases behind; its crate table listed eight of the ten crates, omitting
+  `weir-attest` and `weir-rs` (both published); and its `weir-ctl` row named
+  neither `quarantine` nor `attest`. `CONTRIBUTING.md` gave `PushTracked` as
+  *the* worked example of additive wire-v1 growth without mentioning
+  `PushBatch`/`AckBatch` and its vectors file, and its heavier-suite list
+  predated `load_batch.rs` and `research.rs`. Two version headings
+  (`[2.0.1]`, `[0.4.0]`) had no compare link at the foot of this file.
 
 ## [4.0.1] - 2026-09-28
 
@@ -3620,6 +3647,7 @@ The five commits making up this pass:
 [2.0.5]: https://github.com/miki-przygoda/weir/compare/v2.0.4...v2.0.5
 [2.0.4]: https://github.com/miki-przygoda/weir/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/miki-przygoda/weir/compare/v2.0.0...v2.0.3
+[2.0.1]: https://github.com/miki-przygoda/weir/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/miki-przygoda/weir/compare/v1.3.1...v2.0.0
 [1.3.1]: https://github.com/miki-przygoda/weir/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/miki-przygoda/weir/compare/v1.2.0...v1.3.0
@@ -3628,5 +3656,6 @@ The five commits making up this pass:
 [1.0.0]: https://github.com/miki-przygoda/weir/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/miki-przygoda/weir/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/miki-przygoda/weir/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/miki-przygoda/weir/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/miki-przygoda/weir/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/miki-przygoda/weir/compare/v0.1.0...v0.2.0

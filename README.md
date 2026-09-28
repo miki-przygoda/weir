@@ -29,7 +29,7 @@ for — see [platform support](docs/platform-support.md#durability-by-platform))
 wire format + Rust API under SemVer
 
 *Latency and throughput figures are deliberately not quoted here. Every published
-run — 4.0.0 as of 2026-09-17
+run — 4.0.1 as of 2026-09-28
 ([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
 [`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner, and
 this project's own rule is that external performance claims cite an operator-run
@@ -56,7 +56,7 @@ daemon mid-flight, and watch unconfirmed segments replay, side by side with a
 naive insert-per-record baseline. No build step — open `demo/index.html` in any
 browser. *(Hosted version coming with the public launch.)*
 
-> **Status — 3.0 (stable), heading to 4.0.0.** The wire protocol and public Rust API (`weir-core`,
+> **Status — 4.0 (stable), published at 4.0.1.** The wire protocol and public Rust API (`weir-core`,
 > `weir-client`, `weir-sink-sdk`, `weir-wab`) are under
 > [Semantic Versioning](https://semver.org/), with a
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
@@ -210,7 +210,9 @@ not benchmarks.*
 | `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and the `windows` CI job compiles `weir-client --features tls` there on every push. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`. There is no Windows *server* build: it had no ingest path, and 2.0.5 dropped it. |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
 | `weir-sink-s3` | lib | The S3-API object-storage sink (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph), behind `weir-server`'s opt-in `s3-sink` feature. The first weir sink built **outside** the daemon against `weir-sink-sdk` alone — so it is also the proof that the SDK is a contract a third party can build against. See [docs/sinks/s3.md](docs/sinks/s3.md). |
-| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), and `dl` (dead-letter list/drop/requeue). **Unix only** — it drives `WeirClient::connect`, the Unix-socket constructor. Not a release artifact; build from source or use the Docker image. |
+| `weir-attest`   | lib        | Per-record content-committing hash chain over sealed segments — `RecordId` plus a chain digest, driven by `weir-ctl attest`. **Detection, never prevention**: it makes tampering evident after the fact, it does not stop it, and it is not on the ack path. |
+| `weir-ctl`      | bin        | Admin CLI for a running daemon: `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), `dl` (dead-letter list/drop/requeue), `quarantine` (list/inspect/requeue) and `attest` (seal/verify/head over a sealed segment's hash chain). **Unix only** — it drives `WeirClient::connect`, the Unix-socket constructor. Not a release artifact; build from source or use the Docker image. |
+| `weir-rs`       | lib        | Single-crate facade: re-exports `weir-core` always, plus `client` / `sink-sdk` / `wab` behind features (`full` enables all three). Use it to depend on one crate instead of four. **Named `weir-rs`, not `weir`** — that name belongs to someone else on crates.io. |
 | `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
 
 These are deliberately separate so you can compose the pieces you need without

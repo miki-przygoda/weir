@@ -37,7 +37,7 @@ they are two selectable tiers today.
 
 > See [latest.md](benchmarks/latest.md) for the full tables and
 > [history.md](benchmarks/history.md) for the trend over time. The figures
-> below are rounded from one averaged CI run (v4.0.0, 2026-09-17, 5 passes per
+> below are rounded from one averaged CI run (v4.0.1, 2026-09-28, 5 passes per
 > deadline, `shard_count=4`, `batch_size=64`). **This index is hand-maintained
 > and is not regenerated** — `deploy/avg_benchmarks.py` writes `latest.md` and
 > appends to `history.md`, and says so at its own line 9. When the two disagree,
@@ -52,31 +52,35 @@ they are two selectable tiers today.
 
 | Scenario | Concurrency | RPS | ±σ across the 5 passes |
 |----------|---|-----|-----|
-| Single thread, Buffered | 1 | ~15,100 | ±4,089 |
-| Single thread, Durable | 1 | ~1,500 | ±489 |
-| Thundering herd, Buffered | 64 | ~24,800 | ±19,636 |
-| Saturation ceiling, Buffered | 48 | ~116,300 | not sampled |
-| Saturation ceiling, Durable | 48 | ~17,400 | not sampled |
+| Single thread, Buffered | 1 | ~14,950 | ±350 |
+| Single thread, Durable | 1 | ~3,670 | ±226 |
+| Thundering herd, Buffered | 64 | ~46,300 | ±12,868 |
+| Saturation ceiling, Buffered | 48 | ~97,000 | not sampled |
+| Saturation ceiling, Durable | 48 | ~43,000 | not sampled |
 
 > **The single-thread rows are latency reciprocals, not ceilings.** Read down
 > the `Durable` rows: the same tier, on the same runner, in the same run set,
-> does ~1,500 rec/s on one connection and ~17,400 across 48 — **12×**. Nothing
+> does ~3,670 rec/s on one connection and ~43,000 across 48 — **12×**. Nothing
 > about the daemon changed between those two rows.
 >
 > `Durable` is a group commit at the batch boundary
 > (`crates/weir-core/src/durability.rs`), and the daemon acks frame N before
 > reading frame N+1 on a connection
 > (`crates/weir-server/src/socket/connection.rs`). One synchronous producer
-> therefore pays one fsync per record and is bound by fsync *latency*: 1 ÷ 1,500
-> = 667 µs, which sits between that run's `Durable` p50 of 359 µs and its mean
-> of 1.0 ms. Concurrency is what fills a batch, and a filled batch is what
+> therefore pays one fsync per record and is bound by fsync *latency*: 1 ÷ 3,670
+> = 273 µs, which sits between that run's `Durable` p50 of 259 µs and its mean
+> of 283 µs. Concurrency is what fills a batch, and a filled batch is what
 > amortises the fsync.
 >
-> That the mean sits so far above the median is this runner, not the daemon:
-> the same run reports a `Durable` p99 of 22.4 ms against a p50 of 359 µs — a
-> 62× ratio. The bare-metal capture taken the same week reports 1.1 ms and
-> 3.7 ms for the same two statistics, a ratio of 3.4×. Both measure weir; only
-> one of them is measuring weir *alone*.
+> **How much the runner distorts the tail varies between runs, and this run is
+> a mild one.** Its `Durable` p99 of 567 µs against a p50 of 259 µs is a ratio of
+> 2.2× — *tighter* than the bare-metal capture's 1.1 ms / 3.7 ms, which is 3.4×.
+> The distortion has not gone away, it has moved outward: p99.9 is 7.6 ms and the
+> max 9.5 ms, so the same runner is still injecting multi-millisecond stalls, just
+> past the 99th percentile this time. Earlier run sets put that stall at the p99
+> instead (one reported 22.4 ms against a 359 µs p50, a 62× ratio). Which
+> percentile the noise lands on is not a property of weir, and it is the reason
+> this index refuses to let a single CI percentile stand as a claim.
 >
 > So a single-thread figure answers "how fast can one caller push-and-wait on
 > this hardware", and only a concurrent figure answers "how much can the daemon
