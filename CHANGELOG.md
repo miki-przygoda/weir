@@ -17,6 +17,20 @@ protocol** below.
 
 ### Fixed
 
+- **The benchmark vintage went stale the moment 4.0.1 landed, and the guard
+  caught it.** The `load` job regenerates `docs/benchmarks/latest.md` on every
+  push to `main` and commits it with `[skip ci]`, so the first PR after a release
+  always trips `docs_drift`'s vintage checks. `docs/benchmarks.md` now carries the
+  v4.0.1 figures rather than v4.0.0's — **and the prose that reasons from them**,
+  which is the part the guard exists to force: the single-thread-vs-48-thread gap
+  is still ~12x (3,670 → 43,000 rec/s), and 1 ÷ 3,670 = 273 µs still lands between
+  that run's `Durable` p50 of 259 µs and its mean of 283 µs. One claim had to be
+  rewritten rather than renumbered: the index said CI distorts the tail by 62x
+  (p99 22.4 ms over a p50 of 359 µs), but this run's p99/p50 is **2.2x** —
+  *tighter* than the bare-metal capture's 3.4x. The distortion moved outward, to a
+  7.6 ms p99.9, so the paragraph now says which percentile the noise lands on
+  varies between runs and is not a property of weir.
+
 - **The root markdown files had been missed by the 4.0.1 documentation sweep.**
   That sweep partitioned `docs/`, the crate READMEs, the demo pages and the
   security docs across six auditors, and the repo-root files fell between the
