@@ -71,6 +71,21 @@ daemon completes its own drain before systemd kills it. If you raise
 `shutdown_timeout_secs` (e.g. for long-running batched producers), raise
 `TimeoutStopSec` to match (`shutdown_timeout_secs + ~5s`).
 
+## TCP + mutual TLS on this deployment path
+
+The unit's `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` already allows
+network sockets, so the TCP listener works under systemd — but it is **off unless
+configured**. To turn it on you need a `tls`-feature build plus `tcp_bind`,
+`tls_cert_path`, `tls_key_path` and `tls_client_ca_path`; client certificates are
+verified against that CA and there is no anonymous TCP path.
+
+Two operational notes specific to bare metal: **firewall the port you publish**
+(there is no container network namespace to hide behind here), and **SIGHUP
+reloads TLS material only** — see "Operate" above — so a certificate rotation
+does not need a restart while a config change still does.
+
+Full setup, including generating a test CA: [`docs/operations/tcp-mtls.md`](../../docs/operations/tcp-mtls.md).
+
 ## Secrets
 
 Credentials never go in `weir.toml` (it has no on-disk redaction):

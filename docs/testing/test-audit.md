@@ -1,6 +1,6 @@
 # System test suite overview
 
-File: `crates/weir-server/tests/system.rs` (~2257 lines, 44 `#[test]`
+File: `crates/weir-server/tests/system.rs` (~4081 lines, 70 `#[test]`
 functions as of this writing).
 
 > **What this is.** A current snapshot of the system-integration suite —
@@ -23,7 +23,7 @@ cargo test -p weir-server --test system -- --test-threads=4
 
 ## Gating: which tests run by default
 
-Of the 44 tests, **40 run on a plain `cargo test`**. The remaining four
+Of the 70 tests, **60 run on a plain `cargo test`**. The remaining ten
 are gated:
 
 | Test | Gate | Why |
@@ -32,8 +32,14 @@ are gated:
 | `mysql_sink_end_to_end` | `#[ignore]` | Needs a live MySQL at `WEIR_TEST_MYSQL_URL`. |
 | `postgres_sink_end_to_end` | `#[ignore]` | Needs a live Postgres at `WEIR_TEST_POSTGRES_URL`. |
 | `clickhouse_sink_end_to_end` | `#[ignore]` + `#[cfg(feature = "clickhouse-sink")]` | Needs a live ClickHouse at `WEIR_TEST_CLICKHOUSE_URL` *and* the `clickhouse-sink` feature; otherwise the function isn't even compiled. |
+| `sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record` | `#[ignore]` | Needs the docker-compose stack; pins what a content-keyed schema costs. |
+| `s3_sink_end_to_end` | `#[ignore]` + `#[cfg(feature = "s3-sink")]` | Needs the docker-compose MinIO rig. |
+| `s3_sink_replay_is_an_idempotent_overwrite` | same | Pins replay stability of the object key. |
+| `s3_sink_distinct_batches_of_identical_records_produce_distinct_objects` | same | Pins collision freedom. Either of this pair alone passes a broken key scheme, so they are run as a group. |
+| `s3_sink_keeps_delivering_when_head_bucket_is_denied` | same | Least-privilege IAM reads as Degraded, and a Degraded sink must still drain. |
+| `s3_sink_an_unreachable_endpoint_strands_rather_than_dead_letters` | same | Pins strand-not-dead-letter on an unreachable endpoint. |
 
-The three sink end-to-end tests are also documented operationally in
+The sink end-to-end tests are also documented operationally in
 [`sink-integration.md`](sink-integration.md), with the container-startup
 recipes.
 

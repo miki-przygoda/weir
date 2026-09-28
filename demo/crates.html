@@ -89,7 +89,7 @@
 
     <div class="card">
       <h3>weir-sink-sdk</h3>
-      <div class="chips"><span class="chip">lib</span><span class="chip">deps: weir-core only</span><span class="chip dim">no daemon</span></div>
+      <div class="chips"><span class="chip">lib</span><span class="chip">deps: weir-core + sha2</span><span class="chip dim">no daemon</span></div>
       <p class="card-sub">The <code class="inline">Sink</code> trait plus its <code class="inline">SinkError</code> / <code class="inline">CommitResult</code> / <code class="inline">SinkHealth</code> contract — the stable, frozen interface for forwarding records downstream.</p>
       <p class="card-sub" style="margin:0"><b>Reach for it when</b> you forward to a custom destination. You can <b>author and fully unit-test</b> a sink with no daemon and no async runtime (a no-op-waker <code class="inline">block_on</code> drives <code class="inline">commit</code>). Running it in the shipped daemon is a small fork today — a first-class entry point is a future minor.</p>
       <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/getting-started/integrating.html">→ docs</a></p>
@@ -97,7 +97,7 @@
 
     <div class="card">
       <h3>weir-wab</h3>
-      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip">deps: weir-core + crc32fast</span></div>
+      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip">deps: weir-core + crc32fast + zstd</span></div>
       <p class="card-sub">Standalone, runtime-free reader of the on-disk WAB segment format. Point <code class="inline">SegmentReader</code> at any segment file and it streams each record, verifying its CRC32. The format is versioned: <code class="inline">FORMAT_VERSION_V1</code> and <code class="inline">FORMAT_VERSION_V2</code> (the zstd-compressed segment) are both readable, with <code class="inline">FORMAT_VERSION_MAX_SUPPORTED</code> naming the ceiling.</p>
       <p class="card-sub" style="margin:0"><b>Reach for it when</b> you build an offline recovery / export / inspection tool. This is the same parser the daemon and <code class="inline">weir-ctl</code> use — one implementation, no drift.</p>
       <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/wab_format.html">→ docs</a></p>

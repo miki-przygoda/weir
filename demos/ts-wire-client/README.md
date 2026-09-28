@@ -7,8 +7,8 @@
 A dependency-free TypeScript/Node producer for the [weir](../../) durable
 write-ahead-buffer daemon — no weir crate, no npm runtime deps, Node stdlib only
 (`node:net`, `node:zlib`). The codec was written purely from
-[`docs/wire_protocol.md`](../../../docs/wire_protocol.md) and the
-[`docs/conformance/wire_v1_vectors.json`](../../../docs/conformance/wire_v1_vectors.json)
+[`docs/wire_protocol.md`](../../docs/wire_protocol.md) and the
+[`docs/conformance/wire_v1_vectors.json`](../../docs/conformance/wire_v1_vectors.json)
 vectors. It speaks weir's `AF_UNIX` wire protocol directly, and runs `.ts` files
 directly on stock Node — no build step.
 

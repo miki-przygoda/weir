@@ -32,8 +32,9 @@ timelines depending on severity and complexity.
 ## Supported versions
 
 weir follows [Semantic Versioning](https://semver.org/). Security fixes
-land on `main` and ship in the latest `1.x` release; there are no LTS
-branches, so running the most recent `1.x` is the supported configuration.
+land on `main` and ship in the latest release of the **current major** —
+`4.x` today. There are no LTS branches and no backports to earlier majors,
+so running the most recent `4.x` is the supported configuration.
 
 ## What counts as a vulnerability
 
@@ -48,6 +49,15 @@ branches, so running the most recent `1.x` is the supported configuration.
 - On the TCP + mutual-TLS path: any way to complete a handshake without a
   certificate the configured CA issued, or to bypass client-certificate
   verification.
+- In the S3 sink: any way to make the hand-rolled SigV4 signer
+  (`crates/weir-sink-s3/src/sigv4.rs`) produce a signature over different
+  bytes than it transmits, or to leak credentials into a log, a metric
+  label, or an object key.
+- In `weir-attest`: any way to alter a sealed segment's records and still
+  produce a chain that `weir-ctl attest verify` accepts. Note the model is
+  **detection, never prevention** — see the tamper-evidence section of the
+  threat model — so "an attacker with write access changed a segment" is
+  only a vulnerability if the change goes *undetected*.
 
 ## What is explicitly NOT a vulnerability
 

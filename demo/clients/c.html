@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>weir — C wire client</title>
-<meta name="description" content="A dependency-free C weir v1 wire-protocol producer for embedded telemetry — built from the spec, zero weir-crate deps, 30/30 conformance vectors plus 112 checks." />
+<meta name="description" content="A dependency-free C weir v1 wire-protocol producer for embedded telemetry — built from the spec, zero weir-crate deps, 30/30 conformance vectors plus 114 checks." />
 <link rel="stylesheet" href="../weir.css" />
 </head>
 <body>
@@ -34,7 +34,7 @@
     <div class="chips" style="gap:8px">
       <span class="chip wire">30/30 conformance vectors</span>
       <span class="chip wire">byte-exact</span>
-      <span class="chip wire">+ 112 checks</span>
+      <span class="chip wire">+ 114 checks</span>
       <span class="chip dim">C stdlib + POSIX</span>
       <span class="chip dim">zero Rust deps</span>
     </div>
@@ -53,9 +53,9 @@
   <div class="panel">
     <div class="panel-title">Conformance <span class="pt-right">no daemon needed</span></div>
     <div class="panel-body">
-<pre class="code">make            <span class="c"># builds: conformance, telemetry, negative</span>
+<pre class="code">make            <span class="c"># builds: conformance, conformance_tracked, conformance_batch, telemetry, negative</span>
 ./conformance /path/to/weir/docs/conformance/wire_v1_vectors.json</pre>
-      <p style="color:var(--n-fg-dim)">Expected: <code class="inline">vectors scanned: 30&nbsp;&nbsp;&nbsp;checks passed: 112&nbsp;&nbsp;&nbsp;failed: 0</code> → <em>C codec is wire-compatible with weir v1.</em> The strongest check is byte-exact re-encoding.</p>
+      <p style="color:var(--n-fg-dim)">Expected: <code class="inline">vectors scanned: 30&nbsp;&nbsp;&nbsp;checks passed: 114&nbsp;&nbsp;&nbsp;failed: 0</code> → <em>C codec is wire-compatible with weir v1.</em> The strongest check is byte-exact re-encoding.</p>
       <p style="margin-bottom:0; color:var(--n-fg-dim)">Requirements: C11 + POSIX sockets, no deps · requires a C11 compiler (<code class="inline">-std=c11</code>) · tested with clang 21.</p>
     </div>
   </div>

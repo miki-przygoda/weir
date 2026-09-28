@@ -96,8 +96,16 @@ for this mapping is `nack_for_decode_error` in `crates/weir-server/src/socket/co
 
 ## Coverage
 
-The suite covers every message type, **all nine** Nack reason bytes
-(`0x01`–`0x09`) as decodable Nack frames, and at least one rejection vector per
+> **Known gap: `BadBatchFraming` (`0x0B`) has no vector.** It is an assigned,
+> wire-emitted reason — the one a client gets for most malformed `PushBatch`
+> frames — and it appears in none of the vector files. The frozen
+> `wire_v1_vectors.json` cannot gain it (the freeze forbids changing that file),
+> so it belongs in `wire_v1_batch_vectors.json`. Until then, the counts below
+> describe the vectors that exist, not the full assigned reason set.
+
+
+The suite covers every message type, the **nine** Nack reason bytes
+`0x01`–`0x09` as decodable Nack frames, and at least one rejection vector per
 `DecodeError` variant, including the boundary cases (empty payloads, the
 payload-cap boundary, a truncated header vs. a truncated payload, trailing
 bytes after a complete frame, and a doubly-malformed header that pins the

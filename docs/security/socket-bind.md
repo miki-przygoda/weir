@@ -215,9 +215,11 @@ lands at `0o600 & !0o177 = 0o400`.
 before any producer can connect, so no records exist and no segment is being
 created. The WAB flushers and workers are running by then, but idle. (The
 earlier justification — that startup is single-threaded — was wrong: `main.rs`
-spawns the flushers at line 292 and the workers at line 306, well before the
-bind at line 507. The correct reason is that the process is *idle*, not that it
-is single-threaded.)
+calls `wab::spawn` and then `worker::spawn_workers`, both well before
+`socket::run` binds. The correct reason is that the process is *idle*, not that
+it is single-threaded. Symbol names rather than line numbers, deliberately: the
+numbers this paragraph originally carried had drifted by ~250 lines before anyone
+noticed, which made a true claim look false.)
 
 **Under `cargo test` it is reachable and constant**, because ~300 unrelated
 tests create directories concurrently with ~50 tests that call `bind_hardened`.

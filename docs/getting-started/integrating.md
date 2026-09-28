@@ -18,10 +18,15 @@ convention — see [Architecture → Workspace & crate boundaries](../architectu
 | Operate a running daemon from the shell | `weir-ctl` | no |
 | Build a producer/client in another language | the [wire protocol](../wire_protocol.md) (no Rust dep at all) | no |
 
-All weir crates are sibling directories under `crates/` — `weir-client`,
+The crates this guide covers are sibling directories under `crates/` — `weir-client`,
 `weir-sink-sdk`, `weir-wab`, `weir-core`, `weir-server`, `weir-ctl` — so a
 `path` dependency points at `crates/<name>` (e.g.
 `weir-client = { path = "../weir/crates/weir-client" }`).
+
+`crates/` also holds `weir-attest` (tamper-evidence over sealed segments),
+`weir-sink-s3` (the S3-API sink), `weir-rs` (a single-crate facade that
+re-exports core/client/sink-sdk/wab behind features) and `weir-testkit`
+(`publish = false`, test harness only).
 
 ## Produce from your own program
 
