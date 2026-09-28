@@ -114,13 +114,44 @@ distribution on `[0, max]`:
 | mean | 62,335 | `max/2` = 63,391 | 1.7% |
 | stdev | 36,178 | `max/√12` = 36,599 | 1.2% |
 
-**Buffered loss is uniformly distributed between zero and one writeback
-interval.** That is exactly what a kill landing at a uniformly random point in
-a periodic writeback cycle produces, and it means the ceiling — not the mean —
-is the number that characterises the tier.
+**Buffered loss is uniformly distributed between zero and the ceiling.** That is
+exactly what a kill landing at a uniformly random point in a periodic writeback
+cycle produces, and it means the ceiling — not the mean — is the number that
+characterises the tier.
 
-> **Buffered's worst observed exposure is 1.76 seconds of acknowledged writes;
-> the median is 0.89 seconds.**
+> **Buffered's worst observed exposure is ~124,000 acknowledged records. On this
+> run's hardware and producer that was 1.76 seconds; the seconds are not the
+> invariant.**
+
+### Correction, 2026-09-27: quote the ceiling in records, not seconds
+
+This section originally read "1.76 seconds of acknowledged writes" and called
+the bound "one writeback interval". The seconds column above is the records
+column divided by this run's ~72,000 rec/s, so it could not test its own
+premise. A batched Buffered run
+([`powerloss-batch-buffered.toml`](../../../chaos/schedules/powerloss-batch-buffered.toml),
+747 episodes, canary `bit` in 747/747, clean stop at `slack=0`) did test it by
+raising throughput 1.45x:
+
+| | this run | batched run | prediction if time-bound |
+|---|---|---|---|
+| Throughput | ~72,000 rec/s | ~104,602 rec/s | — |
+| Ceiling, records | 126,782 | **123,664** (−2.5%) | 184,200 |
+| Ceiling, seconds | 1.76 s | **1.18 s** (−33%) | 1.76 s |
+| Mean / stdev | 62,335 / 36,178 | 61,274 / 33,245 | — |
+
+Throughput rose 45% and the record ceiling did not move, so **the ceiling is a
+quantity of data and the duration is throughput-specific**. A sizing rule of the
+form "budget for 1.76 s of acked writes" is wrong for any producer faster than
+this one; budget records. The uniform shape holds in both runs (mean within 0.9%
+of `max/2` in the batched run).
+
+**Still open: records or bytes.** Both runs used 256-byte records, so the two are
+proportional and indistinguishable here. 123,664 × 256 B ≈ 31.7 MB, which has the
+shape of a dirty-page-cache limit, and the zstd comparison below points the same
+way — compression roughly tripled the record exposure, which is what a fixed byte
+budget predicts once each record costs a third as many bytes. A record-size sweep
+would settle it.
 
 Two episodes lost precisely zero while the canary still read `bit`: the fault
 fired and there simply happened to be nothing dirty. Those two are why a

@@ -84,11 +84,21 @@ does not build this project.
 > [`docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`](../docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md).
 >
 > **Buffered's exposure is now a number, not prose.** Loss is uniformly
-> distributed between zero and one writeback interval — mean and stdev both
-> land within 2% of a uniform distribution's `max/2` and `max/√12` — with a
-> ceiling of **126,782 records (~1.76 s of acknowledged writes)** and a median
-> of 63,790 (~0.89 s). The ceiling, not the mean, is what characterises the
-> tier.
+> distributed between zero and the ceiling — mean and stdev both land within 2%
+> of a uniform distribution's `max/2` and `max/√12` — with a ceiling of
+> **126,782 records** and a median of 63,790. The ceiling, not the mean, is what
+> characterises the tier.
+>
+> **Read the ceiling in RECORDS, not in seconds.** This run rendered it as
+> "~1.76 s of acknowledged writes" by dividing by its own ~72,000 rec/s, and
+> called it "one writeback interval". The batched Buffered run
+> ([`powerloss-batch-buffered.toml`](schedules/powerloss-batch-buffered.toml),
+> 747 episodes, 2026-09-27) tested that reading by raising throughput 1.45x: the
+> record ceiling did **not** move (123,664 against 126,782) and the duration fell
+> to **1.18 s**. So the ceiling is a quantity of data and the seconds are
+> throughput-specific. Whether the invariant is records or bytes is still open —
+> both runs used 256-byte records, and 123,664 x 256 B is ~31.7 MB, which a
+> record-size sweep would settle.
 >
 > **What that run alone did NOT establish** — both since closed, and left here
 > because the sequence is the point: a Buffered run measures Buffered, and
@@ -103,6 +113,48 @@ does not build this project.
 >
 > **Phase 2 totals: 6,129 power-loss episodes, 687,712,504 acked records, zero
 > durability violations, zero weir defects.** Both tiers, both on-disk formats.
+
+## The batched ack path (A6) — `wire_batch_size`
+
+Everything above was measured against a load generator whose only producer call
+was a single `push`. 4.0.0 added `PushBatch`, whose reply is a **bitmap**, and a
+set bit is a durability promise carrying the same crown invariant as a
+single-record `Ack`. The whole 687.7M-record corpus therefore says nothing about
+it: not one power cut had ever landed on a batched ack.
+
+`[load].wire_batch_size` closes that. It is the number of records per
+`push_batch` call; absent or `1` keeps the single-`push` call site byte for
+byte, so **every pre-existing schedule still measures exactly what it measured
+before** and stays comparable with the Phase 2 corpus.
+
+It is deliberately *not* spelled `batch_size`, because `[weir].batch_size`
+already means the daemon's group-commit size. The two interact and are worth
+setting against each other rather than conflating: at `wire_batch_size = 256`
+over `[weir].batch_size = 64`, one bitmap spans about four fsyncs, so a set bit
+has to survive a commit boundary instead of mapping onto a single commit.
+
+The oracle reasons **per record, not per call**: one batched call yields
+`wire_batch_size` independent verdicts and the ledger gets one row each. The bit
+mapping is the load-bearing part —
+
+| bitmap bit | ledger outcome | why |
+| --- | --- | --- |
+| set | `Acked` | durable; held to I1 exactly as a single-record `Ack` is |
+| clear | `Unknown` | "not durable as of this reply; retry, and it may nonetheless have been written" — identical to `Nack(InternalError)`. Recording it as `Nacked` would make I2 fire on a legitimate replay and manufacture a P0 out of correct behaviour. |
+
+Two schedules: [`schedules/smoke-batch.toml`](schedules/smoke-batch.toml)
+(`kill -9`, ten episodes — plumbing only: does `wire_batch_size` reach loadgen,
+does each record get its own row, do the invariants hold across a kill) and
+[`schedules/powerloss-batch.toml`](schedules/powerloss-batch.toml) (the
+durability run).
+
+**Check the daemon is really batching before trusting a batched run.** The
+schedule key is easy to typo into silence, and a run that quietly used the
+single-push path looks identical to a passing batched one. Scrape `/metrics`
+mid-run: `weir_batch_records_sum / weir_batch_records_count` should equal
+`wire_batch_size`, and `weir_batch_records_count` must be *rising*. A
+`--batch-size 1` control that leaves that counter untouched is what proves the
+default path never batches.
 
 The injector itself was validated on real hardware first:
 [`docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md`](../docs/benchmarks/chaos-phase2/2026-08-22-dm-flakey-control-experiment.md).
@@ -171,7 +223,14 @@ last row of the report:
    failure counts as an anomaly rather than a violation;
 5. the WAB directory gets a **post-mortem** — surviving sealed segments,
    non-empty active segments, `quarantine/` and `dead_letter/` contents, with
-   paths and sizes. Any survivor is an anomaly. This evidence used to be
+   paths and sizes. A survivor is an anomaly *unless* it is a quarantined
+   segment under power loss, which is the documented correct outcome and is
+   exempted in `run.py` — `drop_writes` tears the active segment, recovery parks
+   the torn tail rather than truncating it, and flagging that would put an
+   anomaly on essentially every power-loss episode. A 747-episode Buffered run
+   ended with 2,902 such survivors, ~3.9 per episode: one per shard per cut.
+   Non-empty active segments and dead-letter files are never exempt. This
+   evidence used to be
    deleted, unread, by `stack.teardown()`.
 
 **The gate is zero FALSE violations, not "it ran".** Any violation at this

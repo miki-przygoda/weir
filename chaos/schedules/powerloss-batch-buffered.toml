@@ -1,0 +1,111 @@
+# Phase 2 power loss against A6's batched ack path at the BUFFERED tier.
+#
+# The companion to powerloss-batch.toml, and the one that produces a number
+# rather than a verdict. Durable under batching is pass/fail — a set bit is a
+# durability promise, so zero loss is the only acceptable result. Buffered acks
+# after the in-memory write, before any fsync, so it is *supposed* to lose
+# records here, and how much it loses is measurable.
+#
+# THE QUESTION. Phase 2 measured Buffered's exposure at a ceiling of 126,782
+# records, which it also reported as ~1.76 s of acknowledged writes. Those are
+# two different claims and batching tells them apart:
+#
+#   - If the ceiling is set by the WRITEBACK INTERVAL — a property of the kernel
+#     and the storage, not of weir — then batching should leave ~1.76 s intact
+#     and multiply the record count by however much batching multiplies
+#     throughput.
+#   - If instead the record count stays near 126,782 while the seconds shrink,
+#     the ceiling is set by something inside weir's flusher, and the "one
+#     writeback interval" reading of Phase 2 was a coincidence of that run's
+#     throughput.
+#
+# HOW TO READ IT, and what NOT to do. The ~1.76 s figure came from dividing the
+# record ceiling by that run's throughput, so the same division here cannot check
+# it — it would just restate the assumption. But the ledger does not need parsing
+# either, and a 100 GB `t_micros` pass would be wasted work: the test is a RATIO
+# across the two runs, and `episodes.jsonl` alone carries it.
+#
+#   time-bound (one writeback interval W):   ceiling_batched / ceiling_unbatched
+#                                            == throughput_batched / throughput_unbatched
+#   count-bound (something in the flusher):  ceiling_batched ~= ceiling_unbatched,
+#                                            whatever the throughput
+#
+# Take `expected_loss` per episode for the ceiling (the MAX, not the mean — the
+# ceiling is what characterises the tier) and `acked_delta / steady_secs` for
+# throughput, against powerloss-buffered.toml's published 126,782. The two
+# predictions differ by whatever factor batching moves throughput, which on the
+# Durable pair was ~24x, so this is not a subtle discrimination.
+#
+# One resolution caveat, for anyone who does go to the ledger anyway: a batched
+# call records ONE timestamp for all `wire_batch_size` records in it, so
+# `t_micros` is per-call, not per-record. At 256 records that is ~1 ms of
+# granularity against a ~1.8 s window — irrelevant at this scale, but it would
+# matter if the window ever came out small.
+#
+# A result of exactly zero loss is INCONCLUSIVE, not green: see
+# report.powerloss_verdict(). It means the injector probably never bit, and the
+# canary (I6) is what settles it.
+#
+# DISK IS THE BINDING CONSTRAINT, and more so than on any previous Buffered
+# schedule. The two ledgers ARE the oracle — I1/I2 are set-containment checks
+# over exactly them — so they can never be trimmed. Buffered is not fsync-bound,
+# so batching raises throughput without the fsync ceiling to absorb it, and the
+# ledger grows in proportion. Measured on the batched DURABLE run for scale:
+# ~115 B of combined ledger per pushed record. Check free space at launch; the
+# orchestrator's 5 GiB `disk_stop_reason` floor is the backstop, not the plan.
+#
+# STEADY STATE STAYS SHORT for the usual reason: what is at risk when the
+# machine dies is bounded by writeback lag, not by how long the episode ran, so
+# 4-8 s exposes the same data to the fault as 8-15 s at half the ledger — and
+# kills are what a rare-event search needs. Validated on Buffered by
+# powerloss-shape-check.toml: halving the episode still reached the ceiling
+# (124,897 against 126,782).
+
+seed = 0xA6C48
+episodes = 3000
+max_duration_secs = 18000  # 5h — the disk, not the episode count, is the bound
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "U"
+# A6's wire batch. NOT [weir].batch_size, which is the daemon group commit.
+# Held at 256 to match powerloss-batch.toml exactly: the two runs differ in the
+# tier and the seed and in nothing else, which is what makes them a pair.
+wire_batch_size = 256
+min_acked_per_episode = 100
+# Phase 1's floor of 100 assumes nothing is lost, which is the opposite of what
+# this run expects. A floor that high would flag every episode behaving exactly
+# as documented as "no progress". Same reasoning as powerloss-buffered.toml.
+min_delivered_per_episode = 1
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+# 16 GiB, NOT the 2048 every other schedule uses, and the difference is measured
+# rather than cautious. Run 1813189325188119 (batched Durable, this schedule's
+# pair) filled a 2 GiB device after 1,189 episodes: batching raises ingest ~25x
+# while the HTTP sink drain does not keep up, so unconfirmed WAB segments
+# accumulate at roughly 1.7 MiB per episode. Buffered is not fsync-bound, so it
+# pushes harder still and would reach the same wall sooner.
+#
+# This is the one parameter that differs from powerloss-batch.toml beyond the
+# tier and the seed, and it is worth saying why it does not spoil the pair: the
+# exposure ceiling is set by writeback lag, which does not depend on how much
+# room the device has. What device size changes is whether the run survives long
+# enough to measure it.
+size_mb = 16384
+# The real fault, not the pass-through stand-in. `load_schedule()` refuses
+# `dm_target = "linear"` paired with `fault.kind = "power_loss"`: linear injects
+# nothing, so that pairing would report green having tested no power loss.
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"

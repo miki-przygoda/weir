@@ -18,7 +18,10 @@ connection can mix them.)
 
 **Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
 records at the durable tier, **none lost** — and, in the same runs, `Buffered`
-loss measured as uniform between zero and one writeback interval, ceiling 1.76 s
+loss measured as uniform between zero and a ceiling of **~124,000 records**
+(1.76 s at that run's ~72,000 rec/s; the ceiling is a quantity of data, so the
+seconds shrink as the producer speeds up — a 1.45x faster run measured the same
+record ceiling in 1.18 s)
 ([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md);
 real kernel power cuts on Linux, which is the platform the guarantee is claimed
 for — see [platform support](docs/platform-support.md#durability-by-platform)) ·

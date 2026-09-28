@@ -56,7 +56,65 @@ protocol** below.
   linear at ~0.19 ms per MiB on beast (536 MB back in 100 ms) and ~0.64 ms per
   MiB on an M3 Max.
 
+- **The chaos harness can now fault-inject A6's batched ack path**, via a new
+  `[load].wire_batch_size` schedule key. Every power-loss episode weir has ever
+  survived was driven by a load generator that called single-record `push` only,
+  so the entire 687.7M-record Phase 2 corpus said nothing about `PushBatch` —
+  whose reply is a bitmap, and whose set bit carries the same crown invariant as
+  a single-record `Ack`. The oracle reasons per record: one batched call yields
+  `wire_batch_size` verdicts and the ledger gets one row each. A set bit records
+  `Acked` and is held to I1; a clear bit records `Unknown`, because it means
+  exactly what `Nack(InternalError)` means ("retry; it may nonetheless have been
+  written") and recording it as `Nacked` would make I2 fire on a legitimate
+  replay. Absent or `1`, the key keeps the single-`push` call site byte for byte,
+  so every existing schedule stays comparable with the Phase 2 corpus. Two
+  schedules ship with it: `chaos/schedules/smoke-batch.toml` (`kill -9`,
+  plumbing) and `chaos/schedules/powerloss-batch.toml` (durability).
+
 ### Fixed
+
+- **`Buffered`'s exposure ceiling was published in seconds, and the seconds are
+  not the invariant.** Phase 2 measured a ceiling of 126,782 records and rendered
+  it as "1.76 s of acknowledged writes" by dividing by that run's ~72,000 rec/s,
+  then described the bound as "one writeback interval" — a reading the same run
+  could not test. A batched `Buffered` power-loss run (747 episodes, canary `bit`
+  in 747/747, clean stop at `slack=0`) raised throughput 1.45x and measured a
+  record ceiling of **123,664** — unmoved, −2.5% — in **1.18 s**, against the
+  184,200 a time-bound ceiling predicts. So the ceiling is a quantity of data and
+  the duration is throughput-specific: a sizing rule of the form "budget for
+  1.76 s of acked writes" is wrong for any producer faster than that run.
+  `README.md`, `chaos/README.md` and the Phase 2 write-up now quote records and
+  say what the seconds depend on. The uniform distribution holds in both runs.
+  **Still open:** both runs used 256-byte records, so records and bytes are
+  proportional and indistinguishable; 123,664 × 256 B ≈ 31.7 MB has the shape of
+  a dirty-page limit, and the zstd comparison agrees, but a record-size sweep is
+  what would settle it.
+
+- **`chaos/README.md` said "any survivor is an anomaly", which `run.py` has never
+  done.** Quarantined segments under power loss are the documented correct
+  outcome — `drop_writes` tears the active segment and recovery parks the torn
+  tail rather than truncating it — and are exempted from the alarm while still
+  being recorded. A 747-episode `Buffered` run ended with 2,902 of them, ~3.9 per
+  episode: one per shard per cut. Non-empty active segments and dead-letter files
+  are never exempt, and the README now says all of that.
+
+- **A full WAB device manufactured a false durability violation against weir.**
+  The chaos disk floor measured `run_dir` — the filesystem holding the two
+  ledgers — and never the mounted test device holding the WAB, which is orders of
+  magnitude smaller. Found on run `1813189325188119`: 1,189 batched `Durable`
+  power-loss episodes passed, then the 2 GiB device filled while the host still
+  had 153 GiB free, so the guard never fired. What followed was, in order —
+  weir hit `ENOSPC` copying a mid-file-corrupt segment into quarantine and
+  **refused to truncate it**, because the corrupt tail may hold acked-durable
+  records ("segment left UNTOUCHED for retry"), which is correct fail-closed
+  behaviour; recovery therefore never completed, the drain never settled, and the
+  episode hit its quiescence timeout; and the oracle ran I1 anyway and reported
+  the 25,577 records weir had deliberately **preserved** as records it had lost.
+  A new `device_stop_reason` floor watches the WAB mount (128 MiB default,
+  `min_free_device_bytes` per schedule) and stops between episodes, keeping the
+  final pass, the report and the WAB post-mortem. Seven tests, including one that
+  scrapes `main()` to prove the guard is wired *and* measures the mount rather
+  than `run_dir` — both failure modes mutation-verified.
 
 - **MinIO withdrew its public images and the `sink integration` job went red on
   every PR.** Every tag on `quay.io/minio/{minio,mc}` now answers `401
@@ -90,6 +148,64 @@ protocol** below.
 - **`docs/benchmarks.md` still described `drain-throughput.md` as mixed-basis**
   with two superseded Linux rows. Those were re-measured on 2026-09-18 and the
   file has been on a single basis since.
+
+- **Both harness lockfiles sat at `3.0.0` for the whole of 4.0.0, and CI could
+  not see it.** `fuzz/` and `chaos/` are separate Cargo workspaces with their own
+  `Cargo.lock`, and those locks pin the weir path deps by version, so a workspace
+  version bump leaves them stale. The `harnesses` job compiled without
+  `--locked`, so cargo silently rewrote the lock in CI and passed. Both locks are
+  refreshed to `4.0.0` and both steps now pass `--locked`, so a stale harness
+  lock fails the gate instead. Verified by mutation: reverting either lock to
+  `3.0.0` fails its own step.
+
+- **The chaos orchestrator's 301-test unit suite had never run in CI.** The
+  `harnesses` job compiled the two Rust binaries and stopped there — but the
+  orchestrator *is* the oracle: I1, I2, I3, quiescence, the canary verdict and
+  the report's pass/fail rules are all Python. Every guard in them was only as
+  good as whoever last remembered to run the suite by hand. It is stdlib-only,
+  needs no root and no device-mapper, and takes ~3 s, so there was never a cost
+  reason for the omission. Now a step in the same job, verified non-vacuous by
+  mutation: breaking one assertion in `test_verify.py` fails it.
+
+- **The chaos suite's one real-device test skipped on GitHub and failed
+  locally.** It gated on `root and Linux`, which is necessary and not
+  sufficient: `act` runs the `harnesses` job as root in a container, so the test
+  ran there and died on `losetup: cannot find an unused loop device`, while
+  GitHub's `ubuntu-latest` runs the job as a non-root user and skipped it. A
+  gate that passes remotely and fails locally teaches you to ignore the local
+  run. It also left a dangling `weir-chaos-flakey-1234` dm mapping behind, which
+  the teardown warning itself says blocks that seed from running again — free on
+  a disposable container, not free on the machine the real runs happen on. The
+  gate now probes what `setup()` actually needs: `losetup`, `dmsetup`,
+  `mkfs.ext4`, and a loop device it can really claim, naming whichever is
+  missing in the skip reason.
+
+- **A misspelled schedule key was silently ignored.** `load_schedule` now
+  refuses any table or key that nothing reads, because the default it would
+  otherwise take is invisible in the report: `wire_batch_size` typed
+  `wire_batchsize` runs every episode down the single-`push` path and then
+  claims coverage of the batched ack path having never sent one batch, and
+  `[fault]` for `[faults]` runs a Phase 1 `kill -9` episode under a Phase 2
+  power-loss schedule. `[weir]` keys are checked against what `Daemon.start`
+  actually passes through, not against weir's config surface — the harness
+  writes no config file, so weir's own unknown-key advisory never sees a
+  schedule typo. Six mutation cases and a test that every shipped schedule
+  still loads.
+
+- **Nothing pinned the flags `run.py` sends its own load generator.** The
+  existing contract test covers the weir-server flags, where an unrecognised
+  flag makes the daemon refuse to start; loadgen's hand-rolled `parse_args`
+  takes a *default* instead, so a `--batch-size` it never learned would run the
+  schedule unbatched and pass. Now scraped and pinned both ways, including that
+  the wire-batch default is 1 on both sides.
+
+- **The chaos orchestrator's frontier slack was too small for batched load.**
+  loadgen checks its ledger flush threshold *after* appending, so a batched
+  thread can append `wire_batch_size` rows in one step and sit at
+  `LEDGER_FLUSH_THRESHOLD + wire_batch_size - 1` unflushed. The bound is now
+  `threads * (LEDGER_FLUSH_THRESHOLD + wire_batch_size - 1)`, which is unchanged
+  at `wire_batch_size = 1`; without it a batched run would report I3 violations
+  against a load generator that was merely still buffering.
 
 
 - **`docs/benchmarks/bare-metal.md` holds a capture, and the release gate it

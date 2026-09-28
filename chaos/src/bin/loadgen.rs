@@ -200,6 +200,9 @@ struct Args {
     record_size: usize,
     tier: char,
     duration_secs: u64,
+    /// Records per `push_batch` call. 1 keeps the single-`push` path byte for
+    /// byte, so an existing schedule measures exactly what it measured before.
+    batch_size: usize,
 }
 
 fn parse_args() -> Args {
@@ -223,6 +226,17 @@ fn parse_args() -> Args {
         duration_secs: get("--duration-secs", "60")
             .parse()
             .expect("--duration-secs"),
+        batch_size: {
+            let n: usize = get("--batch-size", "1").parse().expect("--batch-size");
+            // The daemon's `max_batch_records` defaults to 1024 and its hard cap
+            // is 2048. Refusing here beats discovering it as a frame-level Nack
+            // that closes the connection on every single call.
+            assert!(
+                (1..=1024).contains(&n),
+                "--batch-size must be 1..=1024 (the daemon's default max_batch_records), got {n}"
+            );
+            n
+        },
     }
 }
 
@@ -258,6 +272,7 @@ fn main() {
         let run_id = args.run_id;
         let record_size = args.record_size;
         let tier = args.tier;
+        let batch_size = args.batch_size;
 
         handles.push(std::thread::spawn(move || {
             let mut client: Option<WeirClient> = None;
@@ -282,30 +297,94 @@ fn main() {
                     }
                 }
 
-                let my_seq = seq.fetch_add(1, Ordering::Relaxed);
-                let payload = encode_record(run_id, my_seq, record_size);
-                let t0 = Instant::now();
-                let t_micros = now_micros();
-
                 let c = client.as_mut().expect("just ensured connected");
-                let outcome = match c.push(&payload, durability) {
-                    Ok(()) => Outcome::Acked,
-                    Err(e) => {
-                        let o = classify(&e);
-                        if !e.is_recoverable() {
-                            client = None;
-                        }
-                        o
-                    }
-                };
 
-                pending.push(LedgerEntry {
-                    seq: my_seq,
-                    tier,
-                    outcome,
-                    t_micros,
-                    rtt_micros: t0.elapsed().as_micros() as u64,
-                });
+                if batch_size == 1 {
+                    let my_seq = seq.fetch_add(1, Ordering::Relaxed);
+                    let payload = encode_record(run_id, my_seq, record_size);
+                    let t0 = Instant::now();
+                    let t_micros = now_micros();
+
+                    let outcome = match c.push(&payload, durability) {
+                        Ok(()) => Outcome::Acked,
+                        Err(e) => {
+                            let o = classify(&e);
+                            if !e.is_recoverable() {
+                                client = None;
+                            }
+                            o
+                        }
+                    };
+
+                    pending.push(LedgerEntry {
+                        seq: my_seq,
+                        tier,
+                        outcome,
+                        t_micros,
+                        rtt_micros: t0.elapsed().as_micros() as u64,
+                    });
+                } else {
+                    // A6's batched path. The reply is a bitmap, so one call
+                    // yields `batch_size` independent verdicts and the ledger
+                    // gets one row each — the oracle reasons per record, not per
+                    // call.
+                    let base = seq.fetch_add(batch_size as u64, Ordering::Relaxed);
+                    // String, not Vec<u8>: encode_record returns String and
+                    // String implements AsRef<[u8]>, which is what push_batch wants.
+                    let payloads: Vec<String> = (0..batch_size)
+                        .map(|i| encode_record(run_id, base + i as u64, record_size))
+                        .collect();
+                    let t0 = Instant::now();
+                    let t_micros = now_micros();
+
+                    let verdicts: Vec<Outcome> = match c.push_batch(&payloads, durability) {
+                        Ok(b) => (0..batch_size)
+                            .map(|i| match b.accepted.get(i) {
+                                // A SET bit inherits the crown invariant: this
+                                // record is durable, and the suite holds weir to
+                                // it exactly as it holds a single-record Ack.
+                                Some(true) => Outcome::Acked,
+                                // A CLEAR bit is the weak statement. Per
+                                // weir-core's batch docs it means "not durable as
+                                // of this reply: retry it, and expect that it may
+                                // nonetheless have been written" — identical to
+                                // Nack(InternalError), which `classify` already
+                                // maps to Unknown. Recording it as Nacked would
+                                // make invariant I2 ("a nacked record is never
+                                // delivered") fire on a legitimate replay and
+                                // manufacture a P0 out of correct behaviour.
+                                Some(false) => Outcome::Unknown,
+                                // A reply shorter than the batch. The client
+                                // validates length before returning, so this is
+                                // unreachable; Unknown rather than a panic keeps
+                                // a harness bug from being reported as a weir
+                                // violation.
+                                None => Outcome::Unknown,
+                            })
+                            .collect(),
+                        Err(e) => {
+                            let o = classify(&e);
+                            if !e.is_recoverable() {
+                                client = None;
+                            }
+                            vec![o; batch_size]
+                        }
+                    };
+
+                    // One RTT for the whole call, recorded against every record
+                    // in it. A per-record latency does not exist for a batch, and
+                    // dividing by `batch_size` would invent one.
+                    let rtt = t0.elapsed().as_micros() as u64;
+                    for (i, outcome) in verdicts.into_iter().enumerate() {
+                        pending.push(LedgerEntry {
+                            seq: base + i as u64,
+                            tier,
+                            outcome,
+                            t_micros,
+                            rtt_micros: rtt,
+                        });
+                    }
+                }
 
                 let due = pending.len() >= LEDGER_FLUSH_THRESHOLD
                     || last_flush.elapsed() >= LEDGER_FLUSH_INTERVAL;

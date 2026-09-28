@@ -1,0 +1,44 @@
+# Phase 2 power loss against A6's BATCHED ack path.
+#
+# Why this schedule exists. Phase 2 passed on 2026-08-30 with 6,129 episodes and
+# 687.7M acked records — on 2.x, whose only producer call was a single `push`.
+# 4.0.0 added `PushBatch`, whose reply is a bitmap, and a set bit is a durability
+# promise carrying weir's crown invariant exactly as a single-record Ack does.
+# Nothing had ever power-cut that path: the chaos load generator called `push`
+# only, so the corpus says nothing about batched acks.
+#
+# The A6 work already found a latent bug here in simulation — `flush_batch`
+# drained every pending ack as a failure on any write error, so one rejected
+# record nacked every innocent record sharing its group commit. That was found by
+# DST. This asks the real kernel.
+#
+# wire_batch_size 256 against a 64-record group commit is deliberate: one bitmap
+# then spans about four fsyncs, so a set bit has to survive a commit boundary
+# rather than mapping one-to-one onto a single one.
+seed = 0xA6C47
+episodes = 3000
+max_duration_secs = 28800  # 8h wall clock is the real bound; episodes is a ceiling
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "D"
+wire_batch_size = 256
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "power_loss"

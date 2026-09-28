@@ -1,0 +1,34 @@
+# Smoke test for A6 batched pushes under fault injection.
+#
+# Purpose is the PLUMBING, not the durability claim: prove that
+# `wire_batch_size` reaches loadgen, that batched records land in the ledger one
+# row each, and that the oracle's invariants hold across a kill. Ten episodes,
+# kill -9 only. The durability run is powerloss-batch.toml.
+seed = 0xB47C4
+episodes = 10
+steady_lo_secs = 20.0
+steady_hi_secs = 40.0
+quiescence_timeout_secs = 120.0
+
+[load]
+threads = 4
+record_size = 256
+tier = "D"
+# A6's wire batch. NOT [weir].batch_size, which is the daemon group commit.
+# 256 against a 64-record group commit is deliberate: one AckBatch bitmap then
+# spans about four fsyncs, so a set bit has to survive a boundary rather than
+# mapping one-to-one onto a single commit.
+wire_batch_size = 256
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+
+[storage]
+size_mb = 512
+
+[faults]

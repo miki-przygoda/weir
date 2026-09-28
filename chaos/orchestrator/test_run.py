@@ -285,6 +285,198 @@ class TestScheduleCoherence(unittest.TestCase):
                 run.load_schedule(path)
 
 
+class TestUnknownScheduleKeysRefused(unittest.TestCase):
+    """A misspelled schedule key is the quietest failure this harness has.
+
+    Nothing reads it, so the run takes the default, passes, and produces a
+    report indistinguishable from one that measured what the schedule says.
+    `wire_batch_size` typed `wire_batchsize` runs every episode down the
+    single-`push` path and then claims coverage of A6's batched ack path
+    having never sent one batch — the same class of harness lie that
+    `fault_kind` refuses an unknown fault *value* for.
+
+    These cases are the mutation evidence: each is one character away from a
+    schedule that loads, and the control at the bottom is that schedule.
+    """
+
+    #: The smallest schedule that satisfies every other guard in load_schedule.
+    VALID = (
+        "seed = 1\n"
+        "episodes = 1\n"
+        "steady_lo_secs = 1.0\n"
+        "steady_hi_secs = 2.0\n"
+        "quiescence_timeout_secs = 10.0\n"
+        "\n[load]\n"
+        "threads = 1\n"
+        'record_size = 256\n'
+        'tier = "D"\n'
+        "wire_batch_size = 256\n"
+        "min_acked_per_episode = 1\n"
+        "min_delivered_per_episode = 1\n"
+        "\n[weir]\n"
+        "shard_count = 1\n"
+        "batch_size = 8\n"
+        "batch_deadline_ms = 2\n"
+        "wab_segment_max_bytes = 1048576\n"
+        "\n[storage]\n"
+        "size_mb = 64\n"
+        'dm_target = "flakey"\n'
+        "\n[faults]\n"
+        'kind = "power_loss"\n'
+    )
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sched.toml")
+            with open(path, "w") as f:
+                f.write(text)
+            return run.load_schedule(path)
+
+    def test_the_control_schedule_loads(self):
+        s = self._load(self.VALID)
+        self.assertEqual(s["load"]["wire_batch_size"], 256)
+
+    def test_a_typo_in_a_load_key_is_refused(self):
+        bad = self.VALID.replace("wire_batch_size", "wire_batchsize")
+        with self.assertRaises(ValueError) as cm:
+            self._load(bad)
+        self.assertIn("wire_batchsize", str(cm.exception))
+
+    def test_a_typo_in_a_weir_key_is_refused(self):
+        # The harness never writes a weir config file -- Daemon.start passes
+        # CLI flags read by name -- so weir's own unknown-key advisory never
+        # sees a schedule typo and cannot catch it. This is the only guard.
+        bad = self.VALID.replace("batch_deadline_ms", "batch_deadline")
+        with self.assertRaises(ValueError) as cm:
+            self._load(bad)
+        self.assertIn("batch_deadline", str(cm.exception))
+
+    def test_a_typo_in_a_storage_key_is_refused(self):
+        bad = self.VALID.replace("dm_target", "dm_targt")
+        with self.assertRaises(ValueError) as cm:
+            self._load(bad)
+        self.assertIn("dm_targt", str(cm.exception))
+
+    def test_a_typo_in_a_top_level_key_is_refused(self):
+        bad = self.VALID.replace("quiescence_timeout_secs", "quiesence_timeout_secs")
+        with self.assertRaises(ValueError) as cm:
+            self._load(bad)
+        self.assertIn("quiesence_timeout_secs", str(cm.exception))
+
+    def test_a_misspelled_table_is_refused(self):
+        # `[fault]` for `[faults]` would silently take fault_kind's
+        # kill_random default while the schedule's own dm_target said flakey:
+        # a Phase 1 episode reported under a Phase 2 schedule.
+        bad = self.VALID.replace("[faults]", "[fault]")
+        with self.assertRaises(ValueError) as cm:
+            self._load(bad)
+        self.assertIn("fault", str(cm.exception))
+
+    def test_every_shipped_schedule_still_loads(self):
+        """The whitelist is only correct if it accepts the real corpus.
+
+        A guard that refuses a schedule the project actually runs is worse
+        than no guard, and this is what would have caught it.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        schedules = os.path.join(here, "..", "schedules")
+        found = []
+        for root, _dirs, files in os.walk(schedules):
+            for name in files:
+                if name.endswith(".toml"):
+                    found.append(os.path.join(root, name))
+        self.assertGreater(len(found), 10, "expected the shipped schedule corpus")
+        for path in sorted(found):
+            with self.subTest(schedule=os.path.basename(path)):
+                run.load_schedule(path)
+
+
+class TestWabDeviceFloor(unittest.TestCase):
+    """The WAB device is a separate, much smaller filesystem than the one
+    holding the ledgers, and the host floor cannot see it.
+
+    Regression for run 1813189325188119: 1,189 batched Durable power-loss
+    episodes passed, then the 2 GiB device filled while the host still had
+    ~150 GiB free. weir correctly refused to truncate a corrupt segment it could
+    not quarantine, recovery stalled, quiescence timed out, and I1 reported the
+    25,577 records weir had deliberately PRESERVED as records it had lost -- a
+    false P0 against weir for doing the right thing.
+    """
+
+    def test_a_full_device_stops_the_run(self):
+        reason = run.device_stop_reason(free=16 * 2**20, floor=128 * 2**20)
+        self.assertIsNotNone(reason)
+        self.assertIn("WAB device", reason)
+        self.assertIn("size_mb", reason, "must say how to fix it")
+
+    def test_a_roomy_device_does_not(self):
+        self.assertIsNone(
+            run.device_stop_reason(free=2 * 2**30, floor=128 * 2**20)
+        )
+
+    def test_exactly_at_the_floor_does_not_stop(self):
+        # Same boundary convention as progress_floor_breached and
+        # disk_stop_reason: only strictly below trips it.
+        floor = 128 * 2**20
+        self.assertIsNone(run.device_stop_reason(free=floor, floor=floor))
+        self.assertIsNotNone(run.device_stop_reason(free=floor - 1, floor=floor))
+
+    def test_a_zero_floor_disables_it(self):
+        self.assertIsNone(run.device_stop_reason(free=0, floor=0))
+
+    def test_it_is_a_SEPARATE_floor_from_the_host_one(self):
+        """The bug was one check doing duty for two filesystems. At the numbers
+        that actually occurred -- 150 GiB free on the host, 16 MiB free on the
+        device -- the host check passes and only this one fires. If these two
+        ever collapse into one call, this fails."""
+        host_free, device_free = 150 * 2**30, 16 * 2**20
+        self.assertIsNone(
+            run.disk_stop_reason(host_free, run.DEFAULT_MIN_FREE_BYTES),
+            "the host floor did not fire during the real failure, and must not "
+            "be what this relies on",
+        )
+        self.assertIsNotNone(
+            run.device_stop_reason(device_free, run.DEFAULT_MIN_FREE_DEVICE_BYTES)
+        )
+
+    def test_the_device_floor_is_actually_WIRED_INTO_the_episode_loop(self):
+        """A pure function nothing calls is theatre.
+
+        The call site is inside `main()`, which needs root and a real dm stack,
+        so the suite cannot execute it. Scrape for it instead -- the same
+        approach as the two CLI contract tests -- and require that it measures
+        `mount_point` and not `run_dir`, because measuring the wrong filesystem
+        is the entire original bug and would leave every test above passing.
+        """
+        run_py = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
+        with open(run_py) as f:
+            source = f.read()
+
+        start = source.index("def main(")
+        body = source[start:]
+        self.assertIn(
+            "device_stop_reason(", body,
+            "device_stop_reason is defined but main() never calls it",
+        )
+        call = body[body.index("device_stop_reason("):][:200]
+        self.assertIn(
+            "mount_point", call,
+            f"the device check must measure the WAB MOUNT, not the ledger "
+            f"filesystem -- measuring run_dir is the bug this exists for: {call!r}",
+        )
+        self.assertNotIn(
+            "disk_usage(run_dir)", call,
+            "the device check is measuring run_dir, which is the original defect",
+        )
+
+    def test_the_device_floor_is_smaller_than_the_host_floor(self):
+        # A 2 GiB device cannot satisfy a 5 GiB floor, so reusing the host
+        # constant would stop every run before episode 0.
+        self.assertLess(
+            run.DEFAULT_MIN_FREE_DEVICE_BYTES, run.DEFAULT_MIN_FREE_BYTES
+        )
+
+
 class TestSeededKiller(unittest.TestCase):
     def test_kill_delays_are_reproducible_from_the_seed(self):
         a = run.kill_delays(seed=42, count=10, lo=1.0, hi=5.0)
@@ -372,6 +564,66 @@ class TestDaemonCliContract(unittest.TestCase):
             )
 
 
+class TestLoadgenCliContract(unittest.TestCase):
+    """`TestDaemonCliContract` pins the flags run.py sends to weir-server. The
+    flags it sends to its OWN load generator had nothing pinning them, and that
+    side is the more dangerous one: an unrecognised flag makes weir-server
+    refuse to start, which is loud, while loadgen's hand-rolled `parse_args`
+    takes a default for anything it does not recognise — so a `--batch-size`
+    that loadgen never learned about would run the whole schedule unbatched and
+    pass.
+
+    Scrapes the argv literal rather than executing it, because building loadgen
+    needs cargo and this suite must stay runnable anywhere.
+    """
+
+    def test_every_flag_run_py_sends_loadgen_exists_in_loadgen_rs(self):
+        run_py_path = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
+        with open(run_py_path) as f:
+            run_source = f.read()
+
+        start = run_source.index("loadgen = subprocess.Popen([")
+        end = run_source.index("], stdout=subprocess.DEVNULL", start)
+        argv_block = run_source[start:end]
+        flags = sorted(set(re.findall(r'"(--[a-z0-9-]+)"', argv_block)))
+        self.assertGreater(len(flags), 5, f"scrape found too few flags: {flags}")
+        self.assertIn(
+            "--batch-size", flags,
+            "the scrape must see A6's wire-batch flag, or it is pinning nothing",
+        )
+
+        loadgen_rs_path = os.path.join(run.CHAOS_ROOT, "src", "bin", "loadgen.rs")
+        with open(loadgen_rs_path) as f:
+            loadgen_source = f.read()
+
+        for flag in flags:
+            self.assertIn(
+                f'"{flag}"', loadgen_source,
+                f"{flag!r} is sent to loadgen by run.py but does not appear in "
+                f"{loadgen_rs_path} — loadgen's parse_args takes a DEFAULT for "
+                f"an unrecognised flag, so this drift is silent",
+            )
+
+    def test_the_wire_batch_default_is_one(self):
+        """Absent `wire_batch_size` must mean the single-`push` path.
+
+        This is what keeps every pre-existing schedule comparable with the
+        687.7M-record Phase 2 corpus: if the default ever became anything but
+        1, every historical schedule would start batching and the corpus would
+        silently stop being a like-for-like baseline.
+        """
+        sched = {"load": {"threads": 1}}
+        self.assertEqual(sched["load"].get("wire_batch_size", 1), 1)
+        loadgen_rs_path = os.path.join(run.CHAOS_ROOT, "src", "bin", "loadgen.rs")
+        with open(loadgen_rs_path) as f:
+            loadgen_source = f.read()
+        self.assertIn(
+            'get("--batch-size", "1")', loadgen_source,
+            "loadgen's own default for --batch-size must also be 1, or an "
+            "older run.py paired with a newer loadgen would batch silently",
+        )
+
+
 class TestFrontierSlackContract(unittest.TestCase):
     """`frontier_slack = threads * LEDGER_FLUSH_THRESHOLD` hard-codes loadgen's
     per-thread ledger-flush threshold as a bare Python constant, with nothing
@@ -398,6 +650,40 @@ class TestFrontierSlackContract(unittest.TestCase):
             "constant of the same name — this bounds the I3 frontier "
             "exemption, so a mismatch silently changes how much in-flight "
             "work is excused from the orphan/I1 checks",
+        )
+
+    def test_unbatched_slack_is_exactly_the_pre_batching_bound(self):
+        """The regression that matters: every run in the 687.7M-record Phase 2
+        corpus was verified against `threads * LEDGER_FLUSH_THRESHOLD`. If
+        adding batching moved that number, none of those runs would be
+        reproducible any more."""
+        for threads in (1, 4, 8, 16):
+            self.assertEqual(
+                run.frontier_slack_for(threads),
+                threads * run.LEDGER_FLUSH_THRESHOLD,
+            )
+            self.assertEqual(
+                run.frontier_slack_for(threads, wire_batch_size=1),
+                threads * run.LEDGER_FLUSH_THRESHOLD,
+            )
+
+    def test_batched_slack_covers_a_thread_that_just_appended_a_whole_batch(self):
+        """loadgen checks the threshold AFTER appending, so the true worst case
+        per thread is `LEDGER_FLUSH_THRESHOLD + wire_batch_size - 1`. A bound
+        below that reports I3 violations against a load generator that was
+        merely still buffering — a FALSE P0, the one failure this harness must
+        never produce."""
+        threads, batch = 8, 256
+        worst_case_per_thread = run.LEDGER_FLUSH_THRESHOLD + batch - 1
+        self.assertEqual(
+            run.frontier_slack_for(threads, batch),
+            threads * worst_case_per_thread,
+        )
+        self.assertGreater(
+            run.frontier_slack_for(threads, batch),
+            threads * run.LEDGER_FLUSH_THRESHOLD,
+            "a batched run needs MORE slack than an unbatched one, or the "
+            "verifier judges buffered rows as missing",
         )
 
 

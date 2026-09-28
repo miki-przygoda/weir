@@ -1,10 +1,11 @@
 """Tests for the device-mapper stack plumbing.
 
-The setup/teardown test needs root and Linux; it skips otherwise so the file
-is still runnable on a dev machine.
+The setup/teardown test builds a REAL loopback + device-mapper stack, so it
+skips unless the machine can actually do that. See `_real_dm_unavailable`.
 """
 import os
 import platform
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -21,8 +22,49 @@ import dm_stack
 _Result = namedtuple("_Result", ["returncode", "stdout", "stderr"])
 
 
-def _needs_root_linux():
-    return platform.system() != "Linux" or os.geteuid() != 0
+def _real_dm_unavailable():
+    """Why this machine cannot build a real loopback + dm stack, or "" if it can.
+
+    Root on Linux is necessary and NOT sufficient, and the difference used to
+    make the local CI gate disagree with the remote one. `act` runs the
+    `harnesses` job as root in a container, so the old `root and Linux` check
+    let this test RUN there — and it failed on `losetup: cannot find an unused
+    loop device`, because a container gets no loop devices. GitHub's own
+    `ubuntu-latest` runs the job as a non-root user, so the same test SKIPPED
+    there and CI was green. A gate that passes remotely and fails locally is
+    worse than no gate: it teaches you to ignore the local run.
+
+    It also left a side effect. The failed `setup()` could not unwind cleanly
+    and left a dangling `weir-chaos-flakey-1234` mapping behind, which the
+    teardown warning itself says blocks that seed from running again. On a
+    disposable container that is free; on the machine the real runs happen on
+    it is not.
+
+    So probe for what setup() actually needs: the three binaries, and a loop
+    device it can really claim. `losetup --find` is the same call dm_stack.py
+    makes, so the probe cannot pass where the test would fail.
+    """
+    if platform.system() != "Linux":
+        return f"needs Linux (this is {platform.system()})"
+    if os.geteuid() != 0:
+        return "needs root"
+    missing = [b for b in ("losetup", "dmsetup", "mkfs.ext4") if not shutil.which(b)]
+    if missing:
+        return f"missing {', '.join(missing)}"
+    try:
+        probe = subprocess.run(
+            ["losetup", "--find"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"losetup --find failed: {exc}"
+    if probe.returncode != 0:
+        return f"no free loop device ({probe.stderr.strip() or 'losetup --find failed'})"
+    return ""
+
+
+#: Computed once at import: the probe shells out, and skipIf evaluates its
+#: argument per decorated test.
+_NO_REAL_DM = _real_dm_unavailable()
 
 
 def _fake_run(responses):
@@ -48,7 +90,7 @@ class TestStorageStack(unittest.TestCase):
         with self.assertRaises(ValueError):
             dm_stack.StorageStack("/tmp/x.img", size_mb=1, mount_point="/mnt/x")
 
-    @unittest.skipIf(_needs_root_linux(), "needs root on Linux")
+    @unittest.skipIf(_NO_REAL_DM, f"real dm stack unavailable: {_NO_REAL_DM}")
     def test_setup_then_teardown_leaves_nothing_behind(self):
         with tempfile.TemporaryDirectory() as tmp:
             img = os.path.join(tmp, "wab.img")
