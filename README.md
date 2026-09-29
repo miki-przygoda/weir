@@ -3,7 +3,8 @@
 [![CI](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
-<!-- crates.io + docs.rs badges to be added in the same commit as the first crates.io publish -->
+[![crates.io](https://img.shields.io/crates/v/weir-server.svg?label=weir-server)](https://crates.io/crates/weir-server)
+[![docs.rs](https://img.shields.io/docsrs/weir-rs?label=docs.rs%2Fweir-rs)](https://docs.rs/weir-rs)
 
 A durable, high-throughput write buffer for Rust.
 
@@ -54,7 +55,7 @@ your own hardware: `cargo test -p weir-server --test load --release -- --nocaptu
 simulation of the pipeline: push records, flip the durability tier, crash the
 daemon mid-flight, and watch unconfirmed segments replay, side by side with a
 naive insert-per-record baseline. No build step — open `demo/index.html` in any
-browser. *(Hosted version coming with the public launch.)*
+browser, or use the hosted copy linked above.
 
 > **Status — 4.0 (stable), published at 4.0.1.** The wire protocol and public Rust API (`weir-core`,
 > `weir-client`, `weir-sink-sdk`, `weir-wab`) are under
@@ -67,12 +68,10 @@ browser. *(Hosted version coming with the public launch.)*
 > [configuration reference](docs/operations/configuration.md)). WAB flusher and
 > drain threads are panic-supervised. Published on crates.io.
 >
-> **2.0 is a major release and the wire protocol did not break.** `Durability`
-> collapsed from three tiers to two — `Sync` and `Batched` had carried an
-> identical guarantee since both moved to the batch-boundary group fsync — but
-> the retired `0x02` tier byte still decodes, so a 1.x producer keeps working
-> against a 2.0 daemon without recompiling. See
-> [`CHANGELOG.md`](CHANGELOG.md) for the full break list.
+> **The wire protocol has not broken since 1.0** — `WIRE_VERSION` is still `1`,
+> and a 1.x producer still works against a 4.x daemon without recompiling. Every
+> major so far has broken the Rust API instead; see
+> [`CHANGELOG.md`](CHANGELOG.md) for each one's break list.
 
 ## How it works
 

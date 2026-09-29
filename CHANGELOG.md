@@ -17,6 +17,20 @@ protocol** below.
 
 ### Fixed
 
+- **Three stale spots in the README, all of them claims about the project's own
+  release state.** The badge row carried a placeholder comment saying crates.io
+  and docs.rs badges would arrive "with the first crates.io publish" — nine
+  crates have been published since; the row now carries both badges. The demo
+  section ended with "*(Hosted version coming with the public launch.)*" directly
+  below a link to the already-hosted demo. And a paragraph opening "**2.0 is a
+  major release and the wire protocol did not break**" sat under a 4.0 status
+  block, reading as though 2.0 were current, with `Sync`/`Batched` tier detail
+  that belongs in this file. It is replaced by the claim that actually holds for
+  every major so far: the wire protocol has not broken since 1.0, `WIRE_VERSION`
+  is still `1`, and a 1.x producer still works against a 4.x daemon — verified
+  against `durability.rs`, whose `try_from` still accepts the retired `0x02`
+  precisely so that stays true.
+
 - **The benchmark vintage went stale the moment 4.0.1 landed, and the guard
   caught it.** The `load` job regenerates `docs/benchmarks/latest.md` on every
   push to `main` and commits it with `[skip ci]`, so the first PR after a release
