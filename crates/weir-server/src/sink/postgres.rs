@@ -31,9 +31,27 @@
 //! a segment that was partially committed pre-crash. The default
 //! `OnConflictDoNothing` mode silently drops duplicates so re-commits are
 //! idempotent. `Plain` mode opts out — duplicate-key errors surface as
-//! SQLSTATE `23505` and are classified as transient so the drain retries
-//! the segment after backoff (in case the duplicate is from a stale
-//! concurrent writer rather than a re-commit).
+//! SQLSTATE `23505` and are resolved row by row (see *Plain mode and duplicate
+//! keys* below).
+//!
+//! ## Plain mode and duplicate keys
+//!
+//! A plain multi-row `INSERT` is all-or-nothing, so one duplicate fails the
+//! whole statement. Retrying it cannot help — it hits the same key every time
+//! — so on `23505` the sink hands the batch to
+//! [`sql_common::insert_with_dup_fallback`]:
+//!
+//! - **With `id_column`**: one `SELECT … WHERE id = ANY($1)` finds the rows
+//!   already present. Their id is their WAB coordinate, so they are this
+//!   record, already delivered, and count as committed. One `INSERT` writes
+//!   the rest.
+//! - **Without `id_column`**: the batch is bisected, and each row that is still
+//!   a duplicate on its own is dead-lettered with
+//!   `duplicate key (insert_mode=plain, no id_column): <server message>`.
+//!
+//! All of it runs inside the one per-commit `timeout`. Plain mode without an
+//! `id_column` draws a config-load warning, because there every duplicate
+//! costs a dead-letter record.
 //!
 //! ## What the UNIQUE constraint should be on
 //!
@@ -73,9 +91,9 @@
 //!   `57P02` (`crash_shutdown`),
 //!   `57P03` (`cannot_connect_now`) → transient.
 //! - `23505` (`unique_violation`) — never seen under
-//!   `OnConflictDoNothing`; under `Plain` mode treated as transient so
-//!   the drain retries the segment after backoff, in case the duplicate
-//!   is from a stale concurrent writer rather than a re-commit.
+//!   `OnConflictDoNothing`; under `Plain` mode resolved row by row as
+//!   described above, never retried as-is (retrying the identical statement
+//!   was a livelock). It stays in the transient list for any other path.
 //! - All other server errors (syntax, missing table, missing column,
 //!   access denied, …) → permanent. The whole batch is dead-lettered
 //!   with the server-supplied error message so an operator can debug.
@@ -95,10 +113,10 @@ use std::time::Duration;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use tokio_postgres::{Config as PgConfig, NoTls, config::SslMode, error::SqlState};
 use tokio_postgres_rustls::MakeRustlsConnect;
-use tracing::{debug, info, warn};
+use tracing::info;
 
-use super::sql_common::{self, SqlSinkError};
-use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
+use super::sql_common::{self, SqlSinkError, StmtError};
+use super::{CommitResult, Sink, SinkBatch, SinkHealth};
 
 /// Static driver tag used by [`SqlSinkError`] variants emitted from this
 /// module. Counterpart to `mysql::DRIVER` — keeps `"postgres sink ..."`
@@ -123,7 +141,8 @@ pub enum InsertMode {
     /// module docs.
     OnConflictDoNothing,
     /// `INSERT INTO …` — duplicates surface as SQLSTATE `23505` and are
-    /// classified as transient (drain retries).
+    /// resolved row by row: committed when the `id_column` shows the record is
+    /// already present, dead-lettered otherwise. See the module docs.
     Plain,
 }
 
@@ -317,6 +336,16 @@ impl PostgresSink {
             }
         }
     }
+
+    /// The plain-mode duplicate-key lookup: which of the bound ids are already
+    /// in the table. The ids travel as one `text[]` parameter, so the
+    /// statement is the same for any batch size.
+    pub(crate) fn build_lookup_sql(&self, id_column: &str) -> String {
+        format!(
+            "SELECT \"{id_column}\" FROM \"{}\" WHERE \"{id_column}\" = ANY($1)",
+            self.config.table
+        )
+    }
 }
 
 /// One bound parameter, borrowed from the batch. Named rather than left as a
@@ -340,22 +369,28 @@ pub(crate) enum BoundParam<'a> {
 /// `id_hex` is `None` when no `id_column` is configured, and otherwise carries
 /// exactly one hex `RecordId` per record (enforced upstream by
 /// [`sql_common::per_record_id_hex`]).
+///
+/// `rows` names the records to bind, by index into `batch`: every index for
+/// the first statement, a subset for the duplicate-key fallback. A record's id
+/// and payload are read at the same index, so they cannot drift apart.
 fn build_params<'a>(
     batch: &'a [weir_core::Payload],
     id_hex: Option<&'a [String]>,
+    rows: &[usize],
 ) -> Vec<BoundParam<'a>> {
     match id_hex {
-        None => batch
+        None => rows
             .iter()
-            .map(|p| BoundParam::Payload(p.as_ref()))
+            .map(|&i| BoundParam::Payload(batch[i].as_ref()))
             .collect(),
-        // Zipping rather than indexing keeps the two sequences in step by
-        // construction, and a length mismatch truncates rather than panicking
-        // — which cannot happen, because per_record_id_hex already rejected it.
-        Some(ids) => ids
+        Some(ids) => rows
             .iter()
-            .zip(batch.iter())
-            .flat_map(|(id, payload)| [BoundParam::Id(id), BoundParam::Payload(payload.as_ref())])
+            .flat_map(|&i| {
+                [
+                    BoundParam::Id(&ids[i]),
+                    BoundParam::Payload(batch[i].as_ref()),
+                ]
+            })
             .collect(),
     }
 }
@@ -461,6 +496,23 @@ pub(crate) fn is_transient_sqlstate(state: &SqlState) -> bool {
         || state == &SqlState::UNIQUE_VIOLATION // 23505 — see module docs (Plain mode only)
 }
 
+/// True when a statement's SQLSTATE is a duplicate key the plain-mode fallback
+/// should resolve. Only plain mode: under `ON CONFLICT DO NOTHING` the server
+/// never raises `23505`, and if it somehow did, today's classification stands.
+pub(crate) fn is_dup_key(state: &SqlState, mode: InsertMode) -> bool {
+    mode == InsertMode::Plain && state == &SqlState::UNIQUE_VIOLATION
+}
+
+/// Classifies one statement's failure for the duplicate-key fallback.
+fn classify_stmt(err: tokio_postgres::Error, mode: InsertMode) -> StmtError {
+    if let Some(db) = err.as_db_error()
+        && is_dup_key(db.code(), mode)
+    {
+        return StmtError::DupKey(format!("server {}: {}", db.code().code(), db.message()));
+    }
+    StmtError::Other(classify(err))
+}
+
 // ── Sink trait impl ───────────────────────────────────────────────────────────
 
 impl Sink for PostgresSink {
@@ -478,58 +530,88 @@ impl Sink for PostgresSink {
             record_ids,
         )?;
 
-        let sql = self.build_insert_sql(batch.len());
-
-        let commit_fut = async {
-            let client = self.pool.get().await.map_err(|e| {
-                // Pool errors (no available connection, timeout fetching
-                // one, backend unreachable) are categorically transient.
-                SqlSinkError::transient(DRIVER, format!("pool: {e}"))
-            })?;
-            // tokio-postgres takes parameters as `&[&(dyn ToSql + Sync)]`.
-            // We need a Vec of `&[u8]` first, then a Vec of references to
-            // those — both have to outlive the `execute` call.
-            let bound = build_params(&batch, id_hex.as_deref());
-            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
-                .iter()
-                .map(|slot| match slot {
-                    BoundParam::Id(hex) => *hex as &(dyn tokio_postgres::types::ToSql + Sync),
-                    BoundParam::Payload(bytes) => {
-                        bytes as &(dyn tokio_postgres::types::ToSql + Sync)
-                    }
-                })
-                .collect();
-            client
-                .execute(&sql, &params)
-                .await
-                .map(|_rows| ())
-                .map_err(classify)
+        // One deadline for the whole commit, fallback included: the
+        // duplicate-key path never stretches a commit past the sink timeout.
+        let deadline = tokio::time::Instant::now() + self.config.timeout;
+        let mode = self.config.insert_mode;
+        let (batch, id_hex) = (&batch, id_hex.as_deref());
+        // Pool errors (no available connection, timeout fetching one, backend
+        // unreachable) are categorically transient.
+        let pool_err = |e: deadpool_postgres::PoolError| {
+            StmtError::Other(SqlSinkError::transient(DRIVER, format!("pool: {e}")))
         };
 
-        match tokio::time::timeout(self.config.timeout, commit_fut).await {
-            Ok(Ok(())) => {
-                debug!(
-                    records = batch.len(),
-                    "postgres sink committed batch as single INSERT"
-                );
-                Ok(CommitResult::new(batch, Vec::new()))
+        let insert = |rows: Vec<usize>| {
+            let sql = self.build_insert_sql(rows.len());
+            async move {
+                let client = self.pool.get().await.map_err(pool_err)?;
+                // tokio-postgres takes parameters as `&[&(dyn ToSql + Sync)]`,
+                // borrowed from the batch — no copy of the payload bytes.
+                let bound = build_params(batch, id_hex, &rows);
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
+                    .iter()
+                    .map(|slot| match slot {
+                        BoundParam::Id(hex) => *hex as &(dyn tokio_postgres::types::ToSql + Sync),
+                        BoundParam::Payload(bytes) => {
+                            bytes as &(dyn tokio_postgres::types::ToSql + Sync)
+                        }
+                    })
+                    .collect();
+                client
+                    .execute(&sql, &params)
+                    .await
+                    .map(|_rows| ())
+                    .map_err(|e| classify_stmt(e, mode))
             }
-            Ok(Err(e)) => {
-                if !e.is_transient() {
-                    let reason = format!("{e}");
-                    warn!(
-                        records = batch.len(),
-                        error = %reason,
-                        "postgres sink permanently rejected batch; dead-lettering"
-                    );
-                    let dead_lettered = batch.into_iter().map(|r| (r, reason.clone())).collect();
-                    Ok(CommitResult::new(Vec::new(), dead_lettered))
-                } else {
-                    Err(e)
-                }
+        };
+        let lookup_present = |rows: Vec<usize>| {
+            // Only called when an id column is configured (the driver gets
+            // `ids = Some` exactly then); the `None` arm is unreachable but
+            // answers with an error rather than a panic.
+            let query = self
+                .config
+                .id_column
+                .as_deref()
+                .zip(id_hex)
+                .map(|(col, ids)| {
+                    let wanted: Vec<&str> = rows.iter().map(|&i| ids[i].as_str()).collect();
+                    (self.build_lookup_sql(col), wanted)
+                });
+            async move {
+                let Some((sql, wanted)) = query else {
+                    return Err(StmtError::Other(SqlSinkError::permanent(
+                        DRIVER,
+                        "duplicate-key lookup without an id column",
+                    )));
+                };
+                let client = self.pool.get().await.map_err(pool_err)?;
+                let found = client
+                    .query(&sql, &[&wanted])
+                    .await
+                    .map_err(|e| StmtError::Other(classify(e)))?;
+                found
+                    .iter()
+                    .map(|row| {
+                        row.try_get::<_, String>(0).map_err(|e| {
+                            StmtError::Other(SqlSinkError::permanent(
+                                DRIVER,
+                                format!("duplicate-key lookup: reading the id column: {e}"),
+                            ))
+                        })
+                    })
+                    .collect()
             }
-            Err(_elapsed) => Err(SqlSinkError::timeout(DRIVER)),
-        }
+        };
+
+        sql_common::insert_with_dup_fallback(
+            DRIVER,
+            batch,
+            id_hex,
+            deadline,
+            insert,
+            lookup_present,
+        )
+        .await
     }
 
     fn max_batch_size(&self) -> usize {
@@ -558,6 +640,7 @@ impl Sink for PostgresSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::SinkError;
 
     fn cfg() -> PostgresSinkConfig {
         PostgresSinkConfig {
@@ -680,6 +763,65 @@ mod tests {
         );
     }
 
+    // ── Plain-mode duplicate keys (spec §4.7) ────────────────────────────────
+
+    /// `= ANY($1)` with one array parameter: one round trip and one bind
+    /// whatever the batch size, so the lookup never meets the 65 535-parameter
+    /// ceiling the multi-row INSERT is sized against.
+    #[test]
+    fn lookup_sql_is_one_array_parameter() {
+        let mut c = cfg();
+        c.id_column = Some("record_id".to_string());
+        let sink = PostgresSink::new(c).unwrap();
+        assert_eq!(
+            sink.build_lookup_sql("record_id"),
+            "SELECT \"record_id\" FROM \"weir_records\" WHERE \"record_id\" = ANY($1)"
+        );
+    }
+
+    /// The fallback inserts subsets of the batch; the bound parameters must be
+    /// exactly those rows, in the order the indices name them.
+    #[test]
+    fn bound_params_cover_only_the_selected_rows() {
+        let payloads = vec![
+            weir_core::Payload::from(b"a".as_ref()),
+            weir_core::Payload::from(b"b".as_ref()),
+            weir_core::Payload::from(b"c".as_ref()),
+        ];
+        let hex: Vec<String> = segment_ids(&payloads)
+            .iter()
+            .map(|id| id.to_hex())
+            .collect();
+        assert_eq!(
+            build_params(&payloads, Some(&hex), &[2, 0]),
+            vec![
+                BoundParam::Id(&hex[2]),
+                BoundParam::Payload(b"c"),
+                BoundParam::Id(&hex[0]),
+                BoundParam::Payload(b"a"),
+            ]
+        );
+        assert_eq!(
+            build_params(&payloads, None, &[1]),
+            vec![BoundParam::Payload(b"b")]
+        );
+    }
+
+    /// A duplicate key is handed to the fallback only in plain mode; under
+    /// `ON CONFLICT DO NOTHING` the classification is today's.
+    #[test]
+    fn is_dup_key_is_plain_mode_only() {
+        assert!(is_dup_key(&SqlState::UNIQUE_VIOLATION, InsertMode::Plain));
+        assert!(!is_dup_key(
+            &SqlState::UNIQUE_VIOLATION,
+            InsertMode::OnConflictDoNothing
+        ));
+        assert!(!is_dup_key(
+            &SqlState::T_R_DEADLOCK_DETECTED,
+            InsertMode::Plain
+        ));
+    }
+
     // ── Per-record idempotency key (`id_column`) ─────────────────────────────
 
     /// Two parameters per row, numbered consecutively, with the id column
@@ -741,7 +883,8 @@ mod tests {
             Some(ids.to_vec()),
         )
         .unwrap();
-        build_params(payloads, hex.as_deref())
+        let all: Vec<usize> = (0..payloads.len()).collect();
+        build_params(payloads, hex.as_deref(), &all)
             .into_iter()
             .filter_map(|slot| match slot {
                 BoundParam::Id(hex) => Some(hex.clone()),
@@ -772,7 +915,7 @@ mod tests {
             Some(ids.clone()),
         )
         .unwrap();
-        let bound = build_params(&payloads, hex.as_deref());
+        let bound = build_params(&payloads, hex.as_deref(), &[0, 1]);
 
         let first_hex = ids[0].to_hex();
         let second_hex = ids[1].to_hex();
@@ -1022,6 +1165,227 @@ mod tests {
                 assert_eq!(value, "1bad");
             }
             other => panic!("expected InvalidIdentifier, got {other:?}"),
+        }
+    }
+
+    // ── Live server: plain-mode duplicate keys (spec §4.7) ───────────────────
+    //
+    // `#[ignore]`d: they need the Postgres of the docker-compose rig. Run with
+    // `bash deploy/run-sink-integration-tests.sh`, or with the rig up:
+    //
+    //   WEIR_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:55432/weir_test \
+    //     cargo test -p weir-server --bin weir-server -- --ignored \
+    //     --test-threads=1 sink::postgres::tests::live_
+    //
+    // They drive the sink directly rather than through the daemon, because
+    // the scenario is a REPLAY of the same records under the same ids, which
+    // the daemon only produces after a crash.
+
+    mod live {
+        use super::*;
+        use weir_core::Payload;
+
+        fn url() -> String {
+            std::env::var("WEIR_TEST_POSTGRES_URL")
+                .expect("WEIR_TEST_POSTGRES_URL not set; see deploy/run-sink-integration-tests.sh")
+        }
+
+        async fn admin() -> tokio_postgres::Client {
+            let (client, conn) = tokio_postgres::connect(&url(), NoTls).await.unwrap();
+            tokio::spawn(conn);
+            client
+        }
+
+        /// A fresh table of the given shape. Each test owns its table name, so
+        /// the tests do not disturb each other or the rig's reference tables.
+        async fn fresh_table(table: &str, keyed: bool) {
+            let client = admin().await;
+            client
+                .batch_execute(&format!("DROP TABLE IF EXISTS \"{table}\""))
+                .await
+                .unwrap();
+            let ddl = if keyed {
+                format!(
+                    "CREATE TABLE \"{table}\" (id BIGSERIAL PRIMARY KEY, \
+                     record_id CHAR(64) NOT NULL UNIQUE, payload BYTEA NOT NULL)"
+                )
+            } else {
+                format!(
+                    "CREATE TABLE \"{table}\" (id BIGSERIAL PRIMARY KEY, \
+                     payload BYTEA NOT NULL UNIQUE)"
+                )
+            };
+            client.batch_execute(&ddl).await.unwrap();
+        }
+
+        async fn count(table: &str) -> i64 {
+            admin()
+                .await
+                .query_one(&format!("SELECT COUNT(*) FROM \"{table}\""), &[])
+                .await
+                .unwrap()
+                .get(0)
+        }
+
+        fn sink(
+            table: &str,
+            id_column: bool,
+            max_batch_size: usize,
+            timeout: Duration,
+        ) -> PostgresSink {
+            PostgresSink::new(PostgresSinkConfig {
+                url: url(),
+                table: table.to_string(),
+                column: "payload".to_string(),
+                id_column: id_column.then(|| "record_id".to_string()),
+                insert_mode: InsertMode::Plain,
+                max_batch_size,
+                timeout,
+            })
+            .unwrap()
+        }
+
+        /// The drain's batch for records `0..n` of one segment: the same
+        /// coordinates, hence the same ids, on every replay.
+        fn batch(payloads: &[Payload]) -> SinkBatch {
+            SinkBatch::with_record_ids(
+                payloads.to_vec(),
+                weir_sink_sdk::DedupToken::for_payloads(payloads.iter()),
+                segment_ids(payloads),
+            )
+        }
+
+        fn names(ps: &[Payload]) -> Vec<String> {
+            ps.iter()
+                .map(|p| String::from_utf8(p.to_vec()).unwrap())
+                .collect()
+        }
+
+        fn abc() -> Vec<Payload> {
+            vec![
+                Payload::from(b"a".as_ref()),
+                Payload::from(b"b".as_ref()),
+                Payload::from(b"c".as_ref()),
+            ]
+        }
+
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_POSTGRES_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_id_column_replay_counts_present_rows_as_committed() {
+            let table = "weir_dup_id_replay";
+            fresh_table(table, true).await;
+            let sink = sink(table, true, 1000, Duration::from_secs(10));
+            let all = abc();
+
+            let first = sink.commit(batch(&all[..2])).await.unwrap();
+            assert_eq!(names(&first.committed), ["a", "b"]);
+
+            let second = sink.commit(batch(&all)).await.unwrap();
+            assert_eq!(names(&second.committed), ["a", "b", "c"]);
+            assert!(
+                second.dead_lettered.is_empty(),
+                "{:?}",
+                second.dead_lettered
+            );
+            assert_eq!(
+                count(table).await,
+                3,
+                "exactly three rows: nothing written twice"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_POSTGRES_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_without_id_column_dead_letters_the_duplicates() {
+            let table = "weir_dup_bisect";
+            fresh_table(table, false).await;
+            let sink = sink(table, false, 1000, Duration::from_secs(10));
+            let all = abc();
+
+            sink.commit(SinkBatch::from(all[..2].to_vec()))
+                .await
+                .unwrap();
+            let second = sink.commit(SinkBatch::from(all.clone())).await.unwrap();
+            assert_eq!(names(&second.committed), ["c"]);
+            assert_eq!(
+                second
+                    .dead_lettered
+                    .iter()
+                    .map(|(p, _)| String::from_utf8(p.to_vec()).unwrap())
+                    .collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+            for (_, reason) in &second.dead_lettered {
+                assert!(
+                    reason.starts_with(
+                        "duplicate key (insert_mode=plain, no id_column): server 23505:"
+                    ),
+                    "{reason}"
+                );
+            }
+            assert_eq!(count(table).await, 3);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_POSTGRES_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_id_column_full_replay_of_5000_completes_within_the_timeout() {
+            let table = "weir_dup_replay_5000";
+            fresh_table(table, true).await;
+            let timeout = Duration::from_secs(10);
+            let sink = sink(table, true, 5000, timeout);
+            let all: Vec<Payload> = (0..5000)
+                .map(|i| Payload::copy_from_slice(format!("rec-{i:05}").as_bytes()))
+                .collect();
+
+            sink.commit(batch(&all)).await.unwrap();
+            let t = std::time::Instant::now();
+            let replay = sink.commit(batch(&all)).await.unwrap();
+            let took = t.elapsed();
+            assert_eq!(replay.committed.len(), 5000);
+            assert!(replay.dead_lettered.is_empty());
+            assert!(took < timeout, "replay took {took:?}");
+            assert_eq!(count(table).await, 5000);
+        }
+
+        /// The livelock's own trigger: the server applied the INSERT, the
+        /// client timed out. Latency is injected with a per-row trigger.
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_POSTGRES_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_attempt_that_timed_out_midway_is_completed_by_the_next() {
+            let table = "weir_dup_timed_out";
+            fresh_table(table, true).await;
+            admin()
+                .await
+                .batch_execute(&format!(
+                    "CREATE OR REPLACE FUNCTION {table}_slow() RETURNS trigger AS $$ \
+                     BEGIN PERFORM pg_sleep(0.4); RETURN NEW; END $$ LANGUAGE plpgsql; \
+                     CREATE TRIGGER {table}_slow BEFORE INSERT ON \"{table}\" \
+                     FOR EACH ROW EXECUTE FUNCTION {table}_slow();"
+                ))
+                .await
+                .unwrap();
+            let all = abc();
+
+            let err = sink(table, true, 1000, Duration::from_millis(300))
+                .commit(batch(&all))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SqlSinkError::Timeout { .. }), "{err}");
+            // Let the server finish the statement the client gave up on.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                count(table).await,
+                3,
+                "precondition: the server applied the attempt the client timed out on"
+            );
+
+            let r = sink(table, true, 1000, Duration::from_secs(10))
+                .commit(batch(&all))
+                .await
+                .unwrap();
+            assert_eq!(names(&r.committed), ["a", "b", "c"]);
+            assert!(r.dead_lettered.is_empty(), "{:?}", r.dead_lettered);
+            assert_eq!(count(table).await, 3);
         }
     }
 }

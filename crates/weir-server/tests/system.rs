@@ -3476,6 +3476,108 @@ fn sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record() {
     }
 }
 
+/// Spec §4.7 (D6), through the daemon: in `insert_mode = "plain"` a segment
+/// whose records are already in the table used to livelock the drain. The
+/// multi-row INSERT is all-or-nothing, the duplicate key was transient, and the
+/// identical statement was re-sent forever. Now the sink bisects (no
+/// `id_column` here) and the drain receives a proper partition: the new record
+/// is committed and the two duplicates are dead-lettered, losslessly.
+///
+/// Payloads carry a per-run nonce so a re-run does not collide with rows a
+/// previous run left in the rig's `weir_records` (UNIQUE on the payload).
+///
+/// The id-column half of §4.7 needs a replay of the same WAB coordinates, which
+/// the daemon only produces after a crash, so it is pinned at the sink level by
+/// the `live_` tests in `sink/mysql.rs` and `sink/postgres.rs`.
+#[test]
+#[ignore = "requires the docker-compose test stack (see deploy/run-sink-integration-tests.sh)"]
+fn sql_sink_plain_mode_duplicate_keys_do_not_livelock_the_drain() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    for (engine, url_var, table_cfg, mode_cfg) in [
+        (
+            "postgres",
+            "WEIR_TEST_POSTGRES_URL",
+            "sink_postgres_table",
+            "sink_postgres_insert_mode",
+        ),
+        (
+            "mysql",
+            "WEIR_TEST_MYSQL_URL",
+            "sink_mysql_table",
+            "sink_mysql_insert_mode",
+        ),
+    ] {
+        let url = std::env::var(url_var)
+            .unwrap_or_else(|_| panic!("{url_var} not set — see the test docstring"));
+        let srv = weir_server!(&format!("{engine}_plain_dup"))
+            .batch_size(200)
+            .batch_deadline_ms(5)
+            .shutdown_timeout_secs(5)
+            .env("WEIR_SINK_URL", &url)
+            .extra_config(format!("sink_type = \"{engine}\""))
+            .extra_config(format!("{table_cfg} = \"weir_records\""))
+            .extra_config(format!("{mode_cfg} = \"plain\""))
+            .extra_config("wab_segment_max_age_secs = 1")
+            .start();
+        let rec = |name: &str| format!("plain-dup-{engine}-{nonce}-{name}");
+        let outcome = |body: &str, o: &str| {
+            parse_metric(
+                body,
+                &format!("weir_sink_commit_records_total{{outcome=\"{o}\"}}"),
+            )
+        };
+        let wait_for = |what: &str, done: &dyn Fn(&str) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let body = srv.scrape_metrics();
+                if done(&body) {
+                    return body;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{engine}: timed out waiting for {what}\n{}",
+                    body.lines()
+                        .filter(|l| l.starts_with("weir_sink_"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                thread::sleep(Duration::from_millis(200));
+            }
+        };
+
+        // First segment: a and b, delivered normally.
+        let mut client = srv.client();
+        for name in ["a", "b"] {
+            client
+                .push(rec(name).as_bytes(), Durability::Durable)
+                .expect("push");
+        }
+        wait_for("the first segment", &|b| outcome(b, "committed") >= 2);
+
+        // Second segment: a and b again, plus c. Before the fix this segment
+        // never left the drain: committed stayed at 2, retried climbed forever.
+        for name in ["a", "b", "c"] {
+            client
+                .push(rec(name).as_bytes(), Durability::Durable)
+                .expect("push");
+        }
+        drop(client);
+        let body = wait_for("the second segment to resolve", &|b| {
+            outcome(b, "committed") + outcome(b, "dead_lettered") >= 5
+        });
+        assert_eq!(outcome(&body, "committed"), 3, "{engine}: a, b, then c");
+        assert_eq!(
+            outcome(&body, "dead_lettered"),
+            2,
+            "{engine}: the replayed a and b, kept in the dead-letter store"
+        );
+        drop(srv);
+    }
+}
+
 // ── S3 sink (MinIO) ─────────────────────────────────────────────────────────
 //
 // These require the docker-compose rig. Run them via:

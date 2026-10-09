@@ -606,6 +606,7 @@ impl Config {
                 config.dead_letter_max_bytes
             ));
         }
+        warnings.extend(config.advisory_warnings());
 
         Ok((config, warnings))
     }
@@ -1184,6 +1185,54 @@ impl Config {
 }
 
 // ── Path validation ───────────────────────────────────────────────────────────
+
+impl Config {
+    /// Post-validation advisories about a valid but risky configuration,
+    /// replayed through `tracing` by the caller like the other load warnings.
+    ///
+    /// Plain insert mode without an `id_column` (spec §4.7, D6): a duplicate
+    /// key can then only be resolved by bisecting the batch, and every
+    /// duplicate row is dead-lettered because it is not provably the record
+    /// already stored. That is lossless but fills the DL, and an all-duplicate
+    /// batch whose 2N−1 statements outrun `sink_timeout_secs` never completes.
+    /// With an `id_column` a duplicate is recognised as the same record and
+    /// counts as committed.
+    pub(crate) fn advisory_warnings(&self) -> Vec<String> {
+        match self.sink_type {
+            #[cfg(feature = "mysql-sink")]
+            SinkType::Mysql
+                if self.sink_mysql_insert_mode == crate::sink::mysql::InsertMode::Plain
+                    && self.sink_mysql_id_column.is_none() =>
+            {
+                vec![plain_without_id_column("mysql", "ignore")]
+            }
+            #[cfg(feature = "postgres-sink")]
+            SinkType::Postgres
+                if self.sink_postgres_insert_mode == crate::sink::postgres::InsertMode::Plain
+                    && self.sink_postgres_id_column.is_none() =>
+            {
+                vec![plain_without_id_column(
+                    "postgres",
+                    "on_conflict_do_nothing",
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The advisory for [`Config::advisory_warnings`]: names the setting, the cost
+/// and both fixes.
+#[cfg(any(feature = "mysql-sink", feature = "postgres-sink"))]
+fn plain_without_id_column(sink: &str, idempotent_mode: &str) -> String {
+    format!(
+        "sink_{sink}_insert_mode = \"plain\" without sink_{sink}_id_column: every \
+         duplicate-key row will be dead-lettered (it cannot be proven to be the \
+         record already stored), and an all-duplicate batch can exceed \
+         sink_timeout_secs and be retried indefinitely; set sink_{sink}_id_column \
+         to a UNIQUE column, or use insert_mode = \"{idempotent_mode}\""
+    )
+}
 
 /// Validates a directory path that must already exist.
 /// Returns the canonicalized path.
@@ -1820,6 +1869,76 @@ mod tests {
             assert_eq!(c.sink_mysql_insert_mode, expected);
             fs::remove_dir_all(dir).ok();
         }
+    }
+
+    /// Spec §4.7 (D6): plain mode without an `id_column` dead-letters every
+    /// duplicate row, and an all-duplicate batch can outrun the sink timeout.
+    /// The operator hears about it at startup, not from a full DL.
+    #[cfg(all(feature = "mysql-sink", feature = "postgres-sink"))]
+    #[test]
+    fn plain_mode_without_an_id_column_warns_at_config_load() {
+        let load = |sink: &str, mode: Option<&str>, id: Option<&str>| {
+            let dir = tmp_dir(&format!("plain_warn_{sink}_{mode:?}_{id:?}"));
+            let mut cli = PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some(sink.into()),
+                sink_url: Some(format!("{sink}://u:p@h/d")),
+                ..PartialConfig::empty()
+            };
+            match sink {
+                "mysql" => {
+                    cli.sink_mysql_insert_mode = mode.map(Into::into);
+                    cli.sink_mysql_id_column = id.map(Into::into);
+                }
+                _ => {
+                    cli.sink_postgres_insert_mode = mode.map(Into::into);
+                    cli.sink_postgres_id_column = id.map(Into::into);
+                }
+            }
+            let c =
+                Config::from_layers(cli, PartialConfig::empty(), PartialConfig::empty()).unwrap();
+            fs::remove_dir_all(dir).ok();
+            c.advisory_warnings()
+        };
+
+        for sink in ["mysql", "postgres"] {
+            let w = load(sink, Some("plain"), None);
+            assert_eq!(w.len(), 1, "{sink}: {w:?}");
+            assert!(
+                w[0].contains(&format!("sink_{sink}_insert_mode = \"plain\""))
+                    && w[0].contains(&format!("sink_{sink}_id_column"))
+                    && w[0].contains("dead-letter"),
+                "{sink}: the warning must name the setting, the fix and the cost: {}",
+                w[0]
+            );
+            assert!(
+                load(sink, Some("plain"), Some("record_id")).is_empty(),
+                "{sink}"
+            );
+            assert!(
+                load(sink, None, None).is_empty(),
+                "{sink}: the default mode is idempotent"
+            );
+        }
+        // The idempotent alternatives are named in the advice.
+        assert!(load("mysql", Some("plain"), None)[0].contains("\"ignore\""));
+        assert!(load("postgres", Some("plain"), None)[0].contains("\"on_conflict_do_nothing\""));
+        // A mysql setting is irrelevant to a postgres sink and vice versa.
+        let dir = tmp_dir("plain_warn_other_sink");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some("postgres".into()),
+                sink_url: Some("postgres://u:p@h/d".into()),
+                sink_mysql_insert_mode: Some("plain".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        fs::remove_dir_all(dir).ok();
+        assert!(c.advisory_warnings().is_empty());
     }
 
     #[cfg(feature = "mysql-sink")]

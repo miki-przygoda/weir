@@ -30,6 +30,8 @@
 //!   prefix in Display strings is the operator-friendly choice.
 //! - The Sink trait impl, the SQL-string builder, the config struct.
 
+#[cfg(any(feature = "mysql-sink", feature = "postgres-sink"))]
+use super::CommitResult;
 use super::SinkError;
 
 // ── Identifier validation ─────────────────────────────────────────────────────
@@ -232,6 +234,254 @@ pub(super) fn per_record_id_hex(
     }
 }
 
+// ── Plain-mode duplicate-key fallback ─────────────────────────────────────────
+
+/// How one statement failed, as [`insert_with_dup_fallback`] needs to see it.
+#[cfg(any(feature = "mysql-sink", feature = "postgres-sink"))]
+#[derive(Debug)]
+pub(crate) enum StmtError {
+    /// A `UNIQUE` violation (MySQL 1062, Postgres 23505), carrying the server's
+    /// message. The sinks only produce it in `insert_mode = "plain"`; in the
+    /// idempotent modes the server never raises one.
+    DupKey(String),
+    /// Anything else, already classified by the sink's own `classify`.
+    Other(SqlSinkError),
+}
+
+/// Writes `rows` with one multi-row `INSERT`, and resolves a duplicate-key
+/// failure instead of retrying the identical statement forever (spec §4.7).
+///
+/// # Why
+///
+/// In plain mode a duplicate key used to be transient. The statement is
+/// all-or-nothing, so the drain re-sent exactly the same `INSERT` and hit the
+/// same `UNIQUE` key on every attempt and after every restart: a livelock. The
+/// commonest trigger needs no concurrent writer at all — a `commit_timeout` on
+/// a commit the server *did* apply leaves `durable_through` where it was, and
+/// the retry collides with its own rows.
+///
+/// # What it does
+///
+/// - **First statement.** All rows, one statement — so a batch without
+///   duplicates still costs exactly one round trip. Success commits all; a
+///   transient error is returned as is; any other permanent error
+///   dead-letters the whole batch with that reason (unchanged behaviour).
+/// - **Duplicate key, with ids** (`ids` is `Some`: an `id_column` is set).
+///   An id is the record's WAB coordinate hashed with its bytes, so a row whose
+///   id is already present *is this record, already delivered*. One
+///   `lookup_present` over every id moves the present rows to `committed`, then
+///   one `INSERT` writes the remainder. Progress is monotonic across attempts:
+///   rows an earlier attempt inserted before timing out are found by the
+///   lookup. A duplicate key on the remainder means a concurrent writer or a
+///   *different* `UNIQUE` constraint, and the remainder is bisected.
+/// - **Duplicate key, without ids.** Bisection: split the failing set in
+///   halves and try each. A half that inserts is committed. A single row with
+///   a duplicate key is not provably the same record, so it is dead-lettered —
+///   kept losslessly — with the reason
+///   `duplicate key (insert_mode=plain, no id_column): <server message>`.
+///   All rows duplicates costs 2N−1 statements.
+/// - **Inside the fallback**, another permanent error is bisected down to its
+///   row and dead-letters only that row, with its own reason; another
+///   transient error returns transient for the whole batch (nothing is
+///   reported committed, so the drain retries it all).
+///
+/// # The deadline
+///
+/// Every statement, the first included, is preceded by a deadline check and
+/// bounded by `deadline` — the sink's existing per-commit `timeout`, not a new
+/// one. Passing it returns [`SqlSinkError::Timeout`] (transient). That bounds
+/// the fallback, and leaves one residual the spec records as unresolved: an
+/// all-duplicate batch without ids whose (2N−1) round trips exceed the timeout
+/// never completes. The config-load WARN for plain mode without an
+/// `id_column` is how an operator hears about that before it happens.
+///
+/// # The partition
+///
+/// On `Ok`, every index of `rows` appears exactly once across `committed` and
+/// `dead_lettered`, each in batch order. A row is reported committed only
+/// after a statement containing it succeeded or the lookup found its id —
+/// never on the strength of a statement that failed.
+///
+/// # Shape
+///
+/// The driver owns the decisions; the sink owns only the statements. `insert`
+/// writes the rows at the given indices as one multi-row `INSERT`;
+/// `lookup_present` returns which of the given indices' ids exist in the table
+/// (it is only called when `ids` is `Some`). Owned index vectors keep the
+/// returned futures free of borrows from the arguments.
+#[cfg(any(feature = "mysql-sink", feature = "postgres-sink"))]
+pub(crate) async fn insert_with_dup_fallback<I, IFut, L, LFut>(
+    driver: &'static str,
+    rows: &[weir_core::Payload],
+    ids: Option<&[String]>,
+    deadline: tokio::time::Instant,
+    mut insert: I,
+    mut lookup_present: L,
+) -> Result<CommitResult, SqlSinkError>
+where
+    I: FnMut(Vec<usize>) -> IFut,
+    IFut: std::future::Future<Output = Result<(), StmtError>>,
+    L: FnMut(Vec<usize>) -> LFut,
+    LFut: std::future::Future<Output = Result<std::collections::HashSet<String>, StmtError>>,
+{
+    let n = rows.len();
+
+    // ── First statement: the whole batch ─────────────────────────────────────
+    let first_dup = match bounded(driver, deadline, insert((0..n).collect())).await {
+        Ok(()) => {
+            tracing::debug!(
+                records = n,
+                "{driver} sink committed batch as single INSERT"
+            );
+            return Ok(CommitResult::new(rows.to_vec(), Vec::new()));
+        }
+        Err(StmtError::Other(e)) if e.is_transient() => return Err(e),
+        Err(StmtError::Other(e)) => {
+            let reason = e.to_string();
+            tracing::warn!(
+                records = n,
+                error = %reason,
+                "{driver} sink permanently rejected batch; dead-lettering"
+            );
+            let dead_lettered = rows.iter().map(|r| (r.clone(), reason.clone())).collect();
+            return Ok(CommitResult::new(Vec::new(), dead_lettered));
+        }
+        Err(StmtError::DupKey(msg)) => msg,
+    };
+
+    let mut committed: Vec<usize> = Vec::with_capacity(n);
+    let mut dead_lettered: Vec<(usize, String)> = Vec::new();
+
+    // ── Ids: one lookup, then the remainder ──────────────────────────────────
+    let (to_bisect, failure) = match ids {
+        Some(ids) => {
+            match bounded(driver, deadline, lookup_present((0..n).collect())).await {
+                Ok(present) => {
+                    // A CHAR(n > 64) column hands its value back space-padded
+                    // on Postgres; the ids themselves never carry padding.
+                    let present: std::collections::HashSet<&str> = present
+                        .iter()
+                        .map(|id| id.trim_end_matches([' ', '\0']))
+                        .collect();
+                    let mut remainder = Vec::new();
+                    for (i, id) in ids.iter().enumerate() {
+                        if present.contains(id.as_str()) {
+                            committed.push(i);
+                        } else {
+                            remainder.push(i);
+                        }
+                    }
+                    if remainder.is_empty() {
+                        (Vec::new(), None)
+                    } else {
+                        match bounded(driver, deadline, insert(remainder.clone())).await {
+                            Ok(()) => {
+                                committed.extend(&remainder);
+                                (Vec::new(), None)
+                            }
+                            Err(StmtError::Other(e)) if e.is_transient() => return Err(e),
+                            Err(err) => (remainder, Some(err)),
+                        }
+                    }
+                }
+                Err(StmtError::Other(e)) if e.is_transient() => return Err(e),
+                // The lookup itself was rejected (a column type the driver
+                // cannot read back, say). Bisection needs no lookup and is
+                // lossless, so fall back to it rather than dead-lettering.
+                Err(_) => ((0..n).collect(), Some(StmtError::DupKey(first_dup.clone()))),
+            }
+        }
+        None => ((0..n).collect(), Some(StmtError::DupKey(first_dup.clone()))),
+    };
+
+    // ── Bisection ────────────────────────────────────────────────────────────
+    if let Some(failure) = failure {
+        let dup_reason = |msg: &str| match ids {
+            None => format!("duplicate key (insert_mode=plain, no id_column): {msg}"),
+            Some(_) => format!(
+                "duplicate key (insert_mode=plain) on a record whose id was not present: \
+                 a different UNIQUE constraint or a concurrent writer: {msg}"
+            ),
+        };
+        // `set` is known to have failed with `err`: dead-letter a single row,
+        // split anything larger. Left half is pushed last so it runs first.
+        let mut stack: Vec<Vec<usize>> = Vec::new();
+        let mut on_failure = |mut set: Vec<usize>, err: StmtError, stack: &mut Vec<Vec<usize>>| {
+            if set.len() == 1 {
+                let reason = match err {
+                    StmtError::DupKey(msg) => dup_reason(&msg),
+                    StmtError::Other(e) => e.to_string(),
+                };
+                dead_lettered.push((set[0], reason));
+            } else {
+                let right = set.split_off(set.len() / 2);
+                stack.push(right);
+                stack.push(set);
+            }
+        };
+        on_failure(to_bisect, failure, &mut stack);
+        while let Some(set) = stack.pop() {
+            match bounded(driver, deadline, insert(set.clone())).await {
+                Ok(()) => committed.extend(&set),
+                Err(StmtError::Other(e)) if e.is_transient() => return Err(e),
+                Err(err) => on_failure(set, err, &mut stack),
+            }
+        }
+    }
+
+    committed.sort_unstable();
+    dead_lettered.sort_unstable_by_key(|(i, _)| *i);
+    debug_assert_eq!(
+        committed.len() + dead_lettered.len(),
+        n,
+        "committed ∪ dead_lettered must partition the batch"
+    );
+    // A replay resolved entirely by id is routine after a commit timeout, so
+    // it is INFO; a row sent to the dead-letter store is the operator's to see.
+    if dead_lettered.is_empty() {
+        tracing::info!(
+            records = n,
+            committed = committed.len(),
+            with_id_column = ids.is_some(),
+            first_error = %first_dup,
+            "{driver} sink: duplicate key in insert_mode=plain resolved; every row committed"
+        );
+    } else {
+        tracing::warn!(
+            records = n,
+            committed = committed.len(),
+            dead_lettered = dead_lettered.len(),
+            with_id_column = ids.is_some(),
+            first_error = %first_dup,
+            "{driver} sink: duplicate key in insert_mode=plain; dead-lettering the duplicate rows"
+        );
+    }
+    Ok(CommitResult::new(
+        committed.into_iter().map(|i| rows[i].clone()).collect(),
+        dead_lettered
+            .into_iter()
+            .map(|(i, reason)| (rows[i].clone(), reason))
+            .collect(),
+    ))
+}
+
+/// One statement, preceded by a deadline check and bounded by the deadline.
+/// Either way out is [`SqlSinkError::Timeout`]: transient, so the drain
+/// retries the batch.
+#[cfg(any(feature = "mysql-sink", feature = "postgres-sink"))]
+async fn bounded<T>(
+    driver: &'static str,
+    deadline: tokio::time::Instant,
+    stmt: impl std::future::Future<Output = Result<T, StmtError>>,
+) -> Result<T, StmtError> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(StmtError::Other(SqlSinkError::timeout(driver)));
+    }
+    tokio::time::timeout_at(deadline, stmt)
+        .await
+        .unwrap_or_else(|_elapsed| Err(StmtError::Other(SqlSinkError::timeout(driver))))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -391,5 +641,545 @@ mod tests {
             "postgres sink permanent: syntax error at $1"
         );
         assert_eq!(format!("{t}"), "mysql sink timeout");
+    }
+}
+
+// ── Plain-mode duplicate-key fallback: tests against a fake executor ──────────
+
+#[cfg(all(test, any(feature = "mysql-sink", feature = "postgres-sink")))]
+mod dup_fallback_tests {
+    //! The driver is exercised against an in-memory table rather than a server.
+    //! It reproduces what matters about a real multi-row `INSERT` in autocommit:
+    //! the statement is all-or-nothing, and its error is the first failing
+    //! row's. The live-server versions of the spec §4.7 tests are the
+    //! `#[ignore]`d ones in `mysql.rs` / `postgres.rs`, run by
+    //! `deploy/run-sink-integration-tests.sh`.
+
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use weir_core::Payload;
+
+    const SERVER_DUP: &str = "server 1062: Duplicate entry";
+
+    /// Which column the fake table's `UNIQUE` constraint is on.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Unique {
+        /// `UNIQUE (record_id)` — pairs with an `id_column`.
+        Id,
+        /// `UNIQUE (payload)` — the content-keyed schema, no `id_column`.
+        Payload,
+    }
+
+    struct FakeTable {
+        unique: Unique,
+        /// The rows stored, as (id, payload).
+        rows: RefCell<Vec<(Option<String>, Vec<u8>)>>,
+        /// Payloads the server rejects permanently (e.g. "data too long").
+        permanent: HashSet<Vec<u8>>,
+        /// 1-based statement number that fails transiently.
+        transient_on: Option<usize>,
+        /// Per-statement latency, applied AFTER the statement has taken
+        /// effect — so a statement that outlives the deadline has still been
+        /// applied, which is exactly the `commit_timeout` case in §4.7.
+        latency: Duration,
+        statements: Cell<usize>,
+        lookups: Cell<usize>,
+    }
+
+    impl FakeTable {
+        fn new(unique: Unique) -> Self {
+            Self {
+                unique,
+                rows: RefCell::new(Vec::new()),
+                permanent: HashSet::new(),
+                transient_on: None,
+                latency: Duration::ZERO,
+                statements: Cell::new(0),
+                lookups: Cell::new(0),
+            }
+        }
+
+        fn key(&self, id: Option<&String>, payload: &[u8]) -> Vec<u8> {
+            match self.unique {
+                Unique::Id => id.expect("a UNIQUE on id needs ids").clone().into_bytes(),
+                Unique::Payload => payload.to_vec(),
+            }
+        }
+
+        fn bump(&self) -> usize {
+            let n = self.statements.get() + 1;
+            self.statements.set(n);
+            n
+        }
+
+        async fn insert(
+            &self,
+            rows: &[Payload],
+            ids: Option<&[String]>,
+            idx: Vec<usize>,
+        ) -> Result<(), StmtError> {
+            let n = self.bump();
+            if self.transient_on == Some(n) {
+                return Err(StmtError::Other(SqlSinkError::transient(
+                    "mysql",
+                    "io: connection reset",
+                )));
+            }
+            let mut present: HashSet<Vec<u8>> = self
+                .rows
+                .borrow()
+                .iter()
+                .map(|(id, p)| self.key(id.as_ref(), p))
+                .collect();
+            // All-or-nothing: the first failing row decides the error, and a
+            // failing statement stores nothing.
+            for &i in &idx {
+                let id = ids.map(|ids| &ids[i]);
+                if self.permanent.contains(rows[i].as_ref()) {
+                    return Err(StmtError::Other(SqlSinkError::permanent(
+                        "mysql",
+                        "server 1406: Data too long for column 'payload'",
+                    )));
+                }
+                if !present.insert(self.key(id, &rows[i])) {
+                    return Err(StmtError::DupKey(SERVER_DUP.to_string()));
+                }
+            }
+            self.rows.borrow_mut().extend(
+                idx.iter()
+                    .map(|&i| (ids.map(|ids| ids[i].clone()), rows[i].to_vec())),
+            );
+            if !self.latency.is_zero() {
+                tokio::time::sleep(self.latency).await;
+            }
+            Ok(())
+        }
+
+        async fn lookup(
+            &self,
+            ids: &[String],
+            idx: Vec<usize>,
+        ) -> Result<HashSet<String>, StmtError> {
+            let n = self.bump();
+            self.lookups.set(self.lookups.get() + 1);
+            if self.transient_on == Some(n) {
+                return Err(StmtError::Other(SqlSinkError::transient(
+                    "mysql",
+                    "io: connection reset",
+                )));
+            }
+            let stored: HashSet<String> = self
+                .rows
+                .borrow()
+                .iter()
+                .filter_map(|(id, _)| id.clone())
+                .collect();
+            Ok(idx
+                .iter()
+                .map(|&i| ids[i].clone())
+                .filter(|id| stored.contains(id))
+                .collect())
+        }
+
+        fn stored_payloads(&self) -> Vec<Vec<u8>> {
+            self.rows.borrow().iter().map(|(_, p)| p.clone()).collect()
+        }
+    }
+
+    fn payloads(names: &[&str]) -> Vec<Payload> {
+        names
+            .iter()
+            .map(|n| Payload::copy_from_slice(n.as_bytes()))
+            .collect()
+    }
+
+    /// Ids exactly as the drain derives them: the segment coordinate, so a
+    /// replay of the same segment carries the same ids.
+    fn ids_for(rows: &[Payload]) -> Vec<String> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, p)| {
+                weir_sink_sdk::RecordId::for_record(
+                    "shard_00/seg_00000001.wab.sealed",
+                    i as u64 + 1,
+                    p,
+                )
+                .to_hex()
+            })
+            .collect()
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    async fn run(
+        table: &FakeTable,
+        rows: &[Payload],
+        ids: Option<&[String]>,
+        deadline: Instant,
+    ) -> Result<CommitResult, SqlSinkError> {
+        insert_with_dup_fallback(
+            "mysql",
+            rows,
+            ids,
+            deadline,
+            |idx| table.insert(rows, ids, idx),
+            |idx| table.lookup(ids.expect("lookup only runs with ids"), idx),
+        )
+        .await
+    }
+
+    fn names(ps: &[Payload]) -> Vec<String> {
+        ps.iter()
+            .map(|p| String::from_utf8(p.to_vec()).unwrap())
+            .collect()
+    }
+
+    fn dl_names(dl: &[(Payload, String)]) -> Vec<String> {
+        dl.iter()
+            .map(|(p, _)| String::from_utf8(p.to_vec()).unwrap())
+            .collect()
+    }
+
+    // ── The two spec scenarios ───────────────────────────────────────────────
+
+    /// §4.7, id path: `[a,b]` then `[a,b,c]`. a and b are already present under
+    /// the same ids, so they are the same records already delivered: committed,
+    /// not dead-lettered, and not written twice.
+    #[tokio::test]
+    async fn id_path_a_replay_counts_present_rows_as_committed() {
+        let table = FakeTable::new(Unique::Id);
+        let all = payloads(&["a", "b", "c"]);
+        let ids = ids_for(&all);
+
+        let first = run(&table, &all[..2], Some(&ids[..2]), far())
+            .await
+            .unwrap();
+        assert_eq!(names(&first.committed), ["a", "b"]);
+
+        table.statements.set(0);
+        let second = run(&table, &all, Some(&ids), far()).await.unwrap();
+        assert_eq!(names(&second.committed), ["a", "b", "c"]);
+        assert!(
+            second.dead_lettered.is_empty(),
+            "{:?}",
+            second.dead_lettered
+        );
+        assert_eq!(
+            table.stored_payloads(),
+            [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(
+            table.statements.get(),
+            3,
+            "a constant number of round trips: the failed INSERT, one lookup, the remainder"
+        );
+    }
+
+    /// §4.7, no `id_column`: `[a,b]` then `[a,b,c]`. a and b are not provably the
+    /// same records, so they are kept losslessly in the DL, with the reason.
+    #[tokio::test]
+    async fn bisection_path_dead_letters_the_duplicate_rows_with_the_reason() {
+        let table = FakeTable::new(Unique::Payload);
+        let all = payloads(&["a", "b", "c"]);
+
+        run(&table, &all[..2], None, far()).await.unwrap();
+        let second = run(&table, &all, None, far()).await.unwrap();
+
+        assert_eq!(names(&second.committed), ["c"]);
+        assert_eq!(dl_names(&second.dead_lettered), ["a", "b"]);
+        for (_, reason) in &second.dead_lettered {
+            assert_eq!(
+                reason,
+                &format!("duplicate key (insert_mode=plain, no id_column): {SERVER_DUP}")
+            );
+        }
+        assert_eq!(table.stored_payloads().len(), 3);
+    }
+
+    // ── Cost ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_batch_without_duplicates_still_costs_one_statement() {
+        for (unique, with_ids) in [(Unique::Payload, false), (Unique::Id, true)] {
+            let table = FakeTable::new(unique);
+            let rows = payloads(&["a", "b", "c", "d"]);
+            let ids = ids_for(&rows);
+            let r = run(&table, &rows, with_ids.then_some(&ids[..]), far())
+                .await
+                .unwrap();
+            assert_eq!(r.committed.len(), 4);
+            assert_eq!(table.statements.get(), 1, "{unique:?}");
+        }
+    }
+
+    /// The spec's worst case: every row a duplicate costs 2N−1 statements.
+    #[tokio::test]
+    async fn bisection_worst_case_is_2n_minus_1_statements() {
+        let table = FakeTable::new(Unique::Payload);
+        let rows = payloads(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        run(&table, &rows, None, far()).await.unwrap();
+        table.statements.set(0);
+
+        let r = run(&table, &rows, None, far()).await.unwrap();
+        assert!(r.committed.is_empty());
+        assert_eq!(r.dead_lettered.len(), 8);
+        assert_eq!(table.statements.get(), 2 * 8 - 1);
+    }
+
+    // ── Deadline ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_passed_deadline_is_transient_and_runs_no_statement() {
+        let table = FakeTable::new(Unique::Payload);
+        let rows = payloads(&["a"]);
+        let err = run(
+            &table,
+            &rows,
+            None,
+            Instant::now() - Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert!(matches!(err, SqlSinkError::Timeout { .. }), "{err}");
+        assert_eq!(table.statements.get(), 0);
+    }
+
+    /// The deadline is checked before each statement of the fallback, not only
+    /// around the whole thing — so an all-duplicate batch cannot run past the
+    /// sink timeout one statement at a time.
+    #[tokio::test]
+    async fn a_deadline_passing_mid_bisection_is_transient() {
+        let mut table = FakeTable::new(Unique::Payload);
+        let rows = payloads(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        run(&table, &rows, None, far()).await.unwrap();
+        table.statements.set(0);
+        table.latency = Duration::from_millis(30);
+
+        // Dup-key statements fail before the fake's latency, so only the
+        // successful ones are slow. Interleave fresh rows with duplicates so the
+        // bisection reaches slow single-row successes early: `i` succeeds at
+        // ~30 ms, `j` at ~60 ms, and the check before the next statement trips.
+        let fresh = payloads(&["i", "j", "k", "l"]);
+        let mixed: Vec<Payload> = fresh
+            .iter()
+            .zip(&rows[..4])
+            .flat_map(|(f, d)| [f.clone(), d.clone()])
+            .collect();
+        let err = run(
+            &table,
+            &mixed,
+            None,
+            Instant::now() + Duration::from_millis(45),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SqlSinkError::Timeout { .. }), "{err}");
+        assert!(
+            table.statements.get() < 2 * 8 - 1,
+            "the fallback must stop at the deadline, ran {} statements",
+            table.statements.get()
+        );
+    }
+
+    /// §4.7: a commit the server applied but the client timed out on. The next
+    /// attempt finds every row by id: all committed, nothing dead-lettered.
+    #[tokio::test]
+    async fn an_attempt_that_applied_but_timed_out_is_completed_by_the_next() {
+        let mut table = FakeTable::new(Unique::Id);
+        let rows = payloads(&["a", "b", "c"]);
+        let ids = ids_for(&rows);
+        table.latency = Duration::from_millis(200);
+
+        let err = run(
+            &table,
+            &rows,
+            Some(&ids),
+            Instant::now() + Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SqlSinkError::Timeout { .. }), "{err}");
+        assert_eq!(
+            table.stored_payloads().len(),
+            3,
+            "precondition: the server applied it"
+        );
+
+        table.latency = Duration::ZERO;
+        let r = run(&table, &rows, Some(&ids), far()).await.unwrap();
+        assert_eq!(names(&r.committed), ["a", "b", "c"]);
+        assert!(r.dead_lettered.is_empty());
+        assert_eq!(table.stored_payloads().len(), 3, "nothing written twice");
+    }
+
+    // ── Other errors inside the fallback ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn another_permanent_error_dead_letters_only_that_row() {
+        // No id_column: `a` is a duplicate, `c` is permanently rejected.
+        let mut table = FakeTable::new(Unique::Payload);
+        table.permanent.insert(b"c".to_vec());
+        run(&table, &payloads(&["a"]), None, far()).await.unwrap();
+
+        let r = run(&table, &payloads(&["a", "b", "c", "d"]), None, far())
+            .await
+            .unwrap();
+        assert_eq!(names(&r.committed), ["b", "d"]);
+        assert_eq!(dl_names(&r.dead_lettered), ["a", "c"]);
+        assert!(r.dead_lettered[0].1.starts_with("duplicate key"));
+        assert!(
+            r.dead_lettered[1].1.contains("Data too long"),
+            "the permanent row keeps its own reason: {}",
+            r.dead_lettered[1].1
+        );
+
+        // With an id_column: `a` is present (a replay), `c` permanent.
+        let mut table = FakeTable::new(Unique::Id);
+        table.permanent.insert(b"c".to_vec());
+        let rows = payloads(&["a", "b", "c", "d"]);
+        let ids = ids_for(&rows);
+        run(&table, &rows[..1], Some(&ids[..1]), far())
+            .await
+            .unwrap();
+        let r = run(&table, &rows, Some(&ids), far()).await.unwrap();
+        assert_eq!(names(&r.committed), ["a", "b", "d"]);
+        assert_eq!(dl_names(&r.dead_lettered), ["c"]);
+        assert!(r.dead_lettered[0].1.contains("Data too long"));
+    }
+
+    #[tokio::test]
+    async fn another_transient_error_makes_the_whole_batch_transient() {
+        // No id_column: the second statement (first bisection half) fails.
+        let mut table = FakeTable::new(Unique::Payload);
+        run(&table, &payloads(&["a"]), None, far()).await.unwrap();
+        table.statements.set(0);
+        table.transient_on = Some(2);
+        let err = run(&table, &payloads(&["a", "b", "c", "d"]), None, far())
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "{err}");
+
+        // With an id_column: the lookup (statement 2) fails.
+        let mut table = FakeTable::new(Unique::Id);
+        let rows = payloads(&["a", "b"]);
+        let ids = ids_for(&rows);
+        run(&table, &rows[..1], Some(&ids[..1]), far())
+            .await
+            .unwrap();
+        table.statements.set(0);
+        table.transient_on = Some(2);
+        let err = run(&table, &rows, Some(&ids), far()).await.unwrap_err();
+        assert!(err.is_transient(), "{err}");
+        assert_eq!(table.lookups.get(), 1);
+    }
+
+    /// Unchanged behaviour: a permanent error on the FIRST statement (no
+    /// duplicate involved) dead-letters the whole batch with that reason, in
+    /// one statement, exactly as before.
+    #[tokio::test]
+    async fn a_permanent_first_statement_still_dead_letters_the_whole_batch() {
+        let mut table = FakeTable::new(Unique::Payload);
+        table.permanent.insert(b"a".to_vec());
+        let r = run(&table, &payloads(&["a", "b"]), None, far())
+            .await
+            .unwrap();
+        assert!(r.committed.is_empty());
+        assert_eq!(dl_names(&r.dead_lettered), ["a", "b"]);
+        assert_eq!(table.statements.get(), 1);
+    }
+
+    // ── The partition ────────────────────────────────────────────────────────
+
+    #[derive(Clone, Copy, Debug)]
+    enum Row {
+        New,
+        Dup,
+        Permanent,
+    }
+
+    fn row_strategy() -> impl proptest::strategy::Strategy<Value = Row> {
+        use proptest::prelude::*;
+        prop_oneof![6 => Just(Row::New), 3 => Just(Row::Dup), 1 => Just(Row::Permanent)]
+    }
+
+    proptest::proptest! {
+        /// `committed ∪ dead_lettered = batch` (the drain checks the count at
+        /// drain/mod.rs, but identity is this driver's job), every committed row
+        /// is really in the table — never a false ack — and nothing is stored
+        /// twice under the UNIQUE key.
+        #[test]
+        fn the_partition_always_holds(
+            shape in proptest::collection::vec(row_strategy(), 1..24),
+            with_ids in proptest::bool::ANY,
+            transient_on in proptest::option::weighted(0.2, 1usize..8),
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+            rt.block_on(async {
+                let mut table = FakeTable::new(if with_ids { Unique::Id } else { Unique::Payload });
+                let rows: Vec<Payload> = (0..shape.len())
+                    .map(|i| Payload::copy_from_slice(format!("row-{i:02}").as_bytes()))
+                    .collect();
+                let ids = ids_for(&rows);
+                for (i, kind) in shape.iter().enumerate() {
+                    match kind {
+                        Row::Dup => table.rows.borrow_mut().push((Some(ids[i].clone()), rows[i].to_vec())),
+                        Row::Permanent => { table.permanent.insert(rows[i].to_vec()); }
+                        Row::New => {}
+                    }
+                }
+                table.transient_on = transient_on;
+                let ids_arg = with_ids.then_some(&ids[..]);
+
+                match run(&table, &rows, ids_arg, far()).await {
+                    Err(e) => {
+                        assert!(e.is_transient(), "only a transient fault may fail the batch: {e}");
+                        assert!(transient_on.is_some(), "no fault injected, yet: {e}");
+                    }
+                    Ok(r) => {
+                        let mut seen: Vec<String> = names(&r.committed);
+                        seen.extend(dl_names(&r.dead_lettered));
+                        seen.sort();
+                        let mut want = names(&rows);
+                        want.sort();
+                        assert_eq!(seen, want, "committed ∪ dead_lettered must be the batch, once each");
+
+                        let stored = table.stored_payloads();
+                        for c in &r.committed {
+                            assert!(stored.contains(&c.to_vec()), "false ack: {c:?} committed but not stored");
+                        }
+                        let mut uniq = stored.clone();
+                        uniq.sort();
+                        uniq.dedup();
+                        assert_eq!(uniq.len(), stored.len(), "a row stored twice");
+
+                        // A permanent error on the FIRST statement (the first
+                        // failing row is not a duplicate) keeps today's
+                        // behaviour: the whole batch is dead-lettered.
+                        let first_failure = shape.iter().find(|k| !matches!(k, Row::New));
+                        if matches!(first_failure, Some(Row::Permanent)) {
+                            assert!(r.committed.is_empty());
+                            return;
+                        }
+                        for (i, kind) in shape.iter().enumerate() {
+                            let name = format!("row-{i:02}");
+                            match kind {
+                                Row::Permanent => assert!(dl_names(&r.dead_lettered).contains(&name)),
+                                // With ids, a present row is the same record:
+                                // committed, never dead-lettered.
+                                Row::Dup if with_ids => assert!(names(&r.committed).contains(&name)),
+                                Row::Dup => assert!(dl_names(&r.dead_lettered).contains(&name)),
+                                Row::New => {}
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 }

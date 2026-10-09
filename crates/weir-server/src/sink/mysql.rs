@@ -21,8 +21,26 @@
 //! committed pre-crash (the `.confirmed` sidecar was not written). The
 //! sink defaults to `INSERT IGNORE`, which silently drops duplicates if
 //! the target table has a `UNIQUE` constraint. With `insert_mode = "plain"`
-//! the operator opts out — and accepts the resulting duplicate rows on
-//! crash-recovery retries.
+//! the server reports a duplicate instead, and the sink resolves it row by row
+//! (see *Plain mode and duplicate keys* below).
+//!
+//! ## Plain mode and duplicate keys
+//!
+//! A plain multi-row `INSERT` is all-or-nothing, so one duplicate fails the
+//! whole statement. Retrying it cannot help — it hits the same key every time
+//! — so on `ER_DUP_ENTRY` the sink hands the batch to
+//! [`sql_common::insert_with_dup_fallback`]:
+//!
+//! - **With `id_column`**: one `SELECT … WHERE id IN (…)` finds the rows already
+//!   present. Their id is their WAB coordinate, so they are this record,
+//!   already delivered, and count as committed. One `INSERT` writes the rest.
+//! - **Without `id_column`**: the batch is bisected, and each row that is still
+//!   a duplicate on its own is dead-lettered with
+//!   `duplicate key (insert_mode=plain, no id_column): <server message>`.
+//!
+//! All of it runs inside the one per-commit `timeout`. Plain mode without an
+//! `id_column` draws a config-load warning, because there every duplicate
+//! costs a dead-letter record.
 //!
 //! ## What the UNIQUE constraint should be on
 //!
@@ -64,10 +82,9 @@
 //!   so the drain retries until it's fixed rather than dead-lettering live data.
 //!   This matches the Postgres sink, where a connection-time auth failure is a
 //!   non-DbError and already transient.
-//! - Codes 1062 (`ER_DUP_ENTRY`) — never seen under `INSERT IGNORE`; under
-//!   `plain` mode treated as transient so the drain retries the segment
-//!   after backoff, in case the duplicate is from a stale concurrent
-//!   writer rather than a re-commit.
+//! - Code 1062 (`ER_DUP_ENTRY`) — never seen under `INSERT IGNORE`; under
+//!   `plain` mode resolved row by row as described above, never retried
+//!   as-is (retrying the identical statement was a livelock).
 //! - All other server errors (syntax, missing table, missing column, …) →
 //!   permanent. The whole batch is dead-lettered with the server-supplied
 //!   error message so an operator can debug.
@@ -85,10 +102,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mysql_async::{Pool, prelude::Queryable};
-use tracing::{debug, warn};
 
-use super::sql_common::{self, SqlSinkError};
-use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
+use super::sql_common::{self, SqlSinkError, StmtError};
+use super::{CommitResult, Sink, SinkBatch, SinkHealth};
 
 /// Static driver tag used by [`SqlSinkError`] variants emitted from this
 /// module. Keeps `"mysql sink ..."` consistent in log lines without
@@ -112,7 +128,8 @@ pub enum InsertMode {
     /// discard distinct records that share bytes — see the module docs.
     Ignore,
     /// `INSERT INTO …` — duplicates surface as `ER_DUP_ENTRY` and are
-    /// classified as transient (drain retries).
+    /// resolved row by row: committed when the `id_column` shows the record is
+    /// already present, dead-lettered otherwise. See the module docs.
     Plain,
 }
 
@@ -254,6 +271,17 @@ impl MySqlSink {
             }
         }
     }
+
+    /// The plain-mode duplicate-key lookup: which of `n` ids are already in
+    /// the table. One placeholder per id; `sink_max_batch_size` is capped at
+    /// 10 000, well under MySQL's 65 535-placeholder limit.
+    pub(crate) fn build_lookup_sql(&self, id_column: &str, n: usize) -> String {
+        let placeholders = std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ");
+        format!(
+            "SELECT `{id_column}` FROM `{}` WHERE `{id_column}` IN ({placeholders})",
+            self.config.table
+        )
+    }
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -336,6 +364,22 @@ pub(crate) fn is_transient_server_code(code: u16) -> bool {
     )
 }
 
+/// `ER_DUP_ENTRY`.
+const ER_DUP_ENTRY: u16 = 1062;
+
+/// Classifies one statement's failure for the duplicate-key fallback. In plain
+/// mode `ER_DUP_ENTRY` becomes [`StmtError::DupKey`]; everything else, and
+/// every error in `ignore` mode, goes through [`classify`] unchanged.
+pub(crate) fn classify_stmt(err: mysql_async::Error, mode: InsertMode) -> StmtError {
+    if mode == InsertMode::Plain
+        && let mysql_async::Error::Server(srv) = &err
+        && srv.code == ER_DUP_ENTRY
+    {
+        return StmtError::DupKey(format!("server {}: {}", srv.code, srv.message));
+    }
+    StmtError::Other(classify(err))
+}
+
 /// Positional parameters for the statement `build_insert_sql` produced, in
 /// placeholder order.
 ///
@@ -348,25 +392,26 @@ pub(crate) fn is_transient_server_code(code: u16) -> bool {
 /// `id_hex` is `None` when no `id_column` is configured, and otherwise carries
 /// exactly one hex `RecordId` per record (enforced upstream by
 /// [`sql_common::per_record_id_hex`]).
+///
+/// `rows` names the records to bind, by index into `batch`: every index for
+/// the first statement, a subset for the duplicate-key fallback. A record's id
+/// and payload are read at the same index, so they cannot drift apart.
 fn build_params(
     batch: &[weir_core::Payload],
     id_hex: Option<&[String]>,
+    rows: &[usize],
 ) -> Vec<mysql_async::Value> {
     match id_hex {
-        None => batch
+        None => rows
             .iter()
-            .map(|p| mysql_async::Value::Bytes(p.to_vec()))
+            .map(|&i| mysql_async::Value::Bytes(batch[i].to_vec()))
             .collect(),
-        // Zipping rather than indexing keeps the two sequences in step by
-        // construction, and a length mismatch truncates rather than panicking
-        // — which cannot happen, because per_record_id_hex already rejected it.
-        Some(ids) => ids
+        Some(ids) => rows
             .iter()
-            .zip(batch.iter())
-            .flat_map(|(id, payload)| {
+            .flat_map(|&i| {
                 [
-                    mysql_async::Value::Bytes(id.clone().into_bytes()),
-                    mysql_async::Value::Bytes(payload.to_vec()),
+                    mysql_async::Value::Bytes(ids[i].clone().into_bytes()),
+                    mysql_async::Value::Bytes(batch[i].to_vec()),
                 ]
             })
             .collect(),
@@ -390,40 +435,71 @@ impl Sink for MySqlSink {
             record_ids,
         )?;
 
-        let sql = self.build_insert_sql(batch.len());
-        let params = build_params(&batch, id_hex.as_deref());
+        // One deadline for the whole commit, fallback included: the
+        // duplicate-key path never stretches a commit past the sink timeout.
+        let deadline = tokio::time::Instant::now() + self.config.timeout;
+        let mode = self.config.insert_mode;
+        let (batch, id_hex) = (&batch, id_hex.as_deref());
 
-        let conn_fut = async {
-            let mut conn = self.pool.get_conn().await.map_err(classify)?;
-            conn.exec_drop(&sql, mysql_async::Params::Positional(params))
-                .await
-                .map_err(classify)
+        let insert = |rows: Vec<usize>| {
+            let sql = self.build_insert_sql(rows.len());
+            let params = build_params(batch, id_hex, &rows);
+            async move {
+                let mut conn = self
+                    .pool
+                    .get_conn()
+                    .await
+                    .map_err(|e| StmtError::Other(classify(e)))?;
+                conn.exec_drop(&sql, mysql_async::Params::Positional(params))
+                    .await
+                    .map_err(|e| classify_stmt(e, mode))
+            }
+        };
+        let lookup_present = |rows: Vec<usize>| {
+            // Only called when an id column is configured (the driver gets
+            // `ids = Some` exactly then); the `None` arm is unreachable but
+            // answers with an error rather than a panic.
+            let query = self
+                .config
+                .id_column
+                .as_deref()
+                .zip(id_hex)
+                .map(|(col, ids)| {
+                    let params: Vec<mysql_async::Value> = rows
+                        .iter()
+                        .map(|&i| mysql_async::Value::Bytes(ids[i].clone().into_bytes()))
+                        .collect();
+                    (self.build_lookup_sql(col, rows.len()), params)
+                });
+            async move {
+                let Some((sql, params)) = query else {
+                    return Err(StmtError::Other(SqlSinkError::permanent(
+                        DRIVER,
+                        "duplicate-key lookup without an id column",
+                    )));
+                };
+                let mut conn = self
+                    .pool
+                    .get_conn()
+                    .await
+                    .map_err(|e| StmtError::Other(classify(e)))?;
+                let found: Vec<String> = conn
+                    .exec(&sql, mysql_async::Params::Positional(params))
+                    .await
+                    .map_err(|e| StmtError::Other(classify(e)))?;
+                Ok(found.into_iter().collect())
+            }
         };
 
-        match tokio::time::timeout(self.config.timeout, conn_fut).await {
-            Ok(Ok(())) => {
-                debug!(
-                    records = batch.len(),
-                    "mysql sink committed batch as single INSERT"
-                );
-                Ok(CommitResult::new(batch, Vec::new()))
-            }
-            Ok(Err(e)) => {
-                if !e.is_transient() {
-                    let reason = format!("{e}");
-                    warn!(
-                        records = batch.len(),
-                        error = %reason,
-                        "mysql sink permanently rejected batch; dead-lettering"
-                    );
-                    let dead_lettered = batch.into_iter().map(|r| (r, reason.clone())).collect();
-                    Ok(CommitResult::new(Vec::new(), dead_lettered))
-                } else {
-                    Err(e)
-                }
-            }
-            Err(_elapsed) => Err(SqlSinkError::timeout(DRIVER)),
-        }
+        sql_common::insert_with_dup_fallback(
+            DRIVER,
+            batch,
+            id_hex,
+            deadline,
+            insert,
+            lookup_present,
+        )
+        .await
     }
 
     fn max_batch_size(&self) -> usize {
@@ -448,6 +524,7 @@ impl Sink for MySqlSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sink::SinkError;
     use weir_core::Payload;
 
     fn p(s: &'static [u8]) -> Payload {
@@ -605,7 +682,8 @@ mod tests {
             Some(ids.to_vec()),
         )
         .unwrap();
-        build_params(payloads, hex.as_deref())
+        let all: Vec<usize> = (0..payloads.len()).collect();
+        build_params(payloads, hex.as_deref(), &all)
     }
 
     #[test]
@@ -779,6 +857,74 @@ mod tests {
         ));
     }
 
+    // ── Plain-mode duplicate keys (spec §4.7) ────────────────────────────────
+
+    fn server_err(code: u16) -> mysql_async::Error {
+        mysql_async::Error::Server(mysql_async::ServerError {
+            code,
+            message: "Duplicate entry 'x' for key 'uq'".to_string(),
+            state: "23000".to_string(),
+        })
+    }
+
+    /// Only plain mode ever sees ER_DUP_ENTRY, and only plain mode hands it to
+    /// the fallback. Under `INSERT IGNORE` it keeps today's classification.
+    #[test]
+    fn dup_entry_is_a_dup_key_in_plain_mode_only() {
+        match classify_stmt(server_err(1062), InsertMode::Plain) {
+            StmtError::DupKey(msg) => {
+                assert!(
+                    msg.contains("1062") && msg.contains("Duplicate entry"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected DupKey, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_stmt(server_err(1062), InsertMode::Ignore),
+            StmtError::Other(e) if e.is_transient()
+        ));
+        // Any other code goes through the ordinary classifier.
+        assert!(matches!(
+            classify_stmt(server_err(1406), InsertMode::Plain),
+            StmtError::Other(e) if !e.is_transient()
+        ));
+    }
+
+    #[test]
+    fn lookup_sql_selects_the_id_column_with_one_placeholder_per_id() {
+        let mut c = cfg();
+        c.id_column = Some("record_id".to_string());
+        let sink = MySqlSink::new(c).unwrap();
+        assert_eq!(
+            sink.build_lookup_sql("record_id", 3),
+            "SELECT `record_id` FROM `weir_records` WHERE `record_id` IN (?, ?, ?)"
+        );
+    }
+
+    /// The fallback inserts subsets of the batch; the bound values must be
+    /// exactly those rows, in the order the indices name them.
+    #[test]
+    fn bound_params_cover_only_the_selected_rows() {
+        let payloads = vec![p(b"a"), p(b"b"), p(b"c")];
+        let ids = segment_ids(&payloads);
+        let hex: Vec<String> = ids.iter().map(|id| id.to_hex()).collect();
+        let values = build_params(&payloads, Some(&hex), &[0, 2]);
+        assert_eq!(
+            values,
+            vec![
+                mysql_async::Value::Bytes(hex[0].clone().into_bytes()),
+                mysql_async::Value::Bytes(b"a".to_vec()),
+                mysql_async::Value::Bytes(hex[2].clone().into_bytes()),
+                mysql_async::Value::Bytes(b"c".to_vec()),
+            ]
+        );
+        assert_eq!(
+            build_params(&payloads, None, &[1]),
+            vec![mysql_async::Value::Bytes(b"b".to_vec())]
+        );
+    }
+
     #[test]
     fn build_sql_uses_configured_table_and_column() {
         let mut c = cfg();
@@ -895,5 +1041,224 @@ mod tests {
         assert!(err.is_transient());
         // Driver context survives into the Display string.
         assert!(format!("{err}").contains("mysql"), "got: {err}");
+    }
+
+    // ── Live server: plain-mode duplicate keys (spec §4.7) ───────────────────
+    //
+    // `#[ignore]`d: they need the MySQL of the docker-compose rig. Run with
+    // `bash deploy/run-sink-integration-tests.sh`, or with the rig up:
+    //
+    //   WEIR_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:33306/weir_test \
+    //     cargo test -p weir-server --bin weir-server -- --ignored \
+    //     --test-threads=1 sink::mysql::tests::live_
+    //
+    // They drive the sink directly rather than through the daemon, because
+    // the scenario is a REPLAY of the same records under the same ids, which
+    // the daemon only produces after a crash.
+
+    mod live {
+        use super::*;
+
+        fn url() -> String {
+            std::env::var("WEIR_TEST_MYSQL_URL")
+                .expect("WEIR_TEST_MYSQL_URL not set; see deploy/run-sink-integration-tests.sh")
+        }
+
+        /// A fresh table of the given shape. Each test owns its table name, so
+        /// the tests do not disturb each other or the rig's reference tables.
+        async fn fresh_table(table: &str, keyed: bool) {
+            let pool = Pool::new(mysql_async::Opts::from_url(&url()).unwrap());
+            let mut conn = pool.get_conn().await.unwrap();
+            conn.query_drop(format!("DROP TABLE IF EXISTS `{table}`"))
+                .await
+                .unwrap();
+            let ddl = if keyed {
+                format!(
+                    "CREATE TABLE `{table}` (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+                     record_id CHAR(64) NOT NULL, payload VARBINARY(4096) NOT NULL, \
+                     UNIQUE KEY uq_record_id (record_id))"
+                )
+            } else {
+                format!(
+                    "CREATE TABLE `{table}` (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, \
+                     payload VARBINARY(4096) NOT NULL, UNIQUE KEY uq_payload (payload(255)))"
+                )
+            };
+            conn.query_drop(ddl).await.unwrap();
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+
+        async fn exec(sql: &str) {
+            let pool = Pool::new(mysql_async::Opts::from_url(&url()).unwrap());
+            let mut conn = pool.get_conn().await.unwrap();
+            conn.query_drop(sql).await.unwrap();
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+
+        async fn count(table: &str) -> u64 {
+            let pool = Pool::new(mysql_async::Opts::from_url(&url()).unwrap());
+            let mut conn = pool.get_conn().await.unwrap();
+            let n: Option<u64> = conn
+                .query_first(format!("SELECT COUNT(*) FROM `{table}`"))
+                .await
+                .unwrap();
+            drop(conn);
+            pool.disconnect().await.unwrap();
+            n.unwrap()
+        }
+
+        fn sink(
+            table: &str,
+            id_column: bool,
+            max_batch_size: usize,
+            timeout: Duration,
+        ) -> MySqlSink {
+            MySqlSink::new(MySqlSinkConfig {
+                url: url(),
+                table: table.to_string(),
+                column: "payload".to_string(),
+                id_column: id_column.then(|| "record_id".to_string()),
+                insert_mode: InsertMode::Plain,
+                max_batch_size,
+                timeout,
+            })
+            .unwrap()
+        }
+
+        /// The drain's batch for records `0..n` of one segment: the same
+        /// coordinates, hence the same ids, on every replay.
+        fn batch(payloads: &[Payload]) -> SinkBatch {
+            SinkBatch::with_record_ids(
+                payloads.to_vec(),
+                weir_sink_sdk::DedupToken::for_payloads(payloads.iter()),
+                segment_ids(payloads),
+            )
+        }
+
+        fn names(ps: &[Payload]) -> Vec<String> {
+            ps.iter()
+                .map(|p| String::from_utf8(p.to_vec()).unwrap())
+                .collect()
+        }
+
+        fn abc() -> Vec<Payload> {
+            vec![p(b"a"), p(b"b"), p(b"c")]
+        }
+
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_MYSQL_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_id_column_replay_counts_present_rows_as_committed() {
+            let table = "weir_dup_id_replay";
+            fresh_table(table, true).await;
+            let sink = sink(table, true, 1000, Duration::from_secs(10));
+            let all = abc();
+
+            let first = sink.commit(batch(&all[..2])).await.unwrap();
+            assert_eq!(names(&first.committed), ["a", "b"]);
+
+            let second = sink.commit(batch(&all)).await.unwrap();
+            assert_eq!(names(&second.committed), ["a", "b", "c"]);
+            assert!(
+                second.dead_lettered.is_empty(),
+                "{:?}",
+                second.dead_lettered
+            );
+            assert_eq!(
+                count(table).await,
+                3,
+                "exactly three rows: nothing written twice"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_MYSQL_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_without_id_column_dead_letters_the_duplicates() {
+            let table = "weir_dup_bisect";
+            fresh_table(table, false).await;
+            let sink = sink(table, false, 1000, Duration::from_secs(10));
+            let all = abc();
+
+            sink.commit(SinkBatch::from(all[..2].to_vec()))
+                .await
+                .unwrap();
+            let second = sink.commit(SinkBatch::from(all.clone())).await.unwrap();
+            assert_eq!(names(&second.committed), ["c"]);
+            assert_eq!(
+                second
+                    .dead_lettered
+                    .iter()
+                    .map(|(p, _)| String::from_utf8(p.to_vec()).unwrap())
+                    .collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+            for (_, reason) in &second.dead_lettered {
+                assert!(
+                    reason.starts_with(
+                        "duplicate key (insert_mode=plain, no id_column): server 1062:"
+                    ),
+                    "{reason}"
+                );
+            }
+            assert_eq!(count(table).await, 3);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_MYSQL_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_id_column_full_replay_of_5000_completes_within_the_timeout() {
+            let table = "weir_dup_replay_5000";
+            fresh_table(table, true).await;
+            let timeout = Duration::from_secs(10);
+            let sink = sink(table, true, 5000, timeout);
+            let all: Vec<Payload> = (0..5000)
+                .map(|i| Payload::copy_from_slice(format!("rec-{i:05}").as_bytes()))
+                .collect();
+
+            sink.commit(batch(&all)).await.unwrap();
+            let t = std::time::Instant::now();
+            let replay = sink.commit(batch(&all)).await.unwrap();
+            let took = t.elapsed();
+            assert_eq!(replay.committed.len(), 5000);
+            assert!(replay.dead_lettered.is_empty());
+            assert!(took < timeout, "replay took {took:?}");
+            assert_eq!(count(table).await, 5000);
+        }
+
+        /// The livelock's own trigger: the server applied the INSERT, the
+        /// client timed out. Latency is injected with a per-row trigger.
+        #[tokio::test]
+        #[ignore = "requires WEIR_TEST_MYSQL_URL (deploy/run-sink-integration-tests.sh)"]
+        async fn live_plain_attempt_that_timed_out_midway_is_completed_by_the_next() {
+            let table = "weir_dup_timed_out";
+            fresh_table(table, true).await;
+            exec(&format!(
+                "CREATE TRIGGER `{table}_slow` BEFORE INSERT ON `{table}` \
+                 FOR EACH ROW SET @weir_slow = SLEEP(0.4)"
+            ))
+            .await;
+            let all = abc();
+
+            let err = sink(table, true, 1000, Duration::from_millis(300))
+                .commit(batch(&all))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SqlSinkError::Timeout { .. }), "{err}");
+            // Let the server finish the statement the client gave up on.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                count(table).await,
+                3,
+                "precondition: the server applied the attempt the client timed out on"
+            );
+
+            let r = sink(table, true, 1000, Duration::from_secs(10))
+                .commit(batch(&all))
+                .await
+                .unwrap();
+            assert_eq!(names(&r.committed), ["a", "b", "c"]);
+            assert!(r.dead_lettered.is_empty(), "{:?}", r.dead_lettered);
+            assert_eq!(count(table).await, 3);
+        }
     }
 }
