@@ -34,6 +34,10 @@
 //! - **With `id_column`**: one `SELECT … WHERE id IN (…)` finds the rows already
 //!   present. Their id is their WAB coordinate, so they are this record,
 //!   already delivered, and count as committed. One `INSERT` writes the rest.
+//!   The lookup needs **`SELECT` on the table** as well as `INSERT`. Without
+//!   it the server answers 1142 (`ER_TABLEACCESS_DENIED_ERROR`), which this
+//!   sink classifies as transient (see *Error classification*), so the drain
+//!   retries the batch until the grant is fixed.
 //! - **Without `id_column`**: the batch is bisected, and each row that is still
 //!   a duplicate on its own is dead-lettered with
 //!   `duplicate key (insert_mode=plain, no id_column): <server message>`.
@@ -441,21 +445,22 @@ impl Sink for MySqlSink {
         let mode = self.config.insert_mode;
         let (batch, id_hex) = (&batch, id_hex.as_deref());
 
-        let insert = |rows: Vec<usize>| {
+        // The statement and its parameters (a copy of every payload) are built
+        // inside the future, so `bounded` checks the deadline before paying
+        // for them.
+        let insert = |rows: Vec<usize>| async move {
             let sql = self.build_insert_sql(rows.len());
             let params = build_params(batch, id_hex, &rows);
-            async move {
-                let mut conn = self
-                    .pool
-                    .get_conn()
-                    .await
-                    .map_err(|e| StmtError::Other(classify(e)))?;
-                conn.exec_drop(&sql, mysql_async::Params::Positional(params))
-                    .await
-                    .map_err(|e| classify_stmt(e, mode))
-            }
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(|e| StmtError::Other(classify(e)))?;
+            conn.exec_drop(&sql, mysql_async::Params::Positional(params))
+                .await
+                .map_err(|e| classify_stmt(e, mode))
         };
-        let lookup_present = |rows: Vec<usize>| {
+        let lookup_present = |rows: Vec<usize>| async move {
             // Only called when an id column is configured (the driver gets
             // `ids = Some` exactly then); the `None` arm is unreachable but
             // answers with an error rather than a panic.
@@ -471,24 +476,22 @@ impl Sink for MySqlSink {
                         .collect();
                     (self.build_lookup_sql(col, rows.len()), params)
                 });
-            async move {
-                let Some((sql, params)) = query else {
-                    return Err(StmtError::Other(SqlSinkError::permanent(
-                        DRIVER,
-                        "duplicate-key lookup without an id column",
-                    )));
-                };
-                let mut conn = self
-                    .pool
-                    .get_conn()
-                    .await
-                    .map_err(|e| StmtError::Other(classify(e)))?;
-                let found: Vec<String> = conn
-                    .exec(&sql, mysql_async::Params::Positional(params))
-                    .await
-                    .map_err(|e| StmtError::Other(classify(e)))?;
-                Ok(found.into_iter().collect())
-            }
+            let Some((sql, params)) = query else {
+                return Err(StmtError::Other(SqlSinkError::permanent(
+                    DRIVER,
+                    "duplicate-key lookup without an id column",
+                )));
+            };
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(|e| StmtError::Other(classify(e)))?;
+            let found: Vec<String> = conn
+                .exec(&sql, mysql_async::Params::Positional(params))
+                .await
+                .map_err(|e| StmtError::Other(classify(e)))?;
+            Ok(found.into_iter().collect())
         };
 
         sql_common::insert_with_dup_fallback(

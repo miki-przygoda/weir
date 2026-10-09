@@ -45,6 +45,14 @@
 //!   already present. Their id is their WAB coordinate, so they are this
 //!   record, already delivered, and count as committed. One `INSERT` writes
 //!   the rest.
+//!   The lookup needs **`SELECT` on the table** as well as `INSERT`. Without
+//!   it the server answers `42501` (`insufficient_privilege`), a permanent
+//!   error: the sink logs it at WARN and bisects the whole batch instead, and
+//!   each duplicate row is dead-lettered with
+//!   `duplicate key (insert_mode=plain); the id lookup failed (<lookup error>),
+//!   so the row could not be proven already delivered: <server message>`.
+//!   Such a row is most likely already delivered: grant `SELECT` rather than
+//!   `weir-ctl dl requeue` it, which would write it again under a new id.
 //! - **Without `id_column`**: the batch is bisected, and each row that is still
 //!   a duplicate on its own is dead-lettered with
 //!   `duplicate key (insert_mode=plain, no id_column): <server message>`.

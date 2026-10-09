@@ -591,8 +591,22 @@ impl Config {
     /// a TOML typo would take defaults unnoticed (F54).
     pub fn load() -> Result<(Self, Vec<String>), ConfigError> {
         let (cli, config_path) = cli::parse()?;
-        let (file, mut warnings) = file::read(&config_path)?;
+        let (file, warnings) = file::read(&config_path)?;
         let env = env::read()?;
+        Self::from_layers_with_warnings(cli, env, file, warnings)
+    }
+
+    /// [`Config::from_layers`] plus the post-validation advisories, appended to
+    /// the `warnings` already collected while reading the file. This is
+    /// everything [`Config::load`] returns once the layers are parsed; it is
+    /// split out so tests can assert a warning really reaches the caller, not
+    /// just that it is computed.
+    pub(crate) fn from_layers_with_warnings(
+        cli: PartialConfig,
+        env: PartialConfig,
+        file: PartialConfig,
+        mut warnings: Vec<String>,
+    ) -> Result<(Self, Vec<String>), ConfigError> {
         let config = Self::from_layers(cli, env, file)?;
 
         // Post-validation advisory: a tiny dead-letter cap causes frequent
@@ -1895,10 +1909,17 @@ mod tests {
                     cli.sink_postgres_id_column = id.map(Into::into);
                 }
             }
-            let c =
-                Config::from_layers(cli, PartialConfig::empty(), PartialConfig::empty()).unwrap();
+            // Through the same assembly `load()` returns, so a WARN that
+            // never reaches the operator fails here too.
+            let (_, w) = Config::from_layers_with_warnings(
+                cli,
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+                Vec::new(),
+            )
+            .unwrap();
             fs::remove_dir_all(dir).ok();
-            c.advisory_warnings()
+            w
         };
 
         for sink in ["mysql", "postgres"] {

@@ -273,7 +273,15 @@ pub(crate) enum StmtError {
 ///   one `INSERT` writes the remainder. Progress is monotonic across attempts:
 ///   rows an earlier attempt inserted before timing out are found by the
 ///   lookup. A duplicate key on the remainder means a concurrent writer or a
-///   *different* `UNIQUE` constraint, and the remainder is bisected.
+///   *different* `UNIQUE` constraint, and the remainder is bisected, each
+///   duplicate row dead-lettered with the reason
+///   `duplicate key (insert_mode=plain) on a record whose id was not present:
+///   a different UNIQUE constraint or a concurrent writer: <server message>`.
+///   The lookup needs `SELECT` on the table. If it fails permanently (the
+///   role has `INSERT` only), the error is logged at WARN and the whole batch
+///   is bisected; a duplicate row is then dead-lettered with
+///   `duplicate key (insert_mode=plain); the id lookup failed (<lookup error>),
+///   so the row could not be proven already delivered: <server message>`.
 /// - **Duplicate key, without ids.** Bisection: split the failing set in
 ///   halves and try each. A half that inserts is committed. A single row with
 ///   a duplicate key is not provably the same record, so it is dead-lettered —
@@ -351,6 +359,9 @@ where
 
     let mut committed: Vec<usize> = Vec::with_capacity(n);
     let mut dead_lettered: Vec<(usize, String)> = Vec::new();
+    // Set when an id lookup was attempted and rejected: the ids were then
+    // never checked, and a duplicate row's reason has to say so.
+    let mut lookup_failed: Option<String> = None;
 
     // ── Ids: one lookup, then the remainder ──────────────────────────────────
     let (to_bisect, failure) = match ids {
@@ -385,10 +396,26 @@ where
                     }
                 }
                 Err(StmtError::Other(e)) if e.is_transient() => return Err(e),
-                // The lookup itself was rejected (a column type the driver
-                // cannot read back, say). Bisection needs no lookup and is
-                // lossless, so fall back to it rather than dead-lettering.
-                Err(_) => ((0..n).collect(), Some(StmtError::DupKey(first_dup.clone()))),
+                // The lookup itself was rejected: the ingest role has INSERT
+                // but no SELECT (Postgres 42501), or a column type the driver
+                // cannot read back. Bisection needs no lookup and is lossless,
+                // so fall back to it rather than dead-lettering — but the
+                // error is the operator's to see, and it travels into every
+                // duplicate row's reason (below).
+                Err(err) => {
+                    let lookup_err = match err {
+                        StmtError::Other(e) => e.to_string(),
+                        StmtError::DupKey(msg) => msg,
+                    };
+                    tracing::warn!(
+                        records = n,
+                        error = %lookup_err,
+                        "{driver} sink: insert_mode=plain id lookup failed; bisecting the batch \
+                         instead, and duplicate rows cannot be proven already delivered"
+                    );
+                    lookup_failed = Some(lookup_err);
+                    ((0..n).collect(), Some(StmtError::DupKey(first_dup.clone())))
+                }
             }
         }
         None => ((0..n).collect(), Some(StmtError::DupKey(first_dup.clone()))),
@@ -396,9 +423,16 @@ where
 
     // ── Bisection ────────────────────────────────────────────────────────────
     if let Some(failure) = failure {
-        let dup_reason = |msg: &str| match ids {
-            None => format!("duplicate key (insert_mode=plain, no id_column): {msg}"),
-            Some(_) => format!(
+        let dup_reason = |msg: &str| match (ids, &lookup_failed) {
+            (None, _) => format!("duplicate key (insert_mode=plain, no id_column): {msg}"),
+            // The ids were never checked; on a replay the row is most likely
+            // already delivered, so the reason must not suggest otherwise —
+            // `dl requeue` would write it again under a new id.
+            (Some(_), Some(lookup_err)) => format!(
+                "duplicate key (insert_mode=plain); the id lookup failed ({lookup_err}), \
+                 so the row could not be proven already delivered: {msg}"
+            ),
+            (Some(_), None) => format!(
                 "duplicate key (insert_mode=plain) on a record whose id was not present: \
                  a different UNIQUE constraint or a concurrent writer: {msg}"
             ),
@@ -452,6 +486,7 @@ where
             committed = committed.len(),
             dead_lettered = dead_lettered.len(),
             with_id_column = ids.is_some(),
+            lookup_error = lookup_failed.as_deref(),
             first_error = %first_dup,
             "{driver} sink: duplicate key in insert_mode=plain; dead-lettering the duplicate rows"
         );
@@ -663,6 +698,7 @@ mod dup_fallback_tests {
     use weir_core::Payload;
 
     const SERVER_DUP: &str = "server 1062: Duplicate entry";
+    const LOOKUP_DENIED: &str = "server 42501: permission denied for table weir_records";
 
     /// Which column the fake table's `UNIQUE` constraint is on.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -681,6 +717,9 @@ mod dup_fallback_tests {
         permanent: HashSet<Vec<u8>>,
         /// 1-based statement number that fails transiently.
         transient_on: Option<usize>,
+        /// The lookup is rejected permanently (e.g. the ingest role has
+        /// INSERT but no SELECT: Postgres 42501).
+        lookup_denied: bool,
         /// Per-statement latency, applied AFTER the statement has taken
         /// effect — so a statement that outlives the deadline has still been
         /// applied, which is exactly the `commit_timeout` case in §4.7.
@@ -696,6 +735,7 @@ mod dup_fallback_tests {
                 rows: RefCell::new(Vec::new()),
                 permanent: HashSet::new(),
                 transient_on: None,
+                lookup_denied: false,
                 latency: Duration::ZERO,
                 statements: Cell::new(0),
                 lookups: Cell::new(0),
@@ -769,6 +809,12 @@ mod dup_fallback_tests {
                 return Err(StmtError::Other(SqlSinkError::transient(
                     "mysql",
                     "io: connection reset",
+                )));
+            }
+            if self.lookup_denied {
+                return Err(StmtError::Other(SqlSinkError::permanent(
+                    "postgres",
+                    LOOKUP_DENIED,
                 )));
             }
             let stored: HashSet<String> = self
@@ -1051,6 +1097,65 @@ mod dup_fallback_tests {
         assert_eq!(names(&r.committed), ["a", "b", "d"]);
         assert_eq!(dl_names(&r.dead_lettered), ["c"]);
         assert!(r.dead_lettered[0].1.contains("Data too long"));
+    }
+
+    /// A lookup the server rejects permanently (an ingest role with INSERT but
+    /// no SELECT) falls back to bisection. The ids were never checked, so a
+    /// duplicate row's reason must say the lookup failed and carry its error,
+    /// not claim the id "was not present" — on a replay it almost certainly
+    /// is, and that claim would steer the operator to `dl requeue`, which
+    /// writes real downstream duplicates.
+    #[tokio::test]
+    async fn a_permanently_failed_lookup_says_so_in_the_reason() {
+        let mut table = FakeTable::new(Unique::Id);
+        let rows = payloads(&["a", "b", "c"]);
+        let ids = ids_for(&rows);
+        run(&table, &rows[..2], Some(&ids[..2]), far())
+            .await
+            .unwrap();
+        table.lookup_denied = true;
+
+        let r = run(&table, &rows, Some(&ids), far()).await.unwrap();
+        assert_eq!(names(&r.committed), ["c"]);
+        assert_eq!(dl_names(&r.dead_lettered), ["a", "b"]);
+        let lookup_err = SqlSinkError::permanent("postgres", LOOKUP_DENIED).to_string();
+        for (_, reason) in &r.dead_lettered {
+            assert_eq!(
+                reason,
+                &format!(
+                    "duplicate key (insert_mode=plain); the id lookup failed ({lookup_err}), \
+                     so the row could not be proven already delivered: {SERVER_DUP}"
+                )
+            );
+            assert!(!reason.contains("was not present"), "{reason}");
+        }
+    }
+
+    /// The other id-path reason: the lookup succeeded, the row's id was not
+    /// there, and its insert still hit a duplicate — a different UNIQUE
+    /// constraint or a concurrent writer.
+    #[tokio::test]
+    async fn a_duplicate_after_a_successful_lookup_keeps_the_not_present_reason() {
+        // UNIQUE on payload, but ids supplied: `a` is stored under a different
+        // id (another writer), so the lookup misses it and the insert collides.
+        let table = FakeTable::new(Unique::Payload);
+        let rows = payloads(&["a", "b"]);
+        let ids = ids_for(&rows);
+        table
+            .rows
+            .borrow_mut()
+            .push((Some("someone-else".to_string()), b"a".to_vec()));
+
+        let r = run(&table, &rows, Some(&ids), far()).await.unwrap();
+        assert_eq!(names(&r.committed), ["b"]);
+        assert_eq!(dl_names(&r.dead_lettered), ["a"]);
+        assert_eq!(
+            r.dead_lettered[0].1,
+            format!(
+                "duplicate key (insert_mode=plain) on a record whose id was not present: \
+                 a different UNIQUE constraint or a concurrent writer: {SERVER_DUP}"
+            )
+        );
     }
 
     #[tokio::test]
