@@ -671,7 +671,8 @@ fn drain_thread<S: Sink>(
     // stamps `blocked_since` only when this is `None`, and reuses the stored
     // instant otherwise, so a flap counts as ONE episode and the blocked-duration
     // gauge keeps climbing rather than resetting. Cleared (and the gauge reset)
-    // when a segment is actually confirmed or quarantined — genuine progress (F09).
+    // when a segment is actually confirmed, quarantined or parked — the drain
+    // moved past a segment for good this run, which is genuine progress (F09).
     let mut block_episode: Option<Instant> = None;
 
     // Tracks the sink's last-observed health so we can detect a down→up recovery
@@ -1271,6 +1272,11 @@ fn escalate_local_read(
                 "drain: segment still unreadable (media) after {LOCAL_READ_STRAND_LIMIT} strand \
                  cycles; quarantining"
             );
+            // TODO(safety-floor Task 11, spec §4.4): if this move fails the
+            // segment stays on disk and `forget` drops its failure count, so it
+            // runs three more strand cycles before trying again. Nothing is
+            // delivered at open time, so no duplicates — but this call site
+            // must take the `quarantine_pending` path once that lands.
             quarantine_segment(
                 segment,
                 config,
@@ -1311,7 +1317,8 @@ fn transition_from_draining(
 }
 
 /// Ends the current dead-letter-full blocking episode (if one is open) because
-/// a segment was just confirmed or quarantined — genuine forward progress. The
+/// a segment was just confirmed, quarantined or parked (set aside for the run,
+/// so the drain moved past it like a quarantine) — genuine forward progress. The
 /// blocked-duration gauge is reset to zero only here, never on a transient
 /// unblock, so a flapping cap doesn't repeatedly zero it (F09).
 fn end_block_episode(block_episode: &mut Option<Instant>, metrics: &Metrics) {
@@ -1377,13 +1384,14 @@ async fn process_segment<S: Sink>(
             warn!(path = %segment.display(), "drain: segment not found; treating as already-consumed");
             return ProcessResult::Confirmed { record_count: 0 };
         }
-        // The reader rejected the header itself (bad magic, a version it does
-        // not read, a file too short to hold one). That is a statement about the
-        // BYTES, which no retry changes — so it is decided now, never retried
-        // (spec §4.1). Nothing was delivered either way.
+        // The reader rejected the header itself (bad magic, a version or a
+        // flags bit it does not read, a file too short to hold one). That is a
+        // statement about the BYTES, which no retry changes — so it is decided
+        // now, not retried (spec §4.1), unless the re-read cannot reproduce the
+        // rejection. Nothing was delivered either way.
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             match inspect_rejected_header(segment) {
-                HeaderVerdict::NewerFormat(version) => {
+                HeaderVerdict::NewerFormat { version, flags } => {
                     // Written by a newer weir, not corrupt. Quarantining it would
                     // break a rollback (a downgraded daemon would push every
                     // newer-format segment into manual recovery), so it is set
@@ -1392,10 +1400,12 @@ async fn process_segment<S: Sink>(
                     error!(
                         path = %segment.display(),
                         version,
+                        flags = ?flags,
                         max_supported = weir_wab::format::FORMAT_VERSION_MAX_SUPPORTED,
-                        "drain: segment was written in a newer WAB format than this binary \
-                         reads; parked (left in place, not retried this run) — upgrade weir \
-                         to deliver it; it replays on the next start"
+                        error = %e,
+                        "drain: segment was written in a newer WAB format (version or header \
+                         flags) than this binary reads; parked (left in place, not retried this \
+                         run) — upgrade weir to deliver it; it replays on the next start"
                     );
                     return ProcessResult::Parked {
                         reason: ledger::ParkReason::UnsupportedVersion,
@@ -1627,39 +1637,74 @@ fn local_read_failure(segment: &Path, e: std::io::Error, skip: u64) -> ProcessRe
 /// What a header the reader rejected as `InvalidData` actually is.
 #[derive(Debug)]
 enum HeaderVerdict {
-    /// The magic is right and the version byte is above what this build reads.
-    NewerFormat(u8),
-    /// Bad magic, version 0, or too short to hold a header.
+    /// Written by a newer weir: the magic is right and either the version byte
+    /// is above what this build reads, or it is a v2 header carrying a flags bit
+    /// outside the set this build understands (`flags` is then `Some`).
+    NewerFormat { version: u8, flags: Option<u8> },
+    /// Bad magic, version 0, a v1 header with its reserved byte set, or too
+    /// short to hold a header.
     Corrupt,
     /// The file vanished between the open and the re-read.
     Gone,
-    /// The re-read itself failed with an I/O error.
+    /// The re-read itself failed with an I/O error, or found a header that now
+    /// parses (the bytes changed under us) — undecided either way.
     Unreadable(std::io::Error),
 }
 
-/// Re-reads the first five header bytes (magic + version) of a segment
-/// [`SegmentReader::open`] rejected, to tell a newer format from corruption.
+/// Re-reads the header of a segment [`SegmentReader::open`] rejected, to tell a
+/// newer format from corruption.
 ///
 /// The magic is checked first: a version byte only means something under the
 /// right magic (`b"NOTWEIR…"` has `'W'` = 0x57 at byte 4, which is no version).
+/// A version above the max is newer whatever the file's length, since a newer
+/// format may define its own header. Versions this build knows are judged by
+/// [`weir_wab::format::parse_segment_header`] on the full fixed-size header: a
+/// v2 flags bit outside the known set is what a newer weir writes to add a
+/// feature without bumping the version, so it is newer, not corrupt; a set bit
+/// in v1's reserved byte is corrupt (v1 documents it as zero).
 fn inspect_rejected_header(segment: &Path) -> HeaderVerdict {
     use std::io::Read;
-    use weir_wab::format::{FORMAT_VERSION_MAX_SUPPORTED, SEGMENT_MAGIC};
+    use weir_wab::format::{
+        FORMAT_VERSION_MAX_SUPPORTED, FORMAT_VERSION_V2, SEGMENT_HEADER_LEN, SEGMENT_MAGIC,
+        SegmentHeaderParseError, parse_segment_header,
+    };
 
-    let mut prefix = [0u8; 5];
-    let read = std::fs::File::open(segment).and_then(|mut f| f.read_exact(&mut prefix));
+    let mut header = Vec::with_capacity(SEGMENT_HEADER_LEN);
+    let read = std::fs::File::open(segment)
+        .and_then(|f| f.take(SEGMENT_HEADER_LEN as u64).read_to_end(&mut header));
     match read {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return HeaderVerdict::Corrupt,
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HeaderVerdict::Gone,
         Err(e) => return HeaderVerdict::Unreadable(e),
     }
-    if prefix[0..4] == SEGMENT_MAGIC && prefix[4] > FORMAT_VERSION_MAX_SUPPORTED {
-        HeaderVerdict::NewerFormat(prefix[4])
-    } else {
-        // Bad magic, version 0, or a valid magic + version in a file shorter
-        // than the full header: all corrupt.
-        HeaderVerdict::Corrupt
+    if header.len() < 5 || header[0..4] != SEGMENT_MAGIC {
+        return HeaderVerdict::Corrupt;
+    }
+    let version = header[4];
+    if version > FORMAT_VERSION_MAX_SUPPORTED {
+        return HeaderVerdict::NewerFormat {
+            version,
+            flags: header.get(5).copied(),
+        };
+    }
+    match parse_segment_header(&header) {
+        Err(SegmentHeaderParseError::ReservedFlagsSet {
+            version: FORMAT_VERSION_V2,
+            flags,
+        }) => HeaderVerdict::NewerFormat {
+            version: FORMAT_VERSION_V2,
+            flags: Some(flags),
+        },
+        // Version 0, v1 reserved byte set, or a known version in a file shorter
+        // than the full header.
+        Err(_) => HeaderVerdict::Corrupt,
+        // The open rejected these bytes but they parse now: the file changed
+        // between the two reads. Do not quarantine on a guess — retry it as a
+        // local read, which escalates if it keeps happening.
+        Ok(_) => HeaderVerdict::Unreadable(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "segment header was rejected on open but parses on re-read",
+        )),
     }
 }
 
@@ -3432,11 +3477,15 @@ mod tests {
 
     /// Every header the reader rejects as `InvalidData` that is NOT a newer
     /// format is corruption: bad magic (even when byte 4 happens to look like a
-    /// big version number), version 0, and a file too short to hold a header.
+    /// big version number), version 0, a v1 header with its reserved byte set,
+    /// and a file too short to hold a header. A newer format is either a version
+    /// above the max OR a v2 header with a flags bit this build does not know —
+    /// the flags byte is where a later weir adds a feature without bumping the
+    /// version (`weir_wab::format::KNOWN_FLAGS`), so both park.
     #[test]
     fn corrupt_header_shapes_quarantine_and_a_newer_version_parks() {
         use super::dead_letter::DeadLetterWriter;
-        use weir_wab::format::FORMAT_VERSION_MAX_SUPPORTED;
+        use weir_wab::format::{FLAG_ZSTD, FORMAT_VERSION_MAX_SUPPORTED, FORMAT_VERSION_V2};
         let dir = tmp_dir("hdr_shapes");
         let mut dl = DeadLetterWriter::open(&dir).unwrap();
         let sink = MockSink::with_responses([]);
@@ -3446,13 +3495,19 @@ mod tests {
         let good = make_sealed_segment(&dir, 0, &[b"x"]);
         let good_bytes = std::fs::read(&good).unwrap();
         std::fs::remove_file(&good).unwrap();
+        assert_eq!(good_bytes[4], 1, "fixture is a v1 segment");
         let with_byte4 = |v: u8| {
             let mut b = good_bytes.clone();
             b[4] = v;
             b
         };
+        let with_v2_flags = |flags: u8| {
+            let mut b = with_byte4(FORMAT_VERSION_V2);
+            b[5] = flags;
+            b
+        };
 
-        let cases: [(&str, Vec<u8>); 5] = [
+        let cases: [(&str, Vec<u8>); 7] = [
             // 'W' (0x57) at byte 4 — a version byte far above the max, but the
             // magic is wrong, so this is not a newer weir's segment.
             (
@@ -3463,6 +3518,19 @@ mod tests {
             ("empty", Vec::new()),
             ("short, magic only", b"WEI".to_vec()),
             ("short, magic + version", good_bytes[..6].to_vec()),
+            // v1 documents byte 5 as zero-on-write: a set bit is corruption,
+            // not a feature.
+            ("v1 with a flags bit set", {
+                let mut b = good_bytes.clone();
+                b[5] = 0b0000_0010;
+                b
+            }),
+            // A v2 header is a fixed 24 bytes; a file too short to hold one is
+            // corrupt whatever its flags byte says.
+            (
+                "short v2 with an unknown flag",
+                with_v2_flags(0b0000_0010)[..8].to_vec(),
+            ),
         ];
         for (i, (what, bytes)) in cases.into_iter().enumerate() {
             let sealed = write_raw_sealed(&dir, 10 + i as u64, &bytes);
@@ -3481,20 +3549,42 @@ mod tests {
             );
         }
 
-        let newer = write_raw_sealed(&dir, 20, &with_byte4(FORMAT_VERSION_MAX_SUPPORTED + 1));
-        let result = block_on(process_segment(
-            &newer, &sink, &config, &metrics, &mut dl, 0,
-        ));
-        assert!(
-            matches!(
-                result,
-                ProcessResult::Parked {
-                    reason: ParkReason::UnsupportedVersion
-                }
+        let newer_cases: [(&str, Vec<u8>); 3] = [
+            (
+                "version above the max",
+                with_byte4(FORMAT_VERSION_MAX_SUPPORTED + 1),
             ),
-            "a newer format version is parked, not quarantined"
-        );
-        assert!(newer.exists(), "a parked segment stays where it is");
+            ("v2 with an unknown flag bit", with_v2_flags(0b0000_0010)),
+            (
+                "v2 with zstd plus an unknown flag bit",
+                with_v2_flags(FLAG_ZSTD | 0b1000_0000),
+            ),
+        ];
+        for (i, (what, bytes)) in newer_cases.into_iter().enumerate() {
+            let newer = write_raw_sealed(&dir, 20 + i as u64, &bytes);
+            let result = block_on(process_segment(
+                &newer, &sink, &config, &metrics, &mut dl, 0,
+            ));
+            assert!(
+                matches!(
+                    result,
+                    ProcessResult::Parked {
+                        reason: ParkReason::UnsupportedVersion
+                    }
+                ),
+                "{what}: a newer format is parked, not quarantined"
+            );
+            assert!(newer.exists(), "{what}: a parked segment stays where it is");
+            assert!(
+                !quarantined_copy(&dir, &newer).exists(),
+                "{what}: not moved to quarantine"
+            );
+            assert_eq!(
+                std::fs::read(&newer).unwrap(),
+                bytes,
+                "{what}: bytes untouched"
+            );
+        }
         assert_eq!(sink.call_count(), 0);
         std::fs::remove_dir_all(dir).ok();
     }
@@ -4050,12 +4140,13 @@ mod tests {
 
         // Spec §4.1 changed WHERE a corrupt header is preserved: it used to be
         // left at the sealed path (and retried forever); it is now moved to
-        // quarantine/ on the first attempt. Either way it is never deleted.
+        // quarantine/ on the first attempt. It is never deleted.
         // Transient open failures are still left in place and retried — see
         // the §4.1 tests and `a_local_read_strand_is_not_counted_as_a_sink_strand`.
         assert!(
-            sealed.exists() || quarantined_copy(&dir, &sealed).exists(),
-            "an unopenable segment must be left on disk for recovery, not deleted"
+            !sealed.exists() && quarantined_copy(&dir, &sealed).exists(),
+            "a corrupt-header segment is moved to quarantine/ for recovery, not deleted \
+             and not left at the sealed path to be retried"
         );
         assert!(
             !get_confirmed_path(&sealed).exists(),
