@@ -313,7 +313,6 @@ impl SegmentLedger {
     /// Sets `path` aside for the rest of this run. Its progress is forgotten: a
     /// parked segment replays from record 0 on the next start (or when an
     /// operator un-parks it), so no cursor may outlive the park.
-    #[allow(dead_code)] // reached by the escalation paths (spec §4.1, §4.12)
     pub(crate) fn park(&mut self, path: &Path, why: ParkReason) {
         self.parked.insert(path.to_path_buf(), why);
         self.forget(path);
@@ -322,7 +321,6 @@ impl SegmentLedger {
     /// Counts one local read failure of `path` and returns the running total.
     /// `Process`-class errors are daemon-wide, not a property of the segment,
     /// so they never count.
-    #[allow(dead_code)] // reached by the escalation paths (spec §4.1, §4.2)
     pub(crate) fn note_local_read_failure(&mut self, path: &Path, class: ErrClass) -> u32 {
         if class == ErrClass::Process {
             return self.local_read_failures.get(path).copied().unwrap_or(0);

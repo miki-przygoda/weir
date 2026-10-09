@@ -63,6 +63,13 @@ use ledger::{ErrClass, ParkReason};
 
 pub const MAX_RETRIES: u32 = 3;
 
+/// How many strand cycles of segment-class local read failures (`Access` or
+/// `Media`, spec §4.0 table) a segment gets before it is escalated: parked for
+/// `Access`, quarantined for `Media`. A cycle is `max_retries + 1` attempts, so
+/// the escalation fires on the `(max_retries + 1) × 3`-th failure. `Process`
+/// errors never count (spec §4.1).
+pub(crate) const LOCAL_READ_STRAND_LIMIT: u32 = 3;
+
 /// Upper bound on a single transient-retry backoff once shutdown has been
 /// observed (the drain channel disconnected). The backoff is clamped rather than
 /// dropped: firing the remaining attempts back-to-back with no delay spends the
@@ -192,6 +199,10 @@ enum ProcessResult {
     /// A record failed to read mid-segment. The readable prefix was delivered and
     /// the segment was quarantined for manual recovery — do not retry or delete.
     Quarantined,
+    /// The segment cannot be delivered by this binary but is not corrupt (its
+    /// header names a newer format version). Nothing was delivered. Set it aside
+    /// for the rest of the run, bytes untouched; the next start replays it.
+    Parked { reason: ledger::ParkReason },
 }
 
 enum BatchResult {
@@ -995,6 +1006,7 @@ fn drain_thread<S: Sink>(
                     next_state_after_process(
                         segment,
                         result,
+                        &config,
                         &metrics,
                         &mut block_episode,
                         ledger,
@@ -1154,6 +1166,7 @@ fn drain_thread<S: Sink>(
 fn next_state_after_process(
     segment: PathBuf,
     result: ProcessResult,
+    config: &DrainConfig,
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
     ledger: &mut SegmentLedger,
@@ -1175,12 +1188,31 @@ fn next_state_after_process(
             processed,
             cause,
         } => {
+            if let TransientCause::LocalRead { class, errno } = cause
+                && let Some(next) = escalate_local_read(
+                    &segment,
+                    class,
+                    errno,
+                    config,
+                    metrics,
+                    block_episode,
+                    ledger,
+                )
+            {
+                return next;
+            }
             ledger.record_progress(&segment, processed);
             on_transient(segment, retry_after, processed, cause)
         }
         ProcessResult::BlockedDeadLetter { processed } => {
             ledger.record_progress(&segment, processed);
             enter_blocked(segment, metrics, block_episode, processed)
+        }
+        // Not deliverable by this binary, not corrupt: set aside for the run.
+        ProcessResult::Parked { reason } => {
+            ledger.park(&segment, reason);
+            end_block_episode(block_episode, metrics);
+            DrainState::Draining
         }
         // Segment was quarantined inside process_segment — move on.
         ProcessResult::Quarantined => {
@@ -1189,6 +1221,67 @@ fn next_state_after_process(
             DrainState::Draining
         }
     }
+}
+
+/// Counts one local read failure of `segment` toward its escalation and, once
+/// the count reaches `(max_retries + 1) × LOCAL_READ_STRAND_LIMIT` (three strand
+/// cycles), escalates it (spec §4.1): an `Access` error parks the segment as
+/// `local_read_failed`, a `Media` error quarantines it. Returns the next state
+/// when it escalated, `None` to carry on retrying.
+///
+/// `Process`-class errors are daemon-wide (descriptors, memory), not a property
+/// of the segment: they never count and never escalate, so a segment under fd
+/// pressure keeps cycling exactly as before and heals when the pressure clears.
+fn escalate_local_read(
+    segment: &Path,
+    class: ledger::ErrClass,
+    errno: Option<i32>,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    block_episode: &mut Option<Instant>,
+    ledger: &mut SegmentLedger,
+) -> Option<DrainState> {
+    let failures = ledger.note_local_read_failure(segment, class);
+    let limit = config
+        .max_retries
+        .saturating_add(1)
+        .saturating_mul(LOCAL_READ_STRAND_LIMIT);
+    if failures < limit {
+        return None;
+    }
+    match class {
+        ledger::ErrClass::Process => return None,
+        ledger::ErrClass::Access => {
+            error!(
+                path = %segment.display(),
+                errno,
+                failures,
+                "drain: segment still unreadable (access) after {LOCAL_READ_STRAND_LIMIT} strand \
+                 cycles; parked (left in place, not retried this run) — \
+                 weir_drain_segments_parked{{reason=\"local_read_failed\"}}; fix its permissions or \
+                 type, it replays on the next start"
+            );
+            ledger.park(segment, ledger::ParkReason::LocalReadFailed);
+        }
+        ledger::ErrClass::Media => {
+            error!(
+                path = %segment.display(),
+                errno,
+                failures,
+                "drain: segment still unreadable (media) after {LOCAL_READ_STRAND_LIMIT} strand \
+                 cycles; quarantining"
+            );
+            quarantine_segment(
+                segment,
+                config,
+                metrics,
+                "drain: persistent local read error",
+            );
+            ledger.forget(segment);
+        }
+    }
+    end_block_episode(block_episode, metrics);
+    Some(DrainState::Draining)
 }
 
 fn transition_from_draining(
@@ -1203,6 +1296,7 @@ fn transition_from_draining(
     next_state_after_process(
         segment,
         result,
+        config,
         metrics,
         block_episode,
         ledger,
@@ -1275,7 +1369,7 @@ async fn process_segment<S: Sink>(
     dead_letter: &mut DeadLetterWriter,
     skip: u64,
 ) -> ProcessResult {
-    let reader = match SegmentReader::open(segment) {
+    let reader = match open_segment(segment) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Already gone (deleted out-of-band, or a double-send). Nothing to
@@ -1283,26 +1377,54 @@ async fn process_segment<S: Sink>(
             warn!(path = %segment.display(), "drain: segment not found; treating as already-consumed");
             return ProcessResult::Confirmed { record_count: 0 };
         }
-        Err(e) => {
-            // Any other open failure — transient I/O (fd exhaustion, ENOMEM, a
-            // momentary read error) or post-seal corruption (bad magic/version).
-            // Confirming here would DELETE a segment full of undelivered records on
-            // a transient blip. Preserve it: a transient error clears on retry, and
-            // a genuinely corrupt segment ends up left on disk for manual recovery
-            // (and is quarantined by crash recovery on the next restart).
-            //
-            // The cause is LOCAL, not the sink: a strand from here must not mark
-            // the sink down or count as a sink strand (D11).
-            error!(path = %segment.display(), error = %e, "drain: cannot open segment; preserving for retry");
-            return ProcessResult::Transient {
-                retry_after: None,
-                processed: skip,
-                cause: TransientCause::LocalRead {
-                    class: ledger::classify(&e),
-                    errno: e.raw_os_error(),
-                },
-            };
+        // The reader rejected the header itself (bad magic, a version it does
+        // not read, a file too short to hold one). That is a statement about the
+        // BYTES, which no retry changes — so it is decided now, never retried
+        // (spec §4.1). Nothing was delivered either way.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            match inspect_rejected_header(segment) {
+                HeaderVerdict::NewerFormat(version) => {
+                    // Written by a newer weir, not corrupt. Quarantining it would
+                    // break a rollback (a downgraded daemon would push every
+                    // newer-format segment into manual recovery), so it is set
+                    // aside for this run, bytes untouched, and replayed on the
+                    // next start — where a newer binary delivers it.
+                    error!(
+                        path = %segment.display(),
+                        version,
+                        max_supported = weir_wab::format::FORMAT_VERSION_MAX_SUPPORTED,
+                        "drain: segment was written in a newer WAB format than this binary \
+                         reads; parked (left in place, not retried this run) — upgrade weir \
+                         to deliver it; it replays on the next start"
+                    );
+                    return ProcessResult::Parked {
+                        reason: ledger::ParkReason::UnsupportedVersion,
+                    };
+                }
+                HeaderVerdict::Corrupt => {
+                    error!(path = %segment.display(), error = %e, "drain: segment header is corrupt; quarantining without retrying");
+                    quarantine_segment(segment, config, metrics, "drain: corrupt segment header");
+                    return ProcessResult::Quarantined;
+                }
+                HeaderVerdict::Gone => {
+                    warn!(path = %segment.display(), "drain: segment not found; treating as already-consumed");
+                    return ProcessResult::Confirmed { record_count: 0 };
+                }
+                // Re-reading the header to tell the two apart failed with a
+                // plain I/O error: undecided, so it is a local read like any
+                // other (below).
+                HeaderVerdict::Unreadable(re) => return local_read_failure(segment, re, skip),
+            }
         }
+        // Any other open failure is local I/O — fd exhaustion, ENOMEM, a
+        // permissions problem, a device error. Confirming here would DELETE a
+        // segment full of undelivered records on a transient blip, so it is
+        // preserved and retried. The error's class (spec §4.0 table) decides
+        // what persistence means: a daemon-wide `Process` error cycles until it
+        // clears, while `Access` and `Media` errors escalate (park, quarantine)
+        // after LOCAL_READ_STRAND_LIMIT strand cycles — see
+        // `next_state_after_process`.
+        Err(e) => return local_read_failure(segment, e, skip),
     };
 
     // Read once from the header the reader already parsed. Stable across a
@@ -1484,6 +1606,138 @@ async fn process_segment<S: Sink>(
 
     ProcessResult::Confirmed {
         record_count: read_index,
+    }
+}
+
+/// A local read error at open, as a transient result. The cause is LOCAL, not
+/// the sink: a strand from here must not mark the sink down or count as a sink
+/// strand (D11).
+fn local_read_failure(segment: &Path, e: std::io::Error, skip: u64) -> ProcessResult {
+    error!(path = %segment.display(), error = %e, "drain: cannot open segment; preserving for retry");
+    ProcessResult::Transient {
+        retry_after: None,
+        processed: skip,
+        cause: TransientCause::LocalRead {
+            class: ledger::classify(&e),
+            errno: e.raw_os_error(),
+        },
+    }
+}
+
+/// What a header the reader rejected as `InvalidData` actually is.
+#[derive(Debug)]
+enum HeaderVerdict {
+    /// The magic is right and the version byte is above what this build reads.
+    NewerFormat(u8),
+    /// Bad magic, version 0, or too short to hold a header.
+    Corrupt,
+    /// The file vanished between the open and the re-read.
+    Gone,
+    /// The re-read itself failed with an I/O error.
+    Unreadable(std::io::Error),
+}
+
+/// Re-reads the first five header bytes (magic + version) of a segment
+/// [`SegmentReader::open`] rejected, to tell a newer format from corruption.
+///
+/// The magic is checked first: a version byte only means something under the
+/// right magic (`b"NOTWEIR…"` has `'W'` = 0x57 at byte 4, which is no version).
+fn inspect_rejected_header(segment: &Path) -> HeaderVerdict {
+    use std::io::Read;
+    use weir_wab::format::{FORMAT_VERSION_MAX_SUPPORTED, SEGMENT_MAGIC};
+
+    let mut prefix = [0u8; 5];
+    let read = std::fs::File::open(segment).and_then(|mut f| f.read_exact(&mut prefix));
+    match read {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return HeaderVerdict::Corrupt,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HeaderVerdict::Gone,
+        Err(e) => return HeaderVerdict::Unreadable(e),
+    }
+    if prefix[0..4] == SEGMENT_MAGIC && prefix[4] > FORMAT_VERSION_MAX_SUPPORTED {
+        HeaderVerdict::NewerFormat(prefix[4])
+    } else {
+        // Bad magic, version 0, or a valid magic + version in a file shorter
+        // than the full header: all corrupt.
+        HeaderVerdict::Corrupt
+    }
+}
+
+/// [`SegmentReader::open`], behind the test-only open-fault hook.
+fn open_segment(segment: &Path) -> std::io::Result<SegmentReader> {
+    #[cfg(test)]
+    if let Some(e) = open_hook::on_open(segment) {
+        return Err(e);
+    }
+    SegmentReader::open(segment)
+}
+
+/// Test-only fault injection and observation for segment opens, keyed by the
+/// segment path so concurrently running tests (each in its own scratch dir)
+/// never see each other's faults. Only registered paths are tracked.
+#[cfg(test)]
+pub(crate) mod open_hook {
+    use std::{
+        collections::HashMap,
+        io,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    struct Entry {
+        errno: i32,
+        fail_left: u32,
+        attempts: u64,
+    }
+
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Entry>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashMap<PathBuf, Entry>) -> R) -> R {
+        let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashMap::new))
+    }
+
+    /// Counts opens of `path` without failing any.
+    pub(crate) fn watch(path: &Path) {
+        fail(path, 0, 0);
+    }
+
+    /// Fails the next `times` opens of `path` with `errno`, counting every open.
+    pub(crate) fn fail(path: &Path, errno: i32, times: u32) {
+        with(|m| {
+            m.insert(
+                path.to_path_buf(),
+                Entry {
+                    errno,
+                    fail_left: times,
+                    attempts: 0,
+                },
+            )
+        });
+    }
+
+    /// How many times the drain tried to open `path` since it was registered.
+    pub(crate) fn attempts(path: &Path) -> u64 {
+        with(|m| m.get(path).map_or(0, |e| e.attempts))
+    }
+
+    /// Stops tracking `path`.
+    pub(crate) fn forget(path: &Path) {
+        with(|m| m.remove(path));
+    }
+
+    /// Called on every segment open: counts it, and returns the injected error
+    /// while the fault lasts.
+    pub(super) fn on_open(path: &Path) -> Option<io::Error> {
+        with(|m| {
+            let e = m.get_mut(path)?;
+            e.attempts += 1;
+            if e.fail_left == 0 {
+                return None;
+            }
+            e.fail_left -= 1;
+            Some(io::Error::from_raw_os_error(e.errno))
+        })
     }
 }
 
@@ -3090,6 +3344,355 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // ── A corrupt or newer-format header at open (spec §4.1) ─────────────────
+
+    /// A sealed path whose bytes are whatever the test writes, in `shard_00`.
+    fn write_raw_sealed(dir: &Path, counter: u64, bytes: &[u8]) -> PathBuf {
+        let shard_dir = dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let sealed = segment_path(&shard_dir, counter).with_extension("wab.sealed");
+        std::fs::write(&sealed, bytes).unwrap();
+        sealed
+    }
+
+    /// Where the drain's quarantine puts `sealed` (shard-prefixed name).
+    fn quarantined_copy(dir: &Path, sealed: &Path) -> PathBuf {
+        let shard = sealed
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let name = sealed.file_name().unwrap().to_string_lossy();
+        dir.join("quarantine").join(format!("{shard}__{name}"))
+    }
+
+    /// Polls `cond` for up to `secs`, panicking with `what` if it never holds.
+    fn wait_for(secs: u64, what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Bad magic is corruption, not a transient read: it can never succeed on a
+    /// retry. Before §4.1 it was retried `max_retries+1` times, stranded, and
+    /// re-queued by every rescan for the life of the process (and replayed on
+    /// every restart, because recovery only looks at `.wab`). Now it is
+    /// quarantined on the FIRST attempt, never counted as a strand of either
+    /// kind, and never opened again.
+    #[test]
+    fn a_bad_magic_header_is_quarantined_on_the_first_attempt() {
+        let dir = tmp_dir("hdr_bad_magic");
+        let bytes = b"NOTWEIR-not-a-valid-segment-header-xxxx";
+        let sealed = write_raw_sealed(&dir, 1, bytes);
+        open_hook::watch(&sealed);
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()), // 50 ms idle rescan
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        let q = quarantined_copy(&dir, &sealed);
+        wait_for(5, "the corrupt segment in quarantine/", || q.exists());
+        // Several idle rescans: none may find (or re-open) it.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            open_hook::attempts(&sealed),
+            1,
+            "opened once, never retried"
+        );
+        assert!(!sealed.exists(), "moved out of the shard dir");
+        assert_eq!(
+            std::fs::read(&q).unwrap(),
+            bytes,
+            "the bytes are kept intact"
+        );
+        assert_eq!(metrics.drain_segments_stranded.get(), 0);
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+            0,
+            "corruption is not a local I/O strand either"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        assert_eq!(sink.call_count(), 0);
+        open_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Every header the reader rejects as `InvalidData` that is NOT a newer
+    /// format is corruption: bad magic (even when byte 4 happens to look like a
+    /// big version number), version 0, and a file too short to hold a header.
+    #[test]
+    fn corrupt_header_shapes_quarantine_and_a_newer_version_parks() {
+        use super::dead_letter::DeadLetterWriter;
+        use weir_wab::format::FORMAT_VERSION_MAX_SUPPORTED;
+        let dir = tmp_dir("hdr_shapes");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_responses([]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+
+        let good = make_sealed_segment(&dir, 0, &[b"x"]);
+        let good_bytes = std::fs::read(&good).unwrap();
+        std::fs::remove_file(&good).unwrap();
+        let with_byte4 = |v: u8| {
+            let mut b = good_bytes.clone();
+            b[4] = v;
+            b
+        };
+
+        let cases: [(&str, Vec<u8>); 5] = [
+            // 'W' (0x57) at byte 4 — a version byte far above the max, but the
+            // magic is wrong, so this is not a newer weir's segment.
+            (
+                "bad magic",
+                b"NOTWEIR-not-a-valid-header-xxxxxxxxxxxx".to_vec(),
+            ),
+            ("version 0", with_byte4(0)),
+            ("empty", Vec::new()),
+            ("short, magic only", b"WEI".to_vec()),
+            ("short, magic + version", good_bytes[..6].to_vec()),
+        ];
+        for (i, (what, bytes)) in cases.into_iter().enumerate() {
+            let sealed = write_raw_sealed(&dir, 10 + i as u64, &bytes);
+            let result = block_on(process_segment(
+                &sealed, &sink, &config, &metrics, &mut dl, 0,
+            ));
+            assert!(
+                matches!(result, ProcessResult::Quarantined),
+                "{what}: a corrupt header is quarantined"
+            );
+            assert!(!sealed.exists(), "{what}: moved out of the shard dir");
+            assert_eq!(
+                std::fs::read(quarantined_copy(&dir, &sealed)).unwrap(),
+                bytes,
+                "{what}: bytes kept"
+            );
+        }
+
+        let newer = write_raw_sealed(&dir, 20, &with_byte4(FORMAT_VERSION_MAX_SUPPORTED + 1));
+        let result = block_on(process_segment(
+            &newer, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(
+                result,
+                ProcessResult::Parked {
+                    reason: ParkReason::UnsupportedVersion
+                }
+            ),
+            "a newer format version is parked, not quarantined"
+        );
+        assert!(newer.exists(), "a parked segment stays where it is");
+        assert_eq!(sink.call_count(), 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A segment a NEWER weir wrote is not corrupt. Quarantining it would break
+    /// a rollback: a downgraded daemon would push every newer-format segment
+    /// into manual recovery. It is parked instead — left in place, not
+    /// re-queued this run, and replayed on the next start, when a newer binary
+    /// delivers it.
+    #[test]
+    fn a_newer_format_version_is_parked_not_moved() {
+        use weir_wab::format::FORMAT_VERSION_MAX_SUPPORTED;
+        let dir = tmp_dir("hdr_newer");
+        let sealed = make_sealed_segment(&dir, 0, &[b"from the future"]);
+        let mut bytes = std::fs::read(&sealed).unwrap();
+        bytes[4] = FORMAT_VERSION_MAX_SUPPORTED + 1;
+        std::fs::write(&sealed, &bytes).unwrap();
+        open_hook::watch(&sealed);
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        wait_for(5, "the unsupported_version park", || {
+            parked_gauge(&metrics, crate::metrics::ParkedReason::unsupported_version) == 1.0
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            open_hook::attempts(&sealed),
+            1,
+            "parked, so never re-queued"
+        );
+        assert_eq!(
+            std::fs::read(&sealed).unwrap(),
+            bytes,
+            "left in place, untouched"
+        );
+        assert!(!quarantined_copy(&dir, &sealed).exists(), "not quarantined");
+        assert!(!get_confirmed_path(&sealed).exists(), "not confirmed");
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        assert_eq!(metrics.drain_segments_stranded.get(), 0);
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+            0
+        );
+        assert_eq!(sink.call_count(), 0);
+        open_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Access class (spec §4.0 table): a directory at the sealed path opens but
+    /// every read fails with EISDIR — which works even as root in CI. The
+    /// failure counts toward escalation, and once it reaches
+    /// `(max_retries+1) × LOCAL_READ_STRAND_LIMIT` attempts (three strand
+    /// cycles) the segment is parked as `local_read_failed`: not re-queued by
+    /// any later rescan, and never counted as a sink strand.
+    #[cfg(unix)]
+    #[test]
+    fn an_access_class_read_failure_parks_after_three_strand_cycles() {
+        let dir = tmp_dir("hdr_eisdir");
+        let shard_dir = dir.join("shard_00");
+        let sealed = segment_path(&shard_dir, 1).with_extension("wab.sealed");
+        crate::testutil::mkdir_p(&sealed);
+        open_hook::watch(&sealed);
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()), // the 50 ms idle rescan re-queues each strand
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        wait_for(10, "the local_read_failed park", || {
+            parked_gauge(&metrics, crate::metrics::ParkedReason::local_read_failed) == 1.0
+        });
+        // Many idle rescans after the park: none may re-queue it.
+        std::thread::sleep(Duration::from_millis(400));
+        drop(tx);
+        handle.join().unwrap();
+
+        let per_cycle = u64::from(MAX_RETRIES + 1);
+        assert_eq!(
+            open_hook::attempts(&sealed),
+            per_cycle * u64::from(LOCAL_READ_STRAND_LIMIT),
+            "three cycles of attempts, then parked and never opened again"
+        );
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+            u64::from(LOCAL_READ_STRAND_LIMIT - 1),
+            "the first two cycles strand; the third ends in the park"
+        );
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            0,
+            "a local read failure is never a sink strand"
+        );
+        assert!(sealed.is_dir(), "a parked path is left where it is");
+        assert!(!quarantined_copy(&dir, &sealed).exists());
+        assert_eq!(sink.call_count(), 0);
+        open_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Process class (spec §4.0 table): EMFILE is daemon-wide descriptor
+    /// pressure, not a property of the segment. It never counts toward
+    /// escalation, however long it lasts: the segments keep stranding and
+    /// resuming exactly as before, nothing is parked or quarantined, and every
+    /// segment delivers once the pressure clears.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_class_open_failure_never_parks_and_heals() {
+        const CYCLES: u32 = 30;
+        let dir = tmp_dir("hdr_emfile");
+        let shard_dir = dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let mk = |counter: u64, payload: &[u8]| {
+            let mut s =
+                WabSegment::create(&segment_path(&shard_dir, counter), 0, Compression::None)
+                    .unwrap();
+            s.write_record(payload).unwrap();
+            s.seal().unwrap()
+        };
+        let segs = [mk(1, b"first"), mk(2, b"second")];
+        let failing = CYCLES * (MAX_RETRIES + 1);
+        for seg in &segs {
+            open_hook::fail(seg, libc::EMFILE, failing);
+        }
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        for seg in &segs {
+            tx.send(seg.clone()).unwrap();
+        }
+        wait_for(60, "both segments confirmed once EMFILE clears", || {
+            segs.iter().all(|s| get_confirmed_path(s).exists())
+        });
+        drop(tx);
+        handle.join().unwrap();
+
+        for seg in &segs {
+            assert_eq!(
+                open_hook::attempts(seg),
+                u64::from(failing) + 1,
+                "{} failing attempts, then the one that delivers",
+                failing
+            );
+            open_hook::forget(seg);
+        }
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+            u64::from(CYCLES) * segs.len() as u64,
+            "every cycle strands and resumes, as before"
+        );
+        for reason in [
+            crate::metrics::ParkedReason::local_read_failed,
+            crate::metrics::ParkedReason::unsupported_version,
+            crate::metrics::ParkedReason::drain_panic,
+        ] {
+            assert_eq!(parked_gauge(&metrics, reason), 0.0, "nothing parked");
+        }
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        assert_eq!(metrics.drain_segments_stranded.get(), 0);
+        let mut committed: Vec<Vec<u8>> = sink
+            .committed_records()
+            .iter()
+            .map(|p| p.to_vec())
+            .collect();
+        committed.sort();
+        assert_eq!(
+            committed,
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "everything delivers exactly once after the hook clears"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     // ── CommitResult ──────────────────────────────────────────────────────────
 
     #[test]
@@ -3445,8 +4048,13 @@ mod tests {
         let sink = Arc::new(MockSink::with_responses([]));
         run_drain(rx, tx, sink, fast_config(dir.clone()), noop_metrics());
 
+        // Spec §4.1 changed WHERE a corrupt header is preserved: it used to be
+        // left at the sealed path (and retried forever); it is now moved to
+        // quarantine/ on the first attempt. Either way it is never deleted.
+        // Transient open failures are still left in place and retried — see
+        // the §4.1 tests and `a_local_read_strand_is_not_counted_as_a_sink_strand`.
         assert!(
-            sealed.exists(),
+            sealed.exists() || quarantined_copy(&dir, &sealed).exists(),
             "an unopenable segment must be left on disk for recovery, not deleted"
         );
         assert!(
