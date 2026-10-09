@@ -333,6 +333,13 @@ impl SegmentLedger {
         *n
     }
 
+    /// The running count of segment-class local read failures of `path`, without
+    /// counting one. The drain asks before an attempt whether the next failure
+    /// would escalate (spec §4.2).
+    pub(crate) fn local_read_failures(&self, path: &Path) -> u32 {
+        self.local_read_failures.get(path).copied().unwrap_or(0)
+    }
+
     /// Keeps `path` out of admission and the rescan until `at`.
     #[allow(dead_code)] // reached by the per-segment cool-down (spec §4.6)
     pub(crate) fn set_not_before(&mut self, path: &Path, at: Instant) {

@@ -804,6 +804,7 @@ fn drain_thread<S: Sink>(
                         // refreshed by the wall-clock poll above, so we no longer
                         // probe the sink after every segment (which, under
                         // sustained load, meant a HEAD request per segment).
+                        let last_chance = local_read_escalates_next(&segment, &config, ledger);
                         let result = rt.block_on(process_segment(
                             &segment,
                             &*sink,
@@ -811,6 +812,7 @@ fn drain_thread<S: Sink>(
                             &metrics,
                             &mut dead_letter,
                             skip,
+                            last_chance,
                         ));
                         transition_from_draining(
                             segment,
@@ -993,6 +995,7 @@ fn drain_thread<S: Sink>(
                     DrainState::Draining
                 } else {
                     // Resume past the sub-batches already durably processed (F05).
+                    let last_chance = local_read_escalates_next(&segment, &config, ledger);
                     let result = rt.block_on(process_segment(
                         &segment,
                         &*sink,
@@ -1000,6 +1003,7 @@ fn drain_thread<S: Sink>(
                         &metrics,
                         &mut dead_letter,
                         processed,
+                        last_chance,
                     ));
                     // Subsequent failure: spend one retry and double the delay
                     // (exponential backoff). retries_left is >= 1 here — the
@@ -1243,11 +1247,7 @@ fn escalate_local_read(
     ledger: &mut SegmentLedger,
 ) -> Option<DrainState> {
     let failures = ledger.note_local_read_failure(segment, class);
-    let limit = config
-        .max_retries
-        .saturating_add(1)
-        .saturating_mul(LOCAL_READ_STRAND_LIMIT);
-    if failures < limit {
+    if failures < local_read_limit(config) {
         return None;
     }
     match class {
@@ -1288,6 +1288,21 @@ fn escalate_local_read(
     }
     end_block_episode(block_episode, metrics);
     Some(DrainState::Draining)
+}
+
+/// The local read failure count at which a segment escalates:
+/// `(max_retries + 1) × LOCAL_READ_STRAND_LIMIT`, i.e. three strand cycles.
+fn local_read_limit(config: &DrainConfig) -> u32 {
+    config
+        .max_retries
+        .saturating_add(1)
+        .saturating_mul(LOCAL_READ_STRAND_LIMIT)
+}
+
+/// True when one more segment-class local read failure of `segment` reaches
+/// the escalation limit — the `last_local_read_chance` of [`process_segment`].
+fn local_read_escalates_next(segment: &Path, config: &DrainConfig, ledger: &SegmentLedger) -> bool {
+    ledger.local_read_failures(segment).saturating_add(1) >= local_read_limit(config)
 }
 
 fn transition_from_draining(
@@ -1368,6 +1383,14 @@ fn enter_blocked(
 
 // ── Segment processing ────────────────────────────────────────────────────────
 
+/// Delivers one sealed segment, resuming past its first `skip` records.
+///
+/// `last_local_read_chance` is true when one more segment-class local read
+/// failure would reach the escalation limit (see [`local_read_escalates_next`]).
+/// It matters only to a `Media`-class read error mid-segment: there, and only
+/// there, the escalation must also deliver the partial batch it already read
+/// before quarantining (spec §4.2), which needs the sink — so it happens here
+/// rather than in [`escalate_local_read`].
 async fn process_segment<S: Sink>(
     segment: &Path,
     sink: &S,
@@ -1375,6 +1398,7 @@ async fn process_segment<S: Sink>(
     metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
     skip: u64,
+    last_local_read_chance: bool,
 ) -> ProcessResult {
     let reader = match open_segment(segment) {
         Ok(r) => r,
@@ -1463,19 +1487,70 @@ async fn process_segment<S: Sink>(
     let segment_name = segment_identity(segment);
     let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
 
-    let mut read_failed = false;
+    // Set when the record loop stops on a record it cannot read and the segment
+    // must be quarantined once the readable prefix is delivered; the reason is
+    // the one recorded in quarantine/.
+    let mut quarantine_after_prefix: Option<&'static str> = None;
     for result in reader {
+        #[cfg(test)]
+        let result = read_hook::on_record(segment, read_index, result);
         let payload = match result {
             Ok(p) => p,
-            Err(e) => {
-                // A record failed to read mid-stream (post-seal corruption, or a
-                // transient read error). The corrupt record and everything after it
-                // are unreachable via the sequential reader, so we deliver the
-                // readable prefix and then quarantine the segment below — never
-                // confirm+delete it, which would silently drop the unread tail.
+            // Corruption, as the reader documents it: a CRC mismatch or an
+            // oversized length (`InvalidData`), or a record cut short
+            // (`UnexpectedEof`). The record and everything after it are
+            // unreachable via the sequential reader and no retry changes the
+            // bytes, so we deliver the readable prefix and then quarantine the
+            // segment below — never confirm+delete it, which would silently drop
+            // the unread tail.
+            Err(e) if is_corruption(&e) => {
                 error!(path = %segment.display(), error = %e, "drain: segment read error; will quarantine after delivering the readable prefix");
-                read_failed = true;
+                quarantine_after_prefix = Some("drain: mid-segment read error");
                 break;
+            }
+            // Any other kind is the READ failing, not the bytes being bad (an
+            // EIO blip, a stale handle, fd pressure). Quarantining would push a
+            // good segment into manual recovery, where a requeue re-sends the
+            // prefix. Instead the attempt is a local transient (spec §4.2)
+            // reporting exactly the durable prefix: the partial batch read so
+            // far is NOT committed, and the ledger's cursor makes every later
+            // attempt, across strands too, resume past what was committed — so
+            // nothing is sent twice. The error's class decides persistence:
+            // `Process` cycles until it clears, `Access` parks at the limit,
+            // `Media` takes the corruption path at the limit (below).
+            Err(e) => {
+                let class = ledger::classify(&e);
+                if last_local_read_chance && class == ledger::ErrClass::Media {
+                    // TODO(safety-floor Task 11, spec §4.4): a failed move here
+                    // forgets the cursor; route through `quarantine_pending`.
+                    error!(
+                        path = %segment.display(),
+                        error = %e,
+                        errno = e.raw_os_error(),
+                        "drain: segment still unreadable (media) mid-segment after \
+                         {LOCAL_READ_STRAND_LIMIT} strand cycles; quarantining after delivering \
+                         the readable prefix"
+                    );
+                    quarantine_after_prefix =
+                        Some("drain: persistent local read error mid-segment");
+                    break;
+                }
+                error!(
+                    path = %segment.display(),
+                    error = %e,
+                    ?class,
+                    durable_through,
+                    "drain: segment read error mid-segment (not corruption); preserving for retry \
+                     past the records already delivered"
+                );
+                return ProcessResult::Transient {
+                    retry_after: None,
+                    processed: durable_through,
+                    cause: TransientCause::LocalRead {
+                        class,
+                        errno: e.raw_os_error(),
+                    },
+                };
             }
         };
         read_index += 1;
@@ -1554,10 +1629,10 @@ async fn process_segment<S: Sink>(
             }
         }
     }
-    if read_failed {
+    if let Some(reason) = quarantine_after_prefix {
         // Readable prefix delivered; move the segment (with its unreadable tail) to
         // the quarantine dir for manual recovery rather than deleting it.
-        quarantine_segment(segment, config, metrics, "drain: mid-segment read error");
+        quarantine_segment(segment, config, metrics, reason);
         return ProcessResult::Quarantined;
     }
 
@@ -1573,7 +1648,7 @@ async fn process_segment<S: Sink>(
     // the footer; on any mismatch (or an unreadable footer, i.e. the footer
     // itself was truncated) quarantine rather than confirm+delete. This turns a
     // previously-undetected silent loss into an operator-visible quarantine.
-    match read_segment_record_count(segment) {
+    match read_footer_count(segment) {
         Ok(footer_count) if footer_count == read_index => {}
         Ok(footer_count) => {
             error!(
@@ -1590,7 +1665,10 @@ async fn process_segment<S: Sink>(
             );
             return ProcessResult::Quarantined;
         }
-        Err(e) => {
+        // A footer cut short (the file ends inside it, or is shorter than one):
+        // the footer itself was truncated, so completeness is unverifiable from
+        // the bytes and no retry changes that.
+        Err(e) if is_corruption(&e) => {
             error!(
                 path = %segment.display(),
                 error = %e,
@@ -1604,10 +1682,44 @@ async fn process_segment<S: Sink>(
             );
             return ProcessResult::Quarantined;
         }
+        // Gone between the record loop and the footer read: like the open-time
+        // NotFound, already consumed. Every record was delivered above, so
+        // there is nothing left to deliver or preserve.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!(path = %segment.display(), "drain: segment vanished before its footer was read; treating as already-consumed");
+            return ProcessResult::Confirmed {
+                record_count: read_index,
+            };
+        }
+        // The footer READ failed (EIO, fd pressure, …), which says nothing about
+        // whether the segment is complete. Every record is already durable, so
+        // this is a local transient with `processed` = all of them: each retry,
+        // across strands too, re-reads the segment (G13) and re-checks the
+        // footer but re-commits nothing. At the escalation limit `Media`
+        // quarantines and `Access` parks (`escalate_local_read`); nothing is
+        // left to deliver first. Before spec §4.2 any footer error quarantined a
+        // complete, delivered segment on the first attempt.
+        Err(e) => {
+            error!(
+                path = %segment.display(),
+                error = %e,
+                records = read_index,
+                "drain: cannot read segment footer (not corruption); every record is delivered — \
+                 retrying the completeness check"
+            );
+            return ProcessResult::Transient {
+                retry_after: None,
+                processed: durable_through,
+                cause: TransientCause::LocalRead {
+                    class: ledger::classify(&e),
+                    errno: e.raw_os_error(),
+                },
+            };
+        }
     }
 
     // Clean path only: every readable record is now durably processed
-    // (durable_through == the full count). Asserted AFTER the read_failed
+    // (durable_through == the full count). Asserted AFTER the quarantine
     // early-return — on a resumed segment (skip > 0) that then hits a mid-prefix
     // read error, durable_through == skip < read_index, which is expected and
     // handled above by quarantine; asserting before that check would trip on a
@@ -1617,6 +1729,16 @@ async fn process_segment<S: Sink>(
     ProcessResult::Confirmed {
         record_count: read_index,
     }
+}
+
+/// True for the error kinds the segment reader uses for bad BYTES (spec §4.2):
+/// `InvalidData` (CRC mismatch, oversized length) and `UnexpectedEof` (a record
+/// or footer cut short). Every other kind is the read itself failing.
+fn is_corruption(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// A local read error at open, as a transient result. The cause is LOCAL, not
@@ -1783,6 +1905,115 @@ pub(crate) mod open_hook {
             e.fail_left -= 1;
             Some(io::Error::from_raw_os_error(e.errno))
         })
+    }
+}
+
+/// The footer's record count, behind the test-only read-fault hook.
+fn read_footer_count(segment: &Path) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(e) = read_hook::on_footer(segment) {
+        return Err(e);
+    }
+    read_segment_record_count(segment)
+}
+
+/// Test-only fault injection for the reads AFTER a segment opened: one record
+/// of the sequential record loop, or the footer read of the completeness check.
+/// Keyed by segment path like [`open_hook`], so concurrent tests never see each
+/// other's faults.
+///
+/// The fault is an errno (not an `ErrorKind`) because the drain classifies a
+/// local read error by its errno first (spec §4.0 table); EIO, say, has no
+/// stable `ErrorKind` of its own.
+#[cfg(test)]
+pub(crate) mod read_hook {
+    use std::{
+        collections::HashMap,
+        io,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    use weir_core::Payload;
+
+    /// Where the fault fires.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FaultAt {
+        /// The 0-based `n`-th record of the segment: records `0..n` read fine,
+        /// record `n` fails instead of being yielded.
+        Record(u64),
+        /// The footer read that verifies the record count.
+        Footer,
+    }
+
+    struct Entry {
+        at: FaultAt,
+        errno: i32,
+        fail_left: u32,
+        fired: u64,
+    }
+
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Entry>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashMap<PathBuf, Entry>) -> R) -> R {
+        let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashMap::new))
+    }
+
+    /// Fails the next `times` reads of `at` in `path` with `errno`. Each
+    /// attempt at the segment reaches `at` at most once, so `times` counts
+    /// attempts (`u32::MAX` = never clears).
+    pub(crate) fn fail(path: &Path, at: FaultAt, errno: i32, times: u32) {
+        with(|m| {
+            m.insert(
+                path.to_path_buf(),
+                Entry {
+                    at,
+                    errno,
+                    fail_left: times,
+                    fired: 0,
+                },
+            )
+        });
+    }
+
+    /// How many times the fault has fired for `path`.
+    pub(crate) fn fired(path: &Path) -> u64 {
+        with(|m| m.get(path).map_or(0, |e| e.fired))
+    }
+
+    /// Stops faulting `path`.
+    pub(crate) fn forget(path: &Path) {
+        with(|m| m.remove(path));
+    }
+
+    fn fire(path: &Path, at: FaultAt) -> Option<io::Error> {
+        with(|m| {
+            let e = m.get_mut(path)?;
+            if e.at != at || e.fail_left == 0 {
+                return None;
+            }
+            e.fail_left -= 1;
+            e.fired += 1;
+            Some(io::Error::from_raw_os_error(e.errno))
+        })
+    }
+
+    /// Called for the `index`-th (0-based) record the reader yields.
+    pub(super) fn on_record(
+        path: &Path,
+        index: u64,
+        result: io::Result<Payload>,
+    ) -> io::Result<Payload> {
+        match fire(path, FaultAt::Record(index)) {
+            Some(e) => Err(e),
+            None => result,
+        }
+    }
+
+    /// Called before the footer read.
+    pub(super) fn on_footer(path: &Path) -> Option<io::Error> {
+        fire(path, FaultAt::Footer)
     }
 }
 
@@ -3058,6 +3289,21 @@ mod tests {
         )
     }
 
+    /// `process_segment` gained `last_local_read_chance` (spec §4.2); every test
+    /// written before it runs a segment with no prior local read failures,
+    /// which is `false`. Tests of the escalating attempt call
+    /// `super::process_segment` directly.
+    async fn process_segment<S: Sink>(
+        segment: &Path,
+        sink: &S,
+        config: &DrainConfig,
+        metrics: &Metrics,
+        dead_letter: &mut DeadLetterWriter,
+        skip: u64,
+    ) -> ProcessResult {
+        super::process_segment(segment, sink, config, metrics, dead_letter, skip, false).await
+    }
+
     fn fresh_ledger() -> SegmentLedger {
         SegmentLedger::new(Arc::new(ledger::LedgerCounts::default()))
     }
@@ -3780,6 +4026,358 @@ mod tests {
             vec![b"first".to_vec(), b"second".to_vec()],
             "everything delivers exactly once after the hook clears"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Transient I/O mid-segment and at the footer (spec §4.2) ──────────────
+
+    /// `n` sealed records `r00`, `r01`, … in one segment of `dir`.
+    fn make_numbered_segment(dir: &Path, n: usize) -> (PathBuf, Vec<Vec<u8>>) {
+        let records: Vec<Vec<u8>> = (0..n).map(|i| format!("r{i:02}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        (make_sealed_segment(dir, 0, &refs), records)
+    }
+
+    fn committed_bytes(sink: &MockSink) -> Vec<Vec<u8>> {
+        sink.committed_records()
+            .iter()
+            .map(|p| p.to_vec())
+            .collect()
+    }
+
+    /// One attempt that hits a non-corruption read error mid-segment is a local
+    /// transient, not a quarantine: the sub-batches already committed are the
+    /// durable cursor, and the partial in-memory batch (read but not yet sent)
+    /// is NOT committed — the retry resumes exactly past the durable prefix and
+    /// sends it then, once. Before §4.2 the prefix was committed and the good
+    /// segment quarantined, so a blip pushed it into manual recovery.
+    #[cfg(unix)]
+    #[test]
+    fn a_mid_segment_eio_is_transient_and_commits_no_partial_batch() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("mid_eio_once");
+        let (sealed, records) = make_numbered_segment(&dir, 5);
+        read_hook::fail(&sealed, read_hook::FaultAt::Record(3), libc::EIO, 1);
+
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_batch_size(2, []);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+
+        let result = block_on(process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(
+                result,
+                ProcessResult::Transient {
+                    processed: 2,
+                    cause: TransientCause::LocalRead {
+                        class: ErrClass::Media,
+                        errno: Some(libc::EIO),
+                    },
+                    ..
+                }
+            ),
+            "EIO at record 3 with batches of 2: transient, durable through 2"
+        );
+        assert_eq!(
+            committed_bytes(&sink),
+            records[..2],
+            "r02 was read into the partial batch but must not be committed"
+        );
+        assert!(sealed.exists(), "a blip must not move the segment");
+        assert!(!dir.join("quarantine").exists(), "nothing quarantined");
+
+        // The retry resumes past the durable prefix and finishes the segment.
+        let result = block_on(process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, 2,
+        ));
+        assert!(matches!(
+            result,
+            ProcessResult::Confirmed { record_count: 5 }
+        ));
+        assert_eq!(committed_bytes(&sink), records, "every record exactly once");
+        read_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The escalating attempt (`last_local_read_chance`) changes only a `Media`
+    /// read mid-segment: that one delivers the partial batch and quarantines.
+    /// `Process` (never escalates) and `Access` (parks, in the state machine)
+    /// stay transient and still commit no partial batch.
+    #[cfg(unix)]
+    #[test]
+    fn the_last_local_read_chance_only_changes_a_media_read() {
+        use super::dead_letter::DeadLetterWriter;
+        for (errno, quarantines) in [
+            (libc::EMFILE, false),
+            (libc::EACCES, false),
+            (libc::EIO, true),
+        ] {
+            let dir = tmp_dir(&format!("last_chance_{errno}"));
+            let (sealed, records) = make_numbered_segment(&dir, 5);
+            read_hook::fail(&sealed, read_hook::FaultAt::Record(3), errno, 1);
+            let mut dl = DeadLetterWriter::open(&dir).unwrap();
+            let sink = MockSink::with_batch_size(2, []);
+            let metrics = noop_metrics();
+            let config = fast_config(dir.clone());
+
+            let result = block_on(super::process_segment(
+                &sealed, &sink, &config, &metrics, &mut dl, 0, true,
+            ));
+            if quarantines {
+                assert!(
+                    matches!(result, ProcessResult::Quarantined),
+                    "errno {errno}"
+                );
+                assert_eq!(committed_bytes(&sink), records[..3], "prefix incl. r02");
+                assert!(quarantined_copy(&dir, &sealed).exists());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        ProcessResult::Transient {
+                            processed: 2,
+                            cause: TransientCause::LocalRead { .. },
+                            ..
+                        }
+                    ),
+                    "errno {errno}"
+                );
+                assert_eq!(committed_bytes(&sink), records[..2], "errno {errno}");
+                assert!(sealed.exists());
+            }
+            read_hook::forget(&sealed);
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Spec §4.2: the fault reader fails at record N and STAYS failing past the
+    /// escalation limit. Every record below N reaches the sink exactly once in
+    /// the run — the full sub-batches on the first attempt, the partial batch
+    /// only on the escalating attempt — and the segment ends in `quarantine/`
+    /// after three strand cycles, never counted as a sink strand.
+    #[cfg(unix)]
+    #[test]
+    fn a_persistent_mid_segment_eio_delivers_the_prefix_once_then_quarantines() {
+        const N: u64 = 7;
+        let dir = tmp_dir("mid_eio_persistent");
+        let (sealed, records) = make_numbered_segment(&dir, 10);
+        read_hook::fail(&sealed, read_hook::FaultAt::Record(N), libc::EIO, u32::MAX);
+
+        let sink = Arc::new(MockSink::with_batch_size(3, []));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()), // the 50 ms idle rescan re-queues each strand
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        let quarantined = quarantined_copy(&dir, &sealed);
+        wait_for(10, "the media escalation quarantine", || {
+            quarantined.exists()
+        });
+        // Idle rescans after the quarantine: nothing may re-deliver.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            committed_bytes(&sink),
+            records[..N as usize],
+            "each record below N exactly once, in order — no strand re-sent the prefix"
+        );
+        assert_eq!(
+            read_hook::fired(&sealed),
+            u64::from(MAX_RETRIES + 1) * u64::from(LOCAL_READ_STRAND_LIMIT),
+            "three strand cycles of attempts, then quarantined"
+        );
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+            u64::from(LOCAL_READ_STRAND_LIMIT - 1),
+            "the first two cycles strand; the third ends in the quarantine"
+        );
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            0,
+            "not a sink strand"
+        );
+        assert!(!sealed.exists(), "moved out of the shard dir");
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        read_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The `Access` twin of the test above: a mid-segment EACCES that persists
+    /// parks the segment (bytes left in place) instead of quarantining it, and
+    /// the partial batch is never committed — the next start replays the
+    /// segment, and the at-least-once contract covers the prefix.
+    #[cfg(unix)]
+    #[test]
+    fn a_persistent_mid_segment_eacces_parks_without_committing_the_partial_batch() {
+        let dir = tmp_dir("mid_eacces_persistent");
+        let (sealed, records) = make_numbered_segment(&dir, 10);
+        read_hook::fail(
+            &sealed,
+            read_hook::FaultAt::Record(7),
+            libc::EACCES,
+            u32::MAX,
+        );
+
+        let sink = Arc::new(MockSink::with_batch_size(3, []));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        wait_for(10, "the local_read_failed park", || {
+            parked_gauge(&metrics, crate::metrics::ParkedReason::local_read_failed) == 1.0
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            committed_bytes(&sink),
+            records[..6],
+            "the two full sub-batches exactly once; the partial batch never"
+        );
+        assert_eq!(
+            read_hook::fired(&sealed),
+            u64::from(MAX_RETRIES + 1) * u64::from(LOCAL_READ_STRAND_LIMIT),
+            "three strand cycles of attempts, then parked and never read again"
+        );
+        assert!(sealed.exists(), "a parked segment is left in place");
+        assert!(!quarantined_copy(&dir, &sealed).exists());
+        assert_eq!(metrics.drain_segments_stranded.get(), 0);
+        read_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Spec §4.2: a footer read fault (EIO) held for two strand cycles, then
+    /// cleared. Every record was committed before the footer check, so each
+    /// retry resumes with `skip = record count` and re-commits nothing: the sink
+    /// count equals the record count exactly, and the segment is confirmed.
+    /// Before §4.2 any footer read error quarantined the (complete, delivered)
+    /// segment on the first attempt.
+    #[cfg(unix)]
+    #[test]
+    fn a_footer_read_blip_is_retried_and_confirms_without_redelivery() {
+        const CYCLES: u32 = 2;
+        let dir = tmp_dir("footer_eio_blip");
+        let (sealed, records) = make_numbered_segment(&dir, 4);
+        let failing = CYCLES * (MAX_RETRIES + 1);
+        read_hook::fail(&sealed, read_hook::FaultAt::Footer, libc::EIO, failing);
+
+        let sink = Arc::new(MockSink::with_batch_size(3, []));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        wait_for(10, "the segment confirmed once the footer reads", || {
+            get_confirmed_path(&sealed).exists()
+        });
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            committed_bytes(&sink),
+            records,
+            "sink count == record count: the footer retries re-committed nothing"
+        );
+        assert_eq!(read_hook::fired(&sealed), u64::from(failing));
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+            u64::from(CYCLES),
+            "each failing cycle is a local read strand"
+        );
+        assert_eq!(metrics.drain_segments_stranded.get(), 0);
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        assert!(!sealed.exists(), "confirmed and deleted");
+        read_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A footer EIO that never clears escalates like any `Media` read: three
+    /// strand cycles, then quarantine — and still with every record delivered
+    /// exactly once, because each retry resumed past all of them.
+    #[cfg(unix)]
+    #[test]
+    fn a_persistent_footer_eio_quarantines_after_three_cycles_without_redelivery() {
+        let dir = tmp_dir("footer_eio_persistent");
+        let (sealed, records) = make_numbered_segment(&dir, 4);
+        read_hook::fail(&sealed, read_hook::FaultAt::Footer, libc::EIO, u32::MAX);
+
+        let sink = Arc::new(MockSink::with_batch_size(3, []));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        let quarantined = quarantined_copy(&dir, &sealed);
+        wait_for(10, "the footer media escalation quarantine", || {
+            quarantined.exists()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(committed_bytes(&sink), records, "every record exactly once");
+        assert_eq!(
+            read_hook::fired(&sealed),
+            u64::from(MAX_RETRIES + 1) * u64::from(LOCAL_READ_STRAND_LIMIT)
+        );
+        assert_eq!(metrics.drain_segments_stranded.get(), 0);
+        assert!(!sealed.exists());
+        read_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A footer read that finds the file gone (NotFound) is treated like the
+    /// open-time NotFound: already consumed. Every record was delivered before
+    /// the footer check, so there is nothing to preserve.
+    #[cfg(unix)]
+    #[test]
+    fn a_vanished_footer_counts_as_consumed() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("footer_enoent");
+        let (sealed, records) = make_numbered_segment(&dir, 3);
+        read_hook::fail(&sealed, read_hook::FaultAt::Footer, libc::ENOENT, 1);
+
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let sink = MockSink::with_responses([]);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let result = block_on(process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, 0,
+        ));
+        assert!(
+            matches!(result, ProcessResult::Confirmed { record_count: 3 }),
+            "a footer NotFound is already consumed, not a quarantine"
+        );
+        assert_eq!(committed_bytes(&sink), records);
+        assert!(!dir.join("quarantine").exists());
+        read_hook::forget(&sealed);
         std::fs::remove_dir_all(dir).ok();
     }
 
