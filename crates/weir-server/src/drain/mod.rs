@@ -29,6 +29,7 @@
 
 mod confirmed;
 pub mod dead_letter;
+pub(crate) mod ledger;
 
 use std::{
     collections::VecDeque,
@@ -38,14 +39,15 @@ use std::{
 };
 
 use crossbeam_channel::RecvTimeoutError;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use weir_core::Payload;
 use weir_sink_sdk::RecordId;
 
 use crate::{
     metrics::{
-        DrainStateLabel, DrainStateValue, Metrics, Outcome, OutcomeLabel, SinkHealthLabel,
-        SinkHealthState,
+        DispositionKind, DispositionLabel, DrainStateLabel, DrainStateValue, LocalIoStrandCause,
+        LocalIoStrandLabel, Metrics, Outcome, OutcomeLabel, ParkedLabel, ParkedReason,
+        SinkHealthLabel, SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth},
     wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
@@ -53,6 +55,9 @@ use crate::{
 
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
+use ledger::{Admit, SegmentLedger, TransientCause};
+#[cfg(test)]
+use ledger::{ErrClass, ParkReason};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -153,6 +158,10 @@ enum DrainState {
         /// sub-batches; the retry resumes past them rather than re-committing /
         /// re-dead-lettering them (F05).
         processed: u64,
+        /// What made the most recent attempt transient. Decides the strand
+        /// bookkeeping once the budget runs out: only a sink cause counts as a
+        /// sink strand and marks the sink down (D11).
+        cause: TransientCause,
     },
     BlockedDeadLetterFull {
         segment: PathBuf,
@@ -174,6 +183,7 @@ enum ProcessResult {
     Transient {
         retry_after: Option<Duration>,
         processed: u64,
+        cause: TransientCause,
     },
     /// Dead-letter cap would be exceeded. Block until capacity frees. `processed`
     /// carries the durable progress so the post-headroom retry resumes past the
@@ -186,7 +196,10 @@ enum ProcessResult {
 
 enum BatchResult {
     Ok,
-    Transient { retry_after: Option<Duration> },
+    Transient {
+        retry_after: Option<Duration>,
+        cause: TransientCause,
+    },
     Blocked,
 }
 
@@ -240,6 +253,10 @@ fn run_drain_supervised<S: Sink>(
     heartbeat: DrainHeartbeat,
 ) {
     let mut attempts = 0u32;
+    // Owned here, not by `drain_thread`, so it survives a panic and respawn: a
+    // respawned drain still knows which segments are owned by a disposition,
+    // parked or cooling down, and where each stranded segment resumes.
+    let mut ledger = SegmentLedger::new(Arc::new(ledger::LedgerCounts::default()));
     loop {
         let rx = drain_rx.clone();
         let sink = Arc::clone(&sink);
@@ -251,8 +268,9 @@ fn run_drain_supervised<S: Sink>(
         // recovery edge and rescan the disk — see `drain_thread`'s
         // `initial_health_ok`).
         let first_start = attempts == 0;
+        let ledger = &mut ledger;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drain_thread(rx, sink, cfg, m, first_start, hb)
+            drain_thread(rx, sink, cfg, m, first_start, hb, ledger)
         }));
         // A clean Ok(()) return means the channel closed (all flushers gone) — done.
         let Err(_) = result else { break };
@@ -356,6 +374,37 @@ fn set_sink_health(metrics: &Metrics, health: SinkHealth) {
     }
 }
 
+/// Publishes the ledger's wait-free counts to the drain-ledger gauges. Reads only
+/// the atomics, never the ledger's maps.
+fn publish_ledger_counts(counts: &ledger::LedgerCounts, metrics: &Metrics) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for (reason, why) in [
+        (
+            ParkedReason::local_read_failed,
+            ledger::ParkReason::LocalReadFailed,
+        ),
+        (
+            ParkedReason::unsupported_version,
+            ledger::ParkReason::UnsupportedVersion,
+        ),
+        (ParkedReason::drain_panic, ledger::ParkReason::DrainPanic),
+    ] {
+        metrics
+            .drain_segments_parked
+            .get_or_create(&ParkedLabel { reason })
+            .set(counts.parked_by_reason[why.index()].load(Relaxed) as f64);
+    }
+    for (kind, n) in [
+        (DispositionKind::confirm, &counts.confirm_pending),
+        (DispositionKind::quarantine, &counts.quarantine_pending),
+    ] {
+        metrics
+            .drain_segments_disposition_pending
+            .get_or_create(&DispositionLabel { kind })
+            .set(n.load(Relaxed) as f64);
+    }
+}
+
 /// Probes [`Sink::health`] under a timeout backstop and maps a hang to `Down`.
 ///
 /// The drain runs on a single-threaded runtime; an un-timed `health()` that
@@ -385,6 +434,11 @@ fn probe_health<S: Sink>(rt: &tokio::runtime::Runtime, sink: &S, timeout: Durati
 /// It is excluded from the re-queue so the rescan can run from those arms (M2)
 /// without double-queuing the segment the arm is about to resume on its own. The
 /// `Draining` caller holds nothing across the rescan and passes `None`.
+///
+/// `exclude` is the drain ledger's `excludes` (spec §4.0): segments owned by an
+/// outstanding disposition, parked, or cooling down. The scan skips them before
+/// its confirmed-check, so they are neither re-queued nor touched.
+#[allow(clippy::too_many_arguments)]
 fn probe_and_resume_stranded<S: Sink>(
     rt: &tokio::runtime::Runtime,
     sink: &S,
@@ -393,6 +447,7 @@ fn probe_and_resume_stranded<S: Sink>(
     pending: &mut VecDeque<PathBuf>,
     prev_health_ok: bool,
     in_flight: Option<&Path>,
+    exclude: &dyn Fn(&Path) -> bool,
 ) -> bool {
     let health = probe_health(rt, sink, config.health_probe_timeout);
     // Deliverable, not perfect. `Degraded` means "reachable but not fully
@@ -417,7 +472,7 @@ fn probe_and_resume_stranded<S: Sink>(
     if now_ok && (!prev_health_ok || pending.is_empty()) {
         // `None` shard_count: skip the beyond-configured-count advisory — that's
         // a startup-replay concern, not a recovery one.
-        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None, metrics) {
+        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None, metrics, exclude) {
             Ok(sealed) => {
                 // Dedup against what's already queued via a HashSet membership view
                 // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
@@ -571,6 +626,8 @@ fn drain_thread<S: Sink>(
     // survives a sink call that blocks this thread outright rather than
     // yielding.
     heartbeat: DrainHeartbeat,
+    // Owned by `run_drain_supervised` so it outlives a panic; see `ledger`.
+    ledger: &mut SegmentLedger,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -636,6 +693,10 @@ fn drain_thread<S: Sink>(
         // deliberately park for a long time bump it from inside their own wait
         // loops as well, so only a genuinely blocked thread freezes it.
         heartbeat.bump();
+        // Every ledger mutation happens inside an arm below and is followed by
+        // another pass through here, so publishing at the loop head keeps the
+        // gauges current without threading `metrics` into the ledger.
+        publish_ledger_counts(ledger.counts(), &metrics);
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
@@ -647,7 +708,13 @@ fn drain_thread<S: Sink>(
                 // is saturating the drain channel (the old idle-only poll never
                 // fired under sustained load). `pending` is drained in submission
                 // order, so re-queued stranded segments interleave with new ones.
+                //
+                // Order (spec §4.0): outstanding dispositions first — they never
+                // deliver, and finishing one can change what the rescan may
+                // pick up — then the probe + rescan, then the gauges.
                 if last_health_poll.elapsed() >= config.health_poll_interval {
+                    ledger.retry_dispositions();
+                    let now = Instant::now();
                     prev_health_ok = probe_and_resume_stranded(
                         &rt,
                         &*sink,
@@ -656,6 +723,7 @@ fn drain_thread<S: Sink>(
                         &mut pending,
                         prev_health_ok,
                         None,
+                        &|p| ledger.excludes(p, now),
                     );
                     // Refresh the dead-letter size gauge too, so an out-of-band
                     // `weir-ctl dl drop` (an operator deleting files while the
@@ -676,9 +744,21 @@ fn drain_thread<S: Sink>(
                     last_health_poll = Instant::now();
                 }
 
-                let next_segment = if let Some(p) = pending.pop_front() {
-                    Some(p)
-                } else {
+                // Both sources pass the ledger's admission check (spec §4.0):
+                // the channel is not enumerable, so a path can sit in it AND in
+                // `pending` (re-queued by a rescan, or buffered by one of the
+                // waits below). A copy the ledger owns is dropped here; the
+                // rescan is its way back once it becomes admissible.
+                let next_segment = loop {
+                    if let Some(p) = pending.pop_front() {
+                        match ledger.admit(&p, Instant::now()) {
+                            Admit::Process { skip } => break Some((p, skip)),
+                            Admit::Drop(owner) => {
+                                debug!(path = %p.display(), owner, "drain: not admitting queued segment");
+                                continue;
+                            }
+                        }
+                    }
                     // Idle: wait for a new segment, but no longer than the time
                     // left until the next health poll, then re-enter Draining so
                     // the wall-clock poll above runs. Channel closure (all WAB
@@ -688,29 +768,37 @@ fn drain_thread<S: Sink>(
                         .saturating_sub(last_health_poll.elapsed())
                         .max(Duration::from_millis(1));
                     match drain_rx.recv_timeout(until_next_poll) {
-                        Ok(p) => Some(p),
-                        Err(RecvTimeoutError::Timeout) => None,
+                        Ok(p) => match ledger.admit(&p, Instant::now()) {
+                            Admit::Process { skip } => break Some((p, skip)),
+                            Admit::Drop(owner) => {
+                                debug!(path = %p.display(), owner, "drain: not admitting segment from the channel");
+                                break None;
+                            }
+                        },
+                        Err(RecvTimeoutError::Timeout) => break None,
                         Err(RecvTimeoutError::Disconnected) => break 'outer,
                     }
                 };
 
                 match next_segment {
-                    // Idle timeout with nothing queued: re-enter Draining so the
-                    // wall-clock health poll above runs on schedule.
+                    // Idle timeout with nothing queued (or a dropped channel
+                    // copy): re-enter Draining so the wall-clock health poll
+                    // above runs on schedule.
                     None => DrainState::Draining,
-                    Some(segment) => {
-                        // Fresh segment → process from the start (skip = 0). The
-                        // health gauge + rescan are refreshed by the wall-clock
-                        // poll above, so we no longer probe the sink after every
-                        // segment (which, under sustained load, meant a HEAD
-                        // request per segment).
+                    Some((segment, skip)) => {
+                        // A fresh segment starts at 0; one the ledger holds a
+                        // cursor for (it stranded earlier in this run) resumes
+                        // past its durable prefix. The health gauge + rescan are
+                        // refreshed by the wall-clock poll above, so we no longer
+                        // probe the sink after every segment (which, under
+                        // sustained load, meant a HEAD request per segment).
                         let result = rt.block_on(process_segment(
                             &segment,
                             &*sink,
                             &config,
                             &metrics,
                             &mut dead_letter,
-                            0,
+                            skip,
                         ));
                         transition_from_draining(
                             segment,
@@ -718,6 +806,7 @@ fn drain_thread<S: Sink>(
                             &config,
                             &metrics,
                             &mut block_episode,
+                            ledger,
                         )
                     }
                 }
@@ -729,6 +818,7 @@ fn drain_thread<S: Sink>(
                 retries_left,
                 next_delay,
                 processed,
+                cause,
             } => {
                 set_drain_state(&metrics, DrainStateValue::retrying_transient);
 
@@ -809,6 +899,8 @@ fn drain_thread<S: Sink>(
                 // segment being retried (`segment`) — this arm processes it directly
                 // below, so re-queuing it would double-process. The borrow ends
                 // before `segment` is moved into process_segment / the next state.
+                // Ledger-owned paths are skipped too (spec §4.0).
+                let now = Instant::now();
                 prev_health_ok = probe_and_resume_stranded(
                     &rt,
                     &*sink,
@@ -817,34 +909,75 @@ fn drain_thread<S: Sink>(
                     &mut pending,
                     prev_health_ok,
                     Some(&segment),
+                    &|p| ledger.excludes(p, now),
                 );
 
                 if retries_left == 0 {
-                    metrics.drain_segments_stranded.inc();
-                    // The sink is failing; mark it down so the next healthy probe
-                    // registers as a down→up recovery edge and re-drains this
-                    // stranded segment without waiting for a restart.
-                    prev_health_ok = false;
-                    // H2: the `processed` cursor is intentionally dropped at the
-                    // strand boundary. The rescan re-queues only the PathBuf, so the
-                    // resumed segment is reprocessed from skip=0 (the Draining arm
-                    // calls process_segment(.., 0)) rather than past its already-
-                    // committed sub-batches. This re-delivers the committed prefix
-                    // and re-dead-letters any permanent rejects in it — a duplicate
-                    // window that is the SAME at-least-once/idempotency trade-off the
-                    // SinkSDK already mandates for crash recovery (sinks must dedupe;
-                    // dead-letter duplicates are operator-review noise). Persisting
-                    // the cursor across a strand would need a crash-safe on-disk
-                    // sidecar; deliberately not done — F05 holds *within* a retry
-                    // episode (RetryingTransient carries `processed`), and the strand
-                    // → resume boundary falls back to whole-segment at-least-once.
-                    error!(
-                        path = %segment.display(),
-                        "drain: max retries exhausted; segment left on disk (stranded) — \
-                         weir_drain_segments_stranded_total incremented; re-drained automatically \
-                         when the sink recovers (reprocessed from the start — duplicates handled by \
-                         the sink's idempotency), or on restart"
-                    );
+                    // The `processed` cursor SURVIVES the strand (spec §4.0,
+                    // revising H2): every transient result already recorded it
+                    // in the ledger, pinned to the file's (dev, ino), so when the
+                    // rescan re-queues this path, admission resumes it past the
+                    // committed prefix instead of re-delivering it. It is in
+                    // memory only — a restart still replays the whole segment,
+                    // the at-least-once trade-off the SinkSDK mandates for crash
+                    // recovery (sinks must dedupe).
+                    //
+                    // The bookkeeping depends on WHAT failed (D11).
+                    match cause {
+                        TransientCause::Sink => {
+                            metrics.drain_segments_stranded.inc();
+                            // The sink is failing; mark it down so the next
+                            // healthy probe registers as a down→up recovery edge
+                            // and re-drains this stranded segment without
+                            // waiting for a restart.
+                            prev_health_ok = false;
+                            error!(
+                                path = %segment.display(),
+                                processed,
+                                "drain: max retries exhausted; segment left on disk (stranded) — \
+                                 weir_drain_segments_stranded_total incremented; re-drained \
+                                 automatically when the sink recovers (resuming past the records \
+                                 already delivered), or on restart (from the start — duplicates \
+                                 handled by the sink's idempotency)"
+                            );
+                        }
+                        // A local cause says nothing about the sink: do not fake
+                        // a sink-down edge, and keep it out of the sink-oriented
+                        // stranded counter. The idle rescan resumes it.
+                        TransientCause::LocalRead { class, errno } => {
+                            metrics
+                                .drain_local_io_strands
+                                .get_or_create(&LocalIoStrandLabel {
+                                    cause: LocalIoStrandCause::read,
+                                })
+                                .inc();
+                            error!(
+                                path = %segment.display(),
+                                ?class,
+                                errno,
+                                processed,
+                                "drain: max retries exhausted reading the segment; left on disk — \
+                                 weir_drain_local_io_strands_total{{cause=\"read\"}} incremented; \
+                                 retried by the idle rescan. Check the WAB device, not the sink"
+                            );
+                        }
+                        TransientCause::LocalWrite => {
+                            metrics
+                                .drain_local_io_strands
+                                .get_or_create(&LocalIoStrandLabel {
+                                    cause: LocalIoStrandCause::write,
+                                })
+                                .inc();
+                            error!(
+                                path = %segment.display(),
+                                processed,
+                                "drain: max retries exhausted writing dead-letter records; segment \
+                                 left on disk — weir_drain_local_io_strands_total{{cause=\"write\"}} \
+                                 incremented; retried by the idle rescan. Check the dead_letter/ \
+                                 device (space, permissions), not the sink"
+                            );
+                        }
+                    }
                     DrainState::Draining
                 } else {
                     // Resume past the sub-batches already durably processed (F05).
@@ -864,11 +997,13 @@ fn drain_thread<S: Sink>(
                         result,
                         &metrics,
                         &mut block_episode,
-                        |segment, retry_after, processed| DrainState::RetryingTransient {
+                        ledger,
+                        |segment, retry_after, processed, cause| DrainState::RetryingTransient {
                             segment,
                             retries_left: retries_left - 1,
                             next_delay: next_retry_delay(next_delay * 2, retry_after),
                             processed,
+                            cause,
                         },
                     )
                 }
@@ -938,7 +1073,8 @@ fn drain_thread<S: Sink>(
                 // probe_and_resume_stranded does the same gauge update plus the
                 // down→up re-queue, excluding `segment` (this arm resumes it on its
                 // own via the RetryingTransient transition below, so re-queuing it
-                // would double-process).
+                // would double-process). Ledger-owned paths are skipped too.
+                let now = Instant::now();
                 prev_health_ok = probe_and_resume_stranded(
                     &rt,
                     &*sink,
@@ -947,6 +1083,7 @@ fn drain_thread<S: Sink>(
                     &mut pending,
                     prev_health_ok,
                     Some(&segment),
+                    &|p| ledger.excludes(p, now),
                 );
                 if dead_letter.total_bytes() < config.dead_letter_max_bytes {
                     // Headroom available — retry the preserved segment, RESUMING
@@ -973,6 +1110,7 @@ fn drain_thread<S: Sink>(
                         retries_left: config.max_retries,
                         next_delay: config.base_retry_delay,
                         processed,
+                        cause: TransientCause::Sink,
                     }
                 } else if channel_closed {
                     // No headroom and shutdown requested — leave segment unconfirmed.
@@ -993,6 +1131,11 @@ fn drain_thread<S: Sink>(
         };
     }
 
+    // One best-effort pass over outstanding dispositions on the way out: a
+    // sidecar or quarantine move that can complete now saves a re-delivery on
+    // the next start. It never delivers.
+    ledger.retry_dispositions();
+    publish_ledger_counts(ledger.counts(), &metrics);
     info!("drain thread exiting");
 }
 
@@ -1004,28 +1147,44 @@ fn drain_thread<S: Sink>(
 /// callers (fresh budget vs. decremented/exponential), so each supplies it via
 /// `on_transient`. This is the single source of truth for the non-retry
 /// transitions — see the `Draining` and `RetryingTransient` arms in `run`.
+///
+/// It also keeps the ledger's per-segment progress in step (spec §4.0): a
+/// transient or blocked result records the durable cursor, which survives a
+/// strand; a confirmed or quarantined segment is forgotten.
 fn next_state_after_process(
     segment: PathBuf,
     result: ProcessResult,
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
-    on_transient: impl FnOnce(PathBuf, Option<Duration>, u64) -> DrainState,
+    ledger: &mut SegmentLedger,
+    on_transient: impl FnOnce(PathBuf, Option<Duration>, u64, TransientCause) -> DrainState,
 ) -> DrainState {
     match result {
         ProcessResult::Confirmed { record_count } => {
             confirm_and_delete(&segment, record_count, metrics);
+            ledger.forget(&segment);
+            #[cfg(test)]
+            if ledger.park_after_confirm.remove(&segment) {
+                ledger.park(&segment, ParkReason::LocalReadFailed);
+            }
             end_block_episode(block_episode, metrics);
             DrainState::Draining
         }
         ProcessResult::Transient {
             retry_after,
             processed,
-        } => on_transient(segment, retry_after, processed),
+            cause,
+        } => {
+            ledger.record_progress(&segment, processed);
+            on_transient(segment, retry_after, processed, cause)
+        }
         ProcessResult::BlockedDeadLetter { processed } => {
+            ledger.record_progress(&segment, processed);
             enter_blocked(segment, metrics, block_episode, processed)
         }
         // Segment was quarantined inside process_segment — move on.
         ProcessResult::Quarantined => {
+            ledger.forget(&segment);
             end_block_episode(block_episode, metrics);
             DrainState::Draining
         }
@@ -1038,6 +1197,7 @@ fn transition_from_draining(
     config: &DrainConfig,
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
+    ledger: &mut SegmentLedger,
 ) -> DrainState {
     // First failure for this segment: a fresh retry budget and the base delay.
     next_state_after_process(
@@ -1045,11 +1205,13 @@ fn transition_from_draining(
         result,
         metrics,
         block_episode,
-        |segment, retry_after, processed| DrainState::RetryingTransient {
+        ledger,
+        |segment, retry_after, processed, cause| DrainState::RetryingTransient {
             segment,
             retries_left: config.max_retries,
             next_delay: next_retry_delay(config.base_retry_delay, retry_after),
             processed,
+            cause,
         },
     )
 }
@@ -1128,10 +1290,17 @@ async fn process_segment<S: Sink>(
             // a transient blip. Preserve it: a transient error clears on retry, and
             // a genuinely corrupt segment ends up left on disk for manual recovery
             // (and is quarantined by crash recovery on the next restart).
+            //
+            // The cause is LOCAL, not the sink: a strand from here must not mark
+            // the sink down or count as a sink strand (D11).
             error!(path = %segment.display(), error = %e, "drain: cannot open segment; preserving for retry");
             return ProcessResult::Transient {
                 retry_after: None,
                 processed: skip,
+                cause: TransientCause::LocalRead {
+                    class: ledger::classify(&e),
+                    errno: e.raw_os_error(),
+                },
             };
         }
     };
@@ -1209,10 +1378,11 @@ async fn process_segment<S: Sink>(
             .await
             {
                 BatchResult::Ok => durable_through += n,
-                BatchResult::Transient { retry_after } => {
+                BatchResult::Transient { retry_after, cause } => {
                     return ProcessResult::Transient {
                         retry_after,
                         processed: durable_through,
+                        cause,
                     };
                 }
                 BatchResult::Blocked => {
@@ -1238,10 +1408,11 @@ async fn process_segment<S: Sink>(
         .await
         {
             BatchResult::Ok => durable_through += n,
-            BatchResult::Transient { retry_after } => {
+            BatchResult::Transient { retry_after, cause } => {
                 return ProcessResult::Transient {
                     retry_after,
                     processed: durable_through,
+                    cause,
                 };
             }
             BatchResult::Blocked => {
@@ -1405,7 +1576,10 @@ async fn commit_batch<S: Sink>(
                 timeout_secs = config.commit_timeout.as_secs(),
                 "drain: sink commit exceeded commit_timeout; treating as transient, retrying segment"
             );
-            return BatchResult::Transient { retry_after: None };
+            return BatchResult::Transient {
+                retry_after: None,
+                cause: TransientCause::Sink,
+            };
         }
     };
     match commit {
@@ -1428,7 +1602,10 @@ async fn commit_batch<S: Sink>(
                     "drain: sink CommitResult does not account for every record; preserving \
                      segment instead of confirming (likely a Sink contract violation)"
                 );
-                return BatchResult::Transient { retry_after: None };
+                return BatchResult::Transient {
+                    retry_after: None,
+                    cause: TransientCause::Sink,
+                };
             }
             metrics
                 .sink_commit_duration
@@ -1480,7 +1657,10 @@ async fn commit_batch<S: Sink>(
                 retry_after_secs = retry_after.map(|d| d.as_secs()),
                 "drain: transient sink error; will retry segment"
             );
-            BatchResult::Transient { retry_after }
+            BatchResult::Transient {
+                retry_after,
+                cause: TransientCause::Sink,
+            }
         }
 
         Err(e) => {
@@ -1516,9 +1696,10 @@ async fn commit_batch<S: Sink>(
 /// - `Err(BatchResult::Blocked)` when the write would exceed the cap and the
 ///   batch is not itself larger than the whole cap (a one-off oversized batch is
 ///   written anyway — overshoot once — to avoid a permanent block↔retry livelock, F03).
-/// - `Err(BatchResult::Transient)` when the dead-letter write itself fails (e.g.
-///   ENOSPC): the segment is preserved and retried rather than confirmed+deleted
-///   with the records neither delivered nor dead-lettered — silent data loss (B1/F02).
+/// - `Err(BatchResult::Transient)` with a `LocalWrite` cause when the dead-letter
+///   write itself fails (e.g. ENOSPC): the segment is preserved and retried rather
+///   than confirmed+deleted with the records neither delivered nor dead-lettered —
+///   silent data loss (B1/F02).
 fn dead_letter_records(
     records: &[Payload],
     dead_letter: &mut DeadLetterWriter,
@@ -1552,8 +1733,14 @@ fn dead_letter_records(
             Ok(())
         }
         Err(e) => {
+            // The sink did its part; the WAB device did not. A local write
+            // cause, so a strand from here neither marks the sink down nor
+            // counts as a sink strand (D11, spec §4.11).
             error!(error = %e, "drain: failed to write dead-letter records; preserving segment for retry");
-            Err(BatchResult::Transient { retry_after: None })
+            Err(BatchResult::Transient {
+                retry_after: None,
+                cause: TransientCause::LocalWrite,
+            })
         }
     }
 }
@@ -2520,6 +2707,387 @@ mod tests {
 
     fn get_confirmed_path(sealed: &Path) -> PathBuf {
         super::confirmed::confirmed_path(sealed)
+    }
+
+    // ── Ledger-era call shapes ────────────────────────────────────────────────
+    //
+    // `drain_thread` now borrows the supervisor-owned `SegmentLedger`, and
+    // `probe_and_resume_stranded` takes the ledger's rescan exclusion. These
+    // shadow the glob-imported originals with their previous call shape, so
+    // every test written before the ledger runs unchanged against a fresh
+    // ledger (no exclusions) — exactly what a first-start drain has. Tests that
+    // need to seed or inspect the ledger call `super::drain_thread` directly.
+
+    fn drain_thread<S: Sink>(
+        drain_rx: crossbeam_channel::Receiver<PathBuf>,
+        sink: Arc<S>,
+        config: DrainConfig,
+        metrics: Arc<Metrics>,
+        initial_health_ok: bool,
+        heartbeat: DrainHeartbeat,
+    ) {
+        let mut ledger = fresh_ledger();
+        super::drain_thread(
+            drain_rx,
+            sink,
+            config,
+            metrics,
+            initial_health_ok,
+            heartbeat,
+            &mut ledger,
+        );
+    }
+
+    fn probe_and_resume_stranded<S: Sink>(
+        rt: &tokio::runtime::Runtime,
+        sink: &S,
+        config: &DrainConfig,
+        metrics: &Metrics,
+        pending: &mut VecDeque<PathBuf>,
+        prev_health_ok: bool,
+        in_flight: Option<&Path>,
+    ) -> bool {
+        super::probe_and_resume_stranded(
+            rt,
+            sink,
+            config,
+            metrics,
+            pending,
+            prev_health_ok,
+            in_flight,
+            &|_| false,
+        )
+    }
+
+    fn fresh_ledger() -> SegmentLedger {
+        SegmentLedger::new(Arc::new(ledger::LedgerCounts::default()))
+    }
+
+    fn local_io_strands(m: &Metrics, cause: crate::metrics::LocalIoStrandCause) -> u64 {
+        m.drain_local_io_strands
+            .get_or_create(&crate::metrics::LocalIoStrandLabel { cause })
+            .get()
+    }
+
+    fn parked_gauge(m: &Metrics, reason: crate::metrics::ParkedReason) -> f64 {
+        m.drain_segments_parked
+            .get_or_create(&crate::metrics::ParkedLabel { reason })
+            .get()
+    }
+
+    // ── SegmentLedger: one admission filter on both sources (spec §4.0) ──────
+
+    /// The double-queue hole. The crossbeam channel is not enumerable, so the
+    /// same path can sit in the channel AND be found on disk by the idle rescan.
+    /// Before the ledger that was harmless only because a delivered segment was
+    /// always deleted; any state that keeps a delivered segment on disk (here:
+    /// its `.confirmed` sidecar cannot be written) turned every channel copy and
+    /// every idle rescan into a full re-delivery.
+    ///
+    /// The ledger owns such a segment (the `park_after_confirm` hook stands in
+    /// for the confirm-retry state, which keeps the segment on disk the same
+    /// way), and both sources must respect that: the second channel copy is
+    /// dropped at admission, and the rescan skips the path before
+    /// `check_confirmed` can look at it.
+    #[test]
+    fn same_path_in_channel_and_rescan_is_delivered_once() {
+        let dir = tmp_dir("admit_once");
+        let sealed = make_sealed_segment(&dir, 0, &[b"once"]);
+        // The sidecar write fails: a directory sits where `.confirmed` goes, so
+        // the delivered segment stays sealed and unconfirmed on disk.
+        crate::testutil::mkdir_p(get_confirmed_path(&sealed));
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        // A second copy of the same path, as the channel can hold after a
+        // rescan re-queued what a flusher had also sent.
+        tx.send(sealed.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let mut ledger = fresh_ledger();
+        ledger.park_after_confirm.insert(sealed.clone());
+        let config = fast_config(dir.clone()); // 50 ms health poll + idle rescan
+        let (sink_t, metrics_t) = (Arc::clone(&sink), Arc::clone(&metrics));
+        let handle = std::thread::spawn(move || {
+            super::drain_thread(
+                rx,
+                sink_t,
+                config,
+                metrics_t,
+                true,
+                DrainHeartbeat::new(),
+                &mut ledger,
+            );
+            ledger
+        });
+
+        // Many idle rescans: each would find the segment unconfirmed on disk.
+        std::thread::sleep(Duration::from_millis(500));
+        drop(tx);
+        let ledger = handle.join().unwrap();
+
+        assert_eq!(
+            sink.call_count(),
+            1,
+            "a ledger-owned segment must reach the sink once: neither the channel \
+             copy nor the idle rescan may re-deliver it"
+        );
+        assert_eq!(
+            metrics.drain_segments_resumed.get(),
+            0,
+            "the rescan must exclude a ledger-owned path, not re-queue it"
+        );
+        assert!(sealed.exists(), "the segment's bytes stay on disk");
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            0,
+            "the rescan must skip the path before check_confirmed, never quarantine it"
+        );
+        assert_eq!(
+            ledger.counts().parked_by_reason[ParkReason::LocalReadFailed.index()]
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            parked_gauge(&metrics, crate::metrics::ParkedReason::local_read_failed),
+            1.0,
+            "the drain publishes the ledger's park tally to the gauge"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// F05 across a strand. A segment of five 1-record batches commits batches
+    /// 1-2, then batch 3 fails transiently for longer than `max_retries`, so the
+    /// segment strands. When the sink recovers, the rescan re-queues the path
+    /// and admission resumes it past the committed prefix: the sink never sees
+    /// batches 1-2 again.
+    #[test]
+    fn cursor_survives_a_strand_within_the_run() {
+        let dir = tmp_dir("cursor_strand");
+        let records: [&[u8]; 5] = [b"r1", b"r2", b"r3", b"r4", b"r5"];
+        let sealed = make_sealed_segment(&dir, 0, &records);
+        let payload = |r: &[u8]| Payload::from(r.to_vec());
+
+        let mut responses: Vec<MockResult> = vec![
+            MockSink::ok(vec![payload(records[0])]),
+            MockSink::ok(vec![payload(records[1])]),
+        ];
+        responses.extend((0..=MAX_RETRIES).map(|_| Err(MockError::Transient)));
+        // Then responses run out and the sink commits whatever it is given.
+        let sink = Arc::new(MockSink::with_batch_size(1, responses));
+        let metrics = noop_metrics();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !get_confirmed_path(&sealed).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(metrics.drain_segments_stranded.get(), 1, "one strand");
+        assert!(
+            get_confirmed_path(&sealed).exists(),
+            "the resumed segment is delivered and confirmed"
+        );
+        let all: Vec<Payload> = records.iter().map(|r| payload(r)).collect();
+        assert_eq!(
+            sink.committed_records(),
+            all,
+            "each record committed exactly once, in order"
+        );
+        let ids = sink.seen_record_ids();
+        for (i, r) in records.iter().enumerate().take(2) {
+            let id = RecordId::for_record(&segment_identity(&sealed), i as u64 + 1, &payload(r));
+            assert_eq!(
+                ids.iter().filter(|seen| **seen == id).count(),
+                1,
+                "batch {} was committed before the strand and must never reach the \
+                 sink again",
+                i + 1
+            );
+        }
+        assert_eq!(
+            sink.call_count(),
+            2 + u64::from(MAX_RETRIES + 1) + 3,
+            "2 committed + {} failed attempts at batch 3 + batches 3-5 after resume",
+            MAX_RETRIES + 1
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// D11: a strand caused by reading the segment is not a sink strand. It
+    /// counts in `weir_drain_local_io_strands_total{cause="read"}`, and the
+    /// sink-oriented `weir_drain_segments_stranded_total` (whose help text sends
+    /// the operator to the sink) stays at 0.
+    ///
+    /// A directory at the sealed path opens but cannot be read (EISDIR), which
+    /// works even as root.
+    #[test]
+    fn a_local_read_strand_is_not_counted_as_a_sink_strand() {
+        let dir = tmp_dir("local_read_strand");
+        let shard_dir = dir.join("shard_00");
+        let sealed = segment_path(&shard_dir, 1).with_extension("wab.sealed");
+        crate::testutil::mkdir_p(&sealed);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            // No rescan inside the test: it would re-find the "segment".
+            health_poll_interval: Duration::from_secs(3600),
+            ..fast_config(dir.clone())
+        };
+        run_drain(rx, tx, Arc::clone(&sink), config, Arc::clone(&metrics));
+
+        assert_eq!(
+            sink.call_count(),
+            0,
+            "nothing was readable, nothing delivered"
+        );
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+            1
+        );
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            0,
+            "a local read failure must not be reported as a sink strand"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The other local cause: the sink committed (here: rejected permanently),
+    /// but writing the rejected records to `dead_letter/` failed, so the drain
+    /// may not advance. That is the WAB device, not the sink.
+    #[test]
+    fn a_dead_letter_write_strand_is_not_counted_as_a_sink_strand() {
+        let dir = tmp_dir("local_write_strand");
+        let sealed = make_sealed_segment(&dir, 0, &[b"rejected"]);
+        let responses: Vec<MockResult> = (0..=MAX_RETRIES)
+            .map(|_| Err(MockError::Permanent))
+            .collect();
+        let sink = Arc::new(MockSink::with_responses(responses));
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            health_poll_interval: Duration::from_secs(3600),
+            ..fast_config(dir.clone())
+        };
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            config,
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        // The drain opens dead_letter/ at start. Swap it for a regular file so
+        // every dead-letter write fails (ENOTDIR).
+        let dl = dir.join("dead_letter");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dl.is_dir() {
+            assert!(Instant::now() < deadline, "drain never opened dead_letter/");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::remove_dir_all(&dl).unwrap();
+        std::fs::write(&dl, b"not a directory").unwrap();
+        tx.send(sealed.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::write) == 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::write),
+            1
+        );
+        assert_eq!(metrics.drain_segments_stranded.get(), 0);
+        assert!(
+            sealed.exists(),
+            "the records were never re-homed; keep them"
+        );
+        assert!(!get_confirmed_path(&sealed).exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn transient_results_carry_their_cause() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("transient_cause");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let payloads = vec![Payload::from(b"r1".as_ref())];
+        let ids = test_record_ids(&payloads);
+
+        let sink = MockSink::with_responses([Err(MockError::Transient)]);
+        let result = block_on(commit_batch(
+            &payloads, &ids, 0, &sink, &config, &metrics, &mut dl,
+        ));
+        assert!(matches!(
+            result,
+            BatchResult::Transient {
+                cause: TransientCause::Sink,
+                ..
+            }
+        ));
+
+        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+        let sink = MockSink::with_responses([Err(MockError::Permanent)]);
+        let result = block_on(commit_batch(
+            &payloads, &ids, 0, &sink, &config, &metrics, &mut dl,
+        ));
+        assert!(matches!(
+            result,
+            BatchResult::Transient {
+                cause: TransientCause::LocalWrite,
+                ..
+            }
+        ));
+
+        // An unreadable segment at open: a local read, classified by errno.
+        let not_a_file = dir.join("shard_00").join("seg_00000009.wab.sealed");
+        crate::testutil::mkdir_p(&not_a_file);
+        let result = block_on(process_segment(
+            &not_a_file,
+            &sink,
+            &config,
+            &metrics,
+            &mut dl,
+            0,
+        ));
+        assert!(
+            matches!(
+                result,
+                ProcessResult::Transient {
+                    cause: TransientCause::LocalRead {
+                        class: ErrClass::Access,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "a directory at the sealed path is an Access-class local read"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     // ── CommitResult ──────────────────────────────────────────────────────────
@@ -3543,42 +4111,35 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// The strand boundary is where F05 deliberately STOPS, and the duplicate
-    /// that follows is a documented, billable cost — not an accident.
+    /// The strand boundary no longer drops the F05 cursor (spec §4.0).
     ///
     /// `retry_resumes_past_already_processed_sub_batches` and
     /// `blocked_segment_resumes_past_processed_when_cap_clears` pin the two
-    /// boundaries where the `processed` cursor SURVIVES. This pins the one where
-    /// it is dropped on purpose (H2, the `max_retries` exhausted arm): the
-    /// rescan re-queues only a `PathBuf`, so the Draining arm calls
-    /// `process_segment(.., 0)` and **re-commits the prefix that already
-    /// landed**. Persisting the cursor across a strand would need a crash-safe
-    /// on-disk sidecar; not doing so is the choice, and this is the choice's
-    /// receipt.
+    /// boundaries where the `processed` cursor always survived. Until the
+    /// safety floor this test pinned the one where it was dropped on purpose
+    /// (H2, the `max_retries` exhausted arm): the rescan re-queued only a
+    /// `PathBuf`, so the resumed segment restarted at record 0 and re-committed
+    /// the prefix that already landed — the billable duplicate behind the
+    /// locked-bucket advice in `docs/sinks/s3.md`.
     ///
-    /// It matters downstream, not just here. The S3 sink names each object
-    /// after a WAB coordinate, so in an ordinary bucket the re-PUT overwrites
-    /// and nothing is visible — but Object Lock requires versioning, and there
-    /// each re-commit adds an undeletable noncurrent version. One
-    /// strand-and-recover cycle on a full 256 MiB segment is a few hundred of
-    /// them, which is why `docs/sinks/s3.md` tells operators on locked buckets
-    /// to lower `wab_segment_max_bytes` and to treat `WeirSegmentStranded` as a
-    /// cost alert. That advice is only true while this test passes.
+    /// The drain's `SegmentLedger` now keeps the cursor across the strand,
+    /// pinned to the file's `(dev, ino)`, and admission resumes the re-queued
+    /// path past it. It is still in memory only: a RESTART replays the whole
+    /// segment, which `docs/sinks/s3.md` now says instead.
     ///
-    /// Every existing strand test uses a one-record segment, where a
+    /// Every other strand test uses a one-record segment, where a
     /// restart-at-zero and a resume-past-the-prefix are indistinguishable.
     #[test]
-    fn a_strand_re_delivers_the_prefix_it_already_committed() {
+    fn a_strand_no_longer_re_delivers_the_prefix_it_already_committed() {
         let dir = tmp_dir("strand_reprefix");
         // batch_size = 1 → A and B commit as separate sub-batches, so there IS
-        // a committed prefix to lose at the strand boundary.
+        // a committed prefix the strand boundary could lose.
         let sealed = make_sealed_segment(&dir, 0, &[b"A", b"B"]);
 
         // call 1:            commit([A]) → Ok         (processed → 1)
         // calls 2..2+RETRIES: commit([B]) → Transient  (retries exhaust → STRAND)
         // then responses are exhausted, so MockSink defaults to Ok:
-        // next call:         commit([A]) → Ok         ← the re-delivered prefix
-        // next call:         commit([B]) → Ok         → confirm
+        // next call:         commit([B]) → Ok         → confirm (A is skipped)
         let mut responses: Vec<MockResult> = vec![MockSink::ok(vec![Payload::from(b"A".as_ref())])];
         responses.extend((0..=MAX_RETRIES).map(|_| Err(MockError::Transient)));
         let sink = Arc::new(MockSink::with_batch_size(1, responses));
@@ -3618,19 +4179,16 @@ mod tests {
         let b = Payload::from(b"B".as_ref());
         assert_eq!(
             committed,
-            vec![a.clone(), a.clone(), b.clone()],
-            "expected A committed twice: once before the strand and once after \
-             the resume restarts at record 0. Getting [A, B] instead means the \
-             `processed` cursor now SURVIVES the strand boundary -- which is an \
-             improvement, but it invalidates the duplicate-version cost warning \
-             in docs/sinks/s3.md and the H2 comment in this file. Update both \
-             before changing this assertion."
+            vec![a, b],
+            "A was committed before the strand; the resume must start past it. \
+             Getting [A, A, B] means the cursor is dropped at the strand boundary \
+             again, which re-opens the duplicate-version cost documented in \
+             docs/sinks/s3.md"
         );
         assert_eq!(
             records_committed(&metrics),
-            3,
-            "a 2-record segment delivered 3 records: the duplicate is real and \
-             counted, not hidden inside the sink"
+            2,
+            "a 2-record segment delivers 2 records across a strand within one run"
         );
 
         std::fs::remove_dir_all(dir).ok();

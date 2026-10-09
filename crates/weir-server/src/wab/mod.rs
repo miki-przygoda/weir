@@ -373,10 +373,17 @@ pub(crate) fn spawn(
 ///
 /// `shard_count` only drives the "backlog beyond the configured count" advisory;
 /// pass `None` (e.g. from the recovery rescan) to skip it.
+///
+/// `exclude` names segments the caller already owns. They are skipped BEFORE
+/// `check_confirmed`, whose quarantine side effects must never touch them: the
+/// drain's rescan passes its ledger's `excludes` (a delivered segment whose
+/// confirm is outstanding, a parked one, one cooling down). Startup replay owns
+/// nothing yet and passes `&|_| false`.
 pub(crate) fn scan_unconfirmed_sealed(
     wab_dir: &Path,
     shard_count: Option<usize>,
     metrics: &Metrics,
+    exclude: &dyn Fn(&Path) -> bool,
 ) -> io::Result<Vec<PathBuf>> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
@@ -428,6 +435,11 @@ pub(crate) fn scan_unconfirmed_sealed(
         sealed_segments.sort_by_key(|p| segment::segment_counter_from_path(p));
 
         for sealed in sealed_segments {
+            // Before check_confirmed, never after: its quarantine side effects
+            // must not touch a segment the caller owns.
+            if exclude(&sealed) {
+                continue;
+            }
             match check_confirmed(&sealed, wab_dir, metrics) {
                 Ok(true) => {
                     info!(sealed = %sealed.display(), "skipping — segment already confirmed");
@@ -462,7 +474,7 @@ pub(crate) fn replay_unconfirmed(
     drain_tx: &Sender<PathBuf>,
     metrics: &Arc<Metrics>,
 ) -> io::Result<()> {
-    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count), metrics)? {
+    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count), metrics, &|_| false)? {
         // A footer-read failure here only undercounts the
         // recovery_records_replayed metric (the segment is still queued +
         // delivered); surface it rather than silently reporting 0 so the
@@ -1444,7 +1456,7 @@ mod tests {
         };
 
         let (m, _reg) = crate::metrics::Metrics::new();
-        let got = scan_unconfirmed_sealed(&dir, None, &m).unwrap();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false).unwrap();
         assert!(
             !got.contains(&s1_confirmed),
             "the confirmed segment must be skipped by the recovery scan: {got:?}"
@@ -1454,6 +1466,45 @@ mod tests {
             vec![s0_1, s0_2, s1_2, s5_1],
             "all unconfirmed sealed segments across every shard dir, ascending"
         );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The drain's rescan passes the ledger's `excludes`, and an excluded path
+    /// must be skipped BEFORE `check_confirmed` runs. `check_confirmed`
+    /// quarantines a segment whose sidecar fails to parse, so a ledger-owned
+    /// segment (a delivered one whose sidecar is mid-retry, say) that reached
+    /// it would be moved to `quarantine/` and counted as corruption.
+    #[test]
+    fn excluded_paths_are_skipped_before_check_confirmed() {
+        use crate::wab::format::confirmed_path_for;
+        let dir = tmp_dir("scan_exclude");
+        let sd0 = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd0);
+        let owned = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 1), 0, Compression::None).unwrap();
+            s.write_record(b"owned").unwrap();
+            s.seal().unwrap()
+        };
+        // A torn sidecar: check_confirmed would quarantine the segment.
+        fs::write(confirmed_path_for(&owned), b"").unwrap();
+        let other = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 2), 0, Compression::None).unwrap();
+            s.write_record(b"other").unwrap();
+            s.seal().unwrap()
+        };
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|p| p == owned.as_path()).unwrap();
+        assert_eq!(
+            got,
+            vec![other],
+            "only the non-excluded segment is returned"
+        );
+        assert!(
+            owned.exists(),
+            "an excluded segment must never reach check_confirmed's quarantine"
+        );
+        assert_eq!(m.recovery_segments_quarantined.get(), 0);
         fs::remove_dir_all(dir).ok();
     }
 

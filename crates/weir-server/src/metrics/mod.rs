@@ -132,6 +132,50 @@ pub enum DrainStateValue {
     stopped,
 }
 
+// ── Drain ledger labels (safety floor, spec §4.0) ─────────────────────────────
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LocalIoStrandLabel {
+    pub cause: LocalIoStrandCause,
+}
+
+/// Which local I/O stranded a segment: reading the sealed segment, or the
+/// dead-letter write the drain needs before it may advance.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum LocalIoStrandCause {
+    read,
+    write,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ParkedLabel {
+    pub reason: ParkedReason,
+}
+
+/// Why the drain set a segment aside for the rest of the run.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ParkedReason {
+    local_read_failed,
+    unsupported_version,
+    drain_panic,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DispositionLabel {
+    pub kind: DispositionKind,
+}
+
+/// A step still owed for a segment the drain has finished with: its confirm
+/// (sidecar write or delete), or its quarantine move.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DispositionKind {
+    confirm,
+    quarantine,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsHandshakeFailureLabel {
     pub reason: TlsHandshakeFailureReason,
@@ -333,15 +377,27 @@ pub(crate) struct Metrics {
     /// May transiently OVER-COUNT at a recovery-edge rescan: a segment still
     /// sitting in the drain channel can be re-queued and counted again, so
     /// convergence with `stranded` is approximate / eventually-consistent rather
-    /// than exact. Deduplicating in code is impractical — crossbeam channels are
-    /// not enumerable, so the resume path cannot cheaply check whether a segment
-    /// is already in flight.
+    /// than exact. Deduplicating the COUNT is impractical — crossbeam channels
+    /// are not enumerable, so the resume path cannot cheaply check whether a
+    /// segment is already in flight. Double PROCESSING is filtered: both copies
+    /// pass the drain ledger's admission check before they are processed.
     pub drain_segments_resumed: Counter<u64, AtomicU64>,
     /// Gauge vector: exactly one state label value is 1 at any time; the others are 0.
     pub drain_state: Family<DrainStateLabel, Gauge<f64, AtomicU64>>,
     /// Seconds elapsed since the drain entered `BlockedDeadLetterFull`. Resets to 0
     /// on transition out. Alert if this gauge exceeds an operator-defined threshold (e.g. 300 s).
     pub dead_letter_blocked_duration: Gauge<f64, AtomicU64>,
+
+    // ── Drain ledger (safety floor, spec §4.0) ────────────────────────────────
+    /// Segments set aside after exhausting `max_retries` on a LOCAL I/O failure,
+    /// by cause. Deliberately not `drain_segments_stranded`, which means "the
+    /// sink is failing"; a local strand neither counts there nor marks the sink
+    /// down.
+    pub drain_local_io_strands: Family<LocalIoStrandLabel, Counter<u64, AtomicU64>>,
+    /// Segments parked (not re-queued this run), by reason.
+    pub drain_segments_parked: Family<ParkedLabel, Gauge<f64, AtomicU64>>,
+    /// Finished segments with a confirm or quarantine step still outstanding.
+    pub drain_segments_disposition_pending: Family<DispositionLabel, Gauge<f64, AtomicU64>>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -661,6 +717,34 @@ impl Metrics {
              threshold (e.g. 300 s)"
         );
 
+        // ── Drain ledger (safety floor, spec §4.0) ───────────────────────────
+        let drain_local_io_strands = reg!(
+            Family::<LocalIoStrandLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_drain_local_io_strands",
+            "WAB segments the drain set aside after exhausting max_retries on a LOCAL I/O \
+             failure rather than a sink failure: cause=\"read\" is reading the sealed segment, \
+             cause=\"write\" is writing dead-letter records after a successful commit. Unlike \
+             weir_drain_segments_stranded these do not mark the sink down; the idle rescan \
+             resumes them past their committed prefix. Investigate the WAB and dead-letter \
+             device (I/O errors, ENOSPC, permissions, descriptor exhaustion), not the sink"
+        );
+        let drain_segments_parked = reg!(
+            Family::<ParkedLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_drain_segments_parked",
+            "WAB segments the drain has parked: kept on disk, not re-queued this run, and \
+             replayed on the next start. reason=\"local_read_failed\" is a persistent \
+             permission-class read error, \"unsupported_version\" a segment written by a newer \
+             weir, \"drain_panic\" a segment the drain panicked on twice"
+        );
+        let drain_segments_disposition_pending = reg!(
+            Family::<DispositionLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_drain_segments_disposition_pending",
+            "Delivered or set-aside WAB segments with a local step still outstanding and \
+             retried on every health poll: kind=\"confirm\" is the .confirmed sidecar write or \
+             the segment delete, kind=\"quarantine\" the move into quarantine/. These are \
+             never re-delivered"
+        );
+
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
@@ -727,6 +811,9 @@ impl Metrics {
             drain_segments_resumed,
             drain_state,
             dead_letter_blocked_duration,
+            drain_local_io_strands,
+            drain_segments_parked,
+            drain_segments_disposition_pending,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -782,6 +869,30 @@ impl Metrics {
                 state: SinkHealthState::down,
             })
             .set(0.0);
+
+        // Every drain-ledger series exists at 0 from boot, so a scraper can
+        // baseline and alert on them before the first strand or park.
+        for cause in [LocalIoStrandCause::read, LocalIoStrandCause::write] {
+            let _ = metrics
+                .drain_local_io_strands
+                .get_or_create(&LocalIoStrandLabel { cause });
+        }
+        for reason in [
+            ParkedReason::local_read_failed,
+            ParkedReason::unsupported_version,
+            ParkedReason::drain_panic,
+        ] {
+            metrics
+                .drain_segments_parked
+                .get_or_create(&ParkedLabel { reason })
+                .set(0.0);
+        }
+        for kind in [DispositionKind::confirm, DispositionKind::quarantine] {
+            metrics
+                .drain_segments_disposition_pending
+                .get_or_create(&DispositionLabel { kind })
+                .set(0.0);
+        }
 
         // Pre-initialise the labeled nack counter family so the series exist at 0
         // on the first scrape — without this a scraper can't baseline them until
@@ -876,6 +987,9 @@ mod tests {
             "weir_drain_segments_resumed",
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
+            "weir_drain_local_io_strands",
+            "weir_drain_segments_parked",
+            "weir_drain_segments_disposition_pending",
         ];
         for name in expected {
             assert!(
@@ -908,5 +1022,25 @@ mod tests {
             "drain_state stopped label missing or not pre-initialised to 0:\n{out}"
         );
         assert!(out.contains("healthy"), "sink_health healthy label missing");
+    }
+
+    #[test]
+    fn drain_ledger_series_are_pre_initialised_to_zero() {
+        let (_m, reg) = Metrics::new();
+        let out = encode_to_string(&reg);
+        for series in [
+            "weir_drain_local_io_strands_total{cause=\"read\"} 0",
+            "weir_drain_local_io_strands_total{cause=\"write\"} 0",
+            "weir_drain_segments_parked{reason=\"local_read_failed\"} 0",
+            "weir_drain_segments_parked{reason=\"unsupported_version\"} 0",
+            "weir_drain_segments_parked{reason=\"drain_panic\"} 0",
+            "weir_drain_segments_disposition_pending{kind=\"confirm\"} 0",
+            "weir_drain_segments_disposition_pending{kind=\"quarantine\"} 0",
+        ] {
+            assert!(
+                out.contains(series),
+                "{series:?} missing or not pre-initialised to 0:\n{out}"
+            );
+        }
     }
 }
