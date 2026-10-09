@@ -102,13 +102,20 @@ pub struct SocketConfig {
 /// # Bind sequence (TOCTOU hardening)
 ///
 /// The bind sequence is implemented in `bind_hardened`. It uses a dirfd to pin
-/// the parent directory, `unlinkat` to clear any stale socket without
-/// following symlinks, a tightened umask so `bind(2)` creates the socket
-/// inode at mode 0o600 directly (avoiding a vulnerable post-bind chmod), and
-/// an inode-equality check to catch any rename swap that races the bind.
-/// See `docs/security/socket-bind.md` for the threat model and the
+/// the parent directory, a connect-only liveness probe so it never removes a
+/// socket another process is listening on, `unlinkat` to clear a stale socket
+/// without following symlinks, a tightened umask so `bind(2)` creates the
+/// socket inode at mode 0o600 directly (avoiding a vulnerable post-bind
+/// chmod), and an inode-equality check to catch any rename swap that races the
+/// bind. See `docs/security/socket-bind.md` for the threat model and the
 /// remaining race window that the operator's directory permissions are
 /// expected to close.
+///
+/// # Shutdown removal
+///
+/// On the way out `run` removes the socket file only if the path still names
+/// the inode it bound ([`remove_own_socket`]). A successor that replaced the
+/// socket while this instance was running keeps its socket.
 pub async fn run(
     config: SocketConfig,
     queue_tx: QueueSender<WorkUnit>,
@@ -117,7 +124,8 @@ pub async fn run(
     sem: std::sync::Arc<Semaphore>,
 ) -> io::Result<()> {
     validate_socket_path(&config.socket_path)?;
-    let listener = bind_hardened(&config.socket_path)?;
+    let bound = bind_hardened(&config.socket_path)?;
+    let listener = &bound.listener;
 
     info!(path = %config.socket_path.display(), "socket listening");
 
@@ -281,39 +289,19 @@ pub async fn run(
         }
     }
 
-    // Remove the socket file. On Unix use the same hardened dirfd + fstatat
-    // (S_IFSOCK) + unlinkat sequence as startup cleanup so a by-name remove
-    // can't be redirected by an attacker who swapped a different inode in at
-    // the path under a group/world-writable parent — the exact TOCTOU pattern
-    // the bind path was hardened against (F28). Best-effort: the daemon is
-    // exiting, so a failure is logged, not fatal.
+    // Remove the socket file, but only if the path still names the inode we
+    // bound. The listener is still open here, so a liveness probe would see
+    // our OWN socket as live and leave it behind on every clean shutdown (the
+    // self-probe trap, spec §3.3); identity, not liveness, is the test. The
+    // removal uses the hardened dirfd + fstatat + unlinkat sequence so a
+    // by-name remove can't be redirected by a swapped-in inode (F28).
+    // Best-effort: the daemon is exiting, so a failure is logged, not fatal.
     #[cfg(unix)]
-    remove_socket_hardened(&config.socket_path);
+    remove_own_socket(&config.socket_path, &bound);
     #[cfg(not(unix))]
     let _ = std::fs::remove_file(&config.socket_path);
+    drop(bound);
     Ok(())
-}
-
-/// Hardened shutdown-time removal of the socket file: open the parent dir,
-/// confirm the entry is still a socket (not a swapped-in symlink/file), and
-/// `unlinkat` it. Mirrors `cleanup_existing_socket` so removal never acts on an
-/// attacker-controlled name (F28). A missing file is success; a non-socket
-/// entry is refused (and logged).
-#[cfg(unix)]
-fn remove_socket_hardened(path: &Path) {
-    let result = (|| -> io::Result<()> {
-        let (parent, basename) = split_parent_basename(path)?;
-        let dirfd = open_parent_dirfd(parent)?;
-        let _dirfd_guard = OwnedDirFd(dirfd);
-        cleanup_existing_socket(dirfd, basename, path)
-    })();
-    if let Err(e) = result {
-        warn!(
-            path = %path.display(),
-            error = %e,
-            "socket manager: could not remove socket file at shutdown"
-        );
-    }
 }
 
 async fn drain_join_set(join_set: &mut JoinSet<()>) {
@@ -401,8 +389,37 @@ pub fn validate_socket_path(path: &Path) -> io::Result<()> {
 // achieves the same goal (0o600 from creation) by a different mechanism
 // that does propagate to the filesystem.
 
+/// A bound listener together with the identity of the socket inode it
+/// created.
+///
+/// The identity is what lets shutdown remove the socket file only when the
+/// path still names OUR socket ([`remove_own_socket`]): a successor that
+/// unlinked ours and bound its own at the same path keeps its file.
+///
+/// On Linux, `pin` is an `O_PATH` descriptor on the bound inode, held for the
+/// listener's life. While it is open the inode cannot be freed, so its number
+/// cannot be reused by a successor's bind (ext4/xfs reuse freed inode numbers
+/// promptly), and `(dev, ino)` alone is a sound identity. Other unix targets
+/// have no `O_PATH`; there the comparison adds `st_ctime` (and `st_birthtime`
+/// on macOS) as a best-effort tie-breaker. docs/security/socket-bind.md
+/// carries the limitation.
+#[derive(Debug)]
+pub(crate) struct BoundSocket {
+    pub listener: UnixListener,
+    pub dev: u64,
+    pub ino: u64,
+    /// Held, never read outside tests: holding it is the whole point.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pin: Option<std::os::fd::OwnedFd>,
+    #[cfg(all(unix, not(target_os = "linux")))]
+    ctime: (libc::time_t, libc::c_long),
+    #[cfg(target_os = "macos")]
+    birthtime: (libc::time_t, libc::c_long),
+}
+
 #[cfg(unix)]
-pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
+pub(crate) fn bind_hardened(path: &Path) -> io::Result<BoundSocket> {
     let (parent, basename) = split_parent_basename(path)?;
     let dirfd = open_parent_dirfd(parent)?;
     let _dirfd_guard = OwnedDirFd(dirfd);
@@ -413,7 +430,9 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
     // move the socket somewhere private — see docs/security/socket-bind.md.
     warn_if_parent_world_writable(dirfd, parent);
 
-    cleanup_existing_socket(dirfd, basename, path)?;
+    // Remove a STALE socket only: one nobody is listening on (a SIGKILLed
+    // predecessor's). A live socket is refused, never unlinked.
+    remove_stale_socket_at_startup(dirfd, basename, path)?;
 
     // bind(2) does not follow a symlink at the final component for AF_UNIX
     // socket creation — it either creates the inode at the named path or
@@ -487,7 +506,81 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
         )));
     }
 
-    Ok(listener)
+    // Pin the inode we just verified, immediately after the late-swap check,
+    // so its number cannot be recycled while we run (see `BoundSocket`).
+    #[cfg(target_os = "linux")]
+    let pin = pin_socket_inode(dirfd, basename, &our_inode, path)?;
+
+    let (dev, ino) = stat_identity(&our_inode);
+    Ok(BoundSocket {
+        listener,
+        dev,
+        ino,
+        #[cfg(target_os = "linux")]
+        pin,
+        #[cfg(all(unix, not(target_os = "linux")))]
+        ctime: (our_inode.st_ctime, our_inode.st_ctime_nsec),
+        #[cfg(target_os = "macos")]
+        birthtime: (our_inode.st_birthtime, our_inode.st_birthtime_nsec),
+    })
+}
+
+/// Opens an `O_PATH | O_NOFOLLOW | O_CLOEXEC` descriptor on the socket inode
+/// at `dirfd/basename` and checks it is the inode `bind_hardened` verified.
+///
+/// A different inode means the path was swapped after the late-swap check,
+/// which is the same attack that check refuses, so this refuses too. An open
+/// that fails outright (a kernel without `O_PATH` on sockets) degrades to no
+/// pin with a WARN: `(dev, ino)` is then a best-effort identity, as on other
+/// unix targets.
+#[cfg(target_os = "linux")]
+fn pin_socket_inode(
+    dirfd: libc::c_int,
+    basename: &std::ffi::OsStr,
+    expected: &libc::stat,
+    path: &Path,
+) -> io::Result<Option<std::os::fd::OwnedFd>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let c_name = std::ffi::CString::new(basename.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "basename contains null"))?;
+    // Safety: dirfd is a valid directory fd held by the caller; c_name is a
+    // valid nul-terminated string; the flags are a valid OR of libc constants.
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            c_name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        warn!(
+            path = %path.display(),
+            error = %io::Error::last_os_error(),
+            "could not pin the bound socket inode with O_PATH; shutdown will \
+             identify the socket by (dev, ino) alone"
+        );
+        return Ok(None);
+    }
+    // Safety: fd was just returned by openat and is owned by nothing else.
+    let pin = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // Safety: pin is an open fd; &mut st is a writable libc::stat.
+    if unsafe { libc::fstat(pin.as_raw_fd(), &mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if st.st_dev != expected.st_dev || st.st_ino != expected.st_ino {
+        return Err(io::Error::other(format!(
+            "socket inode at '{}' changed while pinning it \
+             (dev/ino {}/{} → {}/{}); aborting startup",
+            path.display(),
+            expected.st_dev,
+            expected.st_ino,
+            st.st_dev,
+            st.st_ino
+        )));
+    }
+    Ok(Some(pin))
 }
 
 #[cfg(unix)]
@@ -498,8 +591,12 @@ fn umask_set(new: libc::mode_t) -> libc::mode_t {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn bind_hardened(path: &Path) -> io::Result<UnixListener> {
-    UnixListener::bind(path)
+pub(crate) fn bind_hardened(path: &Path) -> io::Result<BoundSocket> {
+    Ok(BoundSocket {
+        listener: UnixListener::bind(path)?,
+        dev: 0,
+        ino: 0,
+    })
 }
 
 #[cfg(unix)]
@@ -556,22 +653,84 @@ fn open_parent_dirfd(parent: &Path) -> io::Result<libc::c_int> {
     Ok(fd)
 }
 
+/// Startup-only removal of a STALE socket at `dirfd/basename`.
+///
+/// `fstatat` (no symlink follow) must show a socket; anything else is refused,
+/// as before (F28). Then the connect-only [`probe_socket`] decides, per the
+/// spec §3.3 table: a stale socket (nobody listening) is unlinked; a live one,
+/// or one whose state the probe cannot tell, is refused and left in place. An
+/// entry that vanished meanwhile is fine.
+///
+/// The entry is re-checked after the probe and must still be the inode first
+/// seen, so a socket swapped in while the probe ran is refused rather than
+/// unlinked unseen.
+///
+/// Never used at shutdown: there the daemon's own listener is still open, the
+/// probe would call it live, and every clean shutdown would leave its socket
+/// behind. Shutdown uses [`remove_own_socket`].
 #[cfg(unix)]
-fn cleanup_existing_socket(
+fn remove_stale_socket_at_startup(
     dirfd: libc::c_int,
     basename: &std::ffi::OsStr,
-    full_path_for_error: &Path,
+    path: &Path,
 ) -> io::Result<()> {
+    let first = match stat_at_dir(dirfd, basename) {
+        Ok(st) => st,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    // Refuse to remove anything that isn't a socket. This catches both
+    // ordinary files (the original startup-cleanup guarantee) and symlinks
+    // (because we used AT_SYMLINK_NOFOLLOW, st_mode reflects the symlink's
+    // type, not its target's — symlinks are S_IFLNK, not S_IFSOCK).
+    let mode_type = first.st_mode & libc::S_IFMT;
+    if mode_type != libc::S_IFSOCK {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "a non-socket entry already exists at '{}' (mode type {:#o}); refusing to remove it",
+                path.display(),
+                mode_type
+            ),
+        ));
+    }
+
+    match probe_socket(path) {
+        SocketProbe::Absent => return Ok(()),
+        SocketProbe::Stale => {}
+        SocketProbe::Live => return Err(live_socket_refusal(path)),
+        SocketProbe::Unknown(errno) => return Err(unknown_socket_refusal(path, errno)),
+    }
+
+    // The probe resolved `path` by name; the unlink below goes through the
+    // pinned dirfd. Both must still name the inode first seen.
+    let same = |st: &libc::stat| st.st_dev == first.st_dev && st.st_ino == first.st_ino;
+    let by_dirfd = match stat_at_dir(dirfd, basename) {
+        Ok(st) => st,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let by_path_matches = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .map(|m| (m.dev(), m.ino()) == stat_identity(&first))
+            .unwrap_or(false)
+    };
+    if !same(&by_dirfd) || !by_path_matches {
+        return Err(io::Error::other(format!(
+            "the socket at '{}' was replaced while probing whether it is in use; \
+             refusing to remove it",
+            path.display()
+        )));
+    }
+
     use std::os::unix::ffi::OsStrExt;
     let c_name = std::ffi::CString::new(basename.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "basename contains null"))?;
-
-    // fstatat with AT_SYMLINK_NOFOLLOW inspects the entry itself without
-    // following a symlink at the final component.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // Safety: dirfd is a valid directory fd held by the caller; c_name is a
-    // valid nul-terminated string; &mut st is a writable libc::stat.
-    let rc = unsafe { libc::fstatat(dirfd, c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    // Safety: dirfd valid; c_name valid; flags=0 means "regular unlink"
+    // (i.e. file, not directory).
+    let rc = unsafe { libc::unlinkat(dirfd, c_name.as_ptr(), 0) };
     if rc < 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::NotFound {
@@ -579,30 +738,290 @@ fn cleanup_existing_socket(
         }
         return Err(err);
     }
-
-    // Refuse to remove anything that isn't a socket. This catches both
-    // ordinary files (the original bind_cleanup guarantee) and symlinks
-    // (because we used AT_SYMLINK_NOFOLLOW, st_mode reflects the symlink's
-    // type, not its target's — symlinks are S_IFLNK, not S_IFSOCK).
-    let mode_type = st.st_mode & libc::S_IFMT;
-    if mode_type != libc::S_IFSOCK {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "a non-socket entry already exists at '{}' (mode type {:#o}); refusing to remove it",
-                full_path_for_error.display(),
-                mode_type
-            ),
-        ));
-    }
-
-    // Safety: dirfd valid; c_name valid; flags=0 means "regular unlink"
-    // (i.e. file, not directory).
-    let rc = unsafe { libc::unlinkat(dirfd, c_name.as_ptr(), 0) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    info!(path = %path.display(), "removed stale socket");
     Ok(())
+}
+
+/// The refusal for a socket someone is listening on (spec §3.3, exact text).
+#[cfg(unix)]
+fn live_socket_refusal(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "socket_path '{}' is in use by a running process; refusing to remove it. \
+             Stop the other weir-server or choose another socket_path.",
+            path.display()
+        ),
+    )
+}
+
+/// The refusal when the probe cannot tell whether the socket is live. Fails
+/// closed: an unreadable state is not proof of staleness.
+#[cfg(unix)]
+fn unknown_socket_refusal(path: &Path, errno: i32) -> io::Error {
+    io::Error::other(format!(
+        "cannot tell whether socket_path '{}' is in use: the liveness probe's connect \
+         failed with {} (errno {errno}); refusing to remove it. If no weir-server is \
+         using it, remove the file manually and start again.",
+        path.display(),
+        io::Error::from_raw_os_error(errno)
+    ))
+}
+
+/// What a connect-only probe says about the socket path.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SocketProbe {
+    /// Nothing at the path (or no directory to hold it).
+    Absent,
+    /// A socket file nobody is listening on, e.g. a SIGKILLed daemon's.
+    Stale,
+    /// Something is listening.
+    Live,
+    /// The probe could not tell (the errno). Callers refuse: fail closed.
+    Unknown(i32),
+}
+
+/// Re-probes of an ECONNREFUSED answer on targets where it is ambiguous.
+#[cfg(all(unix, not(target_os = "linux")))]
+const STALE_REPROBES: u32 = 3;
+#[cfg(all(unix, not(target_os = "linux")))]
+const STALE_REPROBE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Probes whether anything is listening on the Unix socket at `path`.
+///
+/// It opens a non-blocking `AF_UNIX` stream socket and calls `connect`, then
+/// closes it. It never unlinks anything. It must be non-blocking: a blocking
+/// `AF_UNIX` connect to a listener with a full backlog hangs on Linux.
+///
+/// | connect result | meaning |
+/// |---|---|
+/// | `0`, `EAGAIN`, `EINPROGRESS` | `Live` (`EAGAIN` = backlog full = listening, on Linux) |
+/// | `ECONNREFUSED` (Linux) | `Stale` |
+/// | `ECONNREFUSED` (other unix) | stale *or* backlog full; re-probed 3× at 50 ms, `Stale` only if all are refused |
+/// | `ENOENT`, `ENOTDIR` | `Absent` |
+/// | `EACCES`, `EPERM`, other | `Unknown(errno)` |
+///
+/// Side effect: on a live daemon the probe is a real connection, so it bumps
+/// that daemon's connection metrics, and under `peer_uid_check` a foreign uid
+/// is rejected and logged there.
+#[cfg(unix)]
+pub(crate) fn probe_socket(path: &Path) -> SocketProbe {
+    let first = probe_socket_once(path);
+    #[cfg(not(target_os = "linux"))]
+    if first == SocketProbe::Stale {
+        // BSD/macOS report a full backlog as ECONNREFUSED too, so one refusal
+        // does not prove nobody is listening.
+        for _ in 0..STALE_REPROBES {
+            std::thread::sleep(STALE_REPROBE_INTERVAL);
+            let again = probe_socket_once(path);
+            if again != SocketProbe::Stale {
+                return again;
+            }
+        }
+    }
+    first
+}
+
+/// Maps a failed non-blocking `connect(2)` errno to a [`SocketProbe`]. The
+/// non-Linux ECONNREFUSED re-probe lives in [`probe_socket`], not here.
+#[cfg(unix)]
+fn classify_connect_errno(errno: i32) -> SocketProbe {
+    match errno {
+        libc::ECONNREFUSED => SocketProbe::Stale,
+        // ENOTDIR: a path component is not a directory, so nothing can be
+        // listening at the path; the bind reports the real problem.
+        libc::ENOENT | libc::ENOTDIR => SocketProbe::Absent,
+        // EAGAIN == EWOULDBLOCK on every supported target.
+        libc::EAGAIN | libc::EINPROGRESS => SocketProbe::Live,
+        other => SocketProbe::Unknown(other),
+    }
+}
+
+#[cfg(unix)]
+fn probe_socket_once(path: &Path) -> SocketProbe {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    // Safety: sockaddr_un is plain old data; all-zero is a valid value.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.contains(&0) {
+        return SocketProbe::Unknown(libc::EINVAL);
+    }
+    if bytes.len() >= addr.sun_path.len() {
+        // No socket can be bound at a path this long, so if nothing is there
+        // it is plainly absent; if something is, we cannot address it.
+        return match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => SocketProbe::Absent,
+            _ => SocketProbe::Unknown(libc::ENAMETOOLONG),
+        };
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        addr.sun_len = len as u8;
+    }
+
+    let sock = match nonblocking_unix_stream_socket() {
+        Ok(fd) => fd,
+        Err(e) => return SocketProbe::Unknown(e.raw_os_error().unwrap_or(libc::EIO)),
+    };
+    // Safety: sock was just created and is owned by nothing else.
+    let sock = unsafe { OwnedFd::from_raw_fd(sock) };
+    // Safety: addr is a valid, initialised sockaddr_un and len does not exceed
+    // its size (checked above).
+    let rc = unsafe {
+        libc::connect(
+            sock.as_raw_fd(),
+            (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            len as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        return SocketProbe::Live;
+    }
+    let errno = io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    classify_connect_errno(errno)
+}
+
+/// `socket(AF_UNIX, SOCK_STREAM)`, non-blocking and close-on-exec.
+#[cfg(unix)]
+fn nonblocking_unix_stream_socket() -> io::Result<libc::c_int> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Safety: plain syscall with constant arguments.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        // No SOCK_NONBLOCK / SOCK_CLOEXEC here: set both with fcntl. The
+        // descriptor is closed on any failure.
+        // Safety: plain syscall with constant arguments.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Safety: fd is a socket we own; F_SETFD/F_GETFL/F_SETFL take ints.
+        let ok = unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) >= 0 && {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) >= 0
+            }
+        };
+        if !ok {
+            let err = io::Error::last_os_error();
+            // Safety: fd is ours and not yet closed.
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        Ok(fd)
+    }
+}
+
+/// Shutdown-time removal of the socket file this instance bound.
+///
+/// Opens the parent dir, `fstatat`s the entry (no symlink follow) and unlinks
+/// it only if it is still the socket `bound` describes. There is deliberately
+/// no liveness probe: our own listener is still open, and a probe would call
+/// it live. On a mismatch (another instance unlinked ours and bound its own)
+/// it logs a WARN and leaves the file. A missing file is fine; a failure is
+/// logged, never fatal, because the daemon is exiting.
+///
+/// The residual `fstatat`→`unlinkat` window is the same class as the
+/// documented bind→`fstatat` window (docs/security/socket-bind.md) and is
+/// closed by the same private-parent-directory assumption.
+#[cfg(unix)]
+pub(crate) fn remove_own_socket(path: &Path, bound: &BoundSocket) {
+    let result = (|| -> io::Result<()> {
+        let (parent, basename) = split_parent_basename(path)?;
+        let dirfd = open_parent_dirfd(parent)?;
+        let _dirfd_guard = OwnedDirFd(dirfd);
+        let st = match stat_at_dir(dirfd, basename) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if !names_our_socket(&st, bound) {
+            warn!(
+                path = %path.display(),
+                "socket path now names a different socket (another instance replaced it); \
+                 leaving it"
+            );
+            return Ok(());
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let c_name = std::ffi::CString::new(basename.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "basename contains null"))?;
+        // Safety: dirfd valid; c_name valid; flags=0 is a regular unlink.
+        let rc = unsafe { libc::unlinkat(dirfd, c_name.as_ptr(), 0) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(err);
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "socket manager: could not remove socket file at shutdown"
+        );
+    }
+}
+
+/// True if `st` (an `fstatat` of the socket path) is the socket `bound`
+/// created. See [`BoundSocket`] for why `(dev, ino)` suffices on Linux and
+/// what the tie-breakers are elsewhere.
+#[cfg(unix)]
+fn names_our_socket(st: &libc::stat, bound: &BoundSocket) -> bool {
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
+        return false;
+    }
+    if stat_identity(st) != (bound.dev, bound.ino) {
+        return false;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if (st.st_ctime, st.st_ctime_nsec) != bound.ctime {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    if (st.st_birthtime, st.st_birthtime_nsec) != bound.birthtime {
+        return false;
+    }
+    true
+}
+
+/// `(st_dev, st_ino)` widened to `u64`. `dev_t` is `u64` on Linux but `i32` on
+/// macOS, so the cast is a no-op on one target and required on the other.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+fn stat_identity(st: &libc::stat) -> (u64, u64) {
+    (st.st_dev as u64, st.st_ino as u64)
 }
 
 /// `fstatat(dirfd, basename, AT_SYMLINK_NOFOLLOW)` returning the raw stat. Used
@@ -943,43 +1362,285 @@ mod tests {
         );
     }
 
-    /// F28: hardened shutdown removal unlinks a real socket via the dirfd path.
-    #[test]
+    // ── Socket ownership (safety floor, spec §3.3) ────────────────────────────
+
+    /// Binds a std listener at `path`, then drops it: the file stays behind and
+    /// nothing listens on it, exactly what SIGKILL leaves.
     #[cfg(unix)]
-    fn remove_socket_hardened_unlinks_a_socket() {
-        let path = tmp_socket_path("rm_sock");
-        std::fs::remove_file(&path).ok();
-        let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        assert!(path.exists());
-        remove_socket_hardened(&path);
-        assert!(!path.exists(), "hardened removal must unlink the socket");
+    fn leave_stale_socket(path: &Path) {
+        std::fs::remove_file(path).ok();
+        let l = std::os::unix::net::UnixListener::bind(path).unwrap();
+        drop(l);
+        assert!(path.exists(), "a dropped listener leaves its socket file");
     }
 
-    /// F28: hardened removal refuses to unlink a non-socket entry (an attacker
-    /// swap), the same guard the startup cleanup applies.
+    #[cfg(unix)]
+    fn inode_of(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (m.dev(), m.ino())
+    }
+
+    /// The probe's errno table (spec §3.3), independent of any real socket.
     #[test]
     #[cfg(unix)]
-    fn remove_socket_hardened_refuses_non_socket() {
-        let path = tmp_socket_path("rm_nonsock");
+    fn connect_errno_classification_matches_the_probe_table() {
+        assert_eq!(
+            classify_connect_errno(libc::ECONNREFUSED),
+            SocketProbe::Stale
+        );
+        assert_eq!(classify_connect_errno(libc::ENOENT), SocketProbe::Absent);
+        assert_eq!(classify_connect_errno(libc::ENOTDIR), SocketProbe::Absent);
+        // Backlog full on Linux, or a connect still completing: someone listens.
+        assert_eq!(classify_connect_errno(libc::EAGAIN), SocketProbe::Live);
+        assert_eq!(classify_connect_errno(libc::EINPROGRESS), SocketProbe::Live);
+        // Cannot tell: fail closed.
+        for errno in [libc::EACCES, libc::EPERM, libc::EIO] {
+            assert_eq!(
+                classify_connect_errno(errno),
+                SocketProbe::Unknown(errno),
+                "errno {errno}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_classifies_live_stale_and_absent() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("probe_classes");
+        let path = dir.join("weir.sock");
+
+        assert_eq!(probe_socket(&path), SocketProbe::Absent);
+
+        let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(probe_socket(&path), SocketProbe::Live);
+        drop(live);
+
+        assert!(path.exists());
+        assert_eq!(probe_socket(&path), SocketProbe::Stale);
+        assert!(path.exists(), "probe_socket must never unlink");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Review Focus 3: systemd's `RuntimeDirectory` may be gone at start. The
+    /// probe says `Absent` (nothing can listen in a missing directory), and the
+    /// caller proceeds to the existing parent-missing error.
+    #[test]
+    #[cfg(unix)]
+    fn probe_reports_absent_when_parent_missing() {
+        let path = std::env::temp_dir()
+            .join(format!("weir_probe_no_parent_{}", std::process::id()))
+            .join("weir.sock");
+        assert!(!path.parent().unwrap().exists());
+        assert_eq!(probe_socket(&path), SocketProbe::Absent);
+        // And the bind still reports the missing parent, not a probe refusal.
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let err = bind_hardened(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+    }
+
+    /// A bound-then-dropped listener leaves its file; nothing answers
+    /// (ECONNREFUSED), so startup cleanup unlinks it and the bind succeeds on a
+    /// fresh inode.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn startup_cleanup_unlinks_a_dropped_listener_socket() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("startup_stale");
+        let path = dir.join("weir.sock");
+        leave_stale_socket(&path);
+
+        let (parent, basename) = split_parent_basename(&path).unwrap();
+        let dirfd = open_parent_dirfd(parent).unwrap();
+        let _dirfd_guard = OwnedDirFd(dirfd);
+        remove_stale_socket_at_startup(dirfd, basename, &path).expect("stale socket is removed");
+        assert!(!path.exists(), "startup cleanup must unlink a stale socket");
+
+        // And end to end: bind_hardened over a stale socket succeeds.
+        leave_stale_socket(&path);
+        let bound = bind_hardened(&path).expect("bind over a stale socket");
+        assert_eq!(inode_of(&path), (bound.dev, bound.ino));
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A held listener answers the probe, so startup cleanup refuses: the file
+    /// stays, the other listener keeps working, and the error says why.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn startup_cleanup_refuses_a_live_listener() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("startup_live");
+        let path = dir.join("weir.sock");
+        let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let before = inode_of(&path);
+
+        let err = bind_hardened(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("in use by a running process"), "{msg}");
+        assert!(msg.contains("refusing to remove it"), "{msg}");
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+
+        assert_eq!(
+            inode_of(&path),
+            before,
+            "a live socket must not be unlinked"
+        );
+        live.set_nonblocking(true).unwrap();
+        // Drain the probe's own connection, then prove the listener still works.
+        while live.accept().is_ok() {}
+        let _c = std::os::unix::net::UnixStream::connect(&path)
+            .expect("the live listener must still accept after the refused start");
+
+        drop(live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `remove_own_socket` keeps a socket that is not the one we bound: another
+    /// instance unlinked ours and bound its own at the same path.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remove_own_socket_keeps_a_replaced_socket() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("own_replaced");
+        let path = dir.join("weir.sock");
+        let bound = bind_hardened(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let successor = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let successor_inode = inode_of(&path);
+        assert_ne!(
+            successor_inode,
+            (bound.dev, bound.ino),
+            "precondition: the successor is a different inode"
+        );
+
+        remove_own_socket(&path, &bound);
+        assert!(path.exists(), "a successor's socket must not be unlinked");
+        assert_eq!(inode_of(&path), successor_inode);
+        let _c = std::os::unix::net::UnixStream::connect(&path)
+            .expect("the successor must still accept");
+
+        drop(successor);
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `remove_own_socket` unlinks the socket it bound (the identity matches).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remove_own_socket_unlinks_our_socket() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("own_unlink");
+        let path = dir.join("weir.sock");
+        let bound = bind_hardened(&path).unwrap();
+        assert!(path.exists());
+        remove_own_socket(&path, &bound);
+        assert!(!path.exists(), "our own socket must be unlinked");
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// F28: shutdown removal refuses to unlink a non-socket entry (an attacker
+    /// swap), the same guard the startup cleanup applies.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remove_own_socket_refuses_non_socket() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("own_nonsock");
+        let path = dir.join("weir.sock");
+        let bound = bind_hardened(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"not a socket").unwrap();
-        remove_socket_hardened(&path); // logs, must not remove
+        remove_own_socket(&path, &bound); // logs, must not remove
         assert!(
             path.exists(),
-            "hardened removal must refuse a non-socket entry"
+            "shutdown removal must refuse a non-socket entry"
         );
-        std::fs::remove_file(&path).ok();
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// F28: a missing socket file is a no-op (clean shutdown after the file was
     /// already removed out-of-band).
-    #[test]
+    #[tokio::test]
     #[cfg(unix)]
-    fn remove_socket_hardened_missing_is_noop() {
-        let path = tmp_socket_path("rm_missing");
-        std::fs::remove_file(&path).ok();
+    async fn remove_own_socket_missing_is_noop() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("own_missing");
+        let path = dir.join("weir.sock");
+        let bound = bind_hardened(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        remove_own_socket(&path, &bound); // must not panic
         assert!(!path.exists());
-        remove_socket_hardened(&path); // must not panic
-        assert!(!path.exists());
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The regression for the self-probe trap (spec §3.3): at shutdown the
+    /// daemon's own listener is still open, so a liveness probe there would see
+    /// it as live and leave the socket behind on every clean shutdown. A full
+    /// `run` start-then-shutdown, with a real client connection in between,
+    /// must remove its own socket file.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn full_run_start_then_shutdown_removes_its_own_socket() {
+        let dir = umask_immune_dir("full_run_own");
+        let path = dir.join("weir.sock");
+        let cfg = default_config(path.clone());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics(), sem));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let conn = loop {
+            if let Ok(c) = UnixStream::connect(&path).await {
+                break c;
+            }
+            assert!(Instant::now() < deadline, "run() never started listening");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        drop(conn);
+
+        shutdown_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("run() should complete after shutdown")
+            .expect("task should not panic")
+            .expect("run() should return Ok");
+        assert!(
+            !path.exists(),
+            "a clean shutdown must remove the daemon's own socket file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On Linux the bound socket inode is pinned with an `O_PATH` fd for the
+    /// listener's life, so its inode number cannot be reused by a successor.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn o_path_pin_opens_on_socket_inode() {
+        use std::os::fd::AsRawFd;
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("o_path_pin");
+        let path = dir.join("weir.sock");
+        let bound = bind_hardened(&path).unwrap();
+        let pin = bound
+            .pin
+            .as_ref()
+            .expect("O_PATH pin must open on a socket inode");
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // Safety: pin is an open fd; st is writable.
+        assert_eq!(unsafe { libc::fstat(pin.as_raw_fd(), &mut st) }, 0);
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFSOCK);
+        assert_eq!(stat_identity(&st), (bound.dev, bound.ino));
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

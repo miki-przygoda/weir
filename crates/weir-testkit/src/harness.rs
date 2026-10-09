@@ -194,8 +194,9 @@ impl WeirServer {
     }
 
     /// Kills the server with SIGKILL then restarts it with the same config.
-    /// Simulates crash recovery: `bind_cleanup` in the socket layer detects
-    /// and removes the stale socket left behind by the crash.
+    /// Simulates crash recovery: the socket layer's startup liveness probe
+    /// finds nobody listening on the socket the crash left behind, and
+    /// removes it as stale.
     pub fn restart_in_place(&mut self) {
         self.kill_ungracefully();
 

@@ -1430,7 +1430,7 @@ fn one_connection_can_interleave_both_durability_tiers() {
 fn server_restarts_after_sigkill() {
     // 10 s is generous: cold start on a fresh daemon takes well under 1 s.
     // The bound catches a regression where startup blocks on something
-    // (recovery, bind_cleanup, segment scan) for an unreasonable time.
+    // (recovery, stale-socket cleanup, segment scan) for an unreasonable time.
     const RESTART_BUDGET: Duration = Duration::from_secs(10);
 
     let mut srv = weir_server!("crash_restart").start();
@@ -1446,7 +1446,8 @@ fn server_restarts_after_sigkill() {
         "socket should remain after SIGKILL"
     );
 
-    // bind_cleanup removes the stale socket; server starts clean.
+    // Nobody listens on the stale socket, so startup's liveness probe calls
+    // it stale and removes it; the server starts clean.
     let restart_start = Instant::now();
     srv.restart_in_place();
     let restart_elapsed = restart_start.elapsed();
@@ -2168,94 +2169,152 @@ fn wab_data_integrity_after_crash() {
     }
 }
 
-// ── Socket takeover data safety ───────────────────────────────────────────────
+// ── Socket ownership (safety floor, spec §3.3) ────────────────────────────────
 
-/// `bind_cleanup` removes the socket file (even if another process is
-/// listening) so that crash-recovery always succeeds. When a second server
-/// takes the socket path the first server's WAB files must be left entirely
-/// untouched — the socket file and the WAB are independent resources.
+/// A second daemon pointed at a LIVE daemon's socket path must refuse to
+/// start, not unlink the socket and take the path over. (Until the safety
+/// floor, startup removed any socket file at the path, even one another
+/// process was listening on, and A silently lost every new producer.)
+///
+/// B has its own `wab_dir` and metrics port, so nothing but the socket is
+/// shared. B must exit 1 naming the conflict, A's socket must be the same
+/// inode, A must still ack a Durable push on a NEW connection, and A's WAB
+/// must be byte-identical.
 #[test]
-fn socket_takeover_does_not_corrupt_wab_data() {
-    const N: usize = 20;
+fn second_daemon_refuses_a_live_socket() {
+    use std::os::unix::fs::MetadataExt;
 
-    let srv_a = weir_server!("socket_takeover").start();
+    let srv_a = weir_server!("live_socket_a").start();
     let mut client = srv_a.client();
-
-    for i in 0..N {
+    for i in 0..20 {
         client
             .push(format!("srv-a-{i}").as_bytes(), Durability::Durable)
             .expect("push to server A failed");
     }
+    let socket_inode = fs::symlink_metadata(&srv_a.socket_path).unwrap().ino();
+    let wab_before = tree_snapshot(&srv_a.wab_dir);
 
-    let wab_before = wab_dir_bytes(&srv_a.wab_dir);
-    assert!(wab_before > 0, "server A must have written WAB bytes");
-
-    // Spawn server B at the same socket path (it will call bind_cleanup and
-    // take over the socket). Use Command directly — we hold the process lock
-    // via srv_a and need two processes alive at once intentionally.
-    let second_tmp =
-        std::env::temp_dir().join(format!("weir_sys_takeover_b_{}", std::process::id()));
-    let second_wab = second_tmp.join("wab");
-    let second_config = second_tmp.join("weir.toml");
-
-    fs::create_dir_all(&second_wab).unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&second_wab, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    fs::write(
-        &second_config,
-        format!(
-            "[server]\n\
-             socket_path           = \"{}\"\n\
-             wab_dir               = \"{}\"\n\
-             metrics_port          = {}\n\
-             shard_count           = 1\n\
-             worker_count          = 2\n\
-             batch_size            = 100\n\
-             batch_deadline_ms     = 20\n\
-             shutdown_timeout_secs = 3\n\
-             log_level             = \"warn\"\n",
-            srv_a.socket_path.display(),
-            second_wab.display(),
-            free_port(),
-        ),
-    )
-    .unwrap();
-
-    let binary = env!("CARGO_BIN_EXE_weir-server");
-    let mut child_b = Command::new(binary)
-        .args(["--config", second_config.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn server B");
-
-    // Give server B time to start and take the socket.
-    thread::sleep(Duration::from_millis(500));
-
-    // Server A's WAB files must be completely untouched.
-    let wab_after = wab_dir_bytes(&srv_a.wab_dir);
+    let (status, log) = weir_server!("live_socket_b")
+        .env("WEIR_SOCKET_PATH", srv_a.socket_path.to_str().unwrap())
+        .spawn_expecting_exit(Duration::from_secs(10));
     assert_eq!(
-        wab_before, wab_after,
-        "server B startup modified server A's WAB bytes ({wab_before} → {wab_after})"
+        status.code(),
+        Some(1),
+        "B must refuse to start on A's live socket; it exited {status}\nlog:\n{log}"
+    );
+    assert!(
+        log.contains("in use by a running process"),
+        "B must say why it refused\nlog:\n{log}"
+    );
+    assert_eq!(
+        tree_snapshot(&srv_a.wab_dir),
+        wab_before,
+        "B's refused start must not touch a byte of A's WAB"
     );
 
-    // Verify payload bytes are still present.
-    let wab_bytes = read_wab_bytes(&srv_a.wab_dir);
-    for i in 0..N {
-        let payload = format!("srv-a-{i}").into_bytes();
-        assert!(
-            wab_bytes
-                .windows(payload.len())
-                .any(|w| w == payload.as_slice()),
-            "payload srv-a-{i} missing from server A's WAB after socket takeover"
-        );
-    }
+    assert_eq!(
+        fs::symlink_metadata(&srv_a.socket_path)
+            .expect("A's socket file must still exist")
+            .ino(),
+        socket_inode,
+        "A's socket must be the same inode: B must not unlink or replace it"
+    );
+    srv_a
+        .client()
+        .push(b"after-b-refused", Durability::Durable)
+        .expect("A must still accept and ack on a new connection");
+    client
+        .push(b"after-b-refused-old-conn", Durability::Durable)
+        .expect("A's existing connection must still ack");
+}
 
-    let _ = child_b.kill();
-    let _ = child_b.wait();
-    let _ = fs::remove_dir_all(&second_tmp);
+/// Shutdown removes the socket file only if it is still the inode this
+/// daemon bound. Here a successor has replaced A's socket at the same path
+/// while A runs; A's SIGTERM must leave the successor's socket alone.
+#[test]
+fn shutdown_leaves_a_successor_socket_alone() {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut srv_a = weir_server!("successor_socket_a").start();
+    fs::remove_file(&srv_a.socket_path).expect("unlink A's socket");
+    let successor = std::os::unix::net::UnixListener::bind(&srv_a.socket_path)
+        .expect("bind the successor's socket at A's path");
+    let successor_inode = fs::symlink_metadata(&srv_a.socket_path).unwrap().ino();
+
+    srv_a.sigterm();
+
+    let meta = fs::symlink_metadata(&srv_a.socket_path)
+        .expect("A's shutdown must not unlink the successor's socket");
+    assert_eq!(meta.ino(), successor_inode);
+    let _c = std::os::unix::net::UnixStream::connect(&srv_a.socket_path)
+        .expect("the successor must still accept connections");
+    let log = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        log.contains("another instance replaced it"),
+        "A must say why it left the socket\nlog:\n{log}"
+    );
+    drop(successor);
+}
+
+/// Review Focus 4 (stale-socket half): upgrading from 4.0.1, or any restart
+/// after SIGKILL, finds the dead daemon's socket file still on disk. Nothing
+/// listens on it (ECONNREFUSED), so the new daemon must remove it as stale,
+/// bind, recover the WAB and deliver both the records acked before the kill
+/// and the ones acked after the restart.
+#[test]
+fn starts_cleanly_over_a_stale_socket_left_by_sigkill() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("stale_socket_sigkill")
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info")
+        .start();
+    let mut client = srv.client();
+    for i in 0..10 {
+        client
+            .push(format!("stale-pre-{i:02}").as_bytes(), Durability::Durable)
+            .expect("push before the kill");
+    }
+    drop(client);
+
+    srv.kill_ungracefully();
+    let meta = fs::symlink_metadata(&srv.socket_path).expect("SIGKILL leaves the socket file");
+    assert!(meta.file_type().is_socket());
+    let refused = std::os::unix::net::UnixStream::connect(&srv.socket_path)
+        .expect_err("nobody listens on a dead daemon's socket");
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+
+    // Same config, same paths: the new process must clear the stale file.
+    srv.restart_in_place();
+    let mut client = srv.client();
+    for i in 0..10 {
+        client
+            .push(format!("stale-post-{i:02}").as_bytes(), Durability::Durable)
+            .expect("push after the restart");
+    }
+    drop(client);
+    srv.sigterm();
+
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        log.contains("removed stale socket"),
+        "the restart must log the stale-socket removal\nlog:\n{log}"
+    );
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<String> = (0..10)
+        .flat_map(|i| [format!("stale-pre-{i:02}"), format!("stale-post-{i:02}")])
+        .filter(|p| !delivered.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every acked record must reach the sink across the SIGKILL; missing {missing:?}"
+    );
 }
 
 // ── wab_dir ownership (safety floor, spec §3.1) ───────────────────────────────
