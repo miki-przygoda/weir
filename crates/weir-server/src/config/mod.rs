@@ -200,6 +200,20 @@ fn parse_postgres_insert_mode(s: &str) -> Result<crate::sink::postgres::InsertMo
     }
 }
 
+/// Parses `wab_dir_lock`. Only the two documented spellings: a typo must not
+/// silently pick a policy, and `best-effort` removes a safety guard.
+fn parse_wab_dir_lock(s: &str) -> Result<crate::wab::lock::LockPolicy, ConfigError> {
+    use crate::wab::lock::LockPolicy;
+    match s {
+        "required" => Ok(LockPolicy::Required),
+        "best-effort" => Ok(LockPolicy::BestEffort),
+        other => Err(ConfigError::InvalidValue {
+            field: "wab_dir_lock",
+            reason: format!("wab_dir_lock must be \"required\" or \"best-effort\", got {other:?}"),
+        }),
+    }
+}
+
 // ── Partial config (one layer) ────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -216,6 +230,7 @@ pub(crate) struct PartialConfig {
     pub wab_max_bytes: Option<u64>,
     pub wab_compression: Option<String>,
     pub wab_compression_level: Option<i32>,
+    pub wab_dir_lock: Option<String>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub max_batch_records: Option<usize>,
@@ -403,6 +418,12 @@ pub struct Config {
     /// "ultra" tier, which needs materially more memory to both compress and
     /// decompress.
     pub wab_compression_level: i32,
+    /// What to do when the filesystem under `wab_dir` cannot take an exclusive
+    /// `flock` on `<wab_dir>/.weir.lock`: `"required"` (default) refuses to
+    /// start, `"best-effort"` WARNs and runs with no guard against a second
+    /// daemon on the same `wab_dir`. Contention (another weir-server holds the
+    /// lock) is refused under both.
+    pub wab_dir_lock: crate::wab::lock::LockPolicy,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub max_batch_records: usize,
@@ -669,6 +690,8 @@ impl Config {
         }
         let wab_compression_level = merge!(wab_compression_level).unwrap_or(1);
         check_range("wab_compression_level", wab_compression_level, 1, 19)?;
+        let wab_dir_lock =
+            parse_wab_dir_lock(&merge!(wab_dir_lock).unwrap_or_else(|| "required".to_string()))?;
         let wab_segment_max_bytes = merge!(wab_segment_max_bytes).unwrap_or(256 * 1024 * 1024);
         if !(4096..=4 * 1024 * 1024 * 1024).contains(&wab_segment_max_bytes) {
             return Err(ConfigError::InvalidValue {
@@ -1117,6 +1140,7 @@ impl Config {
             wab_max_bytes,
             wab_compression,
             wab_compression_level,
+            wab_dir_lock,
             max_connections,
             max_payload_bytes,
             max_batch_records,
@@ -2313,6 +2337,75 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("wab_compression"), "{msg}");
         assert!(msg.contains("zstd"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_dir_lock_defaults_to_required() {
+        use crate::wab::lock::LockPolicy;
+        let dir = tmp_dir("wab_dir_lock_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        assert_eq!(c.wab_dir_lock, LockPolicy::Required);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_dir_lock_best_effort_accepted_and_cli_overrides_file() {
+        use crate::wab::lock::LockPolicy;
+        let dir = tmp_dir("wab_dir_lock_best_effort");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_dir_lock: Some("best-effort".into()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.wab_dir_lock, LockPolicy::BestEffort);
+
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir_lock: Some("required".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_dir_lock: Some("best-effort".into()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            c.wab_dir_lock,
+            LockPolicy::Required,
+            "CLI wins over the file"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_wab_dir_lock_rejected() {
+        let dir = tmp_dir("bad_wab_dir_lock");
+        // `best_effort` (underscore) is a plausible typo; it must not silently
+        // select either policy.
+        for bad in ["best_effort", "off", ""] {
+            let err = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    wab_dir_lock: Some(bad.into()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("wab_dir_lock"), "{msg}");
+            assert!(msg.contains("best-effort"), "{msg}");
+        }
         fs::remove_dir_all(dir).ok();
     }
 

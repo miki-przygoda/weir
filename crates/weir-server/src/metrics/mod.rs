@@ -342,6 +342,13 @@ pub(crate) struct Metrics {
     /// Seconds elapsed since the drain entered `BlockedDeadLetterFull`. Resets to 0
     /// on transition out. Alert if this gauge exceeds an operator-defined threshold (e.g. 300 s).
     pub dead_letter_blocked_duration: Gauge<f64, AtomicU64>,
+
+    // ── wab_dir ownership (safety floor, spec §3.1) ───────────────────────────
+    /// 1 while this daemon holds the exclusive lock on `<wab_dir>/.weir.lock`.
+    /// 0 under `wab_dir_lock = "best-effort"` on a filesystem that cannot lock
+    /// (no guard against a second daemon), or when ownership was lost just
+    /// before exit.
+    pub wab_dir_lock_held: Gauge<f64, AtomicU64>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -661,6 +668,16 @@ impl Metrics {
              threshold (e.g. 300 s)"
         );
 
+        // ── wab_dir ownership (safety floor) ──────────────────────────────────
+        let wab_dir_lock_held = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_wab_dir_lock_held",
+            "1 while this daemon holds the exclusive flock on <wab_dir>/.weir.lock, so no \
+             second weir-server can recover or drain its live segments. 0 means it runs \
+             WITHOUT that guard: wab_dir_lock = \"best-effort\" on a filesystem that cannot \
+             lock, or ownership was lost just before exit. Alert on 0"
+        );
+
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
@@ -727,6 +744,7 @@ impl Metrics {
             drain_segments_resumed,
             drain_state,
             dead_letter_blocked_duration,
+            wab_dir_lock_held,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -876,6 +894,7 @@ mod tests {
             "weir_drain_segments_resumed",
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
+            "weir_wab_dir_lock_held",
         ];
         for name in expected {
             assert!(
@@ -908,5 +927,15 @@ mod tests {
             "drain_state stopped label missing or not pre-initialised to 0:\n{out}"
         );
         assert!(out.contains("healthy"), "sink_health healthy label missing");
+    }
+
+    /// The lock gauge starts at 0: `main` sets it to 1 only after the lock is
+    /// actually held, so a scrape can never report a guard that is not there.
+    #[test]
+    fn wab_dir_lock_held_starts_at_zero() {
+        let (m, reg) = Metrics::new();
+        assert!(encode_to_string(&reg).contains("weir_wab_dir_lock_held 0"));
+        m.wab_dir_lock_held.set(1.0);
+        assert!(encode_to_string(&reg).contains("weir_wab_dir_lock_held 1"));
     }
 }

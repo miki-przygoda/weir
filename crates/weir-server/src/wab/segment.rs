@@ -931,6 +931,25 @@ mod tests {
         dir
     }
 
+    /// The counter scan must never read a counter out of `.weir.lock` (or any
+    /// non-segment name), wherever it sits: a phantom counter would make the
+    /// writer skip ahead, and a misparse could make it reuse one.
+    #[test]
+    fn segment_counters_ignores_the_wab_dir_lock_file() {
+        let dir = tmp_dir("counters_ignore_lock");
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            let _ = fs::remove_file(e.path());
+        }
+        fs::write(dir.join("seg_00000007.wab.sealed"), b"").unwrap();
+        fs::write(
+            dir.join(crate::wab::lock::LOCK_FILE_NAME),
+            b"pid=99999999\n",
+        )
+        .unwrap();
+        assert_eq!(FsSegmentStore.segment_counters(&dir).unwrap(), vec![7]);
+        fs::remove_dir_all(dir).ok();
+    }
+
     /// WabSegment::create is the daemon's segment-creation trust boundary:
     /// O_EXCL (never clobber an existing file), O_NOFOLLOW (never follow a
     /// symlink), and mode 0o600 (private to the daemon). Pins all three.

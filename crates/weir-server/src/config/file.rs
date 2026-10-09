@@ -39,6 +39,7 @@ struct RawServer {
     sink_http_concurrency: Option<usize>,
     wab_compression: Option<String>,
     wab_compression_level: Option<i32>,
+    wab_dir_lock: Option<String>,
     sink_http_batch: Option<String>,
     sink_max_retries: Option<u32>,
     sink_retry_base_delay_ms: Option<u64>,
@@ -123,6 +124,7 @@ const BASE_SERVER_KEYS: &[&str] = &[
     "sink_http_concurrency",
     "wab_compression",
     "wab_compression_level",
+    "wab_dir_lock",
     "sink_http_batch",
     "sink_max_retries",
     "sink_retry_base_delay_ms",
@@ -245,6 +247,7 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             sink_http_concurrency: s.sink_http_concurrency,
             wab_compression: s.wab_compression,
             wab_compression_level: s.wab_compression_level,
+            wab_dir_lock: s.wab_dir_lock,
             sink_http_batch: s.sink_http_batch,
             sink_max_retries: s.sink_max_retries,
             sink_retry_base_delay_ms: s.sink_retry_base_delay_ms,
@@ -369,6 +372,21 @@ mod tests {
     /// is tolerated (warn-only) — `read` must not error on either. This is the
     /// long-standing behaviour; F55 only changed which keys get a warning, not
     /// whether parsing fails.
+    #[test]
+    fn wab_dir_lock_is_a_known_key() {
+        let dir = crate::testutil::scratch_dir("filecfg_lock");
+        crate::testutil::mkdir_p(&dir);
+        let path = dir.join("weir.toml");
+        std::fs::write(&path, "[server]\nwab_dir_lock = \"best-effort\"\n").unwrap();
+        let (partial, warnings) = read(&path).unwrap();
+        assert_eq!(partial.wab_dir_lock.as_deref(), Some("best-effort"));
+        assert!(
+            warnings.iter().all(|w| !w.contains("wab_dir_lock")),
+            "wab_dir_lock must not be reported as unknown: {warnings:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn read_tolerates_feature_gated_and_unknown_keys() {
         let dir = crate::testutil::scratch_dir("filecfg");

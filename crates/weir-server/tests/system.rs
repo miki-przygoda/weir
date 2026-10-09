@@ -33,7 +33,7 @@ use std::{
 
 use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
-use weir_testkit::{free_port, process_lock, weir_server};
+use weir_testkit::{RecordingSink, free_port, process_lock, weir_server};
 
 // Helper: sum all file bytes under a directory tree.
 fn wab_dir_bytes(dir: &Path) -> u64 {
@@ -856,6 +856,8 @@ fn metrics_all_families_registered() {
         "weir_drain_state",
         "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",
+        // wab_dir ownership
+        "weir_wab_dir_lock_held",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
@@ -2253,6 +2255,227 @@ fn socket_takeover_does_not_corrupt_wab_data() {
     let _ = child_b.kill();
     let _ = child_b.wait();
     let _ = fs::remove_dir_all(&second_tmp);
+}
+
+// ── wab_dir ownership (safety floor, spec §3.1) ───────────────────────────────
+
+/// Every file under `dir`, keyed by its path relative to `dir`, with its size
+/// and a content hash. Two snapshots compare equal only if no file was
+/// created, removed, renamed, resized or rewritten in between.
+fn tree_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, (u64, u64)>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let bytes = fs::read(&p).unwrap_or_default();
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                out.insert(
+                    p.strip_prefix(root).unwrap().to_path_buf(),
+                    (bytes.len() as u64, h.finish()),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The owner's reproduction (2026-10-04), as a regression. Daemon B was started
+/// on the same `wab_dir` as a running daemon A, with its own socket and metrics
+/// port. B recovered and sealed A's ACTIVE segment, delivered, confirmed and
+/// deleted it, and A then acked 50 more Durable records into the unlinked
+/// inode: none were delivered and nothing remained on disk, and A's shutdown
+/// seal logged `No such file or directory`.
+///
+/// With the lock, B must refuse before reading a byte of the WAB, A's tree must
+/// be byte-identical afterwards, and every one of A's 70 acked records must
+/// reach the sink. A recording HTTP sink is used because graceful shutdown
+/// deletes every delivered segment, so WAB bytes after SIGTERM prove nothing.
+#[test]
+fn second_daemon_on_same_wab_dir_is_refused_and_first_keeps_acking() {
+    let sink = RecordingSink::start();
+    let mut srv_a = weir_server!("lock_owner_a")
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let mut client = srv_a.client();
+    for i in 0..20 {
+        client
+            .push(format!("lock-rec-{i:03}").as_bytes(), Durability::Durable)
+            .expect("push to A before B starts");
+    }
+
+    let lock_path = srv_a.wab_dir.join(".weir.lock");
+    let record = fs::read_to_string(&lock_path).expect("A holds a lock file with its record");
+    assert!(
+        record.contains(&format!("pid={}", srv_a.child_pid())),
+        "A's holder record must name A: {record:?}"
+    );
+    let before = tree_snapshot(&srv_a.wab_dir);
+    assert!(
+        before.keys().any(|k| k.to_string_lossy().ends_with(".wab")),
+        "A must have an ACTIVE segment for B to (wrongly) recover: {before:?}"
+    );
+
+    let started = Instant::now();
+    let (status, log) = weir_server!("lock_contender_b")
+        .wab_dir(&srv_a.wab_dir)
+        .spawn_expecting_exit(Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "B must refuse to start on A's wab_dir; it exited {status}\nlog:\n{log}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a startup refusal exits 1\nlog:\n{log}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "B must fail fast, took {:?}",
+        started.elapsed()
+    );
+    assert!(log.contains("locked by"), "B must say why\nlog:\n{log}");
+    assert!(
+        log.contains(&format!("pid {}", srv_a.child_pid())),
+        "B must name A's pid\nlog:\n{log}"
+    );
+    assert_eq!(
+        tree_snapshot(&srv_a.wab_dir),
+        before,
+        "B must not touch a byte of A's WAB (no recovery, no seal, no record rewrite)"
+    );
+
+    for i in 20..70 {
+        client
+            .push(format!("lock-rec-{i:03}").as_bytes(), Durability::Durable)
+            .expect("A keeps acking after B is refused");
+    }
+    drop(client);
+    srv_a.sigterm();
+
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<String> = (0..70)
+        .map(|i| format!("lock-rec-{i:03}"))
+        .filter(|p| !delivered.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every record A acked must reach the sink; missing {} of 70: {missing:?}",
+        missing.len()
+    );
+
+    let log_a = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        !log_a.contains("No such file or directory"),
+        "A's shutdown seal must find its own segment\nlog:\n{log_a}"
+    );
+}
+
+/// Review Focus 1: systemd restarts a daemon immediately after the previous
+/// one was SIGKILLed. The kernel releases an flock when the last fd on the open
+/// file description closes, i.e. at process death, so the successor must
+/// acquire the lock with no wait and no manual cleanup of `.weir.lock`.
+#[test]
+fn lock_is_released_when_the_holder_is_sigkilled() {
+    let shared = std::env::temp_dir().join(format!("weir_sys_lock_sigkill_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&shared);
+    fs::create_dir_all(&shared).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let mut srv_a = weir_server!("lock_sigkill_a").wab_dir(&shared).start();
+    let mut client = srv_a.client();
+    for i in 0..5 {
+        client
+            .push(format!("before-kill-{i}").as_bytes(), Durability::Durable)
+            .unwrap();
+    }
+    drop(client);
+    let pid_a = srv_a.child_pid();
+    srv_a.kill_ungracefully();
+    // Releases the harness process lock and A's temp dir; the shared wab_dir
+    // (an override) and its stale `.weir.lock` stay exactly as SIGKILL left them.
+    drop(srv_a);
+    let stale = fs::read_to_string(shared.join(".weir.lock")).unwrap();
+    assert!(stale.contains(&format!("pid={pid_a}")), "{stale:?}");
+
+    let srv_b = weir_server!("lock_sigkill_b")
+        .wab_dir(&shared)
+        .ready_timeout(Duration::from_secs(10))
+        .start();
+    let record = fs::read_to_string(shared.join(".weir.lock")).unwrap();
+    assert!(
+        record.contains(&format!("pid={}", srv_b.child_pid())),
+        "B must have taken the lock and rewritten the record: {record:?}"
+    );
+    let body = srv_b.scrape_metrics();
+    assert!(
+        body.lines()
+            .any(|l| l.starts_with("weir_wab_dir_lock_held 1")),
+        "B must report the lock as held:\n{body}"
+    );
+
+    drop(srv_b);
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// Review Focus 2: an operator runs `weir-ctl segments` / `dl list` against a
+/// LIVE daemon's wab_dir. weir-ctl must not report `.weir.lock`, must not
+/// rewrite it, and must not disturb the lock: a second daemon started
+/// afterwards is still refused.
+#[test]
+fn weir_ctl_beside_a_live_daemon_neither_sees_nor_disturbs_the_lock() {
+    let srv = weir_server!("lock_ctl_beside").start();
+    let mut client = srv.client();
+    client.push(b"ctl-beside", Durability::Durable).unwrap();
+    drop(client);
+    let lock_path = srv.wab_dir.join(".weir.lock");
+    let record_before = fs::read(&lock_path).unwrap();
+
+    let ctl = weir_ctl_binary();
+    for args in [
+        &["--json", "segments", "--wab-dir"][..],
+        &["--json", "dl", "list", "--wab-dir"][..],
+    ] {
+        let out = Command::new(&ctl)
+            .args(args)
+            .arg(&srv.wab_dir)
+            .output()
+            .expect("run weir-ctl");
+        assert!(
+            out.status.success(),
+            "weir-ctl {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains(".weir.lock"),
+            "weir-ctl {args:?} must not report the lock file: {stdout}"
+        );
+    }
+    assert_eq!(fs::read(&lock_path).unwrap(), record_before);
+
+    let (status, log) = weir_server!("lock_ctl_contender")
+        .wab_dir(&srv.wab_dir)
+        .spawn_expecting_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1), "log:\n{log}");
+    assert!(
+        log.contains("locked by"),
+        "the daemon must still hold its lock after weir-ctl ran\nlog:\n{log}"
+    );
 }
 
 // ── File descriptor limit exhaustion ─────────────────────────────────────────

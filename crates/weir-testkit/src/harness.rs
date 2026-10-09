@@ -430,6 +430,86 @@ impl WeirServerBuilder {
     /// captured log on failure).
     pub fn start(self) -> WeirServer {
         let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (prepared, mut cmd) = self.prepare();
+        let child = cmd.spawn().expect("failed to spawn weir-server");
+
+        let mut handle = WeirServer {
+            child: Some(child),
+            binary_path: prepared.binary_path,
+            socket_path: prepared.socket_path,
+            wab_dir: prepared.wab_dir,
+            config_path: prepared.config_path,
+            tmp_dir: prepared.tmp_dir,
+            metrics_port: prepared.metrics_port,
+            tcp_addr: prepared.tcp_addr,
+            batch_deadline_ms: prepared.batch_deadline_ms,
+            env: prepared.env,
+            _proc_lock,
+        };
+
+        handle.wait_ready(prepared.ready_timeout);
+        handle
+    }
+
+    /// Spawns a daemon that is EXPECTED to exit on its own (a refused start),
+    /// waits up to `timeout` for it, and returns its exit status and combined
+    /// stdout+stderr log. Panics, after killing it, if it is still running at
+    /// the deadline: a daemon that should have refused but did not is the bug
+    /// the caller is testing for.
+    ///
+    /// [`start`](Self::start) cannot do this: `wait_ready` panics on an early
+    /// exit, which is exactly the outcome wanted here.
+    ///
+    /// The child gets its own temp dir, socket path and metrics port, and the
+    /// builder's own `wab_dir` unless [`wab_dir`](Self::wab_dir) points it at
+    /// another daemon's. Use a tag no live server uses: the temp dir is derived
+    /// from it, and it is removed (after the log is read) before this returns.
+    /// A `wab_dir` override is never removed.
+    ///
+    /// Unlike `start`, this does not WAIT for [`process_lock`]: the typical
+    /// caller already holds it through a live [`WeirServer`] on the same
+    /// thread, and a std mutex is not reentrant. It takes the lock only if it
+    /// is free.
+    pub fn spawn_expecting_exit(self, timeout: Duration) -> (std::process::ExitStatus, String) {
+        let _proc_lock = process_lock().try_lock().ok();
+        let silenced = self.silence_logs;
+        let (prepared, mut cmd) = self.prepare();
+        let mut child = cmd.spawn().expect("failed to spawn weir-server");
+
+        let read_log = || {
+            if silenced {
+                String::new()
+            } else {
+                std::fs::read_to_string(&prepared.log_path).unwrap_or_default()
+            }
+        };
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait on weir-server") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let log = read_log();
+                let _ = std::fs::remove_dir_all(&prepared.tmp_dir);
+                panic!(
+                    "weir-server was expected to exit within {timeout:?} but was still \
+                     running (killed)\nlog:\n{log}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let log = read_log();
+        let _ = std::fs::remove_dir_all(&prepared.tmp_dir);
+        (status, log)
+    }
+
+    /// Lays out the temp dir, writes the config and builds the command. Shared
+    /// by [`start`](Self::start) and
+    /// [`spawn_expecting_exit`](Self::spawn_expecting_exit); the caller holds
+    /// (or deliberately does not hold) the process lock.
+    fn prepare(self) -> (Prepared, Command) {
         let metrics_port = free_port();
 
         // Pre-allocate the TCP+mTLS port (if requested) under the same held
@@ -551,26 +631,37 @@ impl WeirServerBuilder {
                 unsafe { cmd.pre_exec(pre_exec) };
             }
         }
-        let child = cmd.spawn().expect("failed to spawn weir-server");
 
-        let mut handle = WeirServer {
-            child: Some(child),
+        let prepared = Prepared {
             binary_path,
             socket_path,
             wab_dir,
             config_path,
+            log_path,
             tmp_dir,
             metrics_port,
             tcp_addr,
             batch_deadline_ms: self.batch_deadline_ms,
             env: self.env,
-            _proc_lock,
+            ready_timeout: self.ready_timeout,
         };
-
-        let ready_timeout = self.ready_timeout;
-        handle.wait_ready(ready_timeout);
-        handle
+        (prepared, cmd)
     }
+}
+
+/// Everything [`WeirServerBuilder::prepare`] decided, before the spawn.
+struct Prepared {
+    binary_path: PathBuf,
+    socket_path: PathBuf,
+    wab_dir: PathBuf,
+    config_path: PathBuf,
+    log_path: PathBuf,
+    tmp_dir: PathBuf,
+    metrics_port: u16,
+    tcp_addr: Option<std::net::SocketAddr>,
+    batch_deadline_ms: u64,
+    env: Vec<(String, String)>,
+    ready_timeout: Duration,
 }
 
 /// Read `WEIR_BENCH_DEADLINE` from env, defaulting to 1ms. Used by

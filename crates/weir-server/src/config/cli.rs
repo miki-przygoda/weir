@@ -32,6 +32,10 @@ OPTIONS:
                                                cannot read
     --wab-compression-level <n>              zstd level 1-19 (default: 3), ignored
                                                unless --wab-compression=zstd
+    --wab-dir-lock <required|best-effort>    On a filesystem that cannot flock the
+                                               wab_dir lock: refuse to start, or warn
+                                               and run unguarded [default: required].
+                                               A held lock always refuses
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
@@ -199,6 +203,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         wab_compression_level: pargs
             .opt_value_from_str("--wab-compression-level")
+            .map_err(pico_err)?,
+        wab_dir_lock: pargs
+            .opt_value_from_str("--wab-dir-lock")
             .map_err(pico_err)?,
         sink_http_batch: pargs
             .opt_value_from_str("--sink-http-batch")
@@ -372,6 +379,16 @@ mod tests {
     fn args(parts: &[&str]) -> pico_args::Arguments {
         // from_vec excludes the executable path, matching how we'd parse real argv.
         pico_args::Arguments::from_vec(parts.iter().map(OsString::from).collect())
+    }
+
+    #[test]
+    fn wab_dir_lock_flag_is_parsed() {
+        let (partial, _) = parse_from(args(&["--wab-dir-lock", "best-effort"])).unwrap();
+        assert_eq!(partial.wab_dir_lock.as_deref(), Some("best-effort"));
+        assert!(
+            HELP.contains("--wab-dir-lock"),
+            "the flag must be in --help"
+        );
     }
 
     // ── F57: lenient boolean flags ────────────────────────────────────────────

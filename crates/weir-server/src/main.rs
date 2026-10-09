@@ -484,6 +484,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "weir starting"
     );
 
+    // ── wab_dir ownership ─────────────────────────────────────────────────────
+    //
+    // Before ANYTHING reads the WAB (recovery inside wab::spawn, the replay, the
+    // drain) and before every other refuse-to-start check, so a duplicate on
+    // the same wab_dir reports "locked by" rather than some later symptom. A
+    // second daemon that got past this point would seal this one's ACTIVE
+    // segment, deliver and delete it, and turn this daemon's later Durable acks
+    // into false acks (spec §3.1). The lock is never released explicitly: the
+    // kernel drops it at process exit, after every join below, and also on an
+    // early `?` return while detached threads still run.
+    let lock_holder = wab::lock::HolderInfo::current(&config);
+    let lock_outcome =
+        wab::lock::acquire_wab_dir_lock(&config.wab_dir, config.wab_dir_lock, &lock_holder)
+            .inspect_err(|e| tracing::error!("{e}"))?;
+
     // ── Concurrency-vs-cores advisory ─────────────────────────────────────────
     // Each shard runs a flusher thread; each worker runs a worker thread.
     // Together those threads form the "agent" pool that does the real per-
@@ -505,6 +520,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (metrics_struct, registry) = metrics::Metrics::new();
     let metrics = Arc::new(metrics_struct);
     let registry = Arc::new(registry);
+    metrics.wab_dir_lock_held.set(match lock_outcome {
+        wab::lock::LockOutcome::Held => 1.0,
+        wab::lock::LockOutcome::Unsupported { .. } => 0.0,
+    });
 
     // ── Queue ─────────────────────────────────────────────────────────────────
 
@@ -1384,6 +1403,21 @@ mod wab_bytes_tests {
             Some(100),
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `<wab_dir>/.weir.lock` sits at the root as a regular file. The gauge
+    /// counts live shard-segment bytes only, so the lock file's bytes are NOT
+    /// counted (the root walk skips every non-directory). Pinned so a future
+    /// walker change cannot start counting it against `wab_max_bytes`.
+    #[test]
+    fn compute_wab_bytes_does_not_count_the_wab_dir_lock_file() {
+        let root = crate::testutil::scratch_dir("wab_bytes_lock");
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join(crate::wab::lock::LOCK_FILE_NAME), vec![b'x'; 77]).unwrap();
+        assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
         std::fs::remove_dir_all(&root).ok();
     }
 

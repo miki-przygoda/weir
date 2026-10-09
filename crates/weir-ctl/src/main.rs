@@ -3244,6 +3244,60 @@ weir_sink_info{sink_type=\"http\"} 1
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Review Focus 2: an operator runs `weir-ctl segments` against a LIVE
+    /// daemon's wab_dir, which holds `.weir.lock` at its root. The scan must not
+    /// report it (it is not a shard), and `--json` keeps its shape.
+    #[test]
+    fn scan_segments_ignores_the_wab_dir_lock_file() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_scan_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_00");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 10]).unwrap();
+        let lock = dir.join(".weir.lock");
+        std::fs::write(&lock, b"pid=1\nhost=h\n").unwrap();
+
+        let (shards, dl_files, dl_bytes) = scan_segments(&dir).unwrap();
+        let names: Vec<&str> = shards.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["shard_00"]);
+        assert_eq!((dl_files, dl_bytes), (0, 0));
+        assert_eq!(
+            std::fs::read(&lock).unwrap(),
+            b"pid=1\nhost=h\n",
+            "reading the WAB must not touch the lock file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// weir-ctl runs beside a live daemon and must never take, probe or
+    /// release the daemon's wab_dir lock: even a momentary `LOCK_SH | LOCK_NB`
+    /// probe can make a starting daemon fail with "locked by". Nothing in this
+    /// crate's sources may call flock (or lockf / fcntl record locks).
+    #[test]
+    fn weir_ctl_never_takes_the_wab_dir_lock() {
+        const SOURCES: [(&str, &str); 2] = [
+            ("main.rs", include_str!("main.rs")),
+            ("attest.rs", include_str!("attest.rs")),
+        ];
+        // Split so this test's own source does not match itself.
+        let needles = [
+            ["fl", "ock("].concat(),
+            ["lo", "ckf("].concat(),
+            ["F_SET", "LK"].concat(),
+            ["try_", "lock_shared"].concat(),
+            [".try_", "lock("].concat(),
+            [".lock_", "shared("].concat(),
+        ];
+        for (name, src) in SOURCES {
+            for needle in &needles {
+                assert!(
+                    !src.contains(needle.as_str()),
+                    "weir-ctl {name} contains {needle:?}: weir-ctl must never lock the wab_dir"
+                );
+            }
+        }
+    }
+
     #[test]
     fn metric_primitives_sum_get_and_active_label() {
         let body = "\
