@@ -239,6 +239,28 @@ impl WeirServer {
         t.elapsed()
     }
 
+    /// Waits up to `timeout` for the daemon to exit ON ITS OWN (no signal is
+    /// sent) and returns its exit status, or `None` if it is still running at
+    /// the deadline (or the handle no longer has a child: it was already
+    /// killed, or reaped by an earlier call). Once it has exited the handle
+    /// forgets the child, so drop
+    /// does not signal a reused pid. The temp dir stays until drop, so the
+    /// caller can still read `weir.log`.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        let child = self.child.as_mut()?;
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                self.child = None;
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Sends SIGTERM, waits for the process to exit cleanly, then drops the
     /// handle (which removes the temp directory).
     pub fn shutdown(mut self) {

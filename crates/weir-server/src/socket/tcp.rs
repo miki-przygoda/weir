@@ -84,6 +84,9 @@ pub struct TcpConfig {
     /// Whether the cap is currently rejecting — the SAME `Arc` the Unix listener
     /// gets, so the hysteresis low-water mark is daemon-wide.
     pub wab_cap_rejecting: Arc<AtomicBool>,
+    /// Set once another instance provably owns the `wab_dir` — the SAME `Arc`
+    /// the Unix listener gets, so neither transport acks after the loss.
+    pub wab_ownership_lost: Arc<AtomicBool>,
 }
 
 /// Binds nothing — accepts on the already-bound `listener` (see module docs for
@@ -125,6 +128,7 @@ pub async fn run(
         wab_max_bytes: config.wab_max_bytes,
         wab_bytes_now: Arc::clone(&config.wab_bytes_now),
         wab_cap_rejecting: Arc::clone(&config.wab_cap_rejecting),
+        wab_ownership_lost: Arc::clone(&config.wab_ownership_lost),
     };
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 

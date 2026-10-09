@@ -82,6 +82,10 @@ pub struct SocketConfig {
     /// so the hysteresis low-water mark is honoured daemon-wide rather than
     /// per-transport.
     pub wab_cap_rejecting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set once another instance provably owns the `wab_dir`; every push is
+    /// then Nacked before it reaches the queue. The SAME `Arc` every listener
+    /// and the `wab_dir` integrity task get.
+    pub wab_ownership_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Binds a Unix socket, accepts connections, and drives the frame-parsing layer.
@@ -131,6 +135,7 @@ pub async fn run(
         wab_max_bytes: config.wab_max_bytes,
         wab_bytes_now: std::sync::Arc::clone(&config.wab_bytes_now),
         wab_cap_rejecting: std::sync::Arc::clone(&config.wab_cap_rejecting),
+        wab_ownership_lost: std::sync::Arc::clone(&config.wab_ownership_lost),
     };
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown_rx);
@@ -743,6 +748,7 @@ mod tests {
             wab_max_bytes: 0,
             wab_bytes_now: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wab_cap_rejecting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wab_ownership_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

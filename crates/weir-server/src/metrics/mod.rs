@@ -349,6 +349,10 @@ pub(crate) struct Metrics {
     /// (no guard against a second daemon), or when ownership was lost just
     /// before exit.
     pub wab_dir_lock_held: Gauge<f64, AtomicU64>,
+    /// `weir_wab_dir_lock_integrity_failures_total`: integrity checks of the
+    /// `wab_dir` lock that found it deleted or replaced (and re-locked it), or
+    /// failed with an errno. Proven loss to another instance exits instead.
+    pub wab_dir_lock_integrity_failures: Counter<u64, AtomicU64>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -677,6 +681,15 @@ impl Metrics {
              WITHOUT that guard: wab_dir_lock = \"best-effort\" on a filesystem that cannot \
              lock, or ownership was lost just before exit. Alert on 0"
         );
+        let wab_dir_lock_integrity_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_dir_lock_integrity_failures",
+            "Once-a-second integrity checks of <wab_dir>/.weir.lock that found the file \
+             deleted or replaced (the daemon re-created and re-locked it) or that failed with \
+             an error. Any increase means someone is tampering with the lock file: while it is \
+             missing, a second weir-server can start on this wab_dir. Proven loss to another \
+             instance does not count here; the daemon exits with status 3 instead"
+        );
 
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
@@ -745,6 +758,7 @@ impl Metrics {
             drain_state,
             dead_letter_blocked_duration,
             wab_dir_lock_held,
+            wab_dir_lock_integrity_failures,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -895,6 +909,7 @@ mod tests {
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
             "weir_wab_dir_lock_held",
+            "weir_wab_dir_lock_integrity_failures",
         ];
         for name in expected {
             assert!(

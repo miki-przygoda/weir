@@ -858,6 +858,7 @@ fn metrics_all_families_registered() {
         "weir_dead_letter_blocked_duration_seconds",
         // wab_dir ownership
         "weir_wab_dir_lock_held",
+        "weir_wab_dir_lock_integrity_failures",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
@@ -2476,6 +2477,171 @@ fn weir_ctl_beside_a_live_daemon_neither_sees_nor_disturbs_the_lock() {
         log.contains("locked by"),
         "the daemon must still hold its lock after weir-ctl ran\nlog:\n{log}"
     );
+}
+
+/// Spec §3.1 integrity, D4b. Someone deletes a live daemon's `.weir.lock`, and
+/// a second daemon B starts on the same `wab_dir` and takes a fresh lock. That
+/// is proof another writer owns the directory, so A must stop acking and exit
+/// with status 3 within one integrity tick (spec: within 2 s), logging
+/// CRITICAL with B's holder record, and without sealing.
+///
+/// Between B's lock and A's next tick, A can still ack (the residual window the
+/// threat model states; only "never delete `.weir.lock`" closes it). What A
+/// must never do is ack AFTER it started refusing: once a push is Nacked, every
+/// later push is Nacked or fails because A is gone.
+#[test]
+fn lock_file_stolen_by_second_daemon_fails_closed() {
+    let mut srv_a = weir_server!("lock_stolen_a").start();
+    let lock_path = srv_a.wab_dir.join(".weir.lock");
+    let mut client = srv_a.client();
+    client
+        .push(b"before-steal", Durability::Durable)
+        .expect("A acks while it owns the lock");
+
+    // B gets its own socket, metrics port and log, and A's wab_dir. Spawned
+    // with Command directly: srv_a holds the harness process lock, and B must
+    // stay up beside A.
+    let b_tmp = std::env::temp_dir().join(format!("weir_sys_lock_stolen_b_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&b_tmp);
+    fs::create_dir_all(&b_tmp).unwrap();
+    let b_config = b_tmp.join("weir.toml");
+    fs::write(
+        &b_config,
+        format!(
+            "[server]\n\
+             socket_path           = \"{}\"\n\
+             wab_dir               = \"{}\"\n\
+             metrics_port          = {}\n\
+             shard_count           = 1\n\
+             worker_count          = 2\n\
+             shutdown_timeout_secs = 3\n\
+             log_level             = \"info\"\n",
+            b_tmp.join("weir.sock").display(),
+            srv_a.wab_dir.display(),
+            free_port(),
+        ),
+    )
+    .unwrap();
+
+    // A's integrity task re-creates and re-locks a deleted lock file on its
+    // next tick (D4a). A B spawned just after that tick is then refused, and
+    // the precondition here ("B acquires the lock") did not happen; retry.
+    let mut child_b = None;
+    for attempt in 0..10 {
+        match fs::remove_file(&lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("unlink {}: {e}", lock_path.display()),
+        }
+        let b_log = b_tmp.join(format!("weir_b_{attempt}.log"));
+        let log = fs::File::create(&b_log).unwrap();
+        let mut c = Command::new(env!("CARGO_BIN_EXE_weir-server"))
+            .args(["--config", b_config.to_str().unwrap()])
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn B");
+        // B writes its record only after its flock succeeded, so its pid in
+        // the record means B holds the lock.
+        let b_marker = format!("pid={}\n", c.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let acquired = loop {
+            if fs::read_to_string(&lock_path).is_ok_and(|r| r.contains(&b_marker)) {
+                break true;
+            }
+            if let Ok(Some(_)) = c.try_wait() {
+                break false; // refused: A re-locked first
+            }
+            if Instant::now() >= deadline {
+                let _ = c.kill();
+                let _ = c.wait();
+                panic!(
+                    "B neither took the lock nor exited\nB log:\n{}",
+                    fs::read_to_string(&b_log).unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        if acquired {
+            child_b = Some(c);
+            break;
+        }
+    }
+    let mut child_b = child_b.expect("B never acquired the lock in 10 attempts");
+    let b_pid = child_b.id();
+    let b_acquired_at = Instant::now();
+
+    // Keep pushing to A until it is gone.
+    let mut outcomes: Vec<Result<(), ClientError>> = Vec::new();
+    let status = loop {
+        if let Some(status) = srv_a.wait_for_exit(Duration::ZERO) {
+            break status;
+        }
+        if b_acquired_at.elapsed() > Duration::from_secs(10) {
+            let _ = child_b.kill();
+            let _ = child_b.wait();
+            panic!(
+                "A is still running 10 s after B took its wab_dir\nA log:\n{}",
+                fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default()
+            );
+        }
+        let alive = matches!(
+            outcomes.last(),
+            None | Some(Ok(())) | Some(Err(ClientError::Nack(_)))
+        );
+        if alive {
+            outcomes.push(
+                client
+                    .push(b"during-steal", Durability::Durable)
+                    .map(|_| ()),
+            );
+        } else {
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let exited_after = b_acquired_at.elapsed();
+
+    let _ = child_b.kill();
+    let _ = child_b.wait();
+    let log_a = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "proven ownership loss exits 3 (got {status})\nA log:\n{log_a}"
+    );
+    assert!(
+        exited_after <= Duration::from_secs(2),
+        "A must exit within 2 s of B taking the lock (1 s integrity tick); took {exited_after:?}"
+    );
+    assert!(
+        log_a.contains("CRITICAL") && log_a.contains("ownership lost"),
+        "A must log CRITICAL\nA log:\n{log_a}"
+    );
+    assert!(
+        log_a.contains(&format!("pid {b_pid}")),
+        "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
+    );
+
+    // Once A refused a push, it never acked another one.
+    if let Some(first_nack) = outcomes
+        .iter()
+        .position(|o| matches!(o, Err(ClientError::Nack(_))))
+    {
+        for o in &outcomes[first_nack..] {
+            match o {
+                Err(ClientError::Nack(r)) => assert_eq!(
+                    *r,
+                    weir_client::NackReason::InternalError,
+                    "ownership loss Nacks InternalError (no wire change)"
+                ),
+                Ok(()) => panic!("A acked after it started refusing: {outcomes:?}"),
+                Err(_) => {} // A is gone
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&b_tmp);
 }
 
 // ── File descriptor limit exhaustion ─────────────────────────────────────────

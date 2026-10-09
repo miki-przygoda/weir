@@ -106,6 +106,30 @@ pub(crate) struct HolderInfo {
 /// by the integrity check; never by the ack path or the drain.
 static WAB_DIR_LOCK: Mutex<Option<File>> = Mutex::new(None);
 
+/// This daemon's own holder record, cached at acquisition so the integrity
+/// check can write it into a re-created lock file without rebuilding it, and
+/// so nothing in-process ever needs to read `.weir.lock` back.
+static OWN_RECORD: Mutex<Option<HolderInfo>> = Mutex::new(None);
+
+/// The process exit code when the daemon proves another instance owns its
+/// `wab_dir` (exit 1 stays "refused to start").
+pub(crate) const EXIT_WAB_OWNERSHIP_LOST: i32 = 3;
+
+/// One integrity check's verdict ([`check_wab_dir_lock`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockIntegrity {
+    /// The lock file at the path is the one held, and the lock is still ours.
+    Ok,
+    /// The lock file was deleted or replaced and nobody else held the new one:
+    /// it was re-created and re-locked (D4a). Worth an ERROR, not a stop.
+    Relocked,
+    /// Another open file description holds the lock: proof that a second
+    /// writer owns the directory (D4b). The daemon must stop acking and exit.
+    LostToOther { holder: Option<HolderInfo> },
+    /// Anything else (an errno). Logged and retried on the next tick.
+    Error(i32),
+}
+
 impl HolderInfo {
     /// This process's record.
     pub(crate) fn current(config: &Config) -> Self {
@@ -195,6 +219,7 @@ pub(crate) fn acquire_wab_dir_lock(
     match try_lock_path(&path, holder) {
         Ok(file) => {
             *WAB_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+            *OWN_RECORD.lock().unwrap_or_else(|e| e.into_inner()) = Some(holder.clone());
             Ok(LockOutcome::Held)
         }
         Err(LockError::Unsupported { errno, path }) if policy == LockPolicy::BestEffort => {
@@ -213,10 +238,114 @@ pub(crate) fn acquire_wab_dir_lock(
     }
 }
 
-/// The held lock's fd, for the integrity check. `None` before acquisition and
-/// under `LockOutcome::Unsupported`.
+/// Checks, once, that this daemon still owns `wab_dir` (spec §3.1, D4).
+///
+/// Called every second by the integrity task in `main` (on a blocking thread),
+/// only when the lock is [`LockOutcome::Held`]. It guards against the lock
+/// being defeated by deleting or replacing `.weir.lock`: a daemon started
+/// after that would create and lock a fresh file and recover this daemon's
+/// live segments.
+///
+/// It never opens the lock path except to re-create it after proving the file
+/// at the path is no longer the held one; the held fd is only `fstat`ed and
+/// re-flocked.
+pub(crate) fn check_wab_dir_lock(wab_dir: &Path) -> LockIntegrity {
+    let own = OWN_RECORD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default();
+    let mut slot = WAB_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    check_lock_slot(wab_dir, &mut slot, &own)
+}
+
+/// [`check_wab_dir_lock`] against an explicit slot, so tests can exercise it
+/// without the process-wide one.
+///
+/// Each check:
+/// 1. `lstat`s the path and compares (dev, ino) with `fstat` of the held fd;
+/// 2. re-issues `flock(held, LOCK_EX | LOCK_NB)`. On a local filesystem that
+///    is a no-op conversion that returns 0. Where flock is emulated with POSIX
+///    locks (NFS) it returns `EWOULDBLOCK` once a lease was lost and another
+///    client took the lock;
+/// 3. classifies: match and 0 is `Ok`; contention on the held fd is
+///    `LostToOther`; a mismatch or a missing file is re-created and re-locked
+///    through the one opener, `Relocked` on success and `LostToOther` when that
+///    re-lock meets contention; any other errno is `Error`.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))] // consumed by the lock-integrity check
+fn check_lock_slot(wab_dir: &Path, slot: &mut Option<File>, own: &HolderInfo) -> LockIntegrity {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(held) = slot.as_ref() else {
+        // Nothing held (never acquired, or best-effort). The integrity task is
+        // not spawned then; report it rather than take a lock here.
+        return LockIntegrity::Error(libc::EBADF);
+    };
+    let path = wab_dir.join(LOCK_FILE_NAME);
+    let errno_of = |e: &std::io::Error| e.raw_os_error().unwrap_or(libc::EIO);
+
+    // 1. What is at the path now. lstat: a symlink planted there is not the
+    // held file, whatever it points at.
+    let at_path = match std::fs::symlink_metadata(&path) {
+        Ok(m) => Some((m.dev(), m.ino())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return LockIntegrity::Error(errno_of(&e)),
+    };
+    let held_id = match held.metadata() {
+        Ok(m) => (m.dev(), m.ino()),
+        Err(e) => return LockIntegrity::Error(errno_of(&e)),
+    };
+
+    // 2. Re-flock the held description.
+    match flock_exclusive_nonblocking(held.as_raw_fd()) {
+        Ok(()) => {}
+        Err(errno) if errno == libc::EWOULDBLOCK => {
+            return LockIntegrity::LostToOther {
+                holder: read_holder(held),
+            };
+        }
+        Err(errno) => return LockIntegrity::Error(errno),
+    }
+
+    // 3. Classify.
+    if at_path == Some(held_id) {
+        return LockIntegrity::Ok;
+    }
+    // The file at the path is gone or is not ours. Re-create and re-lock it
+    // through the one opener. Contention there means a second daemon created
+    // and locked it after the unlink: it may already have recovered our live
+    // segments.
+    match try_lock_path(&path, own) {
+        Ok(file) => {
+            // The old fd refers to an unlinked or renamed-over inode nobody
+            // can reach by this path any more; dropping it is harmless.
+            *slot = Some(file);
+            LockIntegrity::Relocked
+        }
+        Err(LockError::Held { holder, .. }) => LockIntegrity::LostToOther { holder },
+        Err(LockError::Unsupported { errno, .. }) => LockIntegrity::Error(errno),
+        Err(LockError::Io { source, .. }) => LockIntegrity::Error(source.raw_os_error().unwrap_or(
+            if source.kind() == std::io::ErrorKind::InvalidInput {
+                libc::EINVAL
+            } else {
+                libc::EIO
+            },
+        )),
+    }
+}
+
+/// No flock on non-Unix builds: the lock is never `Held` there, so the
+/// integrity task is never spawned.
+#[cfg(not(unix))]
+fn check_lock_slot(_wab_dir: &Path, _slot: &mut Option<File>, _own: &HolderInfo) -> LockIntegrity {
+    LockIntegrity::Ok
+}
+
+/// The held lock's fd. `None` before acquisition and under
+/// `LockOutcome::Unsupported`.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))] // the integrity check reads the slot directly
 pub(crate) fn held_lock_fd() -> Option<std::os::fd::RawFd> {
     use std::os::fd::AsRawFd;
     WAB_DIR_LOCK
@@ -230,8 +359,9 @@ pub(crate) fn held_lock_fd() -> Option<std::os::fd::RawFd> {
 /// the lock. Bypasses [`WAB_DIR_LOCK`], so tests can take and drop locks
 /// without poisoning the process-wide slot.
 ///
-/// This and the integrity check's re-create are the only places that open the
-/// lock path.
+/// The ONLY opener of the lock path. It has two callers: acquisition, and the
+/// integrity check's re-create after it proved the file at the path is no
+/// longer the held one (a `lock_module_never_reopens_path` test pins both).
 #[cfg(unix)]
 #[allow(clippy::result_large_err)] // see acquire_wab_dir_lock
 fn try_lock_path(path: &Path, holder: &HolderInfo) -> Result<File, LockError> {
@@ -760,6 +890,259 @@ mod tests {
                 }
                 other => panic!("expected Io(EPERM) under {policy:?}, got {other}"),
             }
+        }
+    }
+
+    // ── Integrity check (spec §3.1 integrity, D4) ────────────────────────────
+    //
+    // These drive `check_lock_slot` with a LOCAL slot standing in for
+    // `WAB_DIR_LOCK`, so they never populate the process-wide one (another
+    // test asserts it stays empty under best-effort).
+
+    /// Takes the lock on `dir`'s lock path, as `acquire_wab_dir_lock` would.
+    fn held_slot(dir: &Path, h: &HolderInfo) -> Option<File> {
+        Some(try_lock_path(&dir.join(LOCK_FILE_NAME), h).expect("acquire"))
+    }
+
+    /// (dev, ino) of an open file and of whatever is at a path now.
+    fn fd_id(f: &File) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata().unwrap();
+        (m.dev(), m.ino())
+    }
+    fn path_id(p: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(p).unwrap();
+        (m.dev(), m.ino())
+    }
+
+    #[test]
+    fn intact_lock_checks_ok_and_leaves_the_record_alone() {
+        let dir = wab_dir("integrity_ok");
+        let owner = holder("owner");
+        let mut slot = held_slot(&dir, &owner);
+        let before = fd_id(slot.as_ref().unwrap());
+        for _ in 0..3 {
+            // Re-issuing LOCK_EX on the held description is a no-op conversion.
+            assert_eq!(check_lock_slot(&dir, &mut slot, &owner), LockIntegrity::Ok);
+        }
+        assert_eq!(fd_id(slot.as_ref().unwrap()), before, "the held fd is kept");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(LOCK_FILE_NAME)).unwrap(),
+            owner.render()
+        );
+        // Still exclusive: the check must not have weakened the lock.
+        assert!(matches!(
+            try_lock_path(&dir.join(LOCK_FILE_NAME), &holder("x")),
+            Err(LockError::Held { .. })
+        ));
+    }
+
+    /// D4a: the file was deleted by hand and nobody else holds the directory.
+    /// Re-create it, re-lock it, keep running.
+    #[test]
+    fn unlink_and_recreate_relocks() {
+        let dir = wab_dir("integrity_relock");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("owner");
+        let mut slot = held_slot(&dir, &owner);
+        let old = fd_id(slot.as_ref().unwrap());
+
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &owner),
+            LockIntegrity::Relocked
+        );
+
+        let new = fd_id(slot.as_ref().expect("the slot still holds a lock"));
+        assert_ne!(new, old, "the slot must now hold the RE-CREATED file");
+        assert_eq!(new, path_id(&lock), "and it is the file at the lock path");
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            owner.render(),
+            "the re-created file carries this daemon's record"
+        );
+        assert!(
+            matches!(
+                try_lock_path(&lock, &holder("contender")),
+                Err(LockError::Held { .. })
+            ),
+            "a newcomer is refused again once the lock is re-taken"
+        );
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &owner),
+            LockIntegrity::Ok,
+            "the next tick sees an intact lock"
+        );
+    }
+
+    /// The same, when the path is REPLACED (a rename over it) rather than
+    /// removed: the inode differs, nobody holds the new one.
+    #[test]
+    fn replaced_lock_file_relocks() {
+        let dir = wab_dir("integrity_replaced");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("owner");
+        let mut slot = held_slot(&dir, &owner);
+
+        let stray = dir.join("stray");
+        std::fs::write(&stray, b"junk").unwrap();
+        std::fs::rename(&stray, &lock).unwrap();
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &owner),
+            LockIntegrity::Relocked
+        );
+        assert_eq!(fd_id(slot.as_ref().unwrap()), path_id(&lock));
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), owner.render());
+    }
+
+    /// D4b: after the unlink a second daemon created and locked a new file.
+    /// That is proof another writer owns the directory.
+    #[test]
+    fn unlink_then_other_holder_gives_lost_to_other() {
+        let dir = wab_dir("integrity_lost");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("weir-a");
+        let mut slot = held_slot(&dir, &owner);
+        let old = fd_id(slot.as_ref().unwrap());
+
+        std::fs::remove_file(&lock).unwrap();
+        let other = HolderInfo {
+            pid: 4242,
+            ..holder("weir-b")
+        };
+        // A second, process-local open file description takes the new file.
+        let _b = try_lock_path(&lock, &other).expect("B acquires the fresh lock file");
+
+        match check_lock_slot(&dir, &mut slot, &owner) {
+            LockIntegrity::LostToOther { holder: Some(h) } => {
+                assert_eq!(h, other, "the verdict names the NEW owner")
+            }
+            v => panic!("expected LostToOther naming B, got {v:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap(),
+            other.render(),
+            "the losing daemon must not touch the new owner's record"
+        );
+        assert_eq!(
+            fd_id(slot.as_ref().unwrap()),
+            old,
+            "the slot is not replaced on a lost race"
+        );
+    }
+
+    /// Where flock is emulated with POSIX locks (NFS), a lease loss lets
+    /// another client lock the SAME file; the held-fd re-flock then reports
+    /// contention even though the inode still matches.
+    #[test]
+    fn contention_on_the_held_fd_gives_lost_to_other() {
+        let dir = wab_dir("integrity_held_fd_contended");
+        let owner = holder("owner");
+        let mut slot = held_slot(&dir, &owner);
+        let _hook = HookGuard::set(libc::EWOULDBLOCK);
+        assert!(
+            matches!(
+                check_lock_slot(&dir, &mut slot, &owner),
+                LockIntegrity::LostToOther { .. }
+            ),
+            "contention on the held fd is proof of loss"
+        );
+    }
+
+    #[test]
+    fn other_flock_errno_is_an_error_and_keeps_the_held_fd() {
+        let dir = wab_dir("integrity_eio");
+        let owner = holder("owner");
+        let mut slot = held_slot(&dir, &owner);
+        let before = fd_id(slot.as_ref().unwrap());
+        {
+            let _hook = HookGuard::set(libc::EIO);
+            assert_eq!(
+                check_lock_slot(&dir, &mut slot, &owner),
+                LockIntegrity::Error(libc::EIO)
+            );
+        }
+        assert_eq!(fd_id(slot.as_ref().unwrap()), before);
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &owner),
+            LockIntegrity::Ok,
+            "the next tick retries and recovers"
+        );
+    }
+
+    /// A symlink planted where the lock file was is not "nobody holds it":
+    /// the re-create refuses to follow it (ELOOP), which is an error to retry,
+    /// and the target is never written.
+    #[test]
+    fn symlink_planted_at_the_lock_path_is_an_error_not_a_relock() {
+        let dir = wab_dir("integrity_symlink");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("owner");
+        let mut slot = held_slot(&dir, &owner);
+        let target = dir.join("planted_target");
+        let _ = std::fs::remove_file(&target);
+        std::fs::write(&target, b"").unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(&target, &lock).unwrap();
+
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &owner),
+            LockIntegrity::Error(libc::ELOOP)
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+        std::fs::remove_file(&lock).unwrap();
+    }
+
+    #[test]
+    fn check_without_a_held_lock_is_an_error() {
+        let dir = wab_dir("integrity_unheld");
+        let mut slot = None;
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &holder("h")),
+            LockIntegrity::Error(libc::EBADF)
+        );
+        assert!(
+            slot.is_none(),
+            "the check never takes a lock it did not hold"
+        );
+    }
+
+    /// The module's first rule: the lock path is opened in exactly one place
+    /// (`try_lock_path`), which has exactly two callers, acquisition and the
+    /// integrity check's re-create after a proven unlink/replace. Where flock
+    /// is emulated with POSIX locks, closing ANY other fd to the file drops the
+    /// lock, so no other code here may open it.
+    #[test]
+    fn lock_module_never_reopens_path() {
+        let src = include_str!("lock.rs");
+        let prod = src
+            .split("#[cfg(all(test, unix))]\nmod tests")
+            .next()
+            .unwrap();
+        assert!(prod.len() < src.len(), "the tests marker must be found");
+        assert_eq!(
+            prod.matches("OpenOptions::new(").count(),
+            1,
+            "exactly one opener of the lock path (try_lock_path)"
+        );
+        let callers =
+            prod.matches("try_lock_path(").count() - prod.matches("fn try_lock_path(").count();
+        assert_eq!(
+            callers, 2,
+            "try_lock_path is called only by acquisition and the Relocked re-create"
+        );
+        for forbidden in [
+            "File::open(",
+            "File::create(",
+            "fs::read(",
+            "fs::write(",
+            "remove_file(",
+        ] {
+            assert!(
+                !prod.contains(forbidden),
+                "lock.rs must not {forbidden} anything outside its tests"
+            );
         }
     }
 

@@ -345,6 +345,111 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
     sink_healthy && draining
 }
 
+// ── wab_dir lock integrity ────────────────────────────────────────────────────
+
+/// How often the integrity task re-checks `.weir.lock`. Bounds the residual
+/// window in which a second daemon, started after the file was deleted, can
+/// recover this daemon's live segments before this one stops acking.
+const LOCK_INTEGRITY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Applies one [`wab::lock::check_wab_dir_lock`] verdict. Returns the exit code
+/// the daemon must leave with NOW, if any; the caller exits, which keeps this
+/// testable.
+///
+/// On `LostToOther` the order matters: the ingest flag first (every push from
+/// here on is Nacked before it reaches the queue), then the gauge and the log,
+/// then the exit. There is no seal (the segments now belong to the other
+/// daemon, and sealing would rename its files) and no grace period (a grace
+/// only lengthens the window of knowing false acks).
+fn apply_lock_integrity(
+    verdict: wab::lock::LockIntegrity,
+    wab_dir: &Path,
+    metrics: &metrics::Metrics,
+    ownership_lost: &std::sync::atomic::AtomicBool,
+) -> Option<i32> {
+    use wab::lock::LockIntegrity;
+    match verdict {
+        LockIntegrity::Ok => None,
+        LockIntegrity::Relocked => {
+            metrics.wab_dir_lock_integrity_failures.inc();
+            metrics.wab_dir_lock_held.set(1.0);
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                "{} was deleted or replaced while this daemon was running; nobody else \
+                 held it, so it was re-created and re-locked. While it was missing a \
+                 second weir-server could have started on this wab_dir. Never delete \
+                 the lock file of a running daemon",
+                wab::lock::LOCK_FILE_NAME
+            );
+            None
+        }
+        LockIntegrity::LostToOther { holder } => {
+            ownership_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+            metrics.wab_dir_lock_held.set(0.0);
+            let other = match &holder {
+                Some(h) => format!(
+                    "pid {} on host {}, version {}, socket {}",
+                    h.pid, h.host, h.version, h.socket_path
+                ),
+                None => "its holder record could not be read".to_string(),
+            };
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                exit_code = wab::lock::EXIT_WAB_OWNERSHIP_LOST,
+                "CRITICAL: wab_dir ownership lost: another weir-server ({other}) now holds \
+                 the lock on this wab_dir and may already have recovered this daemon's live \
+                 segments. Refusing every new push and exiting now, without sealing (the \
+                 segments are the other daemon's now). Records acked since the lock file \
+                 was deleted may not be delivered. Stop one of the two daemons"
+            );
+            Some(wab::lock::EXIT_WAB_OWNERSHIP_LOST)
+        }
+        LockIntegrity::Error(errno) => {
+            metrics.wab_dir_lock_integrity_failures.inc();
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                errno,
+                error = %std::io::Error::from_raw_os_error(errno),
+                "could not verify the wab_dir lock; retrying in {}s",
+                LOCK_INTEGRITY_INTERVAL.as_secs()
+            );
+            None
+        }
+    }
+}
+
+/// Spawns the once-a-second `wab_dir` lock integrity task (spec §3.1). Its own
+/// task, not part of the 5 s WAB poll, which skips everything when its scan
+/// returns `None`. The check is blocking file-system work, so it runs on
+/// `spawn_blocking`. Only spawned when the lock is actually held.
+fn spawn_lock_integrity_task(
+    wab_dir: std::path::PathBuf,
+    metrics: Arc<metrics::Metrics>,
+    ownership_lost: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LOCK_INTEGRITY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let dir = wab_dir.clone();
+            let verdict = match tokio::task::spawn_blocking(move || {
+                wab::lock::check_wab_dir_lock(&dir)
+            })
+            .await
+            {
+                Ok(v) => v,
+                // Cancelled at runtime shutdown, or the check panicked:
+                // nothing was proven, try again next tick.
+                Err(_) => continue,
+            };
+            if let Some(code) = apply_lock_integrity(verdict, &wab_dir, &metrics, &ownership_lost) {
+                std::process::exit(code);
+            }
+        }
+    });
+}
+
 // ── TLS SIGHUP reload task ────────────────────────────────────────────────────
 
 /// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
@@ -911,6 +1016,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     rt.block_on(async {
+        // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
+        // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
+        // below; the integrity task is the only writer. Spawned first thing in
+        // the runtime so the check is live before any listener accepts.
+        let wab_ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if lock_outcome == wab::lock::LockOutcome::Held {
+            spawn_lock_integrity_task(
+                config.wab_dir.clone(),
+                Arc::clone(&metrics),
+                Arc::clone(&wab_ownership_lost),
+            );
+        }
+
         // Bind metrics listener before starting the socket loop. Default
         // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the
         // security reasoning around exposing this surface on the network.
@@ -1149,6 +1267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wab_max_bytes: config.wab_max_bytes,
                         wab_bytes_now: Arc::clone(&wab_bytes_now),
                         wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+                        wab_ownership_lost: Arc::clone(&wab_ownership_lost),
                     };
 
                     let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1230,6 +1349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wab_max_bytes: config.wab_max_bytes,
                 wab_bytes_now: Arc::clone(&wab_bytes_now),
                 wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+                wab_ownership_lost: Arc::clone(&wab_ownership_lost),
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
         }
@@ -1374,6 +1494,105 @@ mod tuning_tests {
         assert_eq!(recommended_agent_count(16), 7);
         // 32-core: 30 / 2 = 15.
         assert_eq!(recommended_agent_count(32), 15);
+    }
+}
+
+#[cfg(test)]
+mod lock_integrity_tests {
+    use super::apply_lock_integrity;
+    use crate::metrics::Metrics;
+    use crate::wab::lock::{EXIT_WAB_OWNERSHIP_LOST, HolderInfo, LockIntegrity};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn fresh() -> (Metrics, AtomicBool) {
+        let (m, _reg) = Metrics::new();
+        m.wab_dir_lock_held.set(1.0);
+        (m, AtomicBool::new(false))
+    }
+
+    #[test]
+    fn exit_code_for_ownership_lost_is_3() {
+        // 1 stays "refused to start"; 3 is the new, distinct "ownership lost".
+        assert_eq!(EXIT_WAB_OWNERSHIP_LOST, 3);
+    }
+
+    #[test]
+    fn ok_changes_nothing() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Ok, Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(!lost.load(Ordering::Relaxed));
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 0);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
+    }
+
+    /// D4a: deleted by hand, nobody else holds it. Loud, counted, no stop.
+    #[test]
+    fn relocked_counts_keeps_the_gauge_and_keeps_running() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Relocked, Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(
+            !lost.load(Ordering::Relaxed),
+            "a re-lock must not stop ingest"
+        );
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 1);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
+    }
+
+    #[test]
+    fn error_counts_and_retries() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Error(libc::EIO), Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(!lost.load(Ordering::Relaxed), "an errno proves nothing");
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 1);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
+    }
+
+    /// D4b: proof that a second writer owns the directory. Ingest is refused
+    /// first, the gauge drops to 0, and the caller is told to exit 3. It is not
+    /// counted as an integrity failure: it is an exit, not a retry.
+    #[test]
+    fn lost_to_other_stops_ingest_drops_the_gauge_and_exits_3() {
+        let (m, lost) = fresh();
+        let verdict = LockIntegrity::LostToOther {
+            holder: Some(HolderInfo {
+                pid: 4242,
+                host: "weir-b".into(),
+                ..HolderInfo::default()
+            }),
+        };
+        assert_eq!(
+            apply_lock_integrity(verdict, Path::new("/w"), &m, &lost),
+            Some(EXIT_WAB_OWNERSHIP_LOST)
+        );
+        assert!(
+            lost.load(Ordering::Relaxed),
+            "every later push must be Nacked"
+        );
+        assert_eq!(m.wab_dir_lock_held.get(), 0.0);
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 0);
+
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(
+                LockIntegrity::LostToOther { holder: None },
+                Path::new("/w"),
+                &m,
+                &lost
+            ),
+            Some(EXIT_WAB_OWNERSHIP_LOST),
+            "an unreadable record is still proof of loss"
+        );
+        assert!(lost.load(Ordering::Relaxed));
     }
 }
 
