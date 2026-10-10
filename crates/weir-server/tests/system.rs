@@ -2177,9 +2177,10 @@ fn wab_data_integrity_after_crash() {
 /// process was listening on, and A silently lost every new producer.)
 ///
 /// B has its own `wab_dir` and metrics port, so nothing but the socket is
-/// shared. B must exit 1 naming the conflict, A's socket must be the same
-/// inode, A must still ack a Durable push on a NEW connection, and A's WAB
-/// must be byte-identical.
+/// shared. B must exit 1 naming the conflict, and must do so in preflight
+/// (spec §3.0), before it recovers anything or binds its metrics endpoint. A's
+/// socket must be the same inode, A must still ack a Durable push on a NEW
+/// connection, and A's WAB must be byte-identical.
 #[test]
 fn second_daemon_refuses_a_live_socket() {
     use std::os::unix::fs::MetadataExt;
@@ -2196,6 +2197,7 @@ fn second_daemon_refuses_a_live_socket() {
 
     let (status, log) = weir_server!("live_socket_b")
         .env("WEIR_SOCKET_PATH", srv_a.socket_path.to_str().unwrap())
+        .log_level("info")
         .spawn_expecting_exit(Duration::from_secs(10));
     assert_eq!(
         status.code(),
@@ -2206,6 +2208,18 @@ fn second_daemon_refuses_a_live_socket() {
         log.contains("in use by a running process"),
         "B must say why it refused\nlog:\n{log}"
     );
+    // At info, these absences prove the refusal came from preflight: the late
+    // bind in socket::run runs only after recovery and the metrics bind.
+    assert!(
+        log.contains("weir starting"),
+        "B's log must be at info\nlog:\n{log}"
+    );
+    for late in ["recover", "metrics endpoint listening"] {
+        assert!(
+            !log.contains(late),
+            "B must refuse in preflight, before {late:?}\nlog:\n{log}"
+        );
+    }
     assert_eq!(
         tree_snapshot(&srv_a.wab_dir),
         wab_before,
@@ -2315,6 +2329,213 @@ fn starts_cleanly_over_a_stale_socket_left_by_sigkill() {
         missing.is_empty(),
         "every acked record must reach the sink across the SIGKILL; missing {missing:?}"
     );
+}
+
+// ── Preflight (safety floor, spec §3.0) ───────────────────────────────────────
+
+/// The payloads [`seed_sealed_backlog`] leaves on disk.
+const SEEDED_RECORDS: usize = 12;
+
+fn seeded_payload(i: usize) -> Vec<u8> {
+    let mut p = format!("seeded-{i:02}-").into_bytes();
+    p.resize(1024, b'x');
+    p
+}
+
+/// Fills `wab_dir` with a backlog of SEALED, UNCONFIRMED segments: exactly
+/// what a restarted daemon recovers, replays and delivers first.
+///
+/// A seeding daemon runs on `wab_dir` with the smallest legal segment size
+/// (4096 bytes, so a few 1 KiB pushes roll a segment) and an HTTP sink on port
+/// 1, which is privileged and never bound by an unprivileged process: every
+/// delivery attempt is refused, so with `sink_max_retries = 0` each sealed
+/// segment is stranded on disk (connection-refused is transient, so nothing is
+/// dead-lettered). A graceful SIGTERM then seals the active segment too.
+/// Returns the number of sealed segments, asserted to be at least 3.
+fn seed_sealed_backlog(tag: &str, wab_dir: &Path) -> usize {
+    let mut seeder = weir_server!(tag)
+        .wab_dir(wab_dir)
+        .extra_config(
+            "wab_segment_max_bytes = 4096\n\
+             sink_type = \"http\"\n\
+             sink_max_retries = 0",
+        )
+        .env("WEIR_SINK_URL", "http://127.0.0.1:1/sink")
+        .start();
+    let mut client = seeder.client();
+    for i in 0..SEEDED_RECORDS {
+        client
+            .push(seeded_payload(i), Durability::Durable)
+            .expect("seeding push");
+    }
+    drop(client);
+    seeder.sigterm();
+    drop(seeder);
+
+    let sealed = count_wab_files(wab_dir, ".wab.sealed");
+    assert!(
+        sealed >= 3,
+        "the seed must leave at least 3 sealed segments, found {sealed}: {:?}",
+        tree_snapshot(wab_dir)
+    );
+    assert_eq!(
+        count_wab_files(wab_dir, ".wab"),
+        0,
+        "SIGTERM must have sealed the active segment"
+    );
+    assert_eq!(
+        count_wab_files(wab_dir, ".confirmed"),
+        0,
+        "nothing may be confirmed: the sink was unreachable"
+    );
+    sealed
+}
+
+/// Which resource the refused duplicate shares with the running daemon.
+#[derive(Clone, Copy, Debug)]
+enum SharedResource {
+    Socket,
+    MetricsPort,
+}
+
+/// spec §3.0: a duplicate daemon that must refuse to start has to refuse
+/// BEFORE recovery. Until preflight existed, B recovered and replayed its own
+/// backlog, started its drain, and only then hit the conflicting socket or
+/// metrics port and returned through `?` with the drain mid-commit. Under
+/// `Restart=on-failure` that re-delivered the head of B's oldest unconfirmed
+/// segment on every restart, unboundedly.
+///
+/// B gets its own `wab_dir`, pre-seeded with a sealed backlog, and a recording
+/// sink; it shares exactly one resource with a running A. B must exit 1 within
+/// 5 s naming the conflict, the sink must see not one connection, and B's WAB
+/// must be byte-identical. Then, as a positive control, the same B started
+/// without the conflict delivers the whole backlog to the same sink: the
+/// backlog was real, so "0 connections" above is not vacuous.
+fn refused_duplicate_never_delivers(shared: SharedResource) {
+    // Short: the socket path is derived from the tag and must fit sun_path
+    // (104 bytes on macOS, including the temp dir).
+    let tag = match shared {
+        SharedResource::Socket => "sock",
+        SharedResource::MetricsPort => "metr",
+    };
+    let b_wab =
+        std::env::temp_dir().join(format!("weir_sys_refused_dup_{tag}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&b_wab);
+    fs::create_dir_all(&b_wab).unwrap();
+    seed_sealed_backlog(&format!("rdup_seed_{tag}"), &b_wab);
+    // B takes the wab_dir lock before preflight, legitimately rewriting the
+    // holder record in `.weir.lock`; every other byte must stay put.
+    let segments = |dir: &Path| {
+        let mut t = tree_snapshot(dir);
+        t.remove(Path::new(".weir.lock"));
+        t
+    };
+    let seeded = segments(&b_wab);
+
+    let sink = RecordingSink::start();
+    let srv_a = weir_server!(&format!("rdup_a_{tag}")).start();
+    let b = weir_server!(&format!("rdup_b_{tag}"))
+        .wab_dir(&b_wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info");
+    let (b, expected) = match shared {
+        SharedResource::Socket => (
+            b.env("WEIR_SOCKET_PATH", srv_a.socket_path.to_str().unwrap()),
+            "in use by a running process",
+        ),
+        SharedResource::MetricsPort => (
+            b.env("WEIR_METRICS_PORT", srv_a.metrics_port.to_string()),
+            "failed to bind metrics endpoint",
+        ),
+    };
+
+    let started = Instant::now();
+    let (status, log) = b.spawn_expecting_exit(Duration::from_secs(5));
+    let took = started.elapsed();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "B must refuse to start ({shared:?}); it exited {status}\nlog:\n{log}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "B must fail fast, took {took:?}"
+    );
+    assert!(
+        log.contains(expected),
+        "B must name the conflict\nlog:\n{log}"
+    );
+    // The log is at info, so the absences below are evidence, not silence.
+    assert!(
+        log.contains("weir starting"),
+        "B's log must be at info\nlog:\n{log}"
+    );
+    for late in [
+        "recovering",
+        "queuing segment for drain replay",
+        "metrics endpoint listening",
+    ] {
+        assert!(
+            !log.contains(late),
+            "B must refuse in preflight, before {late:?}\nlog:\n{log}"
+        );
+    }
+    // Anything B sent before exiting is already queued at the sink's listener;
+    // give its accept thread a moment to count it.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        sink.connections(),
+        0,
+        "a refused duplicate must never reach the sink (bodies: {})",
+        sink.bodies().len()
+    );
+    assert_eq!(
+        segments(&b_wab),
+        seeded,
+        "B's refused start must not recover, seal, confirm or delete anything"
+    );
+
+    // A is unaffected.
+    srv_a
+        .client()
+        .push(b"a-after-refusal", Durability::Durable)
+        .expect("A must still ack");
+    drop(srv_a);
+
+    // Positive control: without the conflict, B delivers the seeded backlog.
+    let srv_b = weir_server!(&format!("rdup_ok_{tag}"))
+        .wab_dir(&b_wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let missing = loop {
+        let delivered: std::collections::HashSet<Vec<u8>> = sink.bodies().into_iter().collect();
+        let missing: Vec<usize> = (0..SEEDED_RECORDS)
+            .filter(|&i| !delivered.contains(&seeded_payload(i)))
+            .collect();
+        if missing.is_empty() || Instant::now() >= deadline {
+            break missing;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        missing.is_empty(),
+        "control: the seeded backlog must be deliverable; missing records {missing:?}"
+    );
+    drop(srv_b);
+    let _ = fs::remove_dir_all(&b_wab);
+}
+
+#[test]
+fn refused_duplicate_never_delivers_shared_socket() {
+    refused_duplicate_never_delivers(SharedResource::Socket);
+}
+
+#[test]
+fn refused_duplicate_never_delivers_shared_metrics_port() {
+    refused_duplicate_never_delivers(SharedResource::MetricsPort);
 }
 
 // ── wab_dir ownership (safety floor, spec §3.1) ───────────────────────────────

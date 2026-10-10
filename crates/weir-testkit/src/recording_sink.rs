@@ -12,13 +12,14 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A running recording endpoint. Dropping it stops accepting new connections.
 pub struct RecordingSink {
     addr: SocketAddr,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    connections: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
 }
 
@@ -28,9 +29,14 @@ impl RecordingSink {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind recording sink");
         let addr = listener.local_addr().expect("recording sink local_addr");
         let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let connections = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
-        let (b, s) = (Arc::clone(&bodies), Arc::clone(&stop));
+        let (b, c, s) = (
+            Arc::clone(&bodies),
+            Arc::clone(&connections),
+            Arc::clone(&stop),
+        );
         std::thread::Builder::new()
             .name("recording-sink-accept".into())
             .spawn(move || {
@@ -39,6 +45,7 @@ impl RecordingSink {
                         break;
                     }
                     let Ok(conn) = conn else { continue };
+                    c.fetch_add(1, Ordering::SeqCst);
                     let b = Arc::clone(&b);
                     let _ = std::thread::Builder::new()
                         .name("recording-sink-conn".into())
@@ -47,7 +54,12 @@ impl RecordingSink {
             })
             .expect("spawn recording sink thread");
 
-        RecordingSink { addr, bodies, stop }
+        RecordingSink {
+            addr,
+            bodies,
+            connections,
+            stop,
+        }
     }
 
     /// The URL to configure as the daemon's `sink_url`.
@@ -62,6 +74,14 @@ impl RecordingSink {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// How many TCP connections the endpoint has accepted, whatever was (or
+    /// was not) sent on them. Stricter than [`bodies`](Self::bodies) for a
+    /// "nothing reached the sink" assertion: it also counts the HTTP sink's
+    /// `HEAD` health probe and a connection dropped before its first request.
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
     }
 }
 
@@ -197,6 +217,7 @@ mod tests {
         );
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         assert_eq!(sink.bodies(), vec![b"hello".to_vec(), b"abcde".to_vec()]);
+        assert_eq!(sink.connections(), 1, "one keep-alive connection");
         assert!(sink.url().starts_with("http://127.0.0.1:"));
     }
 }

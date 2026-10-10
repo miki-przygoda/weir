@@ -2,6 +2,7 @@ mod config;
 mod drain;
 mod metrics;
 mod models;
+mod preflight;
 mod queue;
 mod sink;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
@@ -604,6 +605,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wab::lock::acquire_wab_dir_lock(&config.wab_dir, config.wab_dir_lock, &lock_holder)
             .inspect_err(|e| tracing::error!("{e}"))?;
 
+    // ── Preflight ─────────────────────────────────────────────────────────────
+    //
+    // Every refuse-to-start check that can run before recovery: the socket
+    // path (format, then a connect-only liveness probe that never unlinks), a
+    // test-bind of the metrics address, and with tcp_bind the TLS material and
+    // a test-bind of the TCP address (spec §3.0). They used to fail only after
+    // recovery, replay and the drain had started, so a refused duplicate under
+    // Restart=on-failure re-delivered its oldest unconfirmed segment on every
+    // restart. The authoritative binds and the TLS load below stay where they
+    // are; preflight narrows their late failure to a race.
+    //
+    // Contract: no refuse-to-start check may run after the drain has begun
+    // delivering.
+    preflight::preflight(&config).inspect_err(|e| tracing::error!("{e}"))?;
+
     // ── Concurrency-vs-cores advisory ─────────────────────────────────────────
     // Each shard runs a flusher thread; each worker runs a worker thread.
     // Together those threads form the "agent" pool that does the real per-
@@ -1035,18 +1051,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let metrics_listener =
             tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port))
                 .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to bind metrics endpoint to {}:{} ({e}) — another process \
-                             (often another weir-server instance) is using that port. Change it \
-                             with --metrics-port / WEIR_METRICS_PORT (or --metrics-bind / \
-                             WEIR_METRICS_BIND).",
-                            config.metrics_bind, config.metrics_port
-                        ),
-                    )
-                })?;
+                .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
         metrics::server::spawn(
             metrics_listener,
             Arc::clone(&registry),
@@ -1231,28 +1236,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match config.tcp_bind {
                 Some(bind_addr) => {
                     // Config validation guarantees the three tls_* paths are
-                    // present whenever tcp_bind is set, so these expects can't
-                    // fire on a validated Config.
-                    let cert = config
-                        .tls_cert_path
-                        .clone()
-                        .expect("config validation guarantees tls_cert_path when tcp_bind is set");
-                    let key = config
-                        .tls_key_path
-                        .clone()
-                        .expect("config validation guarantees tls_key_path when tcp_bind is set");
-                    let ca = config.tls_client_ca_path.clone().expect(
-                        "config validation guarantees tls_client_ca_path when tcp_bind is set",
-                    );
-
-                    let tls = ReloadableServerConfig::load(cert, key, ca).map_err(|e| {
-                        std::io::Error::other(format!("failed to load TLS config: {e}"))
-                    })?;
+                    // present whenever tcp_bind is set; preflight has already
+                    // loaded this material once and test-bound this address,
+                    // so a failure here is a race (spec §3.0).
+                    let (cert, key, ca) = preflight::tls_paths(&config)?;
+                    let tls = ReloadableServerConfig::load(cert, key, ca)
+                        .map_err(|e| preflight::tls_load_error(&e))?;
 
                     // Bind in the caller so a bad bind address fails startup
                     // (rather than the spawned accept task) — see socket::tcp
                     // module docs on the bound-addr design.
-                    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+                    let listener = tokio::net::TcpListener::bind(bind_addr)
+                        .await
+                        .map_err(|e| preflight::tcp_bind_error(bind_addr, &e))?;
                     let actual_addr = listener.local_addr()?;
                     info!(addr = %actual_addr, "TCP+mTLS listener bound");
 

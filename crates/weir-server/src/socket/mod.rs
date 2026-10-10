@@ -686,14 +686,7 @@ fn remove_stale_socket_at_startup(
     // type, not its target's — symlinks are S_IFLNK, not S_IFSOCK).
     let mode_type = first.st_mode & libc::S_IFMT;
     if mode_type != libc::S_IFSOCK {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "a non-socket entry already exists at '{}' (mode type {:#o}); refusing to remove it",
-                path.display(),
-                mode_type
-            ),
-        ));
+        return Err(non_socket_refusal(path, mode_type));
     }
 
     match probe_socket(path) {
@@ -742,9 +735,24 @@ fn remove_stale_socket_at_startup(
     Ok(())
 }
 
-/// The refusal for a socket someone is listening on (spec §3.3, exact text).
+/// The refusal for a non-socket entry (a regular file, a directory, a symlink)
+/// at the socket path. Shared with preflight, which refuses it before recovery.
 #[cfg(unix)]
-fn live_socket_refusal(path: &Path) -> io::Error {
+pub(crate) fn non_socket_refusal(path: &Path, mode_type: impl std::fmt::Octal) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "a non-socket entry already exists at '{}' (mode type {:#o}); refusing to remove it",
+            path.display(),
+            mode_type
+        ),
+    )
+}
+
+/// The refusal for a socket someone is listening on (spec §3.3, exact text).
+/// Shared with preflight.
+#[cfg(unix)]
+pub(crate) fn live_socket_refusal(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrInUse,
         format!(
@@ -756,9 +764,9 @@ fn live_socket_refusal(path: &Path) -> io::Error {
 }
 
 /// The refusal when the probe cannot tell whether the socket is live. Fails
-/// closed: an unreadable state is not proof of staleness.
+/// closed: an unreadable state is not proof of staleness. Shared with preflight.
 #[cfg(unix)]
-fn unknown_socket_refusal(path: &Path, errno: i32) -> io::Error {
+pub(crate) fn unknown_socket_refusal(path: &Path, errno: i32) -> io::Error {
     io::Error::other(format!(
         "cannot tell whether socket_path '{}' is in use: the liveness probe's connect \
          failed with {} (errno {errno}); refusing to remove it. If no weir-server is \
