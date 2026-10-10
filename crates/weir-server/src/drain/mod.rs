@@ -4859,14 +4859,20 @@ mod tests {
         assert_eq!(segments_quarantined_family(&metrics), 0);
 
         std::fs::remove_file(&squatter).unwrap();
-        wait_for(5, "the next poll completes the move", || !sealed.exists());
-        assert!(quarantined_copy(&dir, &sealed).exists());
-        assert_eq!(
-            metrics.recovery_segments_quarantined.get(),
-            1,
-            "the completed move bumps the quarantine series like any other site"
+        // Wait on the quarantine series, not on the file vanishing: the rename
+        // lands before the drain thread bumps the counters, so "file gone" can
+        // be observed while both series still read 0.
+        wait_for(
+            5,
+            "the next poll completes the move and bumps the quarantine series \
+             like any other site",
+            || {
+                metrics.recovery_segments_quarantined.get() == 1
+                    && segments_quarantined_family(&metrics) == 1
+            },
         );
-        assert_eq!(segments_quarantined_family(&metrics), 1);
+        assert!(!sealed.exists());
+        assert!(quarantined_copy(&dir, &sealed).exists());
         assert_eq!(committed_bytes(&sink), vec![b"r1".to_vec()]);
         assert_eq!(metrics.drain_quarantine_failures.get(), 1);
 
@@ -4922,9 +4928,13 @@ mod tests {
         assert!(sealed.exists());
 
         std::fs::remove_file(&squatter).unwrap();
-        wait_for(5, "the next poll completes the move", || !sealed.exists());
+        // As above: the counters are bumped after the rename, so wait on them.
+        wait_for(5, "the next poll completes the move", || {
+            metrics.recovery_segments_quarantined.get() == 1
+                && segments_quarantined_family(&metrics) == 1
+        });
+        assert!(!sealed.exists());
         assert!(quarantined_copy(&dir, &sealed).exists());
-        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
         assert_eq!(open_hook::attempts(&sealed), opens);
         assert_eq!(sink.call_count(), 0);
 
