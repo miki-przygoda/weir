@@ -8,6 +8,8 @@ mod cli;
 mod env;
 mod file;
 
+pub(crate) use cli::ConfigPath;
+
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
@@ -200,6 +202,20 @@ fn parse_postgres_insert_mode(s: &str) -> Result<crate::sink::postgres::InsertMo
     }
 }
 
+/// Parses `wab_dir_lock`. Only the two documented spellings: a typo must not
+/// silently pick a policy, and `best-effort` removes a safety guard.
+fn parse_wab_dir_lock(s: &str) -> Result<crate::wab::lock::LockPolicy, ConfigError> {
+    use crate::wab::lock::LockPolicy;
+    match s {
+        "required" => Ok(LockPolicy::Required),
+        "best-effort" => Ok(LockPolicy::BestEffort),
+        other => Err(ConfigError::InvalidValue {
+            field: "wab_dir_lock",
+            reason: format!("wab_dir_lock must be \"required\" or \"best-effort\", got {other:?}"),
+        }),
+    }
+}
+
 // ── Partial config (one layer) ────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -216,6 +232,7 @@ pub(crate) struct PartialConfig {
     pub wab_max_bytes: Option<u64>,
     pub wab_compression: Option<String>,
     pub wab_compression_level: Option<i32>,
+    pub wab_dir_lock: Option<String>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub max_batch_records: Option<usize>,
@@ -403,6 +420,12 @@ pub struct Config {
     /// "ultra" tier, which needs materially more memory to both compress and
     /// decompress.
     pub wab_compression_level: i32,
+    /// What to do when the filesystem under `wab_dir` cannot take an exclusive
+    /// `flock` on `<wab_dir>/.weir.lock`: `"required"` (default) refuses to
+    /// start, `"best-effort"` WARNs and runs with no guard against a second
+    /// daemon on the same `wab_dir`. Contention (another weir-server holds the
+    /// lock) is refused under both.
+    pub wab_dir_lock: crate::wab::lock::LockPolicy,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub max_batch_records: usize,
@@ -579,21 +602,90 @@ pub struct Config {
     pub tls_handshake_timeout_secs: u64,
 }
 
+/// The WARN for a config file that does not exist (spec §3.4, D10).
+///
+/// Not an error in this release: the Docker image's CMD always passes
+/// `--config /etc/weir/weir.toml`, so env-only container users would all fail
+/// to start. The hard error for an explicit `--config` waits for the minor
+/// release that also changes that CMD. When nothing else configured a sink,
+/// `sink_type` resolves to `noop`, which acks and drops every record, so the
+/// wording escalates: that is the case where a mistyped path silently turns
+/// a durable pipeline into a discard.
+fn missing_config_file_warning(source: &ConfigSource, sink_type: &SinkType) -> String {
+    let path = source.path.display();
+    let mut msg = if source.explicit {
+        format!(
+            "config file {path} (passed with --config) does not exist; running on \
+             command-line flags, WEIR_* environment variables and built-in defaults only. \
+             A missing --config file will become a startup error in a future minor release"
+        )
+    } else {
+        format!(
+            "no config file at the default path {path}; running on command-line flags, \
+             WEIR_* environment variables and built-in defaults only"
+        )
+    };
+    if matches!(sink_type, SinkType::Noop) {
+        msg = format!(
+            "NOOP SINK: {msg}. sink_type resolved to \"noop\": every record is \
+             acknowledged and then DISCARDED, and nothing reaches a downstream system. \
+             If a config file was meant to set the sink, check the path"
+        );
+    }
+    msg
+}
+
+/// Where the config came from, for the startup INFO line (spec §3.4).
+///
+/// `Config::load` runs before the tracing subscriber exists, so it returns
+/// this rather than logging it; `main` logs it once the subscriber is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSource {
+    /// The config file path that was read (or looked for).
+    pub path: PathBuf,
+    /// `true` when the operator passed `--config`; `false` for the default.
+    pub explicit: bool,
+    /// `true` when the file existed and was parsed.
+    pub found: bool,
+}
+
 impl Config {
     /// Loads config from all three layers (CLI > env > file > defaults) and
     /// validates.
     ///
     /// Returns the validated config plus any **advisory warnings** collected
     /// during loading (unknown TOML keys, feature-gated keys, the small
-    /// dead-letter-cap advisory). The caller is expected to replay them through
-    /// `tracing` *after* the subscriber is initialised — `load()` runs before
-    /// the subscriber exists, so emitting them here would silently drop them and
-    /// a TOML typo would take defaults unnoticed (F54).
-    pub fn load() -> Result<(Self, Vec<String>), ConfigError> {
+    /// dead-letter-cap advisory, a missing config file). The caller is expected
+    /// to replay them through `tracing` *after* the subscriber is initialised —
+    /// `load()` runs before the subscriber exists, so emitting them here would
+    /// silently drop them and a TOML typo would take defaults unnoticed (F54).
+    /// The [`ConfigSource`] is returned for the same reason: the caller logs it.
+    pub fn load() -> Result<(Self, Vec<String>, ConfigSource), ConfigError> {
         let (cli, config_path) = cli::parse()?;
-        let (file, mut warnings) = file::read(&config_path)?;
-        let env = env::read()?;
+        Self::load_from(cli, config_path, env::read)
+    }
+
+    /// The body of [`Config::load`] with the CLI layer already parsed and the
+    /// env layer behind a closure, so tests can drive it without touching the
+    /// real argv or environment. `env` runs after the file is read, keeping the
+    /// error precedence `load` always had (a bad file is reported before a bad
+    /// env var).
+    pub(crate) fn load_from(
+        cli: PartialConfig,
+        config_path: ConfigPath,
+        env: impl FnOnce() -> Result<PartialConfig, ConfigError>,
+    ) -> Result<(Self, Vec<String>, ConfigSource), ConfigError> {
+        let (file, mut warnings, found) = match file::read(&config_path.path)? {
+            Some((file, warnings)) => (file, warnings, true),
+            None => (PartialConfig::empty(), Vec::new(), false),
+        };
+        let env = env()?;
         let config = Self::from_layers(cli, env, file)?;
+        let source = ConfigSource {
+            path: config_path.path,
+            explicit: config_path.explicit,
+            found,
+        };
 
         // Post-validation advisory: a tiny dead-letter cap causes frequent
         // BlockedDeadLetterFull transitions. Collected here (not warn!'d inside
@@ -607,7 +699,11 @@ impl Config {
             ));
         }
 
-        Ok((config, warnings))
+        if !found {
+            warnings.push(missing_config_file_warning(&source, &config.sink_type));
+        }
+
+        Ok((config, warnings, source))
     }
 
     /// Merges three partial-config layers (CLI > env > file) against defaults.
@@ -669,6 +765,8 @@ impl Config {
         }
         let wab_compression_level = merge!(wab_compression_level).unwrap_or(1);
         check_range("wab_compression_level", wab_compression_level, 1, 19)?;
+        let wab_dir_lock =
+            parse_wab_dir_lock(&merge!(wab_dir_lock).unwrap_or_else(|| "required".to_string()))?;
         let wab_segment_max_bytes = merge!(wab_segment_max_bytes).unwrap_or(256 * 1024 * 1024);
         if !(4096..=4 * 1024 * 1024 * 1024).contains(&wab_segment_max_bytes) {
             return Err(ConfigError::InvalidValue {
@@ -1117,6 +1215,7 @@ impl Config {
             wab_max_bytes,
             wab_compression,
             wab_compression_level,
+            wab_dir_lock,
             max_connections,
             max_payload_bytes,
             max_batch_records,
@@ -1973,12 +2072,163 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn missing_config_file_returns_empty_partial() {
-        let (result, warnings) =
+    fn missing_config_file_reads_as_absent_not_an_error() {
+        // The file layer reports "absent" (not an error, not an empty layer that
+        // looks like a real file): Config::load turns it into a WARN (§3.4).
+        let read =
             file::read(Path::new("/weir_test_no_such_config_file_xyzzy_12345.toml")).unwrap();
-        assert!(result.shard_count.is_none());
-        assert!(result.wab_dir.is_none());
-        assert!(warnings.is_empty(), "a missing file yields no warnings");
+        assert!(read.is_none(), "a missing file must read as absent");
+    }
+
+    // ── §3.4 (D10): a missing config file is no longer silent ────────────────
+
+    /// Drives `Config::load_from` with a CLI layer that only sets `wab_dir`
+    /// (plus `extra`), the given config path, and an empty env layer.
+    fn load_missing(
+        label: &str,
+        explicit: bool,
+        extra: PartialConfig,
+    ) -> (Config, Vec<String>, ConfigSource, PathBuf) {
+        let dir = tmp_dir(label);
+        let path = dir.join("no-such-weir.toml");
+        let cli = PartialConfig {
+            wab_dir: Some(dir.clone()),
+            ..extra
+        };
+        let (config, warnings, source) = Config::load_from(
+            cli,
+            ConfigPath {
+                path: path.clone(),
+                explicit,
+            },
+            || Ok(PartialConfig::empty()),
+        )
+        .map_err(|e| e.to_string())
+        .expect("a missing config file must not be an error (D10)");
+        (config, warnings, source, path)
+    }
+
+    fn missing_warnings<'a>(warnings: &'a [String], path: &Path) -> Vec<&'a String> {
+        let p = path.display().to_string();
+        warnings.iter().filter(|w| w.contains(&p)).collect()
+    }
+
+    #[cfg(feature = "http-sink")]
+    fn http_sink() -> PartialConfig {
+        PartialConfig {
+            sink_type: Some("http".to_string()),
+            sink_url: Some("http://127.0.0.1:9/ingest".to_string()),
+            ..PartialConfig::empty()
+        }
+    }
+
+    /// An operator's `--config <path>` that does not exist still loads (the
+    /// Docker image always passes `--config`, so env-only users would break),
+    /// but now WARNs, naming the path and that it was passed explicitly.
+    #[test]
+    fn missing_explicit_config_warns_naming_path() {
+        let (_, warnings, source, path) =
+            load_missing("missing_explicit", true, PartialConfig::empty());
+        let hits = missing_warnings(&warnings, &path);
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one missing-file warning: {warnings:?}"
+        );
+        assert!(hits[0].contains("--config"), "{hits:?}");
+        assert!(hits[0].contains("does not exist"), "{hits:?}");
+        assert_eq!(
+            source,
+            ConfigSource {
+                path: path.clone(),
+                explicit: true,
+                found: false
+            }
+        );
+
+        // Same wording without a noop sink: the path and --config still named.
+        #[cfg(feature = "http-sink")]
+        {
+            let (_, warnings, _, path) = load_missing("missing_explicit_http", true, http_sink());
+            let hits = missing_warnings(&warnings, &path);
+            assert_eq!(hits.len(), 1, "{warnings:?}");
+            assert!(hits[0].contains("--config"), "{hits:?}");
+        }
+    }
+
+    /// The implicit default path missing also WARNs, naming the path, and does
+    /// not claim the operator passed `--config`.
+    #[test]
+    fn missing_default_config_warns() {
+        let (_, warnings, source, path) =
+            load_missing("missing_default", false, PartialConfig::empty());
+        let hits = missing_warnings(&warnings, &path);
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one missing-file warning: {warnings:?}"
+        );
+        assert!(hits[0].contains("default"), "{hits:?}");
+        assert!(
+            !hits[0].contains("passed with --config"),
+            "the default path was not passed explicitly: {hits:?}"
+        );
+        assert!(!source.explicit && !source.found, "{source:?}");
+    }
+
+    /// With the file missing and nothing else configuring a sink, `sink_type`
+    /// resolves to `noop`, which acks and discards every record. The warning
+    /// escalates to say exactly that. A real sink keeps the plain wording.
+    #[test]
+    fn missing_config_with_noop_sink_warns_loudly() {
+        for explicit in [true, false] {
+            let (config, warnings, _, path) =
+                load_missing("missing_noop", explicit, PartialConfig::empty());
+            assert!(matches!(config.sink_type, SinkType::Noop));
+            let hits = missing_warnings(&warnings, &path);
+            assert_eq!(hits.len(), 1, "{warnings:?}");
+            assert!(hits[0].contains("noop"), "{hits:?}");
+            assert!(hits[0].contains("DISCARDED"), "{hits:?}");
+        }
+
+        #[cfg(feature = "http-sink")]
+        for explicit in [true, false] {
+            let (_, warnings, _, path) = load_missing("missing_not_noop", explicit, http_sink());
+            let hits = missing_warnings(&warnings, &path);
+            assert_eq!(hits.len(), 1, "{warnings:?}");
+            assert!(
+                !hits[0].contains("DISCARDED"),
+                "a configured sink must not get the noop wording: {hits:?}"
+            );
+        }
+    }
+
+    /// A config file that exists produces no missing-file warning and reports
+    /// itself as found.
+    #[test]
+    fn present_config_file_does_not_warn_missing() {
+        let dir = tmp_dir("present_cfg");
+        let path = dir.join("weir.toml");
+        fs::write(&path, "[server]\nshard_count = 2\n").unwrap();
+        let (config, warnings, source) = Config::load_from(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+            ConfigPath {
+                path: path.clone(),
+                explicit: true,
+            },
+            || Ok(PartialConfig::empty()),
+        )
+        .map_err(|e| e.to_string())
+        .unwrap();
+        assert_eq!(config.shard_count, 2);
+        assert!(
+            missing_warnings(&warnings, &path).is_empty(),
+            "an existing file must not warn: {warnings:?}"
+        );
+        assert!(source.found && source.explicit, "{source:?}");
     }
 
     // ── TCP + TLS config ──────────────────────────────────────────────────────
@@ -2313,6 +2563,75 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("wab_compression"), "{msg}");
         assert!(msg.contains("zstd"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_dir_lock_defaults_to_required() {
+        use crate::wab::lock::LockPolicy;
+        let dir = tmp_dir("wab_dir_lock_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        assert_eq!(c.wab_dir_lock, LockPolicy::Required);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_dir_lock_best_effort_accepted_and_cli_overrides_file() {
+        use crate::wab::lock::LockPolicy;
+        let dir = tmp_dir("wab_dir_lock_best_effort");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_dir_lock: Some("best-effort".into()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.wab_dir_lock, LockPolicy::BestEffort);
+
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir_lock: Some("required".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_dir_lock: Some("best-effort".into()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            c.wab_dir_lock,
+            LockPolicy::Required,
+            "CLI wins over the file"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_wab_dir_lock_rejected() {
+        let dir = tmp_dir("bad_wab_dir_lock");
+        // `best_effort` (underscore) is a plausible typo; it must not silently
+        // select either policy.
+        for bad in ["best_effort", "off", ""] {
+            let err = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    wab_dir_lock: Some(bad.into()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("wab_dir_lock"), "{msg}");
+            assert!(msg.contains("best-effort"), "{msg}");
+        }
         fs::remove_dir_all(dir).ok();
     }
 

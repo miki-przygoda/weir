@@ -1609,6 +1609,32 @@ mod tests {
         fs::remove_dir_all(wab_dir).ok();
     }
 
+    /// `<wab_dir>/.weir.lock` is a regular file at the root, held by the live
+    /// daemon. Recovery walks the root for shard DIRECTORIES only, so it must
+    /// neither fail on the lock file nor touch it.
+    #[test]
+    fn recover_open_segments_ignores_the_wab_dir_lock_file() {
+        use crate::wab::lock::LOCK_FILE_NAME;
+        use crate::wab::segment::{WabSegment, segment_path};
+        let wab_dir = tmp_dir("recover_ignores_lock");
+        let shard_dir = wab_dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let seg = segment_path(&shard_dir, 1);
+        let _ = fs::remove_file(&seg);
+        WabSegment::create(&seg, 0, Compression::None)
+            .unwrap()
+            .write_record(b"live")
+            .unwrap();
+        let lock = wab_dir.join(LOCK_FILE_NAME);
+        fs::write(&lock, b"pid=1\nhost=h\n").unwrap();
+
+        recover_open_segments(&wab_dir, &noop_metrics()).unwrap();
+
+        assert!(!seg.exists(), "the real shard segment is still recovered");
+        assert_eq!(fs::read(&lock).unwrap(), b"pid=1\nhost=h\n");
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
     /// F16: recovery must NOT descend into `dead_letter/` and re-seal a torn
     /// `dl_*.wab` there. Those files (and their dl_ counter) are owned by the
     /// DeadLetterWriter; re-sealing one bypasses dead-letter accounting.

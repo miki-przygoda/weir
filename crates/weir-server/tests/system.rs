@@ -33,7 +33,7 @@ use std::{
 
 use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
-use weir_testkit::{free_port, process_lock, weir_server};
+use weir_testkit::{RecordingSink, free_port, process_lock, weir_server};
 
 // Helper: sum all file bytes under a directory tree.
 fn wab_dir_bytes(dir: &Path) -> u64 {
@@ -856,6 +856,11 @@ fn metrics_all_families_registered() {
         "weir_drain_state",
         "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",
+        // wab_dir ownership
+        "weir_wab_dir_lock_held",
+        "weir_wab_dir_lock_integrity_failures",
+        // Config reload
+        "weir_config_reloads",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
@@ -1427,7 +1432,7 @@ fn one_connection_can_interleave_both_durability_tiers() {
 fn server_restarts_after_sigkill() {
     // 10 s is generous: cold start on a fresh daemon takes well under 1 s.
     // The bound catches a regression where startup blocks on something
-    // (recovery, bind_cleanup, segment scan) for an unreasonable time.
+    // (recovery, stale-socket cleanup, segment scan) for an unreasonable time.
     const RESTART_BUDGET: Duration = Duration::from_secs(10);
 
     let mut srv = weir_server!("crash_restart").start();
@@ -1443,7 +1448,8 @@ fn server_restarts_after_sigkill() {
         "socket should remain after SIGKILL"
     );
 
-    // bind_cleanup removes the stale socket; server starts clean.
+    // Nobody listens on the stale socket, so startup's liveness probe calls
+    // it stale and removes it; the server starts clean.
     let restart_start = Instant::now();
     srv.restart_in_place();
     let restart_elapsed = restart_start.elapsed();
@@ -1668,6 +1674,99 @@ fn readonly_wab_dir_prevents_startup() {
         } else {
             "not "
         }
+    );
+}
+
+/// Spec §3.4 (D10), end to end: an env-only daemon whose `--config` names a
+/// file that does not exist still starts (the Docker image always passes
+/// `--config`), but its log now says so, naming the path and escalating for
+/// the noop sink, and logs the config source. Before this the missing file was
+/// read as an empty layer with no log line at all.
+#[test]
+fn missing_config_file_warns_and_logs_source_at_startup() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp_dir = std::env::temp_dir().join(format!("weir_nocfg_{}", std::process::id()));
+    let wab_dir = tmp_dir.join("wab");
+    let socket_dir = tmp_dir.join("run");
+    let socket_path = socket_dir.join("weir.sock");
+    let missing = tmp_dir.join("no-such-weir.toml");
+    fs::create_dir_all(&wab_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_weir-server"))
+        .args(["--config", missing.to_str().unwrap()])
+        .env("WEIR_SOCKET_PATH", &socket_path)
+        .env("WEIR_WAB_DIR", &wab_dir)
+        .env("WEIR_METRICS_PORT", free_port().to_string())
+        .env("WEIR_LOG_LEVEL", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn weir-server");
+
+    // tracing's fmt subscriber writes to stdout; read both streams so a
+    // future writer change does not silently blind this test.
+    let (tx, rx) = mpsc::channel::<String>();
+    let readers: Vec<_> = [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ]
+    .into_iter()
+    .map(|stream| {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        })
+    })
+    .collect();
+    drop(tx);
+
+    let path = missing.display().to_string();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut log = Vec::new();
+    let (mut warned, mut sourced) = (None, false);
+    while Instant::now() < deadline && !(warned.is_some() && sourced) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if line.contains(&path) && line.contains("does not exist") {
+                    warned = Some(line.clone());
+                }
+                if line.contains("config source") {
+                    sourced = true;
+                }
+                log.push(line);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let still_running = child.try_wait().ok().flatten().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    for r in readers {
+        let _ = r.join();
+    }
+    fs::remove_dir_all(&tmp_dir).ok();
+
+    let warned = warned.unwrap_or_else(|| panic!("no missing-config WARN naming {path}: {log:#?}"));
+    assert!(warned.contains("WARN"), "must be a WARN: {warned}");
+    assert!(
+        warned.contains("--config"),
+        "explicit --config named: {warned}"
+    );
+    assert!(
+        warned.contains("DISCARDED"),
+        "noop sink escalation: {warned}"
+    );
+    assert!(sourced, "no 'config source' INFO line: {log:#?}");
+    assert!(
+        still_running,
+        "a missing config file must not stop the daemon: {log:#?}"
     );
 }
 
@@ -2165,43 +2264,624 @@ fn wab_data_integrity_after_crash() {
     }
 }
 
-// ── Socket takeover data safety ───────────────────────────────────────────────
+// ── Socket ownership (safety floor, spec §3.3) ────────────────────────────────
 
-/// `bind_cleanup` removes the socket file (even if another process is
-/// listening) so that crash-recovery always succeeds. When a second server
-/// takes the socket path the first server's WAB files must be left entirely
-/// untouched — the socket file and the WAB are independent resources.
+/// A second daemon pointed at a LIVE daemon's socket path must refuse to
+/// start, not unlink the socket and take the path over. (Until the safety
+/// floor, startup removed any socket file at the path, even one another
+/// process was listening on, and A silently lost every new producer.)
+///
+/// B has its own `wab_dir` and metrics port, so nothing but the socket is
+/// shared. B must exit 1 naming the conflict, and must do so in preflight
+/// (spec §3.0), before it recovers anything or binds its metrics endpoint. A's
+/// socket must be the same inode, A must still ack a Durable push on a NEW
+/// connection, and A's WAB must be byte-identical.
 #[test]
-fn socket_takeover_does_not_corrupt_wab_data() {
-    const N: usize = 20;
+fn second_daemon_refuses_a_live_socket() {
+    use std::os::unix::fs::MetadataExt;
 
-    let srv_a = weir_server!("socket_takeover").start();
+    let srv_a = weir_server!("live_socket_a").start();
     let mut client = srv_a.client();
-
-    for i in 0..N {
+    for i in 0..20 {
         client
             .push(format!("srv-a-{i}").as_bytes(), Durability::Durable)
             .expect("push to server A failed");
     }
+    let socket_inode = fs::symlink_metadata(&srv_a.socket_path).unwrap().ino();
+    let wab_before = tree_snapshot(&srv_a.wab_dir);
 
-    let wab_before = wab_dir_bytes(&srv_a.wab_dir);
-    assert!(wab_before > 0, "server A must have written WAB bytes");
+    let (status, log) = weir_server!("live_socket_b")
+        .env("WEIR_SOCKET_PATH", srv_a.socket_path.to_str().unwrap())
+        .log_level("info")
+        .spawn_expecting_exit(Duration::from_secs(10));
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "B must refuse to start on A's live socket; it exited {status}\nlog:\n{log}"
+    );
+    assert!(
+        log.contains("in use by a running process"),
+        "B must say why it refused\nlog:\n{log}"
+    );
+    // At info, these absences prove the refusal came from preflight: the late
+    // bind in socket::run runs only after recovery and the metrics bind.
+    assert!(
+        log.contains("weir starting"),
+        "B's log must be at info\nlog:\n{log}"
+    );
+    for late in ["recover", "metrics endpoint listening"] {
+        assert!(
+            !log.contains(late),
+            "B must refuse in preflight, before {late:?}\nlog:\n{log}"
+        );
+    }
+    assert_eq!(
+        tree_snapshot(&srv_a.wab_dir),
+        wab_before,
+        "B's refused start must not touch a byte of A's WAB"
+    );
 
-    // Spawn server B at the same socket path (it will call bind_cleanup and
-    // take over the socket). Use Command directly — we hold the process lock
-    // via srv_a and need two processes alive at once intentionally.
-    let second_tmp =
-        std::env::temp_dir().join(format!("weir_sys_takeover_b_{}", std::process::id()));
-    let second_wab = second_tmp.join("wab");
-    let second_config = second_tmp.join("weir.toml");
+    assert_eq!(
+        fs::symlink_metadata(&srv_a.socket_path)
+            .expect("A's socket file must still exist")
+            .ino(),
+        socket_inode,
+        "A's socket must be the same inode: B must not unlink or replace it"
+    );
+    srv_a
+        .client()
+        .push(b"after-b-refused", Durability::Durable)
+        .expect("A must still accept and ack on a new connection");
+    client
+        .push(b"after-b-refused-old-conn", Durability::Durable)
+        .expect("A's existing connection must still ack");
+}
 
-    fs::create_dir_all(&second_wab).unwrap();
+/// Shutdown removes the socket file only if it is still the inode this
+/// daemon bound. Here a successor has replaced A's socket at the same path
+/// while A runs; A's SIGTERM must leave the successor's socket alone.
+#[test]
+fn shutdown_leaves_a_successor_socket_alone() {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut srv_a = weir_server!("successor_socket_a").start();
+    fs::remove_file(&srv_a.socket_path).expect("unlink A's socket");
+    let successor = std::os::unix::net::UnixListener::bind(&srv_a.socket_path)
+        .expect("bind the successor's socket at A's path");
+    let successor_inode = fs::symlink_metadata(&srv_a.socket_path).unwrap().ino();
+
+    srv_a.sigterm();
+
+    let meta = fs::symlink_metadata(&srv_a.socket_path)
+        .expect("A's shutdown must not unlink the successor's socket");
+    assert_eq!(meta.ino(), successor_inode);
+    let _c = std::os::unix::net::UnixStream::connect(&srv_a.socket_path)
+        .expect("the successor must still accept connections");
+    let log = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        log.contains("another instance replaced it"),
+        "A must say why it left the socket\nlog:\n{log}"
+    );
+    drop(successor);
+}
+
+/// Review Focus 4 (stale-socket half): upgrading from 4.0.1, or any restart
+/// after SIGKILL, finds the dead daemon's socket file still on disk. Nothing
+/// listens on it (ECONNREFUSED), so the new daemon must remove it as stale,
+/// bind, recover the WAB and deliver both the records acked before the kill
+/// and the ones acked after the restart.
+#[test]
+fn starts_cleanly_over_a_stale_socket_left_by_sigkill() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("stale_socket_sigkill")
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info")
+        .start();
+    let mut client = srv.client();
+    for i in 0..10 {
+        client
+            .push(format!("stale-pre-{i:02}").as_bytes(), Durability::Durable)
+            .expect("push before the kill");
+    }
+    drop(client);
+
+    srv.kill_ungracefully();
+    let meta = fs::symlink_metadata(&srv.socket_path).expect("SIGKILL leaves the socket file");
+    assert!(meta.file_type().is_socket());
+    let refused = std::os::unix::net::UnixStream::connect(&srv.socket_path)
+        .expect_err("nobody listens on a dead daemon's socket");
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+
+    // Same config, same paths: the new process must clear the stale file.
+    srv.restart_in_place();
+    let mut client = srv.client();
+    for i in 0..10 {
+        client
+            .push(format!("stale-post-{i:02}").as_bytes(), Durability::Durable)
+            .expect("push after the restart");
+    }
+    drop(client);
+    srv.sigterm();
+
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        log.contains("removed stale socket"),
+        "the restart must log the stale-socket removal\nlog:\n{log}"
+    );
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<String> = (0..10)
+        .flat_map(|i| [format!("stale-pre-{i:02}"), format!("stale-post-{i:02}")])
+        .filter(|p| !delivered.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every acked record must reach the sink across the SIGKILL; missing {missing:?}"
+    );
+}
+
+// ── Preflight (safety floor, spec §3.0) ───────────────────────────────────────
+
+/// The payloads [`seed_sealed_backlog`] leaves on disk.
+const SEEDED_RECORDS: usize = 12;
+
+fn seeded_payload(i: usize) -> Vec<u8> {
+    let mut p = format!("seeded-{i:02}-").into_bytes();
+    p.resize(1024, b'x');
+    p
+}
+
+/// Fills `wab_dir` with a backlog of SEALED, UNCONFIRMED segments: exactly
+/// what a restarted daemon recovers, replays and delivers first.
+///
+/// A seeding daemon runs on `wab_dir` with the smallest legal segment size
+/// (4096 bytes, so a few 1 KiB pushes roll a segment) and an HTTP sink on port
+/// 1, which is privileged and never bound by an unprivileged process: every
+/// delivery attempt is refused, so with `sink_max_retries = 0` each sealed
+/// segment is stranded on disk (connection-refused is transient, so nothing is
+/// dead-lettered). A graceful SIGTERM then seals the active segment too.
+/// Returns the number of sealed segments, asserted to be at least 3.
+fn seed_sealed_backlog(tag: &str, wab_dir: &Path) -> usize {
+    let mut seeder = weir_server!(tag)
+        .wab_dir(wab_dir)
+        .extra_config(
+            "wab_segment_max_bytes = 4096\n\
+             sink_type = \"http\"\n\
+             sink_max_retries = 0",
+        )
+        .env("WEIR_SINK_URL", "http://127.0.0.1:1/sink")
+        .start();
+    let mut client = seeder.client();
+    for i in 0..SEEDED_RECORDS {
+        client
+            .push(seeded_payload(i), Durability::Durable)
+            .expect("seeding push");
+    }
+    drop(client);
+    seeder.sigterm();
+    drop(seeder);
+
+    let sealed = count_wab_files(wab_dir, ".wab.sealed");
+    assert!(
+        sealed >= 3,
+        "the seed must leave at least 3 sealed segments, found {sealed}: {:?}",
+        tree_snapshot(wab_dir)
+    );
+    assert_eq!(
+        count_wab_files(wab_dir, ".wab"),
+        0,
+        "SIGTERM must have sealed the active segment"
+    );
+    assert_eq!(
+        count_wab_files(wab_dir, ".confirmed"),
+        0,
+        "nothing may be confirmed: the sink was unreachable"
+    );
+    sealed
+}
+
+/// Which resource the refused duplicate shares with the running daemon.
+#[derive(Clone, Copy, Debug)]
+enum SharedResource {
+    Socket,
+    MetricsPort,
+}
+
+/// spec §3.0: a duplicate daemon that must refuse to start has to refuse
+/// BEFORE recovery. Until preflight existed, B recovered and replayed its own
+/// backlog, started its drain, and only then hit the conflicting socket or
+/// metrics port and returned through `?` with the drain mid-commit. Under
+/// `Restart=on-failure` that re-delivered the head of B's oldest unconfirmed
+/// segment on every restart, unboundedly.
+///
+/// B gets its own `wab_dir`, pre-seeded with a sealed backlog, and a recording
+/// sink; it shares exactly one resource with a running A. B must exit 1 within
+/// 5 s naming the conflict, the sink must see not one connection, and B's WAB
+/// must be byte-identical. Then, as a positive control, the same B started
+/// without the conflict delivers the whole backlog to the same sink: the
+/// backlog was real, so "0 connections" above is not vacuous.
+fn refused_duplicate_never_delivers(shared: SharedResource) {
+    // Short: the socket path is derived from the tag and must fit sun_path
+    // (104 bytes on macOS, including the temp dir).
+    let tag = match shared {
+        SharedResource::Socket => "sock",
+        SharedResource::MetricsPort => "metr",
+    };
+    let b_wab =
+        std::env::temp_dir().join(format!("weir_sys_refused_dup_{tag}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&b_wab);
+    fs::create_dir_all(&b_wab).unwrap();
+    seed_sealed_backlog(&format!("rdup_seed_{tag}"), &b_wab);
+    // B takes the wab_dir lock before preflight, legitimately rewriting the
+    // holder record in `.weir.lock`; every other byte must stay put.
+    let segments = |dir: &Path| {
+        let mut t = tree_snapshot(dir);
+        t.remove(Path::new(".weir.lock"));
+        t
+    };
+    let seeded = segments(&b_wab);
+
+    let sink = RecordingSink::start();
+    let srv_a = weir_server!(&format!("rdup_a_{tag}")).start();
+    let b = weir_server!(&format!("rdup_b_{tag}"))
+        .wab_dir(&b_wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info");
+    let (b, expected) = match shared {
+        SharedResource::Socket => (
+            b.env("WEIR_SOCKET_PATH", srv_a.socket_path.to_str().unwrap()),
+            "in use by a running process",
+        ),
+        SharedResource::MetricsPort => (
+            b.env("WEIR_METRICS_PORT", srv_a.metrics_port.to_string()),
+            "failed to bind metrics endpoint",
+        ),
+    };
+
+    let started = Instant::now();
+    let (status, log) = b.spawn_expecting_exit(Duration::from_secs(5));
+    let took = started.elapsed();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "B must refuse to start ({shared:?}); it exited {status}\nlog:\n{log}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "B must fail fast, took {took:?}"
+    );
+    assert!(
+        log.contains(expected),
+        "B must name the conflict\nlog:\n{log}"
+    );
+    // The log is at info, so the absences below are evidence, not silence.
+    assert!(
+        log.contains("weir starting"),
+        "B's log must be at info\nlog:\n{log}"
+    );
+    for late in [
+        "recovering",
+        "queuing segment for drain replay",
+        "metrics endpoint listening",
+    ] {
+        assert!(
+            !log.contains(late),
+            "B must refuse in preflight, before {late:?}\nlog:\n{log}"
+        );
+    }
+    // Anything B sent before exiting is already queued at the sink's listener;
+    // give its accept thread a moment to count it.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        sink.connections(),
+        0,
+        "a refused duplicate must never reach the sink (bodies: {})",
+        sink.bodies().len()
+    );
+    assert_eq!(
+        segments(&b_wab),
+        seeded,
+        "B's refused start must not recover, seal, confirm or delete anything"
+    );
+
+    // A is unaffected.
+    srv_a
+        .client()
+        .push(b"a-after-refusal", Durability::Durable)
+        .expect("A must still ack");
+    drop(srv_a);
+
+    // Positive control: without the conflict, B delivers the seeded backlog.
+    let srv_b = weir_server!(&format!("rdup_ok_{tag}"))
+        .wab_dir(&b_wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let missing = loop {
+        let delivered: std::collections::HashSet<Vec<u8>> = sink.bodies().into_iter().collect();
+        let missing: Vec<usize> = (0..SEEDED_RECORDS)
+            .filter(|&i| !delivered.contains(&seeded_payload(i)))
+            .collect();
+        if missing.is_empty() || Instant::now() >= deadline {
+            break missing;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        missing.is_empty(),
+        "control: the seeded backlog must be deliverable; missing records {missing:?}"
+    );
+    drop(srv_b);
+    let _ = fs::remove_dir_all(&b_wab);
+}
+
+#[test]
+fn refused_duplicate_never_delivers_shared_socket() {
+    refused_duplicate_never_delivers(SharedResource::Socket);
+}
+
+#[test]
+fn refused_duplicate_never_delivers_shared_metrics_port() {
+    refused_duplicate_never_delivers(SharedResource::MetricsPort);
+}
+
+// ── wab_dir ownership (safety floor, spec §3.1) ───────────────────────────────
+
+/// Every file under `dir`, keyed by its path relative to `dir`, with its size
+/// and a content hash. Two snapshots compare equal only if no file was
+/// created, removed, renamed, resized or rewritten in between.
+fn tree_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, (u64, u64)>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let bytes = fs::read(&p).unwrap_or_default();
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                out.insert(
+                    p.strip_prefix(root).unwrap().to_path_buf(),
+                    (bytes.len() as u64, h.finish()),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The owner's reproduction (2026-10-04), as a regression. Daemon B was started
+/// on the same `wab_dir` as a running daemon A, with its own socket and metrics
+/// port. B recovered and sealed A's ACTIVE segment, delivered, confirmed and
+/// deleted it, and A then acked 50 more Durable records into the unlinked
+/// inode: none were delivered and nothing remained on disk, and A's shutdown
+/// seal logged `No such file or directory`.
+///
+/// With the lock, B must refuse before reading a byte of the WAB, A's tree must
+/// be byte-identical afterwards, and every one of A's 70 acked records must
+/// reach the sink. A recording HTTP sink is used because graceful shutdown
+/// deletes every delivered segment, so WAB bytes after SIGTERM prove nothing.
+#[test]
+fn second_daemon_on_same_wab_dir_is_refused_and_first_keeps_acking() {
+    let sink = RecordingSink::start();
+    let mut srv_a = weir_server!("lock_owner_a")
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let mut client = srv_a.client();
+    for i in 0..20 {
+        client
+            .push(format!("lock-rec-{i:03}").as_bytes(), Durability::Durable)
+            .expect("push to A before B starts");
+    }
+
+    let lock_path = srv_a.wab_dir.join(".weir.lock");
+    let record = fs::read_to_string(&lock_path).expect("A holds a lock file with its record");
+    assert!(
+        record.contains(&format!("pid={}", srv_a.child_pid())),
+        "A's holder record must name A: {record:?}"
+    );
+    let before = tree_snapshot(&srv_a.wab_dir);
+    assert!(
+        before.keys().any(|k| k.to_string_lossy().ends_with(".wab")),
+        "A must have an ACTIVE segment for B to (wrongly) recover: {before:?}"
+    );
+
+    let started = Instant::now();
+    let (status, log) = weir_server!("lock_contender_b")
+        .wab_dir(&srv_a.wab_dir)
+        .spawn_expecting_exit(Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "B must refuse to start on A's wab_dir; it exited {status}\nlog:\n{log}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a startup refusal exits 1\nlog:\n{log}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "B must fail fast, took {:?}",
+        started.elapsed()
+    );
+    assert!(log.contains("locked by"), "B must say why\nlog:\n{log}");
+    assert!(
+        log.contains(&format!("pid {}", srv_a.child_pid())),
+        "B must name A's pid\nlog:\n{log}"
+    );
+    assert_eq!(
+        tree_snapshot(&srv_a.wab_dir),
+        before,
+        "B must not touch a byte of A's WAB (no recovery, no seal, no record rewrite)"
+    );
+
+    for i in 20..70 {
+        client
+            .push(format!("lock-rec-{i:03}").as_bytes(), Durability::Durable)
+            .expect("A keeps acking after B is refused");
+    }
+    drop(client);
+    srv_a.sigterm();
+
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<String> = (0..70)
+        .map(|i| format!("lock-rec-{i:03}"))
+        .filter(|p| !delivered.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every record A acked must reach the sink; missing {} of 70: {missing:?}",
+        missing.len()
+    );
+
+    let log_a = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        !log_a.contains("No such file or directory"),
+        "A's shutdown seal must find its own segment\nlog:\n{log_a}"
+    );
+}
+
+/// Review Focus 1: systemd restarts a daemon immediately after the previous
+/// one was SIGKILLed. The kernel releases an flock when the last fd on the open
+/// file description closes, i.e. at process death, so the successor must
+/// acquire the lock with no wait and no manual cleanup of `.weir.lock`.
+#[test]
+fn lock_is_released_when_the_holder_is_sigkilled() {
+    let shared = std::env::temp_dir().join(format!("weir_sys_lock_sigkill_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&shared);
+    fs::create_dir_all(&shared).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&second_wab, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
     }
+
+    let mut srv_a = weir_server!("lock_sigkill_a").wab_dir(&shared).start();
+    let mut client = srv_a.client();
+    for i in 0..5 {
+        client
+            .push(format!("before-kill-{i}").as_bytes(), Durability::Durable)
+            .unwrap();
+    }
+    drop(client);
+    let pid_a = srv_a.child_pid();
+    srv_a.kill_ungracefully();
+    // Releases the harness process lock and A's temp dir; the shared wab_dir
+    // (an override) and its stale `.weir.lock` stay exactly as SIGKILL left them.
+    drop(srv_a);
+    let stale = fs::read_to_string(shared.join(".weir.lock")).unwrap();
+    assert!(stale.contains(&format!("pid={pid_a}")), "{stale:?}");
+
+    let srv_b = weir_server!("lock_sigkill_b")
+        .wab_dir(&shared)
+        .ready_timeout(Duration::from_secs(10))
+        .start();
+    let record = fs::read_to_string(shared.join(".weir.lock")).unwrap();
+    assert!(
+        record.contains(&format!("pid={}", srv_b.child_pid())),
+        "B must have taken the lock and rewritten the record: {record:?}"
+    );
+    let body = srv_b.scrape_metrics();
+    assert!(
+        body.lines()
+            .any(|l| l.starts_with("weir_wab_dir_lock_held 1")),
+        "B must report the lock as held:\n{body}"
+    );
+
+    drop(srv_b);
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// Review Focus 2: an operator runs `weir-ctl segments` / `dl list` against a
+/// LIVE daemon's wab_dir. weir-ctl must not report `.weir.lock`, must not
+/// rewrite it, and must not disturb the lock: a second daemon started
+/// afterwards is still refused.
+#[test]
+fn weir_ctl_beside_a_live_daemon_neither_sees_nor_disturbs_the_lock() {
+    let srv = weir_server!("lock_ctl_beside").start();
+    let mut client = srv.client();
+    client.push(b"ctl-beside", Durability::Durable).unwrap();
+    drop(client);
+    let lock_path = srv.wab_dir.join(".weir.lock");
+    let record_before = fs::read(&lock_path).unwrap();
+
+    let ctl = weir_ctl_binary();
+    for args in [
+        &["--json", "segments", "--wab-dir"][..],
+        &["--json", "dl", "list", "--wab-dir"][..],
+    ] {
+        let out = Command::new(&ctl)
+            .args(args)
+            .arg(&srv.wab_dir)
+            .output()
+            .expect("run weir-ctl");
+        assert!(
+            out.status.success(),
+            "weir-ctl {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains(".weir.lock"),
+            "weir-ctl {args:?} must not report the lock file: {stdout}"
+        );
+    }
+    assert_eq!(fs::read(&lock_path).unwrap(), record_before);
+
+    let (status, log) = weir_server!("lock_ctl_contender")
+        .wab_dir(&srv.wab_dir)
+        .spawn_expecting_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1), "log:\n{log}");
+    assert!(
+        log.contains("locked by"),
+        "the daemon must still hold its lock after weir-ctl ran\nlog:\n{log}"
+    );
+}
+
+/// Spec §3.1 integrity, D4b. Someone deletes a live daemon's `.weir.lock`, and
+/// a second daemon B starts on the same `wab_dir` and takes a fresh lock. That
+/// is proof another writer owns the directory, so A must stop acking and exit
+/// with status 3 within one integrity tick (spec: within 2 s), logging
+/// CRITICAL with B's holder record, and without sealing.
+///
+/// Between B's lock and A's next tick, A can still ack (the residual window the
+/// threat model states; only "never delete `.weir.lock`" closes it). What A
+/// must never do is ack AFTER it started refusing: once a push is Nacked, every
+/// later push is Nacked or fails because A is gone.
+#[test]
+fn lock_file_stolen_by_second_daemon_fails_closed() {
+    let mut srv_a = weir_server!("lock_stolen_a").start();
+    let lock_path = srv_a.wab_dir.join(".weir.lock");
+    let mut client = srv_a.client();
+    client
+        .push(b"before-steal", Durability::Durable)
+        .expect("A acks while it owns the lock");
+
+    // B gets its own socket, metrics port and log, and A's wab_dir. Spawned
+    // with Command directly: srv_a holds the harness process lock, and B must
+    // stay up beside A.
+    let b_tmp = std::env::temp_dir().join(format!("weir_sys_lock_stolen_b_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&b_tmp);
+    fs::create_dir_all(&b_tmp).unwrap();
+    let b_config = b_tmp.join("weir.toml");
     fs::write(
-        &second_config,
+        &b_config,
         format!(
             "[server]\n\
              socket_path           = \"{}\"\n\
@@ -2209,50 +2889,418 @@ fn socket_takeover_does_not_corrupt_wab_data() {
              metrics_port          = {}\n\
              shard_count           = 1\n\
              worker_count          = 2\n\
-             batch_size            = 100\n\
-             batch_deadline_ms     = 20\n\
              shutdown_timeout_secs = 3\n\
-             log_level             = \"warn\"\n",
-            srv_a.socket_path.display(),
-            second_wab.display(),
+             log_level             = \"info\"\n",
+            b_tmp.join("weir.sock").display(),
+            srv_a.wab_dir.display(),
             free_port(),
         ),
     )
     .unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_weir-server");
-    let mut child_b = Command::new(binary)
-        .args(["--config", second_config.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn server B");
-
-    // Give server B time to start and take the socket.
-    thread::sleep(Duration::from_millis(500));
-
-    // Server A's WAB files must be completely untouched.
-    let wab_after = wab_dir_bytes(&srv_a.wab_dir);
-    assert_eq!(
-        wab_before, wab_after,
-        "server B startup modified server A's WAB bytes ({wab_before} → {wab_after})"
-    );
-
-    // Verify payload bytes are still present.
-    let wab_bytes = read_wab_bytes(&srv_a.wab_dir);
-    for i in 0..N {
-        let payload = format!("srv-a-{i}").into_bytes();
-        assert!(
-            wab_bytes
-                .windows(payload.len())
-                .any(|w| w == payload.as_slice()),
-            "payload srv-a-{i} missing from server A's WAB after socket takeover"
-        );
+    // A's integrity task re-creates and re-locks a deleted lock file on its
+    // next tick (D4a). A B spawned just after that tick is then refused, and
+    // the precondition here ("B acquires the lock") did not happen; retry.
+    let mut child_b = None;
+    for attempt in 0..10 {
+        match fs::remove_file(&lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("unlink {}: {e}", lock_path.display()),
+        }
+        let b_log = b_tmp.join(format!("weir_b_{attempt}.log"));
+        let log = fs::File::create(&b_log).unwrap();
+        let mut c = Command::new(env!("CARGO_BIN_EXE_weir-server"))
+            .args(["--config", b_config.to_str().unwrap()])
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn B");
+        // B writes its record only after its flock succeeded, so its pid in
+        // the record means B holds the lock.
+        let b_marker = format!("pid={}\n", c.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let acquired = loop {
+            if fs::read_to_string(&lock_path).is_ok_and(|r| r.contains(&b_marker)) {
+                break true;
+            }
+            if let Ok(Some(_)) = c.try_wait() {
+                break false; // refused: A re-locked first
+            }
+            if Instant::now() >= deadline {
+                let _ = c.kill();
+                let _ = c.wait();
+                panic!(
+                    "B neither took the lock nor exited\nB log:\n{}",
+                    fs::read_to_string(&b_log).unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        if acquired {
+            child_b = Some(c);
+            break;
+        }
     }
+    let mut child_b = child_b.expect("B never acquired the lock in 10 attempts");
+    let b_pid = child_b.id();
+    let b_acquired_at = Instant::now();
+
+    // Keep pushing to A until it is gone.
+    let mut outcomes: Vec<Result<(), ClientError>> = Vec::new();
+    let status = loop {
+        if let Some(status) = srv_a.wait_for_exit(Duration::ZERO) {
+            break status;
+        }
+        if b_acquired_at.elapsed() > Duration::from_secs(10) {
+            let _ = child_b.kill();
+            let _ = child_b.wait();
+            panic!(
+                "A is still running 10 s after B took its wab_dir\nA log:\n{}",
+                fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default()
+            );
+        }
+        let alive = matches!(
+            outcomes.last(),
+            None | Some(Ok(())) | Some(Err(ClientError::Nack(_)))
+        );
+        if alive {
+            outcomes.push(
+                client
+                    .push(b"during-steal", Durability::Durable)
+                    .map(|_| ()),
+            );
+        } else {
+            thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let exited_after = b_acquired_at.elapsed();
 
     let _ = child_b.kill();
     let _ = child_b.wait();
-    let _ = fs::remove_dir_all(&second_tmp);
+    let log_a = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "proven ownership loss exits 3 (got {status})\nA log:\n{log_a}"
+    );
+    assert!(
+        exited_after <= Duration::from_secs(2),
+        "A must exit within 2 s of B taking the lock (1 s integrity tick); took {exited_after:?}"
+    );
+    assert!(
+        log_a.contains("CRITICAL") && log_a.contains("ownership lost"),
+        "A must log CRITICAL\nA log:\n{log_a}"
+    );
+    assert!(
+        log_a.contains(&format!("pid {b_pid}")),
+        "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
+    );
+
+    // Once A refused a push, it never acked another one.
+    if let Some(first_nack) = outcomes
+        .iter()
+        .position(|o| matches!(o, Err(ClientError::Nack(_))))
+    {
+        for o in &outcomes[first_nack..] {
+            match o {
+                Err(ClientError::Nack(r)) => assert_eq!(
+                    *r,
+                    weir_client::NackReason::InternalError,
+                    "ownership loss Nacks InternalError (no wire change)"
+                ),
+                Ok(()) => panic!("A acked after it started refusing: {outcomes:?}"),
+                Err(_) => {} // A is gone
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&b_tmp);
+}
+
+// ── SIGHUP (safety floor, spec §3.2) ──────────────────────────────────────────
+
+fn send_sighup(pid: u32) {
+    // SAFETY: kill(2) with a pid we spawned and still own (not yet reaped).
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+    assert_eq!(rc, 0, "kill -HUP {pid}: {}", io::Error::last_os_error());
+}
+
+/// `weir_config_reloads_total{trigger="sighup",outcome=<outcome>}`, 0 if absent.
+fn sighup_reloads(srv: &weir_testkit::WeirServer, outcome: &str) -> u64 {
+    parse_metric(
+        &srv.scrape_metrics(),
+        &format!("weir_config_reloads_total{{trigger=\"sighup\",outcome=\"{outcome}\"}} "),
+    )
+}
+
+/// Polls `sighup_reloads` until it reaches `want` or 5 s pass; returns the last
+/// value. The reload runs on the reload loop after the signal, so the counter
+/// lags the `kill` by a scheduling hop.
+fn wait_for_sighup_reloads(srv: &weir_testkit::WeirServer, outcome: &str, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = sighup_reloads(srv, outcome);
+        if got >= want || Instant::now() >= deadline {
+            return got;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn read_log(srv: &weir_testkit::WeirServer) -> String {
+    fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default()
+}
+
+/// Asserts the daemon survived: still running 300 ms later, and acking.
+fn assert_alive_and_acking(srv: &mut weir_testkit::WeirServer, what: &str) {
+    if let Some(status) = srv.wait_for_exit(Duration::from_millis(300)) {
+        panic!(
+            "{what} killed the daemon ({status})\nlog:\n{}",
+            read_log(srv)
+        );
+    }
+    srv.client()
+        .push(b"after-sighup", Durability::Durable)
+        .unwrap_or_else(|e| panic!("a Durable push after {what} must ack: {e:?}"));
+}
+
+/// spec §3.2: a daemon without TLS used to have no SIGHUP handler at all, so
+/// `kill -HUP` (a `systemctl reload`, a log-rotation script) killed it with the
+/// default disposition. Now it is a counted, logged noop.
+#[test]
+fn sighup_is_a_counted_noop_on_a_default_daemon() {
+    let mut srv = weir_server!("sighup_noop").log_level("info").start();
+    send_sighup(srv.child_pid());
+    assert_alive_and_acking(&mut srv, "SIGHUP");
+    assert_eq!(wait_for_sighup_reloads(&srv, "noop", 1), 1);
+    for outcome in ["ok", "failed", "dropped"] {
+        assert_eq!(sighup_reloads(&srv, outcome), 0, "outcome={outcome}");
+    }
+    let log = read_log(&srv);
+    assert!(
+        log.contains(
+            "SIGHUP received: nothing reloadable in this build/config (config is read once at \
+             startup); nothing changed"
+        ),
+        "the noop must say so\nlog:\n{log}"
+    );
+    srv.shutdown();
+}
+
+/// Review Focus 5: 100 SIGHUPs in a burst neither kill the daemon nor wedge
+/// the reload path. Every HUP that got through is accounted for as served
+/// (noop) or dropped by the bounded queue, and a later HUP is still served.
+#[test]
+fn sighup_flood_does_not_kill_or_wedge() {
+    let mut srv = weir_server!("sighup_flood").start();
+    let pid = srv.child_pid();
+    for _ in 0..100 {
+        send_sighup(pid);
+    }
+    assert_alive_and_acking(&mut srv, "a SIGHUP flood");
+
+    // tokio coalesces pending signals, so fewer than 100 may be seen; at least
+    // one is, and none is counted twice.
+    let served = wait_for_sighup_reloads(&srv, "noop", 1);
+    let dropped = sighup_reloads(&srv, "dropped");
+    assert!(served >= 1, "the flood must be served, not lost");
+    assert!(
+        served + dropped <= 100,
+        "100 HUPs, but served {served} + dropped {dropped}"
+    );
+
+    // Not wedged: once the flood has settled, one more HUP is served.
+    thread::sleep(Duration::from_millis(200));
+    let before = sighup_reloads(&srv, "noop");
+    send_sighup(pid);
+    assert_eq!(
+        wait_for_sighup_reloads(&srv, "noop", before + 1),
+        before + 1,
+        "a HUP after the flood must still be served"
+    );
+    assert_alive_and_acking(&mut srv, "the HUP after the flood");
+    srv.shutdown();
+}
+
+/// Copies the first sealed segment in `wab_dir/shard_00` under fresh counters
+/// until the shard holds `total` sealed segments. Returns `total`.
+fn pad_sealed_backlog(wab_dir: &Path, total: usize) -> usize {
+    let shard = wab_dir.join("shard_00");
+    let counter = |p: &Path| -> u64 {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        name.trim_start_matches("seg_")
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let mut sealed: Vec<PathBuf> = fs::read_dir(&shard)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".wab.sealed"))
+        .collect();
+    sealed.sort_by_key(|p| counter(p));
+    let template = sealed[0].clone();
+    let first_free = counter(sealed.last().unwrap()) + 1;
+    for next in (first_free..).take(total.saturating_sub(sealed.len())) {
+        fs::copy(&template, shard.join(format!("seg_{next:08}.wab.sealed"))).unwrap();
+    }
+    assert_eq!(count_wab_files(wab_dir, ".wab.sealed"), total);
+    total
+}
+
+/// spec §3.2 test 3 (revised): a HUP while `replay_unconfirmed` is blocked,
+/// before the runtime (and so before any tokio handler) exists, must be
+/// ignored.
+///
+/// The sink is a black hole that accepts and never answers, with the maximum
+/// `sink_timeout_secs`, so the drain sits in its first `commit` and stops
+/// taking segments. A backlog larger than the drain channel (256) plus that one
+/// then blocks the replay on its send. A connection-refused sink would not do:
+/// it fails fast and the drain's retry wait pulls the channel into `pending`,
+/// so the replay never blocks.
+#[test]
+fn sighup_during_startup_replay_is_ignored() {
+    const TOTAL: usize = 300;
+    let wab = std::env::temp_dir().join(format!("weir_sys_hup_replay_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&wab);
+    fs::create_dir_all(&wab).unwrap();
+    seed_sealed_backlog("hup_replay_seed", &wab);
+    pad_sealed_backlog(&wab, TOTAL);
+
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("hup_replay")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"\nsink_timeout_secs = 300")
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .spawn();
+    let queued = |log: &str| log.matches("queuing segment for drain replay").count();
+
+    // Wait for the replay to block: the drain holds a hung request and the
+    // replay's line count stops growing short of the backlog.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = 0;
+    loop {
+        let log = read_log(&srv);
+        let n = queued(&log);
+        if n > 0 && n == last && hole.connections() > 0 {
+            break;
+        }
+        last = n;
+        assert!(
+            Instant::now() < deadline,
+            "the replay never blocked (queued {n}, sink connections {})\nlog:\n{log}",
+            hole.connections()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    send_sighup(srv.child_pid());
+    if let Some(status) = srv.wait_for_exit(Duration::from_millis(300)) {
+        panic!(
+            "a SIGHUP during the replay killed the daemon ({status})\nlog:\n{}",
+            read_log(&srv)
+        );
+    }
+    // The HUP landed in the replay phase: it was still blocked afterwards, and
+    // the runtime (whose first act is the metrics bind) did not exist yet.
+    let log = read_log(&srv);
+    assert!(
+        queued(&log) < TOTAL,
+        "the replay must still be blocked after the HUP (queued {} of {TOTAL})",
+        queued(&log)
+    );
+    assert!(
+        !log.contains("metrics endpoint listening"),
+        "the HUP must land before the runtime\nlog:\n{log}"
+    );
+
+    // Close the black hole: the hung commit fails, the drain's retry wait
+    // drains the channel, the replay finishes and the socket binds.
+    drop(hole);
+    srv.wait_ready(Duration::from_secs(30));
+    assert_alive_and_acking(&mut srv, "the SIGHUP during the replay");
+    let log = read_log(&srv);
+    assert_eq!(queued(&log), TOTAL, "the whole backlog must be replayed");
+    assert!(
+        !log.contains("SIGHUP received"),
+        "a HUP before the runtime is dropped, not served late\nlog:\n{log}"
+    );
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// spec §3.2, the recovery-phase variant: a HUP while `recover_open_segments`
+/// is sealing a pile of unsealed segments, long before the runtime exists.
+#[test]
+fn sighup_during_startup_recovery_is_ignored() {
+    const TOTAL: usize = 400;
+    let wab = std::env::temp_dir().join(format!("weir_sys_hup_recov_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&wab);
+    fs::create_dir_all(&wab).unwrap();
+
+    // One unsealed segment: acked Durable records, then SIGKILL (no seal).
+    let mut seeder = weir_server!("hup_recov_seed").wab_dir(&wab).start();
+    let mut client = seeder.client();
+    for i in 0..32 {
+        let mut p = format!("recov-{i:02}-").into_bytes();
+        p.resize(4096, b'r');
+        client.push(p, Durability::Durable).expect("seeding push");
+    }
+    drop(client);
+    seeder.kill_ungracefully();
+    drop(seeder);
+    let shard = wab.join("shard_00");
+    let active: Vec<PathBuf> = fs::read_dir(&shard)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".wab"))
+        .collect();
+    assert_eq!(active.len(), 1, "the seed must leave one unsealed segment");
+    for n in 2..=TOTAL {
+        fs::copy(&active[0], shard.join(format!("seg_{:08}.wab", 1000 + n))).unwrap();
+    }
+    assert_eq!(count_wab_files(&wab, ".wab"), TOTAL);
+
+    let mut srv = weir_server!("hup_recov")
+        .wab_dir(&wab)
+        .log_level("info")
+        .spawn();
+    let started = |log: &str| log.contains("recovering unsealed WAB segment");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started(&read_log(&srv)) {
+        assert!(
+            Instant::now() < deadline,
+            "recovery never started\nlog:\n{}",
+            read_log(&srv)
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    send_sighup(srv.child_pid());
+    // An ignored signal is discarded when it is sent, so a log read now that
+    // still shows recovery unfinished proves the HUP landed during it.
+    let log = read_log(&srv);
+    let done = log.matches("recovery complete").count();
+    assert!(
+        done < TOTAL,
+        "the HUP must land during recovery, but all {TOTAL} segments were already \
+         recovered; seed more"
+    );
+
+    srv.wait_ready(Duration::from_secs(60));
+    assert_alive_and_acking(&mut srv, "the SIGHUP during recovery");
+    let log = read_log(&srv);
+    assert_eq!(
+        log.matches("recovery complete").count(),
+        TOTAL,
+        "every unsealed segment must be recovered\nlog:\n{log}"
+    );
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
 }
 
 // ── File descriptor limit exhaustion ─────────────────────────────────────────

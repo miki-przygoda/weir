@@ -1,6 +1,7 @@
 pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
 pub(crate) mod dst;
+pub(crate) mod lock;
 pub(crate) mod recovery;
 pub(crate) mod segment;
 
@@ -1138,6 +1139,29 @@ mod tests {
         let dir = crate::testutil::scratch_dir(&format!("wab_{label}"));
         crate::testutil::mkdir_p(&dir);
         dir
+    }
+
+    /// `<wab_dir>/.weir.lock` is a regular file at the root: the scan that
+    /// feeds the drain must not mistake it for a shard or a segment.
+    #[test]
+    fn scan_unconfirmed_sealed_ignores_the_wab_dir_lock_file() {
+        let dir = tmp_dir("scan_ignores_lock");
+        let sd0 = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd0);
+        let seg_path = segment_path(&sd0, 1);
+        for p in [seg_path.clone(), seg_path.with_extension("wab.sealed")] {
+            let _ = fs::remove_file(p);
+        }
+        let sealed = {
+            let mut s = WabSegment::create(&seg_path, 0, Compression::None).unwrap();
+            s.write_record(b"a").unwrap();
+            s.seal().unwrap()
+        };
+        fs::write(dir.join(crate::wab::lock::LOCK_FILE_NAME), b"pid=1\n").unwrap();
+
+        let found = scan_unconfirmed_sealed(&dir, Some(1), &Metrics::new().0).unwrap();
+        assert_eq!(found, vec![sealed]);
+        fs::remove_dir_all(dir).ok();
     }
 
     // ── Timed seals ───────────────────────────────────────────────────────────

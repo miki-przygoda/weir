@@ -95,6 +95,13 @@ pub struct ConnectionConfig {
     /// of them agree, and so the low-water mark is honoured globally rather
     /// than per-connection.
     pub wab_cap_rejecting: Arc<AtomicBool>,
+    /// Set by the `wab_dir` integrity task in `main` once another instance
+    /// PROVABLY owns the `wab_dir` (spec §3.1, D4b), just before the process
+    /// exits with code 3. Every push after that is Nacked `InternalError`
+    /// before it reaches the queue: acking it would write into segments the
+    /// other daemon now recovers and deletes. One `Relaxed` load per push; it
+    /// never goes back to `false`.
+    pub wab_ownership_lost: Arc<AtomicBool>,
 }
 
 /// Handles one client connection: parses frames in a loop, queues work units,
@@ -352,8 +359,9 @@ where
                 // on exactly that.
                 //
                 // Both durability tiers are rejected: Buffered still writes
-                // to the WAB, it just acks earlier.
-                if over_wab_cap(&config) {
+                // to the WAB, it just acks earlier. The ownership check sits at
+                // the same point for the same reasons.
+                if let Some(refusal) = admission_refusal(&config) {
                     send_nack(
                         stream.get_mut(),
                         WireNack::InternalError,
@@ -361,7 +369,9 @@ where
                         config.read_timeout,
                     )
                     .await?;
-                    metrics.wab_cap_rejections.inc();
+                    if refusal == AdmissionRefusal::WabCap {
+                        metrics.wab_cap_rejections.inc();
+                    }
                     metrics
                         .records_nack
                         .get_or_create(&NackLabel {
@@ -401,7 +411,7 @@ where
                 // anything counts as accepted. One check admits the whole
                 // batch, which is a widening of the cap's sampling window
                 // worth knowing about — see `max_batch_records`.
-                if over_wab_cap(&config) {
+                if let Some(refusal) = admission_refusal(&config) {
                     send_nack(
                         stream.get_mut(),
                         WireNack::InternalError,
@@ -409,7 +419,9 @@ where
                         config.read_timeout,
                     )
                     .await?;
-                    metrics.wab_cap_rejections.inc();
+                    if refusal == AdmissionRefusal::WabCap {
+                        metrics.wab_cap_rejections.inc();
+                    }
                     metrics
                         .records_nack
                         .get_or_create(&NackLabel {
@@ -822,6 +834,27 @@ where
     send_ack_batch(stream, &accepted, write_timeout).await
 }
 
+/// Why a fully read, CRC-verified push is refused before it counts as
+/// accepted. Both go out as `WireNack::InternalError` (no wire change); the
+/// distinction only decides which counter moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionRefusal {
+    /// Another instance provably owns the `wab_dir`; the daemon is exiting.
+    OwnershipLost,
+    /// Live WAB bytes are over `wab_max_bytes`.
+    WabCap,
+}
+
+/// The admission check shared by the single-record and batch arms. Ownership
+/// loss comes first: it is one `Relaxed` load, and it must win over the cap
+/// (whose hysteresis state it must not disturb).
+fn admission_refusal(config: &ConnectionConfig) -> Option<AdmissionRefusal> {
+    if config.wab_ownership_lost.load(Ordering::Relaxed) {
+        return Some(AdmissionRefusal::OwnershipLost);
+    }
+    over_wab_cap(config).then_some(AdmissionRefusal::WabCap)
+}
+
 /// Whether the WAB cap is currently rejecting pushes.
 ///
 /// Hysteresis: once rejecting, keep rejecting until bytes fall below
@@ -1025,6 +1058,7 @@ mod tests {
             wab_max_bytes: 0,
             wab_bytes_now: Arc::new(AtomicU64::new(0)),
             wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+            wab_ownership_lost: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1675,6 +1709,112 @@ mod tests {
         let (msg_type, payload) = read_response(&mut client).await;
         assert_eq!(msg_type, MessageType::Nack);
         assert_eq!(payload[0], NackReason::InternalError as u8);
+    }
+
+    // ── wab_dir ownership lost (spec §3.1, D4b) ───────────────────────────────
+
+    /// Once another instance provably owns the `wab_dir`, every new push is
+    /// Nacked `InternalError` BEFORE it reaches the queue, for all three push
+    /// kinds and both tiers, without touching the WAB-cap counter. The daemon
+    /// exits right after; this closes the window in which it would otherwise
+    /// keep acking into segments the other daemon now owns.
+    #[tokio::test]
+    async fn ownership_lost_nacks_before_queue() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let lost = Arc::new(AtomicBool::new(true));
+        let cfg = ConnectionConfig {
+            wab_ownership_lost: Arc::clone(&lost),
+            // The cap is enabled and NOT exceeded, so only the ownership flag
+            // can be what refuses these pushes.
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::new(AtomicU64::new(0)),
+            // Short, so a regression (the push reaching the queue, where
+            // nothing acks it) fails in milliseconds instead of hiding behind
+            // an ack-timeout Nack 30 s later.
+            ack_timeout: Duration::from_millis(200),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            Arc::clone(&metrics),
+            never_shutdown_rx(),
+        ));
+        let mut client = client;
+        let rx = queue_rx.get(0);
+
+        let batch = {
+            let body = weir_core::encode_batch_body(&[b"b1", b"b2"]);
+            Envelope::new(
+                Header::new(MessageType::PushBatch, Durability::Durable, 0),
+                body,
+            )
+            .encode()
+        };
+        let buffered = Envelope::new(
+            Header::new(MessageType::Push, Durability::Buffered, 0),
+            b"buffered".to_vec(),
+        )
+        .encode();
+        for frame in [
+            push_frame(b"durable"),
+            push_tracked_frame(b"tracked"),
+            batch,
+            buffered,
+        ] {
+            client.write_all(&frame).await.unwrap();
+            let (msg_type, payload) = read_response(&mut client).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may reach the queue once ownership is lost"
+            );
+            assert_eq!(
+                msg_type,
+                MessageType::Nack,
+                "never an ack once ownership is lost"
+            );
+            assert_eq!(payload[0], NackReason::InternalError as u8);
+        }
+        assert_eq!(
+            metrics.wab_cap_rejections.get(),
+            0,
+            "an ownership-lost Nack is not a WAB-cap rejection"
+        );
+        let nacked = |tier| {
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier,
+                    reason: MetricNack::internal_error,
+                })
+                .get()
+        };
+        assert_eq!(nacked(TierValue::durable), 3);
+        assert_eq!(nacked(TierValue::buffered), 1);
+        assert_eq!(
+            metrics
+                .records_accepted
+                .get_or_create(&TierLabel {
+                    tier: TierValue::durable
+                })
+                .get(),
+            0,
+            "a refused push is never counted as accepted"
+        );
+
+        // The flag is the only thing that refused them: clear it and the same
+        // connection acks (proves the test is not vacuous).
+        lost.store(false, Ordering::Relaxed);
+        let acker = std::thread::spawn(move || {
+            let unit = rx.recv().unwrap();
+            let _ = unit.ack_tx.send(AckOutcome::durable(None));
+        });
+        client.write_all(&push_frame(b"after")).await.unwrap();
+        assert_eq!(read_response(&mut client).await.0, MessageType::Ack);
+        acker.join().unwrap();
     }
 
     // ── WAB cap (wab_max_bytes) ───────────────────────────────────────────────

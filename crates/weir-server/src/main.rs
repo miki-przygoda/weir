@@ -2,7 +2,9 @@ mod config;
 mod drain;
 mod metrics;
 mod models;
+mod preflight;
 mod queue;
+mod reload;
 mod sink;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
@@ -345,49 +347,106 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
     sink_healthy && draining
 }
 
-// ── TLS SIGHUP reload task ────────────────────────────────────────────────────
+// ── wab_dir lock integrity ────────────────────────────────────────────────────
 
-/// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
+/// How often the integrity task re-checks `.weir.lock`. Bounds the residual
+/// window in which a second daemon, started after the file was deleted, can
+/// recover this daemon's live segments before this one stops acking.
+const LOCK_INTEGRITY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Applies one [`wab::lock::check_wab_dir_lock`] verdict. Returns the exit code
+/// the daemon must leave with NOW, if any; the caller exits, which keeps this
+/// testable.
 ///
-/// The task is fail-safe: if `reload()` returns `Err`, the old `ServerConfig`
-/// is retained and an error is logged. Both outcomes increment the
-/// `tls_config_reloads` counter with the appropriate label so operators can
-/// alert on sustained reload failures.
-#[cfg(all(unix, feature = "tls"))]
-fn spawn_tls_reload_task(
-    tls: crate::socket::tls::ReloadableServerConfig,
-    metrics: std::sync::Arc<crate::metrics::Metrics>,
+/// On `LostToOther` the order matters: the ingest flag first (every push from
+/// here on is Nacked before it reaches the queue), then the gauge and the log,
+/// then the exit. There is no seal (the segments now belong to the other
+/// daemon, and sealing would rename its files) and no grace period (a grace
+/// only lengthens the window of knowing false acks).
+fn apply_lock_integrity(
+    verdict: wab::lock::LockIntegrity,
+    wab_dir: &Path,
+    metrics: &metrics::Metrics,
+    ownership_lost: &std::sync::atomic::AtomicBool,
+) -> Option<i32> {
+    use wab::lock::LockIntegrity;
+    match verdict {
+        LockIntegrity::Ok => None,
+        LockIntegrity::Relocked => {
+            metrics.wab_dir_lock_integrity_failures.inc();
+            metrics.wab_dir_lock_held.set(1.0);
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                "{} was deleted or replaced while this daemon was running; nobody else \
+                 held it, so it was re-created and re-locked. While it was missing a \
+                 second weir-server could have started on this wab_dir. Never delete \
+                 the lock file of a running daemon",
+                wab::lock::LOCK_FILE_NAME
+            );
+            None
+        }
+        LockIntegrity::LostToOther { holder } => {
+            ownership_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+            metrics.wab_dir_lock_held.set(0.0);
+            let other = match &holder {
+                Some(h) => format!(
+                    "pid {} on host {}, version {}, socket {}",
+                    h.pid, h.host, h.version, h.socket_path
+                ),
+                None => "its holder record could not be read".to_string(),
+            };
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                exit_code = wab::lock::EXIT_WAB_OWNERSHIP_LOST,
+                "CRITICAL: wab_dir ownership lost: another weir-server ({other}) now holds \
+                 the lock on this wab_dir and may already have recovered this daemon's live \
+                 segments. Refusing every new push and exiting now, without sealing (the \
+                 segments are the other daemon's now). Records acked since the lock file \
+                 was deleted may not be delivered. Stop one of the two daemons"
+            );
+            Some(wab::lock::EXIT_WAB_OWNERSHIP_LOST)
+        }
+        LockIntegrity::Error(errno) => {
+            metrics.wab_dir_lock_integrity_failures.inc();
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                errno,
+                error = %std::io::Error::from_raw_os_error(errno),
+                "could not verify the wab_dir lock; retrying in {}s",
+                LOCK_INTEGRITY_INTERVAL.as_secs()
+            );
+            None
+        }
+    }
+}
+
+/// Spawns the once-a-second `wab_dir` lock integrity task (spec §3.1). Its own
+/// task, not part of the 5 s WAB poll, which skips everything when its scan
+/// returns `None`. The check is blocking file-system work, so it runs on
+/// `spawn_blocking`. Only spawned when the lock is actually held.
+fn spawn_lock_integrity_task(
+    wab_dir: std::path::PathBuf,
+    metrics: Arc<metrics::Metrics>,
+    ownership_lost: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    use crate::metrics::{TlsReloadLabel, TlsReloadOutcome};
-    use tokio::signal::unix::{SignalKind, signal};
     tokio::spawn(async move {
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGHUP handler; cert reload disabled");
-                return;
-            }
-        };
-        while hup.recv().await.is_some() {
-            match tls.reload() {
-                Ok(()) => {
-                    metrics
-                        .tls_config_reloads
-                        .get_or_create(&TlsReloadLabel {
-                            outcome: TlsReloadOutcome::ok,
-                        })
-                        .inc();
-                    tracing::info!("SIGHUP: TLS certificates reloaded");
-                }
-                Err(e) => {
-                    metrics
-                        .tls_config_reloads
-                        .get_or_create(&TlsReloadLabel {
-                            outcome: TlsReloadOutcome::failed,
-                        })
-                        .inc();
-                    tracing::error!(error = %e, "SIGHUP: TLS reload failed; keeping previous certs");
-                }
+        let mut interval = tokio::time::interval(LOCK_INTEGRITY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let dir = wab_dir.clone();
+            let verdict = match tokio::task::spawn_blocking(move || {
+                wab::lock::check_wab_dir_lock(&dir)
+            })
+            .await
+            {
+                Ok(v) => v,
+                // Cancelled at runtime shutdown, or the check panicked:
+                // nothing was proven, try again next tick.
+                Err(_) => continue,
+            };
+            if let Some(code) = apply_lock_integrity(verdict, &wab_dir, &metrics, &ownership_lost) {
+                std::process::exit(code);
             }
         }
     });
@@ -442,14 +501,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // That nested tightening sees the value set here as its "previous", so
     // restoration is consistent.
     //
+    // SIGHUP is ignored from here until the runtime installs the reload
+    // handler (reload::spawn_sighup_task, first thing inside `block_on`). With
+    // the default disposition a HUP (a `systemctl reload`, a log-rotation
+    // script, a terminal hang-up) killed the daemon outright, skipping the seal
+    // and the drain, and before this only a TLS build with tcp_bind ever
+    // installed a handler. Set before Config::load so a HUP during recovery or
+    // the blocking replay is dropped too: safe, because the real TLS load
+    // happens later and reads the current files (spec §3.2).
+    //
     // Safety: libc::umask is always safe; it swaps the process umask and
-    // returns the previous value. No invariants to uphold.
+    // returns the previous value. libc::signal with SIG_IGN installs no handler
+    // code, so there is nothing that must be async-signal-safe, and no other
+    // thread exists yet to race the disposition change.
     #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
-    let (config, config_warnings) = Config::load()?;
+    let (config, config_warnings, config_source) = Config::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -464,6 +535,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in &config_warnings {
         warn!("config: {w}");
     }
+
+    // Name the config source, so "which file did it read?" is answerable from
+    // the log alone. A missing file has its own WARN above (spec §3.4).
+    info!(
+        config_file = %config_source.path.display(),
+        origin = if config_source.explicit { "--config" } else { "default path" },
+        loaded = config_source.found,
+        "config source"
+    );
 
     // On macOS the durable-write path uses F_BARRIERFSYNC, which orders writes
     // and survives a process/OS crash but is NOT a guaranteed media flush on
@@ -483,6 +563,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers = config.worker_count,
         "weir starting"
     );
+
+    // ── wab_dir ownership ─────────────────────────────────────────────────────
+    //
+    // Before ANYTHING reads the WAB (recovery inside wab::spawn, the replay, the
+    // drain) and before every other refuse-to-start check, so a duplicate on
+    // the same wab_dir reports "locked by" rather than some later symptom. A
+    // second daemon that got past this point would seal this one's ACTIVE
+    // segment, deliver and delete it, and turn this daemon's later Durable acks
+    // into false acks (spec §3.1). The lock is never released explicitly: the
+    // kernel drops it at process exit, after every join below, and also on an
+    // early `?` return while detached threads still run.
+    let lock_holder = wab::lock::HolderInfo::current(&config);
+    let lock_outcome =
+        wab::lock::acquire_wab_dir_lock(&config.wab_dir, config.wab_dir_lock, &lock_holder)
+            .inspect_err(|e| tracing::error!("{e}"))?;
+
+    // ── Preflight ─────────────────────────────────────────────────────────────
+    //
+    // Every refuse-to-start check that can run before recovery: the socket
+    // path (format, then a connect-only liveness probe that never unlinks), a
+    // test-bind of the metrics address, and with tcp_bind the TLS material and
+    // a test-bind of the TCP address (spec §3.0). They used to fail only after
+    // recovery, replay and the drain had started, so a refused duplicate under
+    // Restart=on-failure re-delivered its oldest unconfirmed segment on every
+    // restart. The authoritative binds and the TLS load below stay where they
+    // are; preflight narrows their late failure to a race.
+    //
+    // Contract: no refuse-to-start check may run after the drain has begun
+    // delivering.
+    preflight::preflight(&config).inspect_err(|e| tracing::error!("{e}"))?;
 
     // ── Concurrency-vs-cores advisory ─────────────────────────────────────────
     // Each shard runs a flusher thread; each worker runs a worker thread.
@@ -505,6 +615,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (metrics_struct, registry) = metrics::Metrics::new();
     let metrics = Arc::new(metrics_struct);
     let registry = Arc::new(registry);
+    metrics.wab_dir_lock_held.set(match lock_outcome {
+        wab::lock::LockOutcome::Held => 1.0,
+        wab::lock::LockOutcome::Unsupported { .. } => 0.0,
+    });
 
     // ── Queue ─────────────────────────────────────────────────────────────────
 
@@ -892,24 +1006,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     rt.block_on(async {
+        // The one reload path (spec §3.2), first in the runtime: the SIGHUP
+        // handler replaces the SIG_IGN set at the top of main, and from here a
+        // HUP is a counted reload request instead of a no-op drop. The TLS
+        // branch below registers its config once it has loaded it.
+        #[cfg(all(unix, feature = "tls"))]
+        let tls_configured = config.tcp_bind.is_some();
+        #[cfg(not(all(unix, feature = "tls")))]
+        let tls_configured = false;
+        let reloader = reload::Reloader::new(Arc::clone(&metrics), tls_configured);
+        let reload_tx = reload::spawn_reload_loop(Arc::clone(&reloader));
+        #[cfg(unix)]
+        reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
+        #[cfg(not(unix))]
+        drop(reload_tx);
+
+        // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
+        // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
+        // below; the integrity task is the only writer. Spawned first thing in
+        // the runtime so the check is live before any listener accepts.
+        let wab_ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if lock_outcome == wab::lock::LockOutcome::Held {
+            spawn_lock_integrity_task(
+                config.wab_dir.clone(),
+                Arc::clone(&metrics),
+                Arc::clone(&wab_ownership_lost),
+            );
+        }
+
         // Bind metrics listener before starting the socket loop. Default
         // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the
         // security reasoning around exposing this surface on the network.
         let metrics_listener =
             tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port))
                 .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to bind metrics endpoint to {}:{} ({e}) — another process \
-                             (often another weir-server instance) is using that port. Change it \
-                             with --metrics-port / WEIR_METRICS_PORT (or --metrics-bind / \
-                             WEIR_METRICS_BIND).",
-                            config.metrics_bind, config.metrics_port
-                        ),
-                    )
-                })?;
+                .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
         metrics::server::spawn(
             metrics_listener,
             Arc::clone(&registry),
@@ -1094,28 +1225,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match config.tcp_bind {
                 Some(bind_addr) => {
                     // Config validation guarantees the three tls_* paths are
-                    // present whenever tcp_bind is set, so these expects can't
-                    // fire on a validated Config.
-                    let cert = config
-                        .tls_cert_path
-                        .clone()
-                        .expect("config validation guarantees tls_cert_path when tcp_bind is set");
-                    let key = config
-                        .tls_key_path
-                        .clone()
-                        .expect("config validation guarantees tls_key_path when tcp_bind is set");
-                    let ca = config.tls_client_ca_path.clone().expect(
-                        "config validation guarantees tls_client_ca_path when tcp_bind is set",
-                    );
-
-                    let tls = ReloadableServerConfig::load(cert, key, ca).map_err(|e| {
-                        std::io::Error::other(format!("failed to load TLS config: {e}"))
-                    })?;
+                    // present whenever tcp_bind is set; preflight has already
+                    // loaded this material once and test-bound this address,
+                    // so a failure here is a race (spec §3.0).
+                    let (cert, key, ca) = preflight::tls_paths(&config)?;
+                    let tls = ReloadableServerConfig::load(cert, key, ca)
+                        .map_err(|e| preflight::tls_load_error(&e))?;
 
                     // Bind in the caller so a bad bind address fails startup
                     // (rather than the spawned accept task) — see socket::tcp
                     // module docs on the bound-addr design.
-                    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+                    let listener = tokio::net::TcpListener::bind(bind_addr)
+                        .await
+                        .map_err(|e| preflight::tcp_bind_error(bind_addr, &e))?;
                     let actual_addr = listener.local_addr()?;
                     info!(addr = %actual_addr, "TCP+mTLS listener bound");
 
@@ -1130,17 +1252,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         wab_max_bytes: config.wab_max_bytes,
                         wab_bytes_now: Arc::clone(&wab_bytes_now),
                         wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+                        wab_ownership_lost: Arc::clone(&wab_ownership_lost),
                     };
 
                     let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
                     let tcp_queue_tx = queue_tx.clone();
                     let tcp_metrics = Arc::clone(&metrics);
 
-                    // Spawn SIGHUP reload task before moving `tls` into tcp::run.
+                    // Register for reload before moving `tls` into tcp::run.
                     // The clone shares the same inner ArcSwap so a reload from the
-                    // SIGHUP task is immediately visible to the accept loop's
+                    // reload loop is immediately visible to the accept loop's
                     // `tls.current()` call.
-                    spawn_tls_reload_task(tls.clone(), Arc::clone(&metrics));
+                    reloader.register_tls(tls.clone());
 
                     // Pass a clone of the shared semaphore so Unix + TCP draw
                     // from the same permit pool — true global cap.
@@ -1211,6 +1334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wab_max_bytes: config.wab_max_bytes,
                 wab_bytes_now: Arc::clone(&wab_bytes_now),
                 wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+                wab_ownership_lost: Arc::clone(&wab_ownership_lost),
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
         }
@@ -1359,6 +1483,105 @@ mod tuning_tests {
 }
 
 #[cfg(test)]
+mod lock_integrity_tests {
+    use super::apply_lock_integrity;
+    use crate::metrics::Metrics;
+    use crate::wab::lock::{EXIT_WAB_OWNERSHIP_LOST, HolderInfo, LockIntegrity};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn fresh() -> (Metrics, AtomicBool) {
+        let (m, _reg) = Metrics::new();
+        m.wab_dir_lock_held.set(1.0);
+        (m, AtomicBool::new(false))
+    }
+
+    #[test]
+    fn exit_code_for_ownership_lost_is_3() {
+        // 1 stays "refused to start"; 3 is the new, distinct "ownership lost".
+        assert_eq!(EXIT_WAB_OWNERSHIP_LOST, 3);
+    }
+
+    #[test]
+    fn ok_changes_nothing() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Ok, Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(!lost.load(Ordering::Relaxed));
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 0);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
+    }
+
+    /// D4a: deleted by hand, nobody else holds it. Loud, counted, no stop.
+    #[test]
+    fn relocked_counts_keeps_the_gauge_and_keeps_running() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Relocked, Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(
+            !lost.load(Ordering::Relaxed),
+            "a re-lock must not stop ingest"
+        );
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 1);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
+    }
+
+    #[test]
+    fn error_counts_and_retries() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Error(libc::EIO), Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(!lost.load(Ordering::Relaxed), "an errno proves nothing");
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 1);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
+    }
+
+    /// D4b: proof that a second writer owns the directory. Ingest is refused
+    /// first, the gauge drops to 0, and the caller is told to exit 3. It is not
+    /// counted as an integrity failure: it is an exit, not a retry.
+    #[test]
+    fn lost_to_other_stops_ingest_drops_the_gauge_and_exits_3() {
+        let (m, lost) = fresh();
+        let verdict = LockIntegrity::LostToOther {
+            holder: Some(HolderInfo {
+                pid: 4242,
+                host: "weir-b".into(),
+                ..HolderInfo::default()
+            }),
+        };
+        assert_eq!(
+            apply_lock_integrity(verdict, Path::new("/w"), &m, &lost),
+            Some(EXIT_WAB_OWNERSHIP_LOST)
+        );
+        assert!(
+            lost.load(Ordering::Relaxed),
+            "every later push must be Nacked"
+        );
+        assert_eq!(m.wab_dir_lock_held.get(), 0.0);
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 0);
+
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(
+                LockIntegrity::LostToOther { holder: None },
+                Path::new("/w"),
+                &m,
+                &lost
+            ),
+            Some(EXIT_WAB_OWNERSHIP_LOST),
+            "an unreadable record is still proof of loss"
+        );
+        assert!(lost.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
 mod wab_bytes_tests {
     use super::compute_wab_bytes_on_disk;
 
@@ -1384,6 +1607,21 @@ mod wab_bytes_tests {
             Some(100),
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `<wab_dir>/.weir.lock` sits at the root as a regular file. The gauge
+    /// counts live shard-segment bytes only, so the lock file's bytes are NOT
+    /// counted (the root walk skips every non-directory). Pinned so a future
+    /// walker change cannot start counting it against `wab_max_bytes`.
+    #[test]
+    fn compute_wab_bytes_does_not_count_the_wab_dir_lock_file() {
+        let root = crate::testutil::scratch_dir("wab_bytes_lock");
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join(crate::wab::lock::LOCK_FILE_NAME), vec![b'x'; 77]).unwrap();
+        assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
         std::fs::remove_dir_all(&root).ok();
     }
 

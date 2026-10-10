@@ -39,6 +39,7 @@ struct RawServer {
     sink_http_concurrency: Option<usize>,
     wab_compression: Option<String>,
     wab_compression_level: Option<i32>,
+    wab_dir_lock: Option<String>,
     sink_http_batch: Option<String>,
     sink_max_retries: Option<u32>,
     sink_retry_base_delay_ms: Option<u64>,
@@ -123,6 +124,7 @@ const BASE_SERVER_KEYS: &[&str] = &[
     "sink_http_concurrency",
     "wab_compression",
     "wab_compression_level",
+    "wab_dir_lock",
     "sink_http_batch",
     "sink_max_retries",
     "sink_retry_base_delay_ms",
@@ -191,12 +193,15 @@ fn feature_compiled(feature: &str) -> bool {
 /// warnings (unknown / feature-gated keys). Warnings are returned rather than
 /// `warn!`'d because this runs before the tracing subscriber is initialised;
 /// `Config::load` replays them afterward (F54).
-pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigError> {
+///
+/// A file that does not exist is `Ok(None)`, not an error: env-only
+/// deployments (the Docker image always passes `--config`) run without one.
+/// It is no longer silent, though: `Config::load` turns `None` into a WARN
+/// naming the path (spec §3.4).
+pub(super) fn read(path: &Path) -> Result<Option<(PartialConfig, Vec<String>)>, ConfigError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((PartialConfig::empty(), Vec::new()));
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(ConfigError::IoError { source: e }),
     };
 
@@ -216,7 +221,7 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             })?;
 
     let s = raw.server.unwrap_or_default();
-    Ok((
+    Ok(Some((
         PartialConfig {
             socket_path: s.socket_path.map(PathBuf::from),
             wab_dir: s.wab_dir.map(PathBuf::from),
@@ -245,6 +250,7 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             sink_http_concurrency: s.sink_http_concurrency,
             wab_compression: s.wab_compression,
             wab_compression_level: s.wab_compression_level,
+            wab_dir_lock: s.wab_dir_lock,
             sink_http_batch: s.sink_http_batch,
             sink_max_retries: s.sink_max_retries,
             sink_retry_base_delay_ms: s.sink_retry_base_delay_ms,
@@ -294,7 +300,7 @@ pub(super) fn read(path: &Path) -> Result<(PartialConfig, Vec<String>), ConfigEr
             tls_handshake_timeout_secs: s.tls_handshake_timeout_secs,
         },
         warnings,
-    ))
+    )))
 }
 
 /// Collects advisory warnings for unknown top-level keys, unknown `[server]`
@@ -370,6 +376,21 @@ mod tests {
     /// long-standing behaviour; F55 only changed which keys get a warning, not
     /// whether parsing fails.
     #[test]
+    fn wab_dir_lock_is_a_known_key() {
+        let dir = crate::testutil::scratch_dir("filecfg_lock");
+        crate::testutil::mkdir_p(&dir);
+        let path = dir.join("weir.toml");
+        std::fs::write(&path, "[server]\nwab_dir_lock = \"best-effort\"\n").unwrap();
+        let (partial, warnings) = read(&path).unwrap().expect("the file exists");
+        assert_eq!(partial.wab_dir_lock.as_deref(), Some("best-effort"));
+        assert!(
+            warnings.iter().all(|w| !w.contains("wab_dir_lock")),
+            "wab_dir_lock must not be reported as unknown: {warnings:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn read_tolerates_feature_gated_and_unknown_keys() {
         let dir = crate::testutil::scratch_dir("filecfg");
         crate::testutil::mkdir_p(&dir);
@@ -383,7 +404,9 @@ mod tests {
         )
         .unwrap();
 
-        let (partial, warnings) = read(&path).expect("warn-only keys must not fail the parse");
+        let (partial, warnings) = read(&path)
+            .expect("warn-only keys must not fail the parse")
+            .expect("the file exists");
         // The recognised base key still applies.
         assert_eq!(partial.shard_count, Some(2));
         // The unknown key is reported as a collected warning (F54) — not silently

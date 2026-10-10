@@ -31,6 +31,7 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         sink_http_concurrency: env_parse("WEIR_SINK_HTTP_CONCURRENCY")?,
         wab_compression: env_string("WEIR_WAB_COMPRESSION")?,
         wab_compression_level: env_parse("WEIR_WAB_COMPRESSION_LEVEL")?,
+        wab_dir_lock: env_string("WEIR_WAB_DIR_LOCK")?,
         sink_http_batch: env_string("WEIR_SINK_HTTP_BATCH")?,
         sink_max_retries: env_parse("WEIR_SINK_MAX_RETRIES")?,
         sink_retry_base_delay_ms: env_parse("WEIR_SINK_RETRY_BASE_DELAY_MS")?,
