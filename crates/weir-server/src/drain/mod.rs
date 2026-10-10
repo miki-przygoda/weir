@@ -21,11 +21,15 @@
 //!
 //! # Confirmed files
 //!
-//! After draining a segment the drain writes a `.confirmed` sidecar and deletes
-//! the sealed segment. Crash recovery skips segments with a valid `.confirmed` file.
-//! A crash between writing `.confirmed` and deleting the segment is safe: crash
-//! recovery will skip the segment (confirmed), and the orphan sealed file can be
-//! cleaned up on the next startup.
+//! After draining a segment the drain writes a `.confirmed` sidecar (atomically:
+//! a fsynced `.confirmed.tmp` renamed into place) and deletes the sealed
+//! segment. Crash recovery skips segments with a valid `.confirmed` file. A
+//! crash between writing `.confirmed` and deleting the segment is safe: crash
+//! recovery skips the segment (confirmed), and the orphan sealed file is deleted
+//! by the startup scan or the stranded-segment rescan once this daemon owns the
+//! `wab_dir` ([`DrainConfig::orphan_cleanup`]). A confirm step that fails at
+//! runtime is retried by the ledger on every health poll; the segment is never
+//! delivered again.
 
 mod confirmed;
 pub mod dead_letter;
@@ -151,6 +155,12 @@ pub struct DrainConfig {
     /// a liveness check, not a delivery, so it shouldn't inherit the long
     /// commit backstop. A hung probe past this is treated as `Down`.
     pub health_probe_timeout: Duration,
+    /// Whether the stranded-segment rescan may delete an orphan: a sealed
+    /// segment beside a valid `.confirmed` sidecar, left by a crash (or a failed
+    /// delete) between the two confirm steps (spec §4.3, D7). True only while
+    /// this daemon holds the `wab_dir` lock; without it another daemon may be
+    /// mid-confirm on the same segment, so orphans are kept.
+    pub orphan_cleanup: bool,
 }
 
 // ── Internal state machine types ──────────────────────────────────────────────
@@ -483,7 +493,13 @@ fn probe_and_resume_stranded<S: Sink>(
     if now_ok && (!prev_health_ok || pending.is_empty()) {
         // `None` shard_count: skip the beyond-configured-count advisory — that's
         // a startup-replay concern, not a recovery one.
-        match crate::wab::scan_unconfirmed_sealed(&config.wab_dir, None, metrics, exclude) {
+        match crate::wab::scan_unconfirmed_sealed(
+            &config.wab_dir,
+            None,
+            metrics,
+            exclude,
+            config.orphan_cleanup,
+        ) {
             Ok(sealed) => {
                 // Dedup against what's already queued via a HashSet membership view
                 // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
@@ -725,7 +741,7 @@ fn drain_thread<S: Sink>(
                 // deliver, and finishing one can change what the rescan may
                 // pick up — then the probe + rescan, then the gauges.
                 if last_health_poll.elapsed() >= config.health_poll_interval {
-                    ledger.retry_dispositions();
+                    ledger.retry_dispositions(&metrics);
                     let now = Instant::now();
                     prev_health_ok = probe_and_resume_stranded(
                         &rt,
@@ -1151,7 +1167,7 @@ fn drain_thread<S: Sink>(
     // One best-effort pass over outstanding dispositions on the way out: a
     // sidecar or quarantine move that can complete now saves a re-delivery on
     // the next start. It never delivers.
-    ledger.retry_dispositions();
+    ledger.retry_dispositions(&metrics);
     publish_ledger_counts(ledger.counts(), &metrics);
     info!("drain thread exiting");
 }
@@ -1179,12 +1195,12 @@ fn next_state_after_process(
 ) -> DrainState {
     match result {
         ProcessResult::Confirmed { record_count } => {
-            confirm_and_delete(&segment, record_count, metrics);
+            // A confirm that did not finish is owned by the ledger from here:
+            // the polls retry only the outstanding step, and neither the
+            // channel nor the rescan delivers the segment again (spec §4.3).
+            let outcome = confirm_and_delete(&segment, record_count, metrics);
             ledger.forget(&segment);
-            #[cfg(test)]
-            if ledger.park_after_confirm.remove(&segment) {
-                ledger.park(&segment, ParkReason::LocalReadFailed);
-            }
+            ledger.note_confirm_outcome(&segment, outcome, record_count);
             end_block_episode(block_episode, metrics);
             DrainState::Draining
         }
@@ -3207,6 +3223,8 @@ mod tests {
             // Short so the stranded-segment recovery rescan fires promptly in tests.
             health_poll_interval: Duration::from_millis(50),
             health_probe_timeout: Duration::from_secs(5),
+            // As before the wab_dir lock: orphans are kept unless a test opts in.
+            orphan_cleanup: false,
         }
     }
 
@@ -3329,17 +3347,17 @@ mod tests {
     /// its `.confirmed` sidecar cannot be written) turned every channel copy and
     /// every idle rescan into a full re-delivery.
     ///
-    /// The ledger owns such a segment (the `park_after_confirm` hook stands in
-    /// for the confirm-retry state, which keeps the segment on disk the same
-    /// way), and both sources must respect that: the second channel copy is
-    /// dropped at admission, and the rescan skips the path before
-    /// `check_confirmed` can look at it.
+    /// The ledger owns such a segment (`confirm_pending`, spec §4.3: delivered,
+    /// sidecar outstanding), and both sources must respect that: the second
+    /// channel copy is dropped at admission, and the rescan skips the path
+    /// before `check_confirmed` can look at it.
     #[test]
     fn same_path_in_channel_and_rescan_is_delivered_once() {
         let dir = tmp_dir("admit_once");
         let sealed = make_sealed_segment(&dir, 0, &[b"once"]);
         // The sidecar write fails: a directory sits where `.confirmed` goes, so
-        // the delivered segment stays sealed and unconfirmed on disk.
+        // the atomic write's rename fails (EISDIR) and the delivered segment
+        // stays sealed and unconfirmed on disk.
         crate::testutil::mkdir_p(get_confirmed_path(&sealed));
 
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -3351,7 +3369,6 @@ mod tests {
         let sink = Arc::new(MockSink::with_responses([]));
         let metrics = noop_metrics();
         let mut ledger = fresh_ledger();
-        ledger.park_after_confirm.insert(sealed.clone());
         let config = fast_config(dir.clone()); // 50 ms health poll + idle rescan
         let (sink_t, metrics_t) = (Arc::clone(&sink), Arc::clone(&metrics));
         let handle = std::thread::spawn(move || {
@@ -3390,14 +3407,21 @@ mod tests {
             "the rescan must skip the path before check_confirmed, never quarantine it"
         );
         assert_eq!(
-            ledger.counts().parked_by_reason[ParkReason::LocalReadFailed.index()]
+            ledger.confirm_stage(&sealed),
+            Some(ledger::ConfirmStage::Sidecar),
+            "the ledger owns the delivered segment until its sidecar lands"
+        );
+        assert_eq!(
+            ledger
+                .counts()
+                .confirm_pending
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert_eq!(
-            parked_gauge(&metrics, crate::metrics::ParkedReason::local_read_failed),
+            confirm_pending_gauge(&metrics),
             1.0,
-            "the drain publishes the ledger's park tally to the gauge"
+            "the drain publishes the ledger's confirm_pending tally to the gauge"
         );
         std::fs::remove_dir_all(dir).ok();
     }
@@ -4378,6 +4402,320 @@ mod tests {
         assert_eq!(committed_bytes(&sink), records);
         assert!(!dir.join("quarantine").exists());
         read_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Atomic sidecar, confirm_pending, orphan deletion (spec §4.3) ─────────
+
+    /// Runs a first-start drain on its own thread with a fresh ledger, handing
+    /// the ledger back on join so a test can inspect what it still owns.
+    fn spawn_with_ledger<S: Sink + 'static>(
+        rx: crossbeam_channel::Receiver<PathBuf>,
+        sink: Arc<S>,
+        config: DrainConfig,
+        metrics: Arc<Metrics>,
+    ) -> std::thread::JoinHandle<SegmentLedger> {
+        std::thread::spawn(move || {
+            let mut ledger = fresh_ledger();
+            super::drain_thread(
+                rx,
+                sink,
+                config,
+                metrics,
+                true,
+                DrainHeartbeat::new(),
+                &mut ledger,
+            );
+            ledger
+        })
+    }
+
+    fn confirm_failures(m: &Metrics, stage: crate::metrics::ConfirmFailureStage) -> u64 {
+        m.drain_confirm_failures
+            .get_or_create(&crate::metrics::ConfirmFailureLabel { stage })
+            .get()
+    }
+
+    fn confirm_pending_gauge(m: &Metrics) -> f64 {
+        m.drain_segments_disposition_pending
+            .get_or_create(&DispositionLabel {
+                kind: DispositionKind::confirm,
+            })
+            .get()
+    }
+
+    fn tmp_sidecar(sealed: &Path) -> PathBuf {
+        crate::wab::confirmed_tmp_path(&get_confirmed_path(sealed))
+    }
+
+    /// A sidecar that cannot be written used to send the WHOLE delivered
+    /// segment back to the sink on every idle rescan (every
+    /// `health_poll_interval`), for as long as the fault lasted. Now the segment
+    /// is delivered once and only the sidecar is retried.
+    ///
+    /// A directory squatting on `seg_X.wab.confirmed.tmp` makes the sidecar's
+    /// create fail with EISDIR, which works even as root.
+    #[test]
+    fn a_directory_at_the_sidecar_tmp_retries_the_confirm_not_the_delivery() {
+        use crate::metrics::ConfirmFailureStage::sidecar;
+        let dir = tmp_dir("confirm_tmp_eisdir");
+        let sealed = make_sealed_segment(&dir, 0, &[b"once"]);
+        let tmp = tmp_sidecar(&sealed);
+        crate::testutil::mkdir_p(&tmp);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let handle = spawn_with_ledger(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+        );
+
+        wait_for(5, "several failed sidecar attempts", || {
+            confirm_failures(&metrics, sidecar) >= 3
+        });
+        wait_for(2, "the confirm_pending gauge", || {
+            confirm_pending_gauge(&metrics) == 1.0
+        });
+        assert_eq!(
+            sink.call_count(),
+            1,
+            "the segment is delivered once; the polls retry only its sidecar"
+        );
+        assert!(sealed.exists(), "the segment is kept until it is confirmed");
+        assert!(!get_confirmed_path(&sealed).exists());
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+
+        std::fs::remove_dir(&tmp).unwrap();
+        wait_for(5, "the retried confirm deletes the segment", || {
+            !sealed.exists()
+        });
+        assert!(get_confirmed_path(&sealed).exists());
+        assert_eq!(sink.call_count(), 1, "still delivered exactly once");
+        assert_eq!(segments_confirmed(&metrics), 1);
+
+        drop(tx);
+        let ledger = handle.join().unwrap();
+        assert_eq!(
+            ledger
+                .counts()
+                .confirm_pending
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(confirm_pending_gauge(&metrics), 0.0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// ENOSPC mid-write, held across several polls. The in-place write left a
+    /// torn sidecar under the final name, which the next rescan read as
+    /// corruption and QUARANTINED the delivered segment for (an operator's
+    /// `quarantine requeue` then re-sent all of it). Now nothing appears under
+    /// the final name, nothing is quarantined, and the sink sees the segment
+    /// once.
+    #[test]
+    fn a_short_sidecar_write_never_leaves_a_torn_sidecar_or_quarantines() {
+        use crate::metrics::ConfirmFailureStage::sidecar;
+        use confirmed::confirm_hook::{self, Fault};
+        let dir = tmp_dir("confirm_short_write");
+        let sealed = make_sealed_segment(&dir, 0, &[b"once"]);
+        confirm_hook::fail(&sealed, Fault::ShortWrite, libc::ENOSPC, u32::MAX);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let handle = spawn_with_ledger(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+        );
+
+        wait_for(5, "several short sidecar writes", || {
+            confirm_failures(&metrics, sidecar) >= 3
+        });
+        assert!(
+            !get_confirmed_path(&sealed).exists(),
+            "no sidecar under the final name"
+        );
+        assert!(!tmp_sidecar(&sealed).exists(), "no partial tmp left behind");
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        assert!(sealed.exists());
+        assert_eq!(sink.call_count(), 1);
+
+        confirm_hook::clear(&sealed);
+        wait_for(5, "the confirm completes once the disk has room", || {
+            !sealed.exists()
+        });
+        let sidecar_bytes = std::fs::read(get_confirmed_path(&sealed)).unwrap();
+        let meta = crate::wab::format::parse_confirmed(&sidecar_bytes).unwrap();
+        assert_eq!(meta.record_count, 1);
+        assert_eq!(sink.call_count(), 1);
+
+        drop(tx);
+        handle.join().unwrap();
+        confirm_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A failed `sync_all` on the sidecar: nothing is renamed or deleted on the
+    /// strength of a page-cache-only sidecar, and the retry, not a
+    /// re-delivery, finishes the confirm.
+    #[test]
+    fn a_failed_sidecar_fsync_is_retried_without_redelivery() {
+        use crate::metrics::ConfirmFailureStage::sidecar;
+        use confirmed::confirm_hook::{self, Fault};
+        let dir = tmp_dir("confirm_sync_fail");
+        let sealed = make_sealed_segment(&dir, 0, &[b"once"]);
+        confirm_hook::fail(&sealed, Fault::Sync, libc::EIO, 2);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let handle = spawn_with_ledger(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+        );
+        wait_for(5, "the confirm completes after two failed fsyncs", || {
+            !sealed.exists()
+        });
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(confirm_failures(&metrics, sidecar), 2);
+        assert_eq!(sink.call_count(), 1);
+        assert!(get_confirmed_path(&sealed).exists());
+        assert_eq!(confirm_hook::sidecar_writes(&sealed), 3);
+        confirm_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A delete that fails after a durable sidecar is the cheapest stage to
+    /// retry: only `remove_file`, never the sidecar again, never the delivery.
+    /// Before, it only WARNed, and the orphan stayed on disk (and in the WAB
+    /// byte count) for the life of the process.
+    #[test]
+    fn a_failed_delete_retries_only_the_delete() {
+        use crate::metrics::ConfirmFailureStage::{delete, sidecar};
+        use confirmed::confirm_hook::{self, Fault};
+        let dir = tmp_dir("confirm_delete_fail");
+        let sealed = make_sealed_segment(&dir, 0, &[b"once"]);
+        confirm_hook::fail(&sealed, Fault::Delete, libc::EIO, u32::MAX);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let handle = spawn_with_ledger(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+        );
+        wait_for(5, "several failed deletes", || {
+            confirm_failures(&metrics, delete) >= 3
+        });
+        drop(tx);
+        let mut ledger = handle.join().unwrap();
+
+        assert_eq!(sink.call_count(), 1, "never delivered again");
+        assert_eq!(
+            ledger.confirm_stage(&sealed),
+            Some(ledger::ConfirmStage::Delete)
+        );
+        assert_eq!(
+            confirm_hook::sidecar_writes(&sealed),
+            1,
+            "the durable sidecar is not rewritten; only the delete is retried"
+        );
+        assert_eq!(confirm_failures(&metrics, sidecar), 0);
+        assert!(get_confirmed_path(&sealed).exists());
+        assert!(sealed.exists());
+        assert_eq!(
+            segments_confirmed(&metrics),
+            1,
+            "confirmed once, not per retry"
+        );
+
+        confirm_hook::clear(&sealed);
+        ledger.retry_dispositions(&metrics);
+        assert!(!sealed.exists());
+        assert_eq!(ledger.confirm_stage(&sealed), None);
+        assert_eq!(segments_confirmed(&metrics), 1);
+        confirm_hook::forget(&sealed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An orphan pre-seeded on disk (a sealed segment beside a valid sidecar)
+    /// is deleted by the drain's idle rescan when the daemon owns the
+    /// `wab_dir`, and kept when it does not. Either way it is never delivered.
+    #[test]
+    fn the_idle_rescan_deletes_an_orphan_only_when_the_wab_dir_is_owned() {
+        for orphan_cleanup in [true, false] {
+            let dir = tmp_dir(&format!("rescan_orphan_{orphan_cleanup}"));
+            let orphan = make_sealed_segment(&dir, 0, &[b"delivered last run"]);
+            std::fs::write(
+                get_confirmed_path(&orphan),
+                crate::wab::format::build_confirmed(0, 1, 1),
+            )
+            .unwrap();
+
+            let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+            let sink = Arc::new(MockSink::with_responses([]));
+            let config = DrainConfig {
+                orphan_cleanup,
+                ..fast_config(dir.clone())
+            };
+            let handle = spawn_with_ledger(rx, Arc::clone(&sink), config, noop_metrics());
+            if orphan_cleanup {
+                wait_for(5, "the rescan deletes the orphan", || !orphan.exists());
+            } else {
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(orphan.exists(), "without the lock the orphan is kept");
+            }
+            drop(tx);
+            handle.join().unwrap();
+            assert_eq!(sink.call_count(), 0, "an orphan is never delivered");
+            assert!(get_confirmed_path(&orphan).exists(), "the tombstone stays");
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Review Focus 4: a 0-byte `.confirmed` that 4.0.x's in-place write tore
+    /// is quarantined once by the rescan, exactly as today — not deleted as an
+    /// orphan (it proves nothing), not delivered, and not touched again by the
+    /// polls after it.
+    #[test]
+    fn a_legacy_torn_sidecar_is_quarantined_once_by_the_rescan() {
+        let dir = tmp_dir("rescan_legacy_torn");
+        let sealed = make_sealed_segment(&dir, 0, &[b"maybe delivered"]);
+        std::fs::write(get_confirmed_path(&sealed), b"").unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            orphan_cleanup: true,
+            ..fast_config(dir.clone())
+        };
+        let handle = spawn_with_ledger(rx, Arc::clone(&sink), config, Arc::clone(&metrics));
+        wait_for(5, "the torn sidecar's segment is quarantined", || {
+            quarantined_copy(&dir, &sealed).exists()
+        });
+        std::thread::sleep(Duration::from_millis(300)); // several more polls
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        assert_eq!(sink.call_count(), 0);
+        assert!(!sealed.exists());
         std::fs::remove_dir_all(dir).ok();
     }
 

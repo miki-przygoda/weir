@@ -38,7 +38,11 @@ use std::{
     time::Instant,
 };
 
+use tracing::info;
 use weir_core::Payload;
+
+use super::confirmed::{self, ConfirmOutcome};
+use crate::metrics::Metrics;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -137,7 +141,6 @@ pub(crate) struct DeadLetterCarry {
 }
 
 /// Which step of a confirm is still outstanding for a delivered segment (§4.3).
-#[allow(dead_code)] // populated by the atomic-sidecar confirm (spec §4.3)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfirmStage {
     Sidecar,
@@ -146,7 +149,6 @@ pub(crate) enum ConfirmStage {
 
 /// A delivered segment whose `.confirmed` sidecar or delete is outstanding
 /// (§4.3). Delivery is never retried for it; only the confirm is.
-#[allow(dead_code)] // populated by the atomic-sidecar confirm (spec §4.3)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConfirmPending {
     pub stage: ConfirmStage,
@@ -191,11 +193,6 @@ pub(crate) struct SegmentLedger {
     #[allow(dead_code)] // populated by the drain-panic supervisor (spec §4.12)
     in_flight: Option<PathBuf>,
     counts: Arc<LedgerCounts>,
-    /// Test-only stand-in for a ledger-owned disposition: a path in this set is
-    /// parked right after its confirm, so a test can hold a DELIVERED segment on
-    /// disk and prove that neither the channel nor the rescan re-delivers it.
-    #[cfg(test)]
-    pub(crate) park_after_confirm: std::collections::HashSet<PathBuf>,
 }
 
 impl SegmentLedger {
@@ -211,8 +208,6 @@ impl SegmentLedger {
             panic_count: HashMap::new(),
             in_flight: None,
             counts,
-            #[cfg(test)]
-            park_after_confirm: std::collections::HashSet::new(),
         };
         ledger.sync_counts();
         ledger
@@ -347,13 +342,77 @@ impl SegmentLedger {
         self.sync_counts();
     }
 
+    /// Takes ownership of a delivered segment whose confirm did not finish
+    /// (§4.3): from here on admission drops every copy of `path`, the rescan
+    /// skips it, and [`Self::retry_dispositions`] retries only the outstanding
+    /// stage. `Done` releases nothing because nothing was taken.
+    pub(crate) fn note_confirm_outcome(
+        &mut self,
+        path: &Path,
+        outcome: ConfirmOutcome,
+        record_count: u64,
+    ) {
+        let stage = match outcome {
+            ConfirmOutcome::Done => return,
+            ConfirmOutcome::SidecarFailed => ConfirmStage::Sidecar,
+            ConfirmOutcome::DeleteFailed => ConfirmStage::Delete,
+        };
+        self.confirm_pending.insert(
+            path.to_path_buf(),
+            ConfirmPending {
+                stage,
+                record_count,
+            },
+        );
+        self.sync_counts();
+    }
+
     /// Retries outstanding dispositions — the sidecar write and delete of
     /// `confirm_pending`, the move of `quarantine_pending`. **It never
     /// delivers.** Runs first in every health poll and once on drain exit.
     ///
-    /// Nothing populates either set yet, so there is nothing to retry; the call
-    /// sites already sit where the spec orders them.
-    pub(crate) fn retry_dispositions(&mut self) {}
+    /// A `Sidecar` entry redoes the whole confirm (the atomic sidecar, then the
+    /// delete); a `Delete` entry, whose sidecar is already durable, redoes only
+    /// the delete. A segment that has vanished meanwhile (an operator removed
+    /// it, or a concurrent scan deleted it as an orphan) completes as `Done`.
+    pub(crate) fn retry_dispositions(&mut self, metrics: &Metrics) {
+        if self.confirm_pending.is_empty() {
+            return;
+        }
+        let mut done = Vec::new();
+        for (path, pending) in self.confirm_pending.iter_mut() {
+            let outcome = match pending.stage {
+                ConfirmStage::Sidecar => {
+                    confirmed::confirm_and_delete(path, pending.record_count, metrics)
+                }
+                ConfirmStage::Delete => confirmed::delete_confirmed_segment(path, metrics),
+            };
+            match outcome {
+                ConfirmOutcome::Done => {
+                    info!(
+                        path = %path.display(),
+                        "drain: outstanding confirm completed; segment confirmed and deleted \
+                         without re-delivery"
+                    );
+                    done.push(path.clone());
+                }
+                // Still failing; counted by the confirm itself. Retried next poll.
+                ConfirmOutcome::SidecarFailed => {}
+                // The sidecar landed: from now on only the delete is owed.
+                ConfirmOutcome::DeleteFailed => pending.stage = ConfirmStage::Delete,
+            }
+        }
+        for path in done {
+            self.confirm_pending.remove(&path);
+        }
+        self.sync_counts();
+    }
+
+    /// The outstanding confirm stage of `path`, if the ledger owns it.
+    #[cfg(test)]
+    pub(crate) fn confirm_stage(&self, path: &Path) -> Option<ConfirmStage> {
+        self.confirm_pending.get(path).map(|c| c.stage)
+    }
 
     /// The shared count mirrors.
     pub(crate) fn counts(&self) -> &Arc<LedgerCounts> {
@@ -615,6 +674,38 @@ mod tests {
             classify(&io::Error::from(io::ErrorKind::Interrupted)),
             ErrClass::Process
         );
+    }
+
+    /// The confirm_pending lifecycle (spec §4.3): an unfinished confirm makes
+    /// the ledger own the path (admission drops it, the rescan excludes it, the
+    /// gauge mirror counts it), a `Done` outcome takes nothing, and a segment
+    /// that vanished while its sidecar was outstanding is released without
+    /// writing a sidecar for a file that no longer exists.
+    #[test]
+    fn a_confirm_pending_entry_owns_the_path_until_the_confirm_finishes() {
+        let (dir, path) = file("confirm_pending");
+        let metrics = Metrics::new().0;
+        let now = Instant::now();
+
+        let mut l = ledger();
+        l.note_confirm_outcome(&path, ConfirmOutcome::Done, 1);
+        assert_eq!(l.confirm_stage(&path), None, "Done takes nothing");
+
+        l.note_confirm_outcome(&path, ConfirmOutcome::SidecarFailed, 1);
+        assert_eq!(l.confirm_stage(&path), Some(ConfirmStage::Sidecar));
+        assert_eq!(l.admit(&path, now), Admit::Drop("confirm_pending"));
+        assert!(l.excludes(&path, now));
+        assert_eq!(l.counts().confirm_pending.load(Ordering::Relaxed), 1);
+
+        std::fs::remove_file(&path).unwrap();
+        l.retry_dispositions(&metrics);
+        assert_eq!(l.confirm_stage(&path), None);
+        assert_eq!(l.counts().confirm_pending.load(Ordering::Relaxed), 0);
+        assert!(
+            !crate::wab::format::confirmed_path_for(&path).exists(),
+            "no sidecar is written for a segment that is gone"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

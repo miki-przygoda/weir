@@ -193,7 +193,13 @@ On a healthy daemon a sealed segment does **not** linger on disk. After the drai
 
 So in steady state a `.wab.confirmed` sidecar **frequently has no surviving `.wab.sealed` segment beside it** — the segment was deleted the moment delivery was confirmed. **A tool that derives a sealed path from a `.confirmed` sidecar and opens it will usually hit `ENOENT`.** Treat the `.confirmed` sidecar as a tombstone ("this segment was delivered and removed"), not as a pointer to a still-present segment.
 
-The delete is deliberately second: if the `.confirmed` write fails, the segment is **preserved** (no `.confirmed`, segment still on disk) so recovery re-drains it on the next restart — a duplicate absorbed by the at-least-once + dedup contract, never a deleted-but-unconfirmed segment. The only window where a `.sealed` and its `.confirmed` coexist is a crash *between* step 1 and step 2; recovery resolves it by skipping replay (the `.confirmed` is valid) and the orphaned `.sealed` is left for the operator.
+The sidecar write is atomic: the bytes go to a transient `seg_<N>.wab.confirmed.tmp` (mode 0600), which is fsynced, renamed to `seg_<N>.wab.confirmed`, and the shard directory is then fsynced. The final name therefore only ever holds complete, durable contents. A crash or a full disk mid-write leaves at worst a stale `.confirmed.tmp`, which no reader treats as a segment or a sidecar (`weir-ctl` included) and which the next sealed-segment scan deletes.
+
+The delete is deliberately second: if the `.confirmed` write fails, the segment is **preserved** (no `.confirmed`, segment still on disk), never a deleted-but-unconfirmed segment. While the daemon runs, it retries only the failed step (the sidecar, or the delete after a durable sidecar) on every health poll, and never re-delivers the segment; `weir_drain_confirm_failures_total{stage}` counts the failures and `weir_drain_segments_disposition_pending{kind="confirm"}` the segments waiting. A restart before the retry succeeds re-drains the segment once — a duplicate absorbed by the at-least-once + dedup contract.
+
+A `.sealed` and its valid `.confirmed` coexist only after a crash (or a failed delete) *between* step 1 and step 2: an **orphan**. It is never replayed. When the daemon holds the `wab_dir` lock, the startup scan and the drain's stranded-segment rescan delete it: the sidecar and the shard directory are fsynced first, so the tombstone is durable before the segment goes, and the `.confirmed` tombstone stays. Without the lock (`wab_dir_lock = "best-effort"` on a filesystem that cannot lock) orphans are kept, because another instance may still be confirming them; they are skipped and count toward `weir_wab_bytes_on_disk` until removed.
+
+A `.confirmed` that is present but fails to parse (wrong length, bad magic or CRC, unknown version) is still quarantined together with its segment. The atomic write means this version never produces a torn sidecar; one torn by the in-place write of 4.0.x and earlier is quarantined once on upgrade, as before.
 
 ---
 
@@ -229,9 +235,10 @@ A segment rotates (`should_rotate() == true`) when `bytes_written >=` the config
 seg_{counter:08}.wab          active
 seg_{counter:08}.wab.sealed   sealed, awaiting drain
 seg_{counter:08}.wab.confirmed  drain-confirmed
+seg_{counter:08}.wab.confirmed.tmp  transient: a sidecar being written (see Post-drain steady state)
 ```
 
-`counter` is a monotonically increasing `u64`, zero-padded to 8 digits, starting at 1. On startup, `ShardWriter::scan_and_advance_counter` advances `next_counter` past the highest existing counter to prevent collisions with existing sealed segments.
+`counter` is a monotonically increasing `u64`, zero-padded to 8 digits, starting at 1. On startup, `ShardWriter::scan_and_advance_counter` advances `next_counter` past the highest existing counter to prevent collisions with existing sealed segments. It parses the `seg_<digits>` prefix of every name, so a leftover `.confirmed.tmp` can only advance the counter, never rewind it.
 
 ---
 

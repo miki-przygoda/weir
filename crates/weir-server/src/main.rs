@@ -582,6 +582,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Drain ─────────────────────────────────────────────────────────────────
 
+    // Orphan deletion (spec §4.3, D7) is safe only while this daemon owns the
+    // wab_dir: with a second daemon on the same directory, a sealed segment
+    // beside a valid sidecar may be that daemon's confirm in progress. The
+    // ownership comes from the wab_dir lock (`LockOutcome::Held`); until that
+    // is wired in, orphans are kept, exactly as before.
+    let orphan_cleanup = false;
     let drain_config = DrainConfig {
         wab_dir: config.wab_dir.clone(),
         dead_letter_max_bytes: config.dead_letter_max_bytes,
@@ -596,6 +602,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A health probe is a liveness check, not a delivery, so cap it well below
         // commit_timeout: 5s, or the sink's own timeout if that's shorter.
         health_probe_timeout: Duration::from_secs(config.sink_timeout_secs.min(5)),
+        orphan_cleanup,
     };
 
     // A counter the drain bumps once per loop iteration (see
@@ -882,7 +889,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // larger than the channel capacity would otherwise dead-lock startup (B3).
     // Runs before the socket binds, so the recovery backlog is queued ahead of
     // any newly-accepted traffic.
-    wab::replay_unconfirmed(&config.wab_dir, config.shard_count, &replay_tx, &metrics)?;
+    wab::replay_unconfirmed(
+        &config.wab_dir,
+        config.shard_count,
+        &replay_tx,
+        &metrics,
+        orphan_cleanup,
+    )?;
     drop(replay_tx); // release the startup sender so shutdown can close the drain channel
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
@@ -1384,6 +1397,19 @@ mod wab_bytes_tests {
             Some(100),
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A stale `seg_X.wab.confirmed.tmp` (the atomic sidecar write's transient
+    /// file, spec §4.3) holds no record bytes and must not count toward the cap.
+    #[test]
+    fn compute_wab_bytes_ignores_a_confirmed_tmp_file() {
+        let root = crate::testutil::scratch_dir("wab_bytes_tmp");
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        std::fs::write(shard.join("seg_00000002.wab.confirmed.tmp"), vec![0u8; 999]).unwrap();
+        assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
         std::fs::remove_dir_all(&root).ok();
     }
 

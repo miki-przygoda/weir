@@ -177,6 +177,20 @@ pub enum DispositionKind {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfirmFailureLabel {
+    pub stage: ConfirmFailureStage,
+}
+
+/// Which step of a delivered segment's confirm failed: the atomic `.confirmed`
+/// sidecar write, or the delete of the segment after it.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ConfirmFailureStage {
+    sidecar,
+    delete,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsHandshakeFailureLabel {
     pub reason: TlsHandshakeFailureReason,
 }
@@ -398,6 +412,9 @@ pub(crate) struct Metrics {
     pub drain_segments_parked: Family<ParkedLabel, Gauge<f64, AtomicU64>>,
     /// Finished segments with a confirm or quarantine step still outstanding.
     pub drain_segments_disposition_pending: Family<DispositionLabel, Gauge<f64, AtomicU64>>,
+    /// Failed confirm steps for delivered segments, by stage. Each failure is
+    /// retried on the next health poll without re-delivering the segment.
+    pub drain_confirm_failures: Family<ConfirmFailureLabel, Counter<u64, AtomicU64>>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -744,6 +761,15 @@ impl Metrics {
              the segment delete, kind=\"quarantine\" the move into quarantine/. These are \
              never re-delivered"
         );
+        let drain_confirm_failures = reg!(
+            Family::<ConfirmFailureLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_drain_confirm_failures",
+            "Failed steps confirming a delivered WAB segment: stage=\"sidecar\" is the atomic \
+             .confirmed write (tmp, fsync, rename, directory fsync), stage=\"delete\" the removal \
+             of the segment after a durable sidecar. Each is retried on every health poll; the \
+             segment is never re-delivered. A rising sidecar count usually means the WAB device \
+             is full or read-only"
+        );
 
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
@@ -814,6 +840,7 @@ impl Metrics {
             drain_local_io_strands,
             drain_segments_parked,
             drain_segments_disposition_pending,
+            drain_confirm_failures,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -892,6 +919,11 @@ impl Metrics {
                 .drain_segments_disposition_pending
                 .get_or_create(&DispositionLabel { kind })
                 .set(0.0);
+        }
+        for stage in [ConfirmFailureStage::sidecar, ConfirmFailureStage::delete] {
+            let _ = metrics
+                .drain_confirm_failures
+                .get_or_create(&ConfirmFailureLabel { stage });
         }
 
         // Pre-initialise the labeled nack counter family so the series exist at 0
@@ -990,6 +1022,7 @@ mod tests {
             "weir_drain_local_io_strands",
             "weir_drain_segments_parked",
             "weir_drain_segments_disposition_pending",
+            "weir_drain_confirm_failures",
         ];
         for name in expected {
             assert!(
@@ -1036,6 +1069,8 @@ mod tests {
             "weir_drain_segments_parked{reason=\"drain_panic\"} 0",
             "weir_drain_segments_disposition_pending{kind=\"confirm\"} 0",
             "weir_drain_segments_disposition_pending{kind=\"quarantine\"} 0",
+            "weir_drain_confirm_failures_total{stage=\"sidecar\"} 0",
+            "weir_drain_confirm_failures_total{stage=\"delete\"} 0",
         ] {
             assert!(
                 out.contains(series),
