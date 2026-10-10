@@ -1677,6 +1677,99 @@ fn readonly_wab_dir_prevents_startup() {
     );
 }
 
+/// Spec §3.4 (D10), end to end: an env-only daemon whose `--config` names a
+/// file that does not exist still starts (the Docker image always passes
+/// `--config`), but its log now says so, naming the path and escalating for
+/// the noop sink, and logs the config source. Before this the missing file was
+/// read as an empty layer with no log line at all.
+#[test]
+fn missing_config_file_warns_and_logs_source_at_startup() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp_dir = std::env::temp_dir().join(format!("weir_nocfg_{}", std::process::id()));
+    let wab_dir = tmp_dir.join("wab");
+    let socket_dir = tmp_dir.join("run");
+    let socket_path = socket_dir.join("weir.sock");
+    let missing = tmp_dir.join("no-such-weir.toml");
+    fs::create_dir_all(&wab_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_weir-server"))
+        .args(["--config", missing.to_str().unwrap()])
+        .env("WEIR_SOCKET_PATH", &socket_path)
+        .env("WEIR_WAB_DIR", &wab_dir)
+        .env("WEIR_METRICS_PORT", free_port().to_string())
+        .env("WEIR_LOG_LEVEL", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn weir-server");
+
+    // tracing's fmt subscriber writes to stdout; read both streams so a
+    // future writer change does not silently blind this test.
+    let (tx, rx) = mpsc::channel::<String>();
+    let readers: Vec<_> = [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ]
+    .into_iter()
+    .map(|stream| {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        })
+    })
+    .collect();
+    drop(tx);
+
+    let path = missing.display().to_string();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut log = Vec::new();
+    let (mut warned, mut sourced) = (None, false);
+    while Instant::now() < deadline && !(warned.is_some() && sourced) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if line.contains(&path) && line.contains("does not exist") {
+                    warned = Some(line.clone());
+                }
+                if line.contains("config source") {
+                    sourced = true;
+                }
+                log.push(line);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let still_running = child.try_wait().ok().flatten().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    for r in readers {
+        let _ = r.join();
+    }
+    fs::remove_dir_all(&tmp_dir).ok();
+
+    let warned = warned.unwrap_or_else(|| panic!("no missing-config WARN naming {path}: {log:#?}"));
+    assert!(warned.contains("WARN"), "must be a WARN: {warned}");
+    assert!(
+        warned.contains("--config"),
+        "explicit --config named: {warned}"
+    );
+    assert!(
+        warned.contains("DISCARDED"),
+        "noop sink escalation: {warned}"
+    );
+    assert!(sourced, "no 'config source' INFO line: {log:#?}");
+    assert!(
+        still_running,
+        "a missing config file must not stop the daemon: {log:#?}"
+    );
+}
+
 // ── Multi-shard correctness ───────────────────────────────────────────────────
 
 #[test]

@@ -59,7 +59,7 @@ Three-layer configuration: `CLI > env > TOML file > defaults`.
 - `validate_path(field, path)` — full four-check sequence (absolute, no `..`, no null bytes, `canonicalize()` re-validated against same checks). Used for `wab_dir`. Returns `ConfigError::PathInvalid` with field name on failure.
 - `validate_path_format(field, path)` — format-only check (no `canonicalize()`). Used for `socket_path`, which does not exist until bind time.
 - `ConfigError` — manual `impl std::error::Error`, no `thiserror`. Variants: `InvalidValue`, `ParseError`, `IoError`, `PathInvalid`.
-- Unknown TOML keys produce a `warn!` log; a missing config file is treated as an empty layer.
+- Unknown TOML keys produce a `warn!` log; a missing config file is treated as an empty layer (not an error) but logs a WARN naming the path, escalated when the resolved sink is `noop`. The startup log names the config source.
 - See `deploy/docker/weir.toml.example` for all fields, defaults, valid ranges, and `WEIR_*` env-var equivalents.
 
 ### Socket layer (`src/socket/`) — Unix only

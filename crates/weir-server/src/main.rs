@@ -520,7 +520,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
-    let (config, config_warnings) = Config::load()?;
+    let (config, config_warnings, config_source) = Config::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -535,6 +535,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in &config_warnings {
         warn!("config: {w}");
     }
+
+    // Name the config source, so "which file did it read?" is answerable from
+    // the log alone. A missing file has its own WARN above (spec §3.4).
+    info!(
+        config_file = %config_source.path.display(),
+        origin = if config_source.explicit { "--config" } else { "default path" },
+        loaded = config_source.found,
+        "config source"
+    );
 
     // On macOS the durable-write path uses F_BARRIERFSYNC, which orders writes
     // and survives a process/OS crash but is NOT a guaranteed media flush on
