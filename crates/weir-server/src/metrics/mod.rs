@@ -845,10 +845,11 @@ impl Metrics {
             "weir_drain_busy_seconds",
             "Seconds the drain thread has spent in its current operation, by kind: \
              sink_commit and sink_probe are calls into the sink; segment_read, local_fsync, \
-             dead_letter_write, quarantine_move and dir_scan are local I/O on the WAB device. \
-             Only the current kind is non-zero; all read 0 between operations. Sampled every \
-             5 s. A large local value means a slow disk, which a restart does not fix; a \
-             sink_commit value past commit_timeout means a sink blocking the drain thread"
+             dead_letter_write, quarantine_move and dir_scan are local I/O on the WAB device \
+             (dir_scan includes the rescan's orphan-file cleanup fsync). Only the current \
+             kind is non-zero; all read 0 between operations. Sampled every 5 s. A large \
+             local value means a slow disk, which a restart does not fix; a sink_commit \
+             value past commit_timeout means a sink blocking the drain thread"
         );
 
         #[cfg(feature = "bench-trace")]

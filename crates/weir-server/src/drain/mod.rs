@@ -637,11 +637,11 @@ fn probe_and_resume_stranded<S: Sink>(
 /// Bumped at the top of the outer loop, inside every deliberate wait (the
 /// retry backoff and the dead-letter-full block), after every sink commit and
 /// every [`READ_HEARTBEAT_EVERY`] records read, because a drain that is merely
-/// WAITING, or working through one large segment, is not wedged. A single retry backoff can legitimately run to
-/// `MAX_RETRY_DELAY` (300 s), and the blocked arm parks indefinitely — both far
-/// past the stall warning's `health_poll_interval + 15 s` threshold — so
-/// bumping only at the loop head would report a slow-but-healthy sink as a
-/// blocked OS thread.
+/// WAITING, or working through one large segment, is not wedged. A single
+/// retry backoff can legitimately run to `MAX_RETRY_DELAY` (300 s), and the
+/// blocked arm parks indefinitely — both far past the stall warning's
+/// `health_poll_interval + 15 s` threshold — so bumping only at the loop head
+/// would report a slow-but-healthy sink as a blocked OS thread.
 ///
 /// The drain runs on a current-thread runtime, so a sink that BLOCKS the
 /// thread (a blocking DB driver, `std::fs`, a spin loop) defeats both
@@ -762,6 +762,11 @@ pub(crate) enum BusyKind {
     LocalFsync = 4,
     DeadLetterWrite = 5,
     QuarantineMove = 6,
+    /// A directory walk: the stranded-segment rescan, the dead-letter rescan
+    /// or the quarantine size walk. The rescan's orphan-file cleanup fsync
+    /// (`wab::scan_unconfirmed_sealed`) also reads as this kind rather than
+    /// `LocalFsync`: it runs inside the walk, and both are local I/O, so the
+    /// verdict is the same.
     DirScan = 7,
 }
 

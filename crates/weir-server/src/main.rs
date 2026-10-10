@@ -357,6 +357,205 @@ fn growth_warning_is_due(last_warned: Option<std::time::Instant>, now: std::time
     }
 }
 
+impl DrainStallVerdict {
+    /// How urgent the verdict is, for the log rate limit in
+    /// [`stall_log_is_due`]. `Stopped` ranks above `Wedged` because it carries
+    /// the opposite advice (there is no sink call to hunt), so a wedge that
+    /// turns into a dead drain is logged at once too.
+    fn severity(self) -> u8 {
+        match self {
+            Self::SlowSinkCall { .. } => 0,
+            Self::SlowLocalIo { .. } => 1,
+            Self::Wedged => 2,
+            Self::Stopped => 3,
+        }
+    }
+}
+
+/// Whether a stall verdict may be logged at `now`, given the last one logged.
+///
+/// A repeat, or a milder verdict, waits out [`WAB_GROWTH_WARN_INTERVAL`] like
+/// any other periodic warning. An ESCALATION is logged at once: a sink that
+/// blocks the drain's OS thread always reads first as a slow sink call (an INFO
+/// that says no action is needed) and only becomes `Wedged` once it outlives
+/// `commit_timeout` + [`SINK_CALL_GRACE`] — about 35 s later at defaults. With
+/// one shared rate limit, that INFO held the wedge WARN back for five minutes,
+/// in exactly the case the stall check exists for.
+fn stall_log_is_due(
+    last_logged: Option<(std::time::Instant, DrainStallVerdict)>,
+    verdict: DrainStallVerdict,
+    now: std::time::Instant,
+) -> bool {
+    match last_logged {
+        None => true,
+        Some((at, last)) => {
+            verdict.severity() > last.severity() || growth_warning_is_due(Some(at), now)
+        }
+    }
+}
+
+/// The heartbeat-stall check's state across 5 s polls: the last heartbeat
+/// seen, when it last moved, and the last verdict logged (for
+/// [`stall_log_is_due`]).
+struct DrainLiveness {
+    health_poll_interval: Duration,
+    commit_timeout: Duration,
+    last_heartbeat: Option<u64>,
+    heartbeat_changed_at: std::time::Instant,
+    last_logged: Option<(std::time::Instant, DrainStallVerdict)>,
+}
+
+impl DrainLiveness {
+    fn new(
+        now: std::time::Instant,
+        health_poll_interval: Duration,
+        commit_timeout: Duration,
+    ) -> Self {
+        Self {
+            health_poll_interval,
+            commit_timeout,
+            last_heartbeat: None,
+            heartbeat_changed_at: now,
+            last_logged: None,
+        }
+    }
+
+    /// Folds one poll's reading in. Returns the verdict to log on this poll,
+    /// with how long the heartbeat has been frozen, or `None` when the drain
+    /// is moving, still inside the grace period, or rate-limited.
+    fn observe(
+        &mut self,
+        now: std::time::Instant,
+        heartbeat: u64,
+        drain_stopped: bool,
+        busy: Option<(drain::BusyKind, Duration)>,
+    ) -> Option<(DrainStallVerdict, Duration)> {
+        match self.last_heartbeat.replace(heartbeat) {
+            Some(prev) if drain_appears_stalled(prev, heartbeat) => {
+                let frozen_for = now.saturating_duration_since(self.heartbeat_changed_at);
+                let verdict = drain_stall_verdict(
+                    frozen_for,
+                    self.health_poll_interval,
+                    drain_stopped,
+                    busy,
+                    self.commit_timeout,
+                )?;
+                if !stall_log_is_due(self.last_logged, verdict, now) {
+                    return None;
+                }
+                self.last_logged = Some((now, verdict));
+                Some((verdict, frozen_for))
+            }
+            _ => {
+                self.heartbeat_changed_at = now;
+                None
+            }
+        }
+    }
+}
+
+/// The 5 s polling task's state: the WAB-size scan feeding the
+/// `wab_max_bytes` cap and the growth warning, and the drain-heartbeat stall
+/// check with its busy gauge.
+struct WabPoll {
+    metrics: Arc<crate::metrics::Metrics>,
+    wab_bytes_now: Arc<std::sync::atomic::AtomicU64>,
+    wab_max_bytes: u64,
+    heartbeat: DrainHeartbeat,
+    liveness: DrainLiveness,
+    /// Rolling window of on-disk-byte samples feeding `should_warn_wab_growth`.
+    samples: Vec<u64>,
+    /// The last time the growth warning fired (rate-limited).
+    last_growth_warned: Option<std::time::Instant>,
+}
+
+impl WabPoll {
+    fn new(
+        metrics: Arc<crate::metrics::Metrics>,
+        wab_bytes_now: Arc<std::sync::atomic::AtomicU64>,
+        wab_max_bytes: u64,
+        heartbeat: DrainHeartbeat,
+        liveness: DrainLiveness,
+    ) -> Self {
+        Self {
+            metrics,
+            wab_bytes_now,
+            wab_max_bytes,
+            heartbeat,
+            liveness,
+            samples: Vec::with_capacity(WAB_GROWTH_WINDOW + 1),
+            last_growth_warned: None,
+        }
+    }
+
+    /// One tick. Returns the stall verdict logged on it, if any.
+    ///
+    /// The drain-liveness check runs FIRST, before the WAB scan can end the
+    /// tick: a failing scan (an unreadable shard, a dirent error) must not
+    /// silence the one signal that says whether the drain is alive (spec
+    /// §4.8). `scan` is a closure rather than a started task so it begins only
+    /// where it is awaited, and so a test can hand in a failing one.
+    async fn tick<F, Fut>(&mut self, now: std::time::Instant, scan: F) -> Option<DrainStallVerdict>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Option<u64>, tokio::task::JoinError>>,
+    {
+        let logged = self.check_drain_liveness(now);
+
+        // On a join failure the last known size stands and this tick
+        // contributes no sample — see `apply_wab_scan` for why neither 0 nor a
+        // repeated value is safe here.
+        let Some(bytes) = apply_wab_scan(
+            scan().await,
+            &mut self.samples,
+            &self.metrics,
+            &self.wab_bytes_now,
+        ) else {
+            return logged;
+        };
+        let drain_healthy = drain_is_healthy(&self.metrics);
+        let due = growth_warning_is_due(self.last_growth_warned, std::time::Instant::now());
+        if due && should_warn_wab_growth(&self.samples, self.wab_max_bytes, drain_healthy) {
+            warn!(
+                wab_bytes = bytes,
+                growth_bytes = bytes.saturating_sub(self.samples[0]),
+                window_secs = WAB_GROWTH_WINDOW * 5,
+                "WAB is growing while the sink is not healthy and no wab_max_bytes \
+                 is set — producers are still being acked into an unbounded buffer. \
+                 Set wab_max_bytes to bound it."
+            );
+            self.last_growth_warned = Some(std::time::Instant::now());
+        }
+        logged
+    }
+
+    /// Drain-heartbeat stall check, and the busy gauge.
+    ///
+    /// Deliberately independent of `drain_is_healthy` — a wedged drain (a sink
+    /// call that blocks the drain's OS thread instead of yielding) is exactly
+    /// the state where `drain_state` / `sink_health` stay frozen at their last
+    /// (healthy-looking) reading, which is what silences the WAB-growth
+    /// warning. This check reads the heartbeat directly instead, so it isn't
+    /// fooled by the same stale gauges. `drain_state` is still consulted for ONE
+    /// thing — the `stopped` terminal state, the one value the supervisor
+    /// writes that is never stale — because a dead drain freezes the heartbeat
+    /// exactly like a wedged one and needs the opposite advice. The busy signal
+    /// tells a wedge from a drain that is merely inside one slow sink call or
+    /// one slow disk operation. See `drain_stall_verdict`.
+    fn check_drain_liveness(&mut self, now: std::time::Instant) -> Option<DrainStallVerdict> {
+        let busy = self.heartbeat.busy();
+        publish_drain_busy(&self.metrics, busy);
+        let (verdict, frozen_for) = self.liveness.observe(
+            now,
+            self.heartbeat.get(),
+            drain_is_stopped(&self.metrics),
+            busy,
+        )?;
+        log_drain_stall(verdict, frozen_for);
+        Some(verdict)
+    }
+}
+
 /// Fold one WAB-size scan into the polling task's state, returning the size on
 /// success and `None` when the scan failed to join.
 ///
@@ -1112,93 +1311,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // no longer has to be absorbed by this threshold.
         let health_poll_interval_for_stall = Duration::from_secs(config.health_poll_interval_secs);
         let drain_heartbeat_for_poll = drain_heartbeat;
+        let mut poll = WabPoll::new(
+            metrics_w,
+            wab_bytes_bg,
+            cap_for_warning,
+            drain_heartbeat_for_poll,
+            DrainLiveness::new(
+                std::time::Instant::now(),
+                health_poll_interval_for_stall,
+                commit_timeout_for_stall,
+            ),
+        );
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(5));
-            // Rolling window of on-disk-byte samples feeding should_warn_wab_growth,
-            // and the last time that warning actually fired (rate-limited below).
-            let mut samples: Vec<u64> = Vec::with_capacity(WAB_GROWTH_WINDOW + 1);
-            let mut last_warned: Option<std::time::Instant> = None;
-            // Heartbeat-stall tracking (see `drain::DrainHeartbeat` and
-            // `drain_heartbeat_looks_wedged`): the last observed value and when
-            // it last changed, plus the usual rate-limit for the warning itself
-            // once a stall is confirmed.
-            let mut last_heartbeat: Option<u64> = None;
-            let mut heartbeat_changed_at = std::time::Instant::now();
-            let mut last_stall_warned: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
-
-                // Drain-heartbeat stall check, and the busy gauge. Deliberately
-                // FIRST, before the WAB scan below can `continue` the loop: a
-                // failing scan (an unreadable shard, a dirent error) must not
-                // silence the one signal that says whether the drain is alive
-                // (spec §4.8).
-                //
-                // Deliberately independent of `drain_healthy` below — a wedged
-                // drain (a sink call that blocks the drain's OS thread instead
-                // of yielding) is exactly the state where `drain_state` /
-                // `sink_health` stay frozen at their last (healthy-looking)
-                // reading, which is what silences the WAB-growth warning. This
-                // check reads the heartbeat directly instead, so it isn't
-                // fooled by the same stale gauges. `drain_state` is still
-                // consulted for ONE thing — the `stopped` terminal state, the
-                // one value the supervisor writes that is never stale — because
-                // a dead drain freezes the heartbeat exactly like a wedged one
-                // and needs the opposite advice. The busy signal tells a wedge
-                // from a drain that is merely inside one slow sink call or one
-                // slow disk operation. See `drain_stall_verdict`.
-                let now = std::time::Instant::now();
-                let busy = drain_heartbeat_for_poll.busy();
-                publish_drain_busy(&metrics_w, busy);
-                let heartbeat_now = drain_heartbeat_for_poll.get();
-                match last_heartbeat {
-                    Some(prev) if drain_appears_stalled(prev, heartbeat_now) => {
-                        let frozen_for = now.duration_since(heartbeat_changed_at);
-                        let verdict = drain_stall_verdict(
-                            frozen_for,
-                            health_poll_interval_for_stall,
-                            drain_is_stopped(&metrics_w),
-                            busy,
-                            commit_timeout_for_stall,
-                        );
-                        if let Some(verdict) = verdict
-                            && growth_warning_is_due(last_stall_warned, now)
-                        {
-                            log_drain_stall(verdict, frozen_for);
-                            last_stall_warned = Some(now);
-                        }
-                    }
-                    _ => heartbeat_changed_at = now,
-                }
-                last_heartbeat = Some(heartbeat_now);
-
                 let wab_dir = wab_dir_bg.clone();
-                let scan = tokio::task::spawn_blocking(move || {
-                    compute_wab_bytes_on_disk(&wab_dir)
+                poll.tick(std::time::Instant::now(), move || {
+                    tokio::task::spawn_blocking(move || compute_wab_bytes_on_disk(&wab_dir))
                 })
                 .await;
-                // On a join failure the last known size stands and this tick
-                // contributes no sample — see `apply_wab_scan` for why neither
-                // 0 nor a repeated value is safe here.
-                let Some(bytes) =
-                    apply_wab_scan(scan, &mut samples, &metrics_w, &wab_bytes_bg)
-                else {
-                    continue;
-                };
-                let drain_healthy = drain_is_healthy(&metrics_w);
-                let due = growth_warning_is_due(last_warned, std::time::Instant::now());
-                if due && should_warn_wab_growth(&samples, cap_for_warning, drain_healthy) {
-                    warn!(
-                        wab_bytes = bytes,
-                        growth_bytes = bytes.saturating_sub(samples[0]),
-                        window_secs = WAB_GROWTH_WINDOW * 5,
-                        "WAB is growing while the sink is not healthy and no wab_max_bytes \
-                         is set — producers are still being acked into an unbounded buffer. \
-                         Set wab_max_bytes to bound it."
-                    );
-                    last_warned = Some(std::time::Instant::now());
-                }
             }
         });
 
@@ -2262,5 +2395,202 @@ mod drain_heartbeat_stall_tests {
             publish_drain_busy(&m, Some((kind, Duration::from_secs(7))));
             assert_eq!(busy_gauge(&m, label), 7.0, "{kind:?} -> {label:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_stall_log_tests {
+    use super::{
+        DrainLiveness, DrainStallVerdict, WAB_GROWTH_WARN_INTERVAL, WabPoll, stall_log_is_due,
+    };
+    use crate::drain::{BusyGuard, BusyKind, DrainHeartbeat};
+    use crate::metrics::{DrainBusyKind, DrainBusyLabel, Metrics};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const SLOW_SINK: DrainStallVerdict = DrainStallVerdict::SlowSinkCall {
+        kind: BusyKind::SinkCommit,
+        busy_for: Duration::from_secs(45),
+    };
+    const SLOW_DISK: DrainStallVerdict = DrainStallVerdict::SlowLocalIo {
+        kind: BusyKind::LocalFsync,
+        busy_for: Duration::from_secs(45),
+    };
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// The review's sequence at defaults: a sink that blocks the drain's OS
+    /// thread reads as a slow sink call (INFO, "no action needed") at 45 s and
+    /// becomes a wedge once it outlives commit_timeout + 15 s. The wedge WARN
+    /// must go out on that poll, not five minutes after the INFO.
+    #[test]
+    fn a_wedge_right_after_a_slow_sink_call_info_is_logged_at_once() {
+        let t0 = Instant::now();
+        assert!(stall_log_is_due(None, SLOW_SINK, t0 + secs(45)));
+        let last = Some((t0 + secs(45), SLOW_SINK));
+        assert!(
+            stall_log_is_due(last, DrainStallVerdict::Wedged, t0 + secs(80)),
+            "an escalation to Wedged must bypass the rate limit"
+        );
+    }
+
+    #[test]
+    fn every_escalation_bypasses_the_rate_limit() {
+        let t0 = Instant::now();
+        let at = |v| Some((t0, v));
+        let soon = t0 + secs(5);
+        assert!(stall_log_is_due(at(SLOW_SINK), SLOW_DISK, soon));
+        assert!(stall_log_is_due(
+            at(SLOW_SINK),
+            DrainStallVerdict::Wedged,
+            soon
+        ));
+        assert!(stall_log_is_due(
+            at(SLOW_DISK),
+            DrainStallVerdict::Wedged,
+            soon
+        ));
+        assert!(stall_log_is_due(
+            at(SLOW_SINK),
+            DrainStallVerdict::Stopped,
+            soon
+        ));
+        assert!(
+            stall_log_is_due(
+                at(DrainStallVerdict::Wedged),
+                DrainStallVerdict::Stopped,
+                soon
+            ),
+            "Stopped carries the opposite advice to Wedged (no sink call to hunt)"
+        );
+    }
+
+    /// The rate limit itself still holds for a repeat or a de-escalation.
+    #[test]
+    fn a_repeat_or_a_milder_verdict_waits_out_the_interval() {
+        let t0 = Instant::now();
+        let just_before = t0 + WAB_GROWTH_WARN_INTERVAL - secs(1);
+        let at_interval = t0 + WAB_GROWTH_WARN_INTERVAL;
+        for (last, next) in [
+            (DrainStallVerdict::Wedged, DrainStallVerdict::Wedged),
+            (DrainStallVerdict::Stopped, DrainStallVerdict::Stopped),
+            (SLOW_SINK, SLOW_SINK),
+            (SLOW_DISK, SLOW_DISK),
+            (DrainStallVerdict::Wedged, SLOW_SINK),
+            (DrainStallVerdict::Wedged, SLOW_DISK),
+            (DrainStallVerdict::Stopped, DrainStallVerdict::Wedged),
+            (SLOW_DISK, SLOW_SINK),
+        ] {
+            assert!(
+                !stall_log_is_due(Some((t0, last)), next, just_before),
+                "{last:?} then {next:?} inside the interval"
+            );
+            assert!(
+                stall_log_is_due(Some((t0, last)), next, at_interval),
+                "{last:?} then {next:?} once the interval has passed"
+            );
+        }
+    }
+
+    /// A different busy duration is the same verdict class, not an escalation:
+    /// otherwise a slow sink call would log on every 5 s poll.
+    #[test]
+    fn a_longer_busy_duration_is_not_an_escalation() {
+        let t0 = Instant::now();
+        let longer = DrainStallVerdict::SlowSinkCall {
+            kind: BusyKind::SinkProbe,
+            busy_for: secs(70),
+        };
+        assert!(!stall_log_is_due(
+            Some((t0, SLOW_SINK)),
+            longer,
+            t0 + secs(5)
+        ));
+    }
+
+    /// The poll task's state machine end to end, at production defaults
+    /// (health_poll_interval 30 s, commit_timeout 60 s): a sink commit that
+    /// blocks the thread forever, polled every 5 s for two minutes.
+    #[test]
+    fn a_thread_blocking_commit_logs_info_then_the_wedge_without_delay() {
+        let t0 = Instant::now();
+        let mut liveness = DrainLiveness::new(t0, secs(30), secs(60));
+        let mut logged = Vec::new();
+        for tick in 0..=24u64 {
+            let elapsed = secs(tick * 5);
+            let busy = Some((BusyKind::SinkCommit, elapsed));
+            if let Some((verdict, _frozen)) = liveness.observe(t0 + elapsed, 7, false, busy) {
+                logged.push((elapsed.as_secs(), verdict));
+            }
+        }
+        assert_eq!(
+            logged,
+            vec![
+                (
+                    45,
+                    DrainStallVerdict::SlowSinkCall {
+                        kind: BusyKind::SinkCommit,
+                        busy_for: secs(45)
+                    }
+                ),
+                (80, DrainStallVerdict::Wedged),
+            ],
+            "INFO at the stall threshold, the wedge WARN on the first poll past 75 s, \
+             and nothing else inside the 300 s rate limit"
+        );
+    }
+
+    /// A moving heartbeat resets the freeze clock, as before the extraction.
+    #[test]
+    fn a_moving_heartbeat_never_reports() {
+        let t0 = Instant::now();
+        let mut liveness = DrainLiveness::new(t0, secs(30), secs(60));
+        for tick in 0..=40u64 {
+            assert_eq!(
+                liveness.observe(t0 + secs(tick * 5), tick, false, None),
+                None
+            );
+        }
+    }
+
+    /// Spec §4.8 poll placement: the busy gauge and the stall verdict run
+    /// BEFORE the WAB scan can end the tick, so a failing scan does not
+    /// silence the one signal that says whether the drain is alive.
+    #[tokio::test]
+    async fn a_failing_wab_scan_does_not_silence_the_stall_check_or_the_busy_gauge() {
+        let metrics = Arc::new(Metrics::new().0);
+        let hb = DrainHeartbeat::new();
+        let _busy = BusyGuard::new(&hb, BusyKind::LocalFsync);
+        std::thread::sleep(Duration::from_millis(20));
+        let t0 = Instant::now();
+        let mut poll = WabPoll::new(
+            Arc::clone(&metrics),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            0,
+            hb.clone(),
+            DrainLiveness::new(t0, secs(30), secs(60)),
+        );
+        let failing_scan = || async { Ok(None) };
+        assert_eq!(poll.tick(t0, failing_scan).await, None);
+        let verdict = poll.tick(t0 + secs(50), failing_scan).await;
+        assert!(
+            matches!(
+                verdict,
+                Some(DrainStallVerdict::SlowLocalIo {
+                    kind: BusyKind::LocalFsync,
+                    ..
+                })
+            ),
+            "the stall check ran despite the failing scan: {verdict:?}"
+        );
+        let gauge = metrics
+            .drain_busy_seconds
+            .get_or_create(&DrainBusyLabel {
+                kind: DrainBusyKind::local_fsync,
+            })
+            .get();
+        assert!(gauge > 0.0, "the busy gauge was published: {gauge}");
     }
 }
