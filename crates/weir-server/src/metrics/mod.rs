@@ -420,6 +420,9 @@ pub(crate) struct Metrics {
     /// poll (the `quarantine` kind of `drain_segments_disposition_pending`)
     /// without re-delivering the segment's prefix.
     pub drain_quarantine_failures: Counter<u64, AtomicU64>,
+    /// Failed writes of sink-rejected records into `dead_letter/` (spec §4.11).
+    /// The sink commit already happened, so the retry redoes only the write.
+    pub drain_dead_letter_write_failures: Counter<u64, AtomicU64>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -784,6 +787,15 @@ impl Metrics {
              in place, and the prefix is never re-delivered. Usually a full or read-only WAB \
              device, or something other than a directory at <wab_dir>/quarantine"
         );
+        let drain_dead_letter_write_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_dead_letter_write_failures",
+            "Failed attempts to write sink-rejected records into dead_letter/ after the sink \
+             commit succeeded. The drain keeps the rejected records in memory and retries only \
+             the write, so the accepted records are not re-committed; the segment stays on disk \
+             until the write lands. Usually a full or read-only WAB device (ENOSPC, EROFS, \
+             EACCES)"
+        );
 
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
@@ -856,6 +868,7 @@ impl Metrics {
             drain_segments_disposition_pending,
             drain_confirm_failures,
             drain_quarantine_failures,
+            drain_dead_letter_write_failures,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -1039,6 +1052,7 @@ mod tests {
             "weir_drain_segments_disposition_pending",
             "weir_drain_confirm_failures",
             "weir_drain_quarantine_failures",
+            "weir_drain_dead_letter_write_failures",
         ];
         for name in expected {
             assert!(
@@ -1088,6 +1102,7 @@ mod tests {
             "weir_drain_confirm_failures_total{stage=\"sidecar\"} 0",
             "weir_drain_confirm_failures_total{stage=\"delete\"} 0",
             "weir_drain_quarantine_failures_total 0",
+            "weir_drain_dead_letter_write_failures_total 0",
         ] {
             assert!(
                 out.contains(series),

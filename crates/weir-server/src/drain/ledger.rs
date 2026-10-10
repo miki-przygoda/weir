@@ -129,15 +129,38 @@ pub(crate) enum TransientCause {
     LocalWrite,
 }
 
-/// Dead-letter payloads a blocked sub-batch still owes, so the retry redoes only
-/// the dead-letter write instead of re-committing the accepted records (§4.5,
-/// §4.11).
-#[allow(dead_code)] // populated by the dead-letter carry (spec §4.5, §4.11)
+/// Upper bound on the payload bytes all [`DeadLetterCarry`]s may hold in memory
+/// at once (spec §4.5). A carry that would exceed it is not stored, and that
+/// segment falls back to re-committing its blocked sub-batch once, with a WARN.
+pub(crate) const DL_CARRY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Dead-letter payloads a sub-batch still owes after its sink commit, so the
+/// retry redoes only the dead-letter write instead of re-committing the
+/// accepted records (§4.5: the cap blocked the write; §4.11: the write failed).
+#[derive(Debug)]
 pub(crate) struct DeadLetterCarry {
-    /// The cursor to advance to once `payloads` are written.
+    /// The cursor to advance to once `payloads` are written: the end of the
+    /// sub-batch they came from.
     pub through: u64,
+    /// The records the sink rejected, to be dead-lettered.
     pub payloads: Vec<Payload>,
+    /// Sum of the payload lengths: what the carry holds in memory, counted
+    /// against [`DL_CARRY_MAX_BYTES`].
     pub bytes: u64,
+    /// Records of the same sub-batch the sink accepted. They are counted as
+    /// committed only once the carry is written, exactly as an unblocked
+    /// sub-batch counts them only once its dead-letter write lands.
+    pub committed: u64,
+}
+
+/// A carry pinned to the `(dev, ino)` of the file it was measured on, like
+/// [`ResumeCursor`]: a carry for a replaced file names another segment's
+/// records and must never be written.
+#[derive(Debug)]
+struct PinnedCarry {
+    carry: DeadLetterCarry,
+    dev: u64,
+    ino: u64,
 }
 
 /// Which step of a confirm is still outstanding for a delivered segment (§4.3).
@@ -175,7 +198,10 @@ pub(crate) struct SegmentLedger {
     /// Durable progress per segment; survives a strand within a run (F05).
     resume_from: HashMap<PathBuf, ResumeCursor>,
     /// Dead-letter writes a blocked sub-batch still owes (§4.5, §4.11).
-    dl_carry: HashMap<PathBuf, DeadLetterCarry>,
+    dl_carry: HashMap<PathBuf, PinnedCarry>,
+    /// The bound on the sum of `dl_carry` bytes ([`DL_CARRY_MAX_BYTES`]; a
+    /// field only so tests can lower it).
+    dl_carry_max_bytes: u64,
     /// Delivered; sidecar or delete outstanding (§4.3).
     confirm_pending: HashMap<PathBuf, ConfirmPending>,
     /// Quarantine move outstanding (§4.4).
@@ -200,6 +226,7 @@ impl SegmentLedger {
         let ledger = Self {
             resume_from: HashMap::new(),
             dl_carry: HashMap::new(),
+            dl_carry_max_bytes: DL_CARRY_MAX_BYTES,
             confirm_pending: HashMap::new(),
             quarantine_pending: HashMap::new(),
             parked: HashMap::new(),
@@ -333,6 +360,61 @@ impl SegmentLedger {
     /// would escalate (spec §4.2).
     pub(crate) fn local_read_failures(&self, path: &Path) -> u32 {
         self.local_read_failures.get(path).copied().unwrap_or(0)
+    }
+
+    /// Stores what `path` still owes the dead-letter directory, pinned to the
+    /// file's current `(dev, ino)`, replacing any earlier carry of `path`.
+    ///
+    /// Returns false, storing nothing, when the carry would push the sum of all
+    /// carries over the bound, or when the file cannot be stat'ed (nothing to
+    /// pin it to). The caller then falls back to re-committing the sub-batch on
+    /// the next attempt — the behaviour before carries existed — so a refusal
+    /// costs one duplicate commit, never a record.
+    pub(crate) fn set_dl_carry(&mut self, path: &Path, carry: DeadLetterCarry) -> bool {
+        let others: u64 = self
+            .dl_carry
+            .iter()
+            .filter(|(p, _)| p.as_path() != path)
+            .map(|(_, pinned)| pinned.carry.bytes)
+            .sum();
+        let stored = match file_identity(path) {
+            Some((dev, ino)) if others.saturating_add(carry.bytes) <= self.dl_carry_max_bytes => {
+                self.dl_carry
+                    .insert(path.to_path_buf(), PinnedCarry { carry, dev, ino });
+                true
+            }
+            _ => {
+                self.dl_carry.remove(path);
+                false
+            }
+        };
+        self.sync_counts();
+        stored
+    }
+
+    /// Takes the carry of `path`, if any, for the attempt about to process it.
+    /// A carry whose pin no longer matches the file at `path` is discarded: it
+    /// describes another segment's records.
+    pub(crate) fn take_dl_carry(&mut self, path: &Path) -> Option<DeadLetterCarry> {
+        let pinned = self.dl_carry.remove(path)?;
+        self.sync_counts();
+        if file_identity(path) == Some((pinned.dev, pinned.ino)) {
+            Some(pinned.carry)
+        } else {
+            warn!(
+                path = %path.display(),
+                "drain: discarding a dead-letter carry measured on a file that has since been \
+                 replaced; the new file is processed from its own start"
+            );
+            None
+        }
+    }
+
+    /// Lowers the carry bound, for tests that cannot hold 64 MiB.
+    #[cfg(test)]
+    pub(crate) fn with_dl_carry_max_bytes(mut self, max: u64) -> Self {
+        self.dl_carry_max_bytes = max;
+        self
     }
 
     /// Keeps `path` out of admission and the rescan until `at`.
@@ -488,7 +570,10 @@ impl SegmentLedger {
         c.resume_cursors
             .store(self.resume_from.len(), Ordering::Relaxed);
         c.dl_carry_bytes.store(
-            self.dl_carry.values().map(|carry| carry.bytes).sum(),
+            self.dl_carry
+                .values()
+                .map(|pinned| pinned.carry.bytes)
+                .sum(),
             Ordering::Relaxed,
         );
     }
@@ -803,6 +888,86 @@ mod tests {
         assert_eq!(l.counts().quarantine_pending.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn carry(through: u64, payloads: &[&'static [u8]]) -> DeadLetterCarry {
+        let payloads: Vec<Payload> = payloads.iter().map(|p| Payload::from_static(p)).collect();
+        DeadLetterCarry {
+            through,
+            bytes: payloads.iter().map(|p| p.len() as u64).sum(),
+            committed: 1,
+            payloads,
+        }
+    }
+
+    /// The dead-letter carry (spec §4.5, §4.11): stored per segment, pinned to
+    /// the file it was measured on, mirrored in `dl_carry_bytes`, taken (not
+    /// copied) when the segment is next processed, and dropped with the rest
+    /// of the segment's progress.
+    #[test]
+    fn a_dl_carry_is_pinned_to_its_file_and_taken_once() {
+        let (dir, path) = file("dl_carry");
+        let mut l = ledger();
+        assert!(l.set_dl_carry(&path, carry(3, &[b"bad1", b"bad22"])));
+        assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 9);
+
+        let taken = l.take_dl_carry(&path).expect("the carry is there");
+        assert_eq!(taken.through, 3);
+        assert_eq!(taken.payloads.len(), 2);
+        assert_eq!(taken.committed, 1);
+        assert!(l.take_dl_carry(&path).is_none(), "taken, not copied");
+        assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 0);
+
+        // Confirmed, quarantined or parked: the carry goes with the cursor.
+        assert!(l.set_dl_carry(&path, carry(3, &[b"bad"])));
+        l.forget(&path);
+        assert!(l.take_dl_carry(&path).is_none());
+        assert!(l.set_dl_carry(&path, carry(3, &[b"bad"])));
+        l.park(&path, ParkReason::DrainPanic);
+        assert!(l.take_dl_carry(&path).is_none());
+        assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 0);
+
+        // A carry measured on a file that has since been replaced describes
+        // records of a different segment: it is discarded, never written.
+        let mut l = ledger();
+        assert!(l.set_dl_carry(&path, carry(3, &[b"bad"])));
+        let tmp = dir.join("replacement.tmp");
+        std::fs::write(&tmp, b"a different segment").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert!(l.take_dl_carry(&path).is_none());
+        assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 0);
+
+        // No file, no identity: nothing to pin the carry to, so it is not kept.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!l.set_dl_carry(&path, carry(3, &[b"bad"])));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The memory bound: the sum of all carries stays at or under the cap. A
+    /// carry that would push it over is refused (the caller falls back to
+    /// re-committing that sub-batch once), and refusing it leaves the others.
+    #[test]
+    fn dl_carries_are_bounded_in_total() {
+        let (dir, path) = file("dl_carry_cap");
+        let other = dir.join("seg_00000002.wab.sealed");
+        std::fs::write(&other, b"sealed bytes").unwrap();
+        assert_eq!(DL_CARRY_MAX_BYTES, 64 * 1024 * 1024);
+
+        let mut l = ledger().with_dl_carry_max_bytes(10);
+        assert!(l.set_dl_carry(&path, carry(1, &[b"123456"])));
+        assert!(
+            !l.set_dl_carry(&other, carry(1, &[b"12345"])),
+            "6 + 5 > 10: refused"
+        );
+        assert!(l.take_dl_carry(&other).is_none());
+        assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 6);
+        assert!(l.set_dl_carry(&other, carry(1, &[b"1234"])), "6 + 4 fits");
+        assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 10);
+
+        // Replacing a segment's own carry does not count the old one twice.
+        assert!(l.set_dl_carry(&path, carry(2, &[b"654321"])));
+        assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 10);
         std::fs::remove_dir_all(dir).ok();
     }
 

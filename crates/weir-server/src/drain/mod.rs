@@ -14,10 +14,16 @@
 //! Draining
 //!   │  Permanent error AND dead-letter cap exceeded
 //!   ▼
-//! BlockedDeadLetterFull  ──(cap clears)──▶  RetryingTransient (same segment,
-//!                                            RESUMING past already-processed
+//! BlockedDeadLetterFull  ──(the blocked write fits)──▶  RetryingTransient (same
+//!                                            segment, RESUMING past already-processed
 //!                                            sub-batches — see F05)
 //! ```
+//!
+//! A sub-batch the sink committed but whose rejected records could not be
+//! dead-lettered (the cap blocked the write, or the write failed) leaves those
+//! records with the drain's ledger as a carry. The next attempt writes the
+//! carry and resumes past the sub-batch, so its accepted records are committed
+//! once per run, not once per retry (spec §4.5, §4.11).
 //!
 //! # Confirmed files
 //!
@@ -59,7 +65,7 @@ use crate::{
 
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
-use ledger::{Admit, SegmentLedger, TransientCause};
+use ledger::{Admit, DeadLetterCarry, SegmentLedger, TransientCause};
 #[cfg(test)]
 use ledger::{ErrClass, ParkReason};
 
@@ -186,6 +192,10 @@ enum DrainState {
         /// Records already durably processed before the block; the post-headroom
         /// retry resumes past them (F05).
         processed: u64,
+        /// The estimated bytes of the dead-letter write that blocked. The drain
+        /// unblocks only once that write fits under the cap — the same predicate
+        /// that blocked it (spec §4.5) — never on a bare `total < cap`.
+        needed: u64,
     },
 }
 
@@ -197,15 +207,28 @@ enum ProcessResult {
     /// after the drain's exponential-backoff delay (if `None`). `processed` is
     /// the number of records the *earlier* sub-batches of this attempt durably
     /// committed/dead-lettered — the retry skips them (F05).
+    ///
+    /// `carry` is set only for a dead-letter write that failed after the sink
+    /// committed (`cause` is `LocalWrite`, spec §4.11): the rejected records the
+    /// next attempt writes before re-reading, instead of re-committing the
+    /// sub-batch.
     Transient {
         retry_after: Option<Duration>,
         processed: u64,
         cause: TransientCause,
+        carry: Option<DeadLetterCarry>,
     },
     /// Dead-letter cap would be exceeded. Block until capacity frees. `processed`
     /// carries the durable progress so the post-headroom retry resumes past the
-    /// already-handled sub-batches (F05).
-    BlockedDeadLetter { processed: u64 },
+    /// already-handled sub-batches (F05). `needed` is the estimated size of the
+    /// write that blocked, for the unblock predicate, and `carry` the rejected
+    /// records the post-headroom attempt writes without re-committing the
+    /// sub-batch (spec §4.5).
+    BlockedDeadLetter {
+        processed: u64,
+        needed: u64,
+        carry: Option<DeadLetterCarry>,
+    },
     /// A record failed to read mid-segment. The readable prefix was delivered and
     /// the segment was quarantined for manual recovery — do not retry or delete.
     Quarantined,
@@ -222,11 +245,47 @@ enum ProcessResult {
 
 enum BatchResult {
     Ok,
+    /// `owed` is set when the sink committed but the dead-letter write of its
+    /// rejects failed (a `LocalWrite` cause, spec §4.11).
     Transient {
         retry_after: Option<Duration>,
         cause: TransientCause,
+        owed: Option<DeadLetterOwed>,
     },
-    Blocked,
+    /// The dead-letter write of the sink's rejects would exceed the cap; it
+    /// needs `needed` bytes of headroom (spec §4.5).
+    Blocked {
+        needed: u64,
+        owed: DeadLetterOwed,
+    },
+}
+
+/// What a sub-batch still owes the dead-letter directory after its sink call:
+/// the records the sink rejected, and how many it accepted (counted as
+/// committed only once the rejects are written, S24).
+struct DeadLetterOwed {
+    payloads: Vec<Payload>,
+    committed: u64,
+}
+
+impl DeadLetterOwed {
+    /// As the ledger's carry for a sub-batch ending at record `through`.
+    fn into_carry(self, through: u64) -> DeadLetterCarry {
+        DeadLetterCarry {
+            through,
+            bytes: self.payloads.iter().map(|p| p.len() as u64).sum(),
+            committed: self.committed,
+            payloads: self.payloads,
+        }
+    }
+}
+
+/// Why [`dead_letter_records`] did not write.
+enum DeadLetterFailure {
+    /// The write would exceed the cap; it needs `needed` bytes.
+    Blocked { needed: u64 },
+    /// The write itself failed (already logged and counted).
+    WriteFailed,
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
@@ -825,16 +884,16 @@ fn drain_thread<S: Sink>(
                         // refreshed by the wall-clock poll above, so we no longer
                         // probe the sink after every segment (which, under
                         // sustained load, meant a HEAD request per segment).
-                        let last_chance = local_read_escalates_next(&segment, &config, ledger);
-                        let result = rt.block_on(process_segment(
+                        let result = attempt_segment(
+                            &rt,
                             &segment,
                             &*sink,
                             &config,
                             &metrics,
                             &mut dead_letter,
+                            ledger,
                             skip,
-                            last_chance,
-                        ));
+                        );
                         transition_from_draining(
                             segment,
                             result,
@@ -1016,16 +1075,16 @@ fn drain_thread<S: Sink>(
                     DrainState::Draining
                 } else {
                     // Resume past the sub-batches already durably processed (F05).
-                    let last_chance = local_read_escalates_next(&segment, &config, ledger);
-                    let result = rt.block_on(process_segment(
+                    let result = attempt_segment(
+                        &rt,
                         &segment,
                         &*sink,
                         &config,
                         &metrics,
                         &mut dead_letter,
+                        ledger,
                         processed,
-                        last_chance,
-                    ));
+                    );
                     // Subsequent failure: spend one retry and double the delay
                     // (exponential backoff). retries_left is >= 1 here — the
                     // == 0 case returned above.
@@ -1052,6 +1111,7 @@ fn drain_thread<S: Sink>(
                 segment,
                 blocked_since,
                 processed,
+                needed,
             } => {
                 set_drain_state(&metrics, DrainStateValue::blocked_dead_letter_full);
                 metrics
@@ -1087,10 +1147,11 @@ fn drain_thread<S: Sink>(
                 }
 
                 // Rescan so external deletions (e.g. operator cleanup) are reflected.
-                // A failed rescan leaves total_bytes stale at its at-cap value, so
-                // the unblock check below can't clear and the drain stays blocked
-                // even after the operator frees the dir — surface it rather than
-                // swallowing (F08).
+                // A deleted dead_letter/ is recreated and counts as empty (spec
+                // §4.5). Any other failed rescan leaves total_bytes stale at its
+                // at-cap value, so the unblock check below can't clear and the
+                // drain stays blocked even after the operator frees the dir —
+                // surface it rather than swallowing (F08).
                 if let Err(e) = dead_letter.rescan() {
                     warn!(error = %e, "drain: dead-letter rescan failed while blocked; total_bytes may be stale until the next successful rescan");
                 }
@@ -1123,11 +1184,22 @@ fn drain_thread<S: Sink>(
                     Some(&segment),
                     &|p| ledger.excludes(p, now),
                 );
-                if dead_letter.total_bytes() < config.dead_letter_max_bytes {
+                // Unblock on the SAME predicate that blocked: the blocked write
+                // fits. A bare `total < cap` unblocked while the total sat in
+                // `[cap - needed, cap)`, so the retry blocked again at once —
+                // and, before the carry, re-committed the sub-batch's accepted
+                // records on every check interval (spec §4.5). A blocked state
+                // always has `needed <= cap` (a write larger than the whole cap
+                // is written anyway, see `dead_letter_records`), so this can
+                // always clear.
+                if !dead_letter.would_exceed_cap(needed, config.dead_letter_max_bytes) {
                     // Headroom available — retry the preserved segment, RESUMING
                     // past the sub-batches already durably processed (skip =
                     // processed) rather than from record 0, so earlier sub-batches
-                    // aren't re-committed/re-dead-lettered (F05). Route through
+                    // aren't re-committed/re-dead-lettered (F05). The ledger holds
+                    // the blocked sub-batch's rejects as a carry, so the retry
+                    // writes them first and does not re-commit that sub-batch
+                    // either. Route through
                     // RetryingTransient — the state that carries `processed`; fresh
                     // segments still arrive via pending/the channel and are picked
                     // up by Draining.
@@ -1163,6 +1235,7 @@ fn drain_thread<S: Sink>(
                         segment,
                         blocked_since,
                         processed,
+                        needed,
                     }
                 }
             }
@@ -1214,6 +1287,7 @@ fn next_state_after_process(
             retry_after,
             processed,
             cause,
+            carry,
         } => {
             if let TransientCause::LocalRead { class, errno } = cause
                 && let Some(next) = escalate_local_read(
@@ -1229,11 +1303,17 @@ fn next_state_after_process(
                 return next;
             }
             ledger.record_progress(&segment, processed);
+            store_dl_carry(&segment, carry, ledger);
             on_transient(segment, retry_after, processed, cause)
         }
-        ProcessResult::BlockedDeadLetter { processed } => {
+        ProcessResult::BlockedDeadLetter {
+            processed,
+            needed,
+            carry,
+        } => {
             ledger.record_progress(&segment, processed);
-            enter_blocked(segment, metrics, block_episode, processed)
+            store_dl_carry(&segment, carry, ledger);
+            enter_blocked(segment, metrics, block_episode, processed, needed)
         }
         // Not deliverable by this binary, not corrupt: set aside for the run.
         ProcessResult::Parked { reason } => {
@@ -1256,6 +1336,107 @@ fn next_state_after_process(
             end_block_episode(block_episode, metrics);
             DrainState::Draining
         }
+    }
+}
+
+/// Hands a dead-letter carry to the ledger. A carry the ledger refuses (over
+/// [`ledger::DL_CARRY_MAX_BYTES`] in total) is dropped here, and the segment
+/// falls back to re-committing that sub-batch once on its next attempt: its
+/// cursor still ends before it. That costs one duplicate commit, never a record.
+fn store_dl_carry(segment: &Path, carry: Option<DeadLetterCarry>, ledger: &mut SegmentLedger) {
+    let Some(carry) = carry else { return };
+    let (records, bytes) = (carry.payloads.len(), carry.bytes);
+    if !ledger.set_dl_carry(segment, carry) {
+        warn!(
+            path = %segment.display(),
+            records,
+            bytes,
+            max_bytes = ledger::DL_CARRY_MAX_BYTES,
+            "drain: cannot hold this sub-batch's dead-lettered records in memory (carry bound \
+             reached, or the segment cannot be stat'ed); the sub-batch will be re-committed once \
+             when the segment is retried"
+        );
+    }
+}
+
+/// One attempt at `segment`, resuming past its first `skip` records.
+///
+/// A dead-letter write an earlier attempt still owes (the ledger's carry) is
+/// settled first: written, then the attempt resumes past the sub-batch it came
+/// from, so the sink never sees that sub-batch again (spec §4.5, §4.11). If the
+/// write blocks or fails again, the carry goes back to the ledger with the
+/// result and nothing is sent to the sink.
+#[allow(clippy::too_many_arguments)]
+fn attempt_segment<S: Sink>(
+    rt: &tokio::runtime::Runtime,
+    segment: &Path,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    dead_letter: &mut DeadLetterWriter,
+    ledger: &mut SegmentLedger,
+    skip: u64,
+) -> ProcessResult {
+    let skip = match ledger.take_dl_carry(segment) {
+        None => skip,
+        Some(carry) => match settle_dl_carry(segment, skip, carry, dead_letter, config, metrics) {
+            Ok(through) => through,
+            Err(result) => return result,
+        },
+    };
+    let last_chance = local_read_escalates_next(segment, config, ledger);
+    rt.block_on(process_segment(
+        segment,
+        sink,
+        config,
+        metrics,
+        dead_letter,
+        skip,
+        last_chance,
+    ))
+}
+
+/// Writes a carried sub-batch's rejected records. On success returns the record
+/// to resume from (the end of that sub-batch) and counts the sub-batch's
+/// accepted records as committed — the count its commit deferred (S24). On a
+/// block or a failed write returns the result to report, carry included, with
+/// `processed` unchanged.
+fn settle_dl_carry(
+    segment: &Path,
+    skip: u64,
+    carry: DeadLetterCarry,
+    dead_letter: &mut DeadLetterWriter,
+    config: &DrainConfig,
+    metrics: &Metrics,
+) -> Result<u64, ProcessResult> {
+    match dead_letter_records(&carry.payloads, dead_letter, config, metrics) {
+        Ok(()) => {
+            metrics
+                .sink_commit_records
+                .get_or_create(&OutcomeLabel {
+                    outcome: Outcome::committed,
+                })
+                .inc_by(carry.committed);
+            info!(
+                path = %segment.display(),
+                dead_lettered = carry.payloads.len(),
+                resume_from = carry.through,
+                "drain: wrote the dead-letter records a previous attempt owed; resuming without \
+                 re-committing their sub-batch"
+            );
+            Ok(carry.through.max(skip))
+        }
+        Err(DeadLetterFailure::Blocked { needed }) => Err(ProcessResult::BlockedDeadLetter {
+            processed: skip,
+            needed,
+            carry: Some(carry),
+        }),
+        Err(DeadLetterFailure::WriteFailed) => Err(ProcessResult::Transient {
+            retry_after: None,
+            processed: skip,
+            cause: TransientCause::LocalWrite,
+            carry: Some(carry),
+        }),
     }
 }
 
@@ -1391,6 +1572,7 @@ fn enter_blocked(
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
     processed: u64,
+    needed: u64,
 ) -> DrainState {
     // Increment the counter and stamp the episode start only on a genuine new
     // episode. If `block_episode` is already set we re-entered blocked after a
@@ -1406,6 +1588,7 @@ fn enter_blocked(
         segment,
         blocked_since,
         processed,
+        needed,
     }
 }
 
@@ -1580,6 +1763,7 @@ async fn process_segment<S: Sink>(
                         class,
                         errno: e.raw_os_error(),
                     },
+                    carry: None,
                 };
             }
         };
@@ -1603,7 +1787,7 @@ async fn process_segment<S: Sink>(
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
             let full_ids = std::mem::replace(&mut batch_ids, Vec::with_capacity(max_batch));
             let n = full_batch.len() as u64;
-            match commit_batch(
+            let result = commit_batch(
                 &full_batch,
                 &full_ids,
                 segment_created_at,
@@ -1612,28 +1796,16 @@ async fn process_segment<S: Sink>(
                 metrics,
                 dead_letter,
             )
-            .await
-            {
-                BatchResult::Ok => durable_through += n,
-                BatchResult::Transient { retry_after, cause } => {
-                    return ProcessResult::Transient {
-                        retry_after,
-                        processed: durable_through,
-                        cause,
-                    };
-                }
-                BatchResult::Blocked => {
-                    return ProcessResult::BlockedDeadLetter {
-                        processed: durable_through,
-                    };
-                }
+            .await;
+            if let Err(setback) = apply_batch(result, &mut durable_through, n) {
+                return setback;
             }
         }
     }
 
     if !batch.is_empty() {
         let n = batch.len() as u64;
-        match commit_batch(
+        let result = commit_batch(
             &batch,
             &batch_ids,
             segment_created_at,
@@ -1642,21 +1814,9 @@ async fn process_segment<S: Sink>(
             metrics,
             dead_letter,
         )
-        .await
-        {
-            BatchResult::Ok => durable_through += n,
-            BatchResult::Transient { retry_after, cause } => {
-                return ProcessResult::Transient {
-                    retry_after,
-                    processed: durable_through,
-                    cause,
-                };
-            }
-            BatchResult::Blocked => {
-                return ProcessResult::BlockedDeadLetter {
-                    processed: durable_through,
-                };
-            }
+        .await;
+        if let Err(setback) = apply_batch(result, &mut durable_through, n) {
+            return setback;
         }
     }
     if let Some(reason) = quarantine_after_prefix {
@@ -1741,6 +1901,7 @@ async fn process_segment<S: Sink>(
                     class: ledger::classify(&e),
                     errno: e.raw_os_error(),
                 },
+                carry: None,
             };
         }
     }
@@ -1755,6 +1916,41 @@ async fn process_segment<S: Sink>(
 
     ProcessResult::Confirmed {
         record_count: read_index,
+    }
+}
+
+/// Applies a sub-batch of `n` records, starting after record `*durable_through`,
+/// to the cursor: `Ok` advances it past the sub-batch; anything else leaves it
+/// and returns the [`ProcessResult`] to report. What the sub-batch still owes
+/// the dead-letter directory becomes a carry ending at `durable_through + n`, so
+/// the next attempt writes it and resumes past the sub-batch without
+/// re-committing it.
+fn apply_batch(
+    result: BatchResult,
+    durable_through: &mut u64,
+    n: u64,
+) -> Result<(), ProcessResult> {
+    let processed = *durable_through;
+    match result {
+        BatchResult::Ok => {
+            *durable_through += n;
+            Ok(())
+        }
+        BatchResult::Transient {
+            retry_after,
+            cause,
+            owed,
+        } => Err(ProcessResult::Transient {
+            retry_after,
+            processed,
+            cause,
+            carry: owed.map(|o| o.into_carry(processed + n)),
+        }),
+        BatchResult::Blocked { needed, owed } => Err(ProcessResult::BlockedDeadLetter {
+            processed,
+            needed,
+            carry: Some(owed.into_carry(processed + n)),
+        }),
     }
 }
 
@@ -1780,6 +1976,7 @@ fn local_read_failure(segment: &Path, e: std::io::Error, skip: u64) -> ProcessRe
             class: ledger::classify(&e),
             errno: e.raw_os_error(),
         },
+        carry: None,
     }
 }
 
@@ -2200,6 +2397,7 @@ async fn commit_batch<S: Sink>(
             return BatchResult::Transient {
                 retry_after: None,
                 cause: TransientCause::Sink,
+                owed: None,
             };
         }
     };
@@ -2226,6 +2424,7 @@ async fn commit_batch<S: Sink>(
                 return BatchResult::Transient {
                     retry_after: None,
                     cause: TransientCause::Sink,
+                    owed: None,
                 };
             }
             metrics
@@ -2233,8 +2432,9 @@ async fn commit_batch<S: Sink>(
                 .observe(t.elapsed().as_secs_f64());
             // The committed-records count is bumped at the END, only on the path
             // that actually returns BatchResult::Ok — a Blocked or failed-write
-            // Transient return below leaves the batch to be re-committed on retry,
-            // and counting here would double-count it (S24).
+            // Transient return below defers it to whoever finishes the
+            // sub-batch: the carry's write, or (when no carry could be held) the
+            // re-commit. Counting here would double-count it (S24).
             let committed_count = commit_result.committed.len() as u64;
 
             if !commit_result.dead_lettered.is_empty() {
@@ -2246,10 +2446,13 @@ async fn commit_batch<S: Sink>(
                 // A failed dead-letter write (or a cap block) must NOT fall through
                 // to Ok: confirming would delete the segment with these records
                 // neither delivered nor dead-lettered — silent data loss (B1/F02).
+                // The rejects travel with the result as what the sub-batch owes,
+                // so the retry writes them instead of re-committing the accepted
+                // records (spec §4.5, §4.11).
                 if let Err(failure) =
                     dead_letter_records(&dead_payloads, dead_letter, config, metrics)
                 {
-                    return failure;
+                    return owed_result(failure, dead_payloads, committed_count);
                 }
             }
 
@@ -2281,6 +2484,7 @@ async fn commit_batch<S: Sink>(
             BatchResult::Transient {
                 retry_after,
                 cause: TransientCause::Sink,
+                owed: None,
             }
         }
 
@@ -2295,7 +2499,7 @@ async fn commit_batch<S: Sink>(
             // failed dead-letter write (or a cap block) preserves the segment for
             // retry instead of confirming + deleting it (B1/F02).
             if let Err(failure) = dead_letter_records(payloads, dead_letter, config, metrics) {
-                return failure;
+                return owed_result(failure, payloads.to_vec(), 0);
             }
 
             // Dead-letter write succeeded: the records are durably re-homed, so the
@@ -2312,21 +2516,25 @@ async fn commit_batch<S: Sink>(
 /// shared by the partial-rejection and whole-batch-permanent paths in
 /// `commit_batch` (previously duplicated byte-for-byte).
 ///
-/// On failure it returns the `BatchResult` the caller must propagate WITHOUT
-/// confirming the segment:
-/// - `Err(BatchResult::Blocked)` when the write would exceed the cap and the
+/// On failure the caller must NOT confirm the segment:
+/// - `Err(DeadLetterFailure::Blocked)` when the write would exceed the cap and the
 ///   batch is not itself larger than the whole cap (a one-off oversized batch is
 ///   written anyway — overshoot once — to avoid a permanent block↔retry livelock, F03).
-/// - `Err(BatchResult::Transient)` with a `LocalWrite` cause when the dead-letter
-///   write itself fails (e.g. ENOSPC): the segment is preserved and retried rather
-///   than confirmed+deleted with the records neither delivered nor dead-lettered —
-///   silent data loss (B1/F02).
+///   `needed` is the write's estimated size, which the blocked state's unblock
+///   predicate waits on (spec §4.5).
+/// - `Err(DeadLetterFailure::WriteFailed)` when the dead-letter write itself fails
+///   (e.g. ENOSPC), counted in `weir_drain_dead_letter_write_failures_total`: the
+///   segment is preserved and retried rather than confirmed+deleted with the
+///   records neither delivered nor dead-lettered — silent data loss (B1/F02).
+///
+/// Shared by `commit_batch` and by the write of a carried sub-batch's rejects
+/// ([`settle_dl_carry`]), so both block and fail on exactly the same terms.
 fn dead_letter_records(
     records: &[Payload],
     dead_letter: &mut DeadLetterWriter,
     config: &DrainConfig,
     metrics: &Metrics,
-) -> Result<(), BatchResult> {
+) -> Result<(), DeadLetterFailure> {
     let estimated = estimated_write_bytes(records);
     if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
         if estimated > config.dead_letter_max_bytes {
@@ -2336,7 +2544,7 @@ fn dead_letter_records(
                 "drain: dead-letter batch alone exceeds dead_letter_max_bytes; writing it anyway to avoid a permanent block"
             );
         } else {
-            return Err(BatchResult::Blocked);
+            return Err(DeadLetterFailure::Blocked { needed: estimated });
         }
     }
 
@@ -2357,12 +2565,33 @@ fn dead_letter_records(
             // The sink did its part; the WAB device did not. A local write
             // cause, so a strand from here neither marks the sink down nor
             // counts as a sink strand (D11, spec §4.11).
-            error!(error = %e, "drain: failed to write dead-letter records; preserving segment for retry");
-            Err(BatchResult::Transient {
-                retry_after: None,
-                cause: TransientCause::LocalWrite,
-            })
+            metrics.drain_dead_letter_write_failures.inc();
+            error!(
+                error = %e,
+                records = records.len(),
+                "drain: failed to write dead-letter records; preserving segment and retrying only \
+                 the dead-letter write (weir_drain_dead_letter_write_failures_total)"
+            );
+            Err(DeadLetterFailure::WriteFailed)
         }
+    }
+}
+
+/// The [`BatchResult`] for a sub-batch the sink handled but whose rejects could
+/// not be dead-lettered: `payloads` are the rejects it still owes, `committed`
+/// the records the sink accepted.
+fn owed_result(failure: DeadLetterFailure, payloads: Vec<Payload>, committed: u64) -> BatchResult {
+    let owed = DeadLetterOwed {
+        payloads,
+        committed,
+    };
+    match failure {
+        DeadLetterFailure::Blocked { needed } => BatchResult::Blocked { needed, owed },
+        DeadLetterFailure::WriteFailed => BatchResult::Transient {
+            retry_after: None,
+            cause: TransientCause::LocalWrite,
+            owed: Some(owed),
+        },
     }
 }
 
@@ -3397,6 +3626,17 @@ mod tests {
         super::process_segment(segment, sink, config, metrics, dead_letter, skip, false).await
     }
 
+    /// `enter_blocked` gained `needed` (spec §4.5); the episode tests predate
+    /// it and do not depend on it.
+    fn enter_blocked(
+        segment: PathBuf,
+        metrics: &Metrics,
+        block_episode: &mut Option<Instant>,
+        processed: u64,
+    ) -> DrainState {
+        super::enter_blocked(segment, metrics, block_episode, processed, 0)
+    }
+
     fn fresh_ledger() -> SegmentLedger {
         SegmentLedger::new(Arc::new(ledger::LedgerCounts::default()))
     }
@@ -3694,7 +3934,7 @@ mod tests {
             }
         ));
 
-        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+        squat_dead_letter_dir(&dir);
         let sink = MockSink::with_responses([Err(MockError::Permanent)]);
         let result = block_on(commit_batch(
             &payloads, &ids, 0, &sink, &config, &metrics, &mut dl,
@@ -5181,7 +5421,17 @@ mod tests {
     // with the records neither delivered nor dead-lettered. The fix returns
     // Transient so the segment is preserved and retried (and left on disk if
     // retries exhaust), never silently dropped. We fault the dead-letter store by
-    // removing its directory so write_records fails deterministically.
+    // putting a regular file where its directory was, so write_records fails
+    // deterministically (ENOTDIR). Removing the directory no longer works: since
+    // spec §4.9 a missing dead_letter/ is recreated and the write retried.
+
+    /// Replaces the dead-letter directory with a regular file, so every write
+    /// into it fails with ENOTDIR.
+    fn squat_dead_letter_dir(dir: &Path) {
+        let dl = dir.join("dead_letter");
+        std::fs::remove_dir_all(&dl).unwrap();
+        std::fs::write(&dl, b"not a directory").unwrap();
+    }
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
@@ -5196,7 +5446,7 @@ mod tests {
         use super::dead_letter::DeadLetterWriter;
         let dir = tmp_dir("b1_perm_dlfail");
         let mut dl = DeadLetterWriter::open(&dir).unwrap();
-        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+        squat_dead_letter_dir(&dir);
 
         let sink = MockSink::with_responses([Err(MockError::Permanent)]);
         let metrics = noop_metrics();
@@ -5220,7 +5470,7 @@ mod tests {
         use super::dead_letter::DeadLetterWriter;
         let dir = tmp_dir("b1_partial_dlfail");
         let mut dl = DeadLetterWriter::open(&dir).unwrap();
-        std::fs::remove_dir_all(dir.join("dead_letter")).unwrap();
+        squat_dead_letter_dir(&dir);
 
         // commit() succeeds but reports one record permanently rejected; the
         // follow-up dead-letter write then fails.
@@ -6678,11 +6928,15 @@ mod tests {
             "segment must be confirmed after unblock"
         );
         assert!(!sealed.exists());
+        // Spec §4.5 changed this from 2: the record the sink rejected is
+        // carried across the block and dead-lettered on unblock, exactly as it
+        // would have been with headroom; the sink is not asked again.
         assert_eq!(
             sink.call_count(),
-            2,
-            "commit called exactly twice: first attempt + retry"
+            1,
+            "commit called once: the unblocked retry writes the carried reject"
         );
+        assert_eq!(records_dead_lettered(&metrics), 1);
 
         std::fs::remove_dir_all(dir).ok();
     }
@@ -6713,9 +6967,11 @@ mod tests {
         tx.send(sealed.clone()).unwrap();
 
         // call 1: commit([A]) → Ok               (A committed, processed → 1)
-        // call 2: commit([B]) → Permanent        (dead-letter B, but cap full → BLOCK at processed=1)
-        // call 3: commit([B]) → Permanent        (cap cleared → dead-letter B → confirm)
-        // A restart-at-0 bug would instead do call 3 = commit([A]) and call 4 = commit([B]).
+        // call 2: commit([B]) → Permanent        (dead-letter B, but cap full → BLOCK at processed=1,
+        //                                          B carried)
+        // cap cleared → the carried B is dead-lettered → resume past B → confirm (spec §4.5;
+        // before the carry, a third call re-committed [B]).
+        // A restart-at-0 bug would instead re-commit [A] after the block.
         let sink = Arc::new(MockSink::with_batch_size(
             1,
             [
@@ -6766,8 +7022,8 @@ mod tests {
         assert!(!sealed.exists(), "sealed segment deleted after confirm");
         assert_eq!(
             sink.call_count(),
-            3,
-            "resume must continue at B (A,B,B = 3 commits), not restart at A (A,B,A,B = 4)"
+            2,
+            "resume must continue past the carried B (A,B = 2 commits), not restart at A"
         );
         // The crux: only A was ever committed. A restart-at-0 would re-read from
         // record 0, re-committing A on the resume (committed = [A, B], 4 commits).
@@ -6874,6 +7130,311 @@ mod tests {
             "blocked_duration must be zero after unblocking"
         );
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Dead-letter headroom and carry (spec §4.5, §4.11) ────────────────────
+
+    /// Every record in the dead-letter directory's sealed segments, in file
+    /// order. Files that are not segments (the tests' zero-filled cap fillers)
+    /// are skipped.
+    fn dead_letter_contents(wab_dir: &Path) -> Vec<Payload> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(wab_dir.join("dead_letter"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(".wab.sealed"))
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .filter_map(|f| crate::wab::SegmentReader::open(f).ok())
+            .flat_map(|r| r.map(Result::unwrap))
+            .collect()
+    }
+
+    fn partial_reject(ok: &'static [u8], bad: &'static [u8]) -> MockResult {
+        MockSink::ok_with_dead_letter(
+            vec![Payload::from_static(ok)],
+            vec![Payload::from_static(bad)],
+        )
+    }
+
+    /// Spec §4.5. The block predicate is `total + needed > cap`, but the
+    /// unblock predicate was `total < cap`. With the total anywhere in
+    /// `[cap - needed, cap)` the drain unblocked on every check interval,
+    /// re-committed the sub-batch's ACCEPTED records, and blocked again: one
+    /// duplicate commit per `dead_letter_check_interval` for as long as the
+    /// headroom stayed short.
+    ///
+    /// Now the drain unblocks only when `needed` fits, and the rejected records
+    /// are carried, so the resume writes them without asking the sink again.
+    #[test]
+    fn a_dead_letter_block_short_of_headroom_commits_the_sub_batch_once() {
+        let dir = tmp_dir("dl_headroom_once");
+        let sealed = make_sealed_segment(&dir, 0, &[b"ok", b"bad"]);
+        let needed = dead_letter::estimated_segment_bytes(&[Payload::from_static(b"bad")]);
+        let cap = 4096;
+        let dl_dir = dir.join("dead_letter");
+        crate::testutil::mkdir_p(&dl_dir);
+        let filler = dl_dir.join("dl_00000001.wab.sealed");
+        std::fs::write(&filler, vec![0u8; (cap - needed / 2) as usize]).unwrap();
+
+        // Every commit accepts "ok" and rejects "bad" — as a real sink would on
+        // every re-send.
+        let sink = Arc::new(MockSink::with_responses(
+            (0..50).map(|_| partial_reject(b"ok", b"bad")),
+        ));
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            dead_letter_check_interval: Duration::from_millis(50),
+            ..tight_dl_config(dir.clone(), cap)
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            config,
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+
+        wait_for(5, "the block", || drain_is_blocked(&metrics));
+        // Ten check intervals with the total still short of `needed`.
+        std::thread::sleep(Duration::from_millis(10 * 50 + 50));
+        assert_eq!(
+            sink.call_count(),
+            1,
+            "headroom short of what the blocked write needs must not unblock the drain"
+        );
+        assert!(drain_is_blocked(&metrics));
+
+        // Free space beyond `needed`: the drain resumes once and writes the carry.
+        std::fs::remove_file(&filler).unwrap();
+        wait_for(5, "the confirm", || get_confirmed_path(&sealed).exists());
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            sink.call_count(),
+            1,
+            "the resume writes the carried rejects; it does not re-commit the sub-batch"
+        );
+        assert_eq!(sink.committed_records(), vec![Payload::from_static(b"ok")]);
+        assert_eq!(
+            dead_letter_contents(&dir),
+            vec![Payload::from_static(b"bad")]
+        );
+        assert_eq!(
+            records_committed(&metrics),
+            1,
+            "the accepted record counts once"
+        );
+        assert_eq!(records_dead_lettered(&metrics), 1);
+        assert_eq!(dl_full_count(&metrics), 1, "one blocking episode");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Spec §4.5: `rm -rf dead_letter/` is the obvious way to free headroom.
+    /// The rescan used to fail on the missing directory, leaving the total at
+    /// its at-cap value, so the drain never unblocked. Now the rescan recreates
+    /// the directory and the drain resumes within one check interval.
+    #[test]
+    fn deleting_the_dead_letter_dir_while_blocked_resumes_within_one_interval() {
+        let dir = tmp_dir("dl_dir_deleted");
+        let sealed = make_sealed_segment(&dir, 0, &[b"record"]);
+        let dl_dir = dir.join("dead_letter");
+        crate::testutil::mkdir_p(&dl_dir);
+        std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
+
+        let interval = Duration::from_millis(400);
+        let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            dead_letter_check_interval: interval,
+            ..tight_dl_config(dir.clone(), 100)
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            config,
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        wait_for(5, "the block", || drain_is_blocked(&metrics));
+
+        let deleted_at = Instant::now();
+        std::fs::remove_dir_all(&dl_dir).unwrap();
+        let deadline = deleted_at + Duration::from_secs(3);
+        while !get_confirmed_path(&sealed).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "a drain blocked on dead-letter headroom must resume once dead_letter/ is deleted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let took = deleted_at.elapsed();
+        drop(tx);
+        handle.join().unwrap();
+
+        assert!(
+            took < interval + Duration::from_millis(500),
+            "resumed after {took:?}; expected within one {interval:?} check interval"
+        );
+        assert!(dl_dir.is_dir(), "dead_letter/ is recreated");
+        assert_eq!(
+            dead_letter_contents(&dir),
+            vec![Payload::from_static(b"record")]
+        );
+        assert_eq!(sink.call_count(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Spec §4.11. The sink commits first and the rejected records are written
+    /// to `dead_letter/` afterwards. When that write failed (ENOSPC on the WAB
+    /// device), the attempt was transient with the cursor unmoved, so every
+    /// retry and every strand cycle re-committed the accepted records — with
+    /// no bound. Now the rejected records are carried and each retry redoes
+    /// only the write.
+    #[test]
+    fn a_failed_dead_letter_write_redoes_only_the_write() {
+        let dir = tmp_dir("dl_write_enospc");
+        let sealed = make_sealed_segment(&dir, 0, &[b"ok", b"bad"]);
+        let sink = Arc::new(MockSink::with_responses(
+            (0..50).map(|_| partial_reject(b"ok", b"bad")),
+        ));
+        let metrics = noop_metrics();
+        // 10 failed writes span more than two strand cycles at max_retries = 3
+        // (4 attempts each), so the carry has to survive strands and the idle
+        // rescan's re-admission, not just the in-arm retries.
+        let dl_dir = dir.join("dead_letter");
+        dead_letter::write_hook::fail(&dl_dir, libc::ENOSPC, 10);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        wait_for(10, "the confirm", || get_confirmed_path(&sealed).exists());
+        drop(tx);
+        handle.join().unwrap();
+        let fired = dead_letter::write_hook::fired(&dl_dir);
+        dead_letter::write_hook::forget(&dl_dir);
+
+        assert_eq!(fired, 10, "the hook failed ten writes");
+        assert_eq!(
+            sink.call_count(),
+            1,
+            "the sub-batch is committed once; only the dead-letter write is retried"
+        );
+        assert_eq!(sink.committed_records(), vec![Payload::from_static(b"ok")]);
+        assert_eq!(
+            dead_letter_contents(&dir),
+            vec![Payload::from_static(b"bad")],
+            "the dead-letter directory holds each rejected record exactly once"
+        );
+        assert_eq!(metrics.drain_dead_letter_write_failures.get(), 10);
+        assert_eq!(
+            local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::write),
+            2,
+            "two strand cycles of four failed writes each"
+        );
+        assert_eq!(
+            metrics.drain_segments_stranded.get(),
+            0,
+            "not a sink strand"
+        );
+        assert_eq!(records_committed(&metrics), 1);
+        assert_eq!(records_dead_lettered(&metrics), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The carry bound (spec §4.5): a carry that would push the in-memory total
+    /// over the bound is not stored, and that segment falls back to the old
+    /// behaviour — the sub-batch is re-committed once when the drain resumes —
+    /// rather than holding unbounded payloads. Bytes are never dropped.
+    ///
+    /// Without a carry, the unblock predicate is the only thing between a short
+    /// headroom and a re-commit per check interval, so this is also the test
+    /// that pins the predicate itself: ten intervals with the total in
+    /// `[cap - needed, cap)` must not unblock the drain.
+    #[test]
+    fn a_carry_over_the_bound_falls_back_to_recommitting_once() {
+        let dir = tmp_dir("dl_carry_over_bound");
+        let sealed = make_sealed_segment(&dir, 0, &[b"ok", b"bad"]);
+        let needed = dead_letter::estimated_segment_bytes(&[Payload::from_static(b"bad")]);
+        let cap = 4096;
+        let dl_dir = dir.join("dead_letter");
+        crate::testutil::mkdir_p(&dl_dir);
+        let filler = dl_dir.join("dl_00000001.wab.sealed");
+        std::fs::write(&filler, vec![0u8; (cap - needed / 2) as usize]).unwrap();
+
+        let sink = Arc::new(MockSink::with_responses(
+            (0..50).map(|_| partial_reject(b"ok", b"bad")),
+        ));
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            dead_letter_check_interval: Duration::from_millis(50),
+            ..tight_dl_config(dir.clone(), cap)
+        };
+        // "bad" is 3 bytes; a 2-byte bound refuses it.
+        let mut ledger = fresh_ledger().with_dl_carry_max_bytes(2);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let (sink_t, metrics_t) = (Arc::clone(&sink), Arc::clone(&metrics));
+        let handle = std::thread::spawn(move || {
+            super::drain_thread(
+                rx,
+                sink_t,
+                config,
+                metrics_t,
+                true,
+                DrainHeartbeat::new(),
+                &mut ledger,
+            );
+            ledger
+        });
+
+        wait_for(5, "the block", || drain_is_blocked(&metrics));
+        std::thread::sleep(Duration::from_millis(10 * 50 + 50));
+        assert_eq!(
+            sink.call_count(),
+            1,
+            "headroom short of `needed` must not unblock the drain, or every check \
+             interval re-commits the sub-batch"
+        );
+        std::fs::remove_file(&filler).unwrap();
+        wait_for(5, "the confirm", || get_confirmed_path(&sealed).exists());
+        drop(tx);
+        let ledger = handle.join().unwrap();
+
+        assert_eq!(
+            sink.call_count(),
+            2,
+            "without a stored carry the sub-batch is re-committed exactly once"
+        );
+        assert_eq!(
+            sink.committed_records(),
+            vec![Payload::from_static(b"ok"), Payload::from_static(b"ok")]
+        );
+        assert_eq!(
+            dead_letter_contents(&dir),
+            vec![Payload::from_static(b"bad")]
+        );
+        assert_eq!(
+            ledger
+                .counts()
+                .dl_carry_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
