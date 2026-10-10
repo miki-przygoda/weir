@@ -1329,8 +1329,8 @@ mod tests {
         };
         fs::write(dir.join(crate::wab::lock::LOCK_FILE_NAME), b"pid=1\n").unwrap();
 
-        let found = scan_unconfirmed_sealed(&dir, Some(1), &Metrics::new().0, &|_| false, true)
-            .unwrap();
+        let found =
+            scan_unconfirmed_sealed(&dir, Some(1), &Metrics::new().0, &|_| false, true).unwrap();
         assert_eq!(found.segments, vec![sealed]);
         assert!(!found.incomplete);
         assert!(
