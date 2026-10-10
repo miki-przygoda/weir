@@ -39,8 +39,10 @@ const SCRAPE_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// the fork-bomb surface on an endpoint with no authentication.
 ///
 /// The returned `JoinHandle` can be ignored if the server should run for the
-/// lifetime of the process. The task exits when `listener` is dropped or an
-/// unrecoverable accept error occurs.
+/// lifetime of the process. The task never ends on its own: it owns `listener`,
+/// and an accept error is logged and retried after a short backoff rather than
+/// ending it (G14). It stops when its runtime shuts down or the handle is
+/// aborted.
 ///
 /// # Tokio runtime
 ///

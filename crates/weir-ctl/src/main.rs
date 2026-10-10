@@ -3298,6 +3298,27 @@ weir_sink_info{sink_type=\"http\"} 1
         }
     }
 
+    /// The daemon writes a `.confirmed` sidecar through a transient
+    /// `seg_X.wab.confirmed.tmp`. A stale one (a crash or ENOSPC mid-write) is
+    /// neither a segment nor a sidecar: `segments` must not count it in any
+    /// column or in the byte total, so `--json` keeps its shape and its values.
+    #[test]
+    fn scan_segments_ignores_a_confirmed_tmp_file() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_scan_tmp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_00");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("seg_00000002.wab.sealed"), vec![0u8; 200]).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.confirmed.tmp"), vec![0u8; 999]).unwrap();
+
+        let (shards, _, _) = scan_segments(&dir).unwrap();
+        assert_eq!(shards.len(), 1);
+        let s = &shards[0];
+        assert_eq!((s.active, s.sealed, s.confirmed), (0, 1, 0));
+        assert_eq!(s.bytes, 200, "the tmp file's bytes are not counted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn metric_primitives_sum_get_and_active_label() {
         let body = "\

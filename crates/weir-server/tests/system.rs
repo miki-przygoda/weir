@@ -861,6 +861,15 @@ fn metrics_all_families_registered() {
         "weir_wab_dir_lock_integrity_failures",
         // Config reload
         "weir_config_reloads",
+        // Drain ledger (safety floor)
+        "weir_drain_local_io_strands",
+        "weir_drain_segments_parked",
+        "weir_drain_segments_disposition_pending",
+        "weir_drain_confirm_failures",
+        "weir_drain_quarantine_failures",
+        "weir_drain_dead_letter_write_failures",
+        // Drain liveness (safety floor)
+        "weir_drain_busy_seconds",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the

@@ -132,6 +132,99 @@ pub enum DrainStateValue {
     stopped,
 }
 
+// ── Drain ledger labels (safety floor, spec §4.0) ─────────────────────────────
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct LocalIoStrandLabel {
+    pub cause: LocalIoStrandCause,
+}
+
+/// Which local I/O stranded a segment: reading the sealed segment, or the
+/// dead-letter write the drain needs before it may advance.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum LocalIoStrandCause {
+    read,
+    write,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ParkedLabel {
+    pub reason: ParkedReason,
+}
+
+/// Why the drain set a segment aside for the rest of the run.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ParkedReason {
+    local_read_failed,
+    unsupported_version,
+    drain_panic,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DispositionLabel {
+    pub kind: DispositionKind,
+}
+
+/// A step still owed for a segment the drain has finished with: its confirm
+/// (sidecar write or delete), or its quarantine move.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DispositionKind {
+    confirm,
+    quarantine,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfirmFailureLabel {
+    pub stage: ConfirmFailureStage,
+}
+
+/// Which step of a delivered segment's confirm failed: the atomic `.confirmed`
+/// sidecar write, or the delete of the segment after it.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ConfirmFailureStage {
+    sidecar,
+    delete,
+}
+
+// ── Drain liveness label (safety floor, spec §4.8) ───────────────────────────
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DrainBusyLabel {
+    pub kind: DrainBusyKind,
+}
+
+/// What the drain thread is busy doing: a sink call, or local I/O. Mirrors the
+/// drain's `BusyKind`.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DrainBusyKind {
+    sink_commit,
+    sink_probe,
+    segment_read,
+    local_fsync,
+    dead_letter_write,
+    quarantine_move,
+    dir_scan,
+}
+
+impl DrainBusyKind {
+    /// Every label value, so the family is complete from boot and a publish
+    /// can zero the kinds that are not current.
+    pub const ALL: [DrainBusyKind; 7] = [
+        DrainBusyKind::sink_commit,
+        DrainBusyKind::sink_probe,
+        DrainBusyKind::segment_read,
+        DrainBusyKind::local_fsync,
+        DrainBusyKind::dead_letter_write,
+        DrainBusyKind::quarantine_move,
+        DrainBusyKind::dir_scan,
+    ];
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsHandshakeFailureLabel {
     pub reason: TlsHandshakeFailureReason,
@@ -289,7 +382,9 @@ pub(crate) struct Metrics {
     /// weir-drain thread panics caught and respawned by its supervisor. Sustained
     /// values indicate a logic bug in the sink/drain path; if the supervisor
     /// exhausts its respawn budget, delivery stops and the WAB accumulates on disk
-    /// until the daemon restarts.
+    /// until the daemon restarts. A segment in flight for two panics is parked
+    /// (`weir_drain_segments_parked{reason="drain_panic"}`) instead of spending
+    /// the rest of the budget.
     pub drain_panics: Counter<u64, AtomicU64>,
     /// fsync / fdatasync calls that returned an error. A non-zero value is a
     /// durability hazard: the kernel buffered the write but couldn't push it
@@ -365,9 +460,10 @@ pub(crate) struct Metrics {
     /// May transiently OVER-COUNT at a recovery-edge rescan: a segment still
     /// sitting in the drain channel can be re-queued and counted again, so
     /// convergence with `stranded` is approximate / eventually-consistent rather
-    /// than exact. Deduplicating in code is impractical — crossbeam channels are
-    /// not enumerable, so the resume path cannot cheaply check whether a segment
-    /// is already in flight.
+    /// than exact. Deduplicating the COUNT is impractical — crossbeam channels
+    /// are not enumerable, so the resume path cannot cheaply check whether a
+    /// segment is already in flight. Double PROCESSING is filtered: both copies
+    /// pass the drain ledger's admission check before they are processed.
     pub drain_segments_resumed: Counter<u64, AtomicU64>,
     /// Gauge vector: exactly one state label value is 1 at any time; the others are 0.
     pub drain_state: Family<DrainStateLabel, Gauge<f64, AtomicU64>>,
@@ -391,6 +487,35 @@ pub(crate) struct Metrics {
     /// what asked for it and how it went. `weir_tls_config_reloads_total` is
     /// unchanged and still counts the TLS part on its own.
     pub config_reloads: Family<ConfigReloadLabel, Counter<u64, AtomicU64>>,
+
+    // ── Drain ledger (safety floor, spec §4.0) ────────────────────────────────
+    /// Segments set aside after exhausting `max_retries` on a LOCAL I/O failure,
+    /// by cause. Deliberately not `drain_segments_stranded`, which means "the
+    /// sink is failing"; a local strand neither counts there nor marks the sink
+    /// down.
+    pub drain_local_io_strands: Family<LocalIoStrandLabel, Counter<u64, AtomicU64>>,
+    /// Segments parked (not re-queued this run), by reason.
+    pub drain_segments_parked: Family<ParkedLabel, Gauge<f64, AtomicU64>>,
+    /// Finished segments with a confirm or quarantine step still outstanding.
+    pub drain_segments_disposition_pending: Family<DispositionLabel, Gauge<f64, AtomicU64>>,
+    /// Failed confirm steps for delivered segments, by stage. Each failure is
+    /// retried on the next health poll without re-delivering the segment.
+    pub drain_confirm_failures: Family<ConfirmFailureLabel, Counter<u64, AtomicU64>>,
+    /// Segments whose move into `quarantine/` failed when the drain first tried
+    /// it. Counted once per segment: the move is then retried on every health
+    /// poll (the `quarantine` kind of `drain_segments_disposition_pending`)
+    /// without re-delivering the segment's prefix.
+    pub drain_quarantine_failures: Counter<u64, AtomicU64>,
+    /// Failed writes of sink-rejected records into `dead_letter/` (spec §4.11).
+    /// The sink commit already happened, so the retry redoes only the write.
+    pub drain_dead_letter_write_failures: Counter<u64, AtomicU64>,
+
+    // ── Drain liveness (safety floor, spec §4.8) ──────────────────────────────
+    /// Seconds the drain thread has been inside its current sink call or local
+    /// I/O operation, by kind; only the current kind is non-zero, and all are
+    /// zero while the drain is between operations. Set by the 5 s poll task
+    /// from the drain heartbeat's busy atomics.
+    pub drain_busy_seconds: Family<DrainBusyLabel, Gauge<f64, AtomicU64>>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -740,6 +865,74 @@ impl Metrics {
              full, as in a SIGHUP flood, so the request never ran)"
         );
 
+        // ── Drain ledger (safety floor, spec §4.0) ───────────────────────────
+        let drain_local_io_strands = reg!(
+            Family::<LocalIoStrandLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_drain_local_io_strands",
+            "WAB segments the drain set aside after exhausting max_retries on a LOCAL I/O \
+             failure rather than a sink failure: cause=\"read\" is reading the sealed segment, \
+             cause=\"write\" is writing dead-letter records after a successful commit. Unlike \
+             weir_drain_segments_stranded these do not mark the sink down; the idle rescan \
+             resumes them past their committed prefix. Investigate the WAB and dead-letter \
+             device (I/O errors, ENOSPC, permissions, descriptor exhaustion), not the sink"
+        );
+        let drain_segments_parked = reg!(
+            Family::<ParkedLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_drain_segments_parked",
+            "WAB segments the drain has parked: kept on disk, not re-queued this run, and \
+             replayed on the next start. reason=\"local_read_failed\" is a persistent \
+             permission-class read error, \"unsupported_version\" a segment written by a newer \
+             weir, \"drain_panic\" a segment the drain panicked on twice"
+        );
+        let drain_segments_disposition_pending = reg!(
+            Family::<DispositionLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_drain_segments_disposition_pending",
+            "Delivered or set-aside WAB segments with a local step still outstanding and \
+             retried on every health poll: kind=\"confirm\" is the .confirmed sidecar write or \
+             the segment delete, kind=\"quarantine\" the move into quarantine/. These are \
+             never re-delivered"
+        );
+        let drain_confirm_failures = reg!(
+            Family::<ConfirmFailureLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_drain_confirm_failures",
+            "Failed steps confirming a delivered WAB segment: stage=\"sidecar\" is the atomic \
+             .confirmed write (tmp, fsync, rename, directory fsync), stage=\"delete\" the removal \
+             of the segment after a durable sidecar. Each is retried on every health poll; the \
+             segment is never re-delivered. A rising sidecar count usually means the WAB device \
+             is full or read-only"
+        );
+        let drain_quarantine_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_quarantine_failures",
+            "WAB segments the drain could not move into quarantine/ (corrupt, truncated or \
+             persistently unreadable segments whose readable prefix was already delivered). \
+             Counted once per segment; the move is retried on every health poll, the bytes stay \
+             in place, and the prefix is never re-delivered. Usually a full or read-only WAB \
+             device, or something other than a directory at <wab_dir>/quarantine"
+        );
+        let drain_dead_letter_write_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_dead_letter_write_failures",
+            "Failed attempts to write sink-rejected records into dead_letter/ after the sink \
+             commit succeeded. The drain keeps the rejected records in memory and retries only \
+             the write, so the accepted records are not re-committed; the segment stays on disk \
+             until the write lands. Usually a full or read-only WAB device (ENOSPC, EROFS, \
+             EACCES)"
+        );
+
+        // ── Drain liveness (safety floor, spec §4.8) ─────────────────────────
+        let drain_busy_seconds = reg!(
+            Family::<DrainBusyLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_drain_busy_seconds",
+            "Seconds the drain thread has spent in its current operation, by kind: \
+             sink_commit and sink_probe are calls into the sink; segment_read, local_fsync, \
+             dead_letter_write, quarantine_move and dir_scan are local I/O on the WAB device \
+             (dir_scan includes the rescan's orphan-file cleanup fsync). Only the current \
+             kind is non-zero; all read 0 between operations. Sampled every 5 s. A large \
+             local value means a slow disk, which a restart does not fix; a sink_commit \
+             value past commit_timeout means a sink blocking the drain thread"
+        );
+
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
@@ -809,6 +1002,13 @@ impl Metrics {
             wab_dir_lock_held,
             wab_dir_lock_integrity_failures,
             config_reloads,
+            drain_local_io_strands,
+            drain_segments_parked,
+            drain_segments_disposition_pending,
+            drain_confirm_failures,
+            drain_quarantine_failures,
+            drain_dead_letter_write_failures,
+            drain_busy_seconds,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -864,6 +1064,41 @@ impl Metrics {
                 state: SinkHealthState::down,
             })
             .set(0.0);
+
+        // Every drain-ledger series exists at 0 from boot, so a scraper can
+        // baseline and alert on them before the first strand or park.
+        for cause in [LocalIoStrandCause::read, LocalIoStrandCause::write] {
+            let _ = metrics
+                .drain_local_io_strands
+                .get_or_create(&LocalIoStrandLabel { cause });
+        }
+        for reason in [
+            ParkedReason::local_read_failed,
+            ParkedReason::unsupported_version,
+            ParkedReason::drain_panic,
+        ] {
+            metrics
+                .drain_segments_parked
+                .get_or_create(&ParkedLabel { reason })
+                .set(0.0);
+        }
+        for kind in [DispositionKind::confirm, DispositionKind::quarantine] {
+            metrics
+                .drain_segments_disposition_pending
+                .get_or_create(&DispositionLabel { kind })
+                .set(0.0);
+        }
+        for stage in [ConfirmFailureStage::sidecar, ConfirmFailureStage::delete] {
+            let _ = metrics
+                .drain_confirm_failures
+                .get_or_create(&ConfirmFailureLabel { stage });
+        }
+        for kind in DrainBusyKind::ALL {
+            metrics
+                .drain_busy_seconds
+                .get_or_create(&DrainBusyLabel { kind })
+                .set(0.0);
+        }
 
         // Pre-initialise the labeled nack counter family so the series exist at 0
         // on the first scrape — without this a scraper can't baseline them until
@@ -961,6 +1196,12 @@ mod tests {
             "weir_wab_dir_lock_held",
             "weir_wab_dir_lock_integrity_failures",
             "weir_config_reloads",
+            "weir_drain_local_io_strands",
+            "weir_drain_segments_parked",
+            "weir_drain_segments_disposition_pending",
+            "weir_drain_confirm_failures",
+            "weir_drain_quarantine_failures",
+            "weir_drain_dead_letter_write_failures",
         ];
         for name in expected {
             assert!(
@@ -1021,5 +1262,29 @@ mod tests {
         assert!(encode_to_string(&reg).contains("weir_wab_dir_lock_held 0"));
         m.wab_dir_lock_held.set(1.0);
         assert!(encode_to_string(&reg).contains("weir_wab_dir_lock_held 1"));
+    }
+
+    #[test]
+    fn drain_ledger_series_are_pre_initialised_to_zero() {
+        let (_m, reg) = Metrics::new();
+        let out = encode_to_string(&reg);
+        for series in [
+            "weir_drain_local_io_strands_total{cause=\"read\"} 0",
+            "weir_drain_local_io_strands_total{cause=\"write\"} 0",
+            "weir_drain_segments_parked{reason=\"local_read_failed\"} 0",
+            "weir_drain_segments_parked{reason=\"unsupported_version\"} 0",
+            "weir_drain_segments_parked{reason=\"drain_panic\"} 0",
+            "weir_drain_segments_disposition_pending{kind=\"confirm\"} 0",
+            "weir_drain_segments_disposition_pending{kind=\"quarantine\"} 0",
+            "weir_drain_confirm_failures_total{stage=\"sidecar\"} 0",
+            "weir_drain_confirm_failures_total{stage=\"delete\"} 0",
+            "weir_drain_quarantine_failures_total 0",
+            "weir_drain_dead_letter_write_failures_total 0",
+        ] {
+            assert!(
+                out.contains(series),
+                "{series:?} missing or not pre-initialised to 0:\n{out}"
+            );
+        }
     }
 }

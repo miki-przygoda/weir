@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     thread,
     time::{Duration, Instant},
@@ -25,7 +25,7 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::{AckOutcome, Batch, RecordSlot};
@@ -372,13 +372,38 @@ pub(crate) fn spawn(
 /// Dirent errors propagate (no `.ok()` filtering): a silently-skipped sealed
 /// segment is silently-dropped acked data.
 ///
-/// `shard_count` only drives the "backlog beyond the configured count" advisory;
-/// pass `None` (e.g. from the recovery rescan) to skip it.
+/// `shard_count` is `Some` only for startup replay, where it drives the
+/// "backlog beyond the configured count" advisory. It also picks the policy for
+/// a shard directory that cannot be listed:
+///
+/// - `Some` (startup replay): the error propagates. No later rescan is
+///   guaranteed, so a skipped shard would be silently-dropped acked data.
+/// - `None` (the drain's rescan): the shard is skipped with a WARN and the
+///   result is marked [`SealedScan::incomplete`], so one unreadable directory
+///   does not block resuming every other shard (spec §4.9). The rescan runs
+///   again on the next poll, so the skipped shard is retried, not forgotten.
+///
+/// An unreadable `wab_dir` itself is an error either way.
+///
+/// `exclude` names segments the caller already owns. They are skipped BEFORE
+/// `check_confirmed`, whose quarantine side effects must never touch them: the
+/// drain's rescan passes its ledger's `excludes` (a delivered segment whose
+/// confirm is outstanding, a parked one, one cooling down). Startup replay owns
+/// nothing yet and passes `&|_| false`.
+///
+/// Two clean-ups ride along (spec §4.3). A stale `*.confirmed.tmp` (a sidecar
+/// write that died) is deleted. An orphan — a sealed segment beside a valid
+/// sidecar, already delivered — is never returned, and with `orphan_cleanup`
+/// (this daemon holds the `wab_dir` lock) it is deleted after its sidecar is
+/// made durable; without the lock it is kept, since another instance may be
+/// mid-confirm on it.
 pub(crate) fn scan_unconfirmed_sealed(
     wab_dir: &Path,
     shard_count: Option<usize>,
     metrics: &Metrics,
-) -> io::Result<Vec<PathBuf>> {
+    exclude: &dyn Fn(&Path) -> bool,
+    orphan_cleanup: bool,
+) -> io::Result<SealedScan> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
@@ -387,6 +412,7 @@ pub(crate) fn scan_unconfirmed_sealed(
     shard_dirs.sort_by_key(|p| segment::shard_id_from_path(p));
 
     let mut unconfirmed = Vec::new();
+    let mut incomplete = false;
     for sdir in shard_dirs {
         if !sdir.is_dir() {
             continue;
@@ -415,9 +441,36 @@ pub(crate) fn scan_unconfirmed_sealed(
                 "draining backlog from a shard directory beyond the configured shard_count (shard_count reduced across a restart?); records are recovered, not stranded"
             );
         }
-        let mut sealed_segments: Vec<PathBuf> = fs::read_dir(&sdir)?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<io::Result<Vec<_>>>()?
+        let entries: Vec<PathBuf> = match fs::read_dir(&sdir)
+            .and_then(|dir| dir.map(|e| e.map(|e| e.path())).collect::<io::Result<_>>())
+        {
+            Ok(entries) => entries,
+            // The rescan (no shard_count) skips a shard it cannot list, so one
+            // bad directory does not block resuming every other shard (spec
+            // §4.9). The caller is told (`incomplete`) and scans again on its
+            // next poll; nothing in the skipped shard is lost, it waits on
+            // disk. Startup replay propagates instead (the arm below): there
+            // no later rescan is guaranteed.
+            Err(e) if shard_count.is_none() => {
+                warn!(
+                    shard_dir = %sdir.display(),
+                    error = %e,
+                    "cannot list a shard directory; skipping it in this rescan and resuming the \
+                     other shards. Its segments wait on disk until it is readable again (check \
+                     its permissions and the WAB device)"
+                );
+                incomplete = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for tmp in entries
+            .iter()
+            .filter(|p| p.to_string_lossy().ends_with(EXT_CONFIRMED_TMP))
+        {
+            remove_stale_confirmed_tmp(tmp);
+        }
+        let mut sealed_segments: Vec<PathBuf> = entries
             .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
             .collect();
@@ -429,8 +482,37 @@ pub(crate) fn scan_unconfirmed_sealed(
         sealed_segments.sort_by_key(|p| segment::segment_counter_from_path(p));
 
         for sealed in sealed_segments {
+            // Before check_confirmed, never after: its quarantine side effects
+            // must not touch a segment the caller owns.
+            if exclude(&sealed) {
+                continue;
+            }
             match check_confirmed(&sealed, wab_dir, metrics) {
+                // An orphan: delivered (the sidecar is valid) but not deleted,
+                // because the process died, or the delete failed, between the
+                // confirm's two steps. Never replayed either way.
+                Ok(true) if orphan_cleanup => match delete_orphan(&sealed) {
+                    Ok(()) => info!(
+                        sealed = %sealed.display(),
+                        "deleted an orphaned sealed segment; its .confirmed sidecar proves \
+                         delivery and stays as the tombstone"
+                    ),
+                    Err(e) => warn!(
+                        sealed = %sealed.display(),
+                        error = %e,
+                        "could not delete an orphaned sealed segment (already confirmed, \
+                         never re-delivered); retried on the next scan"
+                    ),
+                },
                 Ok(true) => {
+                    if !ORPHAN_CLEANUP_OFF_LOGGED.swap(true, Relaxed) {
+                        warn!(
+                            "orphaned sealed segments (already confirmed) are kept on disk: \
+                             this daemon does not hold the wab_dir lock, so another instance \
+                             may still be confirming them. They are skipped, never re-delivered, \
+                             but count toward wab_bytes_on_disk until removed"
+                        );
+                    }
                     info!(sealed = %sealed.display(), "skipping — segment already confirmed");
                 }
                 Ok(false) => unconfirmed.push(sealed),
@@ -450,7 +532,85 @@ pub(crate) fn scan_unconfirmed_sealed(
             }
         }
     }
-    Ok(unconfirmed)
+    Ok(SealedScan {
+        segments: unconfirmed,
+        incomplete,
+    })
+}
+
+/// What [`scan_unconfirmed_sealed`] found.
+#[derive(Debug)]
+pub(crate) struct SealedScan {
+    /// Sealed-but-unconfirmed segments, ascending per shard.
+    pub segments: Vec<PathBuf>,
+    /// True when at least one shard directory could not be listed and was
+    /// skipped. Only the rescan (`shard_count == None`) skips; startup replay
+    /// fails instead. The list is then partial, and the caller must scan again.
+    pub incomplete: bool,
+}
+
+/// Set once the "orphans are kept" warning has been logged, so a rescan every
+/// health poll does not repeat it.
+static ORPHAN_CLEANUP_OFF_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Deletes an orphaned sealed segment (spec §4.3, D7). Its sidecar has just
+/// parsed as valid; it is fsynced, and its directory entry with it, BEFORE the
+/// segment goes, so the tombstone is durable before the bytes disappear — a
+/// power loss can then never leave a shard directory with neither, which would
+/// let the segment counter rewind past a delivered segment. A sync failure
+/// keeps the segment. `NotFound` on the delete is success: the drain's own
+/// confirm, or the other scan (startup replay races the drain's rescan until
+/// replay moves into the drain), got there first.
+fn delete_orphan(sealed: &Path) -> io::Result<()> {
+    let confirmed = format::confirmed_path_for(sealed);
+    fs::File::open(&confirmed)?.sync_all()?;
+    segment::fsync_parent_dir(&confirmed)?;
+    match fs::remove_file(sealed) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Deletes a stale `*.confirmed.tmp`: the leftover of a sidecar write that
+/// died (a crash, ENOSPC) and that no walker reads. Only a regular file is
+/// removed; anything else under that name (a directory, a symlink) is not
+/// ours, and the confirm that trips over it reports it.
+///
+/// Race: the startup replay scan runs on the main thread while the drain is
+/// already confirming segments, so it can delete the tmp of a sidecar write in
+/// progress. That write's rename then fails, the confirm reports
+/// `SidecarFailed`, and the drain retries it on its next poll — a retry, never
+/// a lost or false confirmation. Every later scan runs on the drain thread
+/// itself, between confirms.
+fn remove_stale_confirmed_tmp(tmp: &Path) {
+    match fs::symlink_metadata(tmp) {
+        Ok(meta) if meta.file_type().is_file() => match fs::remove_file(tmp) {
+            Ok(()) => info!(path = %tmp.display(), "deleted a stale .confirmed.tmp"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                path = %tmp.display(),
+                error = %e,
+                "could not delete a stale .confirmed.tmp; it is ignored by every reader"
+            ),
+        },
+        Ok(_) => debug!(
+            path = %tmp.display(),
+            "not deleting a non-file at a .confirmed.tmp name"
+        ),
+        Err(_) => {}
+    }
+}
+
+/// Suffix of the transient file a `.confirmed` sidecar is written to before it
+/// is renamed into place (spec §4.3). It matches no segment suffix, so every
+/// walker ignores it; stale ones are deleted by [`scan_unconfirmed_sealed`].
+pub(crate) const EXT_CONFIRMED_TMP: &str = ".wab.confirmed.tmp";
+
+/// The tmp path the sidecar `confirmed` is written to before its rename.
+pub(crate) fn confirmed_tmp_path(confirmed: &Path) -> PathBuf {
+    let mut s = confirmed.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
 }
 
 /// Replays sealed-but-unconfirmed segments from a previous run by sending their
@@ -462,8 +622,18 @@ pub(crate) fn replay_unconfirmed(
     shard_count: usize,
     drain_tx: &Sender<PathBuf>,
     metrics: &Arc<Metrics>,
+    orphan_cleanup: bool,
 ) -> io::Result<()> {
-    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count), metrics)? {
+    // `Some(shard_count)`: fail-fast, so the scan is never `incomplete` here.
+    for sealed in scan_unconfirmed_sealed(
+        wab_dir,
+        Some(shard_count),
+        metrics,
+        &|_| false,
+        orphan_cleanup,
+    )?
+    .segments
+    {
         // A footer-read failure here only undercounts the
         // recovery_records_replayed metric (the segment is still queued +
         // delivered); surface it rather than silently reporting 0 so the
@@ -1301,7 +1471,7 @@ mod tests {
         let dir_for_replay = dir.clone();
         let replay = std::thread::spawn(move || {
             let metrics = Arc::new(crate::metrics::Metrics::new().0);
-            replay_unconfirmed(&dir_for_replay, 1, &tx, &metrics).unwrap();
+            replay_unconfirmed(&dir_for_replay, 1, &tx, &metrics, false).unwrap();
             let _ = done_tx.send(());
             // tx dropped here → the consumer below sees the channel disconnect.
         });
@@ -1349,7 +1519,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
         let metrics = Arc::new(crate::metrics::Metrics::new().0);
         // Configured shard_count = 2, but 4 shard dirs hold backlog on disk.
-        replay_unconfirmed(&dir, 2, &tx, &metrics).unwrap();
+        replay_unconfirmed(&dir, 2, &tx, &metrics, false).unwrap();
         drop(tx);
 
         let received: Vec<String> = rx.iter().map(|p| p.display().to_string()).collect();
@@ -1395,7 +1565,7 @@ mod tests {
 
         let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
         let metrics = Arc::new(crate::metrics::Metrics::new().0);
-        replay_unconfirmed(&dir, 1, &tx, &metrics).unwrap();
+        replay_unconfirmed(&dir, 1, &tx, &metrics, false).unwrap();
         drop(tx);
 
         let queued: Vec<PathBuf> = rx.iter().collect();
@@ -1468,7 +1638,9 @@ mod tests {
         };
 
         let (m, _reg) = crate::metrics::Metrics::new();
-        let got = scan_unconfirmed_sealed(&dir, None, &m).unwrap();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false)
+            .unwrap()
+            .segments;
         assert!(
             !got.contains(&s1_confirmed),
             "the confirmed segment must be skipped by the recovery scan: {got:?}"
@@ -1477,6 +1649,237 @@ mod tests {
             got,
             vec![s0_1, s0_2, s1_2, s5_1],
             "all unconfirmed sealed segments across every shard dir, ascending"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The drain's rescan passes the ledger's `excludes`, and an excluded path
+    /// must be skipped BEFORE `check_confirmed` runs. `check_confirmed`
+    /// quarantines a segment whose sidecar fails to parse, so a ledger-owned
+    /// segment (a delivered one whose sidecar is mid-retry, say) that reached
+    /// it would be moved to `quarantine/` and counted as corruption.
+    #[test]
+    fn excluded_paths_are_skipped_before_check_confirmed() {
+        use crate::wab::format::confirmed_path_for;
+        let dir = tmp_dir("scan_exclude");
+        let sd0 = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd0);
+        let owned = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 1), 0, Compression::None).unwrap();
+            s.write_record(b"owned").unwrap();
+            s.seal().unwrap()
+        };
+        // A torn sidecar: check_confirmed would quarantine the segment.
+        fs::write(confirmed_path_for(&owned), b"").unwrap();
+        let other = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 2), 0, Compression::None).unwrap();
+            s.write_record(b"other").unwrap();
+            s.seal().unwrap()
+        };
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|p| p == owned.as_path(), false)
+            .unwrap()
+            .segments;
+        assert_eq!(
+            got,
+            vec![other],
+            "only the non-excluded segment is returned"
+        );
+        assert!(
+            owned.exists(),
+            "an excluded segment must never reach check_confirmed's quarantine"
+        );
+        assert_eq!(m.recovery_segments_quarantined.get(), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    fn sealed_in_shard(shard_dir: &Path, counter: u64, payload: &[u8]) -> PathBuf {
+        crate::testutil::mkdir_p(shard_dir);
+        let mut s =
+            WabSegment::create(&segment_path(shard_dir, counter), 0, Compression::None).unwrap();
+        s.write_record(payload).unwrap();
+        s.seal().unwrap()
+    }
+
+    /// D7: an orphan — a sealed segment beside a VALID sidecar, left by a crash
+    /// (or a failed delete) between the confirm's two steps — is deleted by the
+    /// startup replay once this daemon owns the `wab_dir`, and kept without the
+    /// lock (`wab_dir_lock = "best-effort"` on a filesystem that cannot lock),
+    /// where another daemon may still be mid-confirm on it. The tombstone stays
+    /// either way: it is what keeps the segment counter from rewinding.
+    #[test]
+    fn an_orphan_is_deleted_at_startup_only_when_the_wab_dir_is_owned() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        for orphan_cleanup in [true, false] {
+            let dir = tmp_dir(&format!("replay_orphan_{orphan_cleanup}"));
+            let sd0 = shard_dir_path(&dir, 0);
+            let orphan = sealed_in_shard(&sd0, 1, b"delivered");
+            fs::write(confirmed_path_for(&orphan), build_confirmed(0, 1, 1)).unwrap();
+            let pending = sealed_in_shard(&sd0, 2, b"undelivered");
+
+            let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+            let metrics = Arc::new(crate::metrics::Metrics::new().0);
+            replay_unconfirmed(&dir, 1, &tx, &metrics, orphan_cleanup).unwrap();
+            drop(tx);
+
+            assert_eq!(
+                rx.iter().collect::<Vec<_>>(),
+                vec![pending],
+                "an orphan is never replayed, deleted or not"
+            );
+            assert_eq!(
+                orphan.exists(),
+                !orphan_cleanup,
+                "orphan_cleanup={orphan_cleanup}: the orphan is deleted only when the lock is held"
+            );
+            assert!(
+                confirmed_path_for(&orphan).exists(),
+                "the tombstone stays: the counter scan counts it"
+            );
+            assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// The same orphan handling on the drain's rescan entry point (`None` shard
+    /// count), where a confirm whose delete failed lands once its ledger entry
+    /// is gone (a restart, a respawn).
+    #[test]
+    fn the_rescan_deletes_an_orphan_only_when_the_wab_dir_is_owned() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        for orphan_cleanup in [true, false] {
+            let dir = tmp_dir(&format!("rescan_orphan_{orphan_cleanup}"));
+            let orphan = sealed_in_shard(&shard_dir_path(&dir, 3), 7, b"delivered");
+            fs::write(confirmed_path_for(&orphan), build_confirmed(0, 1, 1)).unwrap();
+
+            let (m, _reg) = crate::metrics::Metrics::new();
+            let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, orphan_cleanup)
+                .unwrap()
+                .segments;
+            assert!(got.is_empty(), "{got:?}");
+            assert_eq!(orphan.exists(), !orphan_cleanup);
+            assert!(confirmed_path_for(&orphan).exists());
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Spec §4.9: one shard directory that cannot be listed (here, mode 000)
+    /// must not block the drain's rescan from resuming every OTHER shard — a
+    /// `?` on the per-shard `read_dir` used to fail the whole scan, so one bad
+    /// directory stranded the backlog of all of them. The rescan
+    /// (`shard_count == None`) skips that shard and says so (`incomplete`), so
+    /// its caller scans again. Startup replay (`Some(count)`) stays fail-fast:
+    /// there no later rescan is guaranteed, and a silently-skipped shard is
+    /// silently-dropped acked data.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_shard_is_skipped_by_the_rescan_but_fails_startup_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("scan_unreadable_shard");
+        let first = sealed_in_shard(&shard_dir_path(&dir, 0), 1, b"first");
+        let bad = shard_dir_path(&dir, 1);
+        let hidden = sealed_in_shard(&bad, 1, b"hidden");
+        let last = sealed_in_shard(&shard_dir_path(&dir, 2), 1, b"last");
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&bad).is_ok() {
+            // Running as root: directory permissions are not enforced, so the
+            // fault cannot be injected this way.
+            fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            fs::remove_dir_all(dir).ok();
+            return;
+        }
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let rescan = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false);
+        let startup = scan_unconfirmed_sealed(&dir, Some(3), &m, &|_| false, false);
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let rescan = rescan.expect("the rescan tolerates one unreadable shard");
+        assert_eq!(
+            rescan.segments,
+            vec![first.clone(), last.clone()],
+            "every readable shard is still returned"
+        );
+        assert!(rescan.incomplete, "the caller is told the list is partial");
+        let err = startup.expect_err("startup replay stays fail-fast");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Readable again: complete, and the hidden segment is found.
+        let healed = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false).unwrap();
+        assert_eq!(healed.segments, vec![first, hidden, last]);
+        assert!(!healed.incomplete);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A stale `*.confirmed.tmp` is the leftover of a sidecar write that died
+    /// (a crash, ENOSPC). The scan deletes it; it is never mistaken for a
+    /// segment or a sidecar. Something that is not a regular file under that
+    /// name is not ours to remove and is left alone.
+    #[test]
+    fn stale_confirmed_tmp_files_are_deleted_by_the_scan() {
+        use crate::wab::format::confirmed_path_for;
+        let dir = tmp_dir("scan_stale_tmp");
+        let sd0 = shard_dir_path(&dir, 0);
+        let sealed = sealed_in_shard(&sd0, 1, b"undelivered");
+        let tmp = confirmed_tmp_path(&confirmed_path_for(&sealed));
+        fs::write(&tmp, b"half a sidecar").unwrap();
+        let squatter = sd0.join(format!("seg_00000002{EXT_CONFIRMED_TMP}"));
+        crate::testutil::mkdir_p(&squatter);
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false)
+            .unwrap()
+            .segments;
+        assert_eq!(got, vec![sealed.clone()]);
+        assert!(!tmp.exists(), "a stale tmp sidecar is deleted");
+        assert!(
+            squatter.is_dir(),
+            "a directory under the tmp name is left alone"
+        );
+        assert!(sealed.exists());
+        assert_eq!(m.recovery_segments_quarantined.get(), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Review Focus 4, upgrading from 4.0.x: a 0-byte `.confirmed` that the old
+    /// in-place write tore is still quarantined exactly once, as it was before —
+    /// the atomic write prevents NEW torn sidecars, it does not reinterpret old
+    /// ones. Orphan deletion must not touch it either: only a sidecar that
+    /// parses as valid proves delivery.
+    #[test]
+    fn a_legacy_torn_sidecar_is_quarantined_once_at_startup() {
+        use crate::wab::format::confirmed_path_for;
+        let dir = tmp_dir("replay_legacy_torn");
+        let sd0 = shard_dir_path(&dir, 0);
+        let sealed = sealed_in_shard(&sd0, 1, b"maybe delivered");
+        fs::write(confirmed_path_for(&sealed), b"").unwrap();
+
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        for _ in 0..2 {
+            let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+            replay_unconfirmed(&dir, 1, &tx, &metrics, true).unwrap();
+            drop(tx);
+            assert!(
+                rx.iter().next().is_none(),
+                "a quarantined segment is not replayed"
+            );
+        }
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "quarantined once, as 4.0.x did"
+        );
+        assert!(!sealed.exists());
+        assert!(
+            dir.join("quarantine")
+                .join(format!(
+                    "shard_00__{}",
+                    sealed.file_name().unwrap().to_string_lossy()
+                ))
+                .exists(),
+            "the segment's bytes are kept in quarantine/"
         );
         fs::remove_dir_all(dir).ok();
     }

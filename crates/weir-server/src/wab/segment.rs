@@ -1504,6 +1504,28 @@ mod tests {
         assert_eq!(segment_counter_from_path(Path::new("/s/seg_abc.wab")), None);
     }
 
+    /// A stale `seg_X.wab.confirmed.tmp` (spec §4.3) parses to its segment's
+    /// counter, so it can only ADVANCE the next counter past a segment that
+    /// existed, never rewind it below one.
+    #[test]
+    fn a_confirmed_tmp_file_can_only_advance_the_counter() {
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000009.wab.confirmed.tmp")),
+            Some(9)
+        );
+        let dir = tmp_dir("counters_tmp");
+        fs::write(dir.join("seg_00000003.wab.sealed"), b"x").unwrap();
+        fs::write(dir.join("seg_00000002.wab.confirmed.tmp"), b"x").unwrap();
+        let mut counters = FsSegmentStore.segment_counters(&dir).unwrap();
+        counters.sort_unstable();
+        assert_eq!(
+            counters,
+            vec![2, 3],
+            "the max, 3, is still the sealed segment's"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn scan_and_advance_counter_advances_past_sealed_segments() {
         // Regression for the recovery counter-reset data-loss bug: after crash

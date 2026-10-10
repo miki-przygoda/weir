@@ -2433,6 +2433,31 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// The transient `seg_X.wab.confirmed.tmp` the atomic sidecar write leaves
+    /// behind after a crash or ENOSPC (spec §4.3) is neither a segment to seal
+    /// nor a sidecar: recovery must leave it alone, and the mode audit must not
+    /// flag it (it is created 0600, but a stale one is not worth an alert).
+    #[test]
+    #[cfg(unix)]
+    fn recovery_ignores_a_confirmed_tmp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let wab = tmp_dir("rec_ignores_confirmed_tmp");
+        let shard = wab.join("shard_00");
+        fs::create_dir_all(&shard).unwrap();
+        let tmp = shard.join("seg_00000001.wab.confirmed.tmp");
+        fs::write(&tmp, b"half a sidecar").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let metrics = noop_metrics();
+        recover_open_segments(&wab, &metrics).unwrap();
+
+        assert!(tmp.exists(), "recovery does not touch a tmp sidecar");
+        assert!(!wab.join("quarantine").exists(), "nothing is quarantined");
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        assert_eq!(metrics.wab_unexpected_mode.get(), 0, "not a segment file");
+        fs::remove_dir_all(wab).ok();
+    }
+
     #[test]
     #[cfg(unix)]
     fn audit_segment_modes_clean_dir_increments_nothing() {
