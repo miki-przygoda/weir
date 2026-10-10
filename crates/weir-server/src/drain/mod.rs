@@ -502,7 +502,14 @@ fn publish_ledger_counts(counts: &ledger::LedgerCounts, metrics: &Metrics) {
 /// `recv` (missing shutdown), and the blocked-state poll would never reach its
 /// `channel_closed` check. Mirrors the `commit()` timeout backstop so a
 /// misbehaving sink degrades the health gauge instead of stalling delivery.
-fn probe_health<S: Sink>(rt: &tokio::runtime::Runtime, sink: &S, timeout: Duration) -> SinkHealth {
+fn probe_health<S: Sink>(
+    rt: &tokio::runtime::Runtime,
+    sink: &S,
+    timeout: Duration,
+    hb: &DrainHeartbeat,
+) -> SinkHealth {
+    // Outside the timeout: a probe that blocks the thread keeps it set.
+    let _busy = BusyGuard::new(hb, BusyKind::SinkProbe);
     match rt.block_on(async { tokio::time::timeout(timeout, sink.health()).await }) {
         Ok(health) => health,
         Err(_elapsed) => SinkHealth::Down(format!(
@@ -538,8 +545,9 @@ fn probe_and_resume_stranded<S: Sink>(
     prev_health_ok: bool,
     in_flight: Option<&Path>,
     exclude: &dyn Fn(&Path) -> bool,
+    hb: &DrainHeartbeat,
 ) -> bool {
-    let health = probe_health(rt, sink, config.health_probe_timeout);
+    let health = probe_health(rt, sink, config.health_probe_timeout, hb);
     // Deliverable, not perfect. `Degraded` means "reachable but not fully
     // healthy" — the HTTP probe returns it for any 4xx outside 401/403/405/501,
     // which includes 404, what a method-routed framework answers for HEAD on a
@@ -562,13 +570,17 @@ fn probe_and_resume_stranded<S: Sink>(
     if now_ok && (!prev_health_ok || pending.is_empty()) {
         // `None` shard_count: skip the beyond-configured-count advisory — that's
         // a startup-replay concern, not a recovery one.
-        match crate::wab::scan_unconfirmed_sealed(
-            &config.wab_dir,
-            None,
-            metrics,
-            exclude,
-            config.orphan_cleanup,
-        ) {
+        let scan = {
+            let _busy = BusyGuard::new(hb, BusyKind::DirScan);
+            crate::wab::scan_unconfirmed_sealed(
+                &config.wab_dir,
+                None,
+                metrics,
+                exclude,
+                config.orphan_cleanup,
+            )
+        };
+        match scan {
             Ok(sealed) => {
                 // Dedup against what's already queued via a HashSet membership view
                 // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
@@ -622,9 +634,10 @@ fn probe_and_resume_stranded<S: Sink>(
 
 /// A monotonic counter the drain advances whenever it is alive.
 ///
-/// Bumped at the top of the outer loop AND inside every deliberate wait (the
-/// retry backoff and the dead-letter-full block), because a drain that is
-/// merely WAITING is not wedged. A single retry backoff can legitimately run to
+/// Bumped at the top of the outer loop, inside every deliberate wait (the
+/// retry backoff and the dead-letter-full block), after every sink commit and
+/// every [`READ_HEARTBEAT_EVERY`] records read, because a drain that is merely
+/// WAITING, or working through one large segment, is not wedged. A single retry backoff can legitimately run to
 /// `MAX_RETRY_DELAY` (300 s), and the blocked arm parks indefinitely — both far
 /// past the stall warning's `health_poll_interval + 15 s` threshold — so
 /// bumping only at the loop head would report a slow-but-healthy sink as a
@@ -643,8 +656,34 @@ fn probe_and_resume_stranded<S: Sink>(
 /// Deliberately NOT a fix: the drain still wedges forever against a sink that
 /// never yields. This only makes that state visible in the logs instead of
 /// silent. `drain_state` is untouched by this — see the callers.
+///
+/// # Busy signal (spec §4.8)
+///
+/// A frozen counter alone cannot tell a wedge from a drain that is merely
+/// inside one long operation: a 60 s sink commit that yields (and that
+/// `commit_timeout` can still cancel), or a sidecar fsync on a disk that
+/// stalls for a minute. Both used to read as "wedged, restart it", and a
+/// restart re-delivers from record 0 and fixes neither. So the counter is
+/// bumped after every sink commit and every [`READ_HEARTBEAT_EVERY`] records
+/// read, and every long operation runs under a [`BusyGuard`] naming what it
+/// is ([`BusyKind`]) and since when. The poll task in `main.rs` reads both
+/// ([`DrainHeartbeat::busy`]) to tell a slow sink call or slow local I/O from
+/// a genuinely wedged thread.
+///
+/// Every write is a wait-free `Relaxed` store on the drain thread, and nothing
+/// here is shared with the ack path.
 #[derive(Clone, Default)]
-pub(crate) struct DrainHeartbeat(std::sync::Arc<std::sync::atomic::AtomicU64>);
+pub(crate) struct DrainHeartbeat(std::sync::Arc<HeartbeatCells>);
+
+#[derive(Default)]
+struct HeartbeatCells {
+    beats: std::sync::atomic::AtomicU64,
+    /// When the current operation started: milliseconds since
+    /// [`busy_clock_ms`]'s process epoch, plus 1. Zero means idle.
+    busy_since: std::sync::atomic::AtomicU64,
+    /// The current operation, a [`BusyKind`] discriminant. Zero means idle.
+    busy_kind: std::sync::atomic::AtomicU8,
+}
 
 impl DrainHeartbeat {
     pub(crate) fn new() -> Self {
@@ -652,11 +691,141 @@ impl DrainHeartbeat {
     }
 
     pub(crate) fn bump(&self) {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .beats
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn get(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.0.beats.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What the drain is busy doing and for how long, or `None` between
+    /// operations. Read from another thread: the two atomics are loaded
+    /// separately, so a reading that straddles a transition may pair one
+    /// operation's kind with its neighbour's start — off by one operation at
+    /// worst, which a poll every 5 s cannot tell apart anyway.
+    pub(crate) fn busy(&self) -> Option<(BusyKind, Duration)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let since = self.0.busy_since.load(Relaxed);
+        if since == 0 {
+            return None;
+        }
+        let kind = BusyKind::from_u8(self.0.busy_kind.load(Relaxed))?;
+        let elapsed_ms = busy_clock_ms().saturating_sub(since - 1);
+        Some((kind, Duration::from_millis(elapsed_ms)))
+    }
+
+    fn set_busy(&self, kind: BusyKind) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.0.busy_kind.store(kind as u8, Relaxed);
+        self.0
+            .busy_since
+            .store(busy_clock_ms().saturating_add(1), Relaxed);
+    }
+
+    fn clear_busy(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.0.busy_since.store(0, Relaxed);
+        self.0.busy_kind.store(0, Relaxed);
+    }
+
+    fn busy_kind(&self) -> Option<BusyKind> {
+        BusyKind::from_u8(self.0.busy_kind.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Milliseconds since a process-wide epoch, the clock of
+/// [`DrainHeartbeat`]'s `busy_since`. Monotonic (an `Instant`), so a wall-clock
+/// step cannot make an operation look minutes long or negative.
+fn busy_clock_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let ms = EPOCH.get_or_init(Instant::now).elapsed().as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
+/// How often the reader loop bumps the heartbeat, in records read. A resumed
+/// attempt re-walks its whole durable prefix (G13), up to a 256 MiB segment of
+/// small records, so reads bump it as well as commits.
+pub(crate) const READ_HEARTBEAT_EVERY: u64 = 1024;
+
+/// What a [`BusyGuard`] says the drain thread is doing. The first two are
+/// calls into the sink, which `commit_timeout` / `health_probe_timeout` bound
+/// when the sink yields; the rest are local I/O on the WAB device, which
+/// nothing bounds and a restart does not speed up.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BusyKind {
+    SinkCommit = 1,
+    SinkProbe = 2,
+    SegmentRead = 3,
+    LocalFsync = 4,
+    DeadLetterWrite = 5,
+    QuarantineMove = 6,
+    DirScan = 7,
+}
+
+impl BusyKind {
+    fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => Self::SinkCommit,
+            2 => Self::SinkProbe,
+            3 => Self::SegmentRead,
+            4 => Self::LocalFsync,
+            5 => Self::DeadLetterWrite,
+            6 => Self::QuarantineMove,
+            7 => Self::DirScan,
+            _ => return None,
+        })
+    }
+
+    /// True for a call into the sink, false for local I/O.
+    pub(crate) fn is_sink_call(self) -> bool {
+        matches!(self, Self::SinkCommit | Self::SinkProbe)
+    }
+
+    /// The `weir_drain_busy_seconds{kind}` label value.
+    pub(crate) fn metric_label(self) -> crate::metrics::DrainBusyKind {
+        use crate::metrics::DrainBusyKind as L;
+        match self {
+            Self::SinkCommit => L::sink_commit,
+            Self::SinkProbe => L::sink_probe,
+            Self::SegmentRead => L::segment_read,
+            Self::LocalFsync => L::local_fsync,
+            Self::DeadLetterWrite => L::dead_letter_write,
+            Self::QuarantineMove => L::quarantine_move,
+            Self::DirScan => L::dir_scan,
+        }
+    }
+}
+
+/// Marks the drain thread busy with one [`BusyKind`] for the guard's lifetime.
+///
+/// Set on `new`, cleared on drop — including a drop during a panic unwind, so a
+/// panicking sink or disk helper cannot leave a respawned drain reporting the
+/// dead one's operation. Guards nest: the reader loop's `SegmentRead` guard
+/// holds a `SinkCommit` guard around each commit, and dropping the inner guard
+/// hands the signal back to the outer kind, timed afresh from that moment (the
+/// question the verdict asks is how long the CURRENT stretch has run).
+pub(crate) struct BusyGuard<'a> {
+    hb: &'a DrainHeartbeat,
+    outer: Option<BusyKind>,
+}
+
+impl<'a> BusyGuard<'a> {
+    pub(crate) fn new(hb: &'a DrainHeartbeat, kind: BusyKind) -> Self {
+        let outer = hb.busy_kind();
+        hb.set_busy(kind);
+        Self { hb, outer }
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        match self.outer {
+            Some(kind) => self.hb.set_busy(kind),
+            None => self.hb.clear_busy(),
+        }
     }
 }
 
@@ -810,7 +979,7 @@ fn drain_thread<S: Sink>(
                 // deliver, and finishing one can change what the rescan may
                 // pick up — then the probe + rescan, then the gauges.
                 if last_health_poll.elapsed() >= config.health_poll_interval {
-                    ledger.retry_dispositions(&config.wab_dir, &metrics);
+                    ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
                     let now = Instant::now();
                     prev_health_ok = probe_and_resume_stranded(
                         &rt,
@@ -821,12 +990,17 @@ fn drain_thread<S: Sink>(
                         prev_health_ok,
                         None,
                         &|p| ledger.excludes(p, now),
+                        &heartbeat,
                     );
                     // Refresh the dead-letter size gauge too, so an out-of-band
                     // `weir-ctl dl drop` (an operator deleting files while the
                     // daemon runs) is reflected without waiting for the blocked
                     // state or a restart.
-                    if dead_letter.rescan().is_ok() {
+                    let rescanned = {
+                        let _busy = BusyGuard::new(&heartbeat, BusyKind::DirScan);
+                        dead_letter.rescan()
+                    };
+                    if rescanned.is_ok() {
                         metrics
                             .dead_letter_bytes_on_disk
                             .set(dead_letter.total_bytes() as f64);
@@ -835,9 +1009,11 @@ fn drain_thread<S: Sink>(
                     // quarantine requeue` (or manually clear the dir) while the
                     // daemon is up, and the gauge should catch up on this same
                     // health-poll cadence rather than only at the next restart.
-                    metrics
-                        .quarantine_bytes_on_disk
-                        .set(quarantine_bytes_on_disk(&config.wab_dir) as f64);
+                    let quarantined = {
+                        let _busy = BusyGuard::new(&heartbeat, BusyKind::DirScan);
+                        quarantine_bytes_on_disk(&config.wab_dir)
+                    };
+                    metrics.quarantine_bytes_on_disk.set(quarantined as f64);
                     last_health_poll = Instant::now();
                 }
 
@@ -898,6 +1074,7 @@ fn drain_thread<S: Sink>(
                             &mut dead_letter,
                             ledger,
                             skip,
+                            &heartbeat,
                         );
                         transition_from_draining(
                             segment,
@@ -906,6 +1083,7 @@ fn drain_thread<S: Sink>(
                             &metrics,
                             &mut block_episode,
                             ledger,
+                            &heartbeat,
                         )
                     }
                 }
@@ -1109,6 +1287,7 @@ fn drain_thread<S: Sink>(
                     prev_health_ok,
                     Some(&segment),
                     &|p| ledger.excludes(p, now),
+                    &heartbeat,
                 );
 
                 // Resume past the sub-batches already durably processed (F05).
@@ -1121,6 +1300,7 @@ fn drain_thread<S: Sink>(
                     &mut dead_letter,
                     ledger,
                     processed,
+                    &heartbeat,
                 );
                 // Subsequent failure: spend one retry and double the delay
                 // (exponential backoff). retries_left is >= 1 here — a spent
@@ -1132,6 +1312,7 @@ fn drain_thread<S: Sink>(
                     &metrics,
                     &mut block_episode,
                     ledger,
+                    &heartbeat,
                     |segment, retry_after, processed, cause| DrainState::RetryingTransient {
                         segment,
                         retries_left: retries_left - 1,
@@ -1188,7 +1369,11 @@ fn drain_thread<S: Sink>(
                 // at-cap value, so the unblock check below can't clear and the
                 // drain stays blocked even after the operator frees the dir —
                 // surface it rather than swallowing (F08).
-                if let Err(e) = dead_letter.rescan() {
+                let rescanned = {
+                    let _busy = BusyGuard::new(&heartbeat, BusyKind::DirScan);
+                    dead_letter.rescan()
+                };
+                if let Err(e) = rescanned {
                     warn!(error = %e, "drain: dead-letter rescan failed while blocked; total_bytes may be stale until the next successful rescan");
                 }
                 metrics
@@ -1219,6 +1404,7 @@ fn drain_thread<S: Sink>(
                     prev_health_ok,
                     Some(&segment),
                     &|p| ledger.excludes(p, now),
+                    &heartbeat,
                 );
                 // Unblock on the SAME predicate that blocked: the blocked write
                 // fits. A bare `total < cap` unblocked while the total sat in
@@ -1281,7 +1467,7 @@ fn drain_thread<S: Sink>(
     // One best-effort pass over outstanding dispositions on the way out: a
     // sidecar or quarantine move that can complete now saves a re-delivery on
     // the next start. It never delivers.
-    ledger.retry_dispositions(&config.wab_dir, &metrics);
+    ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
     publish_ledger_counts(ledger.counts(), &metrics);
     info!("drain thread exiting");
 }
@@ -1299,6 +1485,7 @@ fn drain_thread<S: Sink>(
 /// It also keeps the ledger's per-segment progress in step (spec §4.0): a
 /// transient or blocked result records the durable cursor, which survives a
 /// strand; a confirmed or quarantined segment is forgotten.
+#[allow(clippy::too_many_arguments)]
 fn next_state_after_process(
     segment: PathBuf,
     result: ProcessResult,
@@ -1306,6 +1493,7 @@ fn next_state_after_process(
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
     ledger: &mut SegmentLedger,
+    hb: &DrainHeartbeat,
     on_transient: impl FnOnce(PathBuf, Option<Duration>, u64, TransientCause) -> DrainState,
 ) -> DrainState {
     match result {
@@ -1313,7 +1501,10 @@ fn next_state_after_process(
             // A confirm that did not finish is owned by the ledger from here:
             // the polls retry only the outstanding step, and neither the
             // channel nor the rescan delivers the segment again (spec §4.3).
-            let outcome = confirm_and_delete(&segment, record_count, metrics);
+            let outcome = {
+                let _busy = BusyGuard::new(hb, BusyKind::LocalFsync);
+                confirm_and_delete(&segment, record_count, metrics)
+            };
             ledger.forget(&segment);
             ledger.note_confirm_outcome(&segment, outcome, record_count);
             end_block_episode(block_episode, metrics);
@@ -1334,6 +1525,7 @@ fn next_state_after_process(
                     metrics,
                     block_episode,
                     ledger,
+                    hb,
                 )
             {
                 return next;
@@ -1412,13 +1604,16 @@ fn attempt_segment<S: Sink>(
     dead_letter: &mut DeadLetterWriter,
     ledger: &mut SegmentLedger,
     skip: u64,
+    hb: &DrainHeartbeat,
 ) -> ProcessResult {
     let skip = match ledger.take_dl_carry(segment) {
         None => skip,
-        Some(carry) => match settle_dl_carry(segment, skip, carry, dead_letter, config, metrics) {
-            Ok(through) => through,
-            Err(result) => return result,
-        },
+        Some(carry) => {
+            match settle_dl_carry(segment, skip, carry, dead_letter, config, metrics, hb) {
+                Ok(through) => through,
+                Err(result) => return result,
+            }
+        }
     };
     let last_chance = local_read_escalates_next(segment, config, ledger);
     rt.block_on(process_segment(
@@ -1429,6 +1624,7 @@ fn attempt_segment<S: Sink>(
         dead_letter,
         skip,
         last_chance,
+        hb,
     ))
 }
 
@@ -1444,8 +1640,9 @@ fn settle_dl_carry(
     dead_letter: &mut DeadLetterWriter,
     config: &DrainConfig,
     metrics: &Metrics,
+    hb: &DrainHeartbeat,
 ) -> Result<u64, ProcessResult> {
-    match dead_letter_records(&carry.payloads, dead_letter, config, metrics) {
+    match dead_letter_records(&carry.payloads, dead_letter, config, metrics, hb) {
         Ok(()) => {
             metrics
                 .sink_commit_records
@@ -1485,6 +1682,7 @@ fn settle_dl_carry(
 /// `Process`-class errors are daemon-wide (descriptors, memory), not a property
 /// of the segment: they never count and never escalate, so a segment under fd
 /// pressure keeps cycling exactly as before and heals when the pressure clears.
+#[allow(clippy::too_many_arguments)]
 fn escalate_local_read(
     segment: &Path,
     class: ledger::ErrClass,
@@ -1493,6 +1691,7 @@ fn escalate_local_read(
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
     ledger: &mut SegmentLedger,
+    hb: &DrainHeartbeat,
 ) -> Option<DrainState> {
     let failures = ledger.note_local_read_failure(segment, class);
     if failures < local_read_limit(config) {
@@ -1524,7 +1723,7 @@ fn escalate_local_read(
             // than forgetting it: forgotten, it would be re-opened for three
             // more strand cycles before the move was even tried again.
             const REASON: &str = "drain: persistent local read error";
-            if quarantine_segment(segment, config, metrics, REASON) {
+            if quarantine_segment(segment, config, metrics, REASON, hb) {
                 ledger.forget(segment);
             } else {
                 ledger.note_quarantine_pending(segment, REASON);
@@ -1557,6 +1756,7 @@ fn transition_from_draining(
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
     ledger: &mut SegmentLedger,
+    hb: &DrainHeartbeat,
 ) -> DrainState {
     // First failure for this segment: a fresh retry budget and the base delay.
     next_state_after_process(
@@ -1566,6 +1766,7 @@ fn transition_from_draining(
         metrics,
         block_episode,
         ledger,
+        hb,
         |segment, retry_after, processed, cause| DrainState::RetryingTransient {
             segment,
             retries_left: config.max_retries,
@@ -1638,6 +1839,7 @@ fn enter_blocked(
 /// there, the escalation must also deliver the partial batch it already read
 /// before quarantining (spec §4.2), which needs the sink — so it happens here
 /// rather than in [`escalate_local_read`].
+#[allow(clippy::too_many_arguments)]
 async fn process_segment<S: Sink>(
     segment: &Path,
     sink: &S,
@@ -1646,7 +1848,14 @@ async fn process_segment<S: Sink>(
     dead_letter: &mut DeadLetterWriter,
     skip: u64,
     last_local_read_chance: bool,
+    hb: &DrainHeartbeat,
 ) -> ProcessResult {
+    // The whole attempt is reading the segment, except where a nested guard
+    // says otherwise: each commit (`SinkCommit`), a dead-letter write, a
+    // quarantine move. The heartbeat itself moves after every commit and every
+    // READ_HEARTBEAT_EVERY records (spec §4.8), so one large segment no longer
+    // freezes it for as long as the whole segment takes.
+    let _busy = BusyGuard::new(hb, BusyKind::SegmentRead);
     let reader = match open_segment(segment) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1689,6 +1898,7 @@ async fn process_segment<S: Sink>(
                         config,
                         metrics,
                         "drain: corrupt segment header",
+                        hb,
                     );
                 }
                 HeaderVerdict::Gone => {
@@ -1804,6 +2014,9 @@ async fn process_segment<S: Sink>(
             }
         };
         read_index += 1;
+        if read_index.is_multiple_of(READ_HEARTBEAT_EVERY) {
+            hb.bump();
+        }
         // Skip the prefix already durably processed by a previous attempt so we
         // don't re-commit / re-dead-letter it (F05).
         //
@@ -1831,8 +2044,10 @@ async fn process_segment<S: Sink>(
                 config,
                 metrics,
                 dead_letter,
+                hb,
             )
             .await;
+            hb.bump();
             if let Err(setback) = apply_batch(result, &mut durable_through, n) {
                 return setback;
             }
@@ -1849,8 +2064,10 @@ async fn process_segment<S: Sink>(
             config,
             metrics,
             dead_letter,
+            hb,
         )
         .await;
+        hb.bump();
         if let Err(setback) = apply_batch(result, &mut durable_through, n) {
             return setback;
         }
@@ -1858,7 +2075,7 @@ async fn process_segment<S: Sink>(
     if let Some(reason) = quarantine_after_prefix {
         // Readable prefix delivered; move the segment (with its unreadable tail) to
         // the quarantine dir for manual recovery rather than deleting it.
-        return quarantine_result(segment, config, metrics, reason);
+        return quarantine_result(segment, config, metrics, reason, hb);
     }
 
     // Completeness check before confirming (S01). A sealed segment ends with a
@@ -1887,6 +2104,7 @@ async fn process_segment<S: Sink>(
                 config,
                 metrics,
                 "drain: record count mismatch vs footer (truncated tail)",
+                hb,
             );
         }
         // A footer cut short (the file ends inside it, or is shorter than one):
@@ -1903,6 +2121,7 @@ async fn process_segment<S: Sink>(
                 config,
                 metrics,
                 "drain: footer unreadable, completeness unverifiable",
+                hb,
             );
         }
         // Gone between the record loop and the footer read: like the open-time
@@ -2290,8 +2509,13 @@ fn quarantine_segment(
     config: &DrainConfig,
     metrics: &Metrics,
     reason: &'static str,
+    hb: &DrainHeartbeat,
 ) -> bool {
-    match move_to_quarantine(segment, &config.wab_dir, metrics, reason) {
+    let moved = {
+        let _busy = BusyGuard::new(hb, BusyKind::QuarantineMove);
+        move_to_quarantine(segment, &config.wab_dir, metrics, reason)
+    };
+    match moved {
         Ok(()) => true,
         Err(qe) => {
             metrics.drain_quarantine_failures.inc();
@@ -2314,8 +2538,9 @@ fn quarantine_result(
     config: &DrainConfig,
     metrics: &Metrics,
     reason: &'static str,
+    hb: &DrainHeartbeat,
 ) -> ProcessResult {
-    if quarantine_segment(segment, config, metrics, reason) {
+    if quarantine_segment(segment, config, metrics, reason, hb) {
         ProcessResult::Quarantined
     } else {
         ProcessResult::QuarantinePending { reason }
@@ -2374,6 +2599,7 @@ fn move_to_quarantine(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn commit_batch<S: Sink>(
     payloads: &[Payload],
     record_ids: &[RecordId],
@@ -2382,6 +2608,7 @@ async fn commit_batch<S: Sink>(
     config: &DrainConfig,
     metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
+    hb: &DrainHeartbeat,
 ) -> BatchResult {
     // Derive the batch's dedup token. This runs on the drain thread — off the
     // fsync path entirely — and costs ~170 us per 256 KiB against a sink commit
@@ -2414,7 +2641,16 @@ async fn commit_batch<S: Sink>(
     // Backstop timeout: a sink that hangs (e.g. a third-party sink with no
     // internal timeout) must not stall the drain forever. On elapse, treat it
     // as a transient error so the segment is retried.
-    let commit = match tokio::time::timeout(config.commit_timeout, sink.commit(batch)).await {
+    //
+    // The busy guard sits OUTSIDE the timeout (spec §4.8): a sink that blocks
+    // the thread instead of yielding defeats the timeout, and the guard staying
+    // set past `commit_timeout` is how the poll task tells that wedge from a
+    // merely slow commit. It is dropped before the dead-letter write below.
+    let timed = {
+        let _busy = BusyGuard::new(hb, BusyKind::SinkCommit);
+        tokio::time::timeout(config.commit_timeout, sink.commit(batch)).await
+    };
+    let commit = match timed {
         Ok(inner) => inner,
         Err(_elapsed) => {
             metrics
@@ -2486,7 +2722,7 @@ async fn commit_batch<S: Sink>(
                 // so the retry writes them instead of re-committing the accepted
                 // records (spec §4.5, §4.11).
                 if let Err(failure) =
-                    dead_letter_records(&dead_payloads, dead_letter, config, metrics)
+                    dead_letter_records(&dead_payloads, dead_letter, config, metrics, hb)
                 {
                     return owed_result(failure, dead_payloads, committed_count);
                 }
@@ -2534,7 +2770,7 @@ async fn commit_batch<S: Sink>(
             // Same silent-data-loss guard as the partial-rejection path above: a
             // failed dead-letter write (or a cap block) preserves the segment for
             // retry instead of confirming + deleting it (B1/F02).
-            if let Err(failure) = dead_letter_records(payloads, dead_letter, config, metrics) {
+            if let Err(failure) = dead_letter_records(payloads, dead_letter, config, metrics, hb) {
                 return owed_result(failure, payloads.to_vec(), 0);
             }
 
@@ -2570,6 +2806,7 @@ fn dead_letter_records(
     dead_letter: &mut DeadLetterWriter,
     config: &DrainConfig,
     metrics: &Metrics,
+    hb: &DrainHeartbeat,
 ) -> Result<(), DeadLetterFailure> {
     let estimated = estimated_write_bytes(records);
     if dead_letter.would_exceed_cap(estimated, config.dead_letter_max_bytes) {
@@ -2584,7 +2821,11 @@ fn dead_letter_records(
         }
     }
 
-    match dead_letter.write_records(records) {
+    let written = {
+        let _busy = BusyGuard::new(hb, BusyKind::DeadLetterWrite);
+        dead_letter.write_records(records)
+    };
+    match written {
         Ok(()) => {
             metrics
                 .sink_commit_records
@@ -2991,6 +3232,10 @@ mod tests {
         /// Models the measured blocking-commit case documented on
         /// `DrainHeartbeat`. Zero (the default) disables this entirely.
         blocking_millis: u64,
+        /// How long every `commit()` call spends in a YIELDING sleep
+        /// (`tokio::time::sleep(..).await`) — a slow sink, as opposed to the
+        /// thread-blocking `blocking_millis`. Zero (the default) disables it.
+        yield_for: Duration,
         max_batch: usize,
         /// Wall-clock instant of every `commit()` call. Tests that need to
         /// measure inter-call gaps (e.g. retry-after observance) read this
@@ -3029,6 +3274,7 @@ mod tests {
                 hang_calls: 0,
                 panic_calls: 0,
                 blocking_millis: 0,
+                yield_for: Duration::ZERO,
                 hang_on_call: None,
                 max_batch: 1000,
                 call_timestamps: Mutex::new(Vec::new()),
@@ -3061,6 +3307,7 @@ mod tests {
                 hang_calls: 0,
                 panic_calls: 0,
                 blocking_millis: 0,
+                yield_for: Duration::ZERO,
                 hang_on_call: None,
                 max_batch,
                 call_timestamps: Mutex::new(Vec::new()),
@@ -3101,6 +3348,16 @@ mod tests {
             Self {
                 blocking_millis: millis,
                 ..Self::with_responses(responses)
+            }
+        }
+
+        /// A sink whose every `commit()` spends `per_commit` in a yielding
+        /// sleep, then commits the whole batch; `max_batch` records per call.
+        fn with_yielding_commit(per_commit: Duration, max_batch: usize) -> Self {
+            Self {
+                yield_for: per_commit,
+                max_batch,
+                ..Self::with_responses([])
             }
         }
 
@@ -3190,6 +3447,9 @@ mod tests {
                 // one shape `tokio::time::timeout` cannot cancel (see
                 // `blocking_millis`).
                 std::thread::sleep(Duration::from_millis(self.blocking_millis));
+            }
+            if !self.yield_for.is_zero() {
+                tokio::time::sleep(self.yield_for).await;
             }
             let mut responses = self.responses.lock().unwrap();
             let response = responses
@@ -3644,6 +3904,7 @@ mod tests {
             prev_health_ok,
             in_flight,
             &|_| false,
+            &DrainHeartbeat::new(),
         )
     }
 
@@ -3659,7 +3920,51 @@ mod tests {
         dead_letter: &mut DeadLetterWriter,
         skip: u64,
     ) -> ProcessResult {
-        super::process_segment(segment, sink, config, metrics, dead_letter, skip, false).await
+        super::process_segment(
+            segment,
+            sink,
+            config,
+            metrics,
+            dead_letter,
+            skip,
+            false,
+            &DrainHeartbeat::new(),
+        )
+        .await
+    }
+
+    /// `commit_batch` gained the drain heartbeat (spec §4.8); tests that drive
+    /// one sub-batch directly do not observe it.
+    async fn commit_batch<S: Sink>(
+        payloads: &[Payload],
+        record_ids: &[RecordId],
+        segment_created_at: i64,
+        sink: &S,
+        config: &DrainConfig,
+        metrics: &Metrics,
+        dead_letter: &mut DeadLetterWriter,
+    ) -> BatchResult {
+        super::commit_batch(
+            payloads,
+            record_ids,
+            segment_created_at,
+            sink,
+            config,
+            metrics,
+            dead_letter,
+            &DrainHeartbeat::new(),
+        )
+        .await
+    }
+
+    /// `quarantine_segment` gained the drain heartbeat (spec §4.8).
+    fn quarantine_segment(
+        segment: &Path,
+        config: &DrainConfig,
+        metrics: &Metrics,
+        reason: &'static str,
+    ) -> bool {
+        super::quarantine_segment(segment, config, metrics, reason, &DrainHeartbeat::new())
     }
 
     /// `enter_blocked` gained `needed` (spec §4.5); the episode tests predate
@@ -4499,7 +4804,14 @@ mod tests {
             let config = fast_config(dir.clone());
 
             let result = block_on(super::process_segment(
-                &sealed, &sink, &config, &metrics, &mut dl, 0, true,
+                &sealed,
+                &sink,
+                &config,
+                &metrics,
+                &mut dl,
+                0,
+                true,
+                &DrainHeartbeat::new(),
             ));
             if quarantines {
                 assert!(
@@ -4996,7 +5308,7 @@ mod tests {
         );
 
         confirm_hook::clear(&sealed);
-        ledger.retry_dispositions(&dir, &metrics);
+        ledger.retry_dispositions(&dir, &metrics, &DrainHeartbeat::new());
         assert!(!sealed.exists());
         assert_eq!(ledger.confirm_stage(&sealed), None);
         assert_eq!(segments_confirmed(&metrics), 1);
@@ -8105,6 +8417,358 @@ mod tests {
             "segment must still exist after blocked shutdown"
         );
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Truthful drain liveness (spec §4.8) ──────────────────────────────────
+
+    #[test]
+    fn an_idle_heartbeat_reports_nothing_busy() {
+        let hb = DrainHeartbeat::new();
+        assert_eq!(hb.busy(), None);
+        hb.bump();
+        assert_eq!(hb.busy(), None, "a bump is liveness, not a busy operation");
+    }
+
+    #[test]
+    fn a_busy_guard_names_its_kind_and_clears_on_drop() {
+        let hb = DrainHeartbeat::new();
+        // The poll task reads a clone; the signal must be shared, not copied.
+        let observer = hb.clone();
+        {
+            let _busy = BusyGuard::new(&hb, BusyKind::LocalFsync);
+            std::thread::sleep(Duration::from_millis(30));
+            let (kind, busy_for) = observer.busy().expect("busy inside the guard");
+            assert_eq!(kind, BusyKind::LocalFsync);
+            assert!(
+                busy_for >= Duration::from_millis(25),
+                "busy_for counts from the guard's creation: {busy_for:?}"
+            );
+        }
+        assert_eq!(
+            observer.busy(),
+            None,
+            "dropping the guard clears the signal"
+        );
+    }
+
+    /// The guard is the only thing that clears the busy signal, so a panic
+    /// inside a guarded call (a sink impl, a disk helper) must clear it on the
+    /// way out. A respawned drain otherwise starts life reporting the dead
+    /// drain's operation as still in flight, which the verdict would read as a
+    /// slow call instead of what it is.
+    #[test]
+    fn a_busy_guard_clears_on_a_panic_unwind() {
+        let hb = DrainHeartbeat::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _busy = BusyGuard::new(&hb, BusyKind::SinkCommit);
+            assert!(hb.busy().is_some());
+            panic!("induced panic inside a guarded sink call");
+        }));
+        assert!(unwound.is_err(), "precondition: the closure panicked");
+        assert_eq!(
+            hb.busy(),
+            None,
+            "a guard dropped by a panic unwind must clear the busy signal"
+        );
+    }
+
+    /// The reader loop holds a `SegmentRead` guard and switches to `SinkCommit`
+    /// around each commit. Leaving the commit hands the signal back to the
+    /// read, timed from when the read resumed, not from the start of the
+    /// segment.
+    #[test]
+    fn a_nested_busy_guard_restores_the_outer_kind() {
+        let hb = DrainHeartbeat::new();
+        let _read = BusyGuard::new(&hb, BusyKind::SegmentRead);
+        std::thread::sleep(Duration::from_millis(60));
+        {
+            let _commit = BusyGuard::new(&hb, BusyKind::SinkCommit);
+            let (kind, busy_for) = hb.busy().unwrap();
+            assert_eq!(kind, BusyKind::SinkCommit);
+            assert!(busy_for < Duration::from_millis(50), "{busy_for:?}");
+        }
+        let (kind, busy_for) = hb.busy().unwrap();
+        assert_eq!(kind, BusyKind::SegmentRead, "the read resumes");
+        assert!(
+            busy_for < Duration::from_millis(50),
+            "the resumed read is timed from its resumption: {busy_for:?}"
+        );
+        drop(_read);
+        assert_eq!(hb.busy(), None);
+    }
+
+    /// A sink that records what the drain's busy signal says while each of its
+    /// calls is in progress.
+    struct BusyProbeSink {
+        hb: DrainHeartbeat,
+        in_commit: Mutex<Vec<Option<BusyKind>>>,
+        in_health: Mutex<Vec<Option<BusyKind>>>,
+    }
+
+    impl crate::sink::Sink for BusyProbeSink {
+        type Error = MockError;
+
+        async fn commit(&self, batch: SinkBatch) -> MockResult {
+            self.in_commit
+                .lock()
+                .unwrap()
+                .push(self.hb.busy().map(|(k, _)| k));
+            Ok(CommitResult::new(batch.into_records(), vec![]))
+        }
+
+        fn max_batch_size(&self) -> usize {
+            2
+        }
+
+        async fn health(&self) -> SinkHealth {
+            self.in_health
+                .lock()
+                .unwrap()
+                .push(self.hb.busy().map(|(k, _)| k));
+            SinkHealth::Healthy
+        }
+    }
+
+    #[test]
+    fn the_busy_signal_names_the_sink_call_in_flight() {
+        let dir = tmp_dir("busy_sink_calls");
+        let (sealed, _) = make_numbered_segment(&dir, 5);
+        let hb = DrainHeartbeat::new();
+        let sink = BusyProbeSink {
+            hb: hb.clone(),
+            in_commit: Mutex::new(Vec::new()),
+            in_health: Mutex::new(Vec::new()),
+        };
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+
+        let result = block_on(super::process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, 0, false, &hb,
+        ));
+        assert!(matches!(
+            result,
+            ProcessResult::Confirmed { record_count: 5 }
+        ));
+        assert_eq!(
+            *sink.in_commit.lock().unwrap(),
+            vec![Some(BusyKind::SinkCommit); 3],
+            "every commit runs under SinkCommit, not the surrounding SegmentRead"
+        );
+        assert_eq!(hb.busy(), None, "nothing is busy once the segment is done");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        super::probe_health(&rt, &sink, Duration::from_secs(5), &hb);
+        assert_eq!(
+            *sink.in_health.lock().unwrap(),
+            vec![Some(BusyKind::SinkProbe)]
+        );
+        assert_eq!(hb.busy(), None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The heartbeat used to move only at the loop head and inside the two
+    /// waits, so one segment (up to 256 MiB, delivered inside a single
+    /// `block_on`) froze it for as long as the whole segment took. It now moves
+    /// after every commit and every 1,024 records read — the resumed prefix a
+    /// retry re-walks included.
+    #[test]
+    fn reading_and_committing_advance_the_heartbeat() {
+        let dir = tmp_dir("heartbeat_reads");
+        let records: Vec<Vec<u8>> = (0..2 * READ_HEARTBEAT_EVERY)
+            .map(|i| (i as u32).to_le_bytes().to_vec())
+            .collect();
+        let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let sealed = make_sealed_segment(&dir, 0, &refs);
+        let sink = MockSink::with_batch_size(1, []);
+        let metrics = noop_metrics();
+        let config = fast_config(dir.clone());
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+
+        // Every record is already durable: the attempt only re-walks them.
+        let reads = DrainHeartbeat::new();
+        let skip = records.len() as u64;
+        let result = block_on(super::process_segment(
+            &sealed, &sink, &config, &metrics, &mut dl, skip, false, &reads,
+        ));
+        assert!(matches!(result, ProcessResult::Confirmed { .. }));
+        assert_eq!(sink.call_count(), 0, "precondition: nothing was committed");
+        assert_eq!(
+            reads.get(),
+            2,
+            "one bump per {READ_HEARTBEAT_EVERY} records read"
+        );
+
+        // Three one-record commits past the same prefix: one bump each.
+        let commits = DrainHeartbeat::new();
+        let result = block_on(super::process_segment(
+            &sealed,
+            &sink,
+            &config,
+            &metrics,
+            &mut dl,
+            skip - 3,
+            false,
+            &commits,
+        ));
+        assert!(matches!(result, ProcessResult::Confirmed { .. }));
+        assert_eq!(sink.call_count(), 3);
+        assert_eq!(commits.get(), 2 + 3, "two read bumps plus one per commit");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The case the old verdict got wrong. A sink that takes 2 s per commit and
+    /// YIELDS while it does is slow, not wedged — `commit_timeout` can fire on
+    /// it — yet with the heartbeat moving only at the loop head, a 10-batch
+    /// segment froze it for 20 s, past the 16 s threshold at a 1 s
+    /// `health_poll_interval`, and the operator was told to restart. Observed
+    /// here as `main.rs`'s poll task observes it, at 50 ms instead of 5 s:
+    /// against the production thresholds nothing is ever reported, and against
+    /// thresholds scaled below one commit the freeze is reported as what it is,
+    /// a slow sink call.
+    #[test]
+    fn a_slow_but_yielding_sink_never_reads_as_a_wedged_drain() {
+        const COMMIT: Duration = Duration::from_secs(2);
+        const BATCHES: usize = 10;
+        let dir = tmp_dir("liveness_slow_sink");
+        let (sealed, _) = make_numbered_segment(&dir, BATCHES);
+        let sink = Arc::new(MockSink::with_yielding_commit(COMMIT, 1));
+        let heartbeat = DrainHeartbeat::new();
+        let config = DrainConfig {
+            health_poll_interval: Duration::from_secs(1),
+            commit_timeout: Duration::from_secs(30),
+            ..fast_config(dir.clone())
+        };
+        let (interval, commit_timeout) = (config.health_poll_interval, config.commit_timeout);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let (sink_t, hb_t) = (Arc::clone(&sink), heartbeat.clone());
+        let handle = std::thread::spawn(move || {
+            drain_thread(rx, sink_t, config, noop_metrics(), true, hb_t)
+        });
+
+        let mut last = heartbeat.get();
+        let mut changed_at = Instant::now();
+        let mut longest_freeze = Duration::ZERO;
+        let mut slow_sink_calls = 0;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while sealed.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out delivering the segment"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+            let now = Instant::now();
+            let beat = heartbeat.get();
+            if beat != last {
+                (last, changed_at) = (beat, now);
+                continue;
+            }
+            let frozen_for = now.duration_since(changed_at);
+            longest_freeze = longest_freeze.max(frozen_for);
+            let busy = heartbeat.busy();
+            assert_ne!(
+                crate::drain_stall_verdict(frozen_for, interval, false, busy, commit_timeout),
+                Some(crate::DrainStallVerdict::Wedged),
+                "a slow, yielding sink read as a wedged drain (frozen {frozen_for:?}, busy \
+                 {busy:?})"
+            );
+            let scaled = crate::classify_drain_stall(
+                frozen_for >= Duration::from_millis(500),
+                false,
+                busy,
+                commit_timeout + Duration::from_secs(1),
+            );
+            assert_ne!(
+                scaled,
+                Some(crate::DrainStallVerdict::Wedged),
+                "frozen {frozen_for:?}, busy {busy:?}"
+            );
+            if matches!(scaled, Some(crate::DrainStallVerdict::SlowSinkCall { .. })) {
+                slow_sink_calls += 1;
+            }
+        }
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(sink.call_count(), BATCHES as u64);
+        assert!(
+            longest_freeze < COMMIT + Duration::from_secs(1),
+            "the heartbeat must advance between commits, not once per segment \
+             (longest freeze {longest_freeze:?})"
+        );
+        assert!(
+            slow_sink_calls > 0,
+            "a freeze inside a commit must be reported as a slow sink call"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The backstop the busy signal cannot replace. A sink that blocks the
+    /// drain's OS thread defeats `commit_timeout` (the timer is never polled),
+    /// so the `SinkCommit` guard sits OUTSIDE the timeout and stays set for the
+    /// whole block. Past `commit_timeout` plus the grace that a timeout which
+    /// could fire would have fired, so the verdict turns from a slow sink call
+    /// into a wedge.
+    #[test]
+    fn a_sink_blocking_the_thread_past_commit_timeout_plus_grace_reads_as_wedged() {
+        const STALL_AFTER: Duration = Duration::from_millis(200);
+        const GRACE: Duration = Duration::from_millis(400);
+        let dir = tmp_dir("liveness_blocking_sink");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r"]);
+        let sink = Arc::new(MockSink::with_blocking_commit(1500, []));
+        let heartbeat = DrainHeartbeat::new();
+        let config = DrainConfig {
+            commit_timeout: Duration::from_millis(50),
+            ..fast_config(dir.clone())
+        };
+        let limit = config.commit_timeout + GRACE;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let (sink_t, hb_t) = (Arc::clone(&sink), heartbeat.clone());
+        let handle = std::thread::spawn(move || {
+            drain_thread(rx, sink_t, config, noop_metrics(), true, hb_t)
+        });
+
+        wait_for(5, "the blocking commit to start", || sink.call_count() >= 1);
+        let frozen_at = heartbeat.get();
+        let since = Instant::now();
+        let mut verdicts = Vec::new();
+        while heartbeat.get() == frozen_at && since.elapsed() < Duration::from_millis(1400) {
+            std::thread::sleep(Duration::from_millis(20));
+            let busy = heartbeat.busy();
+            if let Some(v) =
+                crate::classify_drain_stall(since.elapsed() >= STALL_AFTER, false, busy, limit)
+            {
+                if verdicts.last() != Some(&std::mem::discriminant(&v)) {
+                    verdicts.push(std::mem::discriminant(&v));
+                }
+                if v == crate::DrainStallVerdict::Wedged {
+                    let (kind, busy_for) = busy.expect("the blocked commit is still busy");
+                    assert_eq!(kind, BusyKind::SinkCommit);
+                    assert!(busy_for > limit, "{busy_for:?}");
+                    break;
+                }
+            }
+        }
+        let slow = std::mem::discriminant(&crate::DrainStallVerdict::SlowSinkCall {
+            kind: BusyKind::SinkCommit,
+            busy_for: Duration::ZERO,
+        });
+        let wedged = std::mem::discriminant(&crate::DrainStallVerdict::Wedged);
+        assert_eq!(
+            verdicts,
+            vec![slow, wedged],
+            "a slow sink call first, then a wedge once it outlives commit_timeout + grace"
+        );
+
+        drop(tx);
+        handle.join().unwrap();
+        assert_eq!(heartbeat.busy(), None);
         std::fs::remove_dir_all(dir).ok();
     }
 }

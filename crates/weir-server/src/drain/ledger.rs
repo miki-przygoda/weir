@@ -473,19 +473,32 @@ impl SegmentLedger {
     /// meanwhile is done; a move that still fails is logged but not counted
     /// again (`weir_drain_quarantine_failures_total` counts segments, and the
     /// disposition gauge shows how many are still waiting).
-    pub(crate) fn retry_dispositions(&mut self, wab_dir: &Path, metrics: &Metrics) {
+    ///
+    /// Each step runs under the drain's busy signal (`LocalFsync` for a
+    /// confirm, `QuarantineMove` for a move, spec §4.8), so a slow disk here
+    /// reads as slow local I/O rather than a wedged drain.
+    pub(crate) fn retry_dispositions(
+        &mut self,
+        wab_dir: &Path,
+        metrics: &Metrics,
+        hb: &super::DrainHeartbeat,
+    ) {
         if self.confirm_pending.is_empty() && self.quarantine_pending.is_empty() {
             return;
         }
-        self.retry_confirms(metrics);
-        self.retry_quarantines(wab_dir, metrics);
+        self.retry_confirms(metrics, hb);
+        self.retry_quarantines(wab_dir, metrics, hb);
         self.sync_counts();
     }
 
-    fn retry_quarantines(&mut self, wab_dir: &Path, metrics: &Metrics) {
+    fn retry_quarantines(&mut self, wab_dir: &Path, metrics: &Metrics, hb: &super::DrainHeartbeat) {
         let mut moved = Vec::new();
         for (path, &reason) in &self.quarantine_pending {
-            match super::move_to_quarantine(path, wab_dir, metrics, reason) {
+            let result = {
+                let _busy = super::BusyGuard::new(hb, super::BusyKind::QuarantineMove);
+                super::move_to_quarantine(path, wab_dir, metrics, reason)
+            };
+            match result {
                 Ok(()) => {
                     info!(
                         path = %path.display(),
@@ -508,9 +521,10 @@ impl SegmentLedger {
         }
     }
 
-    fn retry_confirms(&mut self, metrics: &Metrics) {
+    fn retry_confirms(&mut self, metrics: &Metrics, hb: &super::DrainHeartbeat) {
         let mut done = Vec::new();
         for (path, pending) in self.confirm_pending.iter_mut() {
+            let _busy = super::BusyGuard::new(hb, super::BusyKind::LocalFsync);
             let outcome = match pending.stage {
                 ConfirmStage::Sidecar => {
                     confirmed::confirm_and_delete(path, pending.record_count, metrics)
@@ -830,7 +844,7 @@ mod tests {
         assert_eq!(l.counts().confirm_pending.load(Ordering::Relaxed), 1);
 
         std::fs::remove_file(&path).unwrap();
-        l.retry_dispositions(&dir, &metrics);
+        l.retry_dispositions(&dir, &metrics, &super::super::DrainHeartbeat::new());
         assert_eq!(l.confirm_stage(&path), None);
         assert_eq!(l.counts().confirm_pending.load(Ordering::Relaxed), 0);
         assert!(
@@ -864,7 +878,7 @@ mod tests {
             "a segment awaiting quarantine is never resumed, so its cursor goes"
         );
 
-        l.retry_dispositions(&dir, &metrics);
+        l.retry_dispositions(&dir, &metrics, &super::super::DrainHeartbeat::new());
         assert_eq!(
             l.counts().quarantine_pending.load(Ordering::Relaxed),
             1,
@@ -874,7 +888,7 @@ mod tests {
         assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
 
         std::fs::remove_file(&squatter).unwrap();
-        l.retry_dispositions(&dir, &metrics);
+        l.retry_dispositions(&dir, &metrics, &super::super::DrainHeartbeat::new());
         assert_eq!(l.counts().quarantine_pending.load(Ordering::Relaxed), 0);
         assert!(!path.exists(), "the retry moved the segment");
         assert!(squatter.is_dir());
@@ -883,7 +897,7 @@ mod tests {
         // ENOENT counts as done: nothing is left to preserve, nothing is counted.
         let gone = dir.join("seg_00000002.wab.sealed");
         l.note_quarantine_pending(&gone, "test: vanished");
-        l.retry_dispositions(&dir, &metrics);
+        l.retry_dispositions(&dir, &metrics, &super::super::DrainHeartbeat::new());
         assert_eq!(l.counts().quarantine_pending.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
 

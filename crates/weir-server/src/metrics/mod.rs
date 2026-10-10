@@ -190,6 +190,41 @@ pub enum ConfirmFailureStage {
     delete,
 }
 
+// ── Drain liveness label (safety floor, spec §4.8) ───────────────────────────
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DrainBusyLabel {
+    pub kind: DrainBusyKind,
+}
+
+/// What the drain thread is busy doing: a sink call, or local I/O. Mirrors the
+/// drain's `BusyKind`.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DrainBusyKind {
+    sink_commit,
+    sink_probe,
+    segment_read,
+    local_fsync,
+    dead_letter_write,
+    quarantine_move,
+    dir_scan,
+}
+
+impl DrainBusyKind {
+    /// Every label value, so the family is complete from boot and a publish
+    /// can zero the kinds that are not current.
+    pub const ALL: [DrainBusyKind; 7] = [
+        DrainBusyKind::sink_commit,
+        DrainBusyKind::sink_probe,
+        DrainBusyKind::segment_read,
+        DrainBusyKind::local_fsync,
+        DrainBusyKind::dead_letter_write,
+        DrainBusyKind::quarantine_move,
+        DrainBusyKind::dir_scan,
+    ];
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct TlsHandshakeFailureLabel {
     pub reason: TlsHandshakeFailureReason,
@@ -423,6 +458,13 @@ pub(crate) struct Metrics {
     /// Failed writes of sink-rejected records into `dead_letter/` (spec §4.11).
     /// The sink commit already happened, so the retry redoes only the write.
     pub drain_dead_letter_write_failures: Counter<u64, AtomicU64>,
+
+    // ── Drain liveness (safety floor, spec §4.8) ──────────────────────────────
+    /// Seconds the drain thread has been inside its current sink call or local
+    /// I/O operation, by kind; only the current kind is non-zero, and all are
+    /// zero while the drain is between operations. Set by the 5 s poll task
+    /// from the drain heartbeat's busy atomics.
+    pub drain_busy_seconds: Family<DrainBusyLabel, Gauge<f64, AtomicU64>>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -797,6 +839,18 @@ impl Metrics {
              EACCES)"
         );
 
+        // ── Drain liveness (safety floor, spec §4.8) ─────────────────────────
+        let drain_busy_seconds = reg!(
+            Family::<DrainBusyLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_drain_busy_seconds",
+            "Seconds the drain thread has spent in its current operation, by kind: \
+             sink_commit and sink_probe are calls into the sink; segment_read, local_fsync, \
+             dead_letter_write, quarantine_move and dir_scan are local I/O on the WAB device. \
+             Only the current kind is non-zero; all read 0 between operations. Sampled every \
+             5 s. A large local value means a slow disk, which a restart does not fix; a \
+             sink_commit value past commit_timeout means a sink blocking the drain thread"
+        );
+
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
@@ -869,6 +923,7 @@ impl Metrics {
             drain_confirm_failures,
             drain_quarantine_failures,
             drain_dead_letter_write_failures,
+            drain_busy_seconds,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -952,6 +1007,12 @@ impl Metrics {
             let _ = metrics
                 .drain_confirm_failures
                 .get_or_create(&ConfirmFailureLabel { stage });
+        }
+        for kind in DrainBusyKind::ALL {
+            metrics
+                .drain_busy_seconds
+                .get_or_create(&DrainBusyLabel { kind })
+                .set(0.0);
         }
 
         // Pre-initialise the labeled nack counter family so the series exist at 0

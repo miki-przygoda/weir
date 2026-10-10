@@ -154,8 +154,16 @@ fn drain_heartbeat_looks_wedged(frozen_for: Duration, health_poll_interval: Dura
     frozen_for >= health_poll_interval + Duration::from_secs(5) * DRAIN_STALL_CONSECUTIVE_POLLS
 }
 
+/// How long past `commit_timeout` a sink call may stay busy before the stall
+/// verdict calls it a wedge (spec §4.8). A sink that yields is cancelled by
+/// `commit_timeout`; one still busy this long after it is blocking the drain's
+/// OS thread, where no timeout can fire. Matches the 3-poll/15 s grace of
+/// [`drain_heartbeat_looks_wedged`].
+const SINK_CALL_GRACE: Duration = Duration::from_secs(15);
+
 /// What a frozen drain heartbeat actually means. A freeze past the threshold is
-/// only half the diagnosis — the `drain_state` gauge supplies the other half.
+/// only part of the diagnosis — the `drain_state` gauge and the heartbeat's
+/// busy signal ([`drain::DrainHeartbeat::busy`]) supply the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DrainStallVerdict {
     /// The drain thread is GONE: the supervisor exhausted its respawn budget
@@ -163,39 +171,160 @@ enum DrainStallVerdict {
     /// its way out. The heartbeat is frozen because nobody is left to bump it.
     /// Nothing is wedged; delivery has ended and only a restart resumes it.
     Stopped,
-    /// The drain still claims a live state, yet cannot reach its own loop head
-    /// — the wedge this check was written for: a sink call blocking the drain's
-    /// OS thread instead of yielding, which no timeout inside the drain can fire
-    /// against.
+    /// The drain still claims a live state, yet cannot reach its own loop head:
+    /// either nothing is marked busy (the thread is stuck somewhere no guard
+    /// covers), or a sink call has stayed busy past `commit_timeout` +
+    /// [`SINK_CALL_GRACE`] — a sink blocking the drain's OS thread instead of
+    /// yielding, which no timeout inside the drain can fire against.
     Wedged,
+    /// Inside a sink call (commit or health probe) that has not yet outlived
+    /// `commit_timeout` + [`SINK_CALL_GRACE`]: a slow sink, which the timeout
+    /// still bounds. Logged at INFO with no restart advice.
+    SlowSinkCall {
+        kind: drain::BusyKind,
+        busy_for: Duration,
+    },
+    /// Inside local I/O on the WAB device (a segment read, an fsync, a
+    /// dead-letter write, a quarantine move, a directory scan), for however
+    /// long. A slow disk: a restart re-delivers from record 0 and leaves the
+    /// disk exactly as slow, so this is never a wedge.
+    SlowLocalIo {
+        kind: drain::BusyKind,
+        busy_for: Duration,
+    },
 }
 
-/// Composes the freeze duration and the live `drain_state` gauge into the one
-/// diagnosis the operator is shown.
+/// Composes the freeze duration, the live `drain_state` gauge and the busy
+/// signal into the one diagnosis the operator is shown (spec §4.8):
+///
+/// | condition | verdict |
+/// |---|---|
+/// | `drain_state{stopped}` | `Stopped` |
+/// | busy in a sink call for ≤ `commit_timeout + 15 s` | `SlowSinkCall` |
+/// | busy in local I/O, any duration | `SlowLocalIo` |
+/// | busy in a sink call for > `commit_timeout + 15 s` | `Wedged` |
+/// | nothing busy | `Wedged` |
 ///
 /// Split out — like [`drain_is_healthy`] and [`should_warn_wab_growth`] before
 /// it — because the composition, not the duration predicate alone, is where the
-/// bug was: the warning fired the "wedged inside a sink call" text on a drain
-/// whose own gauge said `stopped`, asserting in the same breath that "a wedge is
-/// not `stopped`". That is confidently wrong in a state the daemon reaches
-/// deterministically (the dead-letter-open panic exhausts the respawn ladder
-/// before the first `heartbeat.bump()` ever runs), and it points the operator at
-/// a live wedged sink instead of a dead drain.
+/// bugs were: the warning fired the "wedged inside a sink call" text on a drain
+/// whose own gauge said `stopped` (the dead-letter-open panic exhausts the
+/// respawn ladder before the first `heartbeat.bump()` ever runs), and on a
+/// drain that was merely inside one slow commit or one slow fsync, advising a
+/// restart that re-delivers from record 0 and fixes neither.
 ///
 /// Returns `None` while the freeze is still inside the grace period.
 fn drain_stall_verdict(
     frozen_for: Duration,
     health_poll_interval: Duration,
     drain_stopped: bool,
+    busy: Option<(drain::BusyKind, Duration)>,
+    commit_timeout: Duration,
 ) -> Option<DrainStallVerdict> {
-    if !drain_heartbeat_looks_wedged(frozen_for, health_poll_interval) {
+    classify_drain_stall(
+        drain_heartbeat_looks_wedged(frozen_for, health_poll_interval),
+        drain_stopped,
+        busy,
+        commit_timeout + SINK_CALL_GRACE,
+    )
+}
+
+/// [`drain_stall_verdict`] with its two thresholds already applied, so a test
+/// can scale them below the production seconds: `frozen_past_threshold` is
+/// [`drain_heartbeat_looks_wedged`]'s answer, and `sink_call_limit` how long a
+/// sink call may stay busy before it reads as a wedge.
+fn classify_drain_stall(
+    frozen_past_threshold: bool,
+    drain_stopped: bool,
+    busy: Option<(drain::BusyKind, Duration)>,
+    sink_call_limit: Duration,
+) -> Option<DrainStallVerdict> {
+    if !frozen_past_threshold {
         return None;
     }
-    Some(if drain_stopped {
-        DrainStallVerdict::Stopped
-    } else {
-        DrainStallVerdict::Wedged
+    if drain_stopped {
+        return Some(DrainStallVerdict::Stopped);
+    }
+    Some(match busy {
+        Some((kind, busy_for)) if kind.is_sink_call() && busy_for <= sink_call_limit => {
+            DrainStallVerdict::SlowSinkCall { kind, busy_for }
+        }
+        Some((kind, busy_for)) if !kind.is_sink_call() => {
+            DrainStallVerdict::SlowLocalIo { kind, busy_for }
+        }
+        _ => DrainStallVerdict::Wedged,
     })
+}
+
+/// Publishes `weir_drain_busy_seconds{kind}` from one reading of the busy
+/// signal: the current kind carries its duration, every other kind 0, and all
+/// are 0 while the drain is between operations.
+fn publish_drain_busy(
+    metrics: &crate::metrics::Metrics,
+    busy: Option<(drain::BusyKind, Duration)>,
+) {
+    let current = busy.map(|(kind, busy_for)| (kind.metric_label(), busy_for.as_secs_f64()));
+    for kind in crate::metrics::DrainBusyKind::ALL {
+        let secs = match current {
+            Some((k, secs)) if k == kind => secs,
+            _ => 0.0,
+        };
+        metrics
+            .drain_busy_seconds
+            .get_or_create(&crate::metrics::DrainBusyLabel { kind })
+            .set(secs);
+    }
+}
+
+/// Logs one stall verdict. Only `Stopped` and `Wedged` carry restart advice;
+/// a slow sink call is INFO, and slow local I/O a WARN that points at the disk.
+fn log_drain_stall(verdict: DrainStallVerdict, frozen_for: Duration) {
+    let frozen_secs = frozen_for.as_secs();
+    match verdict {
+        DrainStallVerdict::Wedged => warn!(
+            frozen_secs,
+            "drain heartbeat has not advanced in over {frozen_secs}s — the \
+             drain thread may be wedged inside a sink call that blocks its \
+             OS thread (a synchronous DB driver, std::fs, or a spin loop) \
+             rather than yielding. That defeats both commit_timeout and \
+             health_probe_timeout, which can only fire when the awaited \
+             future actually yields on the drain's current-thread runtime. \
+             drain_state still reports a live state, so this is a wedge \
+             rather than a stopped drain; if delivery has genuinely \
+             stalled, an operator restart is the only recovery."
+        ),
+        DrainStallVerdict::Stopped => warn!(
+            frozen_secs,
+            "drain heartbeat has not advanced in over {frozen_secs}s and \
+             drain_state reports `stopped` — the drain thread is GONE, not \
+             wedged. Either the supervisor exhausted its respawn budget \
+             (look for the earlier \"drain thread panicked too many \
+             times\" ERROR) or the daemon is shutting down. Delivery has \
+             ended and the WAB will keep growing on disk; only a process \
+             restart resumes it. Do NOT go looking for a blocked sink \
+             call — there is no drain thread left to block."
+        ),
+        DrainStallVerdict::SlowSinkCall { kind, busy_for } => info!(
+            frozen_secs,
+            busy_kind = ?kind,
+            busy_secs = busy_for.as_secs(),
+            "drain is inside a slow sink call ({kind:?}, {}s so far); it is still within \
+             commit_timeout plus grace, so the drain is waiting on the sink, not wedged. No \
+             action needed unless it persists — check the sink's latency",
+            busy_for.as_secs()
+        ),
+        DrainStallVerdict::SlowLocalIo { kind, busy_for } => warn!(
+            frozen_secs,
+            busy_kind = ?kind,
+            busy_secs = busy_for.as_secs(),
+            "drain has been inside one local I/O operation ({kind:?}) for {}s — the WAB \
+             device is slow or stalled. This is not a wedged drain and a restart will not \
+             help: it re-delivers from record 0 and leaves the disk exactly as slow. Check \
+             the WAB device (I/O latency, a failing or saturated disk, a stalled network \
+             filesystem)",
+            busy_for.as_secs()
+        ),
+    }
 }
 
 /// Whether the drain supervisor has published its terminal `stopped` state.
@@ -604,6 +733,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         health_probe_timeout: Duration::from_secs(config.sink_timeout_secs.min(5)),
         orphan_cleanup,
     };
+    // The stall verdict tells a slow sink call from a sink blocking the drain's
+    // thread by how far past this backstop the call has run (spec §4.8).
+    let commit_timeout_for_stall = drain_config.commit_timeout;
 
     // A counter the drain bumps once per loop iteration (see
     // `drain::DrainHeartbeat`), observed from the WAB-growth poll task below —
@@ -974,8 +1106,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `health_poll_interval` sets the grace period in
         // `drain_heartbeat_looks_wedged`. The grace period only has to cover an
         // IDLE drain now — the two long deliberate waits inside the drain loop
-        // bump the heartbeat themselves (see `drain::DrainHeartbeat`), so a slow
-        // sink no longer has to be absorbed by this threshold.
+        // bump the heartbeat themselves, as do commits and segment reads (see
+        // `drain::DrainHeartbeat`), and a single long sink call or local I/O
+        // operation is named by the busy signal, so a slow sink or a slow disk
+        // no longer has to be absorbed by this threshold.
         let health_poll_interval_for_stall = Duration::from_secs(config.health_poll_interval_secs);
         let drain_heartbeat_for_poll = drain_heartbeat;
         tokio::spawn(async move {
@@ -994,6 +1128,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut last_stall_warned: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
+
+                // Drain-heartbeat stall check, and the busy gauge. Deliberately
+                // FIRST, before the WAB scan below can `continue` the loop: a
+                // failing scan (an unreadable shard, a dirent error) must not
+                // silence the one signal that says whether the drain is alive
+                // (spec §4.8).
+                //
+                // Deliberately independent of `drain_healthy` below — a wedged
+                // drain (a sink call that blocks the drain's OS thread instead
+                // of yielding) is exactly the state where `drain_state` /
+                // `sink_health` stay frozen at their last (healthy-looking)
+                // reading, which is what silences the WAB-growth warning. This
+                // check reads the heartbeat directly instead, so it isn't
+                // fooled by the same stale gauges. `drain_state` is still
+                // consulted for ONE thing — the `stopped` terminal state, the
+                // one value the supervisor writes that is never stale — because
+                // a dead drain freezes the heartbeat exactly like a wedged one
+                // and needs the opposite advice. The busy signal tells a wedge
+                // from a drain that is merely inside one slow sink call or one
+                // slow disk operation. See `drain_stall_verdict`.
+                let now = std::time::Instant::now();
+                let busy = drain_heartbeat_for_poll.busy();
+                publish_drain_busy(&metrics_w, busy);
+                let heartbeat_now = drain_heartbeat_for_poll.get();
+                match last_heartbeat {
+                    Some(prev) if drain_appears_stalled(prev, heartbeat_now) => {
+                        let frozen_for = now.duration_since(heartbeat_changed_at);
+                        let verdict = drain_stall_verdict(
+                            frozen_for,
+                            health_poll_interval_for_stall,
+                            drain_is_stopped(&metrics_w),
+                            busy,
+                            commit_timeout_for_stall,
+                        );
+                        if let Some(verdict) = verdict
+                            && growth_warning_is_due(last_stall_warned, now)
+                        {
+                            log_drain_stall(verdict, frozen_for);
+                            last_stall_warned = Some(now);
+                        }
+                    }
+                    _ => heartbeat_changed_at = now,
+                }
+                last_heartbeat = Some(heartbeat_now);
+
                 let wab_dir = wab_dir_bg.clone();
                 let scan = tokio::task::spawn_blocking(move || {
                     compute_wab_bytes_on_disk(&wab_dir)
@@ -1020,66 +1199,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     last_warned = Some(std::time::Instant::now());
                 }
-
-                // Drain-heartbeat stall check. Deliberately independent of
-                // `drain_healthy` above — a wedged drain (a sink call that
-                // blocks the drain's OS thread instead of yielding) is exactly
-                // the state where `drain_state`/`sink_health` stay frozen at
-                // their last (healthy-looking) reading, which is what silences
-                // the WAB-growth warning above. This check reads the heartbeat
-                // directly instead, so it isn't fooled by the same stale
-                // gauges. `drain_state` is still consulted for ONE thing — the
-                // `stopped` terminal state, the one value the supervisor writes
-                // that is never stale — because a dead drain freezes the
-                // heartbeat exactly like a wedged one and needs the opposite
-                // advice. See `drain_stall_verdict`.
-                let now = std::time::Instant::now();
-                let heartbeat_now = drain_heartbeat_for_poll.get();
-                match last_heartbeat {
-                    Some(prev) if drain_appears_stalled(prev, heartbeat_now) => {
-                        let frozen_for = now.duration_since(heartbeat_changed_at);
-                        // The freeze duration alone cannot tell a wedge from a
-                        // dead drain — `drain_state` supplies that half.
-                        let verdict = drain_stall_verdict(
-                            frozen_for,
-                            health_poll_interval_for_stall,
-                            drain_is_stopped(&metrics_w),
-                        );
-                        if let Some(verdict) = verdict
-                            && growth_warning_is_due(last_stall_warned, now)
-                        {
-                            let frozen_secs = frozen_for.as_secs();
-                            match verdict {
-                                DrainStallVerdict::Wedged => warn!(
-                                    frozen_secs,
-                                    "drain heartbeat has not advanced in over {frozen_secs}s — the \
-                                     drain thread may be wedged inside a sink call that blocks its \
-                                     OS thread (a synchronous DB driver, std::fs, or a spin loop) \
-                                     rather than yielding. That defeats both commit_timeout and \
-                                     health_probe_timeout, which can only fire when the awaited \
-                                     future actually yields on the drain's current-thread runtime. \
-                                     drain_state still reports a live state, so this is a wedge \
-                                     rather than a stopped drain; if delivery has genuinely \
-                                     stalled, an operator restart is the only recovery."
-                                ),
-                                DrainStallVerdict::Stopped => warn!(
-                                    frozen_secs,
-                                    "drain heartbeat has not advanced in over {frozen_secs}s and \
-                                     drain_state reports `stopped` — the drain thread is GONE, not \
-                                     wedged. Either the supervisor exhausted its respawn budget \
-                                     (look for the earlier \"drain thread panicked too many \
-                                     times\" ERROR) or the daemon is shutting down. Delivery has \
-                                     ended and the WAB will keep growing on disk; only a process \
-                                     restart resumes it. Do NOT go looking for a blocked sink \
-                                     call — there is no drain thread left to block."
-                                ),
-                            }
-                            last_stall_warned = Some(now);
-                        }
-                    }
-                    _ => heartbeat_changed_at = now,
-                }
-                last_heartbeat = Some(heartbeat_now);
             }
         });
 
@@ -1792,11 +1911,17 @@ mod apply_wab_scan_tests {
 #[cfg(test)]
 mod drain_heartbeat_stall_tests {
     use super::{
-        DRAIN_STALL_CONSECUTIVE_POLLS, DrainStallVerdict, drain_heartbeat_looks_wedged,
-        drain_is_stopped, drain_stall_verdict,
+        DRAIN_STALL_CONSECUTIVE_POLLS, DrainStallVerdict, SINK_CALL_GRACE,
+        drain_heartbeat_looks_wedged, drain_is_stopped, drain_stall_verdict, publish_drain_busy,
     };
-    use crate::metrics::{DrainStateLabel, DrainStateValue, Metrics};
+    use crate::drain::BusyKind;
+    use crate::metrics::{
+        DrainBusyKind, DrainBusyLabel, DrainStateLabel, DrainStateValue, Metrics,
+    };
     use std::time::Duration;
+
+    /// The production default: `max(2 × sink_timeout, 60 s)`.
+    const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 
     fn set_drain_state(m: &Metrics, active: DrainStateValue) {
         for s in [
@@ -1831,7 +1956,13 @@ mod drain_heartbeat_stall_tests {
             "precondition: the freeze is long enough that something is reported"
         );
         assert_eq!(
-            drain_stall_verdict(frozen_for, interval, drain_is_stopped(&m)),
+            drain_stall_verdict(
+                frozen_for,
+                interval,
+                drain_is_stopped(&m),
+                None,
+                COMMIT_TIMEOUT
+            ),
             Some(DrainStallVerdict::Stopped),
             "a drain whose own gauge says `stopped` is dead, not wedged — reporting a              wedge here misdirects the operator during an incident"
         );
@@ -1852,7 +1983,9 @@ mod drain_heartbeat_stall_tests {
                 drain_stall_verdict(
                     Duration::from_secs(50),
                     Duration::from_secs(30),
-                    drain_is_stopped(&m)
+                    drain_is_stopped(&m),
+                    None,
+                    COMMIT_TIMEOUT,
                 ),
                 Some(DrainStallVerdict::Wedged),
                 "{live:?} is a live state; a frozen heartbeat under it is a real wedge"
@@ -1867,7 +2000,13 @@ mod drain_heartbeat_stall_tests {
         let interval = Duration::from_secs(30);
         for stopped in [true, false] {
             assert_eq!(
-                drain_stall_verdict(Duration::from_secs(20), interval, stopped),
+                drain_stall_verdict(
+                    Duration::from_secs(20),
+                    interval,
+                    stopped,
+                    None,
+                    COMMIT_TIMEOUT
+                ),
                 None
             );
         }
@@ -1943,5 +2082,185 @@ mod drain_heartbeat_stall_tests {
             Duration::from_secs(20),
             health_poll_interval
         ));
+    }
+
+    // ── The busy-aware verdict table (spec §4.8) ─────────────────────────────
+
+    const LOCAL_KINDS: [BusyKind; 5] = [
+        BusyKind::SegmentRead,
+        BusyKind::LocalFsync,
+        BusyKind::DeadLetterWrite,
+        BusyKind::QuarantineMove,
+        BusyKind::DirScan,
+    ];
+
+    /// One row per line of the spec's table, at the default 30 s poll interval
+    /// and 60 s `commit_timeout`, with the heartbeat frozen past the 45 s
+    /// threshold.
+    #[test]
+    fn the_verdict_table() {
+        let interval = Duration::from_secs(30);
+        let frozen = Duration::from_secs(50);
+        let limit = COMMIT_TIMEOUT + SINK_CALL_GRACE;
+        let verdict =
+            |stopped, busy| drain_stall_verdict(frozen, interval, stopped, busy, COMMIT_TIMEOUT);
+
+        // `drain_state{stopped}`: Stopped, whatever the busy atomics say.
+        assert_eq!(verdict(true, None), Some(DrainStallVerdict::Stopped));
+        assert_eq!(
+            verdict(true, Some((BusyKind::SinkCommit, frozen))),
+            Some(DrainStallVerdict::Stopped)
+        );
+
+        // Busy in a sink call up to commit_timeout + 15 s: a slow sink call.
+        for kind in [BusyKind::SinkCommit, BusyKind::SinkProbe] {
+            for busy_for in [frozen, limit] {
+                assert_eq!(
+                    verdict(false, Some((kind, busy_for))),
+                    Some(DrainStallVerdict::SlowSinkCall { kind, busy_for }),
+                    "{kind:?} for {busy_for:?}"
+                );
+            }
+            // Past it, a timeout that could fire would have: the sink is
+            // blocking the thread.
+            let busy_for = limit + Duration::from_millis(1);
+            assert_eq!(
+                verdict(false, Some((kind, busy_for))),
+                Some(DrainStallVerdict::Wedged),
+                "{kind:?} for {busy_for:?}"
+            );
+        }
+
+        // Busy in local I/O for ANY duration: slow local I/O, never a wedge
+        // — a restart does not fix a disk.
+        for kind in LOCAL_KINDS {
+            for busy_for in [frozen, Duration::from_secs(3600)] {
+                assert_eq!(
+                    verdict(false, Some((kind, busy_for))),
+                    Some(DrainStallVerdict::SlowLocalIo { kind, busy_for }),
+                    "{kind:?} for {busy_for:?}"
+                );
+            }
+        }
+
+        // Frozen with nothing busy: the thread is stuck somewhere no guard
+        // covers — a wedge.
+        assert_eq!(verdict(false, None), Some(DrainStallVerdict::Wedged));
+    }
+
+    /// The slow-disk case the beast research measured: one sidecar fsync that
+    /// takes a minute. Before §4.8 this froze the heartbeat past the 45 s
+    /// threshold with nothing to tell it from a wedge, and the operator was
+    /// advised to restart, which re-delivers the segment from record 0 and
+    /// leaves the disk exactly as slow.
+    #[test]
+    fn a_sixty_second_sidecar_fsync_is_slow_local_io_not_a_wedge() {
+        let fsync = Duration::from_secs(60);
+        assert_eq!(
+            drain_stall_verdict(
+                fsync,
+                Duration::from_secs(30),
+                false,
+                Some((BusyKind::LocalFsync, fsync)),
+                COMMIT_TIMEOUT,
+            ),
+            Some(DrainStallVerdict::SlowLocalIo {
+                kind: BusyKind::LocalFsync,
+                busy_for: fsync,
+            })
+        );
+    }
+
+    /// The grace period still comes first: below the freeze threshold nothing
+    /// is reported, whatever is busy and however long for.
+    #[test]
+    fn nothing_busy_or_not_is_reported_below_the_stall_threshold() {
+        let interval = Duration::from_secs(30);
+        let frozen = Duration::from_secs(44);
+        let mut shapes = vec![None];
+        for kind in LOCAL_KINDS
+            .into_iter()
+            .chain([BusyKind::SinkCommit, BusyKind::SinkProbe])
+        {
+            shapes.push(Some((kind, Duration::from_secs(3600))));
+        }
+        for busy in shapes {
+            for stopped in [true, false] {
+                assert_eq!(
+                    drain_stall_verdict(frozen, interval, stopped, busy, COMMIT_TIMEOUT),
+                    None,
+                    "{busy:?}, stopped={stopped}"
+                );
+            }
+        }
+    }
+
+    fn busy_gauge(m: &Metrics, kind: DrainBusyKind) -> f64 {
+        m.drain_busy_seconds
+            .get_or_create(&DrainBusyLabel { kind })
+            .get()
+    }
+
+    const ALL_GAUGE_KINDS: [DrainBusyKind; 7] = [
+        DrainBusyKind::sink_commit,
+        DrainBusyKind::sink_probe,
+        DrainBusyKind::segment_read,
+        DrainBusyKind::local_fsync,
+        DrainBusyKind::dead_letter_write,
+        DrainBusyKind::quarantine_move,
+        DrainBusyKind::dir_scan,
+    ];
+
+    /// `weir_drain_busy_seconds{kind}`: only the current kind is non-zero, and
+    /// an idle drain reads zero everywhere — including the kind that was busy
+    /// on the previous poll.
+    #[test]
+    fn the_busy_gauge_shows_only_the_current_kind() {
+        let m = Metrics::new().0;
+        for kind in ALL_GAUGE_KINDS {
+            assert_eq!(busy_gauge(&m, kind), 0.0, "{kind:?} exists at 0 from boot");
+        }
+
+        publish_drain_busy(
+            &m,
+            Some((BusyKind::LocalFsync, Duration::from_millis(2500))),
+        );
+        for kind in ALL_GAUGE_KINDS {
+            let want = if kind == DrainBusyKind::local_fsync {
+                2.5
+            } else {
+                0.0
+            };
+            assert_eq!(busy_gauge(&m, kind), want, "{kind:?}");
+        }
+
+        publish_drain_busy(&m, Some((BusyKind::SinkCommit, Duration::from_secs(1))));
+        assert_eq!(busy_gauge(&m, DrainBusyKind::sink_commit), 1.0);
+        assert_eq!(busy_gauge(&m, DrainBusyKind::local_fsync), 0.0);
+
+        publish_drain_busy(&m, None);
+        for kind in ALL_GAUGE_KINDS {
+            assert_eq!(busy_gauge(&m, kind), 0.0, "{kind:?}");
+        }
+    }
+
+    /// Each `BusyKind` maps to its own gauge label: a crossed wire would put a
+    /// slow disk on the sink's series.
+    #[test]
+    fn every_busy_kind_has_its_own_gauge_label() {
+        let m = Metrics::new().0;
+        let kinds = [
+            BusyKind::SinkCommit,
+            BusyKind::SinkProbe,
+            BusyKind::SegmentRead,
+            BusyKind::LocalFsync,
+            BusyKind::DeadLetterWrite,
+            BusyKind::QuarantineMove,
+            BusyKind::DirScan,
+        ];
+        for (kind, label) in kinds.into_iter().zip(ALL_GAUGE_KINDS) {
+            publish_drain_busy(&m, Some((kind, Duration::from_secs(7))));
+            assert_eq!(busy_gauge(&m, label), 7.0, "{kind:?} -> {label:?}");
+        }
     }
 }
