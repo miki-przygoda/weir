@@ -418,7 +418,6 @@ impl SegmentLedger {
     }
 
     /// Keeps `path` out of admission and the rescan until `at`.
-    #[allow(dead_code)] // reached by the per-segment cool-down (spec §4.6)
     pub(crate) fn set_not_before(&mut self, path: &Path, at: Instant) {
         self.not_before.insert(path.to_path_buf(), at);
         self.sync_counts();

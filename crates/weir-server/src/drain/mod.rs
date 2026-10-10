@@ -8,7 +8,9 @@
 //! Draining
 //!   │  Transient sink error
 //!   ▼
-//! RetryingTransient  ──(MAX_RETRIES exhausted)──▶  Draining (next segment)
+//! RetryingTransient  ──(MAX_RETRIES exhausted)──▶  Draining (next segment;
+//!   │                                              stranded at once, held off
+//!   │                                              by its not_before)
 //!   │  success
 //!   ▼
 //! Draining
@@ -94,9 +96,10 @@ pub(crate) const LOCAL_READ_STRAND_LIMIT: u32 = 3;
 ///     the normal one (100 / 200 / 400 ms) — the clamp only bites on an operator's
 ///     long base delay or a server-supplied `Retry-After` (up to 5 minutes).
 ///   * With the default retry budget it covers a whole episode in
-///     `(MAX_RETRIES + 1) × 250 ms` = 1 s — which is what
-///     [`SHUTDOWN_RETRY_BACKOFF_BUDGET`] (the actual bound on total added
-///     shutdown time) is sized to. 1 s is small against the per-attempt
+///     `MAX_RETRIES × 250 ms` = 750 ms (an episode serves one wait per retry;
+///     the strand after the last attempt serves none, spec §4.6), inside the
+///     1 s [`SHUTDOWN_RETRY_BACKOFF_BUDGET`] (the actual bound on total added
+///     shutdown time). 1 s is small against the per-attempt
 ///     `commit_timeout` (default 30 s) that the shutdown path already tolerates,
 ///     so this is never the term that decides how long shutdown takes.
 ///   * It is 5× the 50 ms channel-poll slice used while the channel is live, so
@@ -109,15 +112,17 @@ const SHUTDOWN_RETRY_BACKOFF_CAP: Duration = Duration::from_millis(250);
 ///
 /// A per-retry clamp alone is not enough to bound shutdown. Stranding a segment
 /// marks the sink down, so the Draining arm's next health poll sees a down→up
-/// edge and re-queues that same segment (the 4a auto-resume), starting a fresh
-/// retry episode. Against a sink whose HEAD probe stays healthy while every POST
+/// edge and re-queues that same segment (the 4a auto-resume) once its
+/// `not_before` has elapsed, starting a fresh retry episode. Against a sink whose HEAD probe stays healthy while every POST
 /// fails transiently, that cycle is unbounded — today it is only survivable
 /// because zero-delay retries never let `health_poll_interval` elapse. Spending
 /// from one budget keeps the worst case flat: shutdown grows by at most this
 /// much in total, no matter how many segments or resume cycles are involved.
 ///
-/// 1 s is `(MAX_RETRIES + 1) × SHUTDOWN_RETRY_BACKOFF_CAP` — exactly enough for
-/// one full retry episode at the default retry budget, which is the case worth
+/// 1 s was sized as `(MAX_RETRIES + 1) × SHUTDOWN_RETRY_BACKOFF_CAP`, when an
+/// episode still ended with a final wait before the strand; it now needs only
+/// `MAX_RETRIES ×` the cap, so it covers one full retry episode at the default
+/// retry budget with room to spare, which is the case worth
 /// buying (the segment in flight when the operator sent SIGTERM). Anything after
 /// that is a sink that has already failed four spaced-out attempts, which is not
 /// worth delaying a shutdown for.
@@ -906,13 +911,113 @@ fn drain_thread<S: Sink>(
                 }
             }
 
+            // ── RetryingTransient, budget spent: strand now ───────────────────
+            //
+            // Checked BEFORE any wait (spec §4.6). The arm below used to serve
+            // the whole backoff, rescan, and only then notice the budget was
+            // gone, so every strand ended with a dead wait on the single drain
+            // thread: `8 × base` at the defaults, up to `MAX_RETRY_DELAY`
+            // (300 s) under a server's Retry-After, while every other segment
+            // queued behind it.
+            //
+            // The wait is not dropped, it moves off the thread: the delay this
+            // attempt would have served becomes the segment's `not_before`.
+            // Stranding alone would let the next health poll re-queue it at
+            // once (a sink strand marks the sink down, and a healthy probe is a
+            // recovery edge), and a copy of the path still in the channel would
+            // skip the rescan altogether — either one violating a Retry-After.
+            // Admission and the rescan exclusion both honour `not_before`, so
+            // the segment is held off until then while other segments move.
+            DrainState::RetryingTransient {
+                segment,
+                retries_left: 0,
+                next_delay,
+                processed,
+                cause,
+            } => {
+                ledger.set_not_before(&segment, Instant::now() + next_delay);
+                // The `processed` cursor SURVIVES the strand (spec §4.0,
+                // revising H2): every transient result already recorded it
+                // in the ledger, pinned to the file's (dev, ino), so when the
+                // rescan re-queues this path, admission resumes it past the
+                // committed prefix instead of re-delivering it. It is in
+                // memory only — a restart still replays the whole segment,
+                // the at-least-once trade-off the SinkSDK mandates for crash
+                // recovery (sinks must dedupe).
+                //
+                // The bookkeeping depends on WHAT failed (D11).
+                match cause {
+                    TransientCause::Sink => {
+                        metrics.drain_segments_stranded.inc();
+                        // The sink is failing; mark it down so the next
+                        // healthy probe registers as a down→up recovery edge
+                        // and re-drains this stranded segment without
+                        // waiting for a restart.
+                        prev_health_ok = false;
+                        error!(
+                            path = %segment.display(),
+                            processed,
+                            cool_down = ?next_delay,
+                            "drain: max retries exhausted; segment left on disk (stranded) — \
+                             weir_drain_segments_stranded_total incremented; re-drained \
+                             automatically once its cool-down has passed and the sink answers \
+                             (resuming past the records already delivered), or on restart (from the start — duplicates \
+                             handled by the sink's idempotency)"
+                        );
+                    }
+                    // A local cause says nothing about the sink: do not fake
+                    // a sink-down edge, and keep it out of the sink-oriented
+                    // stranded counter. The idle rescan resumes it.
+                    TransientCause::LocalRead { class, errno } => {
+                        metrics
+                            .drain_local_io_strands
+                            .get_or_create(&LocalIoStrandLabel {
+                                cause: LocalIoStrandCause::read,
+                            })
+                            .inc();
+                        error!(
+                            path = %segment.display(),
+                            ?class,
+                            errno,
+                            processed,
+                            cool_down = ?next_delay,
+                            "drain: max retries exhausted reading the segment; left on disk — \
+                             weir_drain_local_io_strands_total{{cause=\"read\"}} incremented; \
+                             retried by the idle rescan. Check the WAB device, not the sink"
+                        );
+                    }
+                    TransientCause::LocalWrite => {
+                        metrics
+                            .drain_local_io_strands
+                            .get_or_create(&LocalIoStrandLabel {
+                                cause: LocalIoStrandCause::write,
+                            })
+                            .inc();
+                        error!(
+                            path = %segment.display(),
+                            processed,
+                            cool_down = ?next_delay,
+                            "drain: max retries exhausted writing dead-letter records; segment \
+                             left on disk — weir_drain_local_io_strands_total{{cause=\"write\"}} \
+                             incremented; retried by the idle rescan. Check the dead_letter/ \
+                             device (space, permissions), not the sink"
+                        );
+                    }
+                }
+
+                DrainState::Draining
+            }
+
             // ── RetryingTransient ─────────────────────────────────────────────
+            // `retries_left >= 1` here; a spent budget matched the arm above.
+            // The previous attempt's cause only matters to a strand, so the
+            // retry ignores it and the attempt below reports its own.
             DrainState::RetryingTransient {
                 segment,
                 retries_left,
                 next_delay,
                 processed,
-                cause,
+                cause: _,
             } => {
                 set_drain_state(&metrics, DrainStateValue::retrying_transient);
 
@@ -1006,104 +1111,35 @@ fn drain_thread<S: Sink>(
                     &|p| ledger.excludes(p, now),
                 );
 
-                if retries_left == 0 {
-                    // The `processed` cursor SURVIVES the strand (spec §4.0,
-                    // revising H2): every transient result already recorded it
-                    // in the ledger, pinned to the file's (dev, ino), so when the
-                    // rescan re-queues this path, admission resumes it past the
-                    // committed prefix instead of re-delivering it. It is in
-                    // memory only — a restart still replays the whole segment,
-                    // the at-least-once trade-off the SinkSDK mandates for crash
-                    // recovery (sinks must dedupe).
-                    //
-                    // The bookkeeping depends on WHAT failed (D11).
-                    match cause {
-                        TransientCause::Sink => {
-                            metrics.drain_segments_stranded.inc();
-                            // The sink is failing; mark it down so the next
-                            // healthy probe registers as a down→up recovery edge
-                            // and re-drains this stranded segment without
-                            // waiting for a restart.
-                            prev_health_ok = false;
-                            error!(
-                                path = %segment.display(),
-                                processed,
-                                "drain: max retries exhausted; segment left on disk (stranded) — \
-                                 weir_drain_segments_stranded_total incremented; re-drained \
-                                 automatically when the sink recovers (resuming past the records \
-                                 already delivered), or on restart (from the start — duplicates \
-                                 handled by the sink's idempotency)"
-                            );
-                        }
-                        // A local cause says nothing about the sink: do not fake
-                        // a sink-down edge, and keep it out of the sink-oriented
-                        // stranded counter. The idle rescan resumes it.
-                        TransientCause::LocalRead { class, errno } => {
-                            metrics
-                                .drain_local_io_strands
-                                .get_or_create(&LocalIoStrandLabel {
-                                    cause: LocalIoStrandCause::read,
-                                })
-                                .inc();
-                            error!(
-                                path = %segment.display(),
-                                ?class,
-                                errno,
-                                processed,
-                                "drain: max retries exhausted reading the segment; left on disk — \
-                                 weir_drain_local_io_strands_total{{cause=\"read\"}} incremented; \
-                                 retried by the idle rescan. Check the WAB device, not the sink"
-                            );
-                        }
-                        TransientCause::LocalWrite => {
-                            metrics
-                                .drain_local_io_strands
-                                .get_or_create(&LocalIoStrandLabel {
-                                    cause: LocalIoStrandCause::write,
-                                })
-                                .inc();
-                            error!(
-                                path = %segment.display(),
-                                processed,
-                                "drain: max retries exhausted writing dead-letter records; segment \
-                                 left on disk — weir_drain_local_io_strands_total{{cause=\"write\"}} \
-                                 incremented; retried by the idle rescan. Check the dead_letter/ \
-                                 device (space, permissions), not the sink"
-                            );
-                        }
-                    }
-                    DrainState::Draining
-                } else {
-                    // Resume past the sub-batches already durably processed (F05).
-                    let result = attempt_segment(
-                        &rt,
-                        &segment,
-                        &*sink,
-                        &config,
-                        &metrics,
-                        &mut dead_letter,
-                        ledger,
-                        processed,
-                    );
-                    // Subsequent failure: spend one retry and double the delay
-                    // (exponential backoff). retries_left is >= 1 here — the
-                    // == 0 case returned above.
-                    next_state_after_process(
+                // Resume past the sub-batches already durably processed (F05).
+                let result = attempt_segment(
+                    &rt,
+                    &segment,
+                    &*sink,
+                    &config,
+                    &metrics,
+                    &mut dead_letter,
+                    ledger,
+                    processed,
+                );
+                // Subsequent failure: spend one retry and double the delay
+                // (exponential backoff). retries_left is >= 1 here — a spent
+                // budget is the arm above, which strands without waiting.
+                next_state_after_process(
+                    segment,
+                    result,
+                    &config,
+                    &metrics,
+                    &mut block_episode,
+                    ledger,
+                    |segment, retry_after, processed, cause| DrainState::RetryingTransient {
                         segment,
-                        result,
-                        &config,
-                        &metrics,
-                        &mut block_episode,
-                        ledger,
-                        |segment, retry_after, processed, cause| DrainState::RetryingTransient {
-                            segment,
-                            retries_left: retries_left - 1,
-                            next_delay: next_retry_delay(next_delay * 2, retry_after),
-                            processed,
-                            cause,
-                        },
-                    )
-                }
+                        retries_left: retries_left - 1,
+                        next_delay: next_retry_delay(next_delay * 2, retry_after),
+                        processed,
+                        cause,
+                    },
+                )
             }
 
             // ── BlockedDeadLetterFull ─────────────────────────────────────────
@@ -6056,6 +6092,164 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    // ── Strand timing and the per-segment cool-down (spec §4.6) ──────────────
+
+    /// A sealed one-shard segment numbered `counter`, so a test can hold two
+    /// distinct segments in the same shard.
+    fn make_sealed_segment_numbered(dir: &Path, counter: u64, payloads: &[&[u8]]) -> PathBuf {
+        let shard_dir = dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let mut seg =
+            WabSegment::create(&segment_path(&shard_dir, counter), 0, Compression::None).unwrap();
+        for p in payloads {
+            seg.write_record(p).unwrap();
+        }
+        seg.seal().unwrap()
+    }
+
+    /// The final backoff was served for nobody. The RetryingTransient arm
+    /// waited out the whole delay, rescanned, and only THEN noticed the budget
+    /// was spent and stranded the segment: with `base=200ms` and
+    /// `max_retries=2` the attempts land at 0, 200 and 600 ms and the strand at
+    /// 1.4 s, the last 800 ms a dead wait on the single drain thread. The
+    /// strand now happens before the wait, at ~0.6 s, and the delay it would
+    /// have served becomes the segment's `not_before` instead.
+    #[test]
+    fn a_segment_strands_without_serving_the_final_backoff() {
+        let dir = tmp_dir("strand_no_final_wait");
+        let sealed = make_sealed_segment(&dir, 0, &[b"data"]);
+        let sink = Arc::new(MockSink::with_responses(
+            (0..1000).map(|_| Err(MockError::Transient)),
+        ));
+        let metrics = noop_metrics();
+        let config = DrainConfig {
+            base_retry_delay: Duration::from_millis(200),
+            max_retries: 2,
+            ..fast_config(dir.clone())
+        };
+        let mut ledger = fresh_ledger();
+        let counts = Arc::clone(ledger.counts());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let (sink_t, metrics_t) = (Arc::clone(&sink), Arc::clone(&metrics));
+        let handle = std::thread::spawn(move || {
+            super::drain_thread(
+                rx,
+                sink_t,
+                config,
+                metrics_t,
+                true,
+                DrainHeartbeat::new(),
+                &mut ledger,
+            );
+        });
+
+        wait_for(5, "the first commit", || sink.call_count() >= 1);
+        wait_for(5, "the strand", || {
+            metrics.drain_segments_stranded.get() >= 1
+        });
+        let stranded_at = Instant::now();
+        let first_failure = sink.call_timestamps()[0];
+        let attempts = sink.call_count();
+        let cooling = counts.cooling_down.load(Ordering::Relaxed);
+        drop(tx);
+        handle.join().unwrap();
+
+        let took = stranded_at.duration_since(first_failure);
+        assert!(
+            took < Duration::from_millis(1000),
+            "the strand must not wait out the final 800 ms backoff first (first failure \
+             to strand took {took:?}; 1.4 s means the dead final wait is back)"
+        );
+        assert_eq!(attempts, 3, "max_retries=2 is still three attempts");
+        assert_eq!(
+            cooling, 1,
+            "the wait the strand skipped becomes the segment's not_before"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A server-supplied `Retry-After` survives the strand. Stranding alone
+    /// would let the very next health poll re-queue the segment (the sink is
+    /// marked down and the probe comes back healthy), and a copy of the path
+    /// still sitting in the channel would bypass the rescan entirely. The
+    /// ledger's `not_before` holds both off until the hint has elapsed, and
+    /// the drain thread is free meanwhile: another segment is delivered during
+    /// the cool-down instead of after it.
+    #[test]
+    fn retry_after_is_honoured_across_a_strand_even_for_a_channel_copy() {
+        const HINT: Duration = Duration::from_secs(2);
+        let dir = tmp_dir("strand_retry_after");
+        let a = make_sealed_segment_numbered(&dir, 1, &[b"a"]);
+        let b = make_sealed_segment_numbered(&dir, 2, &[b"b"]);
+        // One rejection with a 2 s Retry-After, then the sink takes anything.
+        let sink = Arc::new(MockSink::with_responses([Err(
+            MockError::TransientWithRetryAfter(HINT),
+        )]));
+        let metrics = noop_metrics();
+        // No retries: the first failure strands, so the whole hint is the
+        // cool-down. The 50 ms health poll + idle rescan of `fast_config` would
+        // re-queue the segment at once if nothing held it back.
+        let config = DrainConfig {
+            max_retries: 0,
+            ..fast_config(dir.clone())
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(a.clone()).unwrap();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            config,
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+
+        wait_for(5, "the first commit", || sink.call_count() >= 1);
+        let first_failure = sink.call_timestamps()[0];
+        wait_for(5, "the strand", || {
+            metrics.drain_segments_stranded.get() >= 1
+        });
+        // A copy of the cooling-down path in the channel (a flusher or an
+        // earlier rescan put it there), then another segment behind it.
+        tx.send(a.clone()).unwrap();
+        tx.send(b.clone()).unwrap();
+
+        wait_for(5, "the other segment to deliver", || {
+            get_confirmed_path(&b).exists()
+        });
+        let b_done = first_failure.elapsed();
+        assert!(
+            b_done < Duration::from_millis(1500),
+            "the drain thread must not sit out the Retry-After: another segment is \
+             delivered during the cool-down (it took {b_done:?})"
+        );
+        wait_for(10, "the cooled-down segment to deliver", || {
+            get_confirmed_path(&a).exists()
+        });
+        drop(tx);
+        handle.join().unwrap();
+
+        let calls = sink.call_timestamps();
+        let committed = committed_bytes(&sink);
+        assert_eq!(
+            committed,
+            vec![b"b".to_vec(), b"a".to_vec()],
+            "each segment is committed once; the channel copy of the cooling-down \
+             segment is dropped at admission, not delivered"
+        );
+        assert_eq!(
+            calls.len(),
+            3,
+            "a's failure, b, then a once the hint elapsed"
+        );
+        let a_retry = calls[2].duration_since(first_failure);
+        assert!(
+            a_retry >= HINT,
+            "the segment was re-processed {a_retry:?} after a Retry-After of {HINT:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn transient_max_retries_exhausted_leaves_segment_on_disk() {
         let dir = tmp_dir("max_retry");
@@ -6145,8 +6339,9 @@ mod tests {
             1,
             "the segment still strands once the budget is spent"
         );
-        // The RetryingTransient arm is entered MAX_RETRIES + 1 times (each retry
-        // plus the final give-up pass), so the expected total is ~4 × the clamp.
+        // The RetryingTransient arm waits once per retry, MAX_RETRIES times; the
+        // give-up pass strands without waiting (spec §4.6), so the expected
+        // total is ~3 × the clamp.
         assert!(
             elapsed >= Duration::from_millis(600),
             "shutdown retries must still be spaced by the clamped backoff, not fired \
