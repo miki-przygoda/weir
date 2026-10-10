@@ -859,6 +859,8 @@ fn metrics_all_families_registered() {
         // wab_dir ownership
         "weir_wab_dir_lock_held",
         "weir_wab_dir_lock_integrity_failures",
+        // Config reload
+        "weir_config_reloads",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
@@ -2922,6 +2924,290 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
     }
 
     let _ = fs::remove_dir_all(&b_tmp);
+}
+
+// ── SIGHUP (safety floor, spec §3.2) ──────────────────────────────────────────
+
+fn send_sighup(pid: u32) {
+    // SAFETY: kill(2) with a pid we spawned and still own (not yet reaped).
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+    assert_eq!(rc, 0, "kill -HUP {pid}: {}", io::Error::last_os_error());
+}
+
+/// `weir_config_reloads_total{trigger="sighup",outcome=<outcome>}`, 0 if absent.
+fn sighup_reloads(srv: &weir_testkit::WeirServer, outcome: &str) -> u64 {
+    parse_metric(
+        &srv.scrape_metrics(),
+        &format!("weir_config_reloads_total{{trigger=\"sighup\",outcome=\"{outcome}\"}} "),
+    )
+}
+
+/// Polls `sighup_reloads` until it reaches `want` or 5 s pass; returns the last
+/// value. The reload runs on the reload loop after the signal, so the counter
+/// lags the `kill` by a scheduling hop.
+fn wait_for_sighup_reloads(srv: &weir_testkit::WeirServer, outcome: &str, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = sighup_reloads(srv, outcome);
+        if got >= want || Instant::now() >= deadline {
+            return got;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn read_log(srv: &weir_testkit::WeirServer) -> String {
+    fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default()
+}
+
+/// Asserts the daemon survived: still running 300 ms later, and acking.
+fn assert_alive_and_acking(srv: &mut weir_testkit::WeirServer, what: &str) {
+    if let Some(status) = srv.wait_for_exit(Duration::from_millis(300)) {
+        panic!(
+            "{what} killed the daemon ({status})\nlog:\n{}",
+            read_log(srv)
+        );
+    }
+    srv.client()
+        .push(b"after-sighup", Durability::Durable)
+        .unwrap_or_else(|e| panic!("a Durable push after {what} must ack: {e:?}"));
+}
+
+/// spec §3.2: a daemon without TLS used to have no SIGHUP handler at all, so
+/// `kill -HUP` (a `systemctl reload`, a log-rotation script) killed it with the
+/// default disposition. Now it is a counted, logged noop.
+#[test]
+fn sighup_is_a_counted_noop_on_a_default_daemon() {
+    let mut srv = weir_server!("sighup_noop").log_level("info").start();
+    send_sighup(srv.child_pid());
+    assert_alive_and_acking(&mut srv, "SIGHUP");
+    assert_eq!(wait_for_sighup_reloads(&srv, "noop", 1), 1);
+    for outcome in ["ok", "failed", "dropped"] {
+        assert_eq!(sighup_reloads(&srv, outcome), 0, "outcome={outcome}");
+    }
+    let log = read_log(&srv);
+    assert!(
+        log.contains(
+            "SIGHUP received: nothing reloadable in this build/config (config is read once at \
+             startup); nothing changed"
+        ),
+        "the noop must say so\nlog:\n{log}"
+    );
+    srv.shutdown();
+}
+
+/// Review Focus 5: 100 SIGHUPs in a burst neither kill the daemon nor wedge
+/// the reload path. Every HUP that got through is accounted for as served
+/// (noop) or dropped by the bounded queue, and a later HUP is still served.
+#[test]
+fn sighup_flood_does_not_kill_or_wedge() {
+    let mut srv = weir_server!("sighup_flood").start();
+    let pid = srv.child_pid();
+    for _ in 0..100 {
+        send_sighup(pid);
+    }
+    assert_alive_and_acking(&mut srv, "a SIGHUP flood");
+
+    // tokio coalesces pending signals, so fewer than 100 may be seen; at least
+    // one is, and none is counted twice.
+    let served = wait_for_sighup_reloads(&srv, "noop", 1);
+    let dropped = sighup_reloads(&srv, "dropped");
+    assert!(served >= 1, "the flood must be served, not lost");
+    assert!(
+        served + dropped <= 100,
+        "100 HUPs, but served {served} + dropped {dropped}"
+    );
+
+    // Not wedged: once the flood has settled, one more HUP is served.
+    thread::sleep(Duration::from_millis(200));
+    let before = sighup_reloads(&srv, "noop");
+    send_sighup(pid);
+    assert_eq!(
+        wait_for_sighup_reloads(&srv, "noop", before + 1),
+        before + 1,
+        "a HUP after the flood must still be served"
+    );
+    assert_alive_and_acking(&mut srv, "the HUP after the flood");
+    srv.shutdown();
+}
+
+/// Copies the first sealed segment in `wab_dir/shard_00` under fresh counters
+/// until the shard holds `total` sealed segments. Returns `total`.
+fn pad_sealed_backlog(wab_dir: &Path, total: usize) -> usize {
+    let shard = wab_dir.join("shard_00");
+    let counter = |p: &Path| -> u64 {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        name.trim_start_matches("seg_")
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let mut sealed: Vec<PathBuf> = fs::read_dir(&shard)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".wab.sealed"))
+        .collect();
+    sealed.sort_by_key(|p| counter(p));
+    let template = sealed[0].clone();
+    let first_free = counter(sealed.last().unwrap()) + 1;
+    for next in (first_free..).take(total.saturating_sub(sealed.len())) {
+        fs::copy(&template, shard.join(format!("seg_{next:08}.wab.sealed"))).unwrap();
+    }
+    assert_eq!(count_wab_files(wab_dir, ".wab.sealed"), total);
+    total
+}
+
+/// spec §3.2 test 3 (revised): a HUP while `replay_unconfirmed` is blocked,
+/// before the runtime (and so before any tokio handler) exists, must be
+/// ignored.
+///
+/// The sink is a black hole that accepts and never answers, with the maximum
+/// `sink_timeout_secs`, so the drain sits in its first `commit` and stops
+/// taking segments. A backlog larger than the drain channel (256) plus that one
+/// then blocks the replay on its send. A connection-refused sink would not do:
+/// it fails fast and the drain's retry wait pulls the channel into `pending`,
+/// so the replay never blocks.
+#[test]
+fn sighup_during_startup_replay_is_ignored() {
+    const TOTAL: usize = 300;
+    let wab = std::env::temp_dir().join(format!("weir_sys_hup_replay_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&wab);
+    fs::create_dir_all(&wab).unwrap();
+    seed_sealed_backlog("hup_replay_seed", &wab);
+    pad_sealed_backlog(&wab, TOTAL);
+
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("hup_replay")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"\nsink_timeout_secs = 300")
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .spawn();
+    let queued = |log: &str| log.matches("queuing segment for drain replay").count();
+
+    // Wait for the replay to block: the drain holds a hung request and the
+    // replay's line count stops growing short of the backlog.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = 0;
+    loop {
+        let log = read_log(&srv);
+        let n = queued(&log);
+        if n > 0 && n == last && hole.connections() > 0 {
+            break;
+        }
+        last = n;
+        assert!(
+            Instant::now() < deadline,
+            "the replay never blocked (queued {n}, sink connections {})\nlog:\n{log}",
+            hole.connections()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    send_sighup(srv.child_pid());
+    if let Some(status) = srv.wait_for_exit(Duration::from_millis(300)) {
+        panic!(
+            "a SIGHUP during the replay killed the daemon ({status})\nlog:\n{}",
+            read_log(&srv)
+        );
+    }
+    // The HUP landed in the replay phase: it was still blocked afterwards, and
+    // the runtime (whose first act is the metrics bind) did not exist yet.
+    let log = read_log(&srv);
+    assert!(
+        queued(&log) < TOTAL,
+        "the replay must still be blocked after the HUP (queued {} of {TOTAL})",
+        queued(&log)
+    );
+    assert!(
+        !log.contains("metrics endpoint listening"),
+        "the HUP must land before the runtime\nlog:\n{log}"
+    );
+
+    // Close the black hole: the hung commit fails, the drain's retry wait
+    // drains the channel, the replay finishes and the socket binds.
+    drop(hole);
+    srv.wait_ready(Duration::from_secs(30));
+    assert_alive_and_acking(&mut srv, "the SIGHUP during the replay");
+    let log = read_log(&srv);
+    assert_eq!(queued(&log), TOTAL, "the whole backlog must be replayed");
+    assert!(
+        !log.contains("SIGHUP received"),
+        "a HUP before the runtime is dropped, not served late\nlog:\n{log}"
+    );
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// spec §3.2, the recovery-phase variant: a HUP while `recover_open_segments`
+/// is sealing a pile of unsealed segments, long before the runtime exists.
+#[test]
+fn sighup_during_startup_recovery_is_ignored() {
+    const TOTAL: usize = 400;
+    let wab = std::env::temp_dir().join(format!("weir_sys_hup_recov_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&wab);
+    fs::create_dir_all(&wab).unwrap();
+
+    // One unsealed segment: acked Durable records, then SIGKILL (no seal).
+    let mut seeder = weir_server!("hup_recov_seed").wab_dir(&wab).start();
+    let mut client = seeder.client();
+    for i in 0..32 {
+        let mut p = format!("recov-{i:02}-").into_bytes();
+        p.resize(4096, b'r');
+        client.push(p, Durability::Durable).expect("seeding push");
+    }
+    drop(client);
+    seeder.kill_ungracefully();
+    drop(seeder);
+    let shard = wab.join("shard_00");
+    let active: Vec<PathBuf> = fs::read_dir(&shard)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".wab"))
+        .collect();
+    assert_eq!(active.len(), 1, "the seed must leave one unsealed segment");
+    for n in 2..=TOTAL {
+        fs::copy(&active[0], shard.join(format!("seg_{:08}.wab", 1000 + n))).unwrap();
+    }
+    assert_eq!(count_wab_files(&wab, ".wab"), TOTAL);
+
+    let mut srv = weir_server!("hup_recov")
+        .wab_dir(&wab)
+        .log_level("info")
+        .spawn();
+    let started = |log: &str| log.contains("recovering unsealed WAB segment");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started(&read_log(&srv)) {
+        assert!(
+            Instant::now() < deadline,
+            "recovery never started\nlog:\n{}",
+            read_log(&srv)
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    send_sighup(srv.child_pid());
+    // An ignored signal is discarded when it is sent, so a log read now that
+    // still shows recovery unfinished proves the HUP landed during it.
+    let log = read_log(&srv);
+    let done = log.matches("recovery complete").count();
+    assert!(
+        done < TOTAL,
+        "the HUP must land during recovery, but all {TOTAL} segments were already \
+         recovered; seed more"
+    );
+
+    srv.wait_ready(Duration::from_secs(60));
+    assert_alive_and_acking(&mut srv, "the SIGHUP during recovery");
+    let log = read_log(&srv);
+    assert_eq!(
+        log.matches("recovery complete").count(),
+        TOTAL,
+        "every unsealed segment must be recovered\nlog:\n{log}"
+    );
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
 }
 
 // ── File descriptor limit exhaustion ─────────────────────────────────────────

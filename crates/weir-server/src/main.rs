@@ -4,6 +4,7 @@ mod metrics;
 mod models;
 mod preflight;
 mod queue;
+mod reload;
 mod sink;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
@@ -451,54 +452,6 @@ fn spawn_lock_integrity_task(
     });
 }
 
-// ── TLS SIGHUP reload task ────────────────────────────────────────────────────
-
-/// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
-///
-/// The task is fail-safe: if `reload()` returns `Err`, the old `ServerConfig`
-/// is retained and an error is logged. Both outcomes increment the
-/// `tls_config_reloads` counter with the appropriate label so operators can
-/// alert on sustained reload failures.
-#[cfg(all(unix, feature = "tls"))]
-fn spawn_tls_reload_task(
-    tls: crate::socket::tls::ReloadableServerConfig,
-    metrics: std::sync::Arc<crate::metrics::Metrics>,
-) {
-    use crate::metrics::{TlsReloadLabel, TlsReloadOutcome};
-    use tokio::signal::unix::{SignalKind, signal};
-    tokio::spawn(async move {
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGHUP handler; cert reload disabled");
-                return;
-            }
-        };
-        while hup.recv().await.is_some() {
-            match tls.reload() {
-                Ok(()) => {
-                    metrics
-                        .tls_config_reloads
-                        .get_or_create(&TlsReloadLabel {
-                            outcome: TlsReloadOutcome::ok,
-                        })
-                        .inc();
-                    tracing::info!("SIGHUP: TLS certificates reloaded");
-                }
-                Err(e) => {
-                    metrics
-                        .tls_config_reloads
-                        .get_or_create(&TlsReloadLabel {
-                            outcome: TlsReloadOutcome::failed,
-                        })
-                        .inc();
-                    tracing::error!(error = %e, "SIGHUP: TLS reload failed; keeping previous certs");
-                }
-            }
-        }
-    });
-}
-
 /// Returns the configured sink URL, or a clear startup error if it's absent.
 /// Config validation already guarantees it's set for URL-requiring sinks, so
 /// this is belt-and-suspenders — but a `Result` beats a panic on the startup
@@ -548,11 +501,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // That nested tightening sees the value set here as its "previous", so
     // restoration is consistent.
     //
+    // SIGHUP is ignored from here until the runtime installs the reload
+    // handler (reload::spawn_sighup_task, first thing inside `block_on`). With
+    // the default disposition a HUP (a `systemctl reload`, a log-rotation
+    // script, a terminal hang-up) killed the daemon outright, skipping the seal
+    // and the drain, and before this only a TLS build with tcp_bind ever
+    // installed a handler. Set before Config::load so a HUP during recovery or
+    // the blocking replay is dropped too: safe, because the real TLS load
+    // happens later and reads the current files (spec §3.2).
+    //
     // Safety: libc::umask is always safe; it swaps the process umask and
-    // returns the previous value. No invariants to uphold.
+    // returns the previous value. libc::signal with SIG_IGN installs no handler
+    // code, so there is nothing that must be async-signal-safe, and no other
+    // thread exists yet to race the disposition change.
     #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
     let (config, config_warnings) = Config::load()?;
@@ -1032,6 +997,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     rt.block_on(async {
+        // The one reload path (spec §3.2), first in the runtime: the SIGHUP
+        // handler replaces the SIG_IGN set at the top of main, and from here a
+        // HUP is a counted reload request instead of a no-op drop. The TLS
+        // branch below registers its config once it has loaded it.
+        #[cfg(all(unix, feature = "tls"))]
+        let tls_configured = config.tcp_bind.is_some();
+        #[cfg(not(all(unix, feature = "tls")))]
+        let tls_configured = false;
+        let reloader = reload::Reloader::new(Arc::clone(&metrics), tls_configured);
+        let reload_tx = reload::spawn_reload_loop(Arc::clone(&reloader));
+        #[cfg(unix)]
+        reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
+        #[cfg(not(unix))]
+        drop(reload_tx);
+
         // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
         // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
         // below; the integrity task is the only writer. Spawned first thing in
@@ -1270,11 +1250,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let tcp_queue_tx = queue_tx.clone();
                     let tcp_metrics = Arc::clone(&metrics);
 
-                    // Spawn SIGHUP reload task before moving `tls` into tcp::run.
+                    // Register for reload before moving `tls` into tcp::run.
                     // The clone shares the same inner ArcSwap so a reload from the
-                    // SIGHUP task is immediately visible to the accept loop's
+                    // reload loop is immediately visible to the accept loop's
                     // `tls.current()` call.
-                    spawn_tls_reload_task(tls.clone(), Arc::clone(&metrics));
+                    reloader.register_tls(tls.clone());
 
                     // Pass a clone of the shared semaphore so Unix + TCP draw
                     // from the same permit pool — true global cap.

@@ -159,7 +159,7 @@ pub struct TlsReloadLabel {
 
 /// TLS config reload outcome. Lowercase to match Prometheus naming conventions.
 ///
-/// Constructed by the SIGHUP reload task (`spawn_tls_reload_task`, feature = "tls"); on
+/// Constructed by `reload::Reloader` when TLS is registered (feature = "tls"); on
 /// the default Unix-only build the variants are never constructed, so the
 /// dead-code lint is suppressed only there.
 #[allow(non_camel_case_types)]
@@ -168,6 +168,38 @@ pub struct TlsReloadLabel {
 pub enum TlsReloadOutcome {
     ok,
     failed,
+}
+
+/// Labels for `weir_config_reloads_total` (safety floor, spec §3.2): what asked
+/// for the reload and how it went.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigReloadLabel {
+    pub trigger: ConfigReloadTrigger,
+    pub outcome: ConfigReloadOutcome,
+}
+
+/// What asked for a config reload. Lowercase to match Prometheus naming
+/// conventions.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ConfigReloadTrigger {
+    /// SIGHUP.
+    sighup,
+    /// Reserved for the admin socket's `reload` verb (Foundations), which goes
+    /// through the same `reload::Reloader`. Nothing sends it in this release.
+    admin,
+}
+
+/// How a config reload went. `dropped` is a request the bounded reload queue
+/// (8 deep) had no room for, as in a SIGHUP flood: it never ran, and it is
+/// counted so the flood is visible.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum ConfigReloadOutcome {
+    ok,
+    failed,
+    noop,
+    dropped,
 }
 
 // ── Metrics struct ────────────────────────────────────────────────────────────
@@ -223,7 +255,7 @@ pub(crate) struct Metrics {
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub tls_handshake_failures: Family<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>,
     /// SIGHUP TLS config reloads, by outcome. Always compiled and registered;
-    /// incremented by the SIGHUP reload task (`spawn_tls_reload_task`, feature = "tls").
+    /// incremented by `reload::Reloader` when TLS is registered (feature = "tls").
     /// On the default (Unix-only) build the field is never read, so the
     /// dead-code lint is suppressed only there.
     #[cfg_attr(not(feature = "tls"), allow(dead_code))]
@@ -353,6 +385,12 @@ pub(crate) struct Metrics {
     /// `wab_dir` lock that found it deleted or replaced (and re-locked it), or
     /// failed with an errno. Proven loss to another instance exits instead.
     pub wab_dir_lock_integrity_failures: Counter<u64, AtomicU64>,
+
+    // ── Config reload (safety floor, spec §3.2) ───────────────────────────────
+    /// `weir_config_reloads_total{trigger,outcome}`: every reload request, by
+    /// what asked for it and how it went. `weir_tls_config_reloads_total` is
+    /// unchanged and still counts the TLS part on its own.
+    pub config_reloads: Family<ConfigReloadLabel, Counter<u64, AtomicU64>>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -691,6 +729,17 @@ impl Metrics {
              instance does not count here; the daemon exits with status 3 instead"
         );
 
+        // ── Config reload (safety floor) ──────────────────────────────────────
+        let config_reloads = reg!(
+            Family::<ConfigReloadLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_config_reloads",
+            "Config reload requests, by trigger (sighup; admin is reserved) and outcome: ok \
+             (something was reloaded), failed (a reload was attempted and rejected; the \
+             previous config stays in force), noop (nothing reloadable: the config is read \
+             once at startup, and only TLS material reloads), dropped (the reload queue was \
+             full, as in a SIGHUP flood, so the request never ran)"
+        );
+
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
@@ -759,6 +808,7 @@ impl Metrics {
             dead_letter_blocked_duration,
             wab_dir_lock_held,
             wab_dir_lock_integrity_failures,
+            config_reloads,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -910,6 +960,7 @@ mod tests {
             "weir_dead_letter_blocked_duration_seconds",
             "weir_wab_dir_lock_held",
             "weir_wab_dir_lock_integrity_failures",
+            "weir_config_reloads",
         ];
         for name in expected {
             assert!(
@@ -942,6 +993,24 @@ mod tests {
             "drain_state stopped label missing or not pre-initialised to 0:\n{out}"
         );
         assert!(out.contains("healthy"), "sink_health healthy label missing");
+    }
+
+    /// The label order is the contract operators query by:
+    /// `weir_config_reloads_total{trigger="sighup",outcome="noop"}`.
+    #[test]
+    fn config_reloads_encodes_trigger_then_outcome() {
+        let (m, reg) = Metrics::new();
+        m.config_reloads
+            .get_or_create(&ConfigReloadLabel {
+                trigger: ConfigReloadTrigger::sighup,
+                outcome: ConfigReloadOutcome::dropped,
+            })
+            .inc();
+        let out = encode_to_string(&reg);
+        assert!(
+            out.contains("weir_config_reloads_total{trigger=\"sighup\",outcome=\"dropped\"} 1"),
+            "{out}"
+        );
     }
 
     /// The lock gauge starts at 0: `main` sets it to 1 only after the lock is

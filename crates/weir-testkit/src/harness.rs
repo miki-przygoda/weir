@@ -452,11 +452,23 @@ impl WeirServerBuilder {
     /// Spawns the server and blocks until it's ready (or panics with the
     /// captured log on failure).
     pub fn start(self) -> WeirServer {
+        let ready_timeout = self.ready_timeout;
+        let mut handle = self.spawn();
+        handle.wait_ready(ready_timeout);
+        handle
+    }
+
+    /// Spawns the server and returns at once, WITHOUT waiting for the socket.
+    /// For tests that act on the daemon during startup (recovery, the blocking
+    /// replay), before it accepts connections. Call
+    /// [`WeirServer::wait_ready`] when the test wants it up; the log is at
+    /// `tmp_dir/weir.log` meanwhile.
+    pub fn spawn(self) -> WeirServer {
         let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
         let (prepared, mut cmd) = self.prepare();
         let child = cmd.spawn().expect("failed to spawn weir-server");
 
-        let mut handle = WeirServer {
+        WeirServer {
             child: Some(child),
             binary_path: prepared.binary_path,
             socket_path: prepared.socket_path,
@@ -468,10 +480,7 @@ impl WeirServerBuilder {
             batch_deadline_ms: prepared.batch_deadline_ms,
             env: prepared.env,
             _proc_lock,
-        };
-
-        handle.wait_ready(prepared.ready_timeout);
-        handle
+        }
     }
 
     /// Spawns a daemon that is EXPECTED to exit on its own (a refused start),
@@ -666,7 +675,6 @@ impl WeirServerBuilder {
             tcp_addr,
             batch_deadline_ms: self.batch_deadline_ms,
             env: self.env,
-            ready_timeout: self.ready_timeout,
         };
         (prepared, cmd)
     }
@@ -684,7 +692,6 @@ struct Prepared {
     tcp_addr: Option<std::net::SocketAddr>,
     batch_deadline_ms: u64,
     env: Vec<(String, String)>,
-    ready_timeout: Duration,
 }
 
 /// Read `WEIR_BENCH_DEADLINE` from env, defaulting to 1ms. Used by

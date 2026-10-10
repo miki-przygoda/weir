@@ -6,6 +6,11 @@
 //! test can assert on the payloads that actually left weir rather than on WAB
 //! bytes, which graceful shutdown deletes once they are delivered.
 //!
+//! [`RecordingSink::start_hanging`] is the black-hole variant: it accepts every
+//! connection and never answers, so a sink call waits for its timeout. Dropping
+//! it closes every held connection and the listener, so the daemon's next
+//! attempt is refused.
+//!
 //! Deliberately minimal: one thread per connection, keep-alive, and only the
 //! request framing the HTTP sink produces (`Content-Length`, plus `chunked` for
 //! safety). It is a test fixture, not a server.
@@ -26,6 +31,19 @@ pub struct RecordingSink {
 impl RecordingSink {
     /// Binds `127.0.0.1:0` and starts serving on a background thread.
     pub fn start() -> RecordingSink {
+        Self::start_mode(false)
+    }
+
+    /// A black hole: binds `127.0.0.1:0`, accepts every connection (counted by
+    /// [`connections`](Self::connections)) and never reads or answers on it,
+    /// so the daemon's sink call hangs until its `sink_timeout_secs`. Nothing
+    /// is recorded. Dropping the sink closes the held connections and the
+    /// listener: the hung call fails at once and later ones are refused.
+    pub fn start_hanging() -> RecordingSink {
+        Self::start_mode(true)
+    }
+
+    fn start_mode(hang: bool) -> RecordingSink {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind recording sink");
         let addr = listener.local_addr().expect("recording sink local_addr");
         let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
@@ -47,9 +65,16 @@ impl RecordingSink {
                     let Ok(conn) = conn else { continue };
                     c.fetch_add(1, Ordering::SeqCst);
                     let b = Arc::clone(&b);
+                    let s = Arc::clone(&s);
                     let _ = std::thread::Builder::new()
                         .name("recording-sink-conn".into())
-                        .spawn(move || serve(conn, &b));
+                        .spawn(move || {
+                            if hang {
+                                hold(conn, &s)
+                            } else {
+                                serve(conn, &b)
+                            }
+                        });
                 }
             })
             .expect("spawn recording sink thread");
@@ -90,6 +115,14 @@ impl Drop for RecordingSink {
         self.stop.store(true, Ordering::Relaxed);
         // Wake the blocking accept so the thread sees `stop`.
         let _ = TcpStream::connect(self.addr);
+    }
+}
+
+/// Holds a connection open, unread and unanswered, until the sink is dropped;
+/// returning drops (closes) it.
+fn hold(_conn: TcpStream, stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
 
@@ -219,5 +252,44 @@ mod tests {
         assert_eq!(sink.bodies(), vec![b"hello".to_vec(), b"abcde".to_vec()]);
         assert_eq!(sink.connections(), 1, "one keep-alive connection");
         assert!(sink.url().starts_with("http://127.0.0.1:"));
+    }
+
+    #[test]
+    fn a_hanging_sink_never_answers_and_closes_on_drop() {
+        let sink = RecordingSink::start_hanging();
+        let addr = sink.addr;
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(b"POST /sink HTTP/1.1\r\ncontent-length: 5\r\n\r\nhello")
+            .unwrap();
+        s.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let err = s.read(&mut buf).expect_err("a black hole never answers");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ),
+            "{err:?}"
+        );
+        assert_eq!(sink.connections(), 1);
+        assert!(sink.bodies().is_empty());
+
+        drop(sink);
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        // Closed: EOF, or a reset if the unread request was still buffered.
+        match s.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("a black hole must not answer, got {n} bytes"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e:?}"),
+        }
+        // And the listener is gone. The accept thread exits after its wake-up
+        // connect, so allow it a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while TcpStream::connect(addr).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "listener still open");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }
