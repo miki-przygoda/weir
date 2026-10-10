@@ -38,7 +38,7 @@ use std::{
     time::Instant,
 };
 
-use tracing::info;
+use tracing::{info, warn};
 use weir_core::Payload;
 
 use super::confirmed::{self, ConfirmOutcome};
@@ -367,18 +367,67 @@ impl SegmentLedger {
         self.sync_counts();
     }
 
+    /// Takes ownership of a segment whose quarantine move failed (§4.4): from
+    /// here on admission drops every copy of `path`, the rescan skips it, and
+    /// [`Self::retry_dispositions`] retries only the move. Its progress is
+    /// forgotten: whatever prefix it had was delivered, and it is never
+    /// resumed, only moved. The failure itself was counted by the first move.
+    pub(crate) fn note_quarantine_pending(&mut self, path: &Path, reason: &'static str) {
+        self.quarantine_pending.insert(path.to_path_buf(), reason);
+        self.forget(path);
+    }
+
     /// Retries outstanding dispositions — the sidecar write and delete of
-    /// `confirm_pending`, the move of `quarantine_pending`. **It never
-    /// delivers.** Runs first in every health poll and once on drain exit.
+    /// `confirm_pending`, the move of `quarantine_pending` into
+    /// `<wab_dir>/quarantine/`. **It never delivers.** Runs first in every
+    /// health poll and once on drain exit.
     ///
     /// A `Sidecar` entry redoes the whole confirm (the atomic sidecar, then the
     /// delete); a `Delete` entry, whose sidecar is already durable, redoes only
     /// the delete. A segment that has vanished meanwhile (an operator removed
     /// it, or a concurrent scan deleted it as an orphan) completes as `Done`.
-    pub(crate) fn retry_dispositions(&mut self, metrics: &Metrics) {
-        if self.confirm_pending.is_empty() {
+    ///
+    /// A quarantine entry redoes only the move. A landed move bumps the
+    /// quarantine series like any other quarantine; a segment that vanished
+    /// meanwhile is done; a move that still fails is logged but not counted
+    /// again (`weir_drain_quarantine_failures_total` counts segments, and the
+    /// disposition gauge shows how many are still waiting).
+    pub(crate) fn retry_dispositions(&mut self, wab_dir: &Path, metrics: &Metrics) {
+        if self.confirm_pending.is_empty() && self.quarantine_pending.is_empty() {
             return;
         }
+        self.retry_confirms(metrics);
+        self.retry_quarantines(wab_dir, metrics);
+        self.sync_counts();
+    }
+
+    fn retry_quarantines(&mut self, wab_dir: &Path, metrics: &Metrics) {
+        let mut moved = Vec::new();
+        for (path, &reason) in &self.quarantine_pending {
+            match super::move_to_quarantine(path, wab_dir, metrics, reason) {
+                Ok(()) => {
+                    info!(
+                        path = %path.display(),
+                        reason,
+                        "drain: outstanding quarantine move completed without re-delivery"
+                    );
+                    moved.push(path.clone());
+                }
+                Err(e) => warn!(
+                    path = %path.display(),
+                    error = %e,
+                    reason,
+                    "drain: quarantine move still failing; segment kept on disk, not re-delivered, \
+                     retried next health poll"
+                ),
+            }
+        }
+        for path in moved {
+            self.quarantine_pending.remove(&path);
+        }
+    }
+
+    fn retry_confirms(&mut self, metrics: &Metrics) {
         let mut done = Vec::new();
         for (path, pending) in self.confirm_pending.iter_mut() {
             let outcome = match pending.stage {
@@ -405,7 +454,6 @@ impl SegmentLedger {
         for path in done {
             self.confirm_pending.remove(&path);
         }
-        self.sync_counts();
     }
 
     /// The outstanding confirm stage of `path`, if the ledger owns it.
@@ -698,13 +746,63 @@ mod tests {
         assert_eq!(l.counts().confirm_pending.load(Ordering::Relaxed), 1);
 
         std::fs::remove_file(&path).unwrap();
-        l.retry_dispositions(&metrics);
+        l.retry_dispositions(&dir, &metrics);
         assert_eq!(l.confirm_stage(&path), None);
         assert_eq!(l.counts().confirm_pending.load(Ordering::Relaxed), 0);
         assert!(
             !crate::wab::format::confirmed_path_for(&path).exists(),
             "no sidecar is written for a segment that is gone"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The quarantine_pending lifecycle (spec §4.4): a failed move makes the
+    /// ledger own the path (admission drops it, the rescan excludes it, the
+    /// gauge mirror counts it, its cursor goes), each retry redoes only the
+    /// move, and a segment that vanished meanwhile is released as done.
+    #[test]
+    fn a_quarantine_pending_entry_owns_the_path_until_the_move_lands() {
+        let (dir, path) = file("quarantine_pending");
+        let squatter = dir.join("quarantine");
+        std::fs::write(&squatter, b"not a directory").unwrap();
+        let metrics = Metrics::new().0;
+        let now = Instant::now();
+
+        let mut l = ledger();
+        l.record_progress(&path, 3);
+        l.note_quarantine_pending(&path, "test: unreadable tail");
+        assert_eq!(l.admit(&path, now), Admit::Drop("quarantine_pending"));
+        assert!(l.excludes(&path, now));
+        assert_eq!(l.counts().quarantine_pending.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            l.counts().resume_cursors.load(Ordering::Relaxed),
+            0,
+            "a segment awaiting quarantine is never resumed, so its cursor goes"
+        );
+
+        l.retry_dispositions(&dir, &metrics);
+        assert_eq!(
+            l.counts().quarantine_pending.load(Ordering::Relaxed),
+            1,
+            "still failing: still owned"
+        );
+        assert!(path.exists());
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+
+        std::fs::remove_file(&squatter).unwrap();
+        l.retry_dispositions(&dir, &metrics);
+        assert_eq!(l.counts().quarantine_pending.load(Ordering::Relaxed), 0);
+        assert!(!path.exists(), "the retry moved the segment");
+        assert!(squatter.is_dir());
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+
+        // ENOENT counts as done: nothing is left to preserve, nothing is counted.
+        let gone = dir.join("seg_00000002.wab.sealed");
+        l.note_quarantine_pending(&gone, "test: vanished");
+        l.retry_dispositions(&dir, &metrics);
+        assert_eq!(l.counts().quarantine_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+
         std::fs::remove_dir_all(dir).ok();
     }
 

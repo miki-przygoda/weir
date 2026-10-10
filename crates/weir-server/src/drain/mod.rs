@@ -209,6 +209,11 @@ enum ProcessResult {
     /// A record failed to read mid-segment. The readable prefix was delivered and
     /// the segment was quarantined for manual recovery — do not retry or delete.
     Quarantined,
+    /// As `Quarantined`, but the move into `quarantine/` failed (already logged
+    /// and counted). The segment is still on disk, and whatever prefix it had
+    /// was delivered: the ledger takes it into `quarantine_pending`, and the
+    /// health polls retry only the move — never the delivery (spec §4.4).
+    QuarantinePending { reason: &'static str },
     /// The segment cannot be delivered by this binary but is not corrupt (its
     /// header names a newer format version). Nothing was delivered. Set it aside
     /// for the rest of the run, bytes untouched; the next start replays it.
@@ -741,7 +746,7 @@ fn drain_thread<S: Sink>(
                 // deliver, and finishing one can change what the rescan may
                 // pick up — then the probe + rescan, then the gauges.
                 if last_health_poll.elapsed() >= config.health_poll_interval {
-                    ledger.retry_dispositions(&metrics);
+                    ledger.retry_dispositions(&config.wab_dir, &metrics);
                     let now = Instant::now();
                     prev_health_ok = probe_and_resume_stranded(
                         &rt,
@@ -1167,7 +1172,7 @@ fn drain_thread<S: Sink>(
     // One best-effort pass over outstanding dispositions on the way out: a
     // sidecar or quarantine move that can complete now saves a re-delivery on
     // the next start. It never delivers.
-    ledger.retry_dispositions(&metrics);
+    ledger.retry_dispositions(&config.wab_dir, &metrics);
     publish_ledger_counts(ledger.counts(), &metrics);
     info!("drain thread exiting");
 }
@@ -1175,7 +1180,8 @@ fn drain_thread<S: Sink>(
 /// Maps a [`ProcessResult`] to the next [`DrainState`]. The three terminal
 /// outcomes are identical whether we arrived from a first attempt or a retry —
 /// `Confirmed` confirms+deletes and moves on, `BlockedDeadLetter` enters the
-/// blocked state, `Quarantined` (handled inside `process_segment`) moves on.
+/// blocked state, `Quarantined` (handled inside `process_segment`) moves on, and
+/// so does `QuarantinePending`, whose move the ledger retries.
 /// Only the `Transient → RetryingTransient` backoff differs between the two
 /// callers (fresh budget vs. decremented/exponential), so each supplies it via
 /// `on_transient`. This is the single source of truth for the non-retry
@@ -1241,6 +1247,15 @@ fn next_state_after_process(
             end_block_episode(block_episode, metrics);
             DrainState::Draining
         }
+        // The quarantine move failed. The ledger owns the segment from here:
+        // admission drops every copy of it, the rescan skips it, and the polls
+        // retry only the move. Its readable prefix was delivered once and is
+        // never delivered again this run (spec §4.4).
+        ProcessResult::QuarantinePending { reason } => {
+            ledger.note_quarantine_pending(&segment, reason);
+            end_block_episode(block_episode, metrics);
+            DrainState::Draining
+        }
     }
 }
 
@@ -1288,18 +1303,15 @@ fn escalate_local_read(
                 "drain: segment still unreadable (media) after {LOCAL_READ_STRAND_LIMIT} strand \
                  cycles; quarantining"
             );
-            // TODO(safety-floor Task 11, spec §4.4): if this move fails the
-            // segment stays on disk and `forget` drops its failure count, so it
-            // runs three more strand cycles before trying again. Nothing is
-            // delivered at open time, so no duplicates — but this call site
-            // must take the `quarantine_pending` path once that lands.
-            quarantine_segment(
-                segment,
-                config,
-                metrics,
-                "drain: persistent local read error",
-            );
-            ledger.forget(segment);
+            // A failed move hands the segment to `quarantine_pending` rather
+            // than forgetting it: forgotten, it would be re-opened for three
+            // more strand cycles before the move was even tried again.
+            const REASON: &str = "drain: persistent local read error";
+            if quarantine_segment(segment, config, metrics, REASON) {
+                ledger.forget(segment);
+            } else {
+                ledger.note_quarantine_pending(segment, REASON);
+            }
         }
     }
     end_block_episode(block_episode, metrics);
@@ -1453,8 +1465,12 @@ async fn process_segment<S: Sink>(
                 }
                 HeaderVerdict::Corrupt => {
                     error!(path = %segment.display(), error = %e, "drain: segment header is corrupt; quarantining without retrying");
-                    quarantine_segment(segment, config, metrics, "drain: corrupt segment header");
-                    return ProcessResult::Quarantined;
+                    return quarantine_result(
+                        segment,
+                        config,
+                        metrics,
+                        "drain: corrupt segment header",
+                    );
                 }
                 HeaderVerdict::Gone => {
                     warn!(path = %segment.display(), "drain: segment not found; treating as already-consumed");
@@ -1537,8 +1553,6 @@ async fn process_segment<S: Sink>(
             Err(e) => {
                 let class = ledger::classify(&e);
                 if last_local_read_chance && class == ledger::ErrClass::Media {
-                    // TODO(safety-floor Task 11, spec §4.4): a failed move here
-                    // forgets the cursor; route through `quarantine_pending`.
                     error!(
                         path = %segment.display(),
                         error = %e,
@@ -1648,8 +1662,7 @@ async fn process_segment<S: Sink>(
     if let Some(reason) = quarantine_after_prefix {
         // Readable prefix delivered; move the segment (with its unreadable tail) to
         // the quarantine dir for manual recovery rather than deleting it.
-        quarantine_segment(segment, config, metrics, reason);
-        return ProcessResult::Quarantined;
+        return quarantine_result(segment, config, metrics, reason);
     }
 
     // Completeness check before confirming (S01). A sealed segment ends with a
@@ -1673,13 +1686,12 @@ async fn process_segment<S: Sink>(
                 footer = footer_count,
                 "drain: segment record count disagrees with its footer (truncated tail?); quarantining instead of confirming"
             );
-            quarantine_segment(
+            return quarantine_result(
                 segment,
                 config,
                 metrics,
                 "drain: record count mismatch vs footer (truncated tail)",
             );
-            return ProcessResult::Quarantined;
         }
         // A footer cut short (the file ends inside it, or is shorter than one):
         // the footer itself was truncated, so completeness is unverifiable from
@@ -1690,13 +1702,12 @@ async fn process_segment<S: Sink>(
                 error = %e,
                 "drain: cannot read segment footer to verify completeness; quarantining instead of confirming"
             );
-            quarantine_segment(
+            return quarantine_result(
                 segment,
                 config,
                 metrics,
                 "drain: footer unreadable, completeness unverifiable",
             );
-            return ProcessResult::Quarantined;
         }
         // Gone between the record loop and the footer read: like the open-time
         // NotFound, already consumed. Every record was delivered above, so
@@ -2034,10 +2045,64 @@ pub(crate) mod read_hook {
 }
 
 /// Moves a segment that cannot be safely confirmed into the quarantine dir for
-/// manual recovery, rather than deleting it. If the move itself fails the segment
-/// is left on disk (crash recovery re-encounters it) — never silently dropped.
-fn quarantine_segment(segment: &Path, config: &DrainConfig, metrics: &Metrics, reason: &str) {
-    match crate::wab::recovery::quarantine(segment, &config.wab_dir, reason) {
+/// manual recovery, rather than deleting it. Returns whether the move landed.
+///
+/// If the move fails the segment is left on disk — never silently dropped — and
+/// `weir_drain_quarantine_failures_total` counts it. The caller then hands the
+/// segment to the ledger's `quarantine_pending`, whose health-poll retries redo
+/// only the move (spec §4.4); before that, the idle rescan re-delivered the
+/// segment's readable prefix on every poll for as long as the fault lasted.
+fn quarantine_segment(
+    segment: &Path,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    reason: &'static str,
+) -> bool {
+    match move_to_quarantine(segment, &config.wab_dir, metrics, reason) {
+        Ok(()) => true,
+        Err(qe) => {
+            metrics.drain_quarantine_failures.inc();
+            error!(
+                path = %segment.display(),
+                error = %qe,
+                reason,
+                "drain: failed to quarantine segment; left on disk, not re-delivered — the move \
+                 is retried on every health poll (weir_drain_quarantine_failures_total)"
+            );
+            false
+        }
+    }
+}
+
+/// [`quarantine_segment`] as the [`ProcessResult`] `process_segment` returns:
+/// `Quarantined` when the move landed, `QuarantinePending` when it did not.
+fn quarantine_result(
+    segment: &Path,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    reason: &'static str,
+) -> ProcessResult {
+    if quarantine_segment(segment, config, metrics, reason) {
+        ProcessResult::Quarantined
+    } else {
+        ProcessResult::QuarantinePending { reason }
+    }
+}
+
+/// One attempt at the quarantine move, shared by the first try
+/// ([`quarantine_segment`]) and the ledger's retries. On success it bumps the
+/// quarantine series exactly as every other quarantine site does.
+///
+/// A segment that no longer exists counts as done (ENOENT, spec §4.4): an
+/// operator removed or requeued it, so there is nothing left to preserve, and
+/// nothing is counted as quarantined.
+fn move_to_quarantine(
+    segment: &Path,
+    wab_dir: &Path,
+    metrics: &Metrics,
+    reason: &str,
+) -> std::io::Result<()> {
+    match crate::wab::recovery::quarantine(segment, wab_dir, reason) {
         Ok(()) => {
             // BOTH series, per the invariant asserted on
             // `wab::recovery::quarantine_and_count`: "Every segment-quarantine
@@ -2059,10 +2124,20 @@ fn quarantine_segment(segment: &Path, config: &DrainConfig, metrics: &Metrics, r
                     state: crate::metrics::SegmentState::quarantined,
                 })
                 .inc();
+            Ok(())
         }
-        Err(qe) => {
-            error!(path = %segment.display(), error = %qe, reason, "drain: failed to quarantine segment; left on disk");
-        }
+        Err(qe) => match std::fs::symlink_metadata(segment) {
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    path = %segment.display(),
+                    reason,
+                    "drain: segment vanished before it could be quarantined; nothing left to \
+                     preserve"
+                );
+                Ok(())
+            }
+            _ => Err(qe),
+        },
     }
 }
 
@@ -3114,7 +3189,7 @@ mod tests {
         let before_flat = metrics.recovery_segments_quarantined.get();
         let before_family = segments_quarantined_family(&metrics);
 
-        quarantine_segment(&seg, &config, &metrics, "test");
+        assert!(quarantine_segment(&seg, &config, &metrics, "test"));
 
         assert_eq!(
             metrics.recovery_segments_quarantined.get(),
@@ -4645,7 +4720,7 @@ mod tests {
         );
 
         confirm_hook::clear(&sealed);
-        ledger.retry_dispositions(&metrics);
+        ledger.retry_dispositions(&dir, &metrics);
         assert!(!sealed.exists());
         assert_eq!(ledger.confirm_stage(&sealed), None);
         assert_eq!(segments_confirmed(&metrics), 1);
@@ -4716,6 +4791,146 @@ mod tests {
         assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
         assert_eq!(sink.call_count(), 0);
         assert!(!sealed.exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── quarantine_pending (spec §4.4) ────────────────────────────────────────
+
+    fn quarantine_pending_gauge(m: &Metrics) -> f64 {
+        m.drain_segments_disposition_pending
+            .get_or_create(&DispositionLabel {
+                kind: DispositionKind::quarantine,
+            })
+            .get()
+    }
+
+    fn health_polls_left(sink: &MockSink) -> usize {
+        sink.health_script.lock().unwrap().len()
+    }
+
+    /// A quarantine move that fails (here: a regular file squats on
+    /// `<wab_dir>/quarantine`, so the directory cannot be created) used to
+    /// leave the segment sealed and unconfirmed, and every idle rescan sent its
+    /// readable prefix to the sink again, once per `health_poll_interval`, for
+    /// as long as the fault lasted. Now the prefix is delivered once, the
+    /// failure is counted once, and the polls retry only the move.
+    #[test]
+    fn a_failed_quarantine_move_is_retried_not_redelivered() {
+        let dir = tmp_dir("quarantine_pending_crc");
+        let sealed = make_sealed_segment(&dir, 0, &[b"r1", b"r2"]);
+        // Record 2's payload starts at byte 42 (24 header + 10 for record 1):
+        // the reader yields r1, then a CRC mismatch.
+        let mut bytes = std::fs::read(&sealed).unwrap();
+        bytes[42] ^= 0xff;
+        std::fs::write(&sealed, &bytes).unwrap();
+        let squatter = dir.join("quarantine");
+        std::fs::write(&squatter, b"not a directory").unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let sink = Arc::new(MockSink::with_health_script(
+            (0..5).map(|_| SinkHealth::Healthy),
+        ));
+        let metrics = noop_metrics();
+        let handle = spawn_with_ledger(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+        );
+
+        wait_for(5, "five health polls", || health_polls_left(&sink) == 0);
+        assert_eq!(
+            committed_bytes(&sink),
+            vec![b"r1".to_vec()],
+            "the readable prefix is delivered once across five polls, not once per poll"
+        );
+        assert_eq!(
+            metrics.drain_quarantine_failures.get(),
+            1,
+            "the failed move is counted once; its retries are not new failures"
+        );
+        assert_eq!(quarantine_pending_gauge(&metrics), 1.0);
+        assert!(
+            sealed.exists(),
+            "the bytes stay on disk until the move lands"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        assert_eq!(segments_quarantined_family(&metrics), 0);
+
+        std::fs::remove_file(&squatter).unwrap();
+        wait_for(5, "the next poll completes the move", || !sealed.exists());
+        assert!(quarantined_copy(&dir, &sealed).exists());
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "the completed move bumps the quarantine series like any other site"
+        );
+        assert_eq!(segments_quarantined_family(&metrics), 1);
+        assert_eq!(committed_bytes(&sink), vec![b"r1".to_vec()]);
+        assert_eq!(metrics.drain_quarantine_failures.get(), 1);
+
+        drop(tx);
+        let ledger = handle.join().unwrap();
+        assert_eq!(
+            ledger
+                .counts()
+                .quarantine_pending
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(quarantine_pending_gauge(&metrics), 0.0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The escalation site (spec §4.1): a persistent `Media`-class open error
+    /// quarantines after three strand cycles. When that move fails too, the
+    /// segment is handed to `quarantine_pending` — not forgotten and run
+    /// through three more strand cycles of opens — and the polls retry only the
+    /// move.
+    #[test]
+    fn a_failed_escalation_quarantine_is_retried_without_reopening() {
+        let dir = tmp_dir("quarantine_pending_escalate");
+        let sealed = make_sealed_segment(&dir, 0, &[b"never readable"]);
+        open_hook::fail(&sealed, libc::EIO, u32::MAX);
+        let squatter = dir.join("quarantine");
+        std::fs::write(&squatter, b"not a directory").unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(sealed.clone()).unwrap();
+        let sink = Arc::new(MockSink::with_responses([]));
+        let metrics = noop_metrics();
+        let handle = spawn_with_ledger(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            Arc::clone(&metrics),
+        );
+
+        wait_for(10, "the escalated quarantine move fails", || {
+            metrics.drain_quarantine_failures.get() == 1
+        });
+        let opens = open_hook::attempts(&sealed);
+        std::thread::sleep(Duration::from_millis(300)); // several more polls
+        assert_eq!(
+            open_hook::attempts(&sealed),
+            opens,
+            "a segment awaiting its quarantine move is never opened again"
+        );
+        assert_eq!(metrics.drain_quarantine_failures.get(), 1);
+        assert_eq!(quarantine_pending_gauge(&metrics), 1.0);
+        assert!(sealed.exists());
+
+        std::fs::remove_file(&squatter).unwrap();
+        wait_for(5, "the next poll completes the move", || !sealed.exists());
+        assert!(quarantined_copy(&dir, &sealed).exists());
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        assert_eq!(open_hook::attempts(&sealed), opens);
+        assert_eq!(sink.call_count(), 0);
+
+        drop(tx);
+        handle.join().unwrap();
+        open_hook::forget(&sealed);
         std::fs::remove_dir_all(dir).ok();
     }
 

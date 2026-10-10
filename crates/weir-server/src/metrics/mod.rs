@@ -415,6 +415,11 @@ pub(crate) struct Metrics {
     /// Failed confirm steps for delivered segments, by stage. Each failure is
     /// retried on the next health poll without re-delivering the segment.
     pub drain_confirm_failures: Family<ConfirmFailureLabel, Counter<u64, AtomicU64>>,
+    /// Segments whose move into `quarantine/` failed when the drain first tried
+    /// it. Counted once per segment: the move is then retried on every health
+    /// poll (the `quarantine` kind of `drain_segments_disposition_pending`)
+    /// without re-delivering the segment's prefix.
+    pub drain_quarantine_failures: Counter<u64, AtomicU64>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -770,6 +775,15 @@ impl Metrics {
              segment is never re-delivered. A rising sidecar count usually means the WAB device \
              is full or read-only"
         );
+        let drain_quarantine_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_quarantine_failures",
+            "WAB segments the drain could not move into quarantine/ (corrupt, truncated or \
+             persistently unreadable segments whose readable prefix was already delivered). \
+             Counted once per segment; the move is retried on every health poll, the bytes stay \
+             in place, and the prefix is never re-delivered. Usually a full or read-only WAB \
+             device, or something other than a directory at <wab_dir>/quarantine"
+        );
 
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
@@ -841,6 +855,7 @@ impl Metrics {
             drain_segments_parked,
             drain_segments_disposition_pending,
             drain_confirm_failures,
+            drain_quarantine_failures,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -1023,6 +1038,7 @@ mod tests {
             "weir_drain_segments_parked",
             "weir_drain_segments_disposition_pending",
             "weir_drain_confirm_failures",
+            "weir_drain_quarantine_failures",
         ];
         for name in expected {
             assert!(
@@ -1071,6 +1087,7 @@ mod tests {
             "weir_drain_segments_disposition_pending{kind=\"quarantine\"} 0",
             "weir_drain_confirm_failures_total{stage=\"sidecar\"} 0",
             "weir_drain_confirm_failures_total{stage=\"delete\"} 0",
+            "weir_drain_quarantine_failures_total 0",
         ] {
             assert!(
                 out.contains(series),
