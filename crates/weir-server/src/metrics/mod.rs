@@ -350,7 +350,9 @@ pub(crate) struct Metrics {
     /// weir-drain thread panics caught and respawned by its supervisor. Sustained
     /// values indicate a logic bug in the sink/drain path; if the supervisor
     /// exhausts its respawn budget, delivery stops and the WAB accumulates on disk
-    /// until the daemon restarts.
+    /// until the daemon restarts. A segment in flight for two panics is parked
+    /// (`weir_drain_segments_parked{reason="drain_panic"}`) instead of spending
+    /// the rest of the budget.
     pub drain_panics: Counter<u64, AtomicU64>,
     /// fsync / fdatasync calls that returned an error. A non-zero value is a
     /// durability hazard: the kernel buffered the write but couldn't push it

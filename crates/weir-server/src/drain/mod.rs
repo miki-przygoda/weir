@@ -100,7 +100,8 @@ pub(crate) const LOCAL_READ_STRAND_LIMIT: u32 = 3;
 ///     the strand after the last attempt serves none, spec §4.6), inside the
 ///     1 s [`SHUTDOWN_RETRY_BACKOFF_BUDGET`] (the actual bound on total added
 ///     shutdown time). 1 s is small against the per-attempt
-///     `commit_timeout` (default 30 s) that the shutdown path already tolerates,
+///     `commit_timeout` (at least 60 s: twice `sink_timeout_secs`, floored at
+///     60) that the shutdown path already tolerates,
 ///     so this is never the term that decides how long shutdown takes.
 ///   * It is 5× the 50 ms channel-poll slice used while the channel is live, so
 ///     the wait is a real delay and not a rounding artifact of the poll loop.
@@ -314,6 +315,11 @@ pub fn spawn<S: Sink + 'static>(
 /// Maximum times the drain is respawned after a panic before giving up — past
 /// this, delivery stops and the WAB accumulates on disk until restart (the same
 /// policy as the WAB flusher supervisor).
+///
+/// A segment that keeps crashing the drain is parked at its second panic
+/// ([`ledger::DRAIN_PANIC_PARK_LIMIT`], spec §4.12), so one poison segment
+/// costs two respawns, not all of them. The budget is still per process and
+/// never refilled: five distinct poison segments spend it and stop delivery.
 pub(crate) const MAX_DRAIN_RESPAWNS: u32 = 10;
 
 /// Runs [`drain_thread`] under panic supervision. A panic in the drain (a sink
@@ -321,9 +327,16 @@ pub(crate) const MAX_DRAIN_RESPAWNS: u32 = 10;
 /// failure, …) is caught and the drain is respawned with a fresh runtime +
 /// dead-letter writer, reading from the same channel so buffered segments
 /// survive. Without this, a single panic would kill delivery permanently while
-/// producers keep being acked and the WAB grows unbounded. The segment in
-/// flight at panic time is not re-delivered this run, but it is durable on
-/// disk and replayed on the next restart.
+/// producers keep being acked and the WAB grows unbounded.
+///
+/// The segment in flight at panic time stays durable on disk. The respawn's
+/// first healthy probe is a recovery edge, so its rescan re-queues that
+/// segment (and anything else `pending` lost) and it is retried this run,
+/// resuming past whatever prefix the ledger's cursor already covers. A segment
+/// that panics the drain a second time is parked as `drain_panic` instead
+/// (spec §4.12): left in place, not retried this run, replayed from its first
+/// record on the next start. The ledger outlives every respawn, so the count
+/// and the park both hold across incarnations.
 ///
 /// Behavioural consequence for a *permanently* unusable dead-letter directory
 /// (the case this exists for is a stray file sitting where the directory
@@ -358,14 +371,39 @@ fn run_drain_supervised<S: Sink>(
         // recovery edge and rescan the disk — see `drain_thread`'s
         // `initial_health_ok`).
         let first_start = attempts == 0;
-        let ledger = &mut ledger;
+        let lent = &mut ledger;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drain_thread(rx, sink, cfg, m, first_start, hb, ledger)
+            drain_thread(rx, sink, cfg, m, first_start, hb, lent)
         }));
         // A clean Ok(()) return means the channel closed (all flushers gone) — done.
         let Err(_) = result else { break };
         attempts += 1;
         metrics.drain_panics.inc();
+        // Charge the panic to the segment in flight, if any, and park it at the
+        // second (spec §4.12). Without this the respawn's first healthy probe
+        // rescans, re-queues the same segment, and a deterministic panic
+        // repeats until the budget below is spent and delivery stops for
+        // every segment.
+        if let Some((path, panics)) = ledger.note_drain_panic() {
+            if panics >= ledger::DRAIN_PANIC_PARK_LIMIT {
+                error!(
+                    path = %path.display(),
+                    panics,
+                    "drain: this segment crashed the drain {panics} times; parked (left in place, \
+                     not retried this run) — weir_drain_segments_parked{{reason=\"drain_panic\"}}; \
+                     other segments keep delivering. It replays from its first record on the next \
+                     start: fix the sink (or the record it trips on) before restarting"
+                );
+            } else {
+                warn!(
+                    path = %path.display(),
+                    panics,
+                    "drain: panicked while delivering this segment; it is retried after the \
+                     respawn and parked if it crashes the drain again"
+                );
+            }
+            publish_ledger_counts(ledger.counts(), &metrics);
+        }
         if attempts >= config.max_respawns {
             error!(
                 attempts,
@@ -581,7 +619,10 @@ fn probe_and_resume_stranded<S: Sink>(
             )
         };
         match scan {
-            Ok(sealed) => {
+            Ok(crate::wab::SealedScan {
+                segments: sealed,
+                incomplete,
+            }) => {
                 // Dedup against what's already queued via a HashSet membership view
                 // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
                 // matters when a long outage strands many segments (F-rescan). The
@@ -607,6 +648,13 @@ fn probe_and_resume_stranded<S: Sink>(
                         resumed,
                         "drain: sink recovered; re-queued stranded segment(s) for delivery"
                     );
+                }
+                // A shard could not be listed (already logged by the scan): the
+                // readable shards are resumed above, and the edge is held live
+                // exactly as for a failed scan (H1, below), so the next poll
+                // scans again and picks up the skipped shard once it reads.
+                if incomplete {
+                    return prev_health_ok;
                 }
             }
             Err(e) => {
@@ -1599,6 +1647,12 @@ fn store_dl_carry(segment: &Path, carry: Option<DeadLetterCarry>, ledger: &mut S
 /// from, so the sink never sees that sub-batch again (spec §4.5, §4.11). If the
 /// write blocks or fails again, the carry goes back to the ledger with the
 /// result and nothing is sent to the sink.
+///
+/// The whole attempt runs with `segment` marked in flight in the ledger, so a
+/// panic anywhere inside it (a sink, the reader, the dead-letter writer) is
+/// charged to this segment by the supervisor, which parks it at the second
+/// (spec §4.12). The mark is cleared only on a normal return; an unwinding
+/// panic leaves it for the supervisor to read.
 #[allow(clippy::too_many_arguments)]
 fn attempt_segment<S: Sink>(
     rt: &tokio::runtime::Runtime,
@@ -1611,26 +1665,31 @@ fn attempt_segment<S: Sink>(
     skip: u64,
     hb: &DrainHeartbeat,
 ) -> ProcessResult {
-    let skip = match ledger.take_dl_carry(segment) {
-        None => skip,
-        Some(carry) => {
-            match settle_dl_carry(segment, skip, carry, dead_letter, config, metrics, hb) {
-                Ok(through) => through,
-                Err(result) => return result,
+    ledger.begin_attempt(segment);
+    let result = 'attempt: {
+        let skip = match ledger.take_dl_carry(segment) {
+            None => skip,
+            Some(carry) => {
+                match settle_dl_carry(segment, skip, carry, dead_letter, config, metrics, hb) {
+                    Ok(through) => through,
+                    Err(result) => break 'attempt result,
+                }
             }
-        }
+        };
+        let last_chance = local_read_escalates_next(segment, config, ledger);
+        rt.block_on(process_segment(
+            segment,
+            sink,
+            config,
+            metrics,
+            dead_letter,
+            skip,
+            last_chance,
+            hb,
+        ))
     };
-    let last_chance = local_read_escalates_next(segment, config, ledger);
-    rt.block_on(process_segment(
-        segment,
-        sink,
-        config,
-        metrics,
-        dead_letter,
-        skip,
-        last_chance,
-        hb,
-    ))
+    ledger.end_attempt();
+    result
 }
 
 /// Writes a carried sub-batch's rejected records. On success returns the record
@@ -3228,6 +3287,9 @@ mod tests {
         /// Number of initial `commit()` calls that panic, to drive the drain's
         /// panic supervisor.
         panic_calls: u64,
+        /// A payload whose presence in a batch makes `commit()` panic, every
+        /// time: a deterministic poison record (spec §4.12).
+        panic_on_payload: Option<&'static [u8]>,
         /// Milliseconds every `commit()` call spends in a *genuine* blocking
         /// `std::thread::sleep` — never `.await`ed, unlike `hang_calls`'s
         /// `std::future::pending().await`. That distinction is the whole point:
@@ -3278,6 +3340,7 @@ mod tests {
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
                 panic_calls: 0,
+                panic_on_payload: None,
                 blocking_millis: 0,
                 yield_for: Duration::ZERO,
                 hang_on_call: None,
@@ -3311,6 +3374,7 @@ mod tests {
                 call_count: AtomicU64::new(0),
                 hang_calls: 0,
                 panic_calls: 0,
+                panic_on_payload: None,
                 blocking_millis: 0,
                 yield_for: Duration::ZERO,
                 hang_on_call: None,
@@ -3339,6 +3403,15 @@ mod tests {
             Self {
                 panic_calls,
                 ..Self::with_responses(responses)
+            }
+        }
+
+        /// A sink that panics on every `commit()` whose batch contains
+        /// `poison`, and commits every other batch whole.
+        fn panicking_on(poison: &'static [u8]) -> Self {
+            Self {
+                panic_on_payload: Some(poison),
+                ..Self::with_responses([])
             }
         }
 
@@ -3442,6 +3515,11 @@ mod tests {
             self.call_timestamps.lock().unwrap().push(Instant::now());
             if nth <= self.panic_calls {
                 panic!("mock sink: induced panic on commit #{nth}");
+            }
+            if let Some(poison) = self.panic_on_payload
+                && batch.iter().any(|p| &p[..] == poison)
+            {
+                panic!("mock sink: induced panic on a poison payload (commit #{nth})");
             }
             if nth <= self.hang_calls || self.hang_on_call == Some(nth) {
                 // Hang forever; the drain's backstop timeout cancels this future.
@@ -6110,6 +6188,108 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// A deterministic drain panic on one segment (spec §4.12). Before, each
+    /// respawn rescanned the disk, re-queued the same segment, and panicked
+    /// again, until `max_respawns` stopped delivery for EVERY segment. Now the
+    /// segment in flight when the drain panics is parked once it has crashed
+    /// the drain twice: the others deliver, the respawn budget is mostly
+    /// unspent, and `drain_state` never reads `stopped` while the channel is
+    /// live. The parked segment stays on disk, untouched, for the next start.
+    #[test]
+    fn a_segment_that_panics_the_drain_twice_is_parked_and_the_rest_deliver() {
+        let dir = tmp_dir("drain_panic_park");
+        let shard_dir = dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let mk = |counter: u64, payload: &[u8]| {
+            let p = segment_path(&shard_dir, counter);
+            let mut s = WabSegment::create(&p, 0, Compression::None).unwrap();
+            s.write_record(payload).unwrap();
+            s.seal().unwrap()
+        };
+        let before = mk(1, b"before");
+        let poison = mk(2, b"poison");
+        let after = mk(3, b"after");
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for seg in [&before, &poison, &after] {
+            tx.send(seg.clone()).unwrap();
+        }
+        let sink = Arc::new(MockSink::panicking_on(b"poison"));
+        let metrics = noop_metrics();
+        // The real respawn budget (10): the point is that it is NOT exhausted.
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            fast_config(dir.clone()),
+            metrics.clone(),
+            DrainHeartbeat::new(),
+        );
+
+        let parked = || parked_gauge(&metrics, crate::metrics::ParkedReason::drain_panic);
+        let stopped = || drain_state_of(&metrics, DrainStateValue::stopped) == 1.0;
+        let mut ever_stopped = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            ever_stopped |= stopped();
+            if ever_stopped
+                || (parked() == 1.0
+                    && get_confirmed_path(&before).exists()
+                    && get_confirmed_path(&after).exists())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Hold the channel open across several more health polls (50 ms each):
+        // a parked segment must not be re-queued by the rescan and crash the
+        // drain a third time.
+        let hold = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < hold {
+            ever_stopped |= stopped();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let panics_while_live = drain_panics(&metrics);
+        let parked_while_live = parked();
+        drop(tx);
+        handle.join().unwrap();
+
+        assert!(
+            !ever_stopped,
+            "one poison segment must not stop delivery for every segment"
+        );
+        assert_eq!(
+            panics_while_live, 2,
+            "the poison segment crashes the drain exactly twice, then is parked"
+        );
+        assert_eq!(
+            parked_while_live, 1.0,
+            "weir_drain_segments_parked{{reason=\"drain_panic\"}} names the parked segment"
+        );
+        assert!(
+            get_confirmed_path(&before).exists() && get_confirmed_path(&after).exists(),
+            "every other segment is delivered"
+        );
+        assert!(
+            poison.exists() && !get_confirmed_path(&poison).exists(),
+            "the parked segment is left in place, unconfirmed, for the next start"
+        );
+        assert!(
+            !dir.join("quarantine").exists()
+                || std::fs::read_dir(dir.join("quarantine")).unwrap().count() == 0,
+            "a drain panic is not corruption: nothing is quarantined"
+        );
+        let committed = sink.committed_records();
+        for want in [&b"before"[..], &b"after"[..]] {
+            assert_eq!(
+                committed.iter().filter(|p| &p[..] == want).count(),
+                1,
+                "{} is delivered exactly once",
+                String::from_utf8_lossy(want)
+            );
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// The terminal end of B7: if the drain keeps panicking, the supervisor gives
     /// up after `max_respawns` rather than respawning forever — delivery stops and
     /// the WAB accumulates until restart. Driven with `max_respawns = 2` so the
@@ -7006,6 +7186,69 @@ mod tests {
         );
         assert_eq!(pending.len(), 1, "no duplicate enqueue on steady Healthy");
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Spec §4.9: an unreadable shard directory must not block the rescan's
+    /// resume of the other shards. The readable shards' segments are re-queued
+    /// at once, and the partial scan is treated like a failed one for edge
+    /// tracking (H1): the caller's `prev_health_ok` comes back, so the edge
+    /// stays live and the next poll scans again, picking up the hidden shard
+    /// once it is readable.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_shard_does_not_block_the_rescan_of_the_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("rescan_unreadable_shard");
+        let mk = |shard: &str, payload: &[u8]| {
+            let sd = dir.join(shard);
+            crate::testutil::mkdir_p(&sd);
+            let mut s = WabSegment::create(&segment_path(&sd, 1), 0, Compression::None).unwrap();
+            s.write_record(payload).unwrap();
+            s.seal().unwrap()
+        };
+        let first = mk("shard_00", b"first");
+        let hidden = mk("shard_01", b"hidden");
+        let last = mk("shard_02", b"last");
+        let bad = dir.join("shard_01");
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&bad).is_ok() {
+            std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            std::fs::remove_dir_all(dir).ok();
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let sink = MockSink::with_responses([]);
+        let mut pending: VecDeque<PathBuf> = VecDeque::new();
+
+        // On a recovery edge (prev_health_ok = false), healthy probe.
+        let after1 =
+            probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, false, None);
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            Vec::from(pending.clone()),
+            vec![first.clone(), last.clone()],
+            "the readable shards are resumed despite the unreadable one"
+        );
+        assert!(
+            !after1,
+            "a partial rescan keeps the recovery edge live, like a failed one"
+        );
+
+        // Next poll, shard readable again: the edge fires again and the hidden
+        // segment is queued; the two already pending are not queued twice.
+        let after2 =
+            probe_and_resume_stranded(&rt, &sink, &config, &metrics, &mut pending, after1, None);
+        assert!(after2, "a complete rescan settles the edge");
+        assert_eq!(Vec::from(pending), vec![first, last, hidden]);
+        assert_eq!(metrics.drain_segments_resumed.get(), 3);
         std::fs::remove_dir_all(dir).ok();
     }
 

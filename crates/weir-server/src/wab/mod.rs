@@ -371,8 +371,18 @@ pub(crate) fn spawn(
 /// Dirent errors propagate (no `.ok()` filtering): a silently-skipped sealed
 /// segment is silently-dropped acked data.
 ///
-/// `shard_count` only drives the "backlog beyond the configured count" advisory;
-/// pass `None` (e.g. from the recovery rescan) to skip it.
+/// `shard_count` is `Some` only for startup replay, where it drives the
+/// "backlog beyond the configured count" advisory. It also picks the policy for
+/// a shard directory that cannot be listed:
+///
+/// - `Some` (startup replay): the error propagates. No later rescan is
+///   guaranteed, so a skipped shard would be silently-dropped acked data.
+/// - `None` (the drain's rescan): the shard is skipped with a WARN and the
+///   result is marked [`SealedScan::incomplete`], so one unreadable directory
+///   does not block resuming every other shard (spec §4.9). The rescan runs
+///   again on the next poll, so the skipped shard is retried, not forgotten.
+///
+/// An unreadable `wab_dir` itself is an error either way.
 ///
 /// `exclude` names segments the caller already owns. They are skipped BEFORE
 /// `check_confirmed`, whose quarantine side effects must never touch them: the
@@ -392,7 +402,7 @@ pub(crate) fn scan_unconfirmed_sealed(
     metrics: &Metrics,
     exclude: &dyn Fn(&Path) -> bool,
     orphan_cleanup: bool,
-) -> io::Result<Vec<PathBuf>> {
+) -> io::Result<SealedScan> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
@@ -401,6 +411,7 @@ pub(crate) fn scan_unconfirmed_sealed(
     shard_dirs.sort_by_key(|p| segment::shard_id_from_path(p));
 
     let mut unconfirmed = Vec::new();
+    let mut incomplete = false;
     for sdir in shard_dirs {
         if !sdir.is_dir() {
             continue;
@@ -429,9 +440,29 @@ pub(crate) fn scan_unconfirmed_sealed(
                 "draining backlog from a shard directory beyond the configured shard_count (shard_count reduced across a restart?); records are recovered, not stranded"
             );
         }
-        let entries: Vec<PathBuf> = fs::read_dir(&sdir)?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<io::Result<Vec<_>>>()?;
+        let entries: Vec<PathBuf> = match fs::read_dir(&sdir)
+            .and_then(|dir| dir.map(|e| e.map(|e| e.path())).collect::<io::Result<_>>())
+        {
+            Ok(entries) => entries,
+            // The rescan (no shard_count) skips a shard it cannot list, so one
+            // bad directory does not block resuming every other shard (spec
+            // §4.9). The caller is told (`incomplete`) and scans again on its
+            // next poll; nothing in the skipped shard is lost, it waits on
+            // disk. Startup replay propagates instead (the arm below): there
+            // no later rescan is guaranteed.
+            Err(e) if shard_count.is_none() => {
+                warn!(
+                    shard_dir = %sdir.display(),
+                    error = %e,
+                    "cannot list a shard directory; skipping it in this rescan and resuming the \
+                     other shards. Its segments wait on disk until it is readable again (check \
+                     its permissions and the WAB device)"
+                );
+                incomplete = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         for tmp in entries
             .iter()
             .filter(|p| p.to_string_lossy().ends_with(EXT_CONFIRMED_TMP))
@@ -500,7 +531,21 @@ pub(crate) fn scan_unconfirmed_sealed(
             }
         }
     }
-    Ok(unconfirmed)
+    Ok(SealedScan {
+        segments: unconfirmed,
+        incomplete,
+    })
+}
+
+/// What [`scan_unconfirmed_sealed`] found.
+#[derive(Debug)]
+pub(crate) struct SealedScan {
+    /// Sealed-but-unconfirmed segments, ascending per shard.
+    pub segments: Vec<PathBuf>,
+    /// True when at least one shard directory could not be listed and was
+    /// skipped. Only the rescan (`shard_count == None`) skips; startup replay
+    /// fails instead. The list is then partial, and the caller must scan again.
+    pub incomplete: bool,
 }
 
 /// Set once the "orphans are kept" warning has been logged, so a rescan every
@@ -578,13 +623,16 @@ pub(crate) fn replay_unconfirmed(
     metrics: &Arc<Metrics>,
     orphan_cleanup: bool,
 ) -> io::Result<()> {
+    // `Some(shard_count)`: fail-fast, so the scan is never `incomplete` here.
     for sealed in scan_unconfirmed_sealed(
         wab_dir,
         Some(shard_count),
         metrics,
         &|_| false,
         orphan_cleanup,
-    )? {
+    )?
+    .segments
+    {
         // A footer-read failure here only undercounts the
         // recovery_records_replayed metric (the segment is still queued +
         // delivered); surface it rather than silently reporting 0 so the
@@ -1566,7 +1614,9 @@ mod tests {
         };
 
         let (m, _reg) = crate::metrics::Metrics::new();
-        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false).unwrap();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false)
+            .unwrap()
+            .segments;
         assert!(
             !got.contains(&s1_confirmed),
             "the confirmed segment must be skipped by the recovery scan: {got:?}"
@@ -1604,8 +1654,9 @@ mod tests {
         };
 
         let (m, _reg) = crate::metrics::Metrics::new();
-        let got =
-            scan_unconfirmed_sealed(&dir, None, &m, &|p| p == owned.as_path(), false).unwrap();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|p| p == owned.as_path(), false)
+            .unwrap()
+            .segments;
         assert_eq!(
             got,
             vec![other],
@@ -1679,12 +1730,63 @@ mod tests {
             fs::write(confirmed_path_for(&orphan), build_confirmed(0, 1, 1)).unwrap();
 
             let (m, _reg) = crate::metrics::Metrics::new();
-            let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, orphan_cleanup).unwrap();
+            let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, orphan_cleanup)
+                .unwrap()
+                .segments;
             assert!(got.is_empty(), "{got:?}");
             assert_eq!(orphan.exists(), !orphan_cleanup);
             assert!(confirmed_path_for(&orphan).exists());
             fs::remove_dir_all(dir).ok();
         }
+    }
+
+    /// Spec §4.9: one shard directory that cannot be listed (here, mode 000)
+    /// must not block the drain's rescan from resuming every OTHER shard — a
+    /// `?` on the per-shard `read_dir` used to fail the whole scan, so one bad
+    /// directory stranded the backlog of all of them. The rescan
+    /// (`shard_count == None`) skips that shard and says so (`incomplete`), so
+    /// its caller scans again. Startup replay (`Some(count)`) stays fail-fast:
+    /// there no later rescan is guaranteed, and a silently-skipped shard is
+    /// silently-dropped acked data.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_shard_is_skipped_by_the_rescan_but_fails_startup_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("scan_unreadable_shard");
+        let first = sealed_in_shard(&shard_dir_path(&dir, 0), 1, b"first");
+        let bad = shard_dir_path(&dir, 1);
+        let hidden = sealed_in_shard(&bad, 1, b"hidden");
+        let last = sealed_in_shard(&shard_dir_path(&dir, 2), 1, b"last");
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&bad).is_ok() {
+            // Running as root: directory permissions are not enforced, so the
+            // fault cannot be injected this way.
+            fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            fs::remove_dir_all(dir).ok();
+            return;
+        }
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let rescan = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false);
+        let startup = scan_unconfirmed_sealed(&dir, Some(3), &m, &|_| false, false);
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let rescan = rescan.expect("the rescan tolerates one unreadable shard");
+        assert_eq!(
+            rescan.segments,
+            vec![first.clone(), last.clone()],
+            "every readable shard is still returned"
+        );
+        assert!(rescan.incomplete, "the caller is told the list is partial");
+        let err = startup.expect_err("startup replay stays fail-fast");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Readable again: complete, and the hidden segment is found.
+        let healed = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false).unwrap();
+        assert_eq!(healed.segments, vec![first, hidden, last]);
+        assert!(!healed.incomplete);
+        fs::remove_dir_all(dir).ok();
     }
 
     /// A stale `*.confirmed.tmp` is the leftover of a sidecar write that died
@@ -1703,7 +1805,9 @@ mod tests {
         crate::testutil::mkdir_p(&squatter);
 
         let (m, _reg) = crate::metrics::Metrics::new();
-        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false).unwrap();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false)
+            .unwrap()
+            .segments;
         assert_eq!(got, vec![sealed.clone()]);
         assert!(!tmp.exists(), "a stale tmp sidecar is deleted");
         assert!(

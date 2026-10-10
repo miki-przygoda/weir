@@ -129,6 +129,14 @@ pub(crate) enum TransientCause {
     LocalWrite,
 }
 
+/// How many drain panics a segment may be in flight for before it is parked as
+/// `drain_panic` (spec §4.12). One panic can be bad luck (a sink bug tripped by
+/// timing, a transient allocation failure); a second on the same segment, after
+/// a respawn, is deterministic enough to stop retrying it this run. Without the
+/// park every respawn's rescan re-queues the segment, it panics again, and once
+/// the supervisor's respawn budget is spent delivery stops for every segment.
+pub(crate) const DRAIN_PANIC_PARK_LIMIT: u32 = 2;
+
 /// Upper bound on the payload bytes all [`DeadLetterCarry`]s may hold in memory
 /// at once (spec §4.5). A carry that would exceed it is not stored, and that
 /// segment falls back to re-committing its blocked sub-batch once, with a WARN.
@@ -213,10 +221,8 @@ pub(crate) struct SegmentLedger {
     /// Per-segment cool-down (§4.6).
     not_before: HashMap<PathBuf, Instant>,
     /// Drain panics while this segment was in flight (§4.12).
-    #[allow(dead_code)] // populated by the drain-panic supervisor (spec §4.12)
     panic_count: HashMap<PathBuf, u32>,
     /// The segment being processed when a panic unwinds (§4.12).
-    #[allow(dead_code)] // populated by the drain-panic supervisor (spec §4.12)
     in_flight: Option<PathBuf>,
     counts: Arc<LedgerCounts>,
 }
@@ -338,6 +344,41 @@ impl SegmentLedger {
     pub(crate) fn park(&mut self, path: &Path, why: ParkReason) {
         self.parked.insert(path.to_path_buf(), why);
         self.forget(path);
+    }
+
+    /// Marks `path` as the segment in flight, for the supervisor to blame if
+    /// the drain panics before [`Self::end_attempt`] (spec §4.12). The drain
+    /// sets it around each attempt: the dead-letter carry write, the read and
+    /// the sink commits.
+    pub(crate) fn begin_attempt(&mut self, path: &Path) {
+        self.in_flight = Some(path.to_path_buf());
+    }
+
+    /// Clears the in-flight segment: the attempt returned without panicking.
+    pub(crate) fn end_attempt(&mut self) {
+        self.in_flight = None;
+    }
+
+    /// Called by the panic supervisor once a drain incarnation has unwound.
+    /// Charges the panic to the segment that was in flight, if any, and parks
+    /// that segment as [`ParkReason::DrainPanic`] once it reaches
+    /// [`DRAIN_PANIC_PARK_LIMIT`]. Returns the segment and its panic count, or
+    /// `None` when the drain panicked outside an attempt (a probe, a confirm,
+    /// opening the dead-letter writer): nothing to blame, nothing parked.
+    ///
+    /// Parking forgets the segment's progress like every park, so the next
+    /// start replays it from record 0. Below the limit its cursor is kept: a
+    /// panic records no progress of its own, so the retry resumes from
+    /// wherever the last transient or blocked attempt left it.
+    pub(crate) fn note_drain_panic(&mut self) -> Option<(PathBuf, u32)> {
+        let path = self.in_flight.take()?;
+        let n = self.panic_count.entry(path.clone()).or_insert(0);
+        *n = n.saturating_add(1);
+        let panics = *n;
+        if panics >= DRAIN_PANIC_PARK_LIMIT {
+            self.park(&path, ParkReason::DrainPanic);
+        }
+        Some((path, panics))
     }
 
     /// Counts one local read failure of `path` and returns the running total.
@@ -981,6 +1022,63 @@ mod tests {
         // Replacing a segment's own carry does not count the old one twice.
         assert!(l.set_dl_carry(&path, carry(2, &[b"654321"])));
         assert_eq!(l.counts().dl_carry_bytes.load(Ordering::Relaxed), 10);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The drain-panic bookkeeping (spec §4.12): a panic is charged to the
+    /// segment in flight, the second one parks it, a panic outside any attempt
+    /// blames nothing, and a returned attempt clears the in-flight mark.
+    #[test]
+    fn a_segment_in_flight_for_two_drain_panics_is_parked() {
+        let (dir, path) = file("drain_panic");
+        let now = Instant::now();
+        let mut l = ledger();
+        assert_eq!(DRAIN_PANIC_PARK_LIMIT, 2);
+
+        // Nothing in flight: nothing to blame.
+        assert_eq!(l.note_drain_panic(), None);
+
+        // An attempt that returned clears the mark.
+        l.begin_attempt(&path);
+        l.end_attempt();
+        assert_eq!(l.note_drain_panic(), None);
+
+        // First panic: counted, not parked, cursor kept, still admissible.
+        l.record_progress(&path, 4);
+        l.begin_attempt(&path);
+        assert_eq!(l.note_drain_panic(), Some((path.clone(), 1)));
+        assert_eq!(l.admit(&path, now), Admit::Process { skip: 4 });
+        assert_eq!(
+            l.note_drain_panic(),
+            None,
+            "the in-flight mark is consumed by the panic it is charged to"
+        );
+
+        // Second panic on the same segment: parked as drain_panic.
+        l.begin_attempt(&path);
+        assert_eq!(l.note_drain_panic(), Some((path.clone(), 2)));
+        assert_eq!(l.admit(&path, now), Admit::Drop("parked"));
+        assert!(l.excludes(&path, now));
+        assert_eq!(
+            l.counts().parked_by_reason[ParkReason::DrainPanic.index()].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            l.counts().resume_cursors.load(Ordering::Relaxed),
+            0,
+            "a parked segment replays from record 0 on the next start"
+        );
+
+        // A segment that is confirmed between panics starts its count over.
+        let other = dir.join("seg_00000002.wab.sealed");
+        std::fs::write(&other, b"sealed bytes").unwrap();
+        l.begin_attempt(&other);
+        assert_eq!(l.note_drain_panic(), Some((other.clone(), 1)));
+        l.forget(&other);
+        l.begin_attempt(&other);
+        assert_eq!(l.note_drain_panic(), Some((other.clone(), 1)));
+        assert_eq!(l.admit(&other, now), Admit::Process { skip: 0 });
+
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -75,9 +75,10 @@ use sink::postgres::{PostgresSink, PostgresSinkConfig};
 /// the one feature whose job is to fail closed"); returning `Option` here closes
 /// the same hole on the path that produces the number.
 ///
-/// Any error makes the whole answer untrustworthy, including a per-shard one: an
-/// unreadable shard is an undercount, and an undercount lifts the cap by exactly
-/// the bytes we failed to see. The single exception is a file that vanished
+/// Any error makes the whole answer untrustworthy, including a per-shard one and
+/// a single dirent the directory iterator failed to return: an unreadable shard
+/// or entry is an undercount, and an undercount lifts the cap by exactly the
+/// bytes we failed to see. The single exception is a file that vanished
 /// between `read_dir` and `metadata` — the drain confirms and deletes segments
 /// continuously, so that race is routine and the file genuinely occupies nothing.
 fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
@@ -85,7 +86,12 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
         return None;
     };
     let mut total = 0u64;
-    for entry in dir.flatten() {
+    for entry in dir {
+        // Matched, never `.flatten()`ed: a dirent error is an entry we could not
+        // see, which is an undercount (spec §4.9), not an absence.
+        let Ok(entry) = dirent_fault_hook(wab_dir, entry) else {
+            return None;
+        };
         let shard_path = entry.path();
         if !shard_path.is_dir() {
             continue;
@@ -106,7 +112,10 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
         let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
             return None;
         };
-        for file in shard_dir.flatten() {
+        for file in shard_dir {
+            let Ok(file) = dirent_fault_hook(&shard_path, file) else {
+                return None;
+            };
             let fpath = file.path();
             let name = fpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.ends_with(".wab") || name.ends_with(".wab.sealed") {
@@ -119,6 +128,61 @@ fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
         }
     }
     Some(total)
+}
+
+/// The `cfg(test)` dirent fault hook: a real `readdir` error cannot be provoked
+/// from a test, so a test arms a directory and every entry read from it comes
+/// back as an I/O error.
+#[cfg(test)]
+fn dirent_fault_hook(
+    dir: &Path,
+    entry: std::io::Result<std::fs::DirEntry>,
+) -> std::io::Result<std::fs::DirEntry> {
+    dirent_fault::apply(dir, entry)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn dirent_fault_hook(
+    _dir: &Path,
+    entry: std::io::Result<std::fs::DirEntry>,
+) -> std::io::Result<std::fs::DirEntry> {
+    entry
+}
+
+#[cfg(test)]
+mod dirent_fault {
+    use std::{
+        cell::RefCell,
+        io,
+        path::{Path, PathBuf},
+    };
+
+    thread_local! {
+        static ARMED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Fails every dirent read from `dir` on this thread until [`disarm`].
+    pub(super) fn arm(dir: &Path) {
+        ARMED.with(|a| *a.borrow_mut() = Some(dir.to_path_buf()));
+    }
+
+    pub(super) fn disarm() {
+        ARMED.with(|a| *a.borrow_mut() = None);
+    }
+
+    pub(super) fn apply(
+        dir: &Path,
+        entry: io::Result<std::fs::DirEntry>,
+    ) -> io::Result<std::fs::DirEntry> {
+        ARMED.with(|a| {
+            if a.borrow().as_deref() == Some(dir) {
+                Err(io::Error::other("injected dirent error"))
+            } else {
+                entry
+            }
+        })
+    }
 }
 
 /// Number of 5 s samples the growth warning considers (60 s).
@@ -1661,6 +1725,34 @@ mod wab_bytes_tests {
         crate::testutil::mkdir_p(&shard);
         std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
         std::fs::write(shard.join("seg_00000002.wab.confirmed.tmp"), vec![0u8; 999]).unwrap();
+        assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Spec §4.9: a dirent error (an `Err` from the `read_dir` iterator) is an
+    /// unknown, not an absence. `.flatten()` used to drop it, so the entry —
+    /// a whole shard at the top level, a segment inside a shard — was simply
+    /// not counted: an undercount, which lifts the `wab_max_bytes` cap by
+    /// exactly the bytes it failed to see. Both levels now report `None`.
+    #[test]
+    fn a_dirent_error_makes_the_size_unknown() {
+        let root = crate::testutil::scratch_dir("wab_bytes_dirent");
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
+
+        for armed in [&root, &shard] {
+            super::dirent_fault::arm(armed);
+            let got = compute_wab_bytes_on_disk(&root);
+            super::dirent_fault::disarm();
+            assert_eq!(
+                got,
+                None,
+                "a dirent error while listing {} must make the size unknown",
+                armed.display()
+            );
+        }
         assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
         std::fs::remove_dir_all(&root).ok();
     }
