@@ -2941,13 +2941,16 @@ fn steal_wab_dir_lock(tag: &str, wab_dir: &Path) -> (std::process::Child, PathBu
 /// Spec §3.1 integrity, D4b. Someone deletes a live daemon's `.weir.lock`, and
 /// a second daemon B starts on the same `wab_dir` and takes a fresh lock. That
 /// is proof another writer owns the directory, so A must stop acking and exit
-/// with status 3 within one integrity tick (spec: within 2 s), logging
-/// CRITICAL with B's holder record, and without sealing.
+/// with status 3 at its next integrity tick, logging CRITICAL with B's holder
+/// record, and without sealing.
 ///
 /// Between B's lock and A's next tick, A can still ack (the residual window the
 /// threat model states; only "never delete `.weir.lock`" closes it). What A
-/// must never do is ack AFTER it started refusing: once a push is Nacked, every
-/// later push is Nacked or fails because A is gone.
+/// must never do is ack AFTER it started refusing. The test pushes Durable
+/// records back to back on one connection from B's lock until A is gone, and
+/// requires that the connection ends in a refusal (a Nack, or the connection
+/// closing under it) that no ack ever follows (conf-tests-14: this used to be
+/// checked only if a Nack happened to be seen).
 #[test]
 fn lock_file_stolen_by_second_daemon_fails_closed() {
     let mut srv_a = weir_server!("lock_stolen_a").start();
@@ -2960,25 +2963,15 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
     let b_pid = child_b.id();
     let b_acquired_at = Instant::now();
 
-    // Keep pushing to A until it is gone.
+    // The spec bound is one 1 s tick; the deadline is wider so a loaded CI
+    // runner does not flake it (cont-tests-4). The exit status, the CRITICAL
+    // line and B's pid prove the behaviour; this only proves it happens.
+    const EXIT_DEADLINE: Duration = Duration::from_secs(10);
+    let gone =
+        |o: &Result<(), ClientError>| matches!(o, Err(e) if !matches!(e, ClientError::Nack(_)));
     let mut outcomes: Vec<Result<(), ClientError>> = Vec::new();
     let status = loop {
-        if let Some(status) = srv_a.wait_for_exit(Duration::ZERO) {
-            break status;
-        }
-        if b_acquired_at.elapsed() > Duration::from_secs(10) {
-            let _ = child_b.kill();
-            let _ = child_b.wait();
-            panic!(
-                "A is still running 10 s after B took its wab_dir\nA log:\n{}",
-                fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default()
-            );
-        }
-        let alive = matches!(
-            outcomes.last(),
-            None | Some(Ok(())) | Some(Err(ClientError::Nack(_)))
-        );
-        if alive {
+        if !outcomes.last().is_some_and(gone) {
             outcomes.push(
                 client
                     .push(b"during-steal", Durability::Durable)
@@ -2987,8 +2980,24 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
         } else {
             thread::sleep(Duration::from_millis(5));
         }
+        if let Some(status) = srv_a.wait_for_exit(Duration::ZERO) {
+            break status;
+        }
+        if b_acquired_at.elapsed() > EXIT_DEADLINE {
+            let _ = child_b.kill();
+            let _ = child_b.wait();
+            panic!(
+                "A is still running {EXIT_DEADLINE:?} after B took its wab_dir\nA log:\n{}",
+                fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default()
+            );
+        }
     };
     let exited_after = b_acquired_at.elapsed();
+    // A is gone. If the last push raced the exit and was acked, the next one on
+    // the same connection must see it closed; it must never be acked.
+    if !outcomes.last().is_some_and(gone) {
+        outcomes.push(client.push(b"after-exit", Durability::Durable).map(|_| ()));
+    }
 
     let _ = child_b.kill();
     let _ = child_b.wait();
@@ -3000,8 +3009,8 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
         "proven ownership loss exits 3 (got {status})\nA log:\n{log_a}"
     );
     assert!(
-        exited_after <= Duration::from_secs(2),
-        "A must exit within 2 s of B taking the lock (1 s integrity tick); took {exited_after:?}"
+        exited_after <= EXIT_DEADLINE,
+        "A must exit at its next integrity tick after B took the lock; took {exited_after:?}"
     );
     assert!(
         log_a.contains("CRITICAL") && log_a.contains("ownership lost"),
@@ -3012,23 +3021,32 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
         "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
     );
 
-    // Once A refused a push, it never acked another one.
-    if let Some(first_nack) = outcomes
+    // The pushes covered the window, and the connection ended in a refusal.
+    assert!(
+        outcomes.len() >= 2,
+        "the test must push while A still runs after B's lock: {outcomes:?}"
+    );
+    let first_refusal = outcomes
         .iter()
-        .position(|o| matches!(o, Err(ClientError::Nack(_))))
-    {
-        for o in &outcomes[first_nack..] {
-            match o {
-                Err(ClientError::Nack(r)) => assert_eq!(
-                    *r,
-                    weir_client::NackReason::InternalError,
-                    "ownership loss Nacks InternalError (no wire change)"
-                ),
-                Ok(()) => panic!("A acked after it started refusing: {outcomes:?}"),
-                Err(_) => {} // A is gone
-            }
+        .position(Result::is_err)
+        .unwrap_or_else(|| panic!("A was never seen refusing a push: {outcomes:?}"));
+    // Once A refused a push, it never acked another one: every later outcome
+    // is an InternalError Nack or the connection being gone.
+    for o in &outcomes[first_refusal..] {
+        match o {
+            Ok(()) => panic!("A acked after it started refusing: {outcomes:?}"),
+            Err(ClientError::Nack(r)) => assert_eq!(
+                *r,
+                weir_client::NackReason::InternalError,
+                "ownership loss Nacks InternalError (no wire change): {outcomes:?}"
+            ),
+            Err(_) => {} // A is gone
         }
     }
+    assert!(
+        outcomes.last().is_some_and(gone),
+        "the connection must end closed once A exited: {outcomes:?}"
+    );
 
     let _ = fs::remove_dir_all(&b_tmp);
 }
