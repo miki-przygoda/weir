@@ -67,6 +67,27 @@ jobs:
             -v "$PWD/deploy/prometheus:/r:ro" -w /r prom/prometheus:v3.14.0 \
             test rules weir-alerts_test.yml
 
+      # The shipped weir.service runs under SystemCallFilter=@system-service with
+      # SystemCallErrorNumber=EPERM, and the wab_dir lock is a flock(2). If a
+      # systemd release ever dropped flock from that set, the lock would fail
+      # with EPERM and every daemon under the unit would refuse to start. This
+      # reads the runner's systemd tables, so it guards the systemd the runner
+      # ships, not every operator's. The output is captured first so grep -q
+      # cannot SIGPIPE systemd-analyze. act's images may lack systemd: skip there.
+      - name: systemd @system-service still allows flock
+        run: |
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            echo "systemd-analyze not found; skipping the @system-service flock check"
+            exit 0
+          fi
+          set_members=$(systemd-analyze syscall-filter @system-service)
+          if ! printf '%s\n' "$set_members" | grep -qw flock; then
+            echo "flock is not in systemd's @system-service syscall set;" \
+                 "weir.service's SystemCallFilter would make the wab_dir lock fail with EPERM" >&2
+            exit 1
+          fi
+          echo "flock is in @system-service ($(systemd-analyze --version | head -n 1))"
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest

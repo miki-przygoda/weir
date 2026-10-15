@@ -188,7 +188,10 @@ destinations (Vector, Fluentd, Fluent Bit, Beats).
 **Delivery contract (read before migrating from Kafka/NATS):** delivery is
 **at-least-once** — a crash or retry can redeliver a record, so **your sink must
 dedupe** (e.g. on an `Idempotency-Key` / `ON CONFLICT`). **Ordering holds only
-within a single connection's** sequential pushes — there is **no ordering across
+within a single connection's** sequential pushes, and it is the order records
+enter the WAB, not the order the sink receives them: strands, retry cool-downs,
+parked segments, `weir-ctl` requeues and the HTTP sink's concurrent POSTs
+(`sink_http_concurrency`) can all reorder delivery. There is **no ordering across
 connections, and no per-key or global order**. And **routing/keys live in your
 payload**: the wire envelope is opaque bytes, with no topic/subject/key field —
 weir does not inspect or route on content. Details in
