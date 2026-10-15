@@ -51,10 +51,14 @@ use crate::metrics::Metrics;
 ///
 /// `(dev, ino)` is what makes the cursor safe to reuse. Sealed segments are
 /// immutable and names are unique within a run (the writer's counter only
-/// grows), but an operator can still replace a file at the same path — a
-/// `weir-ctl quarantine requeue`, a restore from backup. A cursor whose
-/// identity no longer matches `stat(path)` describes a different file and is
-/// discarded.
+/// grows), but an operator can still replace a file at the same path by hand:
+/// a restore from backup, a `cp` or `mv` over a sealed segment. weir's own
+/// tools never do: `weir-ctl dl requeue` and `quarantine requeue` re-push the
+/// records through the daemon's socket, so they land in new segments under new
+/// names, and delete the source file in `dead_letter/` or `quarantine/` once
+/// every recoverable record has been accepted.
+/// A cursor whose identity no longer matches `stat(path)` describes a
+/// different file and is discarded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResumeCursor {
     pub processed: u64,
