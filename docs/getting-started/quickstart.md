@@ -256,15 +256,21 @@ rm -rf /tmp/weir-quickstart
 
 ## Common issues
 
-**`bind: address already in use`**
-A stale socket from a previous run wasn't cleaned up. Either delete
-it manually (`rm /tmp/weir-quickstart/run/weir.sock`) or, more
-typically, the previous daemon is still running. Check with
-`pgrep weir-server`.
+**`socket_path '…' is in use by a running process; refusing to remove it`**
+Another `weir-server` is listening on that socket. Check with
+`pgrep weir-server`, then stop it or choose another `socket_path`. A
+stale socket left by a daemon that died is removed automatically at
+startup; you do not need to delete it.
 
-**`refusing to remove non-socket file at <path>`**
-A regular file (or symlink) exists at the socket path. The daemon
-refuses to remove it as a safety check — manually inspect and
+**`wab_dir … is locked by another weir-server (pid …)`**
+Another daemon owns the WAB directory; the message names its pid,
+host and socket. Stop that daemon or use another `wab_dir`. Never
+delete `<wab_dir>/.weir.lock` to get past this: two daemons on one
+`wab_dir` corrupt each other's segments and can lose acked records.
+
+**`a non-socket entry already exists at '<path>' … refusing to remove it`**
+A regular file, directory or symlink exists at the socket path. The
+daemon refuses to remove it as a safety check — manually inspect and
 remove if it's safe to do so.
 
 **`invalid path for 'wab_dir': cannot canonicalize '…': No such file or directory`**

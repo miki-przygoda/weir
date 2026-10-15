@@ -19,14 +19,40 @@ Weir merges four layers in this precedence order (first match wins):
    systemd `Environment=`).
 3. **TOML file** — default path `/etc/weir/weir.toml`, overridable via
    `--config <path>`. A missing file is **not** an error; the loader
-   silently falls through to env + defaults. Unknown keys produce a
-   `warn!` log but don't fail startup.
+   falls through to env + defaults, but it logs a WARN naming the path
+   (see [A missing config file](#a-missing-config-file)). Unknown keys
+   produce a `warn!` log but don't fail startup.
 4. **Built-in defaults** — every option has one; running `weir-server`
    with no flags, no env vars, and no config file will start the
    daemon with the defaults documented here.
 
 The merge happens once at startup. Config is not reloaded on SIGHUP
 (see [Limitations](#limitations) below).
+
+### A missing config file
+
+A config file that does not exist still loads (env-only container deployments
+depend on that: the Docker image's CMD always passes
+`--config /etc/weir/weir.toml`), but it is no longer silent. Startup logs a
+WARN, prefixed `config:`, naming the path:
+
+- with `--config <path>`: `config file <path> (passed with --config) does not
+  exist; running on command-line flags, WEIR_* environment variables and
+  built-in defaults only. A missing --config file will become a startup error
+  in a future minor release`
+- without `--config`: `no config file at the default path /etc/weir/weir.toml;
+  running on command-line flags, WEIR_* environment variables and built-in
+  defaults only`
+
+When nothing else configured a sink, `sink_type` resolves to `noop`, which acks
+and discards every record. The warning then starts with `NOOP SINK:` and adds
+that every record is acknowledged and then DISCARDED, because that is the case
+where a mistyped path silently turns a durable pipeline into a discard.
+
+Every start also logs one INFO line, `config source`, with fields
+`config_file`, `origin` (`--config` or `default path`) and `loaded`
+(`true` when the file was read), so which file was used is answerable from the
+log alone.
 
 ### How to read this reference (knob philosophy)
 
@@ -99,9 +125,18 @@ here.
 - The socket file itself is always created with mode `0o600` via a
   hardened bind sequence (`bind_hardened` in
   `crates/weir-server/src/socket/mod.rs`).
-- A stale socket at the path from a previous unclean shutdown is
-  detected and replaced atomically. A non-socket file at the path
-  causes startup to refuse.
+- What already sits at the path is checked before recovery, by a
+  connect-only probe that never unlinks. A stale socket (nobody listening,
+  e.g. after a SIGKILL) is removed later, at bind time. A socket someone is
+  listening on refuses startup with `socket_path '<path>' is in use by a
+  running process; refusing to remove it. Stop the other weir-server or
+  choose another socket_path.`, and a probe that cannot tell (`EACCES`, for
+  example) refuses too, naming the errno. A non-socket file at the path, or
+  a path longer than the platform's Unix-socket limit, also refuses. The
+  probe is a real connection, so it shows up in the live daemon's
+  connection metrics. See [socket-bind](../security/socket-bind.md).
+- At shutdown the daemon removes the socket file only if the path still
+  names the socket it bound; a successor that replaced it keeps its file.
 
 **When to change the default**: production deployments using a
 non-standard runtime directory (e.g. `/var/run/weir/`), or per-instance
@@ -164,7 +199,18 @@ sub-directory live here.
 - Subdirectories: `<wab_dir>/shard_NN/` per shard (zero-padded index,
   e.g. `shard_00`), `<wab_dir>/dead_letter/` for permanently-rejected
   records, `<wab_dir>/quarantine/` for corrupted segments quarantined
-  during crash recovery.
+  by crash recovery or by the drain.
+- **One daemon per `wab_dir`.** At startup, before anything reads the
+  WAB, the daemon takes an exclusive `flock` on `<wab_dir>/.weir.lock`
+  and holds it until the process exits. A second `weir-server` on the
+  same directory refuses to start with `wab_dir <path> is locked by
+  another weir-server (pid <pid> on host <host>, started <time>, version
+  <version>, socket <path>)`. **Never delete `.weir.lock` while a daemon runs**: the daemon
+  re-creates it within about a second, but a second daemon started in that
+  window takes a fresh lock and can recover this daemon's live segments.
+  If it does, the first daemon exits with status 3 (see
+  [`wab_dir_lock`](#wab_dir_lock)). The file format is in
+  [wab_format.md](../wab_format.md#the-wab_dir-lock-file).
 - Segment files are created mode `0o600`. At startup, every
   `.wab` / `.wab.sealed` / `.wab.confirmed` file is audited; any with
   permissions ≠ `0o600` increments
@@ -175,6 +221,64 @@ throughput, and `dead_letter_max_bytes`. For typical workloads,
 provisioning ~5× the dead-letter cap is a safe starting point. The
 WAB is rotated and reclaimed as the sink confirms records, so steady-
 state size is bounded by transient backlog, not by total throughput.
+
+---
+
+#### `wab_dir_lock`
+
+- **Type**: string (`"required"` or `"best-effort"`)
+- **Default**: `"required"`
+- **Validation**: exactly one of the two spellings; anything else
+  (`best_effort`, `off`, an empty string) is a startup error.
+- **CLI**: `--wab-dir-lock <required|best-effort>`
+- **Env**: `WEIR_WAB_DIR_LOCK`
+- **TOML**: `wab_dir_lock`
+
+What to do when the filesystem under `wab_dir` **cannot take** the exclusive
+`flock` on `<wab_dir>/.weir.lock` — that is, when `flock` fails with
+`ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`, `ENOSYS` or `EINVAL`:
+
+- `"required"` refuses to start: `wab_dir <wab_dir> is on a filesystem that
+  cannot take an exclusive lock on <wab_dir>/.weir.lock (<error>). Without the
+  lock nothing stops a second weir-server on the same wab_dir from losing
+  acked records. Move the WAB to a local filesystem that supports flock, or
+  set wab_dir_lock = "best-effort" to run without this guard.`
+- `"best-effort"` logs a WARN on every start, sets `weir_wab_dir_lock_held`
+  to `0`, and runs with **no guard** against a second daemon on the same
+  directory.
+
+The setting covers nothing else:
+
+- **Contention always refuses**, under both values. If another
+  `weir-server` holds the lock, startup fails with `is locked by another
+  weir-server`, naming the holder from its record in the lock file.
+- **Any other error refuses**, under both values: `EACCES` on a lock file
+  owned by another user, `EROFS`, `ELOOP` from a symlink at the lock path,
+  a directory or other non-regular file at the lock path, or `EPERM` from a
+  seccomp filter that blocks `flock`. The message starts `cannot lock
+  wab_dir <wab_dir>`.
+
+All three refusals happen before recovery, and the process exits with
+status 1.
+
+Without the lock the daemon also keeps orphaned sealed segments (already
+delivered, but not deleted) instead of deleting them, since another
+instance may still be confirming them; see
+[wab_format.md](../wab_format.md#post-drain-steady-state).
+
+**While running**, a held lock is checked once a second. If `.weir.lock`
+was deleted or replaced and nobody else holds the new file, the daemon
+re-creates and re-locks it, logs an ERROR and increments
+`weir_wab_dir_lock_integrity_failures_total`. If another instance holds it,
+that is proof a second daemon owns the directory: the daemon refuses every
+new push (`InternalError` NACK), logs `CRITICAL: wab_dir ownership lost`,
+and exits with **status 3** at once, without sealing.
+
+**When to change the default**: only when the WAB must live on a
+filesystem without `flock` and you guarantee one daemon per directory by
+other means. Network filesystems are not a supported guard either way:
+NFS can grant the lock with weaker, emulated semantics. See
+[Platform support](../platform-support.md#untested-and-unsupported).
 
 ---
 
@@ -826,6 +930,12 @@ knob from the bind **host** ([`metrics_bind`](#metrics_bind)); the two combine
 into the listen socket `<metrics_bind>:<metrics_port>` (default
 `127.0.0.1:9185`).
 
+An address that is already in use refuses startup before recovery (a
+test-bind, released at once, runs right after the `wab_dir` lock), with
+`failed to bind metrics endpoint to <bind>:<port> (<error>) — another
+process (often another weir-server instance) is using that port.` The same
+early check covers `tcp_bind` and the TLS material when `tcp_bind` is set.
+
 **When to tune**: change if 9185 conflicts with another service, or
 to allow multiple weir instances on one host.
 
@@ -905,9 +1015,21 @@ record is appended to a dead-letter segment under
 
 > **Dead-letter vs. stranded — they are different.** Exhausting `max_retries`
 > on a *transient* failure does **not** dead-letter; the segment is left in the
-> WAB and re-attempted on the next daemon restart (it increments
-> `weir_drain_segments_stranded_total`, not the dead-letter metrics). Only
-> *permanent* rejections land in the dead-letter directory.
+> WAB (**stranded**) and re-drained by the drain's rescan once its cool-down
+> has passed, resuming past the records already delivered in this run, or
+> from the start on the next restart. A sink strand increments
+> `weir_drain_segments_stranded_total`; a strand caused by local I/O (reading
+> the segment, or writing dead-letter records) increments
+> `weir_drain_local_io_strands_total{cause}` instead. Neither touches the
+> dead-letter metrics. Only *permanent* rejections land in the dead-letter
+> directory.
+>
+> **When the cap blocks a write after the sink committed** (or the
+> dead-letter write fails, e.g. `ENOSPC`), the rejected records are held in
+> memory and written first on the next attempt, so the sub-batch's accepted
+> records are committed once per run, not once per retry. All such held
+> records together are bounded at 64 MiB; past that the sub-batch is
+> re-committed once, with a WARN. A restart re-commits it once.
 
 **Reprocessing dead-lettered records.** Use `weir-ctl dl requeue` once you've
 fixed the downstream cause. It reads the dead-letter segments under
@@ -966,7 +1088,10 @@ Maximum total size of the dead-letter directory. When a new
 dead-letter write would push the directory over this cap, the drain
 transitions to `BlockedDeadLetterFull` and pauses **all** drain
 activity (including for healthy records) until an operator removes
-files or raises the cap.
+files or raises the cap. It unblocks only once the write that blocked
+fits under the cap, not as soon as the total dips below it. Deleting the
+whole `dead_letter/` directory to free space also works: the drain
+re-creates it.
 
 **Why drain blocks entirely**: the alternative (drop the new
 dead-letter record) silently loses data that the sink already
@@ -1019,7 +1144,20 @@ How often the drain re-probes sink health and rescans for **stranded** segments
 to re-drain. The probe runs on a wall-clock cadence, so it fires even while the
 drain is busy under sustained load (it is **not** gated on the channel going
 idle). This is also the upper bound on how long a stranded segment waits before
-the drain notices the sink recovered.
+the drain notices the sink recovered, once the segment's own cool-down (see
+[`sink_max_retries`](#sink_max_retries)) has passed.
+
+Each poll does, in order:
+
+1. retries any outstanding local step for a segment that was already
+   delivered or set aside: a `.confirmed` sidecar write or segment delete that
+   failed, or a failed move into `quarantine/`. These retries never re-deliver
+   anything;
+2. probes the sink and, when it is not `down` and the drain is idle (or the
+   sink just recovered), rescans for stranded segments, deleting stale
+   `.confirmed.tmp` files on the way and, only while the `wab_dir` lock is
+   held, orphaned sealed segments;
+3. refreshes the dead-letter and quarantine size gauges.
 
 **When to tune**: lower it (e.g. 5–10 s) for faster stranded-segment recovery on
 a flaky uplink; raise it to probe a rate-sensitive sink less often. The health
@@ -1376,8 +1514,26 @@ How many times the drain retries a segment on a **transient** sink error
 (with exponential backoff seeded by `sink_retry_base_delay_ms`) before it
 gives up and **strands** the segment on disk. A stranded segment is durable
 (no data loss) but undelivered; it is re-drained automatically when the sink
-health recovers, or on the next daemon restart. `0` strands on the first
-transient failure. Increments `weir_drain_segments_stranded_total` on strand.
+health recovers (or by the rescan of an idle drain), or on the next daemon
+restart. `0` strands on the first transient failure. Increments
+`weir_drain_segments_stranded_total` on a sink strand;
+`weir_drain_local_io_strands_total{cause="read"|"write"}` on a strand caused
+by local I/O instead.
+
+The strand happens right after the last failed attempt; the drain thread does
+not sit out one more backoff first. That backoff (or the sink's `Retry-After`,
+capped at 5 minutes) becomes the segment's **cool-down**: it is not
+re-processed before then, even if a copy of its path is still queued, while
+other segments keep moving. When it is re-processed in the same run it
+resumes past the records already committed; only a restart replays it from
+record 0.
+
+A local read error that persists is escalated after three strand cycles
+(`3 × (sink_max_retries + 1)` failed attempts): a permission-class error
+(`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) parks the segment
+(`weir_drain_segments_parked{reason="local_read_failed"}`), and a media-class
+error (`EIO` and anything unrecognised) quarantines it. Daemon-wide pressure
+(`EMFILE`, `ENFILE`, `ENOMEM`, `ENOBUFS`, `EAGAIN`, `EINTR`) never escalates.
 
 **When to tune**: raise it to ride out longer downstream outages without
 stranding (each extra retry waits up to the backoff cap of 5 minutes); lower
@@ -1539,8 +1695,11 @@ How to phrase the INSERT statement.
   crash-recovery retries are idempotent without consumer-side dedup. A `UNIQUE`
   on the payload instead discards distinct records that share bytes.
 - `"plain"` → `INSERT INTO ...`. Duplicates surface as `ER_DUP_ENTRY`
-  (code 1062) and are classified as transient — the drain retries the
-  segment. Use only if duplicate rows in the target table are tolerable.
+  (code 1062) and are resolved row by row rather than retried; see
+  [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres).
+  **Set [`sink_mysql_id_column`](#sink_mysql_id_column) with it**: without
+  one, every duplicate row is dead-lettered, and the daemon WARNs about the
+  combination at startup.
 
 #### Error classification
 
@@ -1551,8 +1710,9 @@ How to phrase the INSERT statement.
 | 1213 `ER_LOCK_DEADLOCK` | transient | retry |
 | 1290 `ER_OPTION_PREVENTS_STATEMENT` (e.g. `--read-only`) | transient | retry |
 | 1317 `ER_QUERY_INTERRUPTED` | transient | retry |
-| 1062 `ER_DUP_ENTRY` (Plain mode only) | transient | retry |
-| 1064 `ER_PARSE_ERROR`, 1146 `ER_NO_SUCH_TABLE`, 1054 `ER_BAD_FIELD_ERROR`, 1045/1044 access denied | permanent | dead-letter the batch with the server-supplied message |
+| 1045 `ER_ACCESS_DENIED_ERROR`, 1044 `ER_DBACCESS_DENIED_ERROR`, 1142 `ER_TABLEACCESS_DENIED_ERROR` | transient | retry until the grant or password is fixed (a misconfiguration, not the record's fault) |
+| 1062 `ER_DUP_ENTRY` (Plain mode only) | resolved row by row | see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
+| 1064 `ER_PARSE_ERROR`, 1146 `ER_NO_SUCH_TABLE`, 1054 `ER_BAD_FIELD_ERROR` | permanent | dead-letter the batch with the server-supplied message |
 | anything else | permanent | dead-letter the batch |
 
 #### Credentials and TLS
@@ -1694,7 +1854,9 @@ it unset every statement weir generates is byte-identical to previous releases.
 | Mode | INSERT phrasing | Idempotent under crash recovery? |
 |------|------------------|----------------------------------|
 | `on_conflict_do_nothing` (default) | `INSERT INTO t (col) VALUES ($1), ($2), … ON CONFLICT DO NOTHING` | yes, if the table has a `UNIQUE` constraint on [`sink_postgres_id_column`](#sink_postgres_id_column) — a `UNIQUE` on a payload hash instead discards distinct records that share bytes |
-| `plain` | `INSERT INTO t (col) VALUES ($1), ($2), …` | no — duplicates surface as SQLSTATE `23505` and trigger a transient-retry loop until the operator removes the dup manually |
+| `plain` | `INSERT INTO t (col) VALUES ($1), ($2), …` | with [`sink_postgres_id_column`](#sink_postgres_id_column) set, yes: a duplicate whose id is already present counts as committed. Without it, no: each duplicate row is dead-lettered. Duplicates surface as SQLSTATE `23505` and are resolved row by row; see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
+
+Plain mode without `sink_postgres_id_column` draws a startup WARN.
 
 #### Error classification
 
@@ -1705,7 +1867,7 @@ it unset every statement weir generates is byte-identical to previous releases.
 | `55P03` `lock_not_available` | transient | retry |
 | `57014` `query_canceled` | transient | retry |
 | `57P01` `admin_shutdown`, `57P02` `crash_shutdown`, `57P03` `cannot_connect_now` | transient | retry |
-| `23505` `unique_violation` (Plain mode only) | transient | retry |
+| `23505` `unique_violation` (Plain mode only) | resolved row by row | see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
 | `42P01` `undefined_table`, `42703` `undefined_column`, `42601` `syntax_error`, `28P01` `invalid_password` | permanent | dead-letter the batch with the server-supplied message |
 | anything else | permanent | dead-letter the batch |
 
@@ -1742,6 +1904,80 @@ explicit opt-in. A TLS-terminating proxy (stunnel, ghostunnel,
 pgbouncer with TLS upstream) remains a valid option for deployments
 that need certificate-pinning or client-auth — neither is wired up
 by the in-process connector yet.
+
+---
+
+### Plain insert mode and duplicate keys (MySQL and Postgres)
+
+Applies to `sink_mysql_insert_mode = "plain"` and
+`sink_postgres_insert_mode = "plain"`. The default modes (`"ignore"`,
+`"on_conflict_do_nothing"`) never see a duplicate-key error and are
+unaffected.
+
+**Recommendation: set the sink's `id_column` whenever you use plain mode**, put
+the `UNIQUE` constraint on it, and grant the ingest role **`SELECT` as well as
+`INSERT`** on the table. Plain mode without an `id_column` logs this WARN at
+startup (shown for MySQL; the Postgres one names `sink_postgres_*` and
+`"on_conflict_do_nothing"`):
+
+```text
+config: sink_mysql_insert_mode = "plain" without sink_mysql_id_column: every
+duplicate-key row will be dead-lettered (it cannot be proven to be the record
+already stored), and an all-duplicate batch can exceed sink_timeout_secs and
+be retried indefinitely; set sink_mysql_id_column to a UNIQUE column, or use
+insert_mode = "ignore"
+```
+
+**Why it exists.** A plain multi-row `INSERT` is all-or-nothing, so one
+duplicate fails the whole statement. Duplicate keys used to be classified as
+transient, so the drain re-sent the identical statement and hit the same key on
+every attempt and after every restart. The commonest trigger needs no second
+writer: a commit that times out on the weir side after the server applied it is
+retried, and the retry collides with its own rows.
+
+**What happens on a duplicate key.** The first statement always carries the
+whole batch, so a batch without duplicates still costs one statement. On a
+duplicate-key error (`ER_DUP_ENTRY` 1062, SQLSTATE `23505`):
+
+- **With an `id_column`.** One lookup finds which of the batch's ids are
+  already in the table (`SELECT <id_column> FROM <table> WHERE <id_column> IN
+  (…)` on MySQL, `… = ANY($1)` on Postgres). An id is the record's WAB
+  coordinate hashed with its bytes, so a present id is *this record, already
+  delivered*: those rows count as **committed**, nothing is dead-lettered.
+  One `INSERT` then writes the rest. If that collides too (a concurrent writer,
+  or a different `UNIQUE` constraint), the rest is bisected, and each row that
+  is still a duplicate on its own is dead-lettered with the reason
+  `duplicate key (insert_mode=plain) on a record whose id was not present: a
+  different UNIQUE constraint or a concurrent writer: <server message>`.
+- **Without an `id_column`.** The batch is bisected: halves that insert are
+  committed, and each single row that is still a duplicate is dead-lettered
+  with the reason `duplicate key (insert_mode=plain, no id_column): <server
+  message>`. It is kept, losslessly, because nothing proves it is the record
+  already stored. An all-duplicate batch costs 2N−1 statements.
+- **Inside the fallback**, any other permanent error dead-letters only the row
+  that causes it, with its own reason; any transient error makes the whole
+  batch transient, and the drain retries it.
+
+**The `SELECT` grant.** Without it the lookup fails, and the two sinks differ:
+
+- **Postgres** answers `42501` (`insufficient_privilege`), a permanent error.
+  The sink logs a WARN and bisects the whole batch instead, and each duplicate
+  row is dead-lettered with `duplicate key (insert_mode=plain); the id lookup
+  failed (<lookup error>), so the row could not be proven already delivered:
+  <server message>`. Such a row is most likely already delivered: grant
+  `SELECT` rather than `weir-ctl dl requeue` it, which would write it again
+  under a new id.
+- **MySQL** answers 1142 (`ER_TABLEACCESS_DENIED_ERROR`), which this sink
+  classifies as transient, so the drain retries the batch until the grant is
+  fixed. Nothing is dead-lettered.
+
+**The time limit.** The whole fallback runs inside the one per-commit
+[`sink_timeout_secs`](#sink_timeout_secs), checked before every statement;
+running out is a transient timeout, and the next attempt starts over. With an
+`id_column`, progress carries across attempts (rows an earlier attempt inserted
+are found by the next lookup). Without one, an all-duplicate batch whose 2N−1
+round trips do not fit in `sink_timeout_secs` never completes; a smaller
+[`sink_max_batch_size`](#sink_max_batch_size) or an `id_column` avoids it.
 
 ---
 
@@ -2199,7 +2435,11 @@ failures.
 
 - **No hot reload (except TLS material)**: config is read once at startup.
   SIGHUP reloads **TLS cert/key/CA only** — all other configuration changes
-  require a daemon restart.
+  require a daemon restart. SIGHUP never terminates the daemon: it is ignored
+  during recovery and the startup replay, and on a daemon with nothing to reload (no
+  `tcp_bind`, or a build without `tls`) it logs `SIGHUP received: nothing
+  reloadable in this build/config (config is read once at startup); nothing
+  changed` and counts `weir_config_reloads_total{trigger="sighup",outcome="noop"}`.
 - **No per-shard tuning**: `batch_size` and `batch_deadline_ms` apply
   uniformly to every shard. Workloads where shards have very different
   load profiles cannot tune them independently.

@@ -16,6 +16,14 @@ socket_path = "/run/weir/weir.sock"
 # Env: WEIR_WAB_DIR
 wab_dir = "/var/lib/weir/wab"
 
+# What to do when the filesystem under wab_dir cannot take an exclusive flock
+# on <wab_dir>/.weir.lock. "required" refuses to start; "best-effort" WARNs and
+# runs with no guard against a second daemon on the same wab_dir. Another
+# running weir-server holding the lock is refused under both values.
+# Values: "required" | "best-effort". Never delete .weir.lock by hand.
+# Env: WEIR_WAB_DIR_LOCK
+wab_dir_lock = "required"
+
 # Number of WAB shards (one flusher thread per shard). Range: 1-256.
 # Default 1 is correct for single-disk deployments.
 # Env: WEIR_SHARD_COUNT

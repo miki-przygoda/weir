@@ -66,6 +66,53 @@ If you have a Windows producer, run the daemon on Linux and connect over the
 [TCP + mutual-TLS listener](operations/tcp-mtls.md). That configuration is
 supported and CI-enforced; see the next section.
 
+## The `wab_dir` lock needs `flock`
+
+The daemon takes an exclusive `flock(2)` on `<wab_dir>/.weir.lock` before it
+reads the WAB, and refuses to start without it (see
+[`wab_dir_lock`](operations/configuration.md#wab_dir_lock)). What that needs
+from the platform:
+
+- **A filesystem that supports `flock`.** Local Linux filesystems (ext4, xfs,
+  btrfs, tmpfs) and macOS APFS do. One that cannot lock answers `ENOLCK`,
+  `EOPNOTSUPP`, `ENOTSUP`, `ENOSYS` or `EINVAL`, and the daemon refuses to
+  start unless `wab_dir_lock = "best-effort"` is set, which runs it with no
+  guard against a second daemon on the same directory.
+- **`flock` allowed by any seccomp filter.** A filter that blocks it returns
+  `EPERM`, which is not a "cannot lock" errno, so startup is refused under
+  both `wab_dir_lock` values. The shipped `weir.service` uses
+  `SystemCallFilter=@system-service` with `SystemCallErrorNumber=EPERM`; a
+  custom filter must keep `flock`.
+- **One kernel.** `flock` locks the inode on the local kernel, so bind mounts,
+  overlayfs, symlinked paths and containers on one host all see each other's
+  lock. Two hosts sharing the directory over a network filesystem do not
+  reliably do so (next item).
+- **Not a network filesystem.** NFS mounted with `nolock` grants the lock
+  locally and silently, so a daemon on another client sees no contention. With
+  lockd or NFSv4, Linux emulates `flock` with POSIX record locks: closing *any*
+  descriptor to the file drops the lock (the daemon never re-opens it for that
+  reason), and a lost lease can drop it until the daemon's once-a-second check
+  notices another holder. The lock may therefore be *granted* on NFS with
+  weaker semantics; it is not a supported guard there. See
+  [Untested and unsupported](#untested-and-unsupported).
+
+Off Unix the lock code always reports "cannot lock", so a non-Unix build (which
+has no ingest path anyway) refuses to start at the lock under the default
+`wab_dir_lock = "required"`.
+
+## Socket identity at shutdown
+
+At shutdown the daemon removes the socket file only if the path still names the
+socket it bound, so a successor that replaced it keeps its file. On Linux the
+daemon holds an `O_PATH` descriptor on its socket inode for the listener's
+life, so the inode number cannot be reused and `(dev, ino)` is a sound
+identity. Other Unix targets (macOS included) have no `O_PATH`: there the check
+adds `st_ctime`, plus `st_birthtime` on macOS, as a best-effort tie-breaker,
+which is weaker. The startup liveness probe also differs: on Linux a refused
+connect means stale, while BSD and macOS report a full listen backlog as a
+refused connect too, so there a refused socket is probed three more times,
+50 ms apart, and counts as stale only if every probe is refused. Details in [socket-bind](security/socket-bind.md).
+
 ## Libraries and CLI
 
 | Crate | Unix | Windows | Enforced by |
@@ -133,6 +180,10 @@ Stated explicitly because "not mentioned" reads as "probably fine":
 - **Network and shared filesystems for the WAB** (NFS, SMB, EFS, virtiofs).
   Untested, and unwise independently of testing: weir's durability argument
   rests on `fsync` semantics a network filesystem does not necessarily provide.
+  The `wab_dir` lock is not a supported guard there either: it may be granted
+  with weaker semantics than on a local filesystem (see
+  [above](#the-wab_dir-lock-needs-flock)), or refused, which stops startup
+  under the default `wab_dir_lock = "required"`.
 - **Windows `weir-server`.** Not merely untested — it has no ingest path.
 - **macOS in production.** Builds and ships, is not power-loss safe, and no test
   in the suite runs there.

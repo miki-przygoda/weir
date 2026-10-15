@@ -1,9 +1,9 @@
 # Recovering quarantined records
 
 `<wab_dir>/quarantine/` holds forensic copies of WAB segments that crash
-recovery could not fully trust. This page is the procedure: how to notice,
-how to triage, and how to recover what is still readable. For the on-disk
-layout and naming rules, see [`wab_format.md`](../wab_format.md#reserved-subdirectories).
+recovery or the drain could not fully trust. This page is the procedure: how to
+notice, how to triage, and how to recover what is still readable. For the
+on-disk layout and naming rules, see [`wab_format.md`](../wab_format.md#reserved-subdirectories).
 
 **The one fact that motivates all of this:** when recovery meets **mid-file**
 corruption in an active segment, it truncates and seals the valid prefix
@@ -18,32 +18,52 @@ records exist nowhere else. `weir-ctl quarantine` is how you get them back.
 | Signal | What it tells you |
 |---|---|
 | `weir_quarantine_bytes_on_disk` (gauge) | **The complete signal.** Sums every regular file's size under `quarantine/`, regardless of *why* it landed there. Any sustained increase means something new was quarantined. Survives a restart, unlike the counters below. |
-| `weir_recovery_segments_quarantined_total` (counter) | Increments for most quarantine events during **active**-segment recovery: a header the daemon could not parse (bad magic, unknown version, a header shorter than 24 bytes) or mid-file corruption with a copied tail. **Per-process — resets on restart.** |
-| `weir_recovery_segments_failed_total` (counter, new) | Increments whenever `recover_segment` returns an error while scanning active segments. Non-zero means acked records **may** be unreachable — check the startup logs for the path and the cause. **Per-process — resets on restart.** |
-
-**These three do not measure the same thing, and the gap matters:**
-
-- A **header-level** quarantine (bad magic / unknown version / a header
-  shorter than 24 bytes) bumps **both** `..._quarantined_total` and
-  `..._failed_total` — the segment genuinely could not be recovered even by
-  `weir-ctl quarantine`, since `RecoveryReader` needs a parseable header too.
-  `quarantine inspect` on one of these will report an open/parse error, not a
-  record count.
-- A **mid-file corruption** in an active segment — the case this whole
-  toolchain exists for — bumps `..._quarantined_total` **only**.
-  `recover_segment` returns `Ok` in this case (the valid prefix was sealed and
-  delivered normally), so `..._failed_total` does **not** fire here. Do not
-  wait for the failed-counter to move before checking quarantine; watch the
-  quarantined counter and the gauge instead.
-- A **bad `.confirmed` sidecar** (`check_confirmed` rejects a corrupt or
-  unparseable confirmation file during sealed-segment replay) quarantines
-  **both** the sealed segment and its `.confirmed` sidecar, but increments
-  **neither counter** — only a `warn!` log and the byte gauge move. This is
-  the case the gauge exists to catch: if you only alert on the counters, this
-  one is invisible.
+| `weir_recovery_segments_quarantined_total` (counter) | One per segment moved or copied into `quarantine/`, whoever did it: crash recovery (a header it could not parse, or mid-file corruption with a copied tail), the drain (see [What lands here](#what-lands-here-and-what-is-parked-instead)), or a `.confirmed` sidecar that fails verification (the segment is counted once; its sidecar goes along uncounted). **Per-process — resets on restart.** |
+| `weir_recovery_segments_failed_total` (counter) | Crash recovery of an active segment failed **and left it at its original path**, so nothing will reach it. A quarantined segment is never counted here. Non-zero means acked records **may** be unreachable — check the startup logs for the path and the cause. **Per-process — resets on restart.** |
+| `weir_drain_segments_disposition_pending{kind="quarantine"}` (gauge) | Segments the drain decided to quarantine but could not move (`ENOSPC`, `EACCES`, a regular file named `quarantine`). They stay in their shard directory, are **never re-delivered**, and the move is retried on every health poll. `weir_drain_quarantine_failures_total` counts the failed moves. Non-zero means `quarantine/` itself needs attention. |
+| `weir_drain_segments_parked{reason}` (gauge) | Segments set aside **instead of** quarantined; they are not in `quarantine/`. See below. |
 
 **Bottom line:** alert on the gauge for "notice that anything happened at
-all." Use the counters, together with the startup logs, to narrow down why.
+all." Use the counters, together with the logs (`quarantining WAB segment`
+names the path, destination and reason), to narrow down why.
+
+## What lands here, and what is parked instead
+
+The drain and the sealed-segment scan quarantine a **sealed** segment only when
+its bytes are bad, which no retry changes, or have stayed unreadable past the
+escalation limit:
+
+| Condition | When | Delivered before the move |
+|---|---|---|
+| Corrupt header: bad magic, version 0, a v1 header with its reserved byte set, a file too short for a header | first attempt, no retry | nothing |
+| A CRC mismatch, an oversized length or a record cut short mid-segment | when it is reached | the readable prefix |
+| The footer is cut short, or its record count disagrees with the records read (a truncated tail) | after the last record | every record read |
+| A media-class read error (`EIO`, `ENXIO`, `ESTALE`, `EBADMSG`, anything unrecognised) that persists for three strand cycles | at the escalation limit | the readable prefix, exactly once per run |
+| A `.confirmed` sidecar that fails to parse (wrong length, bad magic or CRC, unknown version) — for example one torn by the in-place write of 4.0.1 and earlier; sidecars are now written atomically, so a crash or full disk no longer tears one | the sealed-segment scan, at startup or in the drain's rescan | everything (a sidecar is written only after delivery) |
+
+A **transient** read error is not corruption: the segment is retried and, while
+the daemon runs, resumes past the records already delivered; it never goes to
+`quarantine/` on a blip.
+
+Some segments are **parked** instead: left in place as `seg_*.wab.sealed` in
+their shard directory, not retried for the rest of the run, and replayed from
+record 0 on the next start. `weir-ctl quarantine` does not see them; the
+`weir_drain_segments_parked{reason}` gauge and an ERROR log naming the path do.
+
+| `reason` | Cause | What to do, then restart |
+|---|---|---|
+| `unsupported_version` | Written by a newer weir (a format version above what this build reads, or an unknown v2 flag bit). Not corrupt. | Upgrade weir; a newer binary delivers it. |
+| `local_read_failed` | A permission-class read error (`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) that persisted for three strand cycles | Fix the file's permissions or type. |
+| `drain_panic` | The drain panicked twice while delivering this segment | Find the panic in the log; usually a sink bug triggered by one record. |
+
+Parking a `drain_panic` segment keeps one poison segment from spending the
+drain's whole respawn budget (10 panics per process, never refilled; the 10th
+stops delivery) and stopping delivery for every segment. Five distinct poison segments, two panics each, can
+still exhaust it.
+
+Crash recovery is unchanged: an **active** segment with a header it cannot
+parse (newer format included) is quarantined, and mid-file corruption is copied
+here while the valid prefix is sealed and delivered.
 
 ---
 
@@ -104,6 +124,14 @@ sink sees genuinely different batches and accepts both. Do not assume
 dedup saves you here, in any phrasing — plan for the duplicates at the
 consumer.
 
+The same holds for segments the drain quarantined, in proportion to what it
+delivered first ([What lands here](#what-lands-here-and-what-is-parked-instead)):
+the readable prefix after mid-segment corruption or a persistent media error,
+and **every record read** after a footer mismatch or a bad `.confirmed` sidecar,
+so a requeue of those is all duplicates. A segment quarantined for a
+corrupt header was never delivered, and cannot be requeued either: its header
+does not parse for `RecoveryReader` any more than for the drain.
+
 **Two judgment calls baked into `--yes`, so you don't have to reverse-engineer
 them from behavior:**
 
@@ -151,15 +179,16 @@ Quarantine entries are named `{shard_name}__{original_file_name}`:
 
 - Crash recovery quarantines **active** segments, so its copies keep the
   `.wab` extension: `shard_00__seg_00000004.wab`.
-- The drain quarantines **sealed** segments (a `.confirmed` sidecar that
-  fails verification takes its sealed segment down with it), so those copies
-  end `.wab.sealed`: `shard_00__seg_00000004.wab.sealed`.
+- The drain, and the sealed-segment scan at startup and in the drain's
+  rescan, quarantine **sealed** segments (a `.confirmed` sidecar that fails
+  verification takes its sealed segment down with it), so those end
+  `.wab.sealed`: `shard_00__seg_00000004.wab.sealed`.
 - A name collision (the same shard+counter recurring across a restart)
   appends `.1`, `.2`, … up to `.10000` to either form.
 
 **The directory can also hold `.wab.confirmed` sidecars** — when a bad
 `.confirmed` file is what triggered the quarantine, both it and its sealed
-segment are copied in, e.g. `shard_00__seg_00000004.wab.confirmed` alongside
+segment are moved in, e.g. `shard_00__seg_00000004.wab.confirmed` alongside
 `shard_00__seg_00000004.wab.sealed`. `weir-ctl quarantine` **deliberately
 ignores** these: there is nothing to recover from a confirmation-metadata
 file, and the sealed segment beside it is the one the tooling surfaces. If
