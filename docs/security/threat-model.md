@@ -161,8 +161,9 @@ stale socket. At shutdown the daemon removes the socket file only if the
 path still names the inode it bound, so it does not delete a successor's
 socket. Mechanism: [`socket-bind.md`](socket-bind.md#stale-socket-removal-and-the-liveness-probe).
 
-**Proven ownership loss fails closed.** Once the runtime is up, a separate
-task checks the lock every second. It compares the `(dev, ino)` at the lock
+**Proven ownership loss fails closed.** From right after acquisition (through
+preflight, recovery and the startup replay, not only once the runtime is up),
+a separate thread checks the lock every second. It compares the `(dev, ino)` at the lock
 path with the held fd and re-issues `flock` on the held fd. The verdicts:
 
 | Verdict | What the daemon does |
@@ -185,9 +186,11 @@ loud.
   first daemon's active segments. Durable records the first daemon acks
   between that recovery and its own exit can be false acks. Records it had
   already fsynced into files the second daemon recovers are delivered by the
-  second daemon. The integrity task starts with the runtime, after recovery
-  and the startup replay, so a deletion during those phases is caught only
-  at the first check after them. Detection cannot close this window. The only
+  second daemon. The integrity check runs on its own thread from right after
+  the lock is taken, so the window is the same during recovery and a long
+  startup replay (when the socket and metrics port are not bound yet and a
+  duplicate with an identical config would pass preflight): proven loss there
+  exits 3 before anything is served. Detection cannot close this window. The only
   defence is **never delete `.weir.lock`**. It is a dotfile, so `rm -rf wab/*`
   does not match it under default shell globbing. Alert on any increase of
   `weir_wab_dir_lock_integrity_failures_total`.
@@ -202,7 +205,7 @@ loud.
   there, but it is not a supported guard.
 - **`wab_dir_lock = "best-effort"`.** On a filesystem that cannot lock, this
   runs with no single-ownership guard at all. `weir_wab_dir_lock_held` reads 0
-  for the life of the process, and the integrity task does not run.
+  for the life of the process, and the integrity check does not run.
 - **The socket probe is a real connection.** Probing a live daemon connects
   to it. That bumps the live daemon's connection metrics. Under
   `peer_uid_check`, a probe from a different uid is refused and logged there

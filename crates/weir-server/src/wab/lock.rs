@@ -332,8 +332,8 @@ pub(crate) fn acquire_wab_dir_lock(
 
 /// Checks, once, that this daemon still owns `wab_dir` (spec §3.1, D4).
 ///
-/// Called every second by the integrity task in `main` (on a blocking thread),
-/// only when the lock is [`LockOutcome::Held`]. It guards against the lock
+/// Called every second by the integrity thread in `main`, from right after
+/// acquisition, only when the lock is [`LockOutcome::Held`]. It guards against the lock
 /// being defeated by deleting or replacing `.weir.lock`: a daemon started
 /// after that would create and lock a fresh file and recover this daemon's
 /// live segments.
@@ -371,7 +371,7 @@ fn check_lock_slot(wab_dir: &Path, slot: &mut Option<HeldLock>, own: &HolderInfo
     use std::os::unix::fs::MetadataExt;
 
     let Some(held) = slot.as_mut() else {
-        // Nothing held (never acquired, or best-effort). The integrity task is
+        // Nothing held (never acquired, or best-effort). The integrity thread is
         // not spawned then; report it rather than take a lock here.
         return LockIntegrity::Error(libc::EBADF);
     };
@@ -539,7 +539,7 @@ fn integrity_error(e: LockError) -> LockIntegrity {
 }
 
 /// No flock on non-Unix builds: the lock is never `Held` there, so the
-/// integrity task is never spawned.
+/// integrity thread is never spawned.
 #[cfg(not(unix))]
 fn check_lock_slot(
     _wab_dir: &Path,

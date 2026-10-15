@@ -2863,29 +2863,18 @@ fn weir_ctl_beside_a_live_daemon_neither_sees_nor_disturbs_the_lock() {
     );
 }
 
-/// Spec §3.1 integrity, D4b. Someone deletes a live daemon's `.weir.lock`, and
-/// a second daemon B starts on the same `wab_dir` and takes a fresh lock. That
-/// is proof another writer owns the directory, so A must stop acking and exit
-/// with status 3 within one integrity tick (spec: within 2 s), logging
-/// CRITICAL with B's holder record, and without sealing.
+/// Deletes the running daemon's `<wab_dir>/.weir.lock` and starts a second
+/// daemon B on the same `wab_dir` (its own socket, metrics port and log under
+/// a fresh temp dir, returned) until B holds the lock. Returns B still running.
 ///
-/// Between B's lock and A's next tick, A can still ack (the residual window the
-/// threat model states; only "never delete `.weir.lock`" closes it). What A
-/// must never do is ack AFTER it started refusing: once a push is Nacked, every
-/// later push is Nacked or fails because A is gone.
-#[test]
-fn lock_file_stolen_by_second_daemon_fails_closed() {
-    let mut srv_a = weir_server!("lock_stolen_a").start();
-    let lock_path = srv_a.wab_dir.join(".weir.lock");
-    let mut client = srv_a.client();
-    client
-        .push(b"before-steal", Durability::Durable)
-        .expect("A acks while it owns the lock");
-
-    // B gets its own socket, metrics port and log, and A's wab_dir. Spawned
-    // with Command directly: srv_a holds the harness process lock, and B must
-    // stay up beside A.
-    let b_tmp = std::env::temp_dir().join(format!("weir_sys_lock_stolen_b_{}", std::process::id()));
+/// The running daemon's integrity check re-creates and re-locks a deleted lock
+/// file on its next tick (D4a). A B spawned just after that tick is refused,
+/// and the precondition ("B acquires the lock") did not happen; retry. B is
+/// spawned with `Command` directly: the running daemon holds the harness
+/// process lock, and B must stay up beside it.
+fn steal_wab_dir_lock(tag: &str, wab_dir: &Path) -> (std::process::Child, PathBuf) {
+    let lock_path = wab_dir.join(".weir.lock");
+    let b_tmp = std::env::temp_dir().join(format!("weir_sys_{tag}_{}", std::process::id()));
     let _ = fs::remove_dir_all(&b_tmp);
     fs::create_dir_all(&b_tmp).unwrap();
     let b_config = b_tmp.join("weir.toml");
@@ -2901,16 +2890,12 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
              shutdown_timeout_secs = 3\n\
              log_level             = \"info\"\n",
             b_tmp.join("weir.sock").display(),
-            srv_a.wab_dir.display(),
+            wab_dir.display(),
             free_port(),
         ),
     )
     .unwrap();
 
-    // A's integrity task re-creates and re-locks a deleted lock file on its
-    // next tick (D4a). A B spawned just after that tick is then refused, and
-    // the precondition here ("B acquires the lock") did not happen; retry.
-    let mut child_b = None;
     for attempt in 0..10 {
         match fs::remove_file(&lock_path) {
             Ok(()) => {}
@@ -2934,7 +2919,7 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
                 break true;
             }
             if let Ok(Some(_)) = c.try_wait() {
-                break false; // refused: A re-locked first
+                break false; // refused: the running daemon re-locked first
             }
             if Instant::now() >= deadline {
                 let _ = c.kill();
@@ -2947,11 +2932,31 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
             thread::sleep(Duration::from_millis(2));
         };
         if acquired {
-            child_b = Some(c);
-            break;
+            return (c, b_tmp);
         }
     }
-    let mut child_b = child_b.expect("B never acquired the lock in 10 attempts");
+    panic!("B never acquired the lock in 10 attempts");
+}
+
+/// Spec §3.1 integrity, D4b. Someone deletes a live daemon's `.weir.lock`, and
+/// a second daemon B starts on the same `wab_dir` and takes a fresh lock. That
+/// is proof another writer owns the directory, so A must stop acking and exit
+/// with status 3 within one integrity tick (spec: within 2 s), logging
+/// CRITICAL with B's holder record, and without sealing.
+///
+/// Between B's lock and A's next tick, A can still ack (the residual window the
+/// threat model states; only "never delete `.weir.lock`" closes it). What A
+/// must never do is ack AFTER it started refusing: once a push is Nacked, every
+/// later push is Nacked or fails because A is gone.
+#[test]
+fn lock_file_stolen_by_second_daemon_fails_closed() {
+    let mut srv_a = weir_server!("lock_stolen_a").start();
+    let mut client = srv_a.client();
+    client
+        .push(b"before-steal", Durability::Durable)
+        .expect("A acks while it owns the lock");
+
+    let (mut child_b, b_tmp) = steal_wab_dir_lock("lock_stolen_b", &srv_a.wab_dir);
     let b_pid = child_b.id();
     let b_acquired_at = Instant::now();
 
@@ -3026,6 +3031,93 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
     }
 
     let _ = fs::remove_dir_all(&b_tmp);
+}
+
+/// conf-durability-3: the integrity check must run through the whole startup,
+/// not only once the runtime is up. During a long startup replay the daemon
+/// has bound neither its socket nor its metrics port, so a second daemon with
+/// an identical config would pass preflight; if the lock file is deleted then,
+/// that daemon takes a fresh lock and starts a second drain over the same
+/// backlog. The first daemon must see it within a tick and exit 3, before it
+/// ever serves.
+///
+/// The replay is held with the black-hole sink of
+/// `sighup_during_startup_replay_is_ignored`: a 300-segment backlog, a sink
+/// that accepts and never answers, `sink_timeout_secs = 300`.
+#[test]
+fn lock_stolen_during_startup_replay_fails_closed_before_serving() {
+    const TOTAL: usize = 300;
+    let wab = std::env::temp_dir().join(format!("weir_sys_lock_replay_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&wab);
+    fs::create_dir_all(&wab).unwrap();
+    seed_sealed_backlog("lock_replay_seed", &wab);
+    pad_sealed_backlog(&wab, TOTAL);
+
+    let hole = RecordingSink::start_hanging();
+    let mut srv_a = weir_server!("lock_replay_a")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"\nsink_timeout_secs = 300")
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .spawn();
+    let queued = |log: &str| log.matches("queuing segment for drain replay").count();
+
+    // Wait for the replay to block: the drain holds a hung request and the
+    // replay's line count stops growing short of the backlog.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = 0;
+    loop {
+        let log = read_log(&srv_a);
+        let n = queued(&log);
+        if n > 0 && n == last && hole.connections() > 0 {
+            break;
+        }
+        last = n;
+        assert!(
+            Instant::now() < deadline,
+            "the replay never blocked (queued {n}, sink connections {})\nlog:\n{log}",
+            hole.connections()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    let (mut child_b, b_tmp) = steal_wab_dir_lock("lock_replay_b", &wab);
+    let b_pid = child_b.id();
+    let status = srv_a.wait_for_exit(Duration::from_secs(10));
+    let _ = child_b.kill();
+    let _ = child_b.wait();
+    let log_a = read_log(&srv_a);
+    let Some(status) = status else {
+        panic!(
+            "A is still running 10 s after B took its wab_dir during A's startup replay \
+             (the integrity check is not running yet)\nA log:\n{log_a}"
+        );
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "proven ownership loss during the replay exits 3 (got {status})\nA log:\n{log_a}"
+    );
+    assert!(
+        queued(&log_a) < TOTAL,
+        "the steal must have landed while the replay was still blocked\nA log:\n{log_a}"
+    );
+    assert!(
+        !log_a.contains("metrics endpoint listening"),
+        "A must exit before it serves anything\nA log:\n{log_a}"
+    );
+    assert!(
+        log_a.contains("CRITICAL")
+            && log_a.contains("ownership lost")
+            && log_a.contains(&format!("pid {b_pid}")),
+        "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
+    );
+
+    drop(hole);
+    drop(srv_a);
+    let _ = fs::remove_dir_all(&b_tmp);
+    let _ = fs::remove_dir_all(&wab);
 }
 
 // ── SIGHUP (safety floor, spec §3.2) ──────────────────────────────────────────

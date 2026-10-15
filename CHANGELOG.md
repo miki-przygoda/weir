@@ -76,9 +76,13 @@ nothing new is persisted.
   per push; no wire change), sets `weir_wab_dir_lock_held` to 0, logs
   `CRITICAL: wab_dir ownership lost: another weir-server (…) holds or held the
   lock on this wab_dir …`, and exits **3** at once, without sealing, because the
-  segments are the other daemon's now. Detection does not close the window
-  between the unlink and the next tick (at most about a second); only never
-  deleting `.weir.lock` does.
+  segments are the other daemon's now. The check runs on its own thread from
+  right after the lock is taken, so it also covers recovery and a long startup
+  replay, when the socket and metrics port are not bound yet and a duplicate
+  with an identical config would pass preflight; proven loss there exits 3
+  before anything is served. Detection does not close the window between the
+  unlink and the next tick (at most about a second); only never deleting
+  `.weir.lock` does.
 
 - **A daemon that had to refuse to start re-delivered on every restart.** A
   taken metrics port, a live socket, bad TLS material or a taken `tcp_bind`

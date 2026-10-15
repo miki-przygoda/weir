@@ -741,9 +741,11 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
 
 // ── wab_dir lock integrity ────────────────────────────────────────────────────
 
-/// How often the integrity task re-checks `.weir.lock`. Bounds the residual
+/// How often the integrity thread re-checks `.weir.lock`. Bounds the residual
 /// window in which a second daemon, started after the file was deleted, can
-/// recover this daemon's live segments before this one stops acking.
+/// recover this daemon's live segments before this one stops acking. The
+/// thread runs from right after acquisition, so the bound holds through
+/// recovery and the startup replay too, not only once the runtime is up.
 const LOCK_INTEGRITY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Applies one [`wab::lock::check_wab_dir_lock`] verdict. Returns the exit code
@@ -812,36 +814,36 @@ fn apply_lock_integrity(
     }
 }
 
-/// Spawns the once-a-second `wab_dir` lock integrity task (spec §3.1). Its own
-/// task, not part of the 5 s WAB poll, which skips everything when its scan
-/// returns `None`. The check is blocking file-system work, so it runs on
-/// `spawn_blocking`. Only spawned when the lock is actually held.
-fn spawn_lock_integrity_task(
+/// Spawns the once-a-second `wab_dir` lock integrity check (spec §3.1) on its
+/// own thread, right after the lock is acquired and only when it is actually
+/// held. A plain thread, not a runtime task, because the long startup phases
+/// (recovery, and a replay that blocks at sink speed for as long as the
+/// backlog lasts) run before the runtime exists: a check that only started
+/// with the runtime left the stated ~1 s window unbounded there
+/// (conf-durability-3). Not part of the 5 s WAB poll either, which skips
+/// everything when its scan returns `None`. The first check runs at once.
+fn spawn_lock_integrity_thread(
     wab_dir: std::path::PathBuf,
     metrics: Arc<metrics::Metrics>,
     ownership_lost: Arc<std::sync::atomic::AtomicBool>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(LOCK_INTEGRITY_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            let dir = wab_dir.clone();
-            let verdict = match tokio::task::spawn_blocking(move || {
-                wab::lock::check_wab_dir_lock(&dir)
-            })
-            .await
-            {
-                Ok(v) => v,
-                // Cancelled at runtime shutdown, or the check panicked:
-                // nothing was proven, try again next tick.
-                Err(_) => continue,
-            };
-            if let Some(code) = apply_lock_integrity(verdict, &wab_dir, &metrics, &ownership_lost) {
-                std::process::exit(code);
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("weir-lock-integrity".into())
+        .spawn(move || {
+            loop {
+                // A panicking check proves nothing: try again next tick, as the
+                // runtime task did with a failed spawn_blocking.
+                if let Ok(verdict) =
+                    std::panic::catch_unwind(|| wab::lock::check_wab_dir_lock(&wab_dir))
+                    && let Some(code) =
+                        apply_lock_integrity(verdict, &wab_dir, &metrics, &ownership_lost)
+                {
+                    std::process::exit(code);
+                }
+                std::thread::sleep(LOCK_INTEGRITY_INTERVAL);
             }
-        }
-    });
+        })
+        .map(drop)
 }
 
 /// Returns the configured sink URL, or a clear startup error if it's absent.
@@ -971,6 +973,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wab::lock::acquire_wab_dir_lock(&config.wab_dir, config.wab_dir_lock, &lock_holder)
             .inspect_err(|e| tracing::error!("{e}"))?;
 
+    // ── Metrics ───────────────────────────────────────────────────────────────
+    //
+    // Created here, ahead of preflight, only because the integrity check below
+    // needs them; nothing is served until the runtime binds the endpoint.
+
+    let (metrics_struct, registry) = metrics::Metrics::new();
+    let metrics = Arc::new(metrics_struct);
+    let registry = Arc::new(registry);
+    metrics.wab_dir_lock_held.set(match lock_outcome {
+        wab::lock::LockOutcome::Held => 1.0,
+        wab::lock::LockOutcome::Unsupported { .. } => 0.0,
+    });
+
+    // ── wab_dir lock integrity ────────────────────────────────────────────────
+    //
+    // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
+    // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
+    // below; the integrity thread is the only writer. The thread starts now,
+    // so the check covers preflight, recovery and the startup replay as well
+    // as the runtime: a deletion during those phases is caught within a tick,
+    // and proven loss exits 3 before anything is served.
+    let wab_ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if lock_outcome == wab::lock::LockOutcome::Held {
+        spawn_lock_integrity_thread(
+            config.wab_dir.clone(),
+            Arc::clone(&metrics),
+            Arc::clone(&wab_ownership_lost),
+        )?;
+    }
+
     // ── Preflight ─────────────────────────────────────────────────────────────
     //
     // Every refuse-to-start check that can run before recovery: the socket
@@ -1001,16 +1033,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is non-obvious enough that we'd rather surface it than make users
     // discover it by benchmarking.
     advise_agent_count(config.shard_count, config.worker_count);
-
-    // ── Metrics ───────────────────────────────────────────────────────────────
-
-    let (metrics_struct, registry) = metrics::Metrics::new();
-    let metrics = Arc::new(metrics_struct);
-    let registry = Arc::new(registry);
-    metrics.wab_dir_lock_held.set(match lock_outcome {
-        wab::lock::LockOutcome::Held => 1.0,
-        wab::lock::LockOutcome::Unsupported { .. } => 0.0,
-    });
 
     // ── Queue ─────────────────────────────────────────────────────────────────
 
@@ -1429,19 +1451,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
         #[cfg(not(unix))]
         drop(reload_tx);
-
-        // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
-        // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
-        // below; the integrity task is the only writer. Spawned first thing in
-        // the runtime so the check is live before any listener accepts.
-        let wab_ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if lock_outcome == wab::lock::LockOutcome::Held {
-            spawn_lock_integrity_task(
-                config.wab_dir.clone(),
-                Arc::clone(&metrics),
-                Arc::clone(&wab_ownership_lost),
-            );
-        }
 
         // Bind metrics listener before starting the socket loop. Default
         // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the

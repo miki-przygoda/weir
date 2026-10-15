@@ -95,7 +95,7 @@ pub struct ConnectionConfig {
     /// of them agree, and so the low-water mark is honoured globally rather
     /// than per-connection.
     pub wab_cap_rejecting: Arc<AtomicBool>,
-    /// Set by the `wab_dir` integrity task in `main` once another instance
+    /// Set by the `wab_dir` integrity thread in `main` once another instance
     /// PROVABLY owns the `wab_dir` (spec §3.1, D4b), just before the process
     /// exits with code 3. Every push after that is Nacked `InternalError`
     /// before it reaches the queue: acking it would write into segments the
