@@ -114,8 +114,11 @@ nothing new is persisted.
   socket_path.`, and an errno the probe cannot read refuses too. Shutdown
   removes the socket only if the path still names the inode this daemon bound
   (pinned on Linux by an `O_PATH` fd held for the listener's life); otherwise it
-  WARNs and leaves the file. On non-Linux targets `ECONNREFUSED` can mean a
-  full backlog, so it is re-probed 3 times at 50 ms.
+  WARNs and leaves the file. On non-Linux targets `ECONNREFUSED` can also mean
+  a live listener with a full backlog, so there a refused socket is removed only
+  if a datagram connect to it is refused too. Any bound socket answers that
+  with `EPROTOTYPE`, whatever its backlog, so a live daemon whose accept loop
+  is stalled keeps its socket.
 
 - **`SIGHUP` killed every daemon without TLS.** Only a TLS build with
   `tcp_bind` installed a handler, and only once the runtime was up, so

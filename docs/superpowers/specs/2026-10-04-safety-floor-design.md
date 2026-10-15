@@ -305,7 +305,7 @@ pub(crate) fn check_wab_dir_lock(wab_dir: &Path) -> LockIntegrity; // Ok | Reloc
   | connect result | meaning | action |
   |---|---|---|
   | `ECONNREFUSED` (Linux) | stale | `unlinkat` (startup path only), INFO `removed stale socket` |
-  | `ECONNREFUSED` (non-Linux) | stale *or* backlog full (BSD/macOS report a full backlog as ECONNREFUSED) | re-probe 3× at 50 ms intervals; stale only if all are refused |
+  | `ECONNREFUSED` (non-Linux) | stale *or* backlog full (BSD/macOS report a full backlog as ECONNREFUSED) | settled by a `SOCK_DGRAM` connect: `ECONNREFUSED` = stale, `EPROTOTYPE`/`0` = live, other = unknown (revised by review finding conf-security-7; the original 3× 50 ms re-probe only narrowed the race) |
   | `ENOENT` | already gone | proceed |
   | `0`, `EAGAIN`, `EINPROGRESS` | live (`EAGAIN` = backlog full = listening, on Linux) | refuse: `socket_path … is in use by a running process; refusing to remove it. Stop the other weir-server or choose another socket_path.` |
   | `EACCES`, `EPERM`, other | cannot tell | refuse (fail closed), naming the errno and telling the operator to remove the file manually if it is stale |

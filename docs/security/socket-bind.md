@@ -203,13 +203,58 @@ connect to a listener with a full backlog hangs.
 |---|---|---|
 | `0`, `EAGAIN`, `EINPROGRESS` | `Live` (`EAGAIN` means a full backlog, so something is listening, on Linux) | Refuse: `socket_path '…' is in use by a running process; refusing to remove it. Stop the other weir-server or choose another socket_path.` |
 | `ECONNREFUSED` on Linux | `Stale` | Unlink, INFO `removed stale socket` |
-| `ECONNREFUSED` elsewhere | Stale *or* a full backlog, because BSD and macOS report a full backlog as `ECONNREFUSED` too | Re-probe 3 times at 50 ms intervals; `Stale` only if every probe is refused, otherwise the later verdict stands |
+| `ECONNREFUSED` elsewhere | Stale *or* live, because BSD and macOS also refuse a stream connect when a live listener's backlog is full or it is bound but not listening | Settled by the attachment probe below; the stream verdict alone is never acted on |
 | `ENOENT`, `ENOTDIR` | `Absent` | Nothing to remove; the bind reports any real problem |
 | `EACCES`, `EPERM`, anything else | `Unknown(errno)` | Refuse (fail closed): `cannot tell whether socket_path '…' is in use: the liveness probe's connect failed with … (errno …); refusing to remove it. If no weir-server is using it, remove the file manually and start again.` |
 
 A path too long for `sockaddr_un` is `Absent` if nothing is there and
 `Unknown(ENAMETOOLONG)` otherwise. Preflight also refuses such a path before
 the probe runs.
+
+**The attachment probe (macOS and the BSDs).** On these kernels a refused
+stream connect is ambiguous. The listener's accept backlog may be full: the
+daemon is stuck in its `EMFILE`/`ENFILE` accept back-off, it is stopped, or it
+is paused in a debugger. It may also be bound but not yet listening. A re-probe
+window can only narrow that, because the backlog stays full for as long as the
+listener cannot accept. So `probe_socket` settles the refusal with a second,
+backlog-independent probe. It connects a non-blocking `SOCK_DGRAM` socket to
+the same path.
+
+The BSD-derived `unp_connect` (XNU, FreeBSD, OpenBSD, NetBSD) first looks up the
+socket bound to the file's vnode and refuses with `ECONNREFUSED` only if there
+is none. When a socket is bound, the type mismatch fails with `EPROTOTYPE`
+*before* the stream-only backlog and `listen` checks are reached.
+
+| datagram `connect` result | Verdict |
+|---|---|
+| `ECONNREFUSED` | `Stale`: no socket is attached to the file, so its owner has closed it or died |
+| `EPROTOTYPE`, `0` | `Live`: a stream socket (or a datagram one) is bound there |
+| `ENOENT`, `ENOTDIR` | `Absent`: the file went away between the two probes |
+| anything else | `Unknown(errno)`: refuse (fail closed), as above |
+
+A socket file is therefore removed on these targets only when *both* a stream
+and a datagram connect are refused. The datagram probe never creates a
+connection on the other side, so it adds no connection metrics and no
+`peer_uid_check` log.
+
+This was observed on macOS (XNU 12377, Darwin 25.6). A listener with a full
+backlog, and a socket that is bound but not listening, both answer the stream
+connect with `ECONNREFUSED` and the datagram connect with `EPROTOTYPE`. A
+dropped listener's file, and a SIGKILLed process's file, answer `ECONNREFUSED`
+to both. The unit tests `full_backlog_listener_is_live_not_stale` and
+`bound_but_not_listening_socket_is_live_not_stale` pin this.
+
+For FreeBSD, OpenBSD and NetBSD the same ordering is taken from their
+`unp_connect` source; it is untested here. Those targets refuse every
+connection anyway ([platform support](../platform-support.md)). On Linux the
+stream verdict is unambiguous (a full backlog is `EAGAIN`, so `Live`), and the
+attachment probe does not run there.
+
+An earlier version re-probed a refused socket three times at 50 ms intervals
+and called it stale if every probe was refused. A live daemon whose backlog
+stayed full for 150 ms lost its socket to a second instance that had the same
+`socket_path` but a different `wab_dir`. The `wab_dir` lock cannot catch that
+case (conf-security-7).
 
 The probe runs twice on a normal start:
 
