@@ -910,7 +910,7 @@ fn platform_fsync(file: &File) -> io::Result<()> {
 #[cfg(not(windows))]
 pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        File::open(dir)?.sync_all()?;
+        sync_path(dir)?;
     }
     Ok(())
 }
@@ -918,6 +918,96 @@ pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// Opens `path` (a file, or a directory on Unix) and fsyncs it with `sync_all`.
+///
+/// The one place the sidecar and directory syncs that guard a delete go
+/// through, so a test can fail them ([`sync_hook`]): the fault replaces the
+/// sync itself, so a caller that is ever changed to ignore the result is
+/// caught by the test, not hidden by it.
+pub(crate) fn sync_path(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = sync_hook::on_sync(path) {
+        return Err(e);
+    }
+    File::open(path)?.sync_all()
+}
+
+/// Test-only fault injection and observation for [`sync_path`] (and so for
+/// [`fsync_parent_dir`]), keyed by the path being synced — the file, or the
+/// directory for a directory fsync — so concurrently running tests (each in
+/// its own scratch dir) never see each other's faults. Only registered paths
+/// are tracked.
+#[cfg(test)]
+pub(crate) mod sync_hook {
+    use std::{
+        collections::HashMap,
+        io,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    struct Entry {
+        errno: i32,
+        fail_left: u32,
+        calls: u64,
+    }
+
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Entry>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashMap<PathBuf, Entry>) -> R) -> R {
+        let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashMap::new))
+    }
+
+    /// Fails the next `times` syncs of `path` with `errno` (`u32::MAX` = until
+    /// cleared), counting every sync.
+    pub(crate) fn fail(path: &Path, errno: i32, times: u32) {
+        with(|m| {
+            m.insert(
+                path.to_path_buf(),
+                Entry {
+                    errno,
+                    fail_left: times,
+                    calls: 0,
+                },
+            )
+        });
+    }
+
+    /// Stops failing `path`, keeping the count.
+    pub(crate) fn clear(path: &Path) {
+        with(|m| {
+            if let Some(e) = m.get_mut(path) {
+                e.fail_left = 0;
+            }
+        });
+    }
+
+    /// How many syncs of `path` were attempted since it was registered.
+    pub(crate) fn calls(path: &Path) -> u64 {
+        with(|m| m.get(path).map_or(0, |e| e.calls))
+    }
+
+    /// Stops tracking `path`.
+    pub(crate) fn forget(path: &Path) {
+        with(|m| m.remove(path));
+    }
+
+    pub(super) fn on_sync(path: &Path) -> Option<io::Error> {
+        with(|m| {
+            let e = m.get_mut(path)?;
+            e.calls += 1;
+            if e.fail_left == 0 {
+                return None;
+            }
+            if e.fail_left != u32::MAX {
+                e.fail_left -= 1;
+            }
+            Some(io::Error::from_raw_os_error(e.errno))
+        })
+    }
 }
 
 #[cfg(test)]

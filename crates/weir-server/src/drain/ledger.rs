@@ -217,14 +217,27 @@ pub(crate) struct SegmentLedger {
     /// Not re-queued this run.
     parked: HashMap<PathBuf, ParkReason>,
     /// Segment-class local read failures (§4.1, §4.2).
-    local_read_failures: HashMap<PathBuf, u32>,
+    local_read_failures: HashMap<PathBuf, LocalReadFailures>,
     /// Per-segment cool-down (§4.6).
     not_before: HashMap<PathBuf, Instant>,
     /// Drain panics while this segment was in flight (§4.12).
     panic_count: HashMap<PathBuf, u32>,
     /// The segment being processed when a panic unwinds (§4.12).
     in_flight: Option<PathBuf>,
+    /// When the latest attempt began. A segment's local read failures are aged
+    /// to this instant, not to "now", so the escalation decided after an
+    /// attempt and the `last_local_read_chance` decided before it always agree.
+    attempt_started: Instant,
     counts: Arc<LedgerCounts>,
+}
+
+/// A segment's segment-class local read failures in this run.
+#[derive(Clone, Copy, Debug)]
+struct LocalReadFailures {
+    count: u32,
+    /// When the first of them was counted: escalation also needs this to be
+    /// old enough (conf-regressions-8), so a short blip never escalates.
+    first_at: Instant,
 }
 
 impl SegmentLedger {
@@ -240,6 +253,7 @@ impl SegmentLedger {
             not_before: HashMap::new(),
             panic_count: HashMap::new(),
             in_flight: None,
+            attempt_started: Instant::now(),
             counts,
         };
         ledger.sync_counts();
@@ -294,6 +308,41 @@ impl SegmentLedger {
             || self.quarantine_pending.contains_key(path)
             || self.parked.contains_key(path)
             || self.not_before.get(path).is_some_and(|&at| now < at)
+    }
+
+    /// Checks a resume point the drain carried OUTSIDE the ledger against the
+    /// cursor's `(dev, ino)` pin, as [`Self::admit`] does for a path it admits
+    /// (cont-durability-1). The `RetryingTransient` and `BlockedDeadLetterFull`
+    /// states carry `processed` themselves and never pass through admission, so
+    /// without this a file replaced between attempts had its first `skip`
+    /// records skipped, and was then confirmed and deleted without them.
+    ///
+    /// Returns `skip` unchanged unless the cursor's pin positively names another
+    /// file: then the cursor is discarded and the new file starts at record 0.
+    /// A missing cursor (the stat failed when it was recorded) or a file that
+    /// cannot be stat'ed now keeps `skip`, as before: resetting on an
+    /// unproven mismatch would re-deliver the prefix of the SAME file.
+    pub(crate) fn checked_skip(&mut self, path: &Path, skip: u64) -> u64 {
+        if skip == 0 {
+            return 0;
+        }
+        let Some(cursor) = self.resume_from.get(path).copied() else {
+            return skip;
+        };
+        match file_identity(path) {
+            Some(id) if id != (cursor.dev, cursor.ino) => {
+                warn!(
+                    path = %path.display(),
+                    skip,
+                    "drain: the segment file was replaced since its resume cursor was recorded; \
+                     the new file is processed from its first record"
+                );
+                self.resume_from.remove(path);
+                self.sync_counts();
+                0
+            }
+            _ => skip,
+        }
     }
 
     /// Records that the first `processed` records of `path` are durably handled,
@@ -352,6 +401,7 @@ impl SegmentLedger {
     /// the sink commits.
     pub(crate) fn begin_attempt(&mut self, path: &Path) {
         self.in_flight = Some(path.to_path_buf());
+        self.attempt_started = Instant::now();
     }
 
     /// Clears the in-flight segment: the attempt returned without panicking.
@@ -384,23 +434,42 @@ impl SegmentLedger {
     /// Counts one local read failure of `path` and returns the running total.
     /// `Process`-class errors are daemon-wide, not a property of the segment,
     /// so they never count.
+    ///
+    /// The first counted failure of `path` also records when the failing
+    /// began, for [`Self::local_read_failing_for`].
     pub(crate) fn note_local_read_failure(&mut self, path: &Path, class: ErrClass) -> u32 {
         if class == ErrClass::Process {
-            return self.local_read_failures.get(path).copied().unwrap_or(0);
+            return self.local_read_failures(path);
         }
-        let n = self
+        let f = self
             .local_read_failures
             .entry(path.to_path_buf())
-            .or_insert(0);
-        *n = n.saturating_add(1);
-        *n
+            .or_insert(LocalReadFailures {
+                count: 0,
+                first_at: Instant::now(),
+            });
+        f.count = f.count.saturating_add(1);
+        f.count
     }
 
     /// The running count of segment-class local read failures of `path`, without
     /// counting one. The drain asks before an attempt whether the next failure
     /// would escalate (spec §4.2).
     pub(crate) fn local_read_failures(&self, path: &Path) -> u32 {
-        self.local_read_failures.get(path).copied().unwrap_or(0)
+        self.local_read_failures.get(path).map_or(0, |f| f.count)
+    }
+
+    /// How long `path` had been failing local reads when the latest attempt
+    /// began: from its first counted failure in this run to the start of the
+    /// attempt. Zero when it has none, or when the first one came during that
+    /// attempt. Escalation needs this to reach the drain's min age as well as
+    /// the count to reach its limit (conf-regressions-8).
+    pub(crate) fn local_read_failing_for(&self, path: &Path) -> std::time::Duration {
+        self.local_read_failures
+            .get(path)
+            .map_or(std::time::Duration::ZERO, |f| {
+                self.attempt_started.saturating_duration_since(f.first_at)
+            })
     }
 
     /// Stores what `path` still owes the dead-letter directory, pinned to the
@@ -779,6 +848,40 @@ mod tests {
         l.record_progress(&path, 0);
         assert_eq!(l.counts().resume_cursors.load(Ordering::Relaxed), 0);
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// cont-durability-1: the same pin check for a resume point a drain state
+    /// carried, which never passes through `admit`. Only a positive mismatch
+    /// resets: with no cursor to compare against, the carried value stands.
+    #[test]
+    fn checked_skip_resets_only_a_skip_whose_cursor_names_another_file() {
+        let (dir, path) = file("checked_skip");
+        let mut l = ledger();
+        assert_eq!(l.checked_skip(&path, 0), 0);
+        assert_eq!(
+            l.checked_skip(&path, 4),
+            4,
+            "no cursor: nothing to disprove"
+        );
+
+        l.record_progress(&path, 4);
+        assert_eq!(l.checked_skip(&path, 4), 4, "same file: resume past it");
+        assert_eq!(l.counts().resume_cursors.load(Ordering::Relaxed), 1);
+
+        let tmp = dir.join("replacement.tmp");
+        std::fs::write(&tmp, b"a different segment").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        assert_eq!(
+            l.checked_skip(&path, 4),
+            0,
+            "a replaced file is processed from its first record"
+        );
+        assert_eq!(
+            l.counts().resume_cursors.load(Ordering::Relaxed),
+            0,
+            "the stale cursor is discarded"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

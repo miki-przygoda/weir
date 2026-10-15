@@ -146,12 +146,17 @@ nothing new is persisted.
   into `weir-ctl quarantine requeue`. Only `InvalidData`/`UnexpectedEof`
   (corruption) still take that path. Any other read error, mid-segment or on
   the footer, is a transient local-read failure that commits nothing partial
-  and resumes past the durable prefix. A persistent error escalates after 3
-  strand cycles (`(sink_max_retries + 1) × 3` failures): a media-class error
-  (`EIO` and similar) delivers the prefix once and quarantines, a
-  permission-class error (`EACCES`, a directory at the sealed path) parks the
-  segment as `local_read_failed`. Process-class errors (`EMFILE`, `ENOMEM`)
-  never escalate, so fd pressure heals as before.
+  and resumes past the durable prefix. A persistent error escalates once it
+  has lasted both 3 strand cycles (`(sink_max_retries + 1) × 3` failures) and
+  10 minutes since the segment's first local read failure in the run: a
+  media-class error (`EIO` and similar) delivers the prefix once and
+  quarantines, a permission-class error (`EACCES`, a directory at the sealed
+  path) parks the segment as `local_read_failed`. The 10 minutes keep a device
+  blip (a remount, a path flap, a `chown -R` during maintenance) from
+  quarantining or parking a good segment, which the cycle count alone did
+  about a minute in at the defaults; the segment keeps retrying and delivers
+  once the fault clears. Process-class errors (`EMFILE`, `ENOMEM`) never
+  escalate, so fd pressure heals as before.
 
 - **A strand re-delivered a segment's committed prefix.** The resume cursor now
   survives a strand within a run: it is pinned to the file's `(dev, ino)` in a
@@ -159,8 +164,11 @@ nothing new is persisted.
   re-admitted segment resumes past what it already committed. Every path the
   drain receives, from its queue or the rescan, passes one admission filter,
   so a copy of a path still in the channel can no longer bypass a disposition,
-  a park or a cool-down. The duplicate window for a stranded segment is now a
-  restart, not every strand (`docs/sinks/s3.md` says so).
+  a park or a cool-down. The pin is checked on every attempt, including the
+  retry and the unblock that carry the cursor in the drain's state, so a file
+  replaced at the same path is processed from its first record. The duplicate
+  window for a stranded segment is now a restart, not every strand
+  (`docs/sinks/s3.md` says so).
 
 - **A `.confirmed` sidecar that could not be written re-delivered the whole
   segment every health poll, and a torn one got a delivered segment
@@ -189,7 +197,8 @@ nothing new is persisted.
   rejected records are now carried in the ledger (bounded at 64 MiB in total;
   past that, the sub-batch is re-committed once with a WARN) and written
   before the next attempt without asking the sink again, the drain unblocks on
-  the predicate that blocked it, and a missing `dead_letter/` is re-created.
+  the predicate that blocked it, and a missing `dead_letter/` is re-created;
+  `wab_dir` is fsynced before any record is written into it.
 
 - **A plain-mode duplicate key livelocked the MySQL and Postgres sinks.** With
   `insert_mode = "plain"`, `ER_DUP_ENTRY` (1062) and `unique_violation`
@@ -359,8 +368,10 @@ Behaviour an operator can notice on upgrade:
 - **`SIGHUP` no longer exits** any daemon; without TLS it is a counted no-op.
 - **Corrupt sealed segment headers are quarantined on the first attempt**;
   newer-format segments are parked as `unsupported_version` instead.
-- **Transient read errors no longer quarantine.** Persistent media errors
-  quarantine after 3 strand cycles; persistent permission errors park.
+- **Transient read errors no longer quarantine.** Media errors that persist
+  for 3 strand cycles and at least 10 minutes quarantine; permission errors
+  that persist as long park. An error at segment open, which 4.0.x retried
+  for the life of the process, is now one of them.
 - **The drain's resume cursor survives strands** within a run.
 - **Orphaned sealed files are deleted**: a `.wab.sealed` beside a valid,
   fsynced `.confirmed` is removed at startup and by the rescan, and the
