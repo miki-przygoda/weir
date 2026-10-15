@@ -1171,10 +1171,16 @@ mod tests {
         // (no _total suffix — prometheus-client appends _total only to counter data lines).
         // Family counters with no initialized label sets produce HELP/TYPE lines only,
         // so checking the base name is correct and sufficient.
-        let expected = [
+        //
+        // Every `reg!` call in `Metrics::new`. The match
+        // is on the whole `# HELP <name> ` line, not a substring, because many
+        // names are prefixes of others (`weir_wab_segments` would otherwise be
+        // satisfied by any `weir_wab_segments_*`).
+        let mut expected = vec![
             "weir_records_accepted",
             "weir_records_ack",
             "weir_records_nack",
+            "weir_accept_latency_seconds",
             "weir_tls_handshake_failures",
             "weir_tls_config_reloads",
             "weir_wab_segments",
@@ -1187,28 +1193,66 @@ mod tests {
             "weir_queue_depth",
             "weir_recovery_records_replayed",
             "weir_recovery_segments_quarantined",
+            "weir_recovery_segments_failed",
+            "weir_recovery_quarantine_copy_failed",
+            "weir_quarantine_bytes_on_disk",
             "weir_dead_letter_bytes_on_disk",
             "weir_dead_letter_full",
             "weir_drain_segments_stranded",
             "weir_drain_segments_resumed",
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
+            "weir_wab_fsync_failures",
+            "weir_wab_flusher_panics",
+            "weir_wab_cap_rejections",
+            "weir_wab_unexpected_mode",
+            "weir_wab_record_logical_bytes",
+            "weir_wab_record_stored_bytes",
+            "weir_wab_group_commit_records",
             "weir_wab_dir_lock_held",
             "weir_wab_dir_lock_integrity_failures",
+            "weir_ack_timeout",
+            "weir_batch_records",
+            "weir_batch_partial",
+            "weir_accept_resource_exhaustion",
+            "weir_connection_idle_timeout",
+            "weir_connection_rejected_peer_uid",
+            "weir_connections_aborted_at_shutdown",
             "weir_config_reloads",
+            "weir_drain_panics",
             "weir_drain_local_io_strands",
             "weir_drain_segments_parked",
             "weir_drain_segments_disposition_pending",
             "weir_drain_confirm_failures",
             "weir_drain_quarantine_failures",
             "weir_drain_dead_letter_write_failures",
+            "weir_drain_busy_seconds",
         ];
-        for name in expected {
+        if cfg!(feature = "bench-trace") {
+            expected.extend([
+                "weir_stage_queue_seconds",
+                "weir_stage_bridge_wait_seconds",
+                "weir_stage_write_seconds",
+                "weir_stage_total_seconds",
+            ]);
+        }
+        for name in &expected {
             assert!(
-                out.contains(name),
+                out.lines()
+                    .any(|l| l.starts_with(&format!("# HELP {name} "))),
                 "metric {name:?} missing from output:\n{out}"
             );
         }
+        // And nothing registered that this list does not name: a new family
+        // has to be added here, or this fails.
+        let registered = out.lines().filter(|l| l.starts_with("# HELP ")).count();
+        assert_eq!(
+            registered,
+            expected.len(),
+            "Metrics::new registers {registered} families but this test names {}; \
+             add the new family to `expected`",
+            expected.len()
+        );
     }
 
     #[test]
