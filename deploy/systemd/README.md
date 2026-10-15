@@ -49,11 +49,80 @@ sudo systemctl status weir          # unit state + recent log lines
 journalctl -u weir -f               # follow logs (tagged SyslogIdentifier=weir)
 journalctl -u weir -t weir          # filter by the syslog tag
 sudo systemctl reload-or-restart weir   # restart (config is read once at startup)
+sudo systemctl kill --signal=SIGHUP weir  # reload TLS material; a counted no-op otherwise
 sudo systemctl stop weir            # graceful SIGTERM shutdown (see below)
 ```
 
 Config is read **once at startup** — there is no hot reload (SIGHUP reloads TLS
 material only). Editing `weir.toml` or `weir.env` requires a restart.
+
+## SIGHUP and why there is no `ExecReload=`
+
+SIGHUP never stops the daemon:
+
+- **During startup** it is ignored. `main` sets SIGHUP to `SIG_IGN` before it
+  reads the config, and it stays ignored through WAB recovery and the startup
+  replay. A HUP in that window is dropped.
+- **Once the runtime is up** each SIGHUP is a reload request, counted in
+  `weir_config_reloads_total{trigger="sighup",outcome=…}`:
+  - **without TLS** (no `tcp_bind`): nothing is reloadable. The daemon logs
+    `SIGHUP received: nothing reloadable in this build/config (config is read
+    once at startup); nothing changed` and counts `outcome="noop"`;
+  - **with TLS** (`tcp_bind` set in a `tls` build): it re-reads the cert, key
+    and CA and counts `outcome="ok"` or `"failed"`, in this counter and in
+    `weir_tls_config_reloads_total`. A failed reload keeps the previous certs.
+
+In 4.0.x and earlier, a daemon without a TLS listener kept the default SIGHUP
+disposition, so `kill -HUP` (or a log-rotation script that signals every
+process) killed it without sealing or draining.
+
+The unit still has **no `ExecReload=`**, on purpose. `systemctl
+reload-or-restart weir` falls back to a restart only while the unit has no
+reload command. With an `ExecReload=` that sent SIGHUP, the same command would
+become a reload that changes nothing but TLS material, while the operator
+believes the edited `weir.toml` took effect. Restart for config changes; send
+SIGHUP explicitly (`systemctl kill --signal=SIGHUP weir`) to rotate
+certificates.
+
+## One daemon per `wab_dir`: exit codes and restarts
+
+Before it touches the WAB, the daemon takes an exclusive `flock` on
+`<wab_dir>/.weir.lock` (here `/var/lib/weir/wab/.weir.lock`). It then runs
+preflight: the socket-path liveness probe, a test-bind of the metrics port and,
+with `tcp_bind`, a TLS load and a test-bind of the TCP address. Every refusal
+happens before recovery.
+
+| Exit status | Meaning | What `Restart=on-failure` does |
+|---|---|---|
+| `1` | Refused to start. Examples: `wab_dir … is locked by another weir-server (pid … on host …, …)`, `socket_path '/run/weir/weir.sock' is in use by a running process`, the metrics port is taken, invalid TLS material, a filesystem that cannot lock. | Restarts every `RestartSec=5`. Each attempt refuses again, before recovery, until the conflict is gone. That is safe: a lock or preflight refusal reads no WAB and delivers nothing. |
+| `3` | WAB ownership lost: the once-a-second lock check found **another** weir-server holding this `wab_dir`'s lock (typically because `.weir.lock` was deleted and a second instance started). The daemon Nacks every new push and exits at once without sealing. | Restarts, then refuses with "locked by" (exit 1) every 5 s while the other instance holds the lock. |
+
+To find the other holder, read the "locked by" line, or `sudo cat
+/var/lib/weir/wab/.weir.lock` (a `key=value` holder record, informational
+only). Stop that instance, or point one of the two at a different `wab_dir`.
+**Never delete `.weir.lock`** to "clear" the error: the lock is the guard, and
+deleting it under a running daemon opens the window the exit-3 path exists
+for. A lock held by a crashed process does not need clearing, because the kernel
+releases it when that process exits.
+
+`systemctl restart weir` is unaffected. systemd waits for the old process to
+exit before it starts the new one, so the new process finds the lock free and
+the old socket removed (or stale, after a crash).
+
+The lock needs the `flock` syscall. The unit's `SystemCallFilter=@system-service`
+with `SystemCallErrorNumber=EPERM` would turn a filtered `flock` into `EPERM`,
+which the daemon treats as a refusal (`cannot lock wab_dir …`). To check what
+your systemd version's set contains:
+
+```bash
+systemd-analyze syscall-filter @system-service | grep -w flock
+```
+
+CI runs the same check against the runner's systemd (the `systemd
+@system-service still allows flock` step in `.github/workflows/ci.yml`). That
+guards the systemd the runner ships, not every host's, so the check above is
+still worth running on an unusual distribution. If you tighten the filter, keep
+`flock` in it.
 
 ## Graceful shutdown: `TimeoutStopSec` vs `shutdown_timeout_secs`
 
@@ -81,8 +150,10 @@ verified against that CA and there is no anonymous TCP path.
 
 Two operational notes specific to bare metal: **firewall the port you publish**
 (there is no container network namespace to hide behind here), and **SIGHUP
-reloads TLS material only** — see "Operate" above — so a certificate rotation
-does not need a restart while a config change still does.
+reloads TLS material only** — see [SIGHUP and why there is no
+`ExecReload=`](#sighup-and-why-there-is-no-execreload) — so a certificate
+rotation (`systemctl kill --signal=SIGHUP weir`) does not need a restart while a
+config change still does.
 
 Full setup, including generating a test CA: [`docs/operations/tcp-mtls.md`](../../docs/operations/tcp-mtls.md).
 

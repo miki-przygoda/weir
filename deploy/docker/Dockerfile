@@ -107,13 +107,19 @@ EXPOSE 9185
 # Note: /run/weir is mounted as a volume so the socket path is accessible
 # to sidecars or host bind-mounts; in a single-container deployment, a
 # tmpfs would be cleaner. The bind hardening (bind_hardened) handles any
-# stale socket from a previous run on the same volume.
+# stale socket from a previous run on the same volume; a socket another
+# daemon is still listening on is never removed (the start refuses instead).
+# One WAB volume = one running daemon: the daemon flocks
+# /var/lib/weir/wab/.weir.lock before reading the WAB, so a second container
+# on the same volume refuses to start ("locked by"). Never delete that file.
 VOLUME ["/var/lib/weir/wab", "/run/weir"]
 
 # Weir's signal handlers expect SIGTERM for graceful shutdown. Make this
 # explicit so orchestrators that override Docker's default still get the
 # clean shutdown path. SIGTERM unwinds the pipeline in dependency order
 # and waits for in-flight connections to drain (shutdown_timeout_secs).
+# SIGHUP never stops it: `docker kill --signal=HUP` reloads TLS material when
+# tcp_bind is set and is a counted no-op otherwise.
 STOPSIGNAL SIGTERM
 
 # Lightweight LIVENESS check using bash's /dev/tcp magic (no extra packages

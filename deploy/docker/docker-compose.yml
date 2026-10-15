@@ -4,10 +4,17 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     image: weir-server:local
+    # Do not scale this service (--scale weir=2) on the shared volumes below.
+    # The fixed host port already stops a second replica; without it, the
+    # replica would refuse to start because the first one holds the wab_dir lock
+    # ("locked by"), and this restart policy would restart it in a loop. Give
+    # each instance its own WAB volume. Exit status 1 = refused to start; 3 = WAB
+    # ownership lost to another instance at runtime.
     restart: unless-stopped
 
     volumes:
-      # WAB segments persist across restarts.
+      # WAB segments persist across restarts. The daemon keeps an exclusive
+      # flock on .weir.lock in this volume while it runs: never delete it.
       - wab_data:/var/lib/weir/wab
       # Unix socket shared with producer containers on the same host.
       - weir_socket:/run/weir
@@ -36,8 +43,8 @@ services:
     user: weir
 
     healthcheck:
-      # The metrics endpoint doubles as a liveness probe — it only binds after
-      # the socket is bound and the pipeline is running.
+      # The metrics endpoint doubles as a liveness probe. It binds after WAB
+      # recovery and the startup replay, shortly before the producer socket.
       #
       # The runtime image (debian:bookworm-slim) ships ONLY ca-certificates —
       # there is NO wget or curl — so an HTTP-client probe would always fail with

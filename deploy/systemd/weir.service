@@ -31,7 +31,9 @@ Group=weir
 
 # /run/weir is the socket's PARENT directory. systemd creates and chowns it to
 # weir:weir on every start; the 0700 mode is load-bearing for weir's bind
-# security model (see docs/security/socket-bind.md) — DO NOT loosen it.
+# security model (see docs/security/socket-bind.md) — DO NOT loosen it. A stale
+# socket left by a crash is removed at the next start; a socket another process
+# is still listening on is never removed (the start refuses instead).
 RuntimeDirectory=weir
 RuntimeDirectoryMode=0700
 
@@ -68,8 +70,19 @@ ExecStart=/usr/local/bin/weir-server --config /etc/weir/weir.toml
 KillSignal=SIGTERM
 TimeoutStopSec=35
 
+# Exit status 1 = refused to start (wab_dir locked by another weir-server, a
+# live socket at socket_path, metrics/TCP port taken, bad TLS material). These
+# are checked BEFORE recovery, so a restart loop on them delivers nothing.
+# Exit status 3 = WAB ownership lost to another instance at runtime; the restart
+# then refuses with "locked by" until that instance stops. See README.md.
 Restart=on-failure
 RestartSec=5
+
+# Deliberately NO ExecReload=. Config is read once at startup, so
+# `systemctl reload-or-restart weir` must stay a restart. SIGHUP never stops the
+# daemon: it reloads TLS material when tcp_bind is set and is a counted no-op
+# otherwise (weir_config_reloads_total). Rotate certs with
+# `systemctl kill --signal=SIGHUP weir`.
 
 # ── Resource limits ──────────────────────────────────────────────────────────
 # weir uses one spawn_blocking slot per producer connection; max_connections
@@ -105,6 +118,10 @@ RestrictSUIDSGID=true
 LockPersonality=true
 # weir never JITs or maps W+X pages.
 MemoryDenyWriteExecute=true
+# The wab_dir lock (<wab_dir>/.weir.lock) needs flock(2). If a filter ever
+# denies it, flock fails with EPERM and the daemon refuses to start. Check with
+# `systemd-analyze syscall-filter @system-service | grep -w flock` (CI runs the
+# same check against the runner's systemd).
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 # AF_UNIX for the producer socket; AF_INET/AF_INET6 for /metrics and outbound
