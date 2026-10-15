@@ -114,8 +114,17 @@ recovery → replay → runtime. The lock is `flock(LOCK_EX | LOCK_NB)` on
 `<wab_dir>/.weir.lock` (`crates/weir-server/src/wab/lock.rs`):
 
 - The file is opened `O_NOFOLLOW`, created at mode 0600, and must be a regular
-  file. A symlink (`ELOOP`), a directory, a FIFO or a device at that path
-  refuses startup; a mode other than 0600 is a WARN.
+  file with exactly one hard link, owned by the daemon's uid. A symlink
+  (`ELOOP`), a directory, a FIFO, a device, a hard link (which the record
+  write would otherwise truncate through) or a file another uid owns (whose
+  owner could loosen it and hold the lock while the daemon is down) refuses
+  startup before the `flock`, and nothing is written to it. A file of ours
+  with a mode other than 0600 is set to 0600 once the lock is held, with a
+  WARN.
+- The holder record read back from the file is untrusted: only the first
+  4 KiB is parsed, control and bidi formatting characters are stripped, and a
+  value over 256 bytes is dropped, so a forged record cannot put escape
+  sequences on a terminal through the refusal message.
 - The holder record (`pid`, `host`, `started_unix`, `boot_id` on Linux,
   `version`, `socket_path`, `metrics`) is written **only after** the lock is
   held, so a refused contender never truncates the owner's record. The record
@@ -128,8 +137,11 @@ recovery → replay → runtime. The lock is `flock(LOCK_EX | LOCK_NB)` on
   filesystem that **cannot** lock (`ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`, `ENOSYS`,
   `EINVAL`): `"required"` (the default) refuses to start, and `"best-effort"`
   WARNs on every start, sets `weir_wab_dir_lock_held` to 0 and runs with **no**
-  guard. Any other error refuses, whatever the policy. Examples: `EACCES` on a
-  lock file owned by another user, `EROFS`, and `EPERM` from a seccomp filter.
+  guard. Any other error refuses, whatever the policy. Examples: a lock file
+  owned by another user (the message names its uid and the `chown` that fixes
+  it), `EROFS`, and `EPERM` from a seccomp filter. On a mount that maps owners
+  (NFS `root_squash`, CIFS or FUSE `uid=`) even a file the daemon just created
+  reports another owner and is refused; that fails closed.
 - `flock` locks the inode in the local kernel, so bind mounts, overlayfs,
   symlinked paths and containers on one host that share a volume all conflict
   correctly.
@@ -151,15 +163,16 @@ stale socket. At shutdown the daemon removes the socket file only if the
 path still names the inode it bound, so it does not delete a successor's
 socket. Mechanism: [`socket-bind.md`](socket-bind.md#stale-socket-removal-and-the-liveness-probe).
 
-**Proven ownership loss fails closed.** Once the runtime is up, a separate
-task checks the lock every second. It compares the `(dev, ino)` at the lock
+**Proven ownership loss fails closed.** From right after acquisition (through
+preflight, recovery and the startup replay, not only once the runtime is up),
+a separate thread checks the lock every second. It compares the `(dev, ino)` at the lock
 path with the held fd and re-issues `flock` on the held fd. The verdicts:
 
 | Verdict | What the daemon does |
 |---|---|
 | Intact | Nothing. |
-| File deleted or replaced, and nobody else holds the new one | Re-creates and re-locks it. ERROR log ending `Never delete the lock file of a running daemon`, and `weir_wab_dir_lock_integrity_failures_total` +1. Keeps running. |
-| Another open file description holds the lock (on the held fd, or on the re-created file) | **Proof that a second writer owns the directory.** The daemon raises an in-memory flag, so every new push on the Unix and TCP listeners is Nacked `InternalError` before it reaches the queue (`weir_records_nack_total{reason="internal_error"}`). It then sets `weir_wab_dir_lock_held` to 0, logs `CRITICAL: wab_dir ownership lost: …` naming the other holder, and exits with status **3** at once. It does not seal, because the segments are the other daemon's now, and there is no grace period, because a grace only lengthens the window of knowing false acks. |
+| File deleted (re-created with `O_EXCL`, so a file planted meanwhile is never adopted), or replaced by one nobody holds whose record does not name another daemon | Re-creates or re-locks it. ERROR log ending `Never delete the lock file of a running daemon`, and `weir_wab_dir_lock_integrity_failures_total` +1. Keeps running. |
+| Another open file description holds the lock (on the held fd, or on the re-created file), or the replacement nobody holds carries another daemon's record (that daemon held the directory and exited; its record is left in place). Both are checked before the hard-link and owner checks, which only gate writing this daemon's record, so a second daemon running as another uid is still caught | **Proof that a second writer owns the directory.** The daemon raises an in-memory flag, so every new push on the Unix and TCP listeners is Nacked `InternalError` before it reaches the queue (`weir_records_nack_total{reason="internal_error"}`). It then sets `weir_wab_dir_lock_held` to 0, logs `CRITICAL: wab_dir ownership lost: …` naming the other holder, and exits with status **3** at once. It does not seal, because the segments are the other daemon's now, and there is no grace period, because a grace only lengthens the window of knowing false acks. |
 | Any other error | ERROR log and `weir_wab_dir_lock_integrity_failures_total` +1. Retried on the next tick. |
 
 Exit status 3 is distinct from 1 (refused to start). Under the shipped
@@ -175,9 +188,11 @@ loud.
   first daemon's active segments. Durable records the first daemon acks
   between that recovery and its own exit can be false acks. Records it had
   already fsynced into files the second daemon recovers are delivered by the
-  second daemon. The integrity task starts with the runtime, after recovery
-  and the startup replay, so a deletion during those phases is caught only
-  at the first check after them. Detection cannot close this window. The only
+  second daemon. The integrity check runs on its own thread from right after
+  the lock is taken, so the window is the same during recovery and a long
+  startup replay (when the socket and metrics port are not bound yet and a
+  duplicate with an identical config would pass preflight): proven loss there
+  exits 3 before anything is served. Detection cannot close this window. The only
   defence is **never delete `.weir.lock`**. It is a dotfile, so `rm -rf wab/*`
   does not match it under default shell globbing. Alert on any increase of
   `weir_wab_dir_lock_integrity_failures_total`.
@@ -192,7 +207,7 @@ loud.
   there, but it is not a supported guard.
 - **`wab_dir_lock = "best-effort"`.** On a filesystem that cannot lock, this
   runs with no single-ownership guard at all. `weir_wab_dir_lock_held` reads 0
-  for the life of the process, and the integrity task does not run.
+  for the life of the process, and the integrity check does not run.
 - **The socket probe is a real connection.** Probing a live daemon connects
   to it. That bumps the live daemon's connection metrics. Under
   `peer_uid_check`, a probe from a different uid is refused and logged there

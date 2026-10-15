@@ -55,15 +55,16 @@ WAB (`src/main.rs`):
 umask 0o077 + SIGHUP ignored
 → Config::load → tracing → "config source", "weir starting"
 → wab_dir lock         flock(LOCK_EX|LOCK_NB) on <wab_dir>/.weir.lock   (src/wab/lock.rs)
+→ Metrics::new → lock-integrity thread (1 s, from here to exit)
 → preflight            socket_path format + length, non-socket refusal, connect-only
                        liveness probe (never unlinks), metrics test-bind,
                        [tls + tcp_bind: TLS load + TCP test-bind]       (src/preflight.rs)
-→ Metrics::new → queue → drain channel
+→ queue → drain channel
 → wab::spawn           crash recovery of active segments, flushers
 → workers → drain thread (+ its SegmentLedger)
 → replay of sealed-but-unconfirmed segments into the drain channel
 → tokio runtime:
-    reload loop + SIGHUP handler → lock-integrity task (1 s) → metrics bind
+    reload loop + SIGHUP handler → metrics bind
     → WAB / drain-liveness poll → [TLS load + TCP listener] → SIGTERM/Ctrl-C
     → socket::run      bind_hardened: probe, unlink only a stale socket, bind
 → joins (workers → flushers → drain) → exit; the kernel releases the lock
@@ -108,7 +109,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.
 - SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer receives a `CancellationToken` and drains the `JoinSet` before returning.
 - SIGHUP is ignored (`SIG_IGN`) from the top of `main` and handled once the runtime exists, through the one reload path in `src/reload.rs`: a TLS reload when TLS is loaded, otherwise a logged no-op. Both count in `weir_config_reloads_total{trigger,outcome}`. SIGHUP never terminates the daemon.
-- Each push checks one `AtomicBool`, `wab_ownership_lost`, before the WAB-cap check; once the lock-integrity task has proven another daemon owns the `wab_dir`, pushes are NACKed `InternalError` and the process exits 3.
+- Each push checks one `AtomicBool`, `wab_ownership_lost`, before the WAB-cap check; once the lock-integrity thread has proven another daemon owns the `wab_dir`, pushes are NACKed `InternalError` and the process exits 3.
 
 ### Work queue (`src/queue.rs`)
 
@@ -134,7 +135,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - One flusher thread per shard; each holds an active `WabSegment`.
 - Two durability tiers. `Durable` upholds "ack ⇒ durable": it group-fdatasyncs at the batch boundary before acking every record in the batch. `Buffered` trades durability for latency — it acks after the in-memory write, before any fsync, so it does **not** uphold "ack ⇒ durable" (a Buffered ack survives a process crash but not power loss). (Historically there was a third tier: `Sync` fsynced once per record while `Batched` fsynced once per batch, until both moved onto the same batch-boundary group fsync and the distinction between them stopped existing — one fsync at the end of the batch already covered every record written during it, so a single-producer serial workload saw no difference, and under concurrent producers `Sync` amortised into the group fsync just like `Batched`. weir 2.0 removed the now-redundant tier: wire byte `0x02` is retired and permanently reserved, still decodes to `Durable` for old producers, and is never emitted by the encoder. See [wire_protocol.md → Durability tiers](wire_protocol.md#durability-tiers).)
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
-- Ownership: `src/wab/lock.rs` takes an exclusive `flock` on `<wab_dir>/.weir.lock` before anything reads the WAB, keeps the fd in a process-wide static until exit (never released explicitly, never unlinked, never re-opened), and is re-checked once a second by its own task: a deleted or replaced lock file nobody else holds is re-created and re-locked; one another instance holds is proof of lost ownership, and the daemon exits 3 without sealing. `wab_dir_lock = "best-effort"` only covers a filesystem that cannot lock; then orphan deletion is off. File format: [wab_format.md](wab_format.md#the-wab_dir-lock-file).
+- Ownership: `src/wab/lock.rs` takes an exclusive `flock` on `<wab_dir>/.weir.lock` before anything reads the WAB, keeps the fd in a process-wide static until exit (never released explicitly, never unlinked, never re-opened), and is re-checked once a second by its own thread from right after acquisition (so through recovery and the startup replay too): a deleted lock file is re-created (`O_EXCL`) and re-locked, and a replacement nobody holds is re-locked unless its record names another daemon; one another instance holds, or one carrying another daemon's record, is proof of lost ownership, and the daemon exits 3 without sealing. `wab_dir_lock = "best-effort"` only covers a filesystem that cannot lock; then orphan deletion is off. File format: [wab_format.md](wab_format.md#the-wab_dir-lock-file).
 - Path validation (`validate_path`) is consolidated in `src/config/mod.rs` and used for `wab_dir` and `socket_path` at config-load time. The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
 
 ### Sink (`src/sink/`)
@@ -263,7 +264,7 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 
 Each test spawns a real `weir-server` binary via `env!("CARGO_BIN_EXE_weir-server")` with its own temp directory, socket path, WAB directory, and metrics port. A global process mutex serialises server spawning so the suite runs safely with any `--test-threads` value. Tests are written against the client library (`weir-client`) and the raw wire protocol where needed.
 
-Coverage includes: basic push/ack round-trips, both durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, a second daemon refused on a live socket or a locked `wab_dir` (and the first one's ownership-loss exit when the lock file is stolen), refused duplicates delivering nothing, SIGHUP surviving at every startup phase, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
+Coverage includes: basic push/ack round-trips, both durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, a second daemon refused on a live socket or a locked `wab_dir` (and the first one's ownership-loss exit when the lock file is stolen, at runtime or during a blocked startup replay), refused duplicates delivering nothing, SIGHUP surviving at every startup phase, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
 
 **Load tests** (`crates/weir-server/tests/load.rs`):
 

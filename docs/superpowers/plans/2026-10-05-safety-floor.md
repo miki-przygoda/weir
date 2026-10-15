@@ -155,6 +155,11 @@ Per task, the loop is: write the failing test, run it to see it fail, implement,
 - [ ] **Step 4: System test** `lock_file_stolen_by_second_daemon_fails_closed`, following spec §3.1 steps 1-4: A's exit status is 3, and any push in the window is NACKed, never acked.
 - [ ] **Step 5: Run the full server unit and system suites. Commit** as `fix(wab): fail closed when another instance provably owns the wab_dir`.
 
+**Revised in review (2026-10-05 adversarial review; the spec's §3.1 has the detail).** As built, Task 2 differs from the steps above:
+- The check runs on a std thread (`weir-lock-integrity`) spawned in `main` right after `acquire_wab_dir_lock`, not a task in `rt.block_on`, so it covers preflight, recovery and the startup replay (conf-durability-3; system test `lock_stolen_during_startup_replay_fails_closed_before_serving`).
+- The re-create goes through one opener, `open_lock_path` (`lock_module_never_reopens_path` pins it): `O_EXCL` for a missing file; for a replaced one, a same-`fstat`-id check first (`Ok` plus a kept alias fd, conf-regressions-12), then `flock` and a read of the record before any write (another daemon's record is `LostToOther`, conf-durability-2), and only then the hard-link and owner vet as the gate on writing (conf-security-5, cont-security-2). The proof precedes the vet so a second daemon running as another uid is `LostToOther`, not an error retried while acks continue.
+- A source-check unit test in `main.rs` pins that the integrity thread and both listener configs share one ownership `Arc` (conf-tests-14).
+
 ### Task 3: socket ownership: probe, BoundSocket, own-inode removal (spec §3.3)
 
 **Files:** Modify `socket/mod.rs` (split `cleanup_existing_socket` into the two functions, add `probe_socket`, have `bind_hardened` return `BoundSocket`, update `run`'s shutdown path at ~286 and `remove_socket_hardened` ~298); `tests/system.rs` (replace `socket_takeover_does_not_corrupt_wab_data` at ~2170-2256).

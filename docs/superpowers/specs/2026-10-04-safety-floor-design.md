@@ -141,6 +141,7 @@ pub(crate) fn check_wab_dir_lock(wab_dir: &Path) -> LockIntegrity; // Ok | Reloc
   - `EWOULDBLOCK` (contention): read the holder record (best effort) and return `LockError::Held`. **Contention is never overridable.**
   - `ENOLCK`, `EOPNOTSUPP`, `ENOTSUP` (distinct from EOPNOTSUPP on macOS, a shipped target), `ENOSYS` or `EINVAL` (the filesystem cannot lock): with `wab_dir_lock = "required"` (the default), refuse to start. With `"best-effort"`, WARN on every start, set the gauge to 0, and continue (D2).
   - Anything else refuses. Examples: EACCES on an existing root-owned lock, EROFS, ELOOP from a symlinked lock path, and EPERM from a seccomp filter.
+- **Vetting the opened file (revised in review: conf-security-5, cont-security-2).** Before the flock, acquisition refuses (exit 1, `LockError::Unsafe`, message starting `cannot lock wab_dir`) a file with more than one hard link (the record write would truncate every other name for it) and a file whose owner is not the daemon's euid (that user could loosen its mode and hold the lock while the daemon is down). An open that fails with EACCES/EPERM on a file another uid owns gets the same owner refusal, which names the uid and the `chown` that fixes it (the `sudo weir-server` leftover). Nothing is written to a refused file. Once the flock succeeds, a file of ours whose mode is not 0600 is `fchmod`ed to 0600 with a WARN. The record read back is untrusted: at most 4 KiB is parsed, control and bidi formatting characters are stripped, and a value over 256 bytes is dropped.
 - **Holder record.** Plain `key=value` lines, no serde, parsed best effort:
   ```
   pid=…
@@ -156,19 +157,24 @@ pub(crate) fn check_wab_dir_lock(wab_dir: &Path) -> LockIntegrity; // Ok | Reloc
   > `wab_dir /var/lib/weir/wab is locked by another weir-server (pid 1234 on host weir-0, started 2026-10-04T10:00:00Z, version 4.1.0, socket /run/weir/weir.sock). Two daemons on one wab_dir corrupt each other's segments and can lose acked records. Stop the other instance or point this one at a different wab_dir.`
 - **Placement.** Immediately after the tracing init and the `weir starting` log line (main.rs ~452-485), and before preflight (3.0), `Metrics::new` (main.rs:~506), the drain channel (main.rs:518) and `wab::spawn` (main.rs:559). The lock comes before every other preflight step on purpose, so a duplicate on the same `wab_dir` reports "locked by" rather than "metrics port in use" or "socket in use".
 - **Storage and lifetime.**
-  - `static WAB_DIR_LOCK: std::sync::Mutex<Option<File>>` (const-constructible). It is touched only at acquisition and by the integrity task, never by the ack path or the drain.
+  - `static WAB_DIR_LOCK: std::sync::Mutex<Option<File>>` (const-constructible). It is touched only at acquisition and by the integrity thread, never by the ack path or the drain. (As built, the slot is a `HeldLock`: the held `File` plus any alias fds proven to name it, below.)
   - It is never released explicitly. The kernel releases it at process exit, which is strictly after the flusher joins and the drain join (main.rs:1252-1258), and it also covers early `?` returns from `main`. A stack guard would drop the lock on those returns while detached flusher and drain threads were still running.
   - A successful re-lock (below) replaces the `File`. The old fd refers to an unlinked inode nobody else can reach, so dropping it is harmless.
   - The lock file is never unlinked: unlink-on-exit opens the classic two-inode race.
 - **Integrity check** (it guards against the lock being defeated by deleting or replacing the file).
-  - It runs in **its own** 1 s `tokio::time::interval` task on `spawn_blocking`. It is not in the 5 s WAB poll, because that task `continue`s past everything when the scan returns `None` (main.rs:990-994), and 4.9 makes `None` more likely.
+  - It runs on **its own** std thread, `weir-lock-integrity`, every 1 s. It is not in the 5 s WAB poll, because that task `continue`s past everything when the scan returns `None` (main.rs:990-994), and 4.9 makes `None` more likely. (Revised in review, conf-durability-3: the first design was a tokio `interval` task spawned in `block_on`, which started only after recovery and the startup replay. During a long replay neither the socket nor the metrics port is bound, so a duplicate with an identical config passes preflight and the ~1 s window became unbounded. The thread is spawned in `main` right after `acquire_wab_dir_lock` when the lock is `Held`, checks once at once, and a panicking check is caught and retried.)
   - Each tick does three things:
-    1. `stat(path)`, comparing (dev, ino) with `fstat(held fd)`.
+    1. `lstat(path)`, comparing (dev, ino) with `fstat(held fd)` and with any alias id already proven to name the held file.
     2. Re-issue `flock(held_fd, LOCK_EX|LOCK_NB)`. On a local filesystem this is a no-op conversion that returns 0. Where flock is emulated with POSIX locks (NFS), it returns EWOULDBLOCK after a lease loss once another client holds the lock.
     3. Classify the result:
        - Match and 0 → `Ok`.
-       - Mismatch or ENOENT, and a re-create plus re-lock **succeeds** → `Relocked`. ERROR log, `weir_wab_dir_lock_integrity_failures_total` +1, the gauge stays 1 after the re-lock. No fail-stop: the file was deleted by hand and nobody else holds it (D4a).
-       - Mismatch or ENOENT and the re-lock gets `EWOULDBLOCK`, or the held-fd flock gets `EWOULDBLOCK` → `LostToOther`. **This is proof that a second writer owns the directory.** See fail-closed below (D4b).
+       - Held-fd flock `EWOULDBLOCK` → `LostToOther`.
+       - Mismatch or ENOENT → the re-create, which as built (revised in review) is:
+         - **ENOENT**: create with `O_CREAT|O_EXCL`, so a file planted after the `lstat` (a hard link included) is never adopted; EEXIST is an error, and the next tick inspects that file as a replacement.
+         - **Mismatch**: open without creating. If its `fstat` id equals the held fd's, the path is the held file and `lstat` and `fstat` merely disagree (overlayfs before Linux 4.19; conf-regressions-12): `Ok`, and the proving fd is kept as an alias (closing it could drop a POSIX-emulated lock) so later ticks open nothing.
+         - Then, on a regular file: `flock`; `EWOULDBLOCK` → `LostToOther`. Then read the record **before** writing anything: a record naming another daemon (pid, host, start time or boot id differ) is proof one held the directory and may have recovered our live segments before exiting → `LostToOther`, record left in place as evidence (conf-durability-2). Only then the hard-link and owner vet, as the gate on writing our record: a failure is an error, and the file is untouched. The proof comes first because a second daemon running as another uid owns its file, and a hard link to its file has two names; vetting first turned that proof into an error retried for ever while acks continued.
+         - Otherwise (an empty or unparseable file, or a copy of our own record) the record is written → `Relocked`. ERROR log, `weir_wab_dir_lock_integrity_failures_total` +1, the gauge stays 1. No fail-stop: the file was deleted by hand and nobody else holds it (D4a).
+       - `LostToOther` is **proof that a second writer owns the directory.** See fail-closed below (D4b).
        - Any other errno → ERROR log and counter. Retry on the next tick.
 - **Fail-closed on proven loss (D4b).** On `LostToOther`:
   1. Store `true` into `wab_ownership_lost: Arc<AtomicBool>`. It is created next to `wab_cap_rejecting` (main.rs:952) and checked in `socket/connection.rs` immediately before both `over_wab_cap` call sites (connection.rs:356, 404) and in the TCP handler. New pushes are NACKed with the existing `WireNack::InternalError` (no wire change) and counted under the existing `records_nack`. This is one `Relaxed` load per push; it takes no lock and cannot delay acks.
@@ -212,7 +218,7 @@ pub(crate) fn check_wab_dir_lock(wab_dir: &Path) -> LockIntegrity; // Ok | Reloc
   - The holder record round-trips.
   - A refused contender does not modify the holder record (byte compare).
   - Injected `ENOLCK` and `ENOTSUP`, through a `cfg(test)` flock hook, refuse under `required` and pass with a WARN under `best-effort`.
-  - `check_wab_dir_lock`: unlink and recreate gives `Relocked`; unlink plus a second process-local OFD taking the new file gives `LostToOther`.
+  - `check_wab_dir_lock`: unlink and recreate gives `Relocked`; unlink plus a second process-local OFD taking the new file gives `LostToOther`. As built, also: a replacement nobody holds carrying another daemon's record gives `LostToOther`; one held by, or left by, a daemon of another uid, or hard-linked, gives `LostToOther`; a foreign-owned or hard-linked replacement with no such evidence is an error and untouched; an `lstat`/`fstat` disagreement on our own file is `Ok`.
   - No in-daemon re-open of the lock path.
 - Unit (connection.rs): with `wab_ownership_lost=true`, a Durable push is NACKed `InternalError` before reaching the queue.
 - System (tests/system.rs): `second_daemon_on_same_wab_dir_is_refused_and_first_keeps_acking`, the owner's reproduction as a regression.
@@ -724,12 +730,12 @@ enum ParkReason { LocalReadFailed, UnsupportedVersion, DrainPanic }
 ```
 umask + SIGHUP=SIG_IGN (main.rs:447-450)
 → Config::load (452) → tracing → "weir starting"
-→ **acquire_wab_dir_lock** (new)
+→ **acquire_wab_dir_lock** (new) → Metrics::new → **lock-integrity thread (1 s)** (new; revised in review, was a task in block_on, and Metrics::new moved up for it)
 → **preflight**: validate_socket_path, socket probe (connect-only), metrics test-bind, [tls: TLS validate + tcp test-bind] (new)
-→ Metrics::new → drain channel (518)
+→ drain channel (518)
 → wab::spawn [recovery] (559) → workers → drain (+ SegmentLedger, BusyGuard)
 → replay (885) → runtime (890)
-→ **spawn reload_loop + SIGHUP task + lock-integrity task (1 s)** (new, first in block_on)
+→ **spawn reload_loop + SIGHUP task** (new, first in block_on)
 → metrics bind (899) → poll task (stall verdict before the scan) → TLS load + register_tls → SIGTERM task (1172)
 → socket::run [probe-and-unlink + BoundSocket] (1215)
 → joins (1252-1258) → exit (kernel releases the lock)

@@ -40,10 +40,20 @@ nothing new is persisted.
   after the "weir starting" line, before the metrics registry and before
   anything reads the WAB. The file is opened `O_NOFOLLOW`, mode 0600, must be a
   regular file, and is never unlinked or released, so the kernel drops the lock
-  at process exit (a `SIGKILL`ed daemon's successor starts normally). A holder
-  record (pid, host, start time, boot id, version, socket, metrics address) is
+  at process exit (a `SIGKILL`ed daemon's successor starts normally). A lock
+  file with more than one hard link (writing the record would truncate every
+  other name for it) or owned by another uid (that user could hold it while
+  the daemon is down) is refused before the `flock`, untouched; the owner
+  refusal names the uid and the `chown` that fixes it, which is what a
+  root-owned file left by a `sudo weir-server` run needs. (On a mount that
+  maps owners, such as NFS `root_squash` or CIFS/FUSE `uid=`, the daemon's own
+  new file reports another owner and is refused too; that fails closed.) A
+  file of ours with a loose mode is set to 0600 once held. A holder record
+  (pid, host, start time, boot id, version, socket, metrics address) is
   written only after the lock is taken, so a refused contender never touches
-  it. Contention refuses to start with exit status 1 and a message naming the
+  it. Read back, the record is untrusted: only 4 KiB is parsed, control and
+  bidi formatting characters are stripped, and a value over 256 bytes is
+  dropped rather than printed. Contention refuses to start with exit status 1 and a message naming the
   holder: `wab_dir <dir> is locked by another weir-server (pid … on host …,
   started …, version …, socket …)`. The regression test is the reproduction: B
   exits 1, A's tree is byte-identical, all 70 records reach the sink; with the
@@ -53,17 +63,32 @@ nothing new is persisted.
   second daemon started afterwards locks a fresh file and recovers the first
   one's active segments. The daemon now re-checks its lock once a second
   (`lstat` against the held fd's `(dev, ino)`, and a re-`flock` of the held fd,
-  which reports `EWOULDBLOCK` after an NFS lease loss). A deleted or replaced
-  file that nobody else holds is re-created and re-locked, with an ERROR and
-  `weir_wab_dir_lock_integrity_failures_total` +1. If the re-lock meets
+  which reports `EWOULDBLOCK` after an NFS lease loss). A deleted file is
+  re-created with `O_EXCL` (a file planted there is never adopted), and a
+  replaced file nobody holds is re-locked, each with an ERROR and
+  `weir_wab_dir_lock_integrity_failures_total` +1. The replacement's record is
+  read before anything is written: a record naming another daemon proves one
+  held the directory (and may have recovered this daemon's segments before
+  exiting), so it is treated like contention and left in place as evidence.
+  The `flock` and that read come before the hard-link and owner checks, which
+  gate only writing this daemon's record: a second daemon running as another
+  uid owns its file, and that is proof of a lost lock, not an error to retry
+  while acks continue. A
+  path whose `lstat` id differs from the held fd's but which opens to the
+  same file (overlayfs before Linux 4.19) is recognised as the held lock, not
+  reported as a rival holding this daemon's own pid. If the re-lock meets
   contention, another instance provably owns the directory: the daemon NACKs
   every new push with the existing `InternalError` (one `Relaxed` atomic load
   per push; no wire change), sets `weir_wab_dir_lock_held` to 0, logs
-  `CRITICAL: wab_dir ownership lost: another weir-server (…) now holds the lock
-  on this wab_dir …`, and exits **3** at once, without sealing, because the
-  segments are the other daemon's now. Detection does not close the window
-  between the unlink and the next tick (at most about a second); only never
-  deleting `.weir.lock` does.
+  `CRITICAL: wab_dir ownership lost: another weir-server (…) holds or held the
+  lock on this wab_dir …`, and exits **3** at once, without sealing, because the
+  segments are the other daemon's now. The check runs on its own thread from
+  right after the lock is taken, so it also covers recovery and a long startup
+  replay, when the socket and metrics port are not bound yet and a duplicate
+  with an identical config would pass preflight; proven loss there exits 3
+  before anything is served. Detection does not close the window between the
+  unlink and the next tick (at most about a second); only never deleting
+  `.weir.lock` does.
 
 - **A daemon that had to refuse to start re-delivered on every restart.** A
   taken metrics port, a live socket, bad TLS material or a taken `tcp_bind`

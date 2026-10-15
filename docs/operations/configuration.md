@@ -252,13 +252,27 @@ The setting covers nothing else:
 - **Contention always refuses**, under both values. If another
   `weir-server` holds the lock, startup fails with `is locked by another
   weir-server`, naming the holder from its record in the lock file.
-- **Any other error refuses**, under both values: `EACCES` on a lock file
-  owned by another user, `EROFS`, `ELOOP` from a symlink at the lock path,
-  a directory or other non-regular file at the lock path, or `EPERM` from a
-  seccomp filter that blocks `flock`. The message starts `cannot lock
-  wab_dir <wab_dir>`.
+- **Any other error refuses**, under both values: a lock file owned by
+  another user, a lock file with more than one hard link, `EROFS`, `ELOOP`
+  from a symlink at the lock path, a directory or other non-regular file at
+  the lock path, or `EPERM` from a seccomp filter that blocks `flock`. The
+  message starts `cannot lock wab_dir <wab_dir>`.
+- **Upgrading after a run as root.** A `sudo weir-server` run on a
+  `wab_dir` the service user owns leaves a root-owned `.weir.lock` behind,
+  and every later start as the service user refuses with `<wab_dir>/.weir.lock
+  is owned by uid 0, not by this daemon's uid <uid>`. With no daemon running
+  on that directory, fix it as root with the command the message prints,
+  `chown <uid> <wab_dir>/.weir.lock`.
+- **Filesystems that report another owner.** The owner check compares the
+  file's uid with the daemon's effective uid. On a mount that maps owners
+  (NFS with `root_squash` for a root daemon, which shows its own files as
+  uid 65534; CIFS or FUSE mounted with `uid=`), even a lock file the daemon
+  has just created reports a different owner, so startup refuses with the
+  owner message and `chown` cannot fix it. Run the daemon as the uid the
+  mount reports, or put the WAB on a local filesystem (the supported
+  setup; see below).
 
-All three refusals happen before recovery, and the process exits with
+All of these refusals happen before recovery, and the process exits with
 status 1.
 
 Without the lock the daemon also keeps orphaned sealed segments (already
@@ -267,10 +281,13 @@ instance may still be confirming them; see
 [wab_format.md](../wab_format.md#post-drain-steady-state).
 
 **While running**, a held lock is checked once a second. If `.weir.lock`
-was deleted or replaced and nobody else holds the new file, the daemon
-re-creates and re-locks it, logs an ERROR and increments
-`weir_wab_dir_lock_integrity_failures_total`. If another instance holds it,
-that is proof a second daemon owns the directory: the daemon refuses every
+was deleted, or replaced by a file nobody holds whose record does not
+name another daemon, the daemon re-creates and re-locks it, logs an ERROR
+and increments `weir_wab_dir_lock_integrity_failures_total`. If another
+instance holds it, or the replacement's record names another daemon (one
+held the directory and has exited since), that is proof a second daemon
+owned the directory, even when that file is owned by another uid or has a
+second hard link (those only stop this daemon writing its record into it): the daemon refuses every
 new push (`InternalError` NACK), logs `CRITICAL: wab_dir ownership lost`,
 and exits with **status 3** at once, without sealing.
 

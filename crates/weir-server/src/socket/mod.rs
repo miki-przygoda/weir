@@ -84,7 +84,7 @@ pub struct SocketConfig {
     pub wab_cap_rejecting: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set once another instance provably owns the `wab_dir`; every push is
     /// then Nacked before it reaches the queue. The SAME `Arc` every listener
-    /// and the `wab_dir` integrity task get.
+    /// and the `wab_dir` integrity thread get.
     pub wab_ownership_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
