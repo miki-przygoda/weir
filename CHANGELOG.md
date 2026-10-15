@@ -164,7 +164,8 @@ nothing new is persisted.
   rejected records are now carried in the ledger (bounded at 64 MiB in total;
   past that, the sub-batch is re-committed once with a WARN) and written
   before the next attempt without asking the sink again, the drain unblocks on
-  the predicate that blocked it, and a missing `dead_letter/` is re-created.
+  the predicate that blocked it, and a missing `dead_letter/` is re-created;
+  `wab_dir` is fsynced before any record is written into it.
 
 - **A plain-mode duplicate key livelocked the MySQL and Postgres sinks.** With
   `insert_mode = "plain"`, `ER_DUP_ENTRY` (1062) and `unique_violation`

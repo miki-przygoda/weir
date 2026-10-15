@@ -215,7 +215,7 @@ BlockedDeadLetterFull
 
 - Permanently rejected records are written to `<wab_dir>/dead_letter/` as sealed WAB segments (shard ID `0xFFFF`), so `SegmentReader` can read them without a separate parser.
 - Files named `dl_NNNNNNNN.wab.sealed`; counter increments per file, persisted across restarts by scanning on open.
-- Running `total_bytes` updated after every write; `rescan()` called on each blocked-state wake to detect files deleted by the operator outside the daemon. A `dead_letter/` directory deleted outright is re-created (total reset to 0, counter kept), by `rescan()` and by a write that meets `ENOENT`.
+- Running `total_bytes` updated after every write; `rescan()` called on each blocked-state wake to detect files deleted by the operator outside the daemon. A `dead_letter/` directory deleted outright is re-created (total reset to 0, counter kept), by `rescan()` and by a write that meets `ENOENT`. `wab_dir` is fsynced before any record is written into a (re-)created `dead_letter/`, so a dead-lettered record, whose source segment is then confirmed and deleted, never sits in a directory whose own entry a power loss could undo.
 - `would_exceed_cap(additional_bytes, cap)` is checked before every write; if it would exceed, the drain enters `BlockedDeadLetterFull` instead, and leaves it only once that same write fits.
 
 ### Metrics (`src/metrics/`)
