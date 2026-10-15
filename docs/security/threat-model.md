@@ -139,7 +139,9 @@ recovery → replay → runtime. The lock is `flock(LOCK_EX | LOCK_NB)` on
   WARNs on every start, sets `weir_wab_dir_lock_held` to 0 and runs with **no**
   guard. Any other error refuses, whatever the policy. Examples: a lock file
   owned by another user (the message names its uid and the `chown` that fixes
-  it), `EROFS`, and `EPERM` from a seccomp filter.
+  it), `EROFS`, and `EPERM` from a seccomp filter. On a mount that maps owners
+  (NFS `root_squash`, CIFS or FUSE `uid=`) even a file the daemon just created
+  reports another owner and is refused; that fails closed.
 - `flock` locks the inode in the local kernel, so bind mounts, overlayfs,
   symlinked paths and containers on one host that share a volume all conflict
   correctly.
@@ -170,7 +172,7 @@ path with the held fd and re-issues `flock` on the held fd. The verdicts:
 |---|---|
 | Intact | Nothing. |
 | File deleted (re-created with `O_EXCL`, so a file planted meanwhile is never adopted), or replaced by one nobody holds whose record does not name another daemon | Re-creates or re-locks it. ERROR log ending `Never delete the lock file of a running daemon`, and `weir_wab_dir_lock_integrity_failures_total` +1. Keeps running. |
-| Another open file description holds the lock (on the held fd, or on the re-created file), or the replacement nobody holds carries another daemon's record (that daemon held the directory and exited; its record is left in place) | **Proof that a second writer owns the directory.** The daemon raises an in-memory flag, so every new push on the Unix and TCP listeners is Nacked `InternalError` before it reaches the queue (`weir_records_nack_total{reason="internal_error"}`). It then sets `weir_wab_dir_lock_held` to 0, logs `CRITICAL: wab_dir ownership lost: …` naming the other holder, and exits with status **3** at once. It does not seal, because the segments are the other daemon's now, and there is no grace period, because a grace only lengthens the window of knowing false acks. |
+| Another open file description holds the lock (on the held fd, or on the re-created file), or the replacement nobody holds carries another daemon's record (that daemon held the directory and exited; its record is left in place). Both are checked before the hard-link and owner checks, which only gate writing this daemon's record, so a second daemon running as another uid is still caught | **Proof that a second writer owns the directory.** The daemon raises an in-memory flag, so every new push on the Unix and TCP listeners is Nacked `InternalError` before it reaches the queue (`weir_records_nack_total{reason="internal_error"}`). It then sets `weir_wab_dir_lock_held` to 0, logs `CRITICAL: wab_dir ownership lost: …` naming the other holder, and exits with status **3** at once. It does not seal, because the segments are the other daemon's now, and there is no grace period, because a grace only lengthens the window of knowing false acks. |
 | Any other error | ERROR log and `weir_wab_dir_lock_integrity_failures_total` +1. Retried on the next tick. |
 
 Exit status 3 is distinct from 1 (refused to start). Under the shipped

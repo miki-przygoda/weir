@@ -457,14 +457,20 @@ enum Recreated {
 ///   adopted (`EEXIST`, an error; the next tick inspects it as a replacement).
 /// - The path names **another file**: open it without creating, and
 ///   1. if it is the held file after all (same `fstat` id), say so (`SameFile`);
-///   2. vet it (regular, one link, our uid), so nothing unsafe is written;
+///   2. refuse anything but a regular file;
 ///   3. `flock` it: contention is a second daemon holding it, `LostToOther`;
 ///   4. read its record BEFORE writing ours: a record naming another daemon is
 ///      proof that one held this wab_dir after our file went (it may have
 ///      recovered our live segments and exited since), so `LostToOther`, and
 ///      its record, the only evidence, is left in place (conf-durability-2).
 ///      An empty or unparseable file, or a copy of our own record, is no such
-///      evidence and is re-locked as a deleted file would be.
+///      evidence and is re-locked as a deleted file would be;
+///   5. only then vet it (one link, our uid) as the gate on writing our
+///      record: a failure is an `Error`, and the file is left untouched.
+///
+///   Steps 3 and 4 write nothing, so they run on a file the vet would refuse:
+///   a second daemon running as another uid owns its file, and that must be
+///   proof of a lost lock, not an error retried while acks continue.
 #[cfg(unix)]
 fn recreate_lock(path: &Path, missing: bool, held_id: (u64, u64), own: &HolderInfo) -> Recreated {
     use std::os::unix::fs::MetadataExt;
@@ -479,14 +485,19 @@ fn recreate_lock(path: &Path, missing: bool, held_id: (u64, u64), own: &HolderIn
     };
     match file.metadata() {
         Ok(m) if (m.dev(), m.ino()) == held_id => return Recreated::SameFile(file),
+        Ok(m) if !m.file_type().is_file() => {
+            return Recreated::Verdict(integrity_error(not_a_regular_file(path)));
+        }
         Ok(_) => {}
         Err(e) => {
             return Recreated::Verdict(LockIntegrity::Error(e.raw_os_error().unwrap_or(libc::EIO)));
         }
     }
-    if let Err(e) = vet_lock_file(&file, path) {
-        return Recreated::Verdict(integrity_error(e));
-    }
+    // The proof of a second owner comes before the safety vet: the flock and
+    // the read write nothing, and a replacement another uid owns, or that has a
+    // second name, is exactly what a second daemon running as another user (or
+    // a hard link to its file) looks like. Vetting first turned that proof into
+    // an `Error` retried for ever while this daemon kept acking.
     if let Err(e) = take_lock(&file, path) {
         return Recreated::Verdict(match e {
             LockError::Held { holder, .. } => LockIntegrity::LostToOther { holder },
@@ -499,6 +510,12 @@ fn recreate_lock(path: &Path, missing: bool, held_id: (u64, u64), own: &HolderIn
         return Recreated::Verdict(LockIntegrity::LostToOther {
             holder: Some(found),
         });
+    }
+    // No evidence of another owner. Only now does the vet gate the WRITE: an
+    // unsafe file is left as it is, and dropping `file` gives back the lock
+    // just taken on it.
+    if let Err(e) = vet_lock_file(&file, path) {
+        return Recreated::Verdict(integrity_error(e));
     }
     write_record(&file, path, own);
     Recreated::Locked(file)
@@ -635,8 +652,12 @@ fn open_lock_path(path: &Path, how: OpenHow) -> Result<File, LockError> {
     })
 }
 
-/// Checks an opened lock file BEFORE it is locked or written: a regular file,
-/// one hard link, owned by this daemon's uid. Any failure leaves it untouched.
+/// Checks an opened lock file before anything is written to it: a regular
+/// file, one hard link, owned by this daemon's uid. Any failure leaves it
+/// untouched. Acquisition runs it before the flock too, so a refused
+/// contender never even locks a file it would not write; the integrity
+/// re-create runs it after the flock and the record read, which write nothing
+/// and are its proof of a second owner ([`recreate_lock`]).
 #[cfg(unix)]
 #[allow(clippy::result_large_err)] // see acquire_wab_dir_lock
 fn vet_lock_file(file: &File, path: &Path) -> Result<(), LockError> {
@@ -648,13 +669,7 @@ fn vet_lock_file(file: &File, path: &Path) -> Result<(), LockError> {
     // A directory fails the open (EISDIR); a FIFO or a device opens fine and
     // must not be locked or written as if it were the record.
     if !meta.file_type().is_file() {
-        return Err(LockError::Io {
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "the lock path exists and is not a regular file",
-            ),
-            path: path.to_path_buf(),
-        });
+        return Err(not_a_regular_file(path));
     }
     // O_NOFOLLOW stops symlinks, not hard links: a hard link planted at the
     // path is a regular file whose other names would be truncated below.
@@ -678,7 +693,20 @@ fn vet_lock_file(file: &File, path: &Path) -> Result<(), LockError> {
     Ok(())
 }
 
-/// `flock(LOCK_EX | LOCK_NB)` on a vetted lock file, classified.
+/// A FIFO, device or socket at the lock path: never locked or written.
+#[cfg(unix)]
+fn not_a_regular_file(path: &Path) -> LockError {
+    LockError::Io {
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the lock path exists and is not a regular file",
+        ),
+        path: path.to_path_buf(),
+    }
+}
+
+/// `flock(LOCK_EX | LOCK_NB)` on an opened lock file, classified. Acquisition
+/// vets the file first; the integrity re-create vets it after, before writing.
 #[cfg(unix)]
 #[allow(clippy::result_large_err)] // see acquire_wab_dir_lock
 fn take_lock(file: &File, path: &Path) -> Result<(), LockError> {
@@ -1722,6 +1750,102 @@ mod tests {
         assert_eq!(fd_id(&slot.as_ref().unwrap().file), before);
         std::fs::remove_file(&lock).unwrap();
         std::fs::remove_file(&victim).unwrap();
+    }
+
+    /// Takes `slot`'s lock file away and gives the path to daemon B, which
+    /// creates and locks a fresh file. Returns B's record and B's fd (`None`
+    /// once B has exited, leaving its record behind).
+    fn steal(dir: &Path, owner: &HolderInfo, b_still_running: bool) -> (HolderInfo, Option<File>) {
+        let lock = dir.join(LOCK_FILE_NAME);
+        std::fs::remove_file(&lock).unwrap();
+        let b = HolderInfo {
+            pid: 4242,
+            started_unix: owner.started_unix + 5,
+            ..holder("weir-b")
+        };
+        let fd = try_lock_path(&lock, &b).expect("B takes the fresh file");
+        (b, b_still_running.then_some(fd))
+    }
+
+    fn assert_lost_to(verdict: LockIntegrity, b: &HolderInfo) {
+        match verdict {
+            LockIntegrity::LostToOther { holder: Some(h) } => assert_eq!(&h, b),
+            v => panic!("expected LostToOther naming B, got {v:?}"),
+        }
+    }
+
+    /// Review of the safety-floor fixes: B runs as ANOTHER uid than A (A as
+    /// root, B as the weir user, say). B's replacement is owned by B, so the
+    /// uid vet refuses it, but that must not hide the proof that B holds the
+    /// directory: the flock comes first, contention is LostToOther, and B's
+    /// record is untouched. Vetting first made this `Error(EPERM)`, retried
+    /// every tick while A kept acking.
+    #[test]
+    fn replacement_held_by_a_foreign_uid_daemon_is_lost_to_other() {
+        let dir = wab_dir("integrity_foreign_uid_held");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("weir-a");
+        let mut slot = held_slot(&dir, &owner);
+        let (b, _b_fd) = steal(&dir, &owner, true);
+
+        let _euid = EuidGuard::set(euid() + 1);
+        assert_lost_to(check_lock_slot(&dir, &mut slot, &owner), &b);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), b.render());
+    }
+
+    /// The same for a foreign-uid B that has since exited: its record is still
+    /// the evidence, read before any vet.
+    #[test]
+    fn replacement_left_by_an_exited_foreign_uid_daemon_is_lost_to_other() {
+        let dir = wab_dir("integrity_foreign_uid_exited");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("weir-a");
+        let mut slot = held_slot(&dir, &owner);
+        let (b, _) = steal(&dir, &owner, false);
+
+        let _euid = EuidGuard::set(euid() + 1);
+        assert_lost_to(check_lock_slot(&dir, &mut slot, &owner), &b);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), b.render());
+    }
+
+    /// A second name for B's held file (a hard link) makes nlink 2. That is a
+    /// reason not to WRITE the file, never a reason to miss that B holds it.
+    #[test]
+    fn hard_linked_replacement_held_by_another_daemon_is_lost_to_other() {
+        let dir = wab_dir("integrity_hardlinked_held");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("weir-a");
+        let mut slot = held_slot(&dir, &owner);
+        let (b, _b_fd) = steal(&dir, &owner, true);
+        let extra = dir.join("extra-name");
+        let _ = std::fs::remove_file(&extra);
+        std::fs::hard_link(&lock, &extra).unwrap();
+
+        assert_lost_to(check_lock_slot(&dir, &mut slot, &owner), &b);
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), b.render());
+        std::fs::remove_file(&extra).unwrap();
+    }
+
+    /// A foreign-owned replacement that carries no other daemon's record, and
+    /// that nobody holds, is still never written: it is an error, retried, and
+    /// the slot keeps the old fd.
+    #[test]
+    fn foreign_owned_replacement_without_evidence_is_an_error_and_untouched() {
+        let dir = wab_dir("integrity_foreign_uid_empty");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("weir-a");
+        let mut slot = held_slot(&dir, &owner);
+        let before = fd_id(&slot.as_ref().unwrap().file);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+
+        let _euid = EuidGuard::set(euid() + 1);
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &owner),
+            LockIntegrity::Error(libc::EPERM)
+        );
+        assert_eq!(std::fs::read(&lock).unwrap(), b"", "nothing written");
+        assert_eq!(fd_id(&slot.as_ref().unwrap().file), before);
     }
 
     /// cont-security-2: a lock file of ours with loose bits (restored from a

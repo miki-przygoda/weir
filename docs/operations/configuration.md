@@ -263,8 +263,16 @@ The setting covers nothing else:
   is owned by uid 0, not by this daemon's uid <uid>`. With no daemon running
   on that directory, fix it as root with the command the message prints,
   `chown <uid> <wab_dir>/.weir.lock`.
+- **Filesystems that report another owner.** The owner check compares the
+  file's uid with the daemon's effective uid. On a mount that maps owners
+  (NFS with `root_squash` for a root daemon, which shows its own files as
+  uid 65534; CIFS or FUSE mounted with `uid=`), even a lock file the daemon
+  has just created reports a different owner, so startup refuses with the
+  owner message and `chown` cannot fix it. Run the daemon as the uid the
+  mount reports, or put the WAB on a local filesystem (the supported
+  setup; see below).
 
-All three refusals happen before recovery, and the process exits with
+All of these refusals happen before recovery, and the process exits with
 status 1.
 
 Without the lock the daemon also keeps orphaned sealed segments (already
@@ -278,7 +286,8 @@ name another daemon, the daemon re-creates and re-locks it, logs an ERROR
 and increments `weir_wab_dir_lock_integrity_failures_total`. If another
 instance holds it, or the replacement's record names another daemon (one
 held the directory and has exited since), that is proof a second daemon
-owned the directory: the daemon refuses every
+owned the directory, even when that file is owned by another uid or has a
+second hard link (those only stop this daemon writing its record into it): the daemon refuses every
 new push (`InternalError` NACK), logs `CRITICAL: wab_dir ownership lost`,
 and exits with **status 3** at once, without sealing.
 

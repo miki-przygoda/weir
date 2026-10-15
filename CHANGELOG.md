@@ -45,9 +45,11 @@ nothing new is persisted.
   other name for it) or owned by another uid (that user could hold it while
   the daemon is down) is refused before the `flock`, untouched; the owner
   refusal names the uid and the `chown` that fixes it, which is what a
-  root-owned file left by a `sudo weir-server` run needs. A file of ours with
-  a loose mode is set to 0600 once held. A holder
-  record (pid, host, start time, boot id, version, socket, metrics address) is
+  root-owned file left by a `sudo weir-server` run needs. (On a mount that
+  maps owners, such as NFS `root_squash` or CIFS/FUSE `uid=`, the daemon's own
+  new file reports another owner and is refused too; that fails closed.) A
+  file of ours with a loose mode is set to 0600 once held. A holder record
+  (pid, host, start time, boot id, version, socket, metrics address) is
   written only after the lock is taken, so a refused contender never touches
   it. Read back, the record is untrusted: only 4 KiB is parsed, control and
   bidi formatting characters are stripped, and a value over 256 bytes is
@@ -67,7 +69,11 @@ nothing new is persisted.
   `weir_wab_dir_lock_integrity_failures_total` +1. The replacement's record is
   read before anything is written: a record naming another daemon proves one
   held the directory (and may have recovered this daemon's segments before
-  exiting), so it is treated like contention and left in place as evidence. A
+  exiting), so it is treated like contention and left in place as evidence.
+  The `flock` and that read come before the hard-link and owner checks, which
+  gate only writing this daemon's record: a second daemon running as another
+  uid owns its file, and that is proof of a lost lock, not an error to retry
+  while acks continue. A
   path whose `lstat` id differs from the held fd's but which opens to the
   same file (overlayfs before Linux 4.19) is recognised as the held lock, not
   reported as a rival holding this daemon's own pid. If the re-lock meets
