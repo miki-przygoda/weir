@@ -343,6 +343,14 @@ nothing new is persisted.
     `segment_read`, `local_fsync`, `dead_letter_write`, `quarantine_move` or
     `dir_scan`, and only the current kind is non-zero.
 
+- **Two alert rules for what `WeirSegmentStranded` can no longer see**, each
+  with a `promtool` test in both directions and a runbook in
+  `docs/monitoring.md`: `WeirDrainLocalIoStrands` (warning) on
+  `increase(weir_drain_local_io_strands_total[15m]) > 0`, local WAB or
+  dead-letter device trouble; and `WeirSegmentParked` (critical) on
+  `weir_drain_segments_parked > 0` for 5m, acked data that is not delivered
+  until a restart.
+
 - **A config-load WARN for `insert_mode = "plain"` without an `id_column`**
   (MySQL and Postgres), naming the cost (every duplicate-key row is
   dead-lettered; an all-duplicate batch can exceed `sink_timeout_secs`) and

@@ -652,3 +652,105 @@ tests:
       - eval_time: 20m
         alertname: WeirWabDirUnlocked
         exp_alerts: []
+
+  # ── Local I/O strands and parked segments ───────────────────────────────────
+  #
+  # Since the safety floor a local-I/O strand no longer feeds
+  # weir_drain_segments_stranded_total, so WeirSegmentStranded cannot see it.
+  # These two rules cover what moved: the event counter of local strands, and
+  # the gauge of segments parked until restart.
+
+  - interval: 1m
+    name: a local read strand fires WeirDrainLocalIoStrands at once, and only for its window
+    input_series:
+      - series: 'weir_drain_local_io_strands_total{job="weir",instance="w:9185",cause="read"}'
+        values: "0 0 1+0x30"
+      # The sibling cause stays flat and must not fire alongside.
+      - series: 'weir_drain_local_io_strands_total{job="weir",instance="w:9185",cause="write"}'
+        values: "0+0x32"
+    alert_rule_test:
+      # `for: 0m`: firing on the first evaluation that sees the step.
+      - eval_time: 2m
+        alertname: WeirDrainLocalIoStrands
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              cause: "read"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir drain stranded a segment on local I/O (read) on w:9185"
+              description: "The drain exhausted sink_max_retries on a LOCAL failure, not a sink failure: cause=read means reading a sealed WAB segment failed, cause=write means writing sink-rejected records into dead_letter/ failed. The data is durable and the drain retries it automatically, but delivery of that segment is paused. Investigate the WAB and dead-letter device (I/O errors, ENOSPC, permissions, descriptor exhaustion), not the sink."
+              runbook: "docs/monitoring.md#weirdrainlocaliostrands"
+      # The 15m window has rolled past the step: quiet again.
+      - eval_time: 20m
+        alertname: WeirDrainLocalIoStrands
+        exp_alerts: []
+
+  - interval: 1m
+    name: flat local-strand counters do not fire, and a sink strand does not fire the local rule
+    input_series:
+      - series: 'weir_drain_local_io_strands_total{job="weir",instance="w:9185",cause="read"}'
+        values: "2+0x20"
+      - series: 'weir_drain_local_io_strands_total{job="weir",instance="w:9185",cause="write"}'
+        values: "0+0x20"
+      - series: 'weir_drain_segments_stranded_total{job="weir",instance="w:9185"}'
+        values: "0 0 1+0x18"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: WeirDrainLocalIoStrands
+        exp_alerts: []
+
+  - interval: 1m
+    name: a parked segment fires WeirSegmentParked after 5m and holds
+    input_series:
+      - series: 'weir_drain_segments_parked{job="weir",instance="w:9185",reason="local_read_failed"}'
+        values: "0 0 1x40"
+      - series: 'weir_drain_segments_parked{job="weir",instance="w:9185",reason="drain_panic"}'
+        values: "0x42"
+    alert_rule_test:
+      # Inside `for: 5m`: pending, not firing.
+      - eval_time: 6m
+        alertname: WeirSegmentParked
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: WeirSegmentParked
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              reason: "local_read_failed"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir parked 1 segment(s) on w:9185 (local_read_failed) — acked data not being delivered"
+              description: "The drain has parked one or more sealed segments: they stay on disk untouched and are not delivered until the daemon restarts. reason=local_read_failed: fix the segment file's permissions or type. reason=unsupported_version: the segment was written by a newer weir; upgrade this binary. reason=drain_panic: the drain panicked twice delivering it; fix the sink or the record it trips on. Then restart the daemon, which replays parked segments from their first record. The ERROR logged at park time names the path."
+              runbook: "docs/monitoring.md#weirsegmentparked"
+      # A gauge, not a counter: still firing long after the park, for as long
+      # as the segment stays parked. An `increase()` form would go quiet here.
+      - eval_time: 40m
+        alertname: WeirSegmentParked
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              reason: "local_read_failed"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir parked 1 segment(s) on w:9185 (local_read_failed) — acked data not being delivered"
+              description: "The drain has parked one or more sealed segments: they stay on disk untouched and are not delivered until the daemon restarts. reason=local_read_failed: fix the segment file's permissions or type. reason=unsupported_version: the segment was written by a newer weir; upgrade this binary. reason=drain_panic: the drain panicked twice delivering it; fix the sink or the record it trips on. Then restart the daemon, which replays parked segments from their first record. The ERROR logged at park time names the path."
+              runbook: "docs/monitoring.md#weirsegmentparked"
+
+  - interval: 1m
+    name: no parked segments does not fire WeirSegmentParked
+    input_series:
+      # Pre-initialised at 0 for every reason from boot; 0 must read as healthy.
+      - series: 'weir_drain_segments_parked{job="weir",instance="w:9185",reason="local_read_failed"}'
+        values: "0x20"
+      - series: 'weir_drain_segments_parked{job="weir",instance="w:9185",reason="unsupported_version"}'
+        values: "0x20"
+      - series: 'weir_drain_segments_parked{job="weir",instance="w:9185",reason="drain_panic"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WeirSegmentParked
+        exp_alerts: []

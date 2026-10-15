@@ -206,6 +206,48 @@ groups:
           description: "The drain exhausted sink_max_retries of TRANSIENT sink failures on a segment and left it on disk. The data is durable (no loss), but delivery is paused. Fix the sink (correlate with WeirSinkDown); the drain re-drains stranded segments automatically when the sink recovers (watch weir_drain_segments_resumed_total), or on restart."
           runbook: "docs/monitoring.md#weirsegmentstranded"
 
+      - alert: WeirDrainLocalIoStrands
+        # Since the safety floor, a segment the drain set aside because it could
+        # not READ the sealed segment, or could not WRITE its sink-rejected
+        # records into dead_letter/, counts here and no longer in
+        # weir_drain_segments_stranded_total -- so WeirSegmentStranded is blind
+        # to it. The family is pre-initialised (cause="read"/"write" at 0 from
+        # boot, metrics/mod.rs), so `increase()` reads a real 0 when healthy
+        # rather than an absent series. The `cause` label is kept: it names
+        # which half of the local device is in trouble.
+        #
+        # A warning, not a page: the data is on disk, the drain retries it on
+        # the idle rescan, and nothing is false-acked. A read failure that
+        # persists escalates on its own -- a permission-class error parks the
+        # segment (WeirSegmentParked) and a media-class one quarantines it
+        # (WeirSegmentQuarantined), each with its own alert.
+        expr: increase(weir_drain_local_io_strands_total{job=~"weir"}[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir drain stranded a segment on local I/O ({{ $labels.cause }}) on {{ $labels.instance }}"
+          description: "The drain exhausted sink_max_retries on a LOCAL failure, not a sink failure: cause=read means reading a sealed WAB segment failed, cause=write means writing sink-rejected records into dead_letter/ failed. The data is durable and the drain retries it automatically, but delivery of that segment is paused. Investigate the WAB and dead-letter device (I/O errors, ENOSPC, permissions, descriptor exhaustion), not the sink."
+          runbook: "docs/monitoring.md#weirdrainlocaliostrands"
+
+      - alert: WeirSegmentParked
+        # weir_drain_segments_parked is a GAUGE of segments the drain has set
+        # aside for the rest of this run: acked, durable, and NOT delivered
+        # until the daemon restarts (nothing re-queues a parked segment at
+        # runtime). Reasons: local_read_failed (a permission-class read error
+        # held for 3 strand cycles and 10 minutes), unsupported_version (a
+        # segment from a newer weir), drain_panic (the drain panicked twice on
+        # it). A gauge, so `> 0` on the raw value, not `increase()` -- it holds
+        # for as long as the segment stays parked, which is the incident.
+        # `for: 5m` only damps a scrape race at park time; the gauge does not
+        # fall back to 0 until a restart.
+        expr: weir_drain_segments_parked{job=~"weir"} > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir parked {{ $value }} segment(s) on {{ $labels.instance }} ({{ $labels.reason }}) — acked data not being delivered"
+          description: "The drain has parked one or more sealed segments: they stay on disk untouched and are not delivered until the daemon restarts. reason=local_read_failed: fix the segment file's permissions or type. reason=unsupported_version: the segment was written by a newer weir; upgrade this binary. reason=drain_panic: the drain panicked twice delivering it; fix the sink or the record it trips on. Then restart the daemon, which replays parked segments from their first record. The ERROR logged at park time names the path."
+          runbook: "docs/monitoring.md#weirsegmentparked"
+
       - alert: WeirDeadLettered
         expr: increase(weir_sink_commit_records_total{job=~"weir", outcome="dead_lettered"}[15m]) > 0
         for: 0m

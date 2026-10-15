@@ -271,7 +271,7 @@ on a segment and left it on disk ("stranded"). The data is durable (no loss), bu
 delivery for that segment is paused. Only a *sink* failure counts here: a segment
 stranded by local I/O (reading the segment, or writing its dead-letter records)
 counts in `weir_drain_local_io_strands_total{cause}` instead and does not fire
-this alert — see that metric.
+this alert — see `WeirDrainLocalIoStrands`.
 **Respond:** fix the sink (correlate with `WeirSinkDown` / `weir_sink_health`).
 Once the sink answers anything but `down` again, the drain **automatically
 re-drains** stranded segments on a later health poll, after the segment's
@@ -288,6 +288,54 @@ For the actual stuck files, list them: `weir-ctl segments` shows the
 sealed-but-undelivered files. If the gap persists, the sink isn't healthy yet (or is
 recovering then re-failing). Raise `sink_max_retries` / `sink_retry_base_delay_ms` to ride out longer
 outages before stranding. Distinct from `WeirDeadLettered` (*permanent* rejections).
+
+#### WeirDrainLocalIoStrands
+`increase(weir_drain_local_io_strands_total[15m]) > 0`: the drain exhausted
+`sink_max_retries` on a segment because of a **local** failure, not a sink
+failure, and set it aside. `cause="read"` means reading the sealed WAB segment
+failed with a non-corruption error; `cause="write"` means the sink accepted the
+batch but writing its rejected records into `dead_letter/` failed. These strands
+used to count in `weir_drain_segments_stranded_total` and mark the sink down;
+since the safety floor they count only here, so `WeirSegmentStranded` stays
+quiet for them and this rule is the one that sees them. Warning, not critical:
+the data is durable, nothing is false-acked, and the drain retries the segment
+on its own.
+**Respond:** investigate the WAB and dead-letter device, not the sink — kernel
+I/O errors (`dmesg`), `ENOSPC` or a read-only remount, file permissions under
+`wab_dir`, descriptor exhaustion (`EMFILE`/`ENFILE`). The drain's idle rescan
+resumes the segment past its delivered prefix once its cool-down has passed, so
+the alert clears by itself when the device recovers. A `write` strand keeps
+cycling until the write lands and is never escalated. A `read` failure that
+persists for 3 strand cycles and at least 10 minutes escalates: a
+permission-class error (`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) parks
+the segment (`WeirSegmentParked`) and a media-class error quarantines it
+(`WeirSegmentQuarantined`). Process-wide pressure (`EMFILE`, `ENFILE`,
+`ENOMEM`, `ENOBUFS`, `EAGAIN`, `EINTR`) never escalates. The ERROR logged at
+each strand (`drain: max retries exhausted reading the segment` / `... writing
+dead-letter records`) names the segment path, and for a read the errno.
+
+#### WeirSegmentParked
+`weir_drain_segments_parked > 0` for 5m: the drain has **parked** one or more
+sealed segments — left them on disk untouched and stopped re-queueing them for
+the rest of this run. The records were acked and are durable, but **they are
+not delivered until the daemon restarts**; no rescan picks a parked segment back
+up. The gauge holds until that restart, so this alert does too. Critical: acked
+data is stuck behind an operator action. The `reason` label says which action:
+
+- `local_read_failed` — a permission-class read error that persisted for 3
+  strand cycles and at least 10 minutes. Fix the segment file's permissions,
+  ownership or type (the ERROR logged at park time names the path).
+- `unsupported_version` — the segment was written in a newer WAB format than
+  this binary reads, typically after a rollback. Upgrade weir. It is parked, not
+  quarantined, so the rollback does not push the newer segments into manual
+  recovery.
+- `drain_panic` — the drain panicked twice while delivering this segment
+  (`weir_drain_panics_total` moved too). Fix the sink, or the record it trips
+  on, first; restarting unchanged replays the same segment into the same panic.
+
+**Respond:** fix the cause for the reason shown, then restart the daemon. A
+restart replays every parked segment from its first record, so delivery is
+at-least-once for whatever part of it the sink had already taken.
 
 #### WeirDeadLettered
 The sink **permanently** rejected records (e.g. a 4xx). They are written to the
@@ -665,7 +713,9 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 > there too, and to mark the sink down. It now counts in
 > `weir_drain_local_io_strands_total{cause}` and leaves the sink's health alone.
 > On a host whose WAB device misbehaves, expect `stranded` (and
-> `WeirSegmentStranded`) to go quieter and the new counter to carry what moved.
+> `WeirSegmentStranded`) to go quieter and the new counter to carry what moved;
+> `WeirDrainLocalIoStrands` alerts on it, and `WeirSegmentParked` on segments
+> the drain has set aside until a restart.
 > The rest of this table's drain-ledger rows are new in the same release; every
 > one of their series exists at 0 from boot.
 
