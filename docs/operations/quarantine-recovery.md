@@ -38,7 +38,7 @@ escalation limit:
 | Corrupt header: bad magic, version 0, a v1 header with its reserved byte set, a file too short for a header | first attempt, no retry | nothing |
 | A CRC mismatch, an oversized length or a record cut short mid-segment | when it is reached | the readable prefix |
 | The footer is cut short, or its record count disagrees with the records read (a truncated tail) | after the last record | every record read |
-| A media-class read error (`EIO`, `ENXIO`, `ESTALE`, `EBADMSG`, anything unrecognised) that persists for three strand cycles | at the escalation limit | the readable prefix, exactly once per run |
+| A media-class read error (`EIO`, `ENXIO`, `ESTALE`, `EBADMSG`, anything unrecognised) that persists for three strand cycles and at least 10 minutes | at the escalation limit | the readable prefix, exactly once per run |
 | A `.confirmed` sidecar that fails to parse (wrong length, bad magic or CRC, unknown version) — for example one torn by the in-place write of 4.0.1 and earlier; sidecars are now written atomically, so a crash or full disk no longer tears one | the sealed-segment scan, at startup or in the drain's rescan | everything (a sidecar is written only after delivery) |
 
 A **transient** read error is not corruption: the segment is retried and, while
@@ -53,7 +53,7 @@ record 0 on the next start. `weir-ctl quarantine` does not see them; the
 | `reason` | Cause | What to do, then restart |
 |---|---|---|
 | `unsupported_version` | Written by a newer weir (a format version above what this build reads, or an unknown v2 flag bit). Not corrupt. | Upgrade weir; a newer binary delivers it. |
-| `local_read_failed` | A permission-class read error (`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) that persisted for three strand cycles | Fix the file's permissions or type. |
+| `local_read_failed` | A permission-class read error (`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) that persisted for three strand cycles and at least 10 minutes | Fix the file's permissions or type. |
 | `drain_panic` | The drain panicked twice while delivering this segment | Find the panic in the log; usually a sink bug triggered by one record. |
 
 Parking a `drain_panic` segment keeps one poison segment from spending the

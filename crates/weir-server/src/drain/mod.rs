@@ -82,6 +82,19 @@ pub const MAX_RETRIES: u32 = 3;
 /// errors never count (spec §4.1).
 pub(crate) const LOCAL_READ_STRAND_LIMIT: u32 = 3;
 
+/// The minimum time since a segment's FIRST counted local read failure in this
+/// run before that segment may be escalated, on top of
+/// [`LOCAL_READ_STRAND_LIMIT`] strand cycles (conf-regressions-8). Both must
+/// hold. The cycle count alone escalated about a minute into a fault at the
+/// defaults, so a transient device blip (a remount, an iSCSI or NBD path flap,
+/// a `chown -R` or SELinux relabel during maintenance) quarantined a good
+/// segment into manual recovery or parked it until a restart, where 4.0.1 kept
+/// retrying and recovered by itself. Ten minutes outlasts any blip worth the
+/// name while still setting a genuinely failed segment aside in the same
+/// incident. The segment cycles meanwhile, a cool-down and one strand per
+/// cycle, as a `Process` error does.
+pub(crate) const LOCAL_READ_ESCALATION_MIN_AGE: Duration = Duration::from_secs(600);
+
 /// Upper bound on a single transient-retry backoff once shutdown has been
 /// observed (the drain channel disconnected). The backoff is clamped rather than
 /// dropped: firing the remaining attempts back-to-back with no delay spends the
@@ -173,6 +186,9 @@ pub struct DrainConfig {
     /// this daemon holds the `wab_dir` lock; without it another daemon may be
     /// mid-confirm on the same segment, so orphans are kept.
     pub orphan_cleanup: bool,
+    /// [`LOCAL_READ_ESCALATION_MIN_AGE`] in production. Carried in config,
+    /// like `max_respawns`, so the escalation tests need not wait ten minutes.
+    pub local_read_escalation_min_age: Duration,
 }
 
 // ── Internal state machine types ──────────────────────────────────────────────
@@ -1742,9 +1758,10 @@ fn settle_dl_carry(
 
 /// Counts one local read failure of `segment` toward its escalation and, once
 /// the count reaches `(max_retries + 1) × LOCAL_READ_STRAND_LIMIT` (three strand
-/// cycles), escalates it (spec §4.1): an `Access` error parks the segment as
-/// `local_read_failed`, a `Media` error quarantines it. Returns the next state
-/// when it escalated, `None` to carry on retrying.
+/// cycles) AND the segment has been failing for the escalation min age
+/// ([`local_read_escalation_due`]), escalates it (spec §4.1): an `Access` error
+/// parks the segment as `local_read_failed`, a `Media` error quarantines it.
+/// Returns the next state when it escalated, `None` to carry on retrying.
 ///
 /// `Process`-class errors are daemon-wide (descriptors, memory), not a property
 /// of the segment: they never count and never escalate, so a segment under fd
@@ -1761,7 +1778,7 @@ fn escalate_local_read(
     hb: &DrainHeartbeat,
 ) -> Option<DrainState> {
     let failures = ledger.note_local_read_failure(segment, class);
-    if failures < local_read_limit(config) {
+    if !local_read_escalation_due(segment, failures, config, ledger) {
         return None;
     }
     match class {
@@ -1771,8 +1788,9 @@ fn escalate_local_read(
                 path = %segment.display(),
                 errno,
                 failures,
+                failing_for = ?ledger.local_read_failing_for(segment),
                 "drain: segment still unreadable (access) after {LOCAL_READ_STRAND_LIMIT} strand \
-                 cycles; parked (left in place, not retried this run) — \
+                 cycles and the escalation min age; parked (left in place, not retried this run) — \
                  weir_drain_segments_parked{{reason=\"local_read_failed\"}}; fix its permissions or \
                  type, it replays on the next start"
             );
@@ -1783,8 +1801,9 @@ fn escalate_local_read(
                 path = %segment.display(),
                 errno,
                 failures,
+                failing_for = ?ledger.local_read_failing_for(segment),
                 "drain: segment still unreadable (media) after {LOCAL_READ_STRAND_LIMIT} strand \
-                 cycles; quarantining"
+                 cycles and the escalation min age; quarantining"
             );
             // A failed move hands the segment to `quarantine_pending` rather
             // than forgetting it: forgotten, it would be re-opened for three
@@ -1810,10 +1829,34 @@ fn local_read_limit(config: &DrainConfig) -> u32 {
         .saturating_mul(LOCAL_READ_STRAND_LIMIT)
 }
 
-/// True when one more segment-class local read failure of `segment` reaches
-/// the escalation limit — the `last_local_read_chance` of [`process_segment`].
+/// True when a segment with `failures` segment-class local read failures is
+/// due for escalation: the count has reached [`local_read_limit`] AND the
+/// segment had been failing for at least `local_read_escalation_min_age`
+/// ([`LOCAL_READ_ESCALATION_MIN_AGE`] in production) when the latest attempt
+/// began. Both, so neither a fast burn through the retries nor a slow trickle
+/// of failures alone sets a segment aside (conf-regressions-8).
+fn local_read_escalation_due(
+    segment: &Path,
+    failures: u32,
+    config: &DrainConfig,
+    ledger: &SegmentLedger,
+) -> bool {
+    failures >= local_read_limit(config)
+        && ledger.local_read_failing_for(segment) >= config.local_read_escalation_min_age
+}
+
+/// True when one more segment-class local read failure of `segment` would
+/// escalate it — the `last_local_read_chance` of [`process_segment`]. It is
+/// evaluated after [`SegmentLedger::begin_attempt`], against the same attempt
+/// start [`escalate_local_read`] then ages the failures to, so the two always
+/// agree on which attempt is the escalating one.
 fn local_read_escalates_next(segment: &Path, config: &DrainConfig, ledger: &SegmentLedger) -> bool {
-    ledger.local_read_failures(segment).saturating_add(1) >= local_read_limit(config)
+    local_read_escalation_due(
+        segment,
+        ledger.local_read_failures(segment).saturating_add(1),
+        config,
+        ledger,
+    )
 }
 
 fn transition_from_draining(
@@ -1984,7 +2027,8 @@ async fn process_segment<S: Sink>(
         // preserved and retried. The error's class (spec §4.0 table) decides
         // what persistence means: a daemon-wide `Process` error cycles until it
         // clears, while `Access` and `Media` errors escalate (park, quarantine)
-        // after LOCAL_READ_STRAND_LIMIT strand cycles — see
+        // after LOCAL_READ_STRAND_LIMIT strand cycles once the segment has
+        // been failing for LOCAL_READ_ESCALATION_MIN_AGE — see
         // `next_state_after_process`.
         Err(e) => return local_read_failure(segment, e, skip),
     };
@@ -2054,8 +2098,8 @@ async fn process_segment<S: Sink>(
                         error = %e,
                         errno = e.raw_os_error(),
                         "drain: segment still unreadable (media) mid-segment after \
-                         {LOCAL_READ_STRAND_LIMIT} strand cycles; quarantining after delivering \
-                         the readable prefix"
+                         {LOCAL_READ_STRAND_LIMIT} strand cycles and the escalation min age; \
+                         quarantining after delivering the readable prefix"
                     );
                     quarantine_after_prefix =
                         Some("drain: persistent local read error mid-segment");
@@ -3911,6 +3955,9 @@ mod tests {
             health_probe_timeout: Duration::from_secs(5),
             // As before the wab_dir lock: orphans are kept unless a test opts in.
             orphan_cleanup: false,
+            // The count alone decides, so the escalation tests run in
+            // milliseconds; `min_age_config` opts into a real min age.
+            local_read_escalation_min_age: Duration::ZERO,
         }
     }
 
@@ -4793,6 +4840,165 @@ mod tests {
             "everything delivers exactly once after the hook clears"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `fast_config` with a real escalation min age, for the tests that
+    /// exercise it; every other test escalates on the count alone.
+    fn min_age_config(dir: PathBuf, min_age: Duration) -> DrainConfig {
+        DrainConfig {
+            local_read_escalation_min_age: min_age,
+            ..fast_config(dir)
+        }
+    }
+
+    /// conf-regressions-8: a WAB-device blip (a remount, a `chown -R`, an
+    /// iSCSI path flap) that fails a segment's reads for MORE than three strand
+    /// cycles but less than `LOCAL_READ_ESCALATION_MIN_AGE` is not escalated.
+    /// The count alone used to quarantine (`Media`) or park until restart
+    /// (`Access`) about a minute into such a blip at the defaults, where 4.0.1
+    /// retried and recovered by itself. The segment keeps cycling and delivers,
+    /// whole and once, as soon as the fault clears.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_read_blip_past_three_strand_cycles_but_under_the_min_age_heals() {
+        const MIN_AGE: Duration = Duration::from_secs(5);
+        const CYCLES: u32 = LOCAL_READ_STRAND_LIMIT + 2;
+        for (errno, label) in [(libc::EIO, "media"), (libc::EACCES, "access")] {
+            let dir = tmp_dir(&format!("read_blip_{label}"));
+            let (sealed, records) = make_numbered_segment(&dir, 3);
+            let failing = CYCLES * (MAX_RETRIES + 1);
+            assert!(failing > (MAX_RETRIES + 1) * LOCAL_READ_STRAND_LIMIT);
+            open_hook::fail(&sealed, errno, failing);
+
+            let sink = Arc::new(MockSink::with_responses([]));
+            let metrics = noop_metrics();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let handle = spawn(
+                rx,
+                Arc::clone(&sink),
+                min_age_config(dir.clone(), MIN_AGE),
+                Arc::clone(&metrics),
+                DrainHeartbeat::new(),
+            );
+            let started = Instant::now();
+            tx.send(sealed.clone()).unwrap();
+            wait_for(10, "the segment confirmed once the blip clears", || {
+                get_confirmed_path(&sealed).exists()
+            });
+            assert!(
+                started.elapsed() < MIN_AGE,
+                "{label}: the blip outlasted the min age, so this run proves nothing"
+            );
+            drop(tx);
+            handle.join().unwrap();
+
+            assert_eq!(
+                open_hook::attempts(&sealed),
+                u64::from(failing) + 1,
+                "{label}: every failing attempt, then the one that delivers"
+            );
+            assert_eq!(
+                local_io_strands(&metrics, crate::metrics::LocalIoStrandCause::read),
+                u64::from(CYCLES),
+                "{label}: each failing cycle strands and resumes"
+            );
+            assert_eq!(
+                parked_gauge(&metrics, crate::metrics::ParkedReason::local_read_failed),
+                0.0,
+                "{label}: not parked"
+            );
+            assert_eq!(metrics.recovery_segments_quarantined.get(), 0, "{label}");
+            assert!(!quarantined_copy(&dir, &sealed).exists(), "{label}");
+            assert_eq!(committed_bytes(&sink), records, "{label}: whole, once");
+            open_hook::forget(&sealed);
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// conf-regressions-8, the other side: a fault that persists past BOTH
+    /// thresholds (three strand cycles and the min age since the segment's
+    /// first local read failure) escalates by class, exactly as before: a
+    /// `Media` error at open or mid-segment quarantines (mid-segment after
+    /// delivering the readable prefix once), an `Access` error parks. Not
+    /// before the min age, and never again after.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_read_fault_past_both_thresholds_escalates_by_class() {
+        const MIN_AGE: Duration = Duration::from_millis(1500);
+        const N: u64 = 7;
+        let limit = u64::from((MAX_RETRIES + 1) * LOCAL_READ_STRAND_LIMIT);
+        for case in ["open_media", "mid_segment_media", "open_access"] {
+            let dir = tmp_dir(&format!("read_persistent_{case}"));
+            let (sealed, records) = make_numbered_segment(&dir, 10);
+            let attempts = || match case {
+                "mid_segment_media" => read_hook::fired(&sealed),
+                _ => open_hook::attempts(&sealed),
+            };
+            match case {
+                "open_media" => open_hook::fail(&sealed, libc::EIO, u32::MAX),
+                "open_access" => open_hook::fail(&sealed, libc::EACCES, u32::MAX),
+                _ => read_hook::fail(&sealed, read_hook::FaultAt::Record(N), libc::EIO, u32::MAX),
+            }
+
+            let sink = Arc::new(MockSink::with_batch_size(3, []));
+            let metrics = noop_metrics();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let handle = spawn(
+                rx,
+                Arc::clone(&sink),
+                min_age_config(dir.clone(), MIN_AGE),
+                Arc::clone(&metrics),
+                DrainHeartbeat::new(),
+            );
+            let started = Instant::now();
+            tx.send(sealed.clone()).unwrap();
+            let quarantined = quarantined_copy(&dir, &sealed);
+            wait_for(15, "the escalation", || match case {
+                "open_access" => {
+                    parked_gauge(&metrics, crate::metrics::ParkedReason::local_read_failed) == 1.0
+                }
+                _ => quarantined.exists(),
+            });
+            let elapsed = started.elapsed();
+            assert!(elapsed >= MIN_AGE, "{case}: escalated after {elapsed:?}");
+            let at_escalation = attempts();
+            assert!(
+                at_escalation > limit,
+                "{case}: the count limit ({limit}) alone did not escalate ({at_escalation})"
+            );
+            // Idle rescans after the escalation: none may touch it again.
+            std::thread::sleep(Duration::from_millis(300));
+            drop(tx);
+            handle.join().unwrap();
+            assert_eq!(attempts(), at_escalation, "{case}: never read again");
+
+            match case {
+                "open_access" => {
+                    assert!(sealed.exists(), "a parked segment is left in place");
+                    assert!(!quarantined.exists());
+                    assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+                    assert_eq!(sink.call_count(), 0);
+                }
+                "open_media" => {
+                    assert!(!sealed.exists());
+                    assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+                    assert_eq!(sink.call_count(), 0);
+                }
+                _ => {
+                    assert!(!sealed.exists());
+                    assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+                    assert_eq!(
+                        committed_bytes(&sink),
+                        records[..N as usize],
+                        "the readable prefix exactly once, the partial batch on the \
+                         escalating attempt only"
+                    );
+                }
+            }
+            open_hook::forget(&sealed);
+            read_hook::forget(&sealed);
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 
     // ── Transient I/O mid-segment and at the footer (spec §4.2) ──────────────

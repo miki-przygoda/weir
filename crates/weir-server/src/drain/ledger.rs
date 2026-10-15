@@ -217,14 +217,27 @@ pub(crate) struct SegmentLedger {
     /// Not re-queued this run.
     parked: HashMap<PathBuf, ParkReason>,
     /// Segment-class local read failures (§4.1, §4.2).
-    local_read_failures: HashMap<PathBuf, u32>,
+    local_read_failures: HashMap<PathBuf, LocalReadFailures>,
     /// Per-segment cool-down (§4.6).
     not_before: HashMap<PathBuf, Instant>,
     /// Drain panics while this segment was in flight (§4.12).
     panic_count: HashMap<PathBuf, u32>,
     /// The segment being processed when a panic unwinds (§4.12).
     in_flight: Option<PathBuf>,
+    /// When the latest attempt began. A segment's local read failures are aged
+    /// to this instant, not to "now", so the escalation decided after an
+    /// attempt and the `last_local_read_chance` decided before it always agree.
+    attempt_started: Instant,
     counts: Arc<LedgerCounts>,
+}
+
+/// A segment's segment-class local read failures in this run.
+#[derive(Clone, Copy, Debug)]
+struct LocalReadFailures {
+    count: u32,
+    /// When the first of them was counted: escalation also needs this to be
+    /// old enough (conf-regressions-8), so a short blip never escalates.
+    first_at: Instant,
 }
 
 impl SegmentLedger {
@@ -240,6 +253,7 @@ impl SegmentLedger {
             not_before: HashMap::new(),
             panic_count: HashMap::new(),
             in_flight: None,
+            attempt_started: Instant::now(),
             counts,
         };
         ledger.sync_counts();
@@ -387,6 +401,7 @@ impl SegmentLedger {
     /// the sink commits.
     pub(crate) fn begin_attempt(&mut self, path: &Path) {
         self.in_flight = Some(path.to_path_buf());
+        self.attempt_started = Instant::now();
     }
 
     /// Clears the in-flight segment: the attempt returned without panicking.
@@ -419,23 +434,42 @@ impl SegmentLedger {
     /// Counts one local read failure of `path` and returns the running total.
     /// `Process`-class errors are daemon-wide, not a property of the segment,
     /// so they never count.
+    ///
+    /// The first counted failure of `path` also records when the failing
+    /// began, for [`Self::local_read_failing_for`].
     pub(crate) fn note_local_read_failure(&mut self, path: &Path, class: ErrClass) -> u32 {
         if class == ErrClass::Process {
-            return self.local_read_failures.get(path).copied().unwrap_or(0);
+            return self.local_read_failures(path);
         }
-        let n = self
+        let f = self
             .local_read_failures
             .entry(path.to_path_buf())
-            .or_insert(0);
-        *n = n.saturating_add(1);
-        *n
+            .or_insert(LocalReadFailures {
+                count: 0,
+                first_at: Instant::now(),
+            });
+        f.count = f.count.saturating_add(1);
+        f.count
     }
 
     /// The running count of segment-class local read failures of `path`, without
     /// counting one. The drain asks before an attempt whether the next failure
     /// would escalate (spec §4.2).
     pub(crate) fn local_read_failures(&self, path: &Path) -> u32 {
-        self.local_read_failures.get(path).copied().unwrap_or(0)
+        self.local_read_failures.get(path).map_or(0, |f| f.count)
+    }
+
+    /// How long `path` had been failing local reads when the latest attempt
+    /// began: from its first counted failure in this run to the start of the
+    /// attempt. Zero when it has none, or when the first one came during that
+    /// attempt. Escalation needs this to reach the drain's min age as well as
+    /// the count to reach its limit (conf-regressions-8).
+    pub(crate) fn local_read_failing_for(&self, path: &Path) -> std::time::Duration {
+        self.local_read_failures
+            .get(path)
+            .map_or(std::time::Duration::ZERO, |f| {
+                self.attempt_started.saturating_duration_since(f.first_at)
+            })
     }
 
     /// Stores what `path` still owes the dead-letter directory, pinned to the

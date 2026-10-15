@@ -1528,8 +1528,10 @@ other segments keep moving. When it is re-processed in the same run it
 resumes past the records already committed; only a restart replays it from
 record 0.
 
-A local read error that persists is escalated after three strand cycles
-(`3 × (sink_max_retries + 1)` failed attempts): a permission-class error
+A local read error that persists is escalated once it has lasted both three
+strand cycles (`3 × (sink_max_retries + 1)` failed attempts) and 10 minutes
+since the segment's first local read failure in this run (a fixed minimum,
+so a device blip never sets a good segment aside): a permission-class error
 (`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) parks the segment
 (`weir_drain_segments_parked{reason="local_read_failed"}`), and a media-class
 error (`EIO` and anything unrecognised) quarantines it. Daemon-wide pressure

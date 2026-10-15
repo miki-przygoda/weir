@@ -1110,6 +1110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // commit_timeout: 5s, or the sink's own timeout if that's shorter.
         health_probe_timeout: Duration::from_secs(config.sink_timeout_secs.min(5)),
         orphan_cleanup,
+        local_read_escalation_min_age: drain::LOCAL_READ_ESCALATION_MIN_AGE,
     };
     // The stall verdict tells a slow sink call from a sink blocking the drain's
     // thread by how far past this backstop the call has run (spec §4.8).
