@@ -275,9 +275,12 @@ mod tests {
         assert_eq!(sink.connections(), 1);
         assert!(sink.bodies().is_empty());
 
-        drop(sink);
+        // Set the timeout BEFORE the sink goes away: once the peer has reset
+        // the connection, macOS can reject setsockopt on this socket with
+        // EINVAL, which made this test flaky there.
         s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
+        drop(sink);
         // Closed: EOF, or a reset if the unread request was still buffered.
         match s.read(&mut buf) {
             Ok(0) => {}
