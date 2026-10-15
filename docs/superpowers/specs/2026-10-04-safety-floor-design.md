@@ -11,7 +11,7 @@ Status: design, revision 2, ready for owner review. Base: main @ 18c931a (4.0.1)
 > | D2 | Filesystems that cannot flock | Fail closed by default; `wab_dir_lock = "best-effort"` opt-out; contention is never overridable |
 > | D3 | Lock contention | Fail fast; a bounded wait is revisited with the k8s manifests |
 > | D4 | Lock file deleted/replaced while running | Split by evidence: re-lock if nobody else holds it, fail closed (exit 3) on proven loss |
-> | D5 | Persistent non-corruption read errors | By class: `Process` never escalates, `Access` parks, `Media` quarantines after 3 strand cycles |
+> | D5 | Persistent non-corruption read errors | By class: `Process` never escalates, `Access` parks, `Media` quarantines, once the error has lasted **both** 3 strand cycles **and** `LOCAL_READ_ESCALATION_MIN_AGE` (10 min) since the segment's first local read failure in the run. **The 10-minute floor was added after review (conf-regressions-8) as a further autonomous decision; owner to confirm.** See §4.1. |
 > | D6 | Plain-mode duplicate key | `id_column` set: set-based lookup, dups count as committed; no `id_column`: bisection, dup rows dead-lettered; config-load WARN for plain mode without `id_column` |
 > | D7 | Orphan sealed segments with a valid `.confirmed` | Delete them (lock held only) |
 > | D8 | Ordering wording | Per-connection order is WAB/ingest order; delivery may reorder |
@@ -394,7 +394,7 @@ enum ParkReason { LocalReadFailed, UnsupportedVersion, DrainPanic }
   - Safety: sealed segments are immutable, names are unique within a run (the writer's in-memory counter only grows), and the (dev, ino) check rejects a cursor for a file that was replaced.
 - **Cause classification.** `ProcessResult::Transient` gains `cause: TransientCause { Sink, LocalRead { class: ErrClass, errno: Option<i32> }, LocalWrite }`.
 
-  | `ErrClass` | errno (`raw_os_error`) | counts toward escalation | escalation after K cycles |
+  | `ErrClass` | errno (`raw_os_error`) | counts toward escalation | escalation after K cycles and the 10-minute floor (§4.1) |
   |---|---|---|---|
   | `Process` | EMFILE, ENFILE, ENOMEM, ENOBUFS, EAGAIN, EINTR | **never** (daemon-wide, not a property of the segment) | none: strands and resumes as today, with the cursor kept |
   | `Access` | EACCES, EPERM, EISDIR, ENOTDIR, ELOOP | yes | **park** (`local_read_failed`) |
@@ -429,6 +429,8 @@ enum ParkReason { LocalReadFailed, UnsupportedVersion, DrainPanic }
   - Bad magic, version 0, or a short header: `quarantine_segment` now. Nothing was delivered, so this behaves like a corrupt-header recovery quarantine.
 - Any other kind becomes `Transient{processed: skip, cause: LocalRead{class}}` and follows the 4.0 table.
 - **Escalation.** When a segment's `local_read_failures` reaches `(max_retries+1) × LOCAL_READ_STRAND_LIMIT` (const, 3), that is three strand cycles. `Access` errors park, `Media` errors quarantine, and both log an ERROR naming the path and errno. `Process` errors and `Sink` causes never count.
+  - **Revised after review (conf-regressions-8): escalation needs both conditions.** The count alone escalated about a minute in at the defaults, so a device blip (a remount, a path flap, a `chown -R` or SELinux relabel during maintenance) quarantined a good segment into manual recovery or parked it until a restart, where 4.0.1 kept retrying and healed by itself. Escalation now also requires `LOCAL_READ_ESCALATION_MIN_AGE` (const, 600 s, drain/mod.rs) to have passed since the segment's **first** counted local read failure in this run. The ledger records that instant per segment, and the age is measured to the attempt's start, so the pre-attempt `last_local_read_chance` and the post-attempt escalation always agree, and a persistent mid-segment `Media` error still delivers the readable prefix exactly once. Until both hold the segment keeps cycling (a cool-down and one strand per cycle), as a `Process` error does. Tests override the age through an internal `DrainConfig` field (the `max_respawns` precedent), set to zero in the count-based tests.
+  - **This is an autonomous decision taken after review, flagged for the owner** alongside D5 in the table at the top. It does not change the class rules, and a parked `local_read_failed` segment is still not re-admitted at runtime.
 - Parked segments are retried on restart, and by Foundations' `drain retry-stranded --include-parked` (D5).
 - Fix the comment.
 
@@ -443,6 +445,7 @@ enum ParkReason { LocalReadFailed, UnsupportedVersion, DrainPanic }
 - A segment with version byte `FORMAT_VERSION_MAX_SUPPORTED+1` is parked (`unsupported_version`) and **not** moved.
 - `Access` class, which works as root in CI: put a *directory* at the sealed path, so `File::open` succeeds and `read` fails with `EISDIR`. Expect Transient, then strand, then park after 3 cycles, with no re-queue afterwards and `weir_drain_segments_stranded` unchanged.
 - `Process` class: a `cfg(test)` open hook returns EMFILE for 30 cycles. No segment is parked, and all segments deliver once the hook clears.
+- The 10-minute floor (added after review): `a_local_read_blip_past_three_strand_cycles_but_under_the_min_age_heals` holds EIO and EACCES at open for 5 strand cycles under a 5 s floor; nothing escalates and the segment delivers whole, once. `a_local_read_fault_past_both_thresholds_escalates_by_class` uses a 1.5 s floor: each escalation (EIO at open quarantines, EIO mid-segment delivers the prefix once and then quarantines, EACCES at open parks) comes at or after the floor and after more failures than the count limit, and the segment is never read again. The count-based tests above run with the floor at zero.
 
 ### 4.2 Transient I/O mid-segment or at the footer escalates to quarantine
 
@@ -669,7 +672,7 @@ enum ParkReason { LocalReadFailed, UnsupportedVersion, DrainPanic }
 - `scan_unconfirmed_sealed`: a per-shard `read_dir` uses `?` (wab/mod.rs:417-419), so one unreadable shard blocks every resume.
   - For the **rescan caller only** (`shard_count == None`), skip that shard with a WARN and return the partial list plus `incomplete=true`. The caller treats `incomplete` like today's `Err` for edge tracking (it keeps the edge live, drain/mod.rs:455-465).
   - **Startup replay stays fail-fast.** This deliberately keeps the comment at wab/mod.rs:367-369, "a silently-skipped sealed segment is silently-dropped acked data", true where no later rescan is guaranteed.
-- `compute_wab_bytes_on_disk`: replace the two `.flatten()` calls (main.rs:88, 109) with explicit matching that returns `None` on a dirent error, as its own doc (main.rs:78-82) requires. Its effect on the poll task is neutralised by the 4.8 placement change and the separate 3.1 integrity task.
+- `compute_wab_bytes_on_disk`: replace the two `.flatten()` calls (main.rs:88, 109) with explicit matching that returns `None` on a dirent error, as its own doc (main.rs:78-82) requires. Its effect on the poll task is neutralised by the 4.8 placement change and the separate 3.1 integrity thread.
 - **Stale comments and docs:**
   - drain/mod.rs:22-27 (orphan cleanup; now true)
   - drain/mod.rs:78 ("commit_timeout (default 30 s)"; it is ≥60 s)
@@ -881,7 +884,7 @@ Audit for tests that start a daemon on a `wab_dir` whose previous owner may stil
   - exits 3 when another instance provably owns the `wab_dir`;
   - SIGHUP no longer exits;
   - corrupt sealed segments are quarantined on the first attempt, and newer-format segments are parked rather than quarantined;
-  - transient read errors no longer quarantine; persistent media errors quarantine after 3 cycles;
+  - transient read errors no longer quarantine; persistent media errors quarantine after 3 cycles and at least 10 minutes;
   - the drain resume cursor now survives strands within a run;
   - orphaned sealed files are deleted;
   - plain-mode duplicates: with `id_column` they count as committed, without it they are dead-lettered;

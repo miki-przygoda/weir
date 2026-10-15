@@ -128,7 +128,7 @@ Per task, the loop is: write the failing test, run it to see it fail, implement,
 
 ### Task 2: lock integrity and fail-closed on proven loss (spec §3.1 integrity, D4)
 
-**Files:** Modify `wab/lock.rs`, `main.rs` (spawn the 1 s integrity task in `rt.block_on`), `socket/connection.rs` (check before both `over_wab_cap` call sites ~356/~404), `socket/tcp.rs` (the same handler is shared, so verify), `metrics/mod.rs` (`weir_wab_dir_lock_integrity_failures_total`). Tests: `lock.rs` unit, `connection.rs` unit, `system.rs`.
+**Files:** Modify `wab/lock.rs`, `main.rs` (spawn the 1 s integrity check; as built, a std thread right after the lock, not a task in `rt.block_on`: see the revision note at the end of this task), `socket/connection.rs` (check before both `over_wab_cap` call sites ~356/~404), `socket/tcp.rs` (the same handler is shared, so verify), `metrics/mod.rs` (`weir_wab_dir_lock_integrity_failures_total`). Tests: `lock.rs` unit, `connection.rs` unit, `system.rs`.
 
 **Interfaces:**
 - Consumes `held_lock_fd()` and `LOCK_FILE_NAME` from Task 1.
@@ -146,12 +146,12 @@ Per task, the loop is: write the failing test, run it to see it fail, implement,
   - `ownership_lost_nacks_before_queue`: in connection.rs tests, with `wab_ownership_lost=true`, a Durable push gets `NackReason::InternalError` and the queue receiver gets nothing.
   - `lock_module_never_reopens_path`: read `lock.rs` source with `include_str!`, count `OpenOptions` occurrences outside `mod tests`, and assert 2: acquire and the Relocked re-create.
 - [ ] **Step 2: Run them to see them fail.**
-- [ ] **Step 3: Implement.** Per §3.1, `check_wab_dir_lock` stats the path (dev, ino) against `fstat(held)`, re-issues `flock(held, LOCK_EX|LOCK_NB)`, and classifies the result. The integrity task runs every 1 s via `spawn_blocking`:
+- [ ] **Step 3: Implement.** Per §3.1, `check_wab_dir_lock` stats the path (dev, ino) against `fstat(held)`, re-issues `flock(held, LOCK_EX|LOCK_NB)`, and classifies the result. The integrity check runs every 1 s (planned as a `spawn_blocking` task; built as the `weir-lock-integrity` std thread, see the revision note below):
   - `Relocked`: ERROR log and bump the counter.
   - `LostToOther`: store `wab_ownership_lost=true`, set the gauge to 0, log the CRITICAL line with the holder, then `std::process::exit(EXIT_WAB_OWNERSHIP_LOST)`. Do not seal.
   - `Error`: ERROR log, bump the counter, retry on the next tick.
 
-  Under `LockOutcome::Unsupported` the task is not spawned.
+  Under `LockOutcome::Unsupported` the check is not started.
 - [ ] **Step 4: System test** `lock_file_stolen_by_second_daemon_fails_closed`, following spec §3.1 steps 1-4: A's exit status is 3, and any push in the window is NACKed, never acked.
 - [ ] **Step 5: Run the full server unit and system suites. Commit** as `fix(wab): fail closed when another instance provably owns the wab_dir`.
 
@@ -333,6 +333,8 @@ Also modify `wab/mod.rs`, adding the `scan_unconfirmed_sealed` `exclude` paramet
   - the EMFILE hook for 30 cycles parks nothing, and everything is delivered after the hook clears.
 - [ ] **Step 2: Run them to see them fail. Step 3: Implement** the version-byte read and the escalation threshold `(max_retries+1) × LOCAL_READ_STRAND_LIMIT` (`const LOCAL_READ_STRAND_LIMIT: u32 = 3`).
 - [ ] **Step 4: Run the suites. Commit** as `fix(drain): quarantine a corrupt sealed header instead of retrying it forever`.
+
+**Revised after review (conf-regressions-8; spec §4.1 and D5).** Escalation needs both the count above and `LOCAL_READ_ESCALATION_MIN_AGE` (600 s) since the segment's first counted local read failure in the run, measured to the attempt start. The floor reaches the drain through the internal `DrainConfig::local_read_escalation_min_age` (zero in `fast_config`, so the count-based tests are unchanged). Tests: `a_local_read_blip_past_three_strand_cycles_but_under_the_min_age_heals`, `a_local_read_fault_past_both_thresholds_escalates_by_class`. An autonomous decision taken after review, flagged for the owner.
 
 ### Task 9: transient I/O mid-segment and at the footer (spec §4.2)
 
