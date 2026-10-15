@@ -132,6 +132,36 @@ thresholds: measured p99.9 is ~2.4 ms on NVMe and ~6 ms on a SATA SSD — set
 `High` to ~3–4× your medium's baseline and `Critical` an order of magnitude up.
 If latency is *normal for your medium*, raise the threshold rather than chase it.
 
+#### WeirWabDirUnlocked
+`weir_wab_dir_lock_held == 0`: this daemon is running **without** the exclusive
+`flock` on `<wab_dir>/.weir.lock` that stops a second `weir-server` from using
+the same `wab_dir`. A second daemon on the same directory recovers and drains
+the first one's live segments, and the first one's later `Durable` acks become
+false acks — the one failure on this page that is not "Nack, never a false
+ack". Nothing is wrong yet; the guard is just not there.
+
+The only steady state that reads 0 is `wab_dir_lock = "best-effort"`
+(`--wab-dir-lock` / `WEIR_WAB_DIR_LOCK`) on a filesystem that cannot lock
+(`ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`, `ENOSYS`, `EINVAL`); the daemon also WARNs
+about it on every start. The default, `"required"`, refuses to start there
+instead. The other way to reach 0 — the integrity check proving another
+instance now holds the lock — exits the daemon with status 3 as soon as that
+once-a-second check sees it, so the gauge is 0 only for the instant before
+exit. That incident shows up as the process exiting with status 3 and an ERROR
+beginning `CRITICAL: wab_dir ownership lost` (and as `WeirInstanceDown` if
+nothing restarts it within a minute), not as this alert.
+
+**Respond:** move `wab_dir` to a local filesystem that supports `flock` and
+remove the `best-effort` setting. If that is not possible, make sure by other
+means (orchestration, a single replica, no shared volume) that exactly one
+daemon can ever run on this `wab_dir`, and silence this alert for the instance
+deliberately rather than letting it fire unread.
+
+A rising `weir_wab_dir_lock_integrity_failures_total` is the related signal for
+a daemon that *does* hold the lock: something deleted or replaced the lock file
+(the daemon re-creates and re-locks it), and while it was missing a second
+daemon could have started.
+
 ### Drain / dead-letter
 
 #### WeirDrainNotConfirming
@@ -149,9 +179,14 @@ counter incremented by the WAB flusher (`sealed`) and by the drain's confirm pat
 
 **Respond:** do not start from the gauges, they are lying by omission. Check
 whether the drain thread is alive and what it is blocked on, then the sink.
-`weir_wab_bytes_on_disk` is a useful second opinion: it is written by the main
-poll task rather than the drain, so it stays live during a wedge and should be
-climbing.
+`weir_drain_busy_seconds{kind}` answers the second question directly: like
+`weir_wab_bytes_on_disk`, it is written by the main 5 s poll task rather than
+the drain, so it stays live during a wedge, and the `kind` that is non-zero
+names the sink call or local I/O operation the drain thread is inside. The
+same poll task logs a stall verdict once the drain heartbeat freezes — see
+[Drain liveness](#drain-liveness-reading-a-stalled-drain) for what each verdict
+means and which one a restart actually fixes. `weir_wab_bytes_on_disk` is a
+useful second opinion and should be climbing.
 
 **Two shapes of this rule are wrong**, both documented in the rule's own comment.
 A raw `sealed - confirmed` difference is blind after a restart-with-replay, since
@@ -189,7 +224,10 @@ probing the sink, not that the sink is fine.
 
 **Respond:** restart the daemon. First check the logs for the cause —
 `weir_drain_panics_total` climbing to `max_respawns` points at a panicking sink
-implementation, and a dead-letter open failure names its path. Set
+implementation, and a dead-letter open failure names its path. A segment the
+drain panics on twice is parked (`weir_drain_segments_parked{reason="drain_panic"}`)
+rather than retried, so one poison segment no longer spends the whole respawn
+budget; several distinct poison segments still can. Set
 `wab_max_bytes` if it is not already set, so the next occurrence bounds the WAB
 instead of filling the disk. On a deliberate shutdown this resolves when the
 instance stops being scraped.
@@ -201,16 +239,21 @@ data loss), but delivery is stalled.
 transient errors with backoff; sustained `down` means the sink needs attention.
 Records stay safe on disk until it recovers.
 **Detection lag — alert on more than this one signal.** `weir_sink_health{state}`
-is driven *only* by the periodic HEAD health probe (`probe_health`), not by commit
-failures, and that probe runs on the `health_poll_interval_secs` cadence *from the
-`Draining` state*. During an active outage the drain spends its time in
-`RetryingTransient` (backing off between commit retries), where the probe does not
-run — so `sink_health{down}` can lag the actual outage by a full poll interval or
-more, while `weir_drain_state{state="retrying_transient"}` flips on the *first*
-failed commit. For prompt detection, alert on the faster signals **in addition to**
-`WeirSinkDown`: `weir_drain_state{state="retrying_transient"} == 1` (immediate on
-the first transient failure) and `increase(weir_drain_segments_stranded_total[15m]) > 0`
+is driven *only* by the health probe (`probe_health`), not by commit failures.
+The probe runs in three places: on the `health_poll_interval_secs` cadence in the
+`Draining` state; in `RetryingTransient`, after each retry backoff and before the
+retry itself; and on every wake of `BlockedDeadLetterFull` (every
+`dead_letter_check_interval_secs`). So during an outage `sink_health{down}` trails
+the first failed commit by about one retry backoff (`sink_retry_base_delay_ms`,
+doubling per retry, or a sink's `Retry-After`), not by a poll interval — while
+`weir_drain_state{state="retrying_transient"}` flips on the first failed commit
+itself. And `WeirSinkDown` holds for 5m on top of that. For prompt detection,
+alert on the faster signals **in addition to** `WeirSinkDown`:
+`weir_drain_state{state="retrying_transient"} == 1` (immediate on the first
+transient failure) and `increase(weir_drain_segments_stranded_total[15m]) > 0`
 (`WeirSegmentStranded`, fires once retries are exhausted) — see those entries.
+A sink whose probe stays healthy while its commits fail (a POST-only outage)
+never reaches `down` at all; only those two signals see it.
 
 #### WeirSinkDegraded
 The sink reports itself **degraded** — reachable but not fully healthy (e.g. the
@@ -225,12 +268,19 @@ the WAB keeps buffering durably. Warning, not critical.
 #### WeirSegmentStranded
 The drain exhausted `sink_max_retries` (default 3) of **transient** sink failures
 on a segment and left it on disk ("stranded"). The data is durable (no loss), but
-delivery for that segment is paused.
+delivery for that segment is paused. Only a *sink* failure counts here: a segment
+stranded by local I/O (reading the segment, or writing its dead-letter records)
+counts in `weir_drain_local_io_strands_total{cause}` instead and does not fire
+this alert — see that metric.
 **Respond:** fix the sink (correlate with `WeirSinkDown` / `weir_sink_health`).
-Once the sink **recovers**, the drain **automatically re-drains** stranded
-segments on the next health poll — watch `weir_drain_segments_resumed_total`
-converge toward `weir_drain_segments_stranded_total` and the alert clear. A daemon
-restart also replays them. **Note: `stranded − resumed` is not a strict count of
+Once the sink answers anything but `down` again, the drain **automatically
+re-drains** stranded segments on a later health poll, after the segment's
+cool-down (the backoff its last retry would have waited) has passed, and resumes
+each one **past the records already delivered** in this run — watch
+`weir_drain_segments_resumed_total` converge toward
+`weir_drain_segments_stranded_total` and the alert clear. A daemon restart also
+replays them, from the first record (the resume position is in memory only).
+**Note: `stranded − resumed` is not a strict count of
 currently-stuck segments** — both are event counters, and a segment that strands,
 resumes, then re-strands (e.g. a POST-only outage where the HEAD probe stays
 healthy) bumps both, so the difference can over- or under-state the live backlog.
@@ -494,6 +544,47 @@ re-drain automatically on recovery (watch `weir_drain_segments_resumed_total`).
 
 ---
 
+## Drain liveness: reading a stalled drain
+
+The drain thread cannot report its own wedge — the gauges it writes freeze with
+it (see [WeirDrainNotConfirming](#weirdrainnotconfirming)). So the daemon's 5 s
+poll task watches it from outside, through two signals the drain only stores to:
+
+- **A heartbeat**, bumped at the top of the drain loop, on every slice of the two
+  deliberate waits (a retry backoff and the dead-letter-full block), after every
+  sink commit, and every 1,024 records read. A drain that is waiting, or working
+  through one large segment, keeps it moving.
+- **A busy signal**: which operation the drain thread is inside, and since when.
+  The poll task publishes it as `weir_drain_busy_seconds{kind}` on every tick,
+  before its WAB-size scan, so a failing scan cannot silence it.
+
+An idle drain only re-enters its loop once per `health_poll_interval_secs`, so
+the heartbeat is allowed that long to stand still. Once it has been frozen for
+`health_poll_interval_secs` + 15 s (45 s at the defaults), the poll task logs
+one verdict, checked top to bottom:
+
+| Condition | Verdict | Log | What to do |
+|---|---|---|---|
+| `weir_drain_state{state="stopped"}` is 1 | `Stopped` | WARN, "…and drain_state reports `stopped` — the drain thread is GONE, not wedged" | Nothing is wedged and there is no sink call to hunt: the supervisor exhausted its respawn budget (look for the earlier "drain thread panicked too many times" ERROR) or the daemon is shutting down. Restart. See [WeirDrainStopped](#weirdrainstopped). |
+| busy in `sink_commit` or `sink_probe` for at most `commit_timeout` + 15 s | `SlowSinkCall` | INFO, "drain is inside a slow sink call…" | Nothing, unless it persists. The sink is slow and the timeout still bounds it; check the sink's latency. |
+| busy in `segment_read`, `local_fsync`, `dead_letter_write`, `quarantine_move` or `dir_scan`, for **any** duration | `SlowLocalIo` | WARN, "drain has been inside one local I/O operation…" | Check the WAB device (I/O latency, a failing or saturated disk, a stalled network filesystem). **Do not restart for this**: a restart re-delivers from record 0 and leaves the disk exactly as slow. |
+| busy in `sink_commit` or `sink_probe` for more than `commit_timeout` + 15 s | `Wedged` | WARN, "drain heartbeat has not advanced in over Ns — the drain thread may be wedged…" | The sink is blocking the drain's OS thread (a synchronous driver, `std::fs`, a spin loop) instead of yielding, so no timeout can fire. A restart is the only recovery; the sink implementation is the bug. |
+| nothing busy | `Wedged` | same as above | The drain thread is stuck somewhere no busy guard covers. Restart, and capture a thread dump first if you can. |
+
+`commit_timeout` is `max(2 × sink_timeout_secs, 60 s)` — 60 s at the defaults,
+so a sink call reads as `Wedged` once it has been busy for more than 75 s.
+
+A repeat of the same verdict, or a milder one, is logged at most once every
+5 minutes. An **escalation** is logged at once: a sink that blocks the thread
+always reads first as `SlowSinkCall`, and its `Wedged` WARN is not held back
+behind that INFO.
+
+No shipped alert reads `weir_drain_busy_seconds`, because what counts as "too
+slow" for a local operation depends on your disk. If you add one, alert on the
+local kinds separately from the sink kinds — they need opposite responses.
+
+---
+
 ## Metric reference
 
 All metrics are prefixed `weir_`. Counters carry a `_total` suffix in the
@@ -514,7 +605,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_records_ack_total{tier}` | counter | Records durably acked to the producer, by durability tier (`durable`/`buffered`). The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
 | `weir_records_nack_total{tier,reason}` | counter | Records Nacked (not durably accepted), by durability tier and `reason`. Should be ~0. `reason` is one of `bad_magic`, `version_mismatch`, `bad_header_crc`, `payload_too_large`, `bad_payload_crc`, `internal_error`, `empty_payload`, `unknown_message`, `reserved_flags_set` (the wire `NackReason` variant names, lowercased). `internal_error` is the only *transient* reason (queue saturation / ack timeout / write-fsync error / the [`wab_max_bytes`](operations/configuration.md#wab_max_bytes) cap rejecting — connection stays open, producer retries); the rest are permanent protocol/payload errors that close the connection. The cap is the one cause with its own counter — `weir_wab_cap_rejections_total` — so subtracting it from `internal_error` separates "the WAB is full" from the other three. |
 | `weir_batch_records` | histogram | Records carried by one `PushBatch` frame. Only observed for the optional batch extension, so it stays empty on a daemon no client batches against. Its shape is the question "are producers actually batching?" — a distribution pinned near 1 means the batch path is being paid for without being used. |
-| `weir_batch_partial` | counter | `PushBatch` frames answered with at least one record not durable. Should be ~0. A partial batch is not a protocol error: the frame was valid and the connection stays open, and the clear bits are the same at-least-once signal a single-record `Nack(InternalError)` carries. Rising values track the same underlying causes as `internal_error` — queue saturation, ack timeout, a write or fsync that did not succeed, the `wab_max_bytes` cap — so read it alongside `weir_records_nack_total{reason="internal_error"}` rather than on its own. |
+| `weir_batch_partial_total` | counter | `PushBatch` frames answered with at least one record not durable. Should be ~0. A partial batch is not a protocol error: the frame was valid and the connection stays open, and the clear bits are the same at-least-once signal a single-record `Nack(InternalError)` carries. Rising values track the same underlying causes as `internal_error` — queue saturation, ack timeout, a write or fsync that did not succeed, the `wab_max_bytes` cap — so read it alongside `weir_records_nack_total{reason="internal_error"}` rather than on its own. |
 | `weir_accept_latency_seconds` | histogram | Socket-accept → connection-handler spawn latency (independent of fsync). |
 | `weir_queue_depth` | gauge | In-flight records between the socket layer and workers. |
 
@@ -549,7 +640,9 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_quarantine_bytes_on_disk` | gauge | Total bytes under `<wab_dir>/quarantine/`. **The one signal that moves on every quarantine event**, including the `.confirmed`-sidecar case neither counter above catches. Survives a restart (unlike the counters), refreshed on the same cadence as `weir_dead_letter_bytes_on_disk`. Recover with `weir-ctl quarantine requeue`. |
 | `weir_recovery_quarantine_copy_failed_total` | counter | Mid-file-corrupt segments whose quarantine copy failed (disk full / read-only / inode exhaustion); recovery left the segment un-truncated to preserve acked-durable tail records and will retry. **Non-zero means recovery is stuck on that segment — clear the disk/read-only state and restart.** |
 | `weir_ack_timeout_total` | counter | Acks that never fired within the timeout (wedged flusher). |
-| `weir_stage_{queue,bridge_wait,write,total}_seconds` | histogram | Per-stage latency decomposition (`bench-trace` builds only — diagnostic). |
+| `weir_wab_dir_lock_held` | gauge | 1 while this daemon holds the exclusive `flock` on `<wab_dir>/.weir.lock`, so no second `weir-server` can recover or drain its live segments. **0 means it runs without that guard**: `wab_dir_lock = "best-effort"` on a filesystem that cannot lock. It also reads 0 for the instant before an exit with status 3, when the daemon has proven another instance owns the `wab_dir`. Starts at 0 and is set before the metrics endpoint binds, so a scrape never shows a guard that is not there. **Alert on 0** — the shipped [`WeirWabDirUnlocked`](#weirwabdirunlocked) rule. |
+| `weir_wab_dir_lock_integrity_failures_total` | counter | Once-a-second integrity checks of `<wab_dir>/.weir.lock` that found the file deleted or replaced (the daemon re-created and re-locked it, and logs an ERROR saying so), or that failed with an errno (retried a second later). **Must be 0.** Any increase means something is deleting or replacing the lock file of a running daemon, and while it was missing a second `weir-server` could have started on this `wab_dir`. Proven loss to another instance is not counted here: the daemon exits with status 3 instead. |
+| `weir_stage_queue_seconds`, `weir_stage_bridge_wait_seconds`, `weir_stage_write_seconds`, `weir_stage_total_seconds` | histogram | Per-stage latency decomposition (`bench-trace` builds only — diagnostic): queue + coalesce wait, bridge hop + flusher receive, record write before fsync, and enqueue → ack end to end. |
 
 > **Using `weir_wab_segments_total` for drain backlog.** Within a single process
 > run the family conserves: every segment counted `sealed` is later counted
@@ -565,6 +658,17 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 > `rate(...)`/`increase(...)` over a window for the trend.
 
 ### Drain / sink
+
+> **Changed after 4.0.1 — `weir_drain_segments_stranded_total` now counts sink
+> failures only.** A segment stranded because the drain could not *read* it, or
+> could not write its sink-rejected records into `dead_letter/`, used to count
+> there too, and to mark the sink down. It now counts in
+> `weir_drain_local_io_strands_total{cause}` and leaves the sink's health alone.
+> On a host whose WAB device misbehaves, expect `stranded` (and
+> `WeirSegmentStranded`) to go quieter and the new counter to carry what moved.
+> The rest of this table's drain-ledger rows are new in the same release; every
+> one of their series exists at 0 from boot.
+
 | Metric | Type | Meaning |
 |---|---|---|
 | `weir_drain_state{state}` | gauge | One of `draining` / `retrying_transient` / `blocked_dead_letter_full` / `stopped` is 1. `stopped` is **terminal**: the drain supervisor has exited (clean shutdown, the respawn budget exhausted, or the dead-letter writer failing to open at start) and nothing will be delivered until the daemon restarts — the WAB grows until then. Alert on `weir_drain_state{state="stopped"} == 1` on a daemon you expect to be running. |
@@ -575,8 +679,15 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_dead_letter_bytes_on_disk` | gauge | Dead-letter directory size. |
 | `weir_dead_letter_full_total` | counter | Count of distinct BlockedDeadLetterFull episodes (each entry into the blocked state). For the current-blocked boolean use `weir_drain_state{state="blocked_dead_letter_full"}`. |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Seconds since the drain entered BlockedDeadLetterFull (resets to 0 on exit); alert when it exceeds your threshold. |
-| `weir_drain_segments_stranded_total` | counter | Segments left on disk after exhausting `sink_max_retries` **transient** sink failures. The data is durable; delivery is paused. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`. They are re-drained automatically when the sink recovers (see below) or on restart. This is an **event counter, not a live gauge of distinct stuck segments**: the same segment can strand, auto-resume on the next healthy probe, and re-strand — each strand increments it — so it can exceed the number of distinct stuck segments. That happens notably in a **POST-only outage**: deliveries (`commit`) keep failing while the HEAD health probe stays healthy, so each recovery edge re-queues the segment, it re-fails, and it strands again. Distinct from `weir_dead_letter_full_total` (permanent rejections). |
-| `weir_drain_segments_resumed_total` | counter | Stranded segments re-queued for delivery after a sink health **recovery** (down→up). Convergence with `weir_drain_segments_stranded_total` means an outage's backlog has been picked back up; a persistent gap means segments are still stranded (sink not healthy yet). |
+| `weir_drain_segments_stranded_total` | counter | Segments left on disk after exhausting `sink_max_retries` **transient sink** failures. Local I/O strands are not counted here (see the note above and `weir_drain_local_io_strands_total`). The data is durable; delivery is paused. **Alert on `increase(weir_drain_segments_stranded_total[15m]) > 0`** and correlate with `weir_sink_health{state="down"}`. They are re-drained automatically, past the records already delivered, once their cool-down has passed and the sink answers (see below), or from the first record on restart. This is an **event counter, not a live gauge of distinct stuck segments**: the same segment can strand, auto-resume on the next healthy probe, and re-strand — each strand increments it — so it can exceed the number of distinct stuck segments. That happens notably in a **POST-only outage**: deliveries (`commit`) keep failing while the HEAD health probe stays healthy, so each recovery edge re-queues the segment, it re-fails, and it strands again. Distinct from `weir_dead_letter_full_total` (permanent rejections). |
+| `weir_drain_segments_resumed_total` | counter | Stranded segments re-queued for delivery by the drain's rescan, which runs on a sink health **recovery** (down→up) and on every health poll that finds the drain idle with the sink not `down`. Convergence with `weir_drain_segments_stranded_total` means an outage's backlog has been picked back up; a persistent gap means segments are still stranded (sink not healthy yet). Segments resumed after a local I/O strand count here too, so `resumed` can run ahead of `stranded`. The count can over-state at a recovery edge (a copy still in the drain channel is counted again), but a segment is never *processed* twice: both copies pass the drain's admission check first. |
+| `weir_drain_local_io_strands_total{cause}` | counter | Segments set aside after exhausting `sink_max_retries` on a **local** I/O failure rather than a sink failure. `cause="read"`: reading the sealed segment failed with a non-corruption error. `cause="write"`: writing sink-rejected records into `dead_letter/` failed after the sink commit succeeded. Unlike `weir_drain_segments_stranded_total` these do not mark the sink down; the idle rescan (a health poll that finds the drain idle and the sink not `down`) resumes them past their delivered prefix once their cool-down has passed. **Investigate the WAB and dead-letter device** (I/O errors, `ENOSPC`, permissions, descriptor exhaustion), not the sink. A read failure that persists for 3 strand cycles escalates: a permission-class error parks the segment (`weir_drain_segments_parked{reason="local_read_failed"}`), a media-class error quarantines it. Process-wide pressure (`EMFILE`, `ENFILE`, `ENOMEM`, `ENOBUFS`, `EAGAIN`, `EINTR`) never escalates. |
+| `weir_drain_segments_parked{reason}` | gauge | Segments the drain has parked: left on disk untouched, not re-queued for the rest of this run, and replayed from their first record on the next start. `reason="local_read_failed"`: a permission-class read error (`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) that persisted for 3 strand cycles — fix the file's permissions or type, then restart. `reason="unsupported_version"`: the segment was written in a newer WAB format than this binary reads — upgrade weir; it is parked rather than quarantined so a rollback does not push the newer segments into manual recovery. `reason="drain_panic"`: the drain panicked twice while delivering this segment — fix the sink (or the record it trips on) before restarting. **Non-zero means acked data is not being delivered until a restart**; the ERROR at park time names the path. |
+| `weir_drain_segments_disposition_pending{kind}` | gauge | Segments the drain has finished with that still owe a local step, retried on every health poll and **never re-delivered** while they wait. `kind="confirm"`: a delivered segment whose `.confirmed` sidecar write or delete has not succeeded yet. `kind="quarantine"`: a segment whose move into `quarantine/` has not succeeded yet. Should be 0, or briefly non-zero; a value that stays up means the WAB device is full or read-only — the matching failure counters below say which step. |
+| `weir_drain_confirm_failures_total{stage}` | counter | Failed steps confirming a delivered segment. `stage="sidecar"`: the atomic `.confirmed` write (temp file, fsync, rename, directory fsync). `stage="delete"`: removing the segment after a durable sidecar. Each failure is retried on the next health poll without re-delivering the segment (`weir_drain_segments_disposition_pending{kind="confirm"}`). A rising `sidecar` count usually means the WAB device is full or read-only. |
+| `weir_drain_quarantine_failures_total` | counter | Segments the drain could not move into `quarantine/` (corrupt, truncated or persistently unreadable segments whose readable prefix was already delivered). Counted **once per segment**; the move is then retried on every health poll (`weir_drain_segments_disposition_pending{kind="quarantine"}`), the bytes stay in place, and the prefix is not re-delivered. Usually a full or read-only WAB device, or something other than a directory at `<wab_dir>/quarantine`. |
+| `weir_drain_dead_letter_write_failures_total` | counter | Failed attempts to write sink-rejected records into `dead_letter/` after the sink commit succeeded. The drain keeps the rejected records in memory and retries **only the write**, so the accepted records are not committed again; the segment stays on disk until the write lands. A segment that exhausts its retries this way counts in `weir_drain_local_io_strands_total{cause="write"}` and keeps cycling (it is never parked), so it self-heals once space frees up. Usually a full or read-only WAB device (`ENOSPC`, `EROFS`, `EACCES`). |
+| `weir_drain_busy_seconds{kind}` | gauge | Seconds the drain thread has spent inside its **current** operation. `kind` is `sink_commit` or `sink_probe` (calls into the sink) or `segment_read`, `local_fsync`, `dead_letter_write`, `quarantine_move`, `dir_scan` (local I/O on the WAB device; `dir_scan` includes the rescan's orphan-file cleanup fsync). Only the current kind is non-zero, and all read 0 between operations. Written by the 5 s poll task, not the drain, so it **stays live while the drain is wedged** — sampled every 5 s, so operations shorter than that rarely show. A large local value means a slow disk, which a restart does not fix; a `sink_commit` value past `commit_timeout` means a sink blocking the drain thread. See [Drain liveness](#drain-liveness-reading-a-stalled-drain). |
 
 ### System / security
 | Metric | Type | Meaning |
@@ -586,7 +697,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_connection_idle_timeout_total` | counter | Connections dropped for read-idle (slowloris guard). |
 | `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown after the grace period. |
 | `weir_tls_handshake_failures_total` | counter | (tls) Mutual-TLS handshake failures. |
-| `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. |
+| `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. Unchanged by `weir_config_reloads_total` below, which counts the same reloads again among every other SIGHUP. |
+| `weir_config_reloads_total{trigger,outcome}` | counter | Every config reload request, on every build. `trigger` is `sighup` (`admin` is reserved; nothing sends it yet). `outcome` is `ok` (something was reloaded — today only TLS material), `failed` (a reload was attempted and rejected; the previous config stays in force), `noop` (nothing reloadable: the config is read once at startup, so a daemon without TLS answers every SIGHUP this way and keeps running), or `dropped` (the request never ran: the 8-deep reload queue was full, as in a SIGHUP flood, or the reload loop had stopped). A SIGHUP that arrives before the handler is installed, during startup, is ignored and not counted. |
 
 ### Integrity / tamper evidence (weir-attest)
 

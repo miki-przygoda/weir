@@ -83,6 +83,27 @@ groups:
           description: "fsync latency is an order of magnitude above any healthy local SSD. Durable-tier throughput is collapsing. Likely a failing disk or saturated/remote storage."
           runbook: "docs/monitoring.md#weirfsynclatency"
 
+      - alert: WeirWabDirUnlocked
+        # weir_wab_dir_lock_held is 1 while the daemon holds the exclusive flock
+        # on <wab_dir>/.weir.lock. Its steady 0 is `wab_dir_lock = "best-effort"`
+        # on a filesystem that cannot lock: no guard against a second daemon on
+        # the same wab_dir, whose recovery would turn this one's Durable acks
+        # into false acks. A warning, not a page: nothing has gone wrong yet,
+        # and the setting is an operator's choice.
+        #
+        # The gauge's other 0 -- ownership proven lost to another instance --
+        # lasts only until the exit with status 3 that follows it at once, and
+        # surfaces as WeirInstanceDown; `for: 5m` keeps that instant out of
+        # this rule. The gauge is set before the metrics endpoint binds, so a
+        # daemon that holds the lock never scrapes as 0.
+        expr: weir_wab_dir_lock_held{job=~"weir"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir on {{ $labels.instance }} is running without its wab_dir lock"
+          description: "This daemon does not hold the exclusive lock on <wab_dir>/.weir.lock (wab_dir_lock = \"best-effort\" on a filesystem that cannot flock). Nothing stops a second weir-server from recovering its live segments, which would turn its Durable acks into false acks. Move wab_dir to a local filesystem that supports flock, or guarantee a single daemon by other means."
+          runbook: "docs/monitoring.md#weirwabdirunlocked"
+
   # ── Drain / dead-letter ─────────────────────────────────────────────────────
   - name: weir-drain
     rules:

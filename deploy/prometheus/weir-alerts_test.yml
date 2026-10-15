@@ -607,3 +607,48 @@ tests:
       - eval_time: 6m
         alertname: WeirUnauthorizedConnections
         exp_alerts: []
+
+  # ── wab_dir ownership ───────────────────────────────────────────────────────
+  #
+  # weir_wab_dir_lock_held is a gauge, 1 while the daemon holds the flock on
+  # <wab_dir>/.weir.lock. Its steady 0 is `wab_dir_lock = "best-effort"` on a
+  # filesystem that cannot lock. Its other 0, ownership proven lost, is one
+  # sample before an exit with status 3; the target then goes down and the
+  # series goes stale, which the quiet test below models with `stale`.
+
+  - interval: 1m
+    name: a daemon running without its wab_dir lock fires WeirWabDirUnlocked
+    input_series:
+      - series: 'weir_wab_dir_lock_held{job="weir",instance="w:9185"}'
+        values: "0x20"
+    alert_rule_test:
+      # Inside `for: 5m`: pending, not firing.
+      - eval_time: 4m
+        alertname: WeirWabDirUnlocked
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: WeirWabDirUnlocked
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir on w:9185 is running without its wab_dir lock"
+              description: "This daemon does not hold the exclusive lock on <wab_dir>/.weir.lock (wab_dir_lock = \"best-effort\" on a filesystem that cannot flock). Nothing stops a second weir-server from recovering its live segments, which would turn its Durable acks into false acks. Move wab_dir to a local filesystem that supports flock, or guarantee a single daemon by other means."
+              runbook: "docs/monitoring.md#weirwabdirunlocked"
+
+  - interval: 1m
+    name: a held lock, and the last scrape before an ownership-lost exit, do not fire
+    input_series:
+      - series: 'weir_wab_dir_lock_held{job="weir",instance="w:9185"}'
+        values: "1x20"
+      - series: 'weir_wab_dir_lock_held{job="weir",instance="lost:9185"}'
+        values: "1 1 1 0 stale"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirWabDirUnlocked
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: WeirWabDirUnlocked
+        exp_alerts: []

@@ -25,6 +25,11 @@ const HISTORY: &str = include_str!("../../../docs/benchmarks/history.md");
 const MONITORING: &str = include_str!("../../../docs/monitoring.md");
 const ALERTS: &str = include_str!("../../../deploy/prometheus/weir-alerts.yml");
 const ALERTS_TEST: &str = include_str!("../../../deploy/prometheus/weir-alerts_test.yml");
+const METRICS_SRC: &str = include_str!("../src/metrics/mod.rs");
+const CONFIGURATION: &str = include_str!("../../../docs/operations/configuration.md");
+const CONFIG_EXAMPLE: &str = include_str!("../../../deploy/docker/weir.toml.example");
+const CONFIG_ENV_SRC: &str = include_str!("../src/config/env.rs");
+const CONFIG_CLI_SRC: &str = include_str!("../src/config/cli.rs");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -657,4 +662,164 @@ fn every_alert_rule_has_a_unit_test() {
          header and docs/monitoring.md all said every rule was pinned in both \n\
          directions."
     );
+}
+
+/// Every metric family the daemon registers, as `(exposition name, is_counter)`,
+/// parsed out of the `reg!(<metric>, "weir_…", "<help>")` calls in
+/// `src/metrics/mod.rs`. A counter is exposed with a `_total` suffix the source
+/// does not spell, so the returned name carries it.
+fn registered_metric_families() -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, _) in METRICS_SRC.match_indices("reg!(") {
+        let call = &METRICS_SRC[i + "reg!(".len()..];
+        // The first string literal in the call is the name; everything before it
+        // is the metric expression, which names its type.
+        let open = call.find('"').expect("a reg! call with no name literal");
+        let (expr, rest) = call.split_at(open);
+        let name = &rest[1..rest[1..].find('"').expect("unterminated name literal") + 1];
+        assert!(
+            name.starts_with("weir_"),
+            "the first literal in a reg! call is {name:?}, not a weir_ metric name; \n\
+             the call shape changed and this parser is no longer reading names"
+        );
+        if expr.contains("Counter") {
+            out.push(format!("{name}_total"));
+        } else {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// The metric names a `docs/monitoring.md` reference table row documents: every
+/// backticked `weir_…` name in the row's first cell, label set stripped.
+fn documented_metric_names(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .filter(|l| l.starts_with("| `weir_"))
+        .flat_map(|l| {
+            let first_cell = l.split('|').nth(1).unwrap_or("");
+            first_cell
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .filter(|t| t.starts_with("weir_"))
+                .map(|t| t.split('{').next().unwrap_or(t).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Every metric the daemon registers has a row in `docs/monitoring.md`'s
+/// metric reference, under the name a scrape actually shows, and every row
+/// there names a metric the daemon still registers.
+///
+/// The safety floor added ten metric families at once. The reference table is
+/// the only place an operator learns what `weir_drain_segments_parked` means
+/// or what to do about it, and a family that ships without a row is one the
+/// first operator to see it non-zero has to read the source for. The second
+/// direction catches the rename: a row describing a name nothing exports is a
+/// dashboard query that silently returns no data. This derives the set from
+/// the registrations themselves, so it is closed against both — a property
+/// checked by enumerating part of a set is how this file's other guards were
+/// born.
+///
+/// Counters must be documented with their `_total` suffix, because that is the
+/// name a query uses. The weir-attest rows are excluded from the second
+/// direction: those gauges come from `weir-ctl attest verify`, not the daemon.
+#[test]
+fn every_registered_metric_is_in_the_monitoring_reference() {
+    let registered = registered_metric_families();
+    assert!(
+        registered.len() >= 50,
+        "parsed only {} reg! calls out of src/metrics/mod.rs; the registration \n\
+         shape must have changed and this guard is no longer reading it",
+        registered.len()
+    );
+
+    let reference = MONITORING
+        .split("\n## Metric reference")
+        .nth(1)
+        .expect("docs/monitoring.md must keep its `## Metric reference` section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    // The daemon's own tables, without the weir-attest section (whose rows are
+    // written by weir-ctl onto the node_exporter textfile collector).
+    let daemon_tables: String = reference
+        .split("\n### ")
+        .filter(|s| !s.starts_with("Integrity / tamper evidence (weir-attest)"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reference.contains("Integrity / tamper evidence (weir-attest)"),
+        "the weir-attest section was renamed; update the exclusion above or \n\
+         its rows will be checked against the daemon's registrations"
+    );
+
+    let documented = documented_metric_names(&daemon_tables);
+    let missing: Vec<&String> = registered
+        .iter()
+        .filter(|name| !documented.contains(name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these metric families are registered in src/metrics/mod.rs but have no \n\
+         row in docs/monitoring.md's metric reference (a counter is matched with \n\
+         its `_total` suffix): {missing:?}\n\n\
+         Add a row with its type, labels and label values, what it means and what \n\
+         an operator should do about it."
+    );
+
+    let stale: Vec<&String> = documented
+        .iter()
+        .filter(|name| !registered.contains(name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "docs/monitoring.md's metric reference documents names the daemon does \n\
+         not export: {stale:?}\n\n\
+         A renamed or removed family, or a counter documented without its \n\
+         `_total` suffix. A query built from that row returns no data."
+    );
+}
+
+/// `wab_dir_lock` is the one knob that turns off the single-owner guard on a
+/// `wab_dir`, so an operator who meets the refusal must find it, under the
+/// spellings the daemon actually parses, in the configuration reference and
+/// in the example file that claims to list every option.
+///
+/// The env and CLI spellings are checked against the parser first, so a
+/// rename in the code fails here rather than leaving the docs naming a flag
+/// the daemon rejects.
+#[test]
+fn the_wab_dir_lock_key_is_in_the_configuration_reference() {
+    assert!(
+        CONFIG_ENV_SRC.contains("\"WEIR_WAB_DIR_LOCK\""),
+        "src/config/env.rs no longer reads WEIR_WAB_DIR_LOCK; update this guard \n\
+         and the docs to the new spelling"
+    );
+    assert!(
+        CONFIG_CLI_SRC.contains("\"--wab-dir-lock\""),
+        "src/config/cli.rs no longer parses --wab-dir-lock; update this guard \n\
+         and the docs to the new spelling"
+    );
+    for needle in [
+        "#### `wab_dir_lock`",
+        "`WEIR_WAB_DIR_LOCK`",
+        "`--wab-dir-lock",
+    ] {
+        assert!(
+            CONFIGURATION.contains(needle),
+            "docs/operations/configuration.md must document `wab_dir_lock` \n\
+             (missing {needle:?}): the key, its env var and its CLI flag"
+        );
+    }
+    for needle in ["wab_dir_lock", "WEIR_WAB_DIR_LOCK"] {
+        assert!(
+            CONFIG_EXAMPLE.contains(needle),
+            "deploy/docker/weir.toml.example claims to list every option; it is \n\
+             missing {needle:?}"
+        );
+    }
 }
