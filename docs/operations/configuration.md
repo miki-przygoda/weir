@@ -1690,6 +1690,30 @@ requeue` re-pushes records into a *new* segment, so they arrive as new ids and
 are inserted again. Both requeue commands say so before asking for
 confirmation.
 
+> **Feed each table from one weir instance with a persistent `wab_dir`.** A
+> `RecordId` is unique only within one `wab_dir`'s history. The segment part of
+> it is the file's path relative to `wab_dir` (`shard_03/seg_00000042.wab.sealed`),
+> and every `wab_dir` numbers its segments from 1 in each shard. Nothing in the
+> id says *which* `wab_dir`. So two weir instances writing to the same table,
+> or one instance whose `wab_dir` was wiped, recreated or restored from an older
+> backup (or had its `.confirmed` tombstones deleted), will reuse coordinates
+> another record already had. A record whose bytes match the earlier record at
+> the same coordinate then gets an **identical** `RecordId`, although it is a
+> different record. That is exactly the fixed-shape case the id exists for: a
+> heartbeat, a "one unit consumed" event. `ignore` (the default) and `plain`
+> with this column both treat a present id as *already delivered*, so the
+> second record is **silently dropped**: acked by weir, delivered, and never
+> stored, with no dead-letter and no error.
+>
+> Run one weir instance per table, on a `wab_dir` that survives restarts and
+> redeploys (a persistent volume, not an `emptyDir` or a container's writable
+> layer). If several instances must feed one destination, give each its own
+> table and combine them downstream (a view or a `UNION ALL`); weir writes
+> only the payload and id columns, so it cannot tell one table which instance
+> a row came from. A future major release may mix a per-`wab_dir` instance
+> nonce into the id; the issue is parked in the repository's
+> `docs/explorations/parked-future-directions.md`.
+
 Rejected at startup: an id column equal to `sink_mysql_column` (the generated
 statement would name one column twice, which MySQL rejects permanently — the
 drain would dead-letter every batch), and any value failing identifier
@@ -1712,7 +1736,10 @@ How to phrase the INSERT statement.
   silently dropped by the server. The recommended default: pair with a
   `UNIQUE` constraint on [`sink_mysql_id_column`](#sink_mysql_id_column) so
   crash-recovery retries are idempotent without consumer-side dedup. A `UNIQUE`
-  on the payload instead discards distinct records that share bytes.
+  on the payload instead discards distinct records that share bytes. The id
+  is unique only within one `wab_dir`: feed the table from a single weir
+  instance with a persistent `wab_dir`, or a second instance's records can be
+  dropped as duplicates (see [`sink_mysql_id_column`](#sink_mysql_id_column)).
 - `"plain"` → `INSERT INTO ...`. Duplicates surface as `ER_DUP_ENTRY`
   (code 1062) and are resolved row by row rather than retried; see
   [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres).
@@ -1848,6 +1875,30 @@ requeue` re-pushes records into a *new* segment, so they arrive as new ids and
 are inserted again. Both requeue commands say so before asking for
 confirmation.
 
+> **Feed each table from one weir instance with a persistent `wab_dir`.** A
+> `RecordId` is unique only within one `wab_dir`'s history. The segment part of
+> it is the file's path relative to `wab_dir` (`shard_03/seg_00000042.wab.sealed`),
+> and every `wab_dir` numbers its segments from 1 in each shard. Nothing in the
+> id says *which* `wab_dir`. So two weir instances writing to the same table,
+> or one instance whose `wab_dir` was wiped, recreated or restored from an older
+> backup (or had its `.confirmed` tombstones deleted), will reuse coordinates
+> another record already had. A record whose bytes match the earlier record at
+> the same coordinate then gets an **identical** `RecordId`, although it is a
+> different record. That is exactly the fixed-shape case the id exists for: a
+> heartbeat, a "one unit consumed" event. `on_conflict_do_nothing` (the default) and `plain`
+> with this column both treat a present id as *already delivered*, so the
+> second record is **silently dropped**: acked by weir, delivered, and never
+> stored, with no dead-letter and no error.
+>
+> Run one weir instance per table, on a `wab_dir` that survives restarts and
+> redeploys (a persistent volume, not an `emptyDir` or a container's writable
+> layer). If several instances must feed one destination, give each its own
+> table and combine them downstream (a view or a `UNION ALL`); weir writes
+> only the payload and id columns, so it cannot tell one table which instance
+> a row came from. A future major release may mix a per-`wab_dir` instance
+> nonce into the id; the issue is parked in the repository's
+> `docs/explorations/parked-future-directions.md`.
+
 With this set each row takes **two** bind parameters instead of one. Postgres's
 wire protocol caps a statement at 65 535 parameters and `sink_max_batch_size` is
 already validated to `1..=10000`, so the worst case is 20 000 — no new limit.
@@ -1876,6 +1927,12 @@ it unset every statement weir generates is byte-identical to previous releases.
 | `plain` | `INSERT INTO t (col) VALUES ($1), ($2), …` | with [`sink_postgres_id_column`](#sink_postgres_id_column) set, yes: a duplicate whose id is already present counts as committed. Without it, no: each duplicate row is dead-lettered. Duplicates surface as SQLSTATE `23505` and are resolved row by row; see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
 
 Plain mode without `sink_postgres_id_column` draws a startup WARN.
+
+Either mode with an id column assumes **one weir instance with a persistent
+`wab_dir` feeds the table**: a `RecordId` is unique only within one `wab_dir`,
+so a second instance, or a reset `wab_dir`, can produce the id of a record
+already stored, and both modes then drop the new record as a duplicate (see
+[`sink_postgres_id_column`](#sink_postgres_id_column)).
 
 #### Error classification
 

@@ -50,6 +50,48 @@ a hot-processing fast-path could be a *semantic / architectural* change worth
 exploring (akin to the `LazySync` tier in `phase4-wab-optimization.md`, which acks
 before fsync). Kept; needs a design pass when revisited (likely post-1.0).
 
+## `RecordId` is unique only within one `wab_dir`
+Parked 2026-10-15 from the safety-floor review (findings conf-durability-1 and
+conf-regressions-10). Needs a future major: it changes the id format, which is
+public SDK surface.
+
+**The issue.** `RecordId::for_record` (weir-sink-sdk) is SHA-256 over the
+segment identity, the record's index in the segment and the payload. The
+segment identity is the file's path relative to `wab_dir`
+(`shard_03/seg_00000042.wab.sealed`), and every `wab_dir` numbers its segments
+from 1 in each shard; the `.confirmed` tombstones are what stop the counter
+rewinding within one directory. Nothing in the id names the directory or the
+instance. So two daemons feeding one destination, or one daemon whose
+`wab_dir` is wiped, recreated, restored from an older backup or stripped of its
+tombstones, reuse coordinates. A record whose bytes match the earlier record at
+the same coordinate (a heartbeat, a fixed-shape metering event: the case the id
+was introduced for) gets an identical id. Every sink that dedups on the id
+then drops it silently: MySQL `ignore`, Postgres `on_conflict_do_nothing`, and
+`plain` mode with an `id_column` (which counts a present id as already
+delivered), and an HTTP receiver that honours the per-record
+`Idempotency-Key`. weir acked and delivered the record; it is never stored and
+nothing is dead-lettered. The S3 sink is not affected in practice: its object
+key also carries the segment's `created_at`.
+
+**Mitigation today (documentation).** `docs/operations/configuration.md`
+(the MySQL and Postgres `id_column` and `insert_mode` sections) says to feed
+each table from one weir instance with a persistent `wab_dir`, and to give
+each instance its own table when several must feed one destination.
+
+**Candidate fix.** Persist a random per-`wab_dir` instance nonce, created once
+with the directory (next to `.weir.lock`, fsynced, never rewritten), and mix it
+into the id: `SHA-256(nonce ++ segment identity ++ index ++ payload)` with the
+same length prefixes. A recreated directory gets a new nonce, so its ids cannot
+meet the old ones; a replay of the same directory keeps its nonce, so retries
+still dedup. Open questions for the design pass: every id changes across the
+upgrade, so a segment written before it and replayed after would be inserted a
+second time (derive pre-upgrade segments' ids the old way, keyed on the WAB
+format version, or drain to empty before upgrading); a backup restored *with*
+its nonce still collides with its own future, which only a nonce rotated on
+restore detects; and `weir-attest` and the published test vectors recompute
+ids and would need the nonce too, which puts it on the attest verification
+path.
+
 ## Other deferred items (detail in the exploration docs)
 - **`LazySync` durability tier** (ack after write, before fsync) — Phase 5 / API-lock.
 - **Embeddable library** (`weir-embedded`) — Phase 5.
