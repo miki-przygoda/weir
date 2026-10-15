@@ -563,7 +563,7 @@ static ORPHAN_CLEANUP_OFF_LOGGED: AtomicBool = AtomicBool::new(false);
 /// replay moves into the drain), got there first.
 fn delete_orphan(sealed: &Path) -> io::Result<()> {
     let confirmed = format::confirmed_path_for(sealed);
-    fs::File::open(&confirmed)?.sync_all()?;
+    segment::sync_path(&confirmed)?;
     segment::fsync_parent_dir(&confirmed)?;
     match fs::remove_file(sealed) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1744,6 +1744,47 @@ mod tests {
                 "the tombstone stays: the counter scan counts it"
             );
             assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// conf-tests-13: `delete_orphan` makes the tombstone durable (the sidecar's
+    /// fsync, then its directory's) BEFORE the segment goes. A failure of
+    /// either sync keeps the orphan: deleting it on a tombstone a power loss
+    /// could still undo might leave the shard with neither, and the segment
+    /// counter would rewind past a delivered segment. The next scan, once the
+    /// syncs succeed, deletes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sync_before_an_orphan_delete_keeps_the_orphan() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        use crate::wab::segment::sync_hook;
+        for target in ["sidecar", "dir"] {
+            let dir = tmp_dir(&format!("orphan_sync_fail_{target}"));
+            let sd = shard_dir_path(&dir, 0);
+            let orphan = sealed_in_shard(&sd, 1, b"delivered");
+            let confirmed = confirmed_path_for(&orphan);
+            fs::write(&confirmed, build_confirmed(0, 1, 1)).unwrap();
+            let synced = if target == "sidecar" { &confirmed } else { &sd };
+            sync_hook::fail(synced, libc::EIO, u32::MAX);
+
+            let (m, _reg) = crate::metrics::Metrics::new();
+            let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, true)
+                .unwrap()
+                .segments;
+            assert!(got.is_empty(), "an orphan is never replayed: {got:?}");
+            assert!(sync_hook::calls(synced) >= 1, "{target}: the sync ran");
+            assert!(
+                orphan.exists(),
+                "{target}: a failed sync keeps the orphan (its tombstone may not be durable)"
+            );
+            assert!(confirmed.exists());
+
+            sync_hook::clear(synced);
+            scan_unconfirmed_sealed(&dir, None, &m, &|_| false, true).unwrap();
+            assert!(!orphan.exists(), "{target}: deleted once the syncs succeed");
+            assert!(confirmed.exists(), "the tombstone stays");
+            sync_hook::forget(synced);
             fs::remove_dir_all(dir).ok();
         }
     }

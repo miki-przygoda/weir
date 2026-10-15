@@ -443,6 +443,55 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// The directory fsync AFTER the rename fails (conf-tests-13). The sidecar
+    /// already sits under its final name, but the rename is not durable: a
+    /// power loss could undo it. Deleting the segment on the strength of it
+    /// could then leave neither the segment nor its tombstone, so the shard
+    /// counter would rewind and reuse a delivered segment's name. So the step
+    /// is a `SidecarFailed` like any other sidecar failure: nothing is deleted,
+    /// the ledger owns the segment at the `Sidecar` stage, and the next
+    /// disposition retry finishes the confirm without re-delivering it.
+    #[test]
+    fn a_failed_dir_fsync_after_the_rename_keeps_the_segment_until_a_retry() {
+        use super::super::ledger::{ConfirmStage, LedgerCounts, SegmentLedger};
+        let (dir, sealed) = sealed_in("confirm_dir_sync_fail");
+        crate::wab::segment::sync_hook::fail(&dir, libc::EIO, 1);
+        let m = metrics();
+        assert_eq!(
+            confirm_and_delete(&sealed, 2, &m),
+            ConfirmOutcome::SidecarFailed,
+            "a rename that is not yet durable is not a confirm"
+        );
+        assert_eq!(crate::wab::segment::sync_hook::calls(&dir), 1);
+        assert!(sealed.exists(), "the segment is NOT deleted");
+        assert_eq!(failures(&m, ConfirmFailureStage::sidecar), 1);
+        assert_eq!(failures(&m, ConfirmFailureStage::delete), 0);
+        let confirmed_counter = || {
+            m.wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::confirmed,
+                })
+                .get()
+        };
+        assert_eq!(confirmed_counter(), 0, "not a confirmed transition yet");
+
+        // The drain hands the outcome to the ledger, which retries only the
+        // confirm on the next health poll.
+        let mut ledger = SegmentLedger::new(std::sync::Arc::new(LedgerCounts::default()));
+        ledger.note_confirm_outcome(&sealed, ConfirmOutcome::SidecarFailed, 2);
+        assert_eq!(ledger.confirm_stage(&sealed), Some(ConfirmStage::Sidecar));
+        ledger.retry_dispositions(&dir, &m, &super::super::DrainHeartbeat::new());
+        assert_eq!(ledger.confirm_stage(&sealed), None, "the retry finished it");
+        assert!(!sealed.exists(), "deleted once the rename is durable");
+        let parsed = parse_confirmed(&std::fs::read(confirmed_path(&sealed)).unwrap()).unwrap();
+        assert_eq!(parsed.record_count, 2);
+        assert_eq!(confirmed_counter(), 1);
+        assert_eq!(crate::wab::segment::sync_hook::calls(&dir), 2);
+
+        crate::wab::segment::sync_hook::forget(&dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// A delete failure after a durable sidecar is reported as `DeleteFailed`
     /// and counted; a retry of the delete alone finishes the confirm, and a
     /// segment that has meanwhile vanished (ENOENT) counts as done.
