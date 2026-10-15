@@ -1835,6 +1835,54 @@ mod lock_integrity_tests {
         (m, AtomicBool::new(false))
     }
 
+    /// conf-tests-14: a refusal by the ownership flag and one by the process
+    /// exiting look alike from a client, so no system test can tell whether
+    /// the listeners read the flag the integrity thread sets. This pins the
+    /// wiring in `main` instead: the flag is created once, and the integrity
+    /// thread and both listener configs (Unix and TCP) each get a clone of
+    /// that one `Arc`, never a fresh `AtomicBool`. A source check, like
+    /// `lock_module_never_reopens_path`; the needles are built at run time so
+    /// this test's own text never matches them.
+    #[test]
+    fn ownership_flag_is_one_arc_shared_by_the_integrity_thread_and_the_listeners() {
+        let src = include_str!("main.rs");
+        let name = "wab_ownership_lost";
+        let clone = format!("Arc::clone(&{name})");
+
+        let created = format!("let {name} = ");
+        assert_eq!(src.matches(&created).count(), 1, "the flag is created once");
+        let line = src[src.find(&created).unwrap()..].lines().next().unwrap();
+        assert!(
+            line.contains("Arc::new(") && line.contains("AtomicBool::new(false)"),
+            "{line}"
+        );
+
+        let field = format!("{name}: ");
+        let cloned_field = format!("{name}: {clone},");
+        assert_eq!(
+            src.matches(&field).count(),
+            2,
+            "one ownership field per listener config (Unix and TCP)"
+        );
+        assert_eq!(
+            src.matches(&cloned_field).count(),
+            2,
+            "every listener config gets a clone of the one flag"
+        );
+
+        let call = format!("{}(", "spawn_lock_integrity_thread");
+        let at = src
+            .match_indices(&call)
+            .map(|(i, _)| i)
+            .find(|&i| !src[..i].ends_with("fn "))
+            .expect("main spawns the integrity thread");
+        let args = &src[at..at + src[at..].find(")?").expect("call ends with ?")];
+        assert!(
+            args.contains(&clone),
+            "the integrity thread gets the same flag: {args}"
+        );
+    }
+
     #[test]
     fn exit_code_for_ownership_lost_is_3() {
         // 1 stays "refused to start"; 3 is the new, distinct "ownership lost".

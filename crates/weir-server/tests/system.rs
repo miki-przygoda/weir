@@ -3021,11 +3021,9 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
         "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
     );
 
-    // The pushes covered the window, and the connection ended in a refusal.
-    assert!(
-        outcomes.len() >= 2,
-        "the test must push while A still runs after B's lock: {outcomes:?}"
-    );
+    // The connection ended in a refusal. No minimum push count: if A's tick
+    // lands between B's lock and the first push, that first push already
+    // finds A gone, and a single refusal is the correct outcome.
     let first_refusal = outcomes
         .iter()
         .position(Result::is_err)
