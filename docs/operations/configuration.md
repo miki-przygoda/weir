@@ -252,11 +252,17 @@ The setting covers nothing else:
 - **Contention always refuses**, under both values. If another
   `weir-server` holds the lock, startup fails with `is locked by another
   weir-server`, naming the holder from its record in the lock file.
-- **Any other error refuses**, under both values: `EACCES` on a lock file
-  owned by another user, `EROFS`, `ELOOP` from a symlink at the lock path,
-  a directory or other non-regular file at the lock path, or `EPERM` from a
-  seccomp filter that blocks `flock`. The message starts `cannot lock
-  wab_dir <wab_dir>`.
+- **Any other error refuses**, under both values: a lock file owned by
+  another user, a lock file with more than one hard link, `EROFS`, `ELOOP`
+  from a symlink at the lock path, a directory or other non-regular file at
+  the lock path, or `EPERM` from a seccomp filter that blocks `flock`. The
+  message starts `cannot lock wab_dir <wab_dir>`.
+- **Upgrading after a run as root.** A `sudo weir-server` run on a
+  `wab_dir` the service user owns leaves a root-owned `.weir.lock` behind,
+  and every later start as the service user refuses with `<wab_dir>/.weir.lock
+  is owned by uid 0, not by this daemon's uid <uid>`. With no daemon running
+  on that directory, fix it as root with the command the message prints,
+  `chown <uid> <wab_dir>/.weir.lock`.
 
 All three refusals happen before recovery, and the process exits with
 status 1.

@@ -40,10 +40,18 @@ nothing new is persisted.
   after the "weir starting" line, before the metrics registry and before
   anything reads the WAB. The file is opened `O_NOFOLLOW`, mode 0600, must be a
   regular file, and is never unlinked or released, so the kernel drops the lock
-  at process exit (a `SIGKILL`ed daemon's successor starts normally). A holder
+  at process exit (a `SIGKILL`ed daemon's successor starts normally). A lock
+  file with more than one hard link (writing the record would truncate every
+  other name for it) or owned by another uid (that user could hold it while
+  the daemon is down) is refused before the `flock`, untouched; the owner
+  refusal names the uid and the `chown` that fixes it, which is what a
+  root-owned file left by a `sudo weir-server` run needs. A file of ours with
+  a loose mode is set to 0600 once held. A holder
   record (pid, host, start time, boot id, version, socket, metrics address) is
   written only after the lock is taken, so a refused contender never touches
-  it. Contention refuses to start with exit status 1 and a message naming the
+  it. Read back, the record is untrusted: only 4 KiB is parsed, control and
+  bidi formatting characters are stripped, and a value over 256 bytes is
+  dropped rather than printed. Contention refuses to start with exit status 1 and a message naming the
   holder: `wab_dir <dir> is locked by another weir-server (pid … on host …,
   started …, version …, socket …)`. The regression test is the reproduction: B
   exits 1, A's tree is byte-identical, all 70 records reach the sink; with the

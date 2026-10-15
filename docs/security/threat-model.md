@@ -114,8 +114,17 @@ recovery → replay → runtime. The lock is `flock(LOCK_EX | LOCK_NB)` on
 `<wab_dir>/.weir.lock` (`crates/weir-server/src/wab/lock.rs`):
 
 - The file is opened `O_NOFOLLOW`, created at mode 0600, and must be a regular
-  file. A symlink (`ELOOP`), a directory, a FIFO or a device at that path
-  refuses startup; a mode other than 0600 is a WARN.
+  file with exactly one hard link, owned by the daemon's uid. A symlink
+  (`ELOOP`), a directory, a FIFO, a device, a hard link (which the record
+  write would otherwise truncate through) or a file another uid owns (whose
+  owner could loosen it and hold the lock while the daemon is down) refuses
+  startup before the `flock`, and nothing is written to it. A file of ours
+  with a mode other than 0600 is set to 0600 once the lock is held, with a
+  WARN.
+- The holder record read back from the file is untrusted: only the first
+  4 KiB is parsed, control and bidi formatting characters are stripped, and a
+  value over 256 bytes is dropped, so a forged record cannot put escape
+  sequences on a terminal through the refusal message.
 - The holder record (`pid`, `host`, `started_unix`, `boot_id` on Linux,
   `version`, `socket_path`, `metrics`) is written **only after** the lock is
   held, so a refused contender never truncates the owner's record. The record
@@ -128,8 +137,9 @@ recovery → replay → runtime. The lock is `flock(LOCK_EX | LOCK_NB)` on
   filesystem that **cannot** lock (`ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`, `ENOSYS`,
   `EINVAL`): `"required"` (the default) refuses to start, and `"best-effort"`
   WARNs on every start, sets `weir_wab_dir_lock_held` to 0 and runs with **no**
-  guard. Any other error refuses, whatever the policy. Examples: `EACCES` on a
-  lock file owned by another user, `EROFS`, and `EPERM` from a seccomp filter.
+  guard. Any other error refuses, whatever the policy. Examples: a lock file
+  owned by another user (the message names its uid and the `chown` that fixes
+  it), `EROFS`, and `EPERM` from a seccomp filter.
 - `flock` locks the inode in the local kernel, so bind mounts, overlayfs,
   symlinked paths and containers on one host that share a volume all conflict
   correctly.

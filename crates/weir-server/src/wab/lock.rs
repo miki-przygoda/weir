@@ -83,6 +83,37 @@ pub(crate) enum LockError {
         source: std::io::Error,
         path: PathBuf,
     },
+    /// The file at the lock path is not one this daemon may lock and rewrite.
+    /// Refused before `flock`, and nothing is written to it.
+    Unsafe {
+        problem: UnsafeLockFile,
+        path: PathBuf,
+    },
+}
+
+/// Why a lock file is refused although it could be opened (or, for
+/// `ForeignOwner`, although only its owner is wrong).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnsafeLockFile {
+    /// More than one hard link. Taking the lock truncates and rewrites the
+    /// file, which would overwrite every other name for the same inode (a
+    /// config file, a TLS key, a sealed segment).
+    HardLinked { links: u64 },
+    /// Owned by another uid. That user can re-loosen its mode and hold the
+    /// lock while this daemon is down, locking it out; and a non-root daemon
+    /// cannot open it at all (a `sudo weir-server` run leaves one behind).
+    ForeignOwner { owner: u32, euid: u32 },
+}
+
+impl UnsafeLockFile {
+    /// The errno an integrity check reports for it (`LockIntegrity::Error`).
+    #[cfg(unix)]
+    fn errno(self) -> i32 {
+        match self {
+            UnsafeLockFile::HardLinked { .. } => libc::EMLINK,
+            UnsafeLockFile::ForeignOwner { .. } => libc::EPERM,
+        }
+    }
 }
 
 /// Who holds (or last held) the lock. Written into the lock file as plain
@@ -176,27 +207,64 @@ impl HolderInfo {
     /// empty file: a holder that crashed between `flock` and the write, or a
     /// file nobody has written yet). Unknown keys are ignored, so a newer
     /// record still parses.
+    ///
+    /// The file is untrusted: anyone who can write it can put anything there,
+    /// and its values reach a refusal message on stderr and the exit-3 log
+    /// line. So only the first [`RECORD_MAX_BYTES`] are read, control and bidi
+    /// formatting characters are stripped from every value, and a value longer
+    /// than [`FIELD_MAX_BYTES`] is dropped (left empty) rather than echoed.
     pub(crate) fn parse(text: &str) -> Option<Self> {
+        let mut end = text.len().min(RECORD_MAX_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
         let mut info = HolderInfo::default();
         let mut pid = None;
-        for line in text.lines() {
+        for line in text[..end].lines() {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
+            let v = sanitise_field(v);
             match k {
-                "pid" => pid = v.parse().ok(),
-                "host" => info.host = v.to_string(),
-                "started_unix" => info.started_unix = v.parse().unwrap_or(0),
-                "boot_id" => info.boot_id = Some(v.to_string()),
-                "version" => info.version = v.to_string(),
-                "socket_path" => info.socket_path = v.to_string(),
-                "metrics" => info.metrics = v.to_string(),
+                "pid" => pid = v.as_deref().and_then(|v| v.parse().ok()),
+                "host" => info.host = v.unwrap_or_default(),
+                "started_unix" => info.started_unix = v.and_then(|v| v.parse().ok()).unwrap_or(0),
+                "boot_id" => info.boot_id = v,
+                "version" => info.version = v.unwrap_or_default(),
+                "socket_path" => info.socket_path = v.unwrap_or_default(),
+                "metrics" => info.metrics = v.unwrap_or_default(),
                 _ => {}
             }
         }
         info.pid = pid?;
         Some(info)
     }
+}
+
+/// The most of a lock file [`HolderInfo::parse`] reads. A real record is a few
+/// hundred bytes.
+const RECORD_MAX_BYTES: usize = 4096;
+
+/// The longest holder-record value echoed anywhere. Host names are at most 255
+/// bytes and `sun_path` about 104, so nothing real is longer.
+const FIELD_MAX_BYTES: usize = 256;
+
+/// One untrusted record value, made safe to print: control characters
+/// (newlines, ESC, BEL, C1) and Unicode bidi/zero-width formatting are removed;
+/// `None` when what is left is still longer than [`FIELD_MAX_BYTES`].
+fn sanitise_field(v: &str) -> Option<String> {
+    let invisible = |c: char| {
+        c.is_control()
+            || matches!(c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+    };
+    // Bail out before building a huge string: anything this long is dropped.
+    if v.len() > FIELD_MAX_BYTES * 4 {
+        return None;
+    }
+    let clean: String = v.chars().filter(|&c| !invisible(c)).collect();
+    (clean.len() <= FIELD_MAX_BYTES).then_some(clean)
 }
 
 /// Takes the exclusive lock on `<wab_dir>/.weir.lock` and keeps it for the
@@ -325,6 +393,7 @@ fn check_lock_slot(wab_dir: &Path, slot: &mut Option<File>, own: &HolderInfo) ->
         }
         Err(LockError::Held { holder, .. }) => LockIntegrity::LostToOther { holder },
         Err(LockError::Unsupported { errno, .. }) => LockIntegrity::Error(errno),
+        Err(LockError::Unsafe { problem, .. }) => LockIntegrity::Error(problem.errno()),
         Err(LockError::Io { source, .. }) => LockIntegrity::Error(source.raw_os_error().unwrap_or(
             if source.kind() == std::io::ErrorKind::InvalidInput {
                 libc::EINVAL
@@ -359,58 +428,137 @@ pub(crate) fn held_lock_fd() -> Option<std::os::fd::RawFd> {
 /// the lock. Bypasses [`WAB_DIR_LOCK`], so tests can take and drop locks
 /// without poisoning the process-wide slot.
 ///
-/// The ONLY opener of the lock path. It has two callers: acquisition, and the
-/// integrity check's re-create after it proved the file at the path is no
-/// longer the held one (a `lock_module_never_reopens_path` test pins both).
+/// It has two callers: acquisition, and the integrity check's re-create after
+/// it proved the file at the path is no longer the held one. Both go through
+/// [`open_lock_path`], the ONLY opener of the lock path (a
+/// `lock_module_never_reopens_path` test pins this).
 #[cfg(unix)]
 #[allow(clippy::result_large_err)] // see acquire_wab_dir_lock
 fn try_lock_path(path: &Path, holder: &HolderInfo) -> Result<File, LockError> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+    let file = open_lock_path(path)?;
+    vet_lock_file(&file, path)?;
+    take_lock(&file, path)?;
+    write_record(&file, path, holder);
+    Ok(file)
+}
 
-    let io_err = |source: std::io::Error| LockError::Io {
-        source,
-        path: path.to_path_buf(),
-    };
-
-    // O_NOFOLLOW: a symlink at the lock path fails with ELOOP rather than
-    // locking (and writing into) whatever it points at. std adds O_CLOEXEC.
-    let file = std::fs::OpenOptions::new()
+/// The one `open` of the lock path. `O_NOFOLLOW`: a symlink at the lock path
+/// fails with `ELOOP` rather than locking (and writing into) whatever it points
+/// at. std adds `O_CLOEXEC`.
+///
+/// A permission error on a file another uid owns becomes
+/// [`UnsafeLockFile::ForeignOwner`], so the refusal names the owner and the
+/// fix instead of a bare "Permission denied" (a root-owned file left by a
+/// `sudo weir-server` run is the common case).
+#[cfg(unix)]
+#[allow(clippy::result_large_err)] // see acquire_wab_dir_lock
+fn open_lock_path(path: &Path) -> Result<File, LockError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .map_err(io_err)?;
+        .map_err(|source| {
+            let denied = matches!(source.raw_os_error(), Some(libc::EACCES | libc::EPERM));
+            // lstat, not an open: it never touches a lock.
+            let owner = std::fs::symlink_metadata(path).ok().map(|m| m.uid());
+            match owner {
+                Some(owner) if denied && owner != euid() => LockError::Unsafe {
+                    problem: UnsafeLockFile::ForeignOwner {
+                        owner,
+                        euid: euid(),
+                    },
+                    path: path.to_path_buf(),
+                },
+                _ => LockError::Io {
+                    source,
+                    path: path.to_path_buf(),
+                },
+            }
+        })
+}
 
-    // A directory fails the open above (EISDIR); a FIFO or a device opens fine
-    // and must not be locked or written as if it were the record.
-    let meta = file.metadata().map_err(io_err)?;
+/// Checks an opened lock file BEFORE it is locked or written: a regular file,
+/// one hard link, owned by this daemon's uid. Any failure leaves it untouched.
+#[cfg(unix)]
+#[allow(clippy::result_large_err)] // see acquire_wab_dir_lock
+fn vet_lock_file(file: &File, path: &Path) -> Result<(), LockError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().map_err(|source| LockError::Io {
+        source,
+        path: path.to_path_buf(),
+    })?;
+    // A directory fails the open (EISDIR); a FIFO or a device opens fine and
+    // must not be locked or written as if it were the record.
     if !meta.file_type().is_file() {
-        return Err(io_err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the lock path exists and is not a regular file",
-        )));
+        return Err(LockError::Io {
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the lock path exists and is not a regular file",
+            ),
+            path: path.to_path_buf(),
+        });
     }
-    let mode = meta.permissions().mode() & 0o7777;
-    if mode != 0o600 {
-        // Mirrors audit_segment_modes: loose bits are worth a WARN, not a
-        // refusal. The record holds nothing secret.
-        warn!(
-            lock = %path.display(),
-            mode = format_args!("{mode:o}"),
-            "wab_dir lock file is not mode 0600"
-        );
+    // O_NOFOLLOW stops symlinks, not hard links: a hard link planted at the
+    // path is a regular file whose other names would be truncated below.
+    if meta.nlink() != 1 {
+        return Err(LockError::Unsafe {
+            problem: UnsafeLockFile::HardLinked {
+                links: meta.nlink(),
+            },
+            path: path.to_path_buf(),
+        });
     }
+    if meta.uid() != euid() {
+        return Err(LockError::Unsafe {
+            problem: UnsafeLockFile::ForeignOwner {
+                owner: meta.uid(),
+                euid: euid(),
+            },
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
 
-    if let Err(errno) = flock_exclusive_nonblocking(file.as_raw_fd()) {
-        return Err(classify_flock_errno(errno, &file, path));
-    }
+/// `flock(LOCK_EX | LOCK_NB)` on a vetted lock file, classified.
+#[cfg(unix)]
+#[allow(clippy::result_large_err)] // see acquire_wab_dir_lock
+fn take_lock(file: &File, path: &Path) -> Result<(), LockError> {
+    use std::os::fd::AsRawFd;
+    flock_exclusive_nonblocking(file.as_raw_fd())
+        .map_err(|errno| classify_flock_errno(errno, file, path))
+}
 
-    // Held. Only now replace the record, so a refused contender never touches
-    // the owner's. Informational, so no fsync, and a failure to write it does
-    // not give the lock back.
+/// Run only once the lock is held, so a refused contender never touches the
+/// owner's file: tightens a loose mode to 0600 (another user who can open the
+/// file could otherwise hold it while this daemon is down, locking it out), then
+/// replaces the record. Informational, so no fsync, and a failure here does not
+/// give the lock back.
+#[cfg(unix)]
+fn write_record(file: &File, path: &Path, holder: &HolderInfo) {
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    if let Ok(meta) = file.metadata() {
+        let mode = meta.permissions().mode() & 0o7777;
+        if mode != 0o600 {
+            match file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => warn!(
+                    lock = %path.display(),
+                    was = format_args!("{mode:o}"),
+                    "wab_dir lock file was not mode 0600; set it to 0600"
+                ),
+                Err(e) => warn!(
+                    lock = %path.display(),
+                    mode = format_args!("{mode:o}"),
+                    error = %e,
+                    "wab_dir lock file is not mode 0600 and could not be set to 0600"
+                ),
+            }
+        }
+    }
     let record = holder.render();
     if let Err(e) = file
         .set_len(0)
@@ -423,7 +571,17 @@ fn try_lock_path(path: &Path, holder: &HolderInfo) -> Result<File, LockError> {
              second instance will not be able to name this daemon"
         );
     }
-    Ok(file)
+}
+
+/// `geteuid(2)`; a test hook stands in for another user.
+#[cfg(unix)]
+fn euid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = tests::EUID_HOOK.with(|h| h.get()) {
+        return uid;
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 #[cfg(unix)]
@@ -461,7 +619,7 @@ fn classify_flock_errno(errno: i32, file: &File, path: &Path) -> LockError {
 #[cfg(unix)]
 fn read_holder(file: &File) -> Option<HolderInfo> {
     use std::os::unix::fs::FileExt;
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; RECORD_MAX_BYTES];
     let n = file.read_at(&mut buf, 0).ok()?;
     HolderInfo::parse(&String::from_utf8_lossy(&buf[..n]))
 }
@@ -556,7 +714,8 @@ impl LockError {
         match self {
             LockError::Held { path, .. }
             | LockError::Unsupported { path, .. }
-            | LockError::Io { path, .. } => path,
+            | LockError::Io { path, .. }
+            | LockError::Unsafe { path, .. } => path,
         }
     }
 
@@ -613,6 +772,35 @@ impl std::fmt::Display for LockError {
                 self.wab_dir(),
                 path.display()
             ),
+            LockError::Unsafe {
+                problem: UnsafeLockFile::HardLinked { links },
+                path,
+            } => write!(
+                f,
+                "cannot lock wab_dir {}: {} has {links} hard links. Taking the lock rewrites \
+                 the file, which would overwrite every other name for the same file, so \
+                 weir-server refuses it and nothing was written. Something replaced the lock \
+                 file with a hard link: find out what. If no weir-server is running on this \
+                 wab_dir, remove {} (the other names keep their contents) and start again.",
+                self.wab_dir(),
+                path.display(),
+                path.display()
+            ),
+            LockError::Unsafe {
+                problem: UnsafeLockFile::ForeignOwner { owner, euid },
+                path,
+            } => write!(
+                f,
+                "cannot lock wab_dir {}: {} is owned by uid {owner}, not by this daemon's uid \
+                 {euid}. Another user's lock file can be loosened and held by that user, \
+                 locking this daemon out, so weir-server refuses it. A previous run as another \
+                 user (for example `sudo weir-server`) leaves one behind. If no weir-server is \
+                 running on this wab_dir, either run weir-server as uid {owner}, or give the \
+                 file to this daemon's user as root: `chown {euid} {}`.",
+                self.wab_dir(),
+                path.display(),
+                path.display()
+            ),
         }
     }
 }
@@ -645,6 +833,25 @@ mod tests {
         /// instead of calling `libc::flock`. Per thread, so parallel tests
         /// cannot see each other's injection.
         pub(super) static FLOCK_HOOK: Cell<Option<i32>> = const { Cell::new(None) };
+    }
+
+    thread_local! {
+        /// When set, the lock module's euid reads this instead of geteuid(2),
+        /// so a test can look like another user to its own files.
+        pub(super) static EUID_HOOK: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    struct EuidGuard;
+    impl EuidGuard {
+        fn set(uid: u32) -> Self {
+            EUID_HOOK.with(|h| h.set(Some(uid)));
+            EuidGuard
+        }
+    }
+    impl Drop for EuidGuard {
+        fn drop(&mut self) {
+            EUID_HOOK.with(|h| h.set(None));
+        }
     }
 
     /// Clears the hook even if the test panics.
@@ -1124,7 +1331,12 @@ mod tests {
         assert_eq!(
             prod.matches("OpenOptions::new(").count(),
             1,
-            "exactly one opener of the lock path (try_lock_path)"
+            "exactly one opener of the lock path (open_lock_path)"
+        );
+        assert_eq!(
+            prod.matches("open_lock_path(").count() - prod.matches("fn open_lock_path(").count(),
+            1,
+            "open_lock_path is called only by try_lock_path"
         );
         let callers =
             prod.matches("try_lock_path(").count() - prod.matches("fn try_lock_path(").count();
@@ -1144,6 +1356,252 @@ mod tests {
                 "lock.rs must not {forbidden} anything outside its tests"
             );
         }
+    }
+
+    // ── Lock-file hardening (conf-security-5, cont-security-2, conf-security-6) ──
+
+    /// conf-security-5: a hard link planted at the lock path would have the
+    /// daemon truncate and overwrite the file it shares an inode with (the
+    /// config, a TLS key). Refused before flock, and nothing is written.
+    #[test]
+    fn hardlinked_lock_file_is_refused_and_the_victim_is_untouched() {
+        let dir = wab_dir("hardlink_acquire");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let victim = dir.join("victim.toml");
+        let _ = std::fs::remove_file(&victim);
+        let original = b"[server]\nsecret = \"do not truncate me\"\n".to_vec();
+        std::fs::write(&victim, &original).unwrap();
+        std::fs::hard_link(&victim, &lock).unwrap();
+
+        for policy in [LockPolicy::Required, LockPolicy::BestEffort] {
+            let err = acquire_wab_dir_lock(&dir, policy, &holder("h"))
+                .expect_err("a hard-linked lock file must be refused");
+            assert!(
+                matches!(
+                    err,
+                    LockError::Unsafe {
+                        problem: UnsafeLockFile::HardLinked { links: 2 },
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+            let msg = err.to_string();
+            for needle in [
+                "hard links",
+                "nothing was written",
+                &lock.display().to_string(),
+            ] {
+                assert!(msg.contains(needle), "{needle:?} missing from: {msg}");
+            }
+        }
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            original,
+            "the hard-link target must be byte-identical"
+        );
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::remove_file(&victim).unwrap();
+    }
+
+    /// The same at runtime: the held file is deleted and a hard link to a
+    /// victim planted in its place. The re-create refuses it (an error, retried
+    /// next tick), keeps the held fd, and never writes the victim.
+    #[test]
+    fn hardlink_planted_at_runtime_is_an_error_and_the_victim_is_untouched() {
+        let dir = wab_dir("hardlink_integrity");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let owner = holder("owner");
+        let mut slot = held_slot(&dir, &owner);
+        let before = fd_id(slot.as_ref().unwrap());
+        let victim = dir.join("victim.key");
+        let _ = std::fs::remove_file(&victim);
+        std::fs::write(&victim, b"-----BEGIN PRIVATE KEY-----\n").unwrap();
+
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::hard_link(&victim, &lock).unwrap();
+        assert_eq!(
+            check_lock_slot(&dir, &mut slot, &owner),
+            LockIntegrity::Error(libc::EMLINK)
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"-----BEGIN PRIVATE KEY-----\n"
+        );
+        assert_eq!(fd_id(slot.as_ref().unwrap()), before);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::remove_file(&victim).unwrap();
+    }
+
+    /// cont-security-2: a lock file of ours with loose bits (restored from a
+    /// backup, baked into an image at 0644) is tightened to 0600 once held, so
+    /// another user who can read it cannot hold it across a restart.
+    #[test]
+    fn loose_mode_lock_file_is_tightened_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = wab_dir("loose_mode");
+        let lock = dir.join(LOCK_FILE_NAME);
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _held = try_lock_path(&lock, &holder("h")).expect("our own file is adopted");
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    /// cont-security-2 and the conf-regressions-11 upgrade case: a lock file
+    /// another uid owns is refused, naming the owner and the exact fix. The
+    /// file is ours here; the euid hook makes this process look like another
+    /// user. Opened fine (a root daemon, or a loose mode): refused at fstat.
+    #[test]
+    fn foreign_owned_lock_file_is_refused_naming_the_owner_and_the_fix() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = wab_dir("foreign_owner");
+        let lock = dir.join(LOCK_FILE_NAME);
+        std::fs::write(&lock, b"pid=1\n").unwrap();
+        let real = std::fs::metadata(&lock).unwrap().uid();
+        let fake = real + 1;
+        let _euid = EuidGuard::set(fake);
+
+        let err = acquire_wab_dir_lock(&dir, LockPolicy::BestEffort, &holder("h"))
+            .expect_err("a lock file another uid owns must be refused");
+        match &err {
+            LockError::Unsafe {
+                problem: UnsafeLockFile::ForeignOwner { owner, euid },
+                ..
+            } => assert_eq!((*owner, *euid), (real, fake)),
+            other => panic!("expected ForeignOwner, got {other}"),
+        }
+        let msg = err.to_string();
+        for needle in [
+            &format!("owned by uid {real}"),
+            &format!("this daemon's uid {fake}"),
+            &format!("chown {fake} {}", lock.display()),
+            &format!("run weir-server as uid {real}"),
+            "If no weir-server is running on this wab_dir",
+        ] {
+            assert!(msg.contains(needle), "{needle:?} missing from: {msg}");
+        }
+        assert_eq!(std::fs::read(&lock).unwrap(), b"pid=1\n", "nothing written");
+    }
+
+    /// The upgrade case proper (conf-regressions-11 b): a root-owned 0600 lock
+    /// file left by a `sudo weir-server` run. A non-root daemon cannot even open
+    /// it (EACCES); the refusal must still name the owner and the fix rather
+    /// than a bare "Permission denied". Mode 0000 stands in for "not ours".
+    #[test]
+    fn unopenable_foreign_lock_file_names_the_owner_and_the_fix() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root opens a 0000 file; the EACCES path is unreachable
+        }
+        let dir = wab_dir("foreign_eacces");
+        let lock = dir.join(LOCK_FILE_NAME);
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let real = std::fs::metadata(&lock).unwrap().uid();
+        let fake = real + 1;
+        let err = {
+            let _euid = EuidGuard::set(fake);
+            acquire_wab_dir_lock(&dir, LockPolicy::Required, &holder("h")).unwrap_err()
+        };
+        assert!(
+            matches!(
+                err,
+                LockError::Unsafe {
+                    problem: UnsafeLockFile::ForeignOwner { .. },
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("chown {fake} {}", lock.display())),
+            "{err}"
+        );
+        // Our own unopenable file stays a plain Io error (nothing to chown).
+        let err = acquire_wab_dir_lock(&dir, LockPolicy::Required, &holder("h")).unwrap_err();
+        match &err {
+            LockError::Io { source, .. } => {
+                assert_eq!(source.raw_os_error(), Some(libc::EACCES), "{err}")
+            }
+            other => panic!("expected Io(EACCES), got {other}"),
+        }
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// conf-security-6: the record is untrusted file content. Control
+    /// characters (ANSI/OSC escapes, newlines) are stripped, and an oversized
+    /// field is dropped rather than echoed.
+    #[test]
+    fn hostile_holder_record_is_sanitised() {
+        let huge = "A".repeat(1 << 20);
+        let text = format!(
+            "pid=7\nhost=\x1b]0;pwned\x07\x1b[2Jdb-primary\nversion=1.0\r\n\
+             metrics=\u{202e}1.0.0.721\nsocket_path={huge}\nboot_id=past-the-cap\n"
+        );
+        let h = HolderInfo::parse(&text).expect("pid parses");
+        assert_eq!(h.pid, 7);
+        assert_eq!(h.host, "]0;pwned[2Jdb-primary");
+        assert_eq!(h.version, "1.0");
+        assert_eq!(h.socket_path, "", "an oversized field is dropped");
+        assert_eq!(h.metrics, "1.0.0.721", "bidi overrides are stripped");
+        assert_eq!(h.boot_id, None, "nothing past the 4 KiB record cap is read");
+        assert_eq!(
+            HolderInfo::parse("pid=\x1b[31m7\n"),
+            None,
+            "a bad pid is no record"
+        );
+    }
+
+    /// The same, end to end: a contender refused by a holder whose record is
+    /// hostile prints a bounded message with no control characters.
+    #[test]
+    fn refusal_message_never_echoes_a_hostile_record() {
+        use std::os::fd::AsRawFd;
+        let dir = wab_dir("hostile_refusal");
+        let lock = dir.join(LOCK_FILE_NAME);
+        let huge = "B".repeat(1 << 20);
+        std::fs::write(
+            &lock,
+            format!("pid=1\nhost=evil\x1b[2J\nline\nsocket_path=/s\x07\nversion={huge}\n"),
+        )
+        .unwrap();
+        // Hold it without writing a record, as a hostile holder would.
+        let f = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+        // SAFETY: flock on an fd owned by the live `f`.
+        assert_eq!(
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        let err = acquire_wab_dir_lock(&dir, LockPolicy::Required, &holder("h")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(
+                err,
+                LockError::Held {
+                    holder: Some(_),
+                    ..
+                }
+            ),
+            "{msg}"
+        );
+        assert!(
+            !msg.chars().any(char::is_control),
+            "control chars in: {msg:?}"
+        );
+        assert!(
+            msg.len() < 2048,
+            "the message must be bounded, got {} bytes",
+            msg.len()
+        );
+        assert!(msg.contains("pid 1 on host evil[2J,"), "{msg}");
+        assert!(msg.contains("socket /s)"), "{msg}");
+        drop(f);
     }
 
     #[test]
