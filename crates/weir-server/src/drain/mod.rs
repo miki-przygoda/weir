@@ -1667,6 +1667,9 @@ fn attempt_segment<S: Sink>(
 ) -> ProcessResult {
     ledger.begin_attempt(segment);
     let result = 'attempt: {
+        // `skip` may come from a state rather than from admission; either
+        // way, a cursor measured on a file since replaced does not apply.
+        let skip = ledger.checked_skip(segment, skip);
         let skip = match ledger.take_dl_carry(segment) {
             None => skip,
             Some(carry) => {
@@ -7796,6 +7799,135 @@ mod tests {
             "exactly one record (B) dead-lettered; A was never dead-lettered (no restart-at-0)"
         );
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Replaces the sealed segment at `sealed` with a different file (a new
+    /// inode) holding `payloads`, the way an operator restoring or overwriting
+    /// a segment would. Returns nothing; asserts the inode changed.
+    #[cfg(unix)]
+    fn replace_segment_file(sealed: &Path, label: &str, payloads: &[&[u8]]) {
+        use std::os::unix::fs::MetadataExt;
+        let src_dir = tmp_dir(label);
+        let replacement = make_sealed_segment(&src_dir, 0, payloads);
+        let old_ino = std::fs::metadata(sealed).unwrap().ino();
+        std::fs::rename(&replacement, sealed).unwrap();
+        assert_ne!(
+            std::fs::metadata(sealed).unwrap().ino(),
+            old_ino,
+            "the replacement is a different file"
+        );
+        std::fs::remove_dir_all(src_dir).ok();
+    }
+
+    /// cont-durability-1, the `RetryingTransient` path. The retry resumes from
+    /// the `processed` its state carries, and before the fix nothing checked
+    /// that against the `(dev, ino)` pin that admission checks: a file replaced
+    /// between attempts had its first `processed` records skipped, and the
+    /// segment was then confirmed and deleted, so they were never delivered.
+    /// Now a cursor that no longer describes the file at the path resumes the
+    /// new file from record 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_retry_resumes_a_replaced_file_from_its_first_record() {
+        let dir = tmp_dir("retry_replaced_file");
+        let sealed = make_sealed_segment(&dir, 0, &[b"A", b"B"]);
+        // commit([A]) ok (cursor 1, pinned to this file); commit([B]) transient.
+        // Everything after commits whole.
+        let sink = Arc::new(MockSink::with_batch_size(
+            1,
+            [
+                MockSink::ok(vec![Payload::from(b"A".as_ref())]),
+                Err(MockError::Transient),
+            ],
+        ));
+        let config = DrainConfig {
+            // Long enough to replace the file before the retry fires.
+            base_retry_delay: Duration::from_millis(400),
+            ..fast_config(dir.clone())
+        };
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            config,
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        wait_for(5, "the transient commit of B", || sink.call_count() >= 2);
+        replace_segment_file(&sealed, "retry_replaced_file_src", &[b"X", b"Y"]);
+
+        wait_for(5, "the replaced segment confirmed", || {
+            get_confirmed_path(&sealed).exists()
+        });
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            committed_bytes(&sink),
+            vec![b"A".to_vec(), b"X".to_vec(), b"Y".to_vec()],
+            "the new file is delivered from its first record; skipping X would lose it"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// cont-durability-1, the `BlockedDeadLetterFull` → unblock path: the same
+    /// state-carried `processed`, plus a dead-letter carry pinned to the old
+    /// file. The carry is discarded (it names the old file's records) and the
+    /// new file is processed from record 0, as the discard's WARN says.
+    #[cfg(unix)]
+    #[test]
+    fn an_unblocked_segment_resumes_a_replaced_file_from_its_first_record() {
+        let dir = tmp_dir("blocked_replaced_file");
+        let sealed = make_sealed_segment(&dir, 0, &[b"A", b"B"]);
+        let dl_dir = dir.join("dead_letter");
+        crate::testutil::mkdir_p(&dl_dir);
+        let blocking_file = dl_dir.join("dl_00000001.wab.sealed");
+        std::fs::write(&blocking_file, vec![0u8; 200]).unwrap();
+
+        // commit([A]) ok (cursor 1); commit([B]) permanent → the cap is full →
+        // blocked at processed=1 with B carried. Everything after commits whole.
+        let sink = Arc::new(MockSink::with_batch_size(
+            1,
+            [
+                MockSink::ok(vec![Payload::from(b"A".as_ref())]),
+                Err(MockError::Permanent),
+            ],
+        ));
+        let metrics = noop_metrics();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = spawn(
+            rx,
+            Arc::clone(&sink),
+            tight_dl_config(dir.clone(), 100),
+            Arc::clone(&metrics),
+            DrainHeartbeat::new(),
+        );
+        tx.send(sealed.clone()).unwrap();
+        wait_for(5, "blocked on dead-letter headroom", || {
+            drain_is_blocked(&metrics)
+        });
+        replace_segment_file(&sealed, "blocked_replaced_file_src", &[b"X", b"Y"]);
+        std::fs::remove_file(&blocking_file).unwrap();
+
+        wait_for(5, "the replaced segment confirmed", || {
+            get_confirmed_path(&sealed).exists()
+        });
+        drop(tx);
+        handle.join().unwrap();
+
+        assert_eq!(
+            committed_bytes(&sink),
+            vec![b"A".to_vec(), b"X".to_vec(), b"Y".to_vec()],
+            "the new file is delivered from its first record; skipping X would lose it"
+        );
+        assert_eq!(
+            records_dead_lettered(&metrics),
+            0,
+            "the old file's carried reject is not written for the new file"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

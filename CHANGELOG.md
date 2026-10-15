@@ -134,8 +134,11 @@ nothing new is persisted.
   re-admitted segment resumes past what it already committed. Every path the
   drain receives, from its queue or the rescan, passes one admission filter,
   so a copy of a path still in the channel can no longer bypass a disposition,
-  a park or a cool-down. The duplicate window for a stranded segment is now a
-  restart, not every strand (`docs/sinks/s3.md` says so).
+  a park or a cool-down. The pin is checked on every attempt, including the
+  retry and the unblock that carry the cursor in the drain's state, so a file
+  replaced at the same path is processed from its first record. The duplicate
+  window for a stranded segment is now a restart, not every strand
+  (`docs/sinks/s3.md` says so).
 
 - **A `.confirmed` sidecar that could not be written re-delivered the whole
   segment every health poll, and a torn one got a delivered segment
