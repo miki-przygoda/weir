@@ -19,7 +19,9 @@ The safety floor: the defects through which an operator mistake, a local disk
 fault or a sink quirk could cost acked records, re-deliver without bound, or
 kill the daemon. The mechanisms are under **Fixed**, the new key, exit code,
 files and metrics under **Added**, and **Changed** collects every behaviour an
-operator can notice on upgrade. The wire protocol (`WIRE_VERSION` 1), the WAB
+operator can notice on upgrade. **Upgrading from 4.0.x**, at the end, lists
+every new reason a deployment that ran 4.0.x can be refused at startup, with
+the message it prints and the fix. The wire protocol (`WIRE_VERSION` 1), the WAB
 segment format, the `.confirmed` sidecar format and `weir-ctl`'s `--json`
 output are unchanged, and downgrading to 4.0.x is safe: an old binary skips
 `.weir.lock` (not a directory) and `*.confirmed.tmp` (not `.wab.sealed`), and
@@ -400,6 +402,89 @@ Behaviour an operator can notice on upgrade:
 - **Delivery order.** Per-connection order is the order records enter the WAB;
   strands, cool-downs, parking, requeue and the HTTP sink's concurrent POSTs
   can reorder delivery. The README and `weir-client` docs now say so.
+
+### Upgrading from 4.0.x
+
+Each refusal below exits with status 1 **before recovery reads the WAB**, so
+nothing is replayed or delivered and nothing is lost; under systemd's
+`Restart=on-failure` or compose's `restart: unless-stopped` the unit simply
+loops on the same message until the cause is fixed. Check for these before
+rolling the upgrade out. A `SIGKILL`ed predecessor is not one of them: the
+kernel drops its `flock` at exit, and its stale socket is removed as before.
+
+New refusals, where 4.0.x started:
+
+- **A `wab_dir` on a filesystem that cannot `flock`** (NFSv3 without
+  `lockd`/`statd`, some FUSE or CIFS mounts: `ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`,
+  `ENOSYS`, `EINVAL`). Message: `wab_dir <dir> is on a filesystem that cannot
+  take an exclusive lock on <dir>/.weir.lock (<error>). … Move the WAB to a
+  local filesystem that supports flock, or set wab_dir_lock = "best-effort" to
+  run without this guard.` Moving `wab_dir` to local storage is the fix. To keep
+  the old behaviour instead, set `wab_dir_lock = "best-effort"` (env
+  `WEIR_WAB_DIR_LOCK=best-effort`, CLI `--wab-dir-lock best-effort`): the
+  daemon WARNs on every start, `weir_wab_dir_lock_held` stays 0 and
+  `WeirWabDirUnlocked` fires, and nothing stops a second daemon on the same
+  directory, exactly as in 4.0.x.
+
+- **A `.weir.lock` owned by another uid.** 4.0.x had no lock file, so this
+  appears after the upgrade, the first time weir-server runs against the
+  directory as someone else: a one-off `sudo weir-server` to debug leaves
+  `<wab_dir>/.weir.lock` owned by root (mode 0600, never unlinked by design),
+  and every later start as the service user is refused. A container image
+  whose weir user changed uid does the same. Message: ``cannot lock wab_dir
+  <dir>: <dir>/.weir.lock is owned by uid <owner>, not by this daemon's uid
+  <euid>. … If no weir-server is running on this wab_dir, either run
+  weir-server as uid <owner>, or give the file to this daemon's user as root:
+  `chown <euid> <dir>/.weir.lock`.`` Run the `chown` it names, as root, once
+  no weir-server is running there. On a mount that maps owners (NFS
+  `root_squash`, CIFS or FUSE `uid=`) even the daemon's own new file reports
+  another owner, and `chown` cannot help: move `wab_dir` to local storage.
+
+- **A stale socket at `socket_path` this daemon's uid cannot connect to**, for
+  example one left by a run as root, or by an image whose weir uid changed, on
+  a persistent socket volume (the shipped compose file keeps `/run/weir` in the
+  `weir_socket` volume). 4.0.x unlinked it; the liveness probe now gets
+  `EACCES`, cannot tell stale from live, and refuses: `cannot tell whether
+  socket_path '<path>' is in use: the liveness probe's connect failed with
+  Permission denied (os error 13) (errno 13); refusing to remove it. If no
+  weir-server is using it, remove the file manually and start again.` Confirm
+  nothing is serving it, then `rm` the socket.
+
+- **Two daemons on one `wab_dir` during a rolling update.** A Kubernetes
+  Deployment's default `RollingUpdate` (`maxSurge: 25%`) starts the new pod
+  while the old one still holds the volume; a compose or swarm service with
+  `update_config.order: start-first` does the same. In 4.0.x that overlap was
+  the false-ack bug under **Fixed**; now the new daemon is refused with
+  `wab_dir <dir> is locked by another weir-server (pid … on host …, started …,
+  version …, socket …). Two daemons on one wab_dir corrupt each other's
+  segments and can lose acked records. Stop the other instance or point this
+  one at a different wab_dir.` It crash-loops until the old daemon exits, and
+  with `maxUnavailable: 0` the rollout stalls. Use `strategy: {type:
+  Recreate}`, or `RollingUpdate` with `maxSurge: 0` (and `maxUnavailable: 1`);
+  for swarm, `order: stop-first`. Plain `docker compose up` already stops the
+  old container before starting the new one.
+
+- **A live socket at `socket_path`.** 4.0.x unlinked it and took the path over,
+  silently cutting the running daemon off from new producers. Now: `socket_path
+  '<path>' is in use by a running process; refusing to remove it. Stop the
+  other weir-server or choose another socket_path.` Give each daemon on a host
+  its own `socket_path`.
+
+Refusals 4.0.x also made, but only after recovery and the drain had started
+(so each restart re-delivered the head of the oldest unconfirmed segment), and
+which now come before recovery:
+
+- **A taken metrics port**: `failed to bind metrics endpoint to <bind>:<port>
+  (<error>) — another process (often another weir-server instance) is using
+  that port. Change it with --metrics-port / WEIR_METRICS_PORT (or
+  --metrics-bind / WEIR_METRICS_BIND).` A taken `tcp_bind` reads the same way
+  (`failed to bind the TCP+mTLS listener to tcp_bind <addr> (<error>) …`).
+- **Invalid TLS material** with `tcp_bind` set: `failed to load TLS config:
+  <error>`, naming the file that did not load. A `SIGHUP` reload of bad
+  material is still fail-safe and keeps the old certificates.
+- **A `socket_path` longer than the platform's `sun_path`**, or a non-socket
+  entry (a file, directory or symlink) at `socket_path`: refused as before,
+  with the same fix, but before recovery.
 
 ## [4.0.1] - 2026-09-28
 
