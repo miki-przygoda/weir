@@ -273,10 +273,12 @@ instance may still be confirming them; see
 [wab_format.md](../wab_format.md#post-drain-steady-state).
 
 **While running**, a held lock is checked once a second. If `.weir.lock`
-was deleted or replaced and nobody else holds the new file, the daemon
-re-creates and re-locks it, logs an ERROR and increments
-`weir_wab_dir_lock_integrity_failures_total`. If another instance holds it,
-that is proof a second daemon owns the directory: the daemon refuses every
+was deleted, or replaced by a file nobody holds whose record does not
+name another daemon, the daemon re-creates and re-locks it, logs an ERROR
+and increments `weir_wab_dir_lock_integrity_failures_total`. If another
+instance holds it, or the replacement's record names another daemon (one
+held the directory and has exited since), that is proof a second daemon
+owned the directory: the daemon refuses every
 new push (`InternalError` NACK), logs `CRITICAL: wab_dir ownership lost`,
 and exits with **status 3** at once, without sealing.
 

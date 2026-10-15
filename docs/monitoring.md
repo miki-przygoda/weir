@@ -145,7 +145,7 @@ The only steady state that reads 0 is `wab_dir_lock = "best-effort"`
 (`ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`, `ENOSYS`, `EINVAL`); the daemon also WARNs
 about it on every start. The default, `"required"`, refuses to start there
 instead. The other way to reach 0 — the integrity check proving another
-instance now holds the lock — exits the daemon with status 3 as soon as that
+instance holds or held the lock — exits the daemon with status 3 as soon as that
 once-a-second check sees it, so the gauge is 0 only for the instant before
 exit. That incident shows up as the process exiting with status 3 and an ERROR
 beginning `CRITICAL: wab_dir ownership lost` (and as `WeirInstanceDown` if

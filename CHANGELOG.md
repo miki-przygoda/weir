@@ -61,14 +61,21 @@ nothing new is persisted.
   second daemon started afterwards locks a fresh file and recovers the first
   one's active segments. The daemon now re-checks its lock once a second
   (`lstat` against the held fd's `(dev, ino)`, and a re-`flock` of the held fd,
-  which reports `EWOULDBLOCK` after an NFS lease loss). A deleted or replaced
-  file that nobody else holds is re-created and re-locked, with an ERROR and
-  `weir_wab_dir_lock_integrity_failures_total` +1. If the re-lock meets
+  which reports `EWOULDBLOCK` after an NFS lease loss). A deleted file is
+  re-created with `O_EXCL` (a file planted there is never adopted), and a
+  replaced file nobody holds is re-locked, each with an ERROR and
+  `weir_wab_dir_lock_integrity_failures_total` +1. The replacement's record is
+  read before anything is written: a record naming another daemon proves one
+  held the directory (and may have recovered this daemon's segments before
+  exiting), so it is treated like contention and left in place as evidence. A
+  path whose `lstat` id differs from the held fd's but which opens to the
+  same file (overlayfs before Linux 4.19) is recognised as the held lock, not
+  reported as a rival holding this daemon's own pid. If the re-lock meets
   contention, another instance provably owns the directory: the daemon NACKs
   every new push with the existing `InternalError` (one `Relaxed` atomic load
   per push; no wire change), sets `weir_wab_dir_lock_held` to 0, logs
-  `CRITICAL: wab_dir ownership lost: another weir-server (…) now holds the lock
-  on this wab_dir …`, and exits **3** at once, without sealing, because the
+  `CRITICAL: wab_dir ownership lost: another weir-server (…) holds or held the
+  lock on this wab_dir …`, and exits **3** at once, without sealing, because the
   segments are the other daemon's now. Detection does not close the window
   between the unlink and the next tick (at most about a second); only never
   deleting `.weir.lock` does.

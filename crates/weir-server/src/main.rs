@@ -790,7 +790,7 @@ fn apply_lock_integrity(
             tracing::error!(
                 wab_dir = %wab_dir.display(),
                 exit_code = wab::lock::EXIT_WAB_OWNERSHIP_LOST,
-                "CRITICAL: wab_dir ownership lost: another weir-server ({other}) now holds \
+                "CRITICAL: wab_dir ownership lost: another weir-server ({other}) holds or held \
                  the lock on this wab_dir and may already have recovered this daemon's live \
                  segments. Refusing every new push and exiting now, without sealing (the \
                  segments are the other daemon's now). Records acked since the lock file \
