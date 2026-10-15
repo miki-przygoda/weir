@@ -789,12 +789,6 @@ pub(crate) enum SocketProbe {
     Unknown(i32),
 }
 
-/// Re-probes of an ECONNREFUSED answer on targets where it is ambiguous.
-#[cfg(all(unix, not(target_os = "linux")))]
-const STALE_REPROBES: u32 = 3;
-#[cfg(all(unix, not(target_os = "linux")))]
-const STALE_REPROBE_INTERVAL: Duration = Duration::from_millis(50);
-
 /// Probes whether anything is listening on the Unix socket at `path`.
 ///
 /// It opens a non-blocking `AF_UNIX` stream socket and calls `connect`, then
@@ -805,33 +799,31 @@ const STALE_REPROBE_INTERVAL: Duration = Duration::from_millis(50);
 /// |---|---|
 /// | `0`, `EAGAIN`, `EINPROGRESS` | `Live` (`EAGAIN` = backlog full = listening, on Linux) |
 /// | `ECONNREFUSED` (Linux) | `Stale` |
-/// | `ECONNREFUSED` (other unix) | stale *or* backlog full; re-probed 3× at 50 ms, `Stale` only if all are refused |
+/// | `ECONNREFUSED` (other unix) | stale *or* backlog full; settled by [`probe_socket_attached`] |
 /// | `ENOENT`, `ENOTDIR` | `Absent` |
 /// | `EACCES`, `EPERM`, other | `Unknown(errno)` |
 ///
-/// Side effect: on a live daemon the probe is a real connection, so it bumps
-/// that daemon's connection metrics, and under `peer_uid_check` a foreign uid
-/// is rejected and logged there.
+/// Side effect: on a live daemon the stream probe is a real connection, so it
+/// bumps that daemon's connection metrics, and under `peer_uid_check` a
+/// foreign uid is rejected and logged there.
 #[cfg(unix)]
 pub(crate) fn probe_socket(path: &Path) -> SocketProbe {
     let first = probe_socket_once(path);
+    // BSD/macOS refuse a stream connect with ECONNREFUSED both when nothing is
+    // bound (stale) and when a live listener's accept backlog is full, and the
+    // backlog can stay full for as long as the listener cannot accept
+    // (fd exhaustion, SIGSTOP). Re-probing only narrows that window, so
+    // the refusal is settled by a probe that does not depend on the backlog
+    // at all (conf-security-7).
     #[cfg(not(target_os = "linux"))]
     if first == SocketProbe::Stale {
-        // BSD/macOS report a full backlog as ECONNREFUSED too, so one refusal
-        // does not prove nobody is listening.
-        for _ in 0..STALE_REPROBES {
-            std::thread::sleep(STALE_REPROBE_INTERVAL);
-            let again = probe_socket_once(path);
-            if again != SocketProbe::Stale {
-                return again;
-            }
-        }
+        return probe_socket_attached(path);
     }
     first
 }
 
-/// Maps a failed non-blocking `connect(2)` errno to a [`SocketProbe`]. The
-/// non-Linux ECONNREFUSED re-probe lives in [`probe_socket`], not here.
+/// Maps a failed non-blocking stream `connect(2)` errno to a [`SocketProbe`].
+/// The non-Linux ECONNREFUSED follow-up lives in [`probe_socket`], not here.
 #[cfg(unix)]
 fn classify_connect_errno(errno: i32) -> SocketProbe {
     match errno {
@@ -845,8 +837,52 @@ fn classify_connect_errno(errno: i32) -> SocketProbe {
     }
 }
 
+/// The non-Linux follow-up to a refused stream connect: is any socket still
+/// attached to the file at `path`?
+///
+/// It connects a `SOCK_DGRAM` socket to the path. The BSD-derived kernels
+/// (XNU `unp_connect`, and FreeBSD/OpenBSD/NetBSD likewise) look up the socket
+/// bound to the file's vnode first and refuse with `ECONNREFUSED` only if there
+/// is none; with one bound, a type mismatch fails with `EPROTOTYPE` *before*
+/// the stream-only backlog check. So the answer does not depend on the
+/// listener's backlog, its accept loop, or whether it is stopped. It also never
+/// creates a connection on the other side: no metrics bump, no peer-uid log.
+///
+/// | datagram connect result | meaning |
+/// |---|---|
+/// | `ECONNREFUSED` | `Stale`: no socket is attached to the file |
+/// | `EPROTOTYPE`, `0` | `Live`: a socket is bound there (stream, or a datagram one) |
+/// | `ENOENT`, `ENOTDIR` | `Absent`: the file went away between probes |
+/// | other | `Unknown(errno)`: fail closed |
+#[cfg(all(unix, not(target_os = "linux")))]
+fn probe_socket_attached(path: &Path) -> SocketProbe {
+    connect_probe(path, libc::SOCK_DGRAM, classify_attached_errno)
+}
+
+/// Maps a failed datagram `connect(2)` errno for [`probe_socket_attached`].
+#[cfg(all(unix, not(target_os = "linux")))]
+fn classify_attached_errno(errno: i32) -> SocketProbe {
+    match errno {
+        libc::ECONNREFUSED => SocketProbe::Stale,
+        libc::EPROTOTYPE => SocketProbe::Live,
+        libc::ENOENT | libc::ENOTDIR => SocketProbe::Absent,
+        other => SocketProbe::Unknown(other),
+    }
+}
+
 #[cfg(unix)]
 fn probe_socket_once(path: &Path) -> SocketProbe {
+    connect_probe(path, libc::SOCK_STREAM, classify_connect_errno)
+}
+
+/// One non-blocking `connect(2)` of a fresh `AF_UNIX` socket of `sock_type` to
+/// `path`. A successful connect is `Live`; a failure goes through `classify`.
+#[cfg(unix)]
+fn connect_probe(
+    path: &Path,
+    sock_type: libc::c_int,
+    classify: fn(i32) -> SocketProbe,
+) -> SocketProbe {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
 
@@ -881,7 +917,7 @@ fn probe_socket_once(path: &Path) -> SocketProbe {
         addr.sun_len = len as u8;
     }
 
-    let sock = match nonblocking_unix_stream_socket() {
+    let sock = match nonblocking_unix_socket(sock_type) {
         Ok(fd) => fd,
         Err(e) => return SocketProbe::Unknown(e.raw_os_error().unwrap_or(libc::EIO)),
     };
@@ -902,19 +938,19 @@ fn probe_socket_once(path: &Path) -> SocketProbe {
     let errno = io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO);
-    classify_connect_errno(errno)
+    classify(errno)
 }
 
-/// `socket(AF_UNIX, SOCK_STREAM)`, non-blocking and close-on-exec.
+/// `socket(AF_UNIX, sock_type)`, non-blocking and close-on-exec.
 #[cfg(unix)]
-fn nonblocking_unix_stream_socket() -> io::Result<libc::c_int> {
+fn nonblocking_unix_socket(sock_type: libc::c_int) -> io::Result<libc::c_int> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        // Safety: plain syscall with constant arguments.
+        // Safety: plain syscall with integer arguments.
         let fd = unsafe {
             libc::socket(
                 libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                sock_type | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
                 0,
             )
         };
@@ -927,8 +963,8 @@ fn nonblocking_unix_stream_socket() -> io::Result<libc::c_int> {
     {
         // No SOCK_NONBLOCK / SOCK_CLOEXEC here: set both with fcntl. The
         // descriptor is closed on any failure.
-        // Safety: plain syscall with constant arguments.
-        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        // Safety: plain syscall with integer arguments.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, sock_type, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1429,6 +1465,148 @@ mod tests {
         assert_eq!(probe_socket(&path), SocketProbe::Stale);
         assert!(path.exists(), "probe_socket must never unlink");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The non-Linux attachment probe's errno table (conf-security-7). Only a
+    /// refusal is stale; a type mismatch means a socket is bound there.
+    #[test]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn attached_errno_classification_fails_closed() {
+        assert_eq!(
+            classify_attached_errno(libc::ECONNREFUSED),
+            SocketProbe::Stale
+        );
+        assert_eq!(classify_attached_errno(libc::EPROTOTYPE), SocketProbe::Live);
+        assert_eq!(classify_attached_errno(libc::ENOENT), SocketProbe::Absent);
+        assert_eq!(classify_attached_errno(libc::ENOTDIR), SocketProbe::Absent);
+        for errno in [libc::EACCES, libc::EPERM, libc::EIO, libc::EAGAIN] {
+            assert_eq!(
+                classify_attached_errno(errno),
+                SocketProbe::Unknown(errno),
+                "errno {errno}"
+            );
+        }
+    }
+
+    /// conf-security-7: a socket that is bound but not (or not yet) listening
+    /// refuses a stream connect on BSD/macOS, yet its owner is alive. The probe
+    /// must not call it stale.
+    #[test]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn bound_but_not_listening_socket_is_live_not_stale() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("bound_not_listening");
+        let path = dir.join("weir.sock");
+
+        // Safety: plain syscall; the fd is owned by `sock` below.
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        // Safety: fd was just created and is owned by nothing else.
+        let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+        // Safety: all-zero is a valid sockaddr_un.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len());
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as libc::c_char;
+        }
+        let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            addr.sun_len = len as u8;
+        }
+        // Safety: addr is initialised and len is within its size.
+        let rc = unsafe {
+            libc::bind(
+                std::os::fd::AsRawFd::as_raw_fd(&sock),
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                len as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+
+        assert_eq!(
+            probe_socket_once(&path),
+            SocketProbe::Stale,
+            "precondition: a bound, non-listening socket refuses a stream connect"
+        );
+        assert_eq!(probe_socket(&path), SocketProbe::Live);
+
+        drop(sock);
+        assert_eq!(
+            probe_socket(&path),
+            SocketProbe::Stale,
+            "once its owner closes it, the same file is stale"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// conf-security-7: on BSD/macOS a listener whose accept backlog is full
+    /// refuses a stream connect with ECONNREFUSED, the same errno a stale socket
+    /// gives. The probe must still call it `Live`, and startup must refuse to
+    /// unlink it, however long the backlog stays full.
+    #[tokio::test]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    async fn full_backlog_listener_is_live_not_stale() {
+        use std::os::fd::AsRawFd;
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("full_backlog");
+        let path = dir.join("weir.sock");
+        let live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Shrink the backlog so it fills in a few connects; BSD and XNU let a
+        // listening socket call listen() again to resize it.
+        // Safety: live is an open listening socket we own.
+        assert_eq!(unsafe { libc::listen(live.as_raw_fd(), 1) }, 0);
+
+        // Fill it: never accept, keep connecting until a stream connect is
+        // refused. The probe's own connections queue too.
+        let mut held = Vec::new();
+        let mut filled = false;
+        for _ in 0..1024 {
+            if probe_socket_once(&path) == SocketProbe::Stale {
+                filled = true;
+                break;
+            }
+            if let Ok(c) = std::os::unix::net::UnixStream::connect(&path) {
+                held.push(c);
+            }
+        }
+        assert!(
+            filled,
+            "precondition: a full backlog refuses a stream connect on this platform"
+        );
+
+        // The ambiguity is reproduced; the probe must not call it stale.
+        assert_eq!(probe_socket(&path), SocketProbe::Live);
+
+        let before = inode_of(&path);
+        let err = bind_hardened(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert_eq!(
+            inode_of(&path),
+            before,
+            "a live socket with a full backlog must not be unlinked"
+        );
+
+        // Drain the backlog and prove the listener still works.
+        drop(held);
+        live.set_nonblocking(true).unwrap();
+        while live.accept().is_ok() {}
+        let _c = std::os::unix::net::UnixStream::connect(&path)
+            .expect("the live listener must still accept after the refused start");
+
+        drop(live);
         std::fs::remove_dir_all(&dir).ok();
     }
 

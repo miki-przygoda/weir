@@ -109,9 +109,11 @@ life, so the inode number cannot be reused and `(dev, ino)` is a sound
 identity. Other Unix targets (macOS included) have no `O_PATH`: there the check
 adds `st_ctime`, plus `st_birthtime` on macOS, as a best-effort tie-breaker,
 which is weaker. The startup liveness probe also differs: on Linux a refused
-connect means stale, while BSD and macOS report a full listen backlog as a
-refused connect too, so there a refused socket is probed three more times,
-50 ms apart, and counts as stale only if every probe is refused. Details in [socket-bind](security/socket-bind.md).
+connect means stale. BSD and macOS also refuse a stream connect when a live
+listener's backlog is full, so there a refused socket gets a second probe, a
+datagram connect, which fails with `EPROTOTYPE` whenever any socket is still
+bound to the file. The file counts as stale only if both probes are refused.
+Details in [socket-bind](security/socket-bind.md#stale-socket-removal-and-the-liveness-probe).
 
 ## Libraries and CLI
 
