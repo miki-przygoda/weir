@@ -855,35 +855,13 @@ fn admission_refusal(config: &ConnectionConfig) -> Option<AdmissionRefusal> {
     over_wab_cap(config).then_some(AdmissionRefusal::WabCap)
 }
 
-/// Whether the WAB cap is currently rejecting pushes.
-///
-/// Hysteresis: once rejecting, keep rejecting until bytes fall below
-/// `cap * 9 / 10`, so ingest does not flap on and off at the boundary. `cap == 0`
-/// disables the check entirely.
-///
-/// The `rejecting` flag is shared by every connection on the daemon, so the
-/// low-water mark is global: one connection observing recovery releases all of
-/// them, and one observing the cap holds all of them.
+/// Whether the WAB cap is currently rejecting pushes; see [`crate::wab::cap`].
 fn over_wab_cap(config: &ConnectionConfig) -> bool {
-    if config.wab_max_bytes == 0 {
-        return false;
-    }
-    let bytes = config.wab_bytes_now.load(Ordering::Relaxed);
-    let rejecting = config.wab_cap_rejecting.load(Ordering::Relaxed);
-    // Divide before multiplying: `cap * 9` would overflow for caps above
-    // u64::MAX / 9, and the rounding loss is at most 9 bytes.
-    let low_water = config.wab_max_bytes / 10 * 9;
-    let now_rejecting = if rejecting {
-        bytes >= low_water
-    } else {
-        bytes >= config.wab_max_bytes
-    };
-    if now_rejecting != rejecting {
-        config
-            .wab_cap_rejecting
-            .store(now_rejecting, Ordering::Relaxed);
-    }
-    now_rejecting
+    crate::wab::cap::evaluate(
+        config.wab_max_bytes,
+        config.wab_bytes_now.load(Ordering::Relaxed),
+        &config.wab_cap_rejecting,
+    )
 }
 
 fn durability_to_tier(d: Durability) -> TierValue {

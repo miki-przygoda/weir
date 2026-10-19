@@ -1,3 +1,4 @@
+pub(crate) mod cap;
 pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
 pub(crate) mod dst;
