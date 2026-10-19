@@ -401,6 +401,54 @@ def cumulative_deltas(result, prev):
     return {k: v - prev.get(k, 0) for k, v in totals.items()}, totals
 
 
+#: Where the crash-path post-mortem lands, beside episodes.jsonl. A separate
+#: file and NOT an episodes.jsonl row: report.py and main()'s closing count
+#: treat every non-"final" row as an episode, and this is not one.
+CRASH_POSTMORTEM_FILE = "crash-postmortem.json"
+
+
+def crash_postmortem(wab_dir, reason, residue_fn=None):
+    """The WAB post-mortem for a run that ended on an exception.
+
+    `final_pass` step 5 is the only other place the WAB is scanned before
+    `stack.teardown()` unmounts the device and deletes `wab.img`. A run that
+    raised out of the episode loop never reaches it, so the evidence of what
+    weir left on disk was destroyed unread, on exactly the runs where it is
+    most needed. Same scanner and the same 50-row cap as the final pass, so
+    the two records read alike. Never raises: a failed scan is recorded.
+    """
+    residue_fn = residue_fn or quiescence.scan_wab_residue
+    record = {"reason": reason, "wab_dir": wab_dir}
+    if wab_dir is None:
+        record["wab_scan_error"] = (
+            "no WAB directory was created before the run failed"
+        )
+        return record
+    try:
+        residue = residue_fn(wab_dir)
+    except Exception as exc:
+        record["wab_scan_error"] = f"{type(exc).__name__}: {exc}"
+        return record
+    record["wab_residue"] = {
+        "unconfirmed_sealed": residue.unconfirmed_sealed,
+        "nonempty_active": residue.nonempty_active,
+        "quarantined": residue.quarantined,
+        "dead_letter": residue.dead_letter,
+    }
+    survivors = list(residue.survivors)
+    record["wab_survivor_count"] = len(survivors)
+    record["wab_survivors"] = survivors[:50]
+    return record
+
+
+def write_crash_postmortem(run_dir, record):
+    """Writes `record` to `run_dir/crash-postmortem.json`; returns the path."""
+    path = os.path.join(run_dir, CRASH_POSTMORTEM_FILE)
+    with open(path, "w") as f:
+        json.dump(record, f, indent=2)
+    return path
+
+
 def final_pass(
     loadgen, daemon, recorder, acc, ledger_tail, delivered_tail, wab_dir,
     frontier_slack, seed, prev_totals=None, scrape_fn=None, residue_fn=None,
@@ -847,12 +895,16 @@ def main():
     ledger_path = os.path.join(run_dir, "ledger.log")
     delivered_path = os.path.join(run_dir, "delivered.log")
     episodes_path = os.path.join(run_dir, "episodes.jsonl")
+    # Written only when a run ends on an exception before its final pass.
+    crash_path = os.path.join(run_dir, CRASH_POSTMORTEM_FILE)
 
     # Refuse to start on top of a previous run's leftovers rather than silently
     # stacking a mount or mixing two runs' logs. Re-running the same seed reuses
     # this directory, and mixed logs would produce spurious ledger conflicts on
     # exactly the reproduction run meant to confirm a finding.
-    for path in (ledger_path, delivered_path, episodes_path):
+    # The crash post-mortem too: a stale one would be rendered into the next
+    # run's report as though that run had crashed.
+    for path in (ledger_path, delivered_path, episodes_path, crash_path):
         if os.path.exists(path) and os.path.getsize(path) > 0:
             sys.exit(
                 f"{path} already exists and is non-empty. Move or delete "
@@ -894,6 +946,12 @@ def main():
     loadgen_log = None
     violations = 0
     anomalies = 0
+    # Crash-path state for the post-mortem in `finally`. `wab_dir` stays None
+    # if the run fails before it creates the WAB directory; `final_pass_ran`
+    # says whether final_pass step 5 already scanned the WAB.
+    wab_dir = None
+    final_pass_ran = False
+    crash_reason = None
 
     try:
         stack.setup()
@@ -1293,6 +1351,7 @@ def main():
                 daemon.wab_dir, frontier_slack, seed, prev_totals=prev_totals,
                 tier=sched["load"]["tier"], fault=kind,
             )
+            final_pass_ran = True
             violations += v
             anomalies += a
             ep_log.write(json.dumps(final_record) + "\n")
@@ -1305,6 +1364,11 @@ def main():
                 f"anomalies={final_record['anomaly_reasons'] or 'none'}",
                 flush=True,
             )
+    except BaseException as exc:
+        # Recorded for the crash post-mortem in `finally`, then re-raised
+        # unchanged: this is evidence capture, not error handling.
+        crash_reason = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         # Each step isolated. A process can exit between `poll()` and
         # `terminate()`, and an unguarded ProcessLookupError there would skip
@@ -1348,6 +1412,18 @@ def main():
                     recorder.wait(timeout=10)
         except Exception as exc:
             print(f"cleanup: recorder terminate failed: {exc}", file=sys.stderr)
+        # The crash-path WAB post-mortem: what weir left on disk, read BEFORE
+        # teardown unmounts the device. Only when final_pass did not already
+        # scan it (step 5), i.e. the run raised before or inside the final pass.
+        if not final_pass_ran:
+            try:
+                pm = crash_postmortem(
+                    wab_dir, crash_reason or "the run ended before its final pass")
+                pm_path = write_crash_postmortem(run_dir, pm)
+                print(f"crash path: WAB post-mortem written to {pm_path}",
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f"cleanup: crash post-mortem failed: {exc}", file=sys.stderr)
         try:
             stack.teardown()
         except Exception as exc:

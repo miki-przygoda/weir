@@ -1138,5 +1138,88 @@ class TestExitCodeForVerdict(unittest.TestCase):
         self.assertEqual(run.exit_code_for(1, 0, "inconclusive"), 1)
 
 
+class TestCrashPostmortem(unittest.TestCase):
+    """The prerequisite (spec §16 chaos item 3): an exception escaping the
+    episode loop went straight to stack.teardown(), which unmounted the WAB
+    and deleted wab.img with no post-mortem. The one piece of evidence that
+    explains a crash was destroyed unread."""
+
+    SURVIVORS = (
+        {"kind": "unconfirmed_sealed",
+         "path": "/w/shard_0/seg_00000003.wab.sealed", "size": 4096},
+        {"kind": "nonempty_active",
+         "path": "/w/shard_1/seg_00000007.wab", "size": 900},
+    )
+
+    def test_survivors_are_recorded_with_the_reason(self):
+        residue = quiescence.Residue(1, 1, 0, 0, self.SURVIVORS)
+        rec = run.crash_postmortem(
+            "/w", "RuntimeError: boom", residue_fn=lambda _d: residue)
+        self.assertEqual(rec["reason"], "RuntimeError: boom")
+        self.assertEqual(rec["wab_dir"], "/w")
+        self.assertEqual(rec["wab_residue"], {
+            "unconfirmed_sealed": 1, "nonempty_active": 1,
+            "quarantined": 0, "dead_letter": 0,
+        })
+        self.assertEqual(rec["wab_survivor_count"], 2)
+        self.assertEqual(
+            rec["wab_survivors"][0]["path"], "/w/shard_0/seg_00000003.wab.sealed")
+
+    def test_a_failing_scan_is_recorded_not_raised(self):
+        def boom(_d):
+            raise OSError("EIO")
+        rec = run.crash_postmortem("/w", "x", residue_fn=boom)
+        self.assertEqual(rec["wab_scan_error"], "OSError: EIO")
+        self.assertNotIn("wab_residue", rec)
+
+    def test_a_run_that_died_before_the_wab_existed_says_so(self):
+        rec = run.crash_postmortem(None, "x", residue_fn=lambda _d: 1 / 0)
+        self.assertIn("no WAB directory", rec["wab_scan_error"])
+
+    def test_the_survivor_list_is_capped_at_fifty_but_counted_in_full(self):
+        many = tuple(
+            {"kind": "unconfirmed_sealed", "path": f"/w/s/{n}", "size": 1}
+            for n in range(80)
+        )
+        rec = run.crash_postmortem(
+            "/w", "x", residue_fn=lambda _d: quiescence.Residue(80, 0, 0, 0, many))
+        self.assertEqual(rec["wab_survivor_count"], 80)
+        self.assertEqual(len(rec["wab_survivors"]), 50)
+
+    def test_it_is_written_beside_the_episode_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = run.write_crash_postmortem(tmp, {"reason": "x", "wab_dir": None})
+            self.assertEqual(path, os.path.join(tmp, run.CRASH_POSTMORTEM_FILE))
+            with open(path) as f:
+                self.assertEqual(json.load(f)["reason"], "x")
+
+    def _main_source(self):
+        run_py = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
+        with open(run_py) as f:
+            source = f.read()
+        return source[source.index("def main("):]
+
+    def test_main_runs_it_before_teardown_and_only_when_the_final_pass_did_not(self):
+        body = self._main_source()
+        fin = body[body.index("\n    finally:\n"):]
+        self.assertIn("crash_postmortem(", fin)
+        # Anchored on the 12-space-indented CALL line: the finally block's own
+        # comments mention `stack.teardown()` before the call does.
+        self.assertLess(
+            fin.index("crash_postmortem("), fin.index("\n            stack.teardown("),
+            "the post-mortem must read the WAB before teardown unmounts it",
+        )
+        self.assertIn("if not final_pass_ran", fin)
+        self.assertIn("final_pass_ran = True", body)
+
+    def test_a_leftover_crash_file_blocks_a_rerun_of_the_seed(self):
+        body = self._main_source()
+        self.assertIn(
+            "(ledger_path, delivered_path, episodes_path, crash_path)", body,
+            "a stale crash-postmortem.json would be rendered into the NEXT "
+            "run's report as though that run had crashed",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
