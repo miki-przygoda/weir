@@ -1090,6 +1090,7 @@ mod tests {
             changed,
             rejected,
             note: None,
+            at_unix_ms: 0,
         };
         r.publish(
             report(

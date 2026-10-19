@@ -279,8 +279,8 @@ pub struct ConfigReloadLabel {
 pub enum ConfigReloadTrigger {
     /// SIGHUP.
     sighup,
-    /// Reserved for the admin socket's `reload` verb (Foundations), which goes
-    /// through the same `reload::Reloader`. Nothing sends it in this release.
+    /// The admin socket's `reload` verb, which goes through the same
+    /// `reload::Reloader`.
     admin,
 }
 
