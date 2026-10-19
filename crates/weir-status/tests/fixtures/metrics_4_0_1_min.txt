@@ -1,0 +1,30 @@
+# HELP weir_wab_bytes_on_disk Current bytes used by live WAB shard segments on disk.
+# TYPE weir_wab_bytes_on_disk gauge
+weir_wab_bytes_on_disk 4096
+# HELP weir_sink_health Sink health.
+# TYPE weir_sink_health gauge
+weir_sink_health{state="healthy"} 1
+weir_sink_health{state="degraded"} 0
+weir_sink_health{state="down"} 0
+# HELP weir_sink_info Configured sink.
+# TYPE weir_sink_info gauge
+weir_sink_info{sink_type="noop"} 1
+# HELP weir_drain_state Drain state.
+# TYPE weir_drain_state gauge
+weir_drain_state{state="draining"} 1
+weir_drain_state{state="retrying_transient"} 0
+weir_drain_state{state="blocked_dead_letter_full"} 0
+weir_drain_state{state="stopped"} 0
+# HELP weir_recovery_segments_failed Recovery failures.
+# TYPE weir_recovery_segments_failed counter
+weir_recovery_segments_failed_total 1
+# HELP weir_recovery_quarantine_copy_failed Quarantine copy failures.
+# TYPE weir_recovery_quarantine_copy_failed counter
+weir_recovery_quarantine_copy_failed_total 0
+# HELP weir_dead_letter_bytes_on_disk Dead-letter bytes.
+# TYPE weir_dead_letter_bytes_on_disk gauge
+weir_dead_letter_bytes_on_disk 0
+# HELP weir_quarantine_bytes_on_disk Quarantine bytes.
+# TYPE weir_quarantine_bytes_on_disk gauge
+weir_quarantine_bytes_on_disk 0
+# EOF
