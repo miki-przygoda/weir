@@ -9,6 +9,7 @@
 
 pub(crate) mod framing;
 pub(crate) mod identity;
+pub(crate) mod verbs;
 
 use std::{
     fmt, io,
@@ -226,5 +227,88 @@ mod tests {
         assert_eq!(e.reason_code, reason::COLLIDES_WITH_SOCKET_PATH);
         assert!(!admin.exists(), "a refused bind creates nothing");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Test scaffolding shared by the verb, dispatcher and accept-loop tests: an
+/// [`AdminState`](verbs::AdminState) over a test board, a detached drain and
+/// a live or stalled reload loop.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{path::Path, sync::Arc};
+
+    use serde_json::{Map, Value};
+    use tokio::sync::{Mutex, mpsc, watch};
+
+    use super::{identity, verbs::AdminState};
+    use crate::{
+        drain::control::DrainControl,
+        lifecycle::ShutdownLevel,
+        metrics::{AdminOutcomeLabel, AdminRequestLabel, AdminVerbLabel, Metrics},
+        reload::{self, ReloadRequest, Reloader},
+        status::StatusBoard,
+    };
+
+    pub(crate) enum ReloadMode {
+        /// A real reload loop (no TLS: every reload is a `noop`).
+        Live,
+        /// A queue nobody serves.
+        Stalled,
+    }
+
+    pub(crate) struct Harness {
+        pub(crate) st: Arc<AdminState>,
+        pub(crate) level_tx: watch::Sender<ShutdownLevel>,
+        pub(crate) _stalled: Option<mpsc::Receiver<ReloadRequest>>,
+    }
+
+    /// Must run inside a tokio runtime (the live loop is spawned).
+    pub(crate) fn harness(mode: ReloadMode) -> Harness {
+        let metrics = Arc::new(Metrics::new().0);
+        let (level_tx, level_rx) = watch::channel(ShutdownLevel::Running);
+        let (reload_tx, stalled) = match mode {
+            ReloadMode::Live => (
+                reload::spawn_reload_loop(Reloader::new(Arc::clone(&metrics), false)),
+                None,
+            ),
+            ReloadMode::Stalled => {
+                let (tx, rx) = reload::reload_channel();
+                (tx, Some(rx))
+            }
+        };
+        let wab = crate::testutil::scratch_dir("admin_harness");
+        let st = Arc::new(AdminState {
+            board: StatusBoard::for_test(),
+            drain_ctl: DrainControl::detached(),
+            reload_tx,
+            level_rx,
+            thresholds: Arc::new(weir_status::Thresholds::default()),
+            livez_checks: Arc::from(Vec::<weir_status::LivezCheck>::new()),
+            instance: identity::instance_id(&wab, Path::new("/run/weir/weir.sock"), 1).unwrap(),
+            metrics,
+            wab_max_bytes: 0,
+            daemon_euid: uid(),
+            mutate: Mutex::new(()),
+        });
+        Harness {
+            st,
+            level_tx,
+            _stalled: stalled,
+        }
+    }
+
+    pub(crate) fn uid() -> u32 {
+        // Safety: geteuid has no preconditions.
+        unsafe { libc::geteuid() }
+    }
+
+    pub(crate) fn args(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn requests(m: &Metrics, verb: AdminVerbLabel, outcome: AdminOutcomeLabel) -> u64 {
+        m.admin_requests
+            .get_or_create(&AdminRequestLabel { verb, outcome })
+            .get()
     }
 }
