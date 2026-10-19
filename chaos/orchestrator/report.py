@@ -44,6 +44,55 @@ def _dash(value):
     return "—" if value is None else value
 
 
+#: Mirrors run.CRASH_POSTMORTEM_FILE (report.py must not import run.py, which
+#: imports report). test_run.py pins the two together.
+CRASH_POSTMORTEM_FILE = "crash-postmortem.json"
+
+
+def render_crash_postmortem(crash):
+    """The WAB as `stack.teardown()` was about to unmount it, for a run that
+    ended on an exception before its final pass."""
+    lines = ["## Crash post-mortem\n"]
+    lines.append(
+        "The run ended on an exception before its final pass. This is what weir "
+        "left on disk at that moment: the only record of it, because teardown "
+        "unmounts the device next.\n"
+    )
+    lines.append(f"- **Reason:** {crash.get('reason')}")
+    lines.append(f"- **WAB dir:** `{crash.get('wab_dir')}`")
+    if crash.get("image_kept"):
+        lines.append(
+            f"- **Image kept for forensics:** `{crash['image_kept']}` "
+            "(loop-mount it read-only to inspect)")
+    if crash.get("wab_scan_error"):
+        lines.append(f"- **Scan error:** {crash['wab_scan_error']}")
+    residue = crash.get("wab_residue") or {}
+    for key in ("unconfirmed_sealed", "nonempty_active", "quarantined", "dead_letter"):
+        lines.append(f"- {key}: {_dash(residue.get(key))}")
+    survivors = crash.get("wab_survivors") or []
+    if survivors:
+        lines.append("")
+        lines.append("| Kind | Path | Size (bytes) |")
+        lines.append("|---|---|---|")
+        for s in survivors[:MAX_SURVIVORS_SHOWN]:
+            lines.append(f"| {s.get('kind')} | `{s.get('path')}` | {s.get('size')} |")
+        hidden = crash.get("wab_survivor_count", len(survivors)) - min(
+            len(survivors), MAX_SURVIVORS_SHOWN)
+        if hidden > 0:
+            lines.append(f"\n…and {hidden} more (see {CRASH_POSTMORTEM_FILE}).")
+    lines.append("")
+    return lines
+
+
+def load_crash_postmortem(run_dir):
+    """Reads run_dir/crash-postmortem.json, or None when the run did not crash."""
+    path = os.path.join(run_dir, CRASH_POSTMORTEM_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
 def render_final_pass(final):
     """Renders the end-of-run record (D1) as its own section.
 
@@ -273,8 +322,12 @@ def _fault_kinds(records):
     }
 
 
-def render(episodes, meta):
-    """Renders episodes (list of dicts) into markdown."""
+def render(episodes, meta, crash=None):
+    """Renders episodes (list of dicts) into markdown.
+
+    `crash` is the crash-path post-mortem (`load_crash_postmortem`), or None
+    for a run that reached its final pass.
+    """
     fault_kinds = _fault_kinds(episodes)
     fault_episodes = [e for e in episodes if e.get("episode") != FINAL]
     final = next((e for e in episodes if e.get("episode") == FINAL), None)
@@ -535,6 +588,9 @@ def render(episodes, meta):
                 "episodes fail — but it is a harness finding, not a weir one.\n"
             )
 
+    if crash is not None:
+        lines.extend(render_crash_postmortem(crash))
+
     if final is not None:
         lines.extend(render_final_pass(final))
 
@@ -750,7 +806,7 @@ def write_report(run_dir):
     meta = gather_meta(episodes)
     out_path = os.path.join(run_dir, "report.md")
     with open(out_path, "w") as f:
-        f.write(render(episodes, meta))
+        f.write(render(episodes, meta, crash=load_crash_postmortem(run_dir)))
     return out_path
 
 

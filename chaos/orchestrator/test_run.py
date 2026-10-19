@@ -1193,6 +1193,11 @@ class TestCrashPostmortem(unittest.TestCase):
             with open(path) as f:
                 self.assertEqual(json.load(f)["reason"], "x")
 
+    def test_report_s_copy_of_the_file_name_matches(self):
+        # report.py cannot import run.py, so it carries its own copy of the
+        # name; a drift would make every crash post-mortem invisible.
+        self.assertEqual(report.CRASH_POSTMORTEM_FILE, run.CRASH_POSTMORTEM_FILE)
+
     def _main_source(self):
         run_py = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
         with open(run_py) as f:

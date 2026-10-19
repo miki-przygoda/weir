@@ -725,3 +725,44 @@ class TestCommitLabel(unittest.TestCase):
     def test_a_missing_commit_is_left_alone_rather_than_labelled_dirty(self):
         # git absent or not a repo: say nothing rather than invent "-dirty".
         self.assertEqual(report.commit_label("", " M x.rs\n"), "")
+
+
+CRASH = {
+    "reason": "RuntimeError: boom", "wab_dir": "/mnt/weir-wab/wab",
+    "image_kept": "/chaos/runs/7/wab.img",
+    "wab_residue": {"unconfirmed_sealed": 1, "nonempty_active": 0,
+                    "quarantined": 0, "dead_letter": 0},
+    "wab_survivor_count": 1,
+    "wab_survivors": [{"kind": "unconfirmed_sealed",
+                       "path": "/mnt/weir-wab/wab/shard_0/seg_00000003.wab.sealed",
+                       "size": 4096}],
+}
+
+
+class TestCrashPostmortemSection(unittest.TestCase):
+    def test_no_crash_renders_no_section(self):
+        self.assertNotIn("## Crash post-mortem", report.render(EPISODES, {}))
+
+    def test_the_section_names_the_reason_the_image_and_every_survivor(self):
+        out = report.render(EPISODES, {}, crash=CRASH)
+        self.assertIn("## Crash post-mortem", out)
+        self.assertIn("RuntimeError: boom", out)
+        self.assertIn("/chaos/runs/7/wab.img", out)
+        self.assertIn("seg_00000003.wab.sealed", out)
+        self.assertIn("4096", out)
+
+    def test_a_scan_error_is_shown_rather_than_an_empty_table(self):
+        out = report.render(EPISODES, {}, crash={
+            "reason": "x", "wab_dir": None,
+            "wab_scan_error": "no WAB directory was created before the run failed"})
+        self.assertIn("no WAB directory", out)
+
+    def test_write_report_picks_up_the_crash_file(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "episodes.jsonl"), "w") as f:
+                f.write(json.dumps(EPISODES[0]) + "\n")
+            with open(os.path.join(tmp, report.CRASH_POSTMORTEM_FILE), "w") as f:
+                json.dump(CRASH, f)
+            with open(report.write_report(tmp)) as f:
+                self.assertIn("## Crash post-mortem", f.read())
