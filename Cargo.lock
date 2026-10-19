@@ -2780,6 +2780,7 @@ dependencies = [
  "weir-core",
  "weir-sink-s3",
  "weir-sink-sdk",
+ "weir-status",
  "weir-testkit",
  "weir-wab",
  "zstd",

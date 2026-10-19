@@ -6,6 +6,7 @@ mod preflight;
 mod queue;
 mod reload;
 mod sink;
+mod status;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
 // feature alone: `--features tls` on Windows would otherwise name `crate::socket`,
