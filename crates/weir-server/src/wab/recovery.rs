@@ -681,7 +681,7 @@ pub(crate) fn recover_segment(
     // Not double-counted anywhere: `replay_unconfirmed` only *queues* pre-existing
     // .wab.sealed files, which were counted by whichever process sealed them; a
     // replay is not a transition, so it must not bump this counter. Idempotency:
-    // recovery runs once per process (wab::spawn) and only ever sees unsealed
+    // recovery runs once per process (wab::recover) and only ever sees unsealed
     // .wab files, so within a process each seal is counted exactly once. If a
     // crash between the rename and the parent fsync lost the dirent, the next
     // process re-seals and re-counts — but that is a different process with a

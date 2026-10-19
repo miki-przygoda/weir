@@ -304,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── wab_dir ownership ─────────────────────────────────────────────────────
     //
-    // Before ANYTHING reads the WAB (recovery inside wab::spawn, the replay, the
+    // Before ANYTHING reads the WAB (recovery in wab::recover, the replay, the
     // drain) and before every other refuse-to-start check, so a duplicate on
     // the same wab_dir reports "locked by" rather than some later symptom. A
     // second daemon that got past this point would seal this one's ACTIVE
@@ -462,11 +462,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         compression_level: config.wab_compression_level,
     };
+    // Recovery is its own step (spec §6 step 8): every shard dir made private,
+    // then each unsealed segment a crash left sealed. PR 4 runs it while the
+    // runtime already serves HTTP; here it keeps its old position.
+    board.enter_phase(weir_status::Phase::Recovering, &metrics);
+    let recovery = wab::recover(&config.wab_dir, config.shard_count, &metrics)?;
+    info!(
+        shard_dirs = recovery.shard_dirs,
+        quarantined = recovery.segments_quarantined,
+        failed = recovery.segments_failed,
+        elapsed_ms = recovery.elapsed.as_millis() as u64,
+        "WAB recovery complete"
+    );
     // The status board's shard registry: flusher supervisors and worker drop
     // guards record each shard's and worker's state on it (spec §5.3).
-    // Recovery runs inside `wab::spawn` (until PR 3 splits it out).
-    board.enter_phase(weir_status::Phase::Recovering, &metrics);
-    let wab_handle = wab::spawn(
+    let wab_handle = wab::spawn_flushers(
         config.wab_dir.clone(),
         wab_config,
         drain_tx,
@@ -478,7 +488,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
     //
     // Workers send `Batch`es directly to the WAB flusher via the shard channels
-    // returned by `wab::spawn`. No bridge thread: the hop is
+    // returned by `wab::spawn_flushers`. No bridge thread: the hop is
     // worker → Batch-channel → flusher.
 
     // The 5 s poll task reports the EWMA as evidence; the workers take the
@@ -822,7 +832,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Replay recovery backlog (drain consumer is now live) ──────────────────
     //
     // Replay sealed-but-unconfirmed segments from a previous run now that the
-    // drain thread is consuming. Done here rather than inside wab::spawn so the
+    // drain thread is consuming. Done here rather than inside wab::recover so the
     // blocking sends into the bounded drain channel are drained live — a backlog
     // larger than the channel capacity would otherwise dead-lock startup (B3).
     // Runs before the socket binds, so the recovery backlog is queued ahead of

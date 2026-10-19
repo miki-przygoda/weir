@@ -110,13 +110,13 @@ impl Default for WabConfig {
     }
 }
 
-/// Returned by `spawn`. Drop `shard_txs` to initiate shutdown (flusher threads
+/// Returned by [`spawn_flushers`]. Drop `shard_txs` to initiate shutdown (flusher threads
 /// exit when their receiver disconnects), then join the handles to wait for all
 /// segments to be sealed.
 ///
 /// A joined handle carries no verdict: each shard's supervisor records how its
 /// flusher ended (`Stopped`, or `Offline` with a reason) on the
-/// `ShardRegistry` passed to `spawn` before the thread returns (spec §5.3).
+/// `ShardRegistry` passed to `spawn_flushers` before the thread returns (spec §5.3).
 pub(crate) struct WabHandle {
     /// One sender per shard. Drop all of them to signal shutdown.
     pub(crate) shard_txs: Vec<Sender<Batch>>,
@@ -292,13 +292,102 @@ pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
     }
 }
 
-/// Runs crash recovery, replays sealed-but-unconfirmed segments to `drain_tx`,
-/// then spawns one flusher thread per shard.
+/// What [`recover`] did. Logged once at startup ("WAB recovery complete").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoverySummary {
+    /// Shard directories ensured private (`0..shard_count`).
+    pub(crate) shard_dirs: usize,
+    /// Segments quarantined by this recovery pass.
+    pub(crate) segments_quarantined: u64,
+    /// Segments recovery could not process (`weir_recovery_segments_failed`).
+    pub(crate) segments_failed: u64,
+    pub(crate) elapsed: Duration,
+}
+
+/// Startup phase `recovering` (spec §6 step 8): `create_dir_private` for every
+/// configured shard, then crash recovery (unsealed `.wab` → `.wab.sealed`).
+/// Runs on the main thread before any flusher exists: the segment-counter
+/// safety rule in `flusher_thread` relies on recovery having finished.
+///
+/// Replay of sealed-but-unconfirmed segments is NOT done here: see
+/// [`scan_replay`], whose list reaches the drain only once the drain consumer
+/// runs (a blocking send into the bounded channel with no consumer would
+/// dead-lock startup on a backlog larger than its capacity, B3).
+pub(crate) fn recover(
+    wab_dir: &Path,
+    shard_count: usize,
+    metrics: &Arc<Metrics>,
+) -> io::Result<RecoverySummary> {
+    // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
+    let t0 = Instant::now();
+    let quarantined_before = metrics.recovery_segments_quarantined.get();
+    let failed_before = metrics.recovery_segments_failed.get();
+    for shard_id in 0..shard_count {
+        create_dir_private(shard_dir_path(wab_dir, shard_id))?;
+    }
+    recover_open_segments(wab_dir, metrics)?;
+    Ok(RecoverySummary {
+        shard_dirs: shard_count,
+        segments_quarantined: metrics
+            .recovery_segments_quarantined
+            .get()
+            .saturating_sub(quarantined_before),
+        segments_failed: metrics
+            .recovery_segments_failed
+            .get()
+            .saturating_sub(failed_before),
+        elapsed: t0.elapsed(),
+    })
+}
+
+/// Startup phase `handoff` (spec §6 step 9): the sealed-but-unconfirmed
+/// backlog, in the order the drain must deliver it, with the same footer
+/// accounting the old `replay_unconfirmed` did, and NO sends. In PR 3 the
+/// list is still pushed through the channel by [`replay_unconfirmed`]; from
+/// PR 4 it moves into the drain in memory as `initial_backlog`.
+///
+/// `Some(shard_count)` is passed to the scan, so an unlistable shard fails
+/// startup (no later rescan is guaranteed), exactly as before.
+pub(crate) fn scan_replay(
+    wab_dir: &Path,
+    shard_count: usize,
+    metrics: &Arc<Metrics>,
+    orphan_cleanup: bool,
+) -> io::Result<Vec<PathBuf>> {
+    // `Some(shard_count)`: fail-fast, so the scan is never `incomplete` here.
+    let scan = scan_unconfirmed_sealed(
+        wab_dir,
+        Some(shard_count),
+        metrics,
+        &|_| false,
+        orphan_cleanup,
+    )?;
+    for sealed in &scan.segments {
+        // A footer-read failure here only undercounts the
+        // recovery_records_replayed metric (the segment is still queued +
+        // delivered); surface it rather than silently reporting 0 so the
+        // undercount is explainable.
+        let record_count = match read_segment_record_count(sealed) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
+                0
+            }
+        };
+        info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
+        metrics.recovery_records_replayed.inc_by(record_count);
+    }
+    Ok(scan.segments)
+}
+
+/// Startup phase `handoff`, last step (spec §6 step 10): one flusher thread
+/// per shard. MUST run after [`recover`]: `flusher_thread` establishes its
+/// segment counter from what recovery left on disk.
 ///
 /// `coalesce_hint` is an `Arc<AtomicU64>` holding the EWMA of fsync latency in
 /// microseconds (init 200). Each flusher thread updates it after every fsync;
 /// the worker threads read it to size their coalesce window.
-pub(crate) fn spawn(
+pub(crate) fn spawn_flushers(
     wab_dir: PathBuf,
     config: WabConfig,
     drain_tx: Sender<PathBuf>,
@@ -306,22 +395,7 @@ pub(crate) fn spawn(
     coalesce_hint: Arc<AtomicU64>,
     registry: Arc<ShardRegistry>,
 ) -> io::Result<WabHandle> {
-    // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
-
-    for shard_id in 0..config.shard_count {
-        create_dir_private(shard_dir_path(&wab_dir, shard_id))?;
-    }
-
-    // Phase 1 (calling thread): crash recovery — unsealed .wab → .wab.sealed
-    recover_open_segments(&wab_dir, &metrics)?;
-
-    // NOTE: replay of sealed-but-unconfirmed segments is intentionally NOT done
-    // here. The caller invokes `replay_unconfirmed` AFTER the drain consumer is
-    // spawned — otherwise the blocking sends into the bounded drain channel would
-    // dead-lock the startup thread once the recovery backlog exceeds the channel
-    // capacity and no consumer exists yet (B3).
-
-    // Phase 2: one flusher thread per shard
+    // One flusher thread per shard.
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let mut shard_txs = Vec::with_capacity(config.shard_count);
     let mut join_handles = Vec::with_capacity(config.shard_count);
@@ -413,7 +487,7 @@ pub(crate) fn spawn(
 /// segments (`.wab.sealed` with no `.confirmed` sidecar), returning their paths
 /// in ascending per-shard counter order. Already-confirmed segments are skipped;
 /// a segment that fails the confirmed check is quarantined by `check_confirmed`
-/// and skipped. Shared by startup [`replay_unconfirmed`] and the drain's
+/// and skipped. Shared by startup [`scan_replay`] and the drain's
 /// sink-recovery rescan of stranded segments.
 ///
 /// Enumerates EVERY shard directory on disk, not just `0..shard_count` —
@@ -669,6 +743,9 @@ pub(crate) fn confirmed_tmp_path(confirmed: &Path) -> PathBuf {
 /// paths to the drain. MUST be called only after the drain consumer is running:
 /// the sends block on the bounded drain channel, so with no consumer a backlog
 /// larger than the channel capacity would dead-lock the caller (B3).
+///
+/// PR 3 keeps this as the channel-fed replay over [`scan_replay`]; PR 4 deletes
+/// it when the list moves into the drain as `initial_backlog`.
 pub(crate) fn replay_unconfirmed(
     wab_dir: &Path,
     shard_count: usize,
@@ -676,29 +753,7 @@ pub(crate) fn replay_unconfirmed(
     metrics: &Arc<Metrics>,
     orphan_cleanup: bool,
 ) -> io::Result<()> {
-    // `Some(shard_count)`: fail-fast, so the scan is never `incomplete` here.
-    for sealed in scan_unconfirmed_sealed(
-        wab_dir,
-        Some(shard_count),
-        metrics,
-        &|_| false,
-        orphan_cleanup,
-    )?
-    .segments
-    {
-        // A footer-read failure here only undercounts the
-        // recovery_records_replayed metric (the segment is still queued +
-        // delivered); surface it rather than silently reporting 0 so the
-        // undercount is explainable.
-        let record_count = match read_segment_record_count(&sealed) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
-                0
-            }
-        };
-        info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
-        metrics.recovery_records_replayed.inc_by(record_count);
+    for sealed in scan_replay(wab_dir, shard_count, metrics, orphan_cleanup)? {
         drain_tx.send(sealed).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -2422,5 +2477,87 @@ mod tests {
             cur, clamped,
             "NVMe-range EWMA ({cur} µs) should not be clipped by [50, 2000] bounds"
         );
+    }
+
+    // ── The startup split (recover / scan_replay / spawn_flushers) ───────────
+
+    /// `recover` is the first half of the old `spawn`: it makes the shard dirs
+    /// private and seals what a crash left open, and it does nothing else.
+    #[test]
+    fn recover_creates_private_shard_dirs_and_seals_open_segments() {
+        let dir = tmp_dir("recover_split");
+        let sd0 = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd0);
+        let open = segment_path(&sd0, 1);
+        {
+            let mut s = WabSegment::create(&open, 0, Compression::None).unwrap();
+            s.write_record(b"left-open").unwrap();
+            s.fsync().unwrap();
+            // dropped unsealed: what a crash leaves
+        }
+        let metrics = Arc::new(Metrics::new().0);
+
+        let summary = recover(&dir, 2, &metrics).unwrap();
+
+        assert_eq!(summary.shard_dirs, 2);
+        assert_eq!(summary.segments_quarantined, 0);
+        assert_eq!(summary.segments_failed, 0);
+        assert!(!open.exists(), "recovery seals the open segment");
+        let sealed = open.with_extension("wab.sealed");
+        assert_eq!(read_segment_record_count(&sealed).unwrap(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for id in 0..2 {
+                let mode = fs::metadata(shard_dir_path(&dir, id))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o700, "shard_{id:02} must be private");
+            }
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// `scan_replay` is the replay WITHOUT the sends: the list, in the order
+    /// the drain will see it, and the replay metric, with no channel at all.
+    #[test]
+    fn scan_replay_lists_the_backlog_in_order_and_counts_its_records() {
+        let dir = tmp_dir("scan_replay");
+        let sd0 = shard_dir_path(&dir, 0);
+        let sd1 = shard_dir_path(&dir, 1);
+        let a = sealed_in_shard(&sd0, 1, b"a");
+        let b = sealed_in_shard(&sd0, 2, b"b");
+        let c = sealed_in_shard(&sd1, 1, b"c");
+        let metrics = Arc::new(Metrics::new().0);
+
+        let replay = scan_replay(&dir, 2, &metrics, false).unwrap();
+
+        assert_eq!(replay, vec![a, b, c]);
+        assert_eq!(metrics.recovery_records_replayed.get(), 3);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Startup keeps the fail-fast policy: an unreadable shard aborts the scan
+    /// rather than silently dropping its backlog.
+    #[cfg(unix)]
+    #[test]
+    fn scan_replay_fails_on_an_unreadable_shard() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads a 0o000 directory; the condition cannot be built
+        }
+        let dir = tmp_dir("scan_replay_unreadable");
+        let sd0 = shard_dir_path(&dir, 0);
+        sealed_in_shard(&sd0, 1, b"a");
+        fs::set_permissions(&sd0, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = scan_replay(&dir, 1, &Arc::new(Metrics::new().0), false);
+        fs::set_permissions(&sd0, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            err.is_err(),
+            "startup replay must not skip a shard it cannot list"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 }

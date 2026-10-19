@@ -4165,8 +4165,8 @@ fn quarantined_records_after_a_corruption_can_be_recovered() {
 
     srv.restart_in_place();
 
-    // Crash recovery runs synchronously during startup — `wab::spawn`'s
-    // "Phase 1 (calling thread): crash recovery", BEFORE the socket is bound
+    // Crash recovery runs synchronously during startup — `wab::recover`, on
+    // the main thread before any flusher exists, BEFORE the socket is bound
     // — so by the time `restart_in_place` returns (it waits for the socket to
     // accept connections), the quarantine copy already exists on disk.
     assert!(

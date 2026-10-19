@@ -10,7 +10,7 @@
 //! delivery at the restart cadence.
 //!
 //! [`preflight`] runs right after the `wab_dir` lock and before `Metrics::new`
-//! and `wab::spawn`, so nothing has read the WAB yet. It checks, in order:
+//! and `wab::recover`, so nothing has read the WAB yet. It checks, in order:
 //!
 //! 1. `socket::validate_socket_path` (format only);
 //! 2. what sits at `socket_path`: a non-socket entry refuses (the late bind

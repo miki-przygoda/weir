@@ -64,7 +64,8 @@ umask 0o077 + SIGHUP ignored
                        liveness probe (never unlinks), metrics test-bind,
                        [tls + tcp_bind: TLS load + TCP test-bind]       (src/preflight.rs)
 → queue → drain channel
-→ wab::spawn           crash recovery of active segments, flushers
+→ wab::recover         private shard dirs, crash recovery of active segments
+→ wab::spawn_flushers  one flusher thread per shard
 → workers → drain thread (+ its SegmentLedger)
 → replay of sealed-but-unconfirmed segments into the drain channel
 → startup cap gate     synchronous WAB size scan + wab_max_bytes evaluation;

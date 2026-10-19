@@ -259,7 +259,8 @@ impl Worker {
 /// later for the same shard, even across multiple concurrent connections.
 ///
 /// Accepts `shard_txs`: one `Sender<Batch>` per shard, owned by the WAB
-/// (`wab::spawn` creates the channels and returns the senders via `WabHandle`).
+/// (`wab::spawn_flushers` creates the channels and returns the senders via
+/// `WabHandle`).
 /// Workers send `Batch`es directly to the flusher — no intermediate bridge
 /// thread. Returns one `JoinHandle` per worker. Workers exit cleanly when all
 /// `QueueSender` clones are dropped.
@@ -489,7 +490,8 @@ mod tests {
 
     /// Create a set of per-shard `(Sender<Batch>, Receiver<Batch>)` pairs for
     /// tests. The test holds the receivers; the senders are passed to
-    /// `spawn_workers` (mirroring how `wab::spawn` owns them in production).
+    /// `spawn_workers` (mirroring how `wab::spawn_flushers` owns them in
+    /// production).
     fn make_shard_channels(shard_count: usize) -> (Vec<Sender<Batch>>, Vec<Receiver<Batch>>) {
         let mut txs = Vec::with_capacity(shard_count);
         let mut rxs = Vec::with_capacity(shard_count);
