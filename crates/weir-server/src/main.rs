@@ -706,8 +706,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // Shutdown coordination: signal handler → shutdown_tx → socket::serve exits.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Shutdown coordination: signal handler → level_tx → both accept loops
+        // go lame-duck. Interim: Task 4.10 replaces this with the Lifecycle.
+        let (level_tx, level_rx) = tokio::sync::watch::channel(lifecycle::ShutdownLevel::Running);
 
         // ONE shared connection-cap semaphore for ALL listeners (Unix + TCP).
         // Both listeners clone this Arc, so the COMBINED cap across all transports
@@ -774,10 +775,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // cloned queue_tx. Both listeners share `conn_sem` above so the combined
         // connection cap is the single global max_connections value.
         //
-        // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
-        // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
+        // The TCP loop subscribes to the same shutdown level as the Unix loop,
+        // so SIGTERM/Ctrl-C drains both listeners.
         #[cfg(all(unix, feature = "tls"))]
-        let (tcp_shutdown_tx, tcp_join) = match (listeners.tcp, tls) {
+        let tcp_join = match (listeners.tcp, tls) {
             (Some(listener), Some(tls)) => {
                 let tcp_config = socket::tcp::TcpConfig {
                     max_connections: config.max_connections,
@@ -793,7 +794,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     wab_ownership_lost: Arc::clone(&wab_ownership_lost),
                 };
 
-                let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                let tcp_level_rx = level_tx.subscribe();
                 let tcp_queue_tx = queue_tx.clone();
                 let tcp_metrics = Arc::clone(&metrics);
                 // Pass a clone of the shared semaphore so Unix + TCP draw
@@ -804,30 +805,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tcp_join = tokio::spawn(async move {
                     // tcp::run owns the handler-shutdown watch internally and
                     // signals handlers BEFORE draining — no extra plumbing needed here.
-                    // PR 1's Closed / Failed marks (Task 1.23). Interim: PR 4
-                    // Task 4.7 moves them into `tcp::run` (README Q6).
-                    match socket::tcp::run(
+                    // It is also the one writer of the TCP listener's Closed
+                    // and Failed marks (README Q6).
+                    if let Err(e) = socket::tcp::run(
                         tcp_config,
                         listener,
                         tls,
                         tcp_queue_tx,
                         tcp_sem,
-                        tcp_shutdown_rx,
+                        tcp_level_rx,
                         tcp_metrics,
                         tcp_router,
+                        tcp_board,
                     )
                     .await
                     {
-                        Ok(()) => tcp_board.listeners.tcp.set(weir_status::ListenerState::Closed),
-                        Err(e) => {
-                            tcp_board.listeners.tcp.set(weir_status::ListenerState::Failed);
-                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
-                        }
+                        tracing::error!(error = %e, "TCP+mTLS listener exited with error");
                     }
                 });
-                (Some(tcp_shutdown_tx), Some(tcp_join))
+                Some(tcp_join)
             }
-            _ => (None, None),
+            _ => None,
         };
 
         let board_sig = Arc::clone(&board);
@@ -855,11 +853,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // closes, so a flusher whose input closes from here on reads as a clean
             // `Stopped`, not `Offline(FlusherExited)`. PR 4's Lifecycle takes this over.
             board_sig.begin_shutdown(&metrics_sig);
-            #[cfg(all(unix, feature = "tls"))]
-            if let Some(tx) = tcp_shutdown_tx {
-                let _ = tx.send(());
-            }
-            let _ = shutdown_tx.send(());
+            // One broadcast reaches both listeners (send_replace stores the
+            // level even if no receiver is alive yet).
+            level_tx.send_replace(lifecycle::ShutdownLevel::Graceful);
         });
 
         // Socket accept loop — blocks until shutdown signal.
@@ -868,7 +864,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             socket_config,
             listeners.unix,
             queue_tx,
-            shutdown_rx,
+            level_rx,
             Arc::clone(&metrics),
             conn_sem,
             router,
@@ -878,11 +874,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             // On non-Unix builds weir-server is not supported; just wait for shutdown.
             board.enter_phase(weir_status::Phase::Serving, &metrics);
-            let _ = shutdown_rx.await;
+            let mut level_rx = level_rx;
+            lifecycle::shutdown_requested(&mut level_rx).await;
         }
 
         // Await the TCP+mTLS listener's graceful drain before leaving the runtime.
-        // The signal handler already fired `tcp_shutdown_tx`, so `tcp::run` is
+        // The signal handler already raised the shutdown level, so `tcp::run` is
         // draining its in-flight connections; without this await `drop(rt)` below
         // would cancel that drain the moment the Unix loop returns (e.g. when there
         // are no Unix connections), severing live TCP connections instead of
