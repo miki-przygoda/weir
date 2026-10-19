@@ -1300,6 +1300,12 @@ impl Config {
 // ── Path validation ───────────────────────────────────────────────────────────
 
 impl Config {
+    /// The drain's backstop commit timeout: at least 60 s and at least twice
+    /// the sink's own timeout, so it fires only when a sink ignores its own.
+    pub(crate) fn commit_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.sink_timeout_secs.saturating_mul(2).max(60))
+    }
+
     /// Post-validation advisories about a valid but risky configuration,
     /// replayed through `tracing` by the caller like the other load warnings.
     ///

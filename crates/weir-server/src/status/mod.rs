@@ -4,6 +4,7 @@
 //! only load. No blocking lock type appears anywhere under this directory
 //! (spec §9.2 rule 5); `no_blocking_locks_under_status` enforces it.
 pub(crate) mod board;
+pub(crate) mod config_view;
 pub(crate) mod shards;
 
 pub(crate) use shards::{ShardRegistry, ShardSlot, SupervisorExit, WorkerGuard};

@@ -1138,7 +1138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_respawns: drain::MAX_DRAIN_RESPAWNS,
         // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
         // sink hangs without honouring its internal timeout.
-        commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
+        commit_timeout: config.commit_timeout(),
         health_poll_interval: Duration::from_secs(config.health_poll_interval_secs),
         // A health probe is a liveness check, not a delivery, so cap it well below
         // commit_timeout: 5s, or the sink's own timeout if that's shorter.
