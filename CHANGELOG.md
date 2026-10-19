@@ -457,7 +457,9 @@ Behaviour an operator can notice on upgrade:
   `stop_grace_period: 45s`.
 - A metrics client must send its complete request head within 1 s or is
   closed; `metrics_max_connections` now counts concurrent scrapes after the
-  head, and probes use their own pool of 4.
+  head, and probes use their own pool of 4. A peer that connects and closes
+  or errors without sending a byte is now closed without a response (it used
+  to get the metrics body).
 
 ### Upgrading from 4.0.x
 
