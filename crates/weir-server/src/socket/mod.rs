@@ -18,6 +18,13 @@
 
 mod connection;
 mod peer;
+// The accept loops take a `ShardRouter` from Task 3.10 and `main` builds a
+// live one in Task 3.11, which removes this allowance.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "no production caller until PR 3 Task 3.11")
+)]
+pub(crate) mod route;
 
 #[cfg(feature = "tls")]
 pub mod tcp;
