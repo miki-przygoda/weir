@@ -344,7 +344,8 @@ pub(crate) fn recover(
 
 /// Startup phase `handoff` (spec §6 step 9): the sealed-but-unconfirmed
 /// backlog, in the order the drain must deliver it, with the same footer
-/// accounting the old `replay_unconfirmed` did, and NO sends. In PR 3 the
+/// accounting the old `replay_unconfirmed` did, and NO sends: it logs
+/// "queuing segment for drain replay" for every segment up front. In PR 3 the
 /// list is still pushed through the channel by [`replay_unconfirmed`]; from
 /// PR 4 it moves into the drain in memory as `initial_backlog`.
 ///
@@ -754,6 +755,11 @@ pub(crate) fn confirmed_tmp_path(confirmed: &Path) -> PathBuf {
 ///
 /// PR 3 keeps this as the channel-fed replay over [`scan_replay`]; PR 4 deletes
 /// it when the list moves into the drain as `initial_backlog`.
+///
+/// The scan logs "queuing segment for drain replay" for the whole backlog
+/// before the first send, so those lines no longer say how far the sends got.
+/// The line after the loop does: until it appears, the replay is still handing
+/// segments to the drain (and, with a stalled drain, blocked on a send).
 pub(crate) fn replay_unconfirmed(
     wab_dir: &Path,
     shard_count: usize,
@@ -761,7 +767,9 @@ pub(crate) fn replay_unconfirmed(
     metrics: &Arc<Metrics>,
     orphan_cleanup: bool,
 ) -> io::Result<()> {
-    for sealed in scan_replay(wab_dir, shard_count, metrics, orphan_cleanup)? {
+    let backlog = scan_replay(wab_dir, shard_count, metrics, orphan_cleanup)?;
+    let segments = backlog.len();
+    for sealed in backlog {
         drain_tx.send(sealed).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -769,6 +777,7 @@ pub(crate) fn replay_unconfirmed(
             )
         })?;
     }
+    info!(segments, "startup replay handed to the drain");
     Ok(())
 }
 

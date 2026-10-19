@@ -3187,26 +3187,7 @@ fn lock_stolen_during_startup_replay_fails_closed_before_serving() {
         .env("WEIR_SINK_URL", hole.url())
         .log_level("info")
         .spawn();
-    let queued = |log: &str| log.matches("queuing segment for drain replay").count();
-
-    // Wait for the replay to block: the drain holds a hung request and the
-    // replay's line count stops growing short of the backlog.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last = 0;
-    loop {
-        let log = read_log(&srv_a);
-        let n = queued(&log);
-        if n > 0 && n == last && hole.connections() > 0 {
-            break;
-        }
-        last = n;
-        assert!(
-            Instant::now() < deadline,
-            "the replay never blocked (queued {n}, sink connections {})\nlog:\n{log}",
-            hole.connections()
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
+    wait_for_blocked_replay(&srv_a, &hole, TOTAL);
 
     let (mut child_b, b_tmp) = steal_wab_dir_lock("lock_replay_b", &wab);
     let b_pid = child_b.id();
@@ -3227,7 +3208,7 @@ fn lock_stolen_during_startup_replay_fails_closed_before_serving() {
         "proven ownership loss during the replay exits 3 (got {status})\nA log:\n{log_a}"
     );
     assert!(
-        queued(&log_a) < TOTAL,
+        !replay_handed_off(&log_a),
         "the steal must have landed while the replay was still blocked\nA log:\n{log_a}"
     );
     assert!(
@@ -3380,6 +3361,49 @@ fn pad_sealed_backlog(wab_dir: &Path, total: usize) -> usize {
     total
 }
 
+/// `wab::scan_replay` logs this once per backlog segment, all of them before
+/// the replay sends the first one, so the count says how much the scan found,
+/// not how far the sends got.
+fn replay_queued(log: &str) -> usize {
+    log.matches("queuing segment for drain replay").count()
+}
+
+/// `wab::replay_unconfirmed` logs this once its last send returned: the replay
+/// phase is over. Its absence while the daemon runs means the replay is still
+/// handing segments to the drain.
+const REPLAY_HANDED_OFF: &str = "startup replay handed to the drain";
+
+fn replay_handed_off(log: &str) -> bool {
+    log.contains(REPLAY_HANDED_OFF)
+}
+
+/// Waits until the startup replay of a `total`-segment backlog is blocked
+/// behind `hole`: the scan has queued the whole backlog, the drain holds a hung
+/// request, and the replay has not finished its sends. With `total` above the
+/// drain channel's capacity (256) plus the one segment the drain holds, the
+/// replay cannot finish while the sink hangs, so from here it stays blocked
+/// until `hole` is dropped.
+fn wait_for_blocked_replay(srv: &weir_testkit::WeirServer, hole: &RecordingSink, total: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let log = read_log(srv);
+        let queued = replay_queued(&log);
+        assert!(
+            !replay_handed_off(&log),
+            "the replay finished instead of blocking (queued {queued} of {total})\nlog:\n{log}"
+        );
+        if queued == total && hole.connections() > 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replay never blocked (queued {queued} of {total}, sink connections {})\nlog:\n{log}",
+            hole.connections()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// spec §3.2 test 3 (revised): a HUP while `replay_unconfirmed` is blocked,
 /// before the runtime (and so before any tokio handler) exists, must be
 /// ignored.
@@ -3406,26 +3430,7 @@ fn sighup_during_startup_replay_is_ignored() {
         .env("WEIR_SINK_URL", hole.url())
         .log_level("info")
         .spawn();
-    let queued = |log: &str| log.matches("queuing segment for drain replay").count();
-
-    // Wait for the replay to block: the drain holds a hung request and the
-    // replay's line count stops growing short of the backlog.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut last = 0;
-    loop {
-        let log = read_log(&srv);
-        let n = queued(&log);
-        if n > 0 && n == last && hole.connections() > 0 {
-            break;
-        }
-        last = n;
-        assert!(
-            Instant::now() < deadline,
-            "the replay never blocked (queued {n}, sink connections {})\nlog:\n{log}",
-            hole.connections()
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
+    wait_for_blocked_replay(&srv, &hole, TOTAL);
 
     send_sighup(srv.child_pid());
     if let Some(status) = srv.wait_for_exit(Duration::from_millis(300)) {
@@ -3438,9 +3443,8 @@ fn sighup_during_startup_replay_is_ignored() {
     // the runtime (whose first act is the metrics bind) did not exist yet.
     let log = read_log(&srv);
     assert!(
-        queued(&log) < TOTAL,
-        "the replay must still be blocked after the HUP (queued {} of {TOTAL})",
-        queued(&log)
+        !replay_handed_off(&log),
+        "the replay must still be blocked after the HUP\nlog:\n{log}"
     );
     assert!(
         !log.contains("metrics endpoint listening"),
@@ -3453,13 +3457,29 @@ fn sighup_during_startup_replay_is_ignored() {
     srv.wait_ready(Duration::from_secs(30));
     assert_alive_and_acking(&mut srv, "the SIGHUP during the replay");
     let log = read_log(&srv);
-    assert_eq!(queued(&log), TOTAL, "the whole backlog must be replayed");
+    assert_eq!(
+        replay_queued(&log),
+        TOTAL,
+        "the whole backlog must be queued"
+    );
+    assert!(
+        log.contains(&format!("{REPLAY_HANDED_OFF} segments={TOTAL}")),
+        "the whole backlog must be handed to the drain\nlog:\n{log}"
+    );
     assert!(
         !log.contains("SIGHUP received"),
         "a HUP before the runtime is dropped, not served late\nlog:\n{log}"
     );
     drop(srv);
     let _ = fs::remove_dir_all(&wab);
+}
+
+/// The per-segment "recovery complete sealed=<path>" lines of
+/// `recover_open_segments`, one per unsealed segment it sealed. The `sealed=`
+/// field keeps `wab::recover`'s one-off "WAB recovery complete" summary out of
+/// the count.
+fn segments_recovered(log: &str) -> usize {
+    log.matches("recovery complete sealed=").count()
 }
 
 /// spec §3.2, the recovery-phase variant: a HUP while `recover_open_segments`
@@ -3512,7 +3532,7 @@ fn sighup_during_startup_recovery_is_ignored() {
     // An ignored signal is discarded when it is sent, so a log read now that
     // still shows recovery unfinished proves the HUP landed during it.
     let log = read_log(&srv);
-    let done = log.matches("recovery complete").count();
+    let done = segments_recovered(&log);
     assert!(
         done < TOTAL,
         "the HUP must land during recovery, but all {TOTAL} segments were already \
@@ -3523,9 +3543,14 @@ fn sighup_during_startup_recovery_is_ignored() {
     assert_alive_and_acking(&mut srv, "the SIGHUP during recovery");
     let log = read_log(&srv);
     assert_eq!(
-        log.matches("recovery complete").count(),
+        segments_recovered(&log),
         TOTAL,
         "every unsealed segment must be recovered\nlog:\n{log}"
+    );
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WAB recovery complete") && l.contains("quarantined=0 failed=0")),
+        "recovery must report no quarantined or failed segment\nlog:\n{log}"
     );
     drop(srv);
     let _ = fs::remove_dir_all(&wab);
