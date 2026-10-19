@@ -1703,5 +1703,60 @@ class TestTriggerWiring(unittest.TestCase):
         self.assertTrue(run.ADMIN_SOCKET_PATH.startswith("/run/weir-chaos/"))
 
 
+class TestFoundationsSchedules(unittest.TestCase):
+    """The four schedules that gate the Foundations release (spec §16). Each
+    must end every episode in a real dm-flakey power cut on the Durable tier,
+    carry enough episodes for the gate's per-schedule floor, and set its own
+    drain budget (omitting it pins 3600, i.e. tests the 4.0 shutdown)."""
+
+    SCHEDULES = {"shutdown-bounded.toml": "sigterm_at",
+                 "shutdown-forced.toml": "double_sigterm",
+                 "startup-signal.toml": "sigterm_in_recovery",
+                 "pause-resume-cut.toml": "admin_pause_resume"}
+
+    def _path(self, name):
+        return os.path.join(os.path.dirname(os.path.abspath(run.__file__)),
+                            "..", "schedules", name)
+
+    def _load(self, name):
+        return run.load_schedule(self._path(name))
+
+    def test_each_ends_every_episode_in_a_real_power_cut_on_durable(self):
+        for name, kind in self.SCHEDULES.items():
+            with self.subTest(name):
+                s = self._load(name)
+                self.assertEqual(run.fault_kind(s), kind)
+                self.assertEqual(s["faults"]["cut"], "power_loss")
+                self.assertEqual(s["storage"]["dm_target"], "flakey")
+                self.assertEqual(s["load"]["tier"], "D")
+                self.assertGreaterEqual(s["episodes"], 250,
+                                        "the gate needs >= 200 cuts per schedule")
+                self.assertIn("drain_shutdown_budget_secs", s["weir"],
+                              "omitting it pins 3600 and tests the 4.0 shutdown")
+
+    def test_seeds_are_distinct_so_run_dirs_never_collide(self):
+        seeds = [self._load(n)["seed"] for n in self.SCHEDULES]
+        self.assertEqual(len(set(seeds)), len(seeds))
+
+    def test_the_bounded_schedule_cuts_past_its_own_bound_sometimes(self):
+        s = self._load("shutdown-bounded.toml")
+        bound = (s["weir"]["shutdown_timeout_secs"]
+                 + s["weir"]["drain_shutdown_budget_secs"] + run.SHUTDOWN_GRACE_EXTRA_SECS)
+        self.assertGreater(s["faults"]["cut_hi_ms"] / 1000.0, bound)
+        self.assertGreater(s["faults"]["stall_sink_probability"], 0.0)
+
+    def test_the_forced_schedule_cuts_past_the_forced_bound_sometimes(self):
+        s = self._load("shutdown-forced.toml")
+        self.assertGreater(s["faults"]["cut_hi_ms"] / 1000.0, faults.FORCED_BOUND_SECS)
+
+    def test_the_readme_documents_each_and_the_test_hooks_build(self):
+        with open(os.path.join(os.path.dirname(self._path("x")), "..", "README.md")) as f:
+            readme = f.read()
+        for name in self.SCHEDULES:
+            self.assertIn(name, readme)
+        self.assertIn("--features test-hooks", readme)
+        self.assertIn("orchestrator/gate.py", readme)
+
+
 if __name__ == "__main__":
     unittest.main()
