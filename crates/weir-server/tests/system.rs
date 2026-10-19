@@ -6424,3 +6424,125 @@ fn a_derived_admin_path_in_a_shared_parent_disables_admin_not_the_daemon() {
     drop(srv);
     let _ = fs::remove_dir_all(&shared);
 }
+
+/// spec §16 system test 6: pause, then 1,000 pushes, then resume. Ingest
+/// keeps acking while delivery holds; everything arrives after resume.
+#[test]
+fn admin_pause_holds_delivery_while_ingest_acks_and_resume_delivers_all() {
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("admin_pause")
+        .extra_config("sink_type = \"http\"")
+        // Small segments, so sealed segments exist during the pushes and
+        // an unpaused drain WOULD deliver them.
+        .extra_config("wab_segment_max_bytes = 4096")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let r = admin_json(&srv, "drain.pause", r#"{"wait_ms":5000}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(
+        r["result"]["paused"], true,
+        "an idle drain observes a pause within a 50 ms slice: {r}"
+    );
+
+    let before = sink.bodies().len();
+    let payloads: Vec<String> = (0..1000)
+        .map(|i| format!("paused-{i:04}-{}", "x".repeat(48)))
+        .collect();
+    let mut c = srv.client();
+    for p in &payloads {
+        c.push(p.as_bytes(), Durability::Durable)
+            .expect("ingest keeps acking while paused");
+    }
+    drop(c);
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        sink.bodies().len(),
+        before,
+        "nothing is delivered while paused"
+    );
+    assert_eq!(
+        admin_json(&srv, "status", "{}")["result"]["drain"]["paused"],
+        true
+    );
+
+    let r = admin_json(&srv, "drain.resume", r#"{"wait_ms":5000}"#);
+    assert_eq!(r["result"]["was_paused"], true, "{r}");
+    assert_eq!(r["result"]["resumed"], true, "{r}");
+
+    // SIGTERM seals the active segment; the drain budget (10 s default)
+    // covers 1,000 local POSTs with room to spare.
+    srv.sigterm();
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<&String> = payloads
+        .iter()
+        .filter(|p| !delivered.contains(*p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of 1000 never delivered, e.g. {:?}",
+        missing.len(),
+        missing.first()
+    );
+}
+
+/// spec §16 system test 7: a stranded segment is redelivered by
+/// drain.retry_stranded, without waiting for the (here hour-long) health
+/// poll that would otherwise resume it.
+#[test]
+fn admin_retry_stranded_redelivers_without_waiting_for_the_health_poll() {
+    let port = free_port(); // nothing listens yet: every delivery is refused
+    let srv = weir_server!("admin_retry")
+        .extra_config("sink_type = \"http\"")
+        .extra_config("sink_max_retries = 0")
+        .extra_config("health_poll_interval_secs = 3600")
+        // A strand holds its segment off for the backoff it would have
+        // served (the safety floor's `not_before` cool-down, which the rescan
+        // honours so a Retry-After is never violated): 100 ms here.
+        .extra_config("sink_retry_base_delay_ms = 100")
+        .extra_config("wab_segment_max_bytes = 4096")
+        .env("WEIR_SINK_URL", format!("http://127.0.0.1:{port}/sink"))
+        .start();
+    let mut c = srv.client();
+    for i in 0..40 {
+        c.push(
+            format!("stranded-{i:02}-{}", "y".repeat(200)).as_bytes(),
+            Durability::Durable,
+        )
+        .unwrap();
+    }
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while scrape_value(&srv, "weir_drain_segments_stranded_total") < 1.0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        scrape_value(&srv, "weir_drain_segments_stranded_total") >= 1.0,
+        "nothing stranded"
+    );
+    // Let every sealed segment strand and every 100 ms cool-down elapse: the
+    // verb rescans the WAB, and a segment still cooling down is (rightly)
+    // excluded from it. Nothing else re-queues it: the next health poll is
+    // an hour away.
+    thread::sleep(Duration::from_secs(1));
+
+    let sink = RecordingSink::start_on(port);
+    let r = admin_json(&srv, "drain.retry_stranded", r#"{"wait_ms":10000}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["completed"], true, "{r}");
+    assert!(r["result"]["requeued"].as_u64().unwrap_or(0) >= 1, "{r}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while sink.bodies().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        sink.bodies().iter().any(|b| b.starts_with(b"stranded-")),
+        "the requeued segment reached the recovered sink"
+    );
+}

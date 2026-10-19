@@ -64,8 +64,24 @@ impl RecordingSink {
         Self::start_mode(Mode::Answer { delay: per_request })
     }
 
+    /// Like [`start`](Self::start), on a fixed loopback port: for a test that
+    /// points the daemon at a sink that is down at first and comes up later.
+    /// Panics if the port was taken in between.
+    pub fn start_on(port: u16) -> RecordingSink {
+        Self::start_mode_at(
+            ("127.0.0.1", port),
+            Mode::Answer {
+                delay: std::time::Duration::ZERO,
+            },
+        )
+    }
+
     fn start_mode(mode: Mode) -> RecordingSink {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recording sink");
+        Self::start_mode_at(("127.0.0.1", 0), mode)
+    }
+
+    fn start_mode_at(addr: (&str, u16), mode: Mode) -> RecordingSink {
+        let listener = TcpListener::bind(addr).expect("bind recording sink");
         let addr = listener.local_addr().expect("recording sink local_addr");
         let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let connections = Arc::new(AtomicUsize::new(0));
@@ -318,6 +334,20 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "listener still open");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn start_on_serves_and_records_on_the_given_port() {
+        let port = crate::free_port();
+        let sink = RecordingSink::start_on(port);
+        assert_eq!(sink.url(), format!("http://127.0.0.1:{port}/sink"));
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let r = request(
+            &mut s,
+            b"POST /sink HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi",
+        );
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        assert_eq!(sink.bodies(), vec![b"hi".to_vec()]);
     }
 
     #[test]
