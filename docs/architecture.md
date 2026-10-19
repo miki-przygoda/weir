@@ -53,7 +53,11 @@ WAB (`src/main.rs`):
 
 ```
 umask 0o077 + SIGHUP ignored
-→ Config::load → tracing → "config source", "weir starting"
+→ Config::load → tracing (colour only on a terminal; a bad log_level WARNs)
+→ "config source", "weir starting"
+                       carries version, wire_version and the effective config
+                       as a ConfigView: no secrets, sink URLs reduced to
+                       scheme://host:port                (src/status/config_view.rs)
 → wab_dir lock         flock(LOCK_EX|LOCK_NB) on <wab_dir>/.weir.lock   (src/wab/lock.rs)
 → Metrics::new → lock-integrity thread (1 s, from here to exit)
 → preflight            socket_path format + length, non-socket refusal, connect-only
@@ -63,6 +67,8 @@ umask 0o077 + SIGHUP ignored
 → wab::spawn           crash recovery of active segments, flushers
 → workers → drain thread (+ its SegmentLedger)
 → replay of sealed-but-unconfirmed segments into the drain channel
+→ startup cap gate     synchronous WAB size scan + wab_max_bytes evaluation;
+                       a failed scan with a cap set starts rejecting (src/status/poll.rs)
 → tokio runtime:
     reload loop + SIGHUP handler → metrics bind
     → WAB / drain-liveness poll → [TLS load + TCP listener] → SIGTERM/Ctrl-C

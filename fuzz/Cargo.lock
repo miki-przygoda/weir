@@ -36,6 +36,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2384,6 +2393,7 @@ dependencies = [
 name = "weir-server"
 version = "4.0.1"
 dependencies = [
+ "arc-swap",
  "core_affinity",
  "crc32fast",
  "crossbeam-channel",
@@ -2396,6 +2406,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
  "tokio",
@@ -2407,6 +2418,7 @@ dependencies = [
  "webpki-roots",
  "weir-core",
  "weir-sink-sdk",
+ "weir-status",
  "weir-wab",
  "zstd",
 ]
@@ -2417,6 +2429,13 @@ version = "4.0.1"
 dependencies = [
  "sha2 0.10.9",
  "weir-core",
+]
+
+[[package]]
+name = "weir-status"
+version = "4.0.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

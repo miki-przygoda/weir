@@ -364,6 +364,19 @@ nothing new is persisted.
   `flock` ever filtered, the lock would fail with `EPERM` and every daemon
   under the unit would refuse to start.
 
+- **A status model the whole daemon shares (`weir-status`).** A new published crate holds the
+  `weir.status/v1` types, the 30-code Conditions catalogue and one pure evaluator. The daemon
+  publishes its live state to a wait-free status board, and a 5 s task evaluates it into new
+  gauges: `weir_ready`, `weir_live`, `weir_condition_active{code,severity}` (one series per code),
+  `weir_startup_phase{phase}`, `weir_wab_shard_up{shard}`, `weir_worker_up{worker}`,
+  `weir_wab_undelivered_{segments,records}`, `weir_wab_oldest_undelivered_age_seconds`,
+  `weir_build_info` and the `weir_config_*` effective-config gauges, among 34 new families (see
+  docs/monitoring.md "Status, lifecycle and conditions"). Missing evidence makes a condition
+  *unevaluated*, never healthy.
+- `weir_records_nack_internal_total{cause}` splits the transient `InternalError` nacks into
+  `queue_full`, `write_failed`, `sender_dropped`, `ack_timeout`, `wab_cap`, `coordinate` and
+  `ownership_lost`. The wire bytes are unchanged.
+
 ### Changed
 
 Behaviour an operator can notice on upgrade:
@@ -402,6 +415,19 @@ Behaviour an operator can notice on upgrade:
 - **Delivery order.** Per-connection order is the order records enter the WAB;
   strands, cool-downs, parking, requeue and the HTTP sink's concurrent POSTs
   can reorder delivery. The README and `weir-client` docs now say so.
+- **The `wab_max_bytes` cap clears without traffic.** The 5 s size scan now re-evaluates the cap,
+  so a daemon that drained below 90% of the cap resumes accepting before the next push arrives.
+  A failed scan leaves the flag as it was (fail-closed).
+- **A restart over the cap rejects from the first push.** A synchronous size scan runs after
+  recovery, before the socket binds. If that scan fails with a cap set, pushes nack until a
+  scan succeeds.
+- `weir_dead_letter_bytes_on_disk` and `weir_quarantine_bytes_on_disk` are also refreshed by the
+  5 s task.
+- Logging: the "weir starting" line carries `version`, `wire_version` and the effective config
+  (no secrets: sink URLs are reduced to scheme://host:port). Colour is emitted only when stdout
+  is a terminal. An invalid `log_level` is logged as a WARN instead of silently becoming `info`.
+  Commit-path log lines name their segment. A dead-letter-blocked episode WARNs when it starts.
+- Build: `arc-swap` is always compiled (it was optional behind `tls`).
 
 ### Upgrading from 4.0.x
 
