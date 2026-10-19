@@ -8,7 +8,13 @@
 #![forbid(unsafe_code)]
 
 pub mod codes;
+pub mod config;
+pub mod evidence;
+pub mod segment;
 
 pub use codes::{
     ALL, Affects, CATALOGUE, CatalogueEntry, ConditionCode, Gate, OFFLINE_ONLY, Severity, entry,
 };
+pub use config::{ConfigValue, PublicConfig};
+pub use evidence::*;
+pub use segment::SegmentId;
