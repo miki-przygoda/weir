@@ -51,7 +51,7 @@ use std::{
 };
 
 use crossbeam_channel::RecvTimeoutError;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use weir_core::Payload;
 use weir_sink_sdk::RecordId;
 
@@ -1927,6 +1927,15 @@ fn enter_blocked(
     // instant so `dead_letter_full` counts distinct episodes and the duration
     // gauge keeps climbing rather than resetting (F09).
     let blocked_since = *block_episode.get_or_insert_with(|| {
+        // SP-D (spec §5.13): once per episode, when it starts, so a flapping
+        // cap does not repeat it.
+        warn!(
+            segment = %segment_identity(&segment),
+            needed_bytes = needed,
+            "drain: dead_letter/ is full; delivery is blocked until space is freed \
+             (weir-ctl dl requeue / dl drop) or dead_letter_max_bytes is raised. Ingest \
+             continues and the WAB grows (condition drain_blocked_dead_letter_full)"
+        );
         metrics.dead_letter_full.inc();
         Instant::now()
     });
@@ -2057,6 +2066,10 @@ async fn process_segment<S: Sink>(
     // same string at ack time for a tracked push's `RecordCoordinate`, and the
     // two must agree or the coordinate names a record the sink never keyed.
     let segment_name = segment_identity(segment);
+    // SP-D (spec §5.13): every line logged inside a commit names the segment.
+    // ERROR level so the span is enabled under any `log_level` that lets a
+    // commit-path WARN or ERROR through.
+    let segment_span = tracing::error_span!("segment", segment = %segment_name);
     let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
 
     // Set when the record loop stops on a record it cannot read and the segment
@@ -2157,6 +2170,7 @@ async fn process_segment<S: Sink>(
                 dead_letter,
                 hb,
             )
+            .instrument(segment_span.clone())
             .await;
             hb.bump();
             if let Err(setback) = apply_batch(result, &mut durable_through, n) {
@@ -2177,6 +2191,7 @@ async fn process_segment<S: Sink>(
             dead_letter,
             hb,
         )
+        .instrument(segment_span.clone())
         .await;
         hb.bump();
         if let Err(setback) = apply_batch(result, &mut durable_through, n) {
@@ -9368,5 +9383,55 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(heartbeat.busy(), None);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── SP-D logging (spec §5.13) ───────────────────────────────────────────
+
+    #[test]
+    fn commit_path_log_lines_name_the_segment() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("commit_log_segment");
+        let segment = make_sealed_segment(&dir, 0, &[b"r1"]);
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let sink = MockSink::with_responses([Err(MockError::Transient)]);
+        let (_, logs) = crate::testutil::capture_logs(|| {
+            block_on(process_segment(
+                &segment, &sink, &config, &metrics, &mut dl, 0,
+            ))
+        });
+        let line = logs
+            .lines()
+            .find(|l| l.contains("transient sink error"))
+            .unwrap_or_else(|| panic!("no transient line:\n{logs}"));
+        assert!(
+            line.contains("shard_00/seg_00000001"),
+            "the commit line must name its segment: {line}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_dead_letter_blocked_episode_warns_once_when_it_starts() {
+        let metrics = noop_metrics();
+        let mut episode = None;
+        let seg = PathBuf::from("/w/shard_00/seg_00000004.wab.sealed");
+        let (_, first) = crate::testutil::capture_logs(|| {
+            super::enter_blocked(seg.clone(), &metrics, &mut episode, 0, 4096)
+        });
+        assert!(
+            first.contains("WARN")
+                && first.contains("dead_letter/ is full")
+                && first.contains("shard_00/seg_00000004"),
+            "{first}"
+        );
+        let (_, again) = crate::testutil::capture_logs(|| {
+            super::enter_blocked(seg.clone(), &metrics, &mut episode, 0, 4096)
+        });
+        assert!(
+            !again.contains("dead_letter/ is full"),
+            "the same episode does not repeat it: {again}"
+        );
     }
 }
