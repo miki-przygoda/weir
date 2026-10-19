@@ -1071,7 +1071,9 @@ fn a_serving_daemon_reports_ready_through_the_new_gauges() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let body = loop {
         let body = srv.scrape_metrics();
-        if body.contains("weir_ready 1") {
+        // The sample, not `contains("weir_ready 1")`: the HELP line reads
+        // "# HELP weir_ready 1 when ..." and matched before the first poll.
+        if parse_metric_f64(&body, "weir_ready ") == 1.0 {
             break body;
         }
         assert!(
