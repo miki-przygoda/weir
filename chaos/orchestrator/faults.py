@@ -10,8 +10,10 @@ every power cut records I6, the injector's.
 
 Stdlib only, like the rest of the orchestrator.
 """
+import os
 import random
 import signal
+import time
 
 LEGACY_KINDS = ("kill_random", "power_loss")
 TRIGGER_KINDS = ("sigterm_at", "double_sigterm", "sigterm_in_recovery",
@@ -481,3 +483,74 @@ def run_trigger(kind, step, ops):
     if handler is None:
         raise ValueError(f"not a lifecycle trigger: {kind!r}")
     return handler(step, ops)
+
+
+class LiveOps:
+    """The ops protocol against the real daemon, recorder and storage stack.
+    Thin by design: every decision lives in the trigger functions above,
+    which are tested on a virtual clock."""
+
+    def __init__(self, daemon, recorder, stack, cut_mode, episode, sink_url,
+                 admin_path=None, delivered_path=None, scrape_fn=None,
+                 admin_fn=None, sleep_fn=time.sleep, now_fn=time.monotonic):
+        import admin as admin_mod
+        import quiescence
+        self.daemon, self.recorder, self.stack = daemon, recorder, stack
+        self.cut_mode, self.episode, self.sink_url = cut_mode, episode, sink_url
+        self.admin_path, self.delivered_path = admin_path, delivered_path
+        self.scrape_fn = scrape_fn or quiescence.scrape
+        self.admin_fn = admin_fn or admin_mod.call
+        self.sleep_fn, self.now_fn = sleep_fn, now_fn
+
+    def now(self):
+        return self.now_fn()
+
+    def sleep(self, secs):
+        if secs > 0:
+            self.sleep_fn(secs)
+
+    def bound_secs(self):
+        return self.daemon.bound_secs()
+
+    def signal_daemon(self, sig):
+        return self.daemon.signal(sig)
+
+    def daemon_exit_code(self):
+        return self.daemon.exit_code()
+
+    def kill_daemon(self):
+        self.daemon.kill9()
+
+    def spawn_daemon(self, extra_env):
+        self.daemon.spawn(self.sink_url, extra_env=extra_env)
+
+    def scrape(self):
+        return self.scrape_fn(self.daemon.metrics_url)
+
+    def daemon_log_since_spawn(self):
+        return self.daemon.log_since_spawn()
+
+    def producer_socket_exists(self):
+        return os.path.exists(self.daemon.socket_path)
+
+    def stall_sink(self):
+        # SIGSTOP the recorder: weir's sink calls hang exactly like a
+        # blackholed sink (spec §16 system test 4), so the drain budget binds.
+        if self.recorder is not None and self.recorder.poll() is None:
+            self.recorder.send_signal(signal.SIGSTOP)
+
+    def unstall_sink(self):
+        # A SIGSTOPped recorder still poll()s as alive, so this always reaches
+        # a stalled one; the triggers unstall in a `finally`, so final_pass's
+        # recorder-alive check is never fooled by a stall left behind.
+        if self.recorder is not None and self.recorder.poll() is None:
+            self.recorder.send_signal(signal.SIGCONT)
+
+    def admin(self, verb, args):
+        return self.admin_fn(self.admin_path, verb, args)
+
+    def delivered_bytes(self):
+        return os.path.getsize(self.delivered_path)
+
+    def cut(self):
+        return cut(self.cut_mode, self.stack, self.daemon, self.episode)

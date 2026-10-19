@@ -514,5 +514,91 @@ class TestDaemonLogContract(unittest.TestCase):
                 self.assertIn(needle, src)
 
 
+class LiveDaemon:
+    metrics_url = "http://127.0.0.1:19185/metrics"
+    wab_dir = "/w"
+
+    def __init__(self, socket_path="/nonexistent/weir.sock"):
+        self.socket_path = socket_path
+        self.calls = []
+
+    def spawn(self, sink_url, extra_env=None):
+        self.calls.append(("spawn", sink_url, extra_env))
+
+    def signal(self, sig):
+        self.calls.append(("signal", sig))
+        return True
+
+    def exit_code(self):
+        return None
+
+    def kill9(self):
+        self.calls.append(("kill9",))
+
+    def log_since_spawn(self):
+        return b"x"
+
+    def bound_secs(self):
+        return 9
+
+
+class TestLiveOps(unittest.TestCase):
+    def _ops(self, recorder=None, **kw):
+        import test_run
+        return faults.LiveOps(LiveDaemon(), recorder or test_run.FakeProc(), None,
+                              "kill", 4, "http://sink", **kw)
+
+    def test_stall_and_unstall_stop_and_continue_a_live_recorder(self):
+        import test_run
+        rec = test_run.FakeProc()
+        ops = self._ops(recorder=rec)
+        ops.stall_sink()
+        ops.unstall_sink()
+        self.assertEqual(rec.signals, [signal.SIGSTOP, signal.SIGCONT])
+
+    def test_a_dead_recorder_is_not_signalled(self):
+        import test_run
+        rec = test_run.FakeProc(returncode=0)
+        ops = self._ops(recorder=rec)
+        ops.stall_sink()
+        ops.unstall_sink()
+        self.assertEqual(rec.signals, [])
+
+    def test_delivered_bytes_is_the_delivery_logs_size(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"7 1\n7 2\n")
+        self.addCleanup(os.unlink, f.name)
+        self.assertEqual(self._ops(delivered_path=f.name).delivered_bytes(), 8)
+
+    def test_it_implements_every_ops_method_the_triggers_call(self):
+        # The triggers are tested against FakeOps only; an `ops.<name>` that
+        # LiveOps lacks would surface as an AttributeError mid-campaign.
+        import re
+        with open(faults.__file__) as f:
+            called = set(re.findall(r"\bops\.([a-z_]+)\(", f.read()))
+        self.assertTrue(called)
+        self.assertEqual({n for n in called if not callable(getattr(faults.LiveOps, n, None))},
+                         set())
+        self.assertEqual({n for n in called if not callable(getattr(FakeOps, n, None))},
+                         set())
+
+    def test_spawn_signal_cut_and_admin_delegate(self):
+        seen = []
+        ops = self._ops(admin_path="/run/weir-chaos/weir.admin.sock",
+                        admin_fn=lambda p, v, a: seen.append((p, v, a)) or {"ok": True},
+                        scrape_fn=lambda url: {"u": url})
+        ops.spawn_daemon({"WEIR_TEST_HOOKS": "1"})
+        self.assertTrue(ops.signal_daemon(signal.SIGTERM))
+        self.assertIsNone(ops.cut())
+        ops.admin("drain.pause", {"wait_ms": 1})
+        self.assertEqual(ops.daemon.calls, [
+            ("spawn", "http://sink", {"WEIR_TEST_HOOKS": "1"}),
+            ("signal", signal.SIGTERM), ("kill9",)])
+        self.assertEqual(seen, [("/run/weir-chaos/weir.admin.sock", "drain.pause", {"wait_ms": 1})])
+        self.assertEqual(ops.scrape(), {"u": LiveDaemon.metrics_url})
+        self.assertEqual(ops.bound_secs(), 9)
+        self.assertFalse(ops.producer_socket_exists())
+
+
 if __name__ == "__main__":
     unittest.main()
