@@ -11,6 +11,7 @@ every power cut records I6, the injector's.
 Stdlib only, like the rest of the orchestrator.
 """
 import random
+import signal
 
 LEGACY_KINDS = ("kill_random", "power_loss")
 TRIGGER_KINDS = ("sigterm_at", "double_sigterm", "sigterm_in_recovery",
@@ -229,3 +230,125 @@ def cut(mode, stack, daemon, episode):
         daemon.kill9()
         return None
     raise ValueError(f"unknown cut mode {mode!r}")
+
+
+#: After a SECOND signal: connections are aborted, the drain wait shrinks to
+#: DRAIN_EXIT_GRACE (2 s), and the joins stay bounded at about 1 s plus 100 ms
+#: per rotation (spec §7). 8 s is that plus generous slack; being alive past
+#: it is a finding.
+FORCED_BOUND_SECS = 8.0
+EXIT_POLL_SECS = 0.05
+
+
+def _watch_until(ops, deadline):
+    """Sleeps until `deadline` (virtual or real), noting when the daemon exits.
+    Returns (exit_code, exited_at), or (None, None) if it was still running."""
+    while True:
+        code = ops.daemon_exit_code()
+        if code is not None:
+            exited_at = ops.now()
+            ops.sleep(deadline - ops.now())
+            return code, exited_at
+        remaining = deadline - ops.now()
+        if remaining <= 0:
+            return None, None
+        ops.sleep(min(EXIT_POLL_SECS, remaining))
+
+
+def _exit_fields(code, exited_at, t0):
+    return {"exit_code": code,
+            "exit_after_secs": None if exited_at is None else round(exited_at - t0, 3)}
+
+
+def _cut_phase(code):
+    return "after_exit" if code is not None else "during_shutdown"
+
+
+def shutdown_verdict(exit_code, alive_for_secs, bound_secs, label="shutdown"):
+    """Anomaly reasons for one signalled shutdown. Pure.
+
+    A non-zero exit is never a pass (owner decision: forced and orphaned
+    exits are 0). Still running at the cut, later than the bound weir
+    documents, is the bounded-shutdown promise broken.
+    """
+    reasons = []
+    if exit_code is not None and exit_code != 0:
+        reasons.append(f"daemon_exit_code={exit_code}")
+    if exit_code is None and alive_for_secs > bound_secs:
+        reasons.append(f"{label}_overran_bound(alive_at={alive_for_secs:.1f}s,"
+                       f"bound={bound_secs:.1f}s)")
+    return reasons
+
+
+def _sigterm_at(step, ops):
+    stall = step["stall_sink"]
+    result = {"trigger": "sigterm_at", "stall_sink": stall,
+              "cut_after_secs": round(step["cut_after_secs"], 3),
+              "bound_secs": ops.bound_secs()}
+    if stall:
+        ops.stall_sink()
+    try:
+        t0 = ops.now()
+        sent = ops.signal_daemon(signal.SIGTERM)
+        code, exited_at = _watch_until(ops, t0 + step["cut_after_secs"])
+        result["signal_sent"] = sent
+        result.update(_exit_fields(code, exited_at, t0))
+        result["cut_phase"] = _cut_phase(code)
+        result["canary"] = ops.cut()
+    finally:
+        if stall:
+            ops.unstall_sink()
+    result["anomaly_reasons"] = (
+        ["daemon_dead_before_signal"] if not sent
+        else shutdown_verdict(code, step["cut_after_secs"], result["bound_secs"]))
+    return result
+
+
+def _double_sigterm(step, ops):
+    stall = step["stall_sink"]
+    result = {"trigger": "double_sigterm", "stall_sink": stall,
+              "second_signal_secs": round(step["second_signal_secs"], 3),
+              "cut_after_secs": round(step["cut_after_secs"], 3),
+              "bound_secs": ops.bound_secs(), "forced_bound_secs": FORCED_BOUND_SECS}
+    if stall:
+        ops.stall_sink()
+    try:
+        t0 = ops.now()
+        sent = ops.signal_daemon(signal.SIGTERM)
+        t1 = t0 + step["second_signal_secs"]
+        code, exited_at = _watch_until(ops, t1)
+        second = False
+        if code is None:
+            second = ops.signal_daemon(signal.SIGTERM)
+            code, exited_at = _watch_until(ops, t1 + step["cut_after_secs"])
+        else:
+            ops.sleep(t1 + step["cut_after_secs"] - ops.now())
+        result["signal_sent"] = sent
+        result["second_signal_sent"] = second
+        result.update(_exit_fields(code, exited_at, t0))
+        result["forced_observed"] = bool(
+            second and FORCED_LOG_LINE in ops.daemon_log_since_spawn())
+        result["cut_phase"] = _cut_phase(code)
+        result["canary"] = ops.cut()
+    finally:
+        if stall:
+            ops.unstall_sink()
+    if not sent:
+        reasons = ["daemon_dead_before_signal"]
+    elif second:
+        reasons = shutdown_verdict(code, step["cut_after_secs"], FORCED_BOUND_SECS,
+                                   label="forced_shutdown")
+    else:
+        reasons = shutdown_verdict(
+            code, step["second_signal_secs"] + step["cut_after_secs"], result["bound_secs"])
+    result["anomaly_reasons"] = reasons
+    return result
+
+
+def run_trigger(kind, step, ops):
+    """Runs one lifecycle trigger and the cut that ends it. Returns its record."""
+    handlers = {"sigterm_at": _sigterm_at, "double_sigterm": _double_sigterm}
+    handler = handlers.get(kind)
+    if handler is None:
+        raise ValueError(f"not a lifecycle trigger: {kind!r}")
+    return handler(step, ops)

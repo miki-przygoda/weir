@@ -136,6 +136,206 @@ class TestPowerCutWiring(unittest.TestCase):
         self.assertNotIn("stack.engage_fault()", body)
 
 
+class FakeOps:
+    """The ops protocol on a virtual clock. `exit_at` is the virtual time the
+    daemon exits by itself; `on_signal(ops)` lets a test script how a signal
+    changes that."""
+
+    def __init__(self, bound=9.0, exit_at=None, exit_code=0, on_signal=None,
+                 scrapes=None, admin_replies=None, log=b"", socket_left=False,
+                 delivered=None, cut_raises=None):
+        self.t = 0.0
+        self.calls = []
+        self.bound = bound
+        self.exit_at = exit_at
+        self.code = exit_code
+        self.on_signal = on_signal
+        self.scrapes = list(scrapes or [{}])
+        self.admin_replies = admin_replies or {}
+        self.log = log
+        self.socket_left = socket_left
+        self.delivered = list(delivered or [0])
+        self.cut_raises = cut_raises
+        self.signals = 0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, secs):
+        self.t += max(0.0, secs)
+
+    def bound_secs(self):
+        return self.bound
+
+    def daemon_exit_code(self):
+        if self.exit_at is not None and self.t >= self.exit_at:
+            return self.code
+        return None
+
+    def signal_daemon(self, sig):
+        alive = self.daemon_exit_code() is None
+        self.calls.append(("signal", round(self.t, 2)))
+        if alive:
+            self.signals += 1
+            if self.on_signal:
+                self.on_signal(self)
+        return alive
+
+    def kill_daemon(self):
+        self.calls.append(("kill", round(self.t, 2)))
+        self.exit_at, self.code = self.t, -9
+
+    def spawn_daemon(self, extra_env):
+        self.calls.append(("spawn", dict(extra_env)))
+        self.exit_at, self.code = None, 0
+
+    def scrape(self):
+        self.calls.append(("scrape", round(self.t, 2)))
+        item = self.scrapes.pop(0) if len(self.scrapes) > 1 else self.scrapes[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def daemon_log_since_spawn(self):
+        return self.log
+
+    def producer_socket_exists(self):
+        return self.socket_left
+
+    def stall_sink(self):
+        self.calls.append(("stall_sink", round(self.t, 2)))
+
+    def unstall_sink(self):
+        self.calls.append(("unstall_sink", round(self.t, 2)))
+
+    def admin(self, verb, args):
+        self.calls.append(("admin", verb, round(self.t, 2)))
+        reply = self.admin_replies[verb]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    def delivered_bytes(self):
+        return self.delivered.pop(0) if len(self.delivered) > 1 else self.delivered[0]
+
+    def cut(self):
+        self.calls.append(("cut", round(self.t, 2)))
+        if self.cut_raises:
+            raise self.cut_raises
+        return "bit"
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+
+def exits_after(secs, on_nth=1, code=0):
+    def on_signal(ops):
+        if ops.signals == on_nth:
+            ops.exit_at, ops.code = ops.t + secs, code
+    return on_signal
+
+
+class TestSigtermAt(unittest.TestCase):
+    def step(self, cut_after, stall=False):
+        return {"cut_after_secs": cut_after, "stall_sink": stall}
+
+    def test_a_cut_during_shutdown_lands_at_the_planned_time(self):
+        ops = FakeOps()
+        r = faults.run_trigger("sigterm_at", self.step(3.0), ops)
+        self.assertEqual(ops.names(), ["signal", "cut"])
+        self.assertAlmostEqual(ops.calls[-1][1], 3.0, delta=0.06)
+        self.assertEqual(r["cut_phase"], "during_shutdown")
+        self.assertIsNone(r["exit_code"])
+        self.assertEqual(r["canary"], "bit")
+        self.assertEqual(r["anomaly_reasons"], [])
+
+    def test_a_daemon_that_exits_first_is_cut_after_exit(self):
+        ops = FakeOps(on_signal=exits_after(1.0))
+        r = faults.run_trigger("sigterm_at", self.step(3.0), ops)
+        self.assertEqual(r["cut_phase"], "after_exit")
+        self.assertEqual(r["exit_code"], 0)
+        self.assertAlmostEqual(r["exit_after_secs"], 1.0, delta=0.06)
+        self.assertAlmostEqual(ops.calls[-1][1], 3.0, delta=0.06)
+        self.assertEqual(r["anomaly_reasons"], [])
+
+    def test_a_nonzero_exit_is_an_anomaly(self):
+        # Owner decision: a forced or orphaned exit is still exit 0. Exit 3 is
+        # the safety floor's EXIT_WAB_OWNERSHIP_LOST and is never a pass here.
+        ops = FakeOps(on_signal=exits_after(1.0, code=3))
+        r = faults.run_trigger("sigterm_at", self.step(3.0), ops)
+        self.assertIn("daemon_exit_code=3", r["anomaly_reasons"])
+
+    def test_alive_past_the_documented_bound_is_an_anomaly(self):
+        r = faults.run_trigger("sigterm_at", self.step(12.0), FakeOps(bound=9.0))
+        self.assertEqual(len(r["anomaly_reasons"]), 1)
+        self.assertTrue(r["anomaly_reasons"][0].startswith("shutdown_overran_bound"))
+
+    def test_alive_inside_the_bound_is_not(self):
+        r = faults.run_trigger("sigterm_at", self.step(8.0), FakeOps(bound=9.0))
+        self.assertEqual(r["anomaly_reasons"], [])
+
+    def test_alive_exactly_at_the_bound_is_not_an_anomaly(self):
+        self.assertEqual(faults.shutdown_verdict(None, 9.0, 9.0), [])
+
+    def test_a_stalled_sink_is_released_only_after_the_cut(self):
+        ops = FakeOps()
+        faults.run_trigger("sigterm_at", self.step(2.0, stall=True), ops)
+        self.assertEqual(ops.names(), ["stall_sink", "signal", "cut", "unstall_sink"])
+
+    def test_the_sink_is_released_even_when_the_cut_raises(self):
+        # A recorder left SIGSTOPped makes every later acked record look lost.
+        ops = FakeOps(cut_raises=RuntimeError("umount busy"))
+        with self.assertRaises(RuntimeError):
+            faults.run_trigger("sigterm_at", self.step(1.0, stall=True), ops)
+        self.assertEqual(ops.names()[-1], "unstall_sink")
+
+    def test_a_daemon_already_dead_is_an_anomaly_not_a_shutdown(self):
+        r = faults.run_trigger("sigterm_at", self.step(1.0),
+                               FakeOps(exit_at=0.0, exit_code=-9))
+        self.assertFalse(r["signal_sent"])
+        self.assertEqual(r["anomaly_reasons"], ["daemon_dead_before_signal"])
+
+    def test_an_unknown_kind_is_refused(self):
+        with self.assertRaises(ValueError):
+            faults.run_trigger("power_loss", {}, FakeOps())
+
+
+class TestDoubleSigterm(unittest.TestCase):
+    def step(self, second, cut_after):
+        return {"second_signal_secs": second, "cut_after_secs": cut_after,
+                "stall_sink": False}
+
+    def test_the_second_signal_forces_the_exit_and_is_seen_in_the_log(self):
+        ops = FakeOps(on_signal=exits_after(0.4, on_nth=2),
+                      log=b"WARN forced shutdown\n")
+        r = faults.run_trigger("double_sigterm", self.step(0.5, 2.0), ops)
+        self.assertEqual(ops.names(), ["signal", "signal", "cut"])
+        self.assertTrue(r["second_signal_sent"])
+        self.assertTrue(r["forced_observed"])
+        self.assertEqual(r["exit_code"], 0)
+        self.assertEqual(r["cut_phase"], "after_exit")
+        self.assertAlmostEqual(ops.calls[-1][1], 2.5, delta=0.06)
+        self.assertEqual(r["anomaly_reasons"], [])
+
+    def test_a_forced_shutdown_past_its_bound_is_an_anomaly(self):
+        r = faults.run_trigger("double_sigterm", self.step(0.5, 10.0), FakeOps())
+        self.assertTrue(r["anomaly_reasons"][0].startswith("forced_shutdown_overran_bound"))
+
+    def test_no_second_signal_when_the_first_already_finished_it(self):
+        ops = FakeOps(on_signal=exits_after(0.2))
+        r = faults.run_trigger("double_sigterm", self.step(0.5, 2.0), ops)
+        self.assertEqual(ops.names(), ["signal", "cut"])
+        self.assertFalse(r["second_signal_sent"])
+        self.assertAlmostEqual(ops.calls[-1][1], 2.5, delta=0.06)
+
+    def test_forced_not_seen_in_the_log_is_recorded_not_alarmed(self):
+        # The daemon may exit between our poll and the second signal.
+        ops = FakeOps(on_signal=exits_after(0.4, on_nth=2), log=b"")
+        r = faults.run_trigger("double_sigterm", self.step(0.5, 2.0), ops)
+        self.assertFalse(r["forced_observed"])
+        self.assertEqual(r["anomaly_reasons"], [])
+
+
 class TestDaemonLogContract(unittest.TestCase):
     """The triggers judge weir by two log lines, two env vars and two series
     that PR 1, PR 2 and PR 4 introduce. Pin them against the source so a
