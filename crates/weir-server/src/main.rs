@@ -6,6 +6,7 @@ mod preflight;
 mod queue;
 mod reload;
 mod sink;
+mod status;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
 // feature alone: `--features tls` on Windows would otherwise name `crate::socket`,
@@ -1084,12 +1085,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         compression_level: config.wab_compression_level,
     };
+    // The shard registry: flusher supervisors and worker drop guards record
+    // each shard's and worker's state on it (spec §5.3). Declared before
+    // `wab::spawn`, which takes a clone. Task 1.23 replaces it with the
+    // status board's registry.
+    let worker_registry = Arc::new(status::ShardRegistry::new(
+        config.shard_count,
+        config.worker_count,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ));
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),
         wab_config,
         drain_tx,
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
+        Arc::clone(&worker_registry),
     )?;
 
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
@@ -1098,7 +1109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // returned by `wab::spawn`. No bridge thread: the hop is
     // worker → Batch-channel → flusher.
 
-    let worker_handles = worker::spawn_workers(
+    let worker_handles = worker::spawn_workers_with(
         &queue_rx,
         wab_handle.shard_txs,
         config.shard_count,
@@ -1106,6 +1117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.batch_size,
         Duration::from_millis(config.batch_deadline_ms),
         coalesce_hint,
+        Some(Arc::clone(&worker_registry)),
     );
 
     // ── Drain ─────────────────────────────────────────────────────────────────
@@ -1126,7 +1138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_respawns: drain::MAX_DRAIN_RESPAWNS,
         // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
         // sink hangs without honouring its internal timeout.
-        commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
+        commit_timeout: config.commit_timeout(),
         health_poll_interval: Duration::from_secs(config.health_poll_interval_secs),
         // A health probe is a liveness check, not a delivery, so cap it well below
         // commit_timeout: 5s, or the sink's own timeout if that's shorter.
