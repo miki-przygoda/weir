@@ -1566,7 +1566,13 @@ fn drain_thread_with<S: Sink>(
                 // Order (spec §4.0): outstanding dispositions first — they never
                 // deliver, and finishing one can change what the rescan may
                 // pick up — then the probe + rescan, then the gauges.
-                if last_health_poll.elapsed() >= config.health_poll_interval {
+                //
+                // Absorb mode (T0, spec §5.4): skip the probe, the rescan and
+                // the gauge walks; a probe can block for health_probe_timeout
+                // and overrun the exit grace. The disposition retry runs once
+                // more on the way out (the tail of this function).
+                if !control.absorbing() && last_health_poll.elapsed() >= config.health_poll_interval
+                {
                     ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
                     let now = Instant::now();
                     prev_health_ok = probe_and_resume_stranded_with(
@@ -2079,21 +2085,24 @@ fn drain_thread_with<S: Sink>(
                     // segment being retried (`segment`) — this arm processes it directly
                     // below, so re-queuing it would double-process. The borrow ends
                     // before `segment` is moved into process_segment / the next state.
-                    // Ledger-owned paths are skipped too (spec §4.0).
-                    let now = Instant::now();
-                    prev_health_ok = probe_and_resume_stranded_with(
-                        &rt,
-                        &*sink,
-                        &config,
-                        &metrics,
-                        Some(&drain_rx),
-                        &mut pending,
-                        &mut backlog,
-                        prev_health_ok,
-                        Some(&segment),
-                        &|p| ledger.excludes(p, now),
-                        &ctx,
-                    );
+                    // Ledger-owned paths are skipped too (spec §4.0). Not in
+                    // absorb mode (spec §5.4): a probe can overrun the exit grace.
+                    if !control.absorbing() {
+                        let now = Instant::now();
+                        prev_health_ok = probe_and_resume_stranded_with(
+                            &rt,
+                            &*sink,
+                            &config,
+                            &metrics,
+                            Some(&drain_rx),
+                            &mut pending,
+                            &mut backlog,
+                            prev_health_ok,
+                            Some(&segment),
+                            &|p| ledger.excludes(p, now),
+                            &ctx,
+                        );
+                    }
                 }
 
                 // Resume past the sub-batches already durably processed (F05).
@@ -2242,20 +2251,27 @@ fn drain_thread_with<S: Sink>(
                 // down→up re-queue, excluding `segment` (this arm resumes it on its
                 // own via the RetryingTransient transition below, so re-queuing it
                 // would double-process). Ledger-owned paths are skipped too.
-                let now = Instant::now();
-                prev_health_ok = probe_and_resume_stranded_with(
-                    &rt,
-                    &*sink,
-                    &config,
-                    &metrics,
-                    Some(&drain_rx),
-                    &mut pending,
-                    &mut backlog,
-                    prev_health_ok,
-                    Some(&segment),
-                    &|p| ledger.excludes(p, now),
-                    &ctx,
-                );
+                //
+                // Not in absorb mode (spec §5.4): a probe can block for
+                // health_probe_timeout and overrun the exit grace. The local
+                // dead-letter rescan above stays, so an operator freeing
+                // headroom still unblocks this arm during shutdown.
+                if !control.absorbing() {
+                    let now = Instant::now();
+                    prev_health_ok = probe_and_resume_stranded_with(
+                        &rt,
+                        &*sink,
+                        &config,
+                        &metrics,
+                        Some(&drain_rx),
+                        &mut pending,
+                        &mut backlog,
+                        prev_health_ok,
+                        Some(&segment),
+                        &|p| ledger.excludes(p, now),
+                        &ctx,
+                    );
+                }
                 // Unblock on the SAME predicate that blocked: the blocked write
                 // fits. A bare `total < cap` unblocked while the total sat in
                 // `[cap - needed, cap)`, so the retry blocked again at once —

@@ -1314,3 +1314,83 @@ fn the_sinks_last_error_is_redacted_and_capped() {
     join_within(h, Duration::from_secs(5));
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// A sink whose health probe takes 5 s (yielding).
+struct SlowHealthSink;
+impl crate::sink::Sink for SlowHealthSink {
+    type Error = MockError;
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MockError> {
+        Ok(CommitResult::new(batch.into_records(), Vec::new()))
+    }
+    async fn health(&self) -> SinkHealth {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        SinkHealth::Healthy
+    }
+}
+
+/// Spec §16 drain test 19: absorb mode skips probe_health, so a sink whose
+/// health() takes 5 s cannot delay the exit.
+#[test]
+fn absorb_mode_skips_the_health_probe_so_a_slow_probe_cannot_delay_exit() {
+    let dir = tmp_dir("fnd_absorb_probe");
+    let control = DrainControl::attached();
+    let cfg = DrainConfig {
+        health_poll_interval: Duration::from_millis(300),
+        health_probe_timeout: Duration::from_secs(10),
+        ..fast_config(dir.clone())
+    };
+    let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let h = start(
+        rx,
+        &Arc::new(SlowHealthSink),
+        cfg,
+        &noop_metrics(),
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    control.begin_shutdown(); // T0, before the first poll falls due at 300 ms
+    std::thread::sleep(Duration::from_millis(350)); // the poll is now due
+    drop(tx); // T1: flushers joined
+    let t = Instant::now();
+    control.request_stop(Duration::from_secs(10)); // T2
+    let exit = join_within(h, Duration::from_secs(2));
+    assert!(
+        t.elapsed() < Duration::from_millis(300),
+        "a probe ran during shutdown: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(exit.reason, DrainExitReason::Stopped);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Pins the absorb half of wait_slice (landed in Task 2.4).
+#[test]
+fn an_absorbing_wait_slice_empties_the_channel_into_pending() {
+    let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(16);
+    for n in 0..10 {
+        tx.send(PathBuf::from(format!(
+            "/wab/shard_00/seg_{n:08}.wab.sealed"
+        )))
+        .unwrap();
+    }
+    let control = DrainControl::attached();
+    control.begin_shutdown();
+    let (hb, publish) = (DrainHeartbeat::new(), Publisher::none());
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb: &hb,
+    };
+    let mut pending = VecDeque::new();
+    let w = wait_slice(
+        &rx,
+        &ctx,
+        Duration::from_millis(10),
+        &mut pending,
+        0,
+        &mut false,
+    );
+    assert_eq!(w, Wait::TimedOut);
+    assert_eq!(pending.len(), 10);
+    assert!(rx.is_empty());
+}
