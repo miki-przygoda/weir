@@ -273,7 +273,9 @@ pub(crate) struct DrainCell {
     pub(crate) replay_total: AtomicU64,
     pub(crate) replay_remaining: AtomicU64,
     pub(crate) blocked_since_ms: AtomicU64,
+    #[cfg_attr(not(test), allow(dead_code))] // PR 2 (the drain's stop path) reads it
     pub(crate) stopping: AtomicBool,
+    #[cfg_attr(not(test), allow(dead_code))] // PR 2 (the drain's stop path) reads it
     pub(crate) deadline_ms: AtomicU64,
     pub(crate) last_requeue: ArcSwapOption<RequeueResult>,
     pub(crate) exit: ArcSwapOption<DrainExitInfo>,
@@ -914,6 +916,7 @@ mod tests {
 
     #[test]
     fn the_drain_cell_publishes_state_progress_and_exit() {
+        use crate::status::InFlight; // the re-export PR 2 imports
         let d = DrainCell::new();
         d.set_state(DrainStateValue::retrying_transient);
         let since = d.state_since_ms.load(Ordering::Relaxed);
@@ -996,6 +999,7 @@ mod tests {
 
     #[test]
     fn the_sink_cell_tracks_health_success_and_failure_streaks() {
+        use crate::status::SinkFailureKind; // the re-export PR 2 imports
         let s = SinkCell::new();
         assert!(s.evidence().is_none());
         s.set_health(
@@ -1091,6 +1095,179 @@ mod tests {
         assert_eq!(b.shards.shard_count(), 2);
         assert_eq!(b.admin.evidence().state, AdminState::Disabled);
         assert_eq!(*b.recent.load_full(), RecentCounters::default());
+    }
+
+    /// Every DrainCell writer PR 2 calls reaches the evidence (or, for the
+    /// stop intent the evidence does not carry, its own cell).
+    #[test]
+    fn the_remaining_drain_writers_reach_the_evidence() {
+        // Through the crate::status re-exports PR 2 imports.
+        use crate::status::{DrainExitInfo, DrainExitReason, RequeueResult};
+        let d = DrainCell::new();
+        d.set_state(DrainStateValue::draining);
+        let before = unix_ms_now();
+        d.stamp_progress();
+        d.set_generation(3);
+        d.set_queue_lens(4, 5);
+        d.set_replay(10, 6);
+        d.set_blocked_since(77);
+        d.set_observed_requeue(8);
+        d.set_last_requeue(RequeueResult {
+            ticket: 8,
+            requeued: 2,
+            already_queued: 1,
+            scan_error: Some("eio".into()),
+            backoff_cut: true,
+            coalesced: false,
+            at_ms: 99,
+        });
+        let e = d.evidence(None, None, None).unwrap();
+        assert!(e.last_progress_unix_ms.unwrap() >= before);
+        assert_eq!(
+            (e.generation, e.pending_segments, e.backlog_segments),
+            (3, 4, 5)
+        );
+        assert_eq!((e.replay_total, e.replay_remaining), (10, 6));
+        assert_eq!(e.blocked_since_unix_ms, Some(77));
+        assert_eq!(e.observed_requeue, 8);
+        assert_eq!(
+            e.last_requeue,
+            Some(RequeueEvidence {
+                ticket: 8,
+                requeued: 2,
+                already_queued: 1,
+                backoff_cut: true,
+                coalesced: false,
+                scan_error: Some("eio".into()),
+                at_unix_ms: 99
+            })
+        );
+        d.set_blocked_since(0);
+        assert_eq!(
+            d.evidence(None, None, None).unwrap().blocked_since_unix_ms,
+            None,
+            "0 clears"
+        );
+
+        assert!(!d.stopping.load(Ordering::Acquire));
+        d.set_stopping(Some(1_234));
+        assert!(d.stopping.load(Ordering::Acquire));
+        assert_eq!(d.deadline_ms.load(Ordering::Relaxed), 1_234);
+        d.set_stopping(None);
+        assert_eq!(
+            d.deadline_ms.load(Ordering::Relaxed),
+            NONE_MS,
+            "no deadline"
+        );
+
+        d.set_exit(DrainExitInfo {
+            reason: DrainExitReason::Stopped,
+            abandoned: None,
+            pending_left: 0,
+            backlog_left: 0,
+            last_panic: None,
+            at_ms: 3,
+        });
+        assert_eq!(
+            d.evidence(None, None, None).unwrap().exit,
+            DrainExitCode::Stopped
+        );
+    }
+
+    #[test]
+    fn the_wab_cell_reports_unknown_until_the_poll_task_writes() {
+        let w = WabCell::new();
+        assert_eq!(
+            (w.first_scan_ok_ms(), w.last_scan_ok_ms(), w.growth()),
+            (None, None, None)
+        );
+        assert!(w.lag().is_none());
+        w.note_scan_ok(10);
+        w.note_scan_ok(20);
+        assert_eq!(
+            (w.first_scan_ok_ms(), w.last_scan_ok_ms()),
+            (Some(10), Some(20)),
+            "first stays first"
+        );
+        w.set_growth(true);
+        assert_eq!(w.growth(), Some(true));
+        w.set_growth(false);
+        assert_eq!(w.growth(), Some(false));
+        w.set_lag(LagReport {
+            undelivered_segments: 1,
+            ..LagReport::default()
+        });
+        assert_eq!(w.lag().unwrap().undelivered_segments, 1);
+    }
+
+    #[test]
+    fn the_admin_cell_moves_between_bound_unavailable_and_disabled() {
+        let a = AdminCell::new();
+        assert_eq!(
+            a.evidence(),
+            AdminEvidence {
+                enabled: false,
+                state: AdminState::Disabled,
+                reason: None,
+                path: None
+            }
+        );
+        a.set_unavailable(AdminReason::InUse);
+        let e = a.evidence();
+        assert!(e.enabled);
+        assert_eq!(
+            (e.state, e.reason),
+            (AdminState::Unavailable, Some(AdminReason::InUse))
+        );
+        a.set_bound("/run/weir/wab.admin.sock".into());
+        let e = a.evidence();
+        assert_eq!(
+            (e.state, e.reason),
+            (AdminState::Bound, None),
+            "binding clears the reason"
+        );
+        assert_eq!(e.path.as_deref(), Some("/run/weir/wab.admin.sock"));
+        a.set_disabled();
+        let e = a.evidence();
+        assert!(!e.enabled);
+        assert_eq!(e.state, AdminState::Disabled);
+    }
+
+    #[test]
+    fn static_info_captures_the_daemon_and_its_wab_dir_identity() {
+        let dir = crate::testutil::scratch_dir("board_static_info");
+        crate::testutil::mkdir_p(&dir);
+        let config = Config::from_layers(
+            crate::config::PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..crate::config::PartialConfig::empty()
+            },
+            crate::config::PartialConfig::empty(),
+            crate::config::PartialConfig::empty(),
+        )
+        .expect("valid config");
+        let view = Arc::new(ConfigView::from(&config));
+        let s = StaticInfo::capture(&config, Arc::clone(&view));
+        assert_eq!(s.wab_dir, config.wab_dir, "the canonical wab_dir");
+        assert_eq!(s.socket_path, config.socket_path);
+        assert_eq!(
+            (s.pid, s.version, s.wire_version),
+            (
+                std::process::id(),
+                env!("CARGO_PKG_VERSION"),
+                weir_core::WIRE_VERSION
+            )
+        );
+        assert!(s.started_at_ms > 0);
+        assert!(Arc::ptr_eq(&s.config, &view));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = std::fs::metadata(&dir).unwrap();
+            assert_eq!((s.wab_dir_dev, s.wab_dir_ino), (m.dev(), m.ino()));
+        }
+        let b = StatusBoard::for_test();
+        assert_eq!((b.shards.shard_count(), b.shards.worker_count()), (1, 1));
     }
 
     #[test]
