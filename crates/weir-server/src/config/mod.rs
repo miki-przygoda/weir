@@ -270,6 +270,8 @@ pub(crate) struct PartialConfig {
     pub metrics_max_connections: Option<usize>,
     pub livez_checks: Option<String>,
     pub peer_uid_check: Option<bool>,
+    pub admin_socket_enabled: Option<bool>,
+    pub admin_socket_path: Option<PathBuf>,
     pub shutdown_timeout_secs: Option<u64>,
     pub drain_shutdown_budget_secs: Option<u64>,
     pub connection_read_timeout_secs: Option<u64>,
@@ -489,6 +491,11 @@ pub struct Config {
     /// under a different uid than the daemon AND the socket directory's
     /// permissions are the chosen trust boundary.
     pub peer_uid_check: bool,
+    /// Serve the admin Unix socket (Foundations spec §11). Default `true`.
+    pub admin_socket_enabled: bool,
+    /// The operator-set admin socket path, already validated. `None` means
+    /// the path derived from `wab_dir`; resolve with [`Config::admin_socket`].
+    pub admin_socket_path: Option<PathBuf>,
     pub shutdown_timeout_secs: u64,
     /// How long the drain may keep delivering after every flusher has joined
     /// (spec §7 T2). At the deadline the in-flight segment is abandoned without
@@ -689,6 +696,101 @@ pub struct ConfigSource {
     pub found: bool,
 }
 
+// ── Admin socket path (Foundations spec §11) ─────────────────────────────────
+
+/// Where (and whether) the admin socket binds. Resolved once at startup.
+// Unconditional: the tests compare it only through the derived PartialEq,
+// which dead-code analysis ignores, so its fields are unread in the test
+// target too until `admin::start` destructures it.
+#[allow(
+    dead_code,
+    reason = "admin::start (Task 6.14) is the caller; Task 6.14 removes this"
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdminSocketSetting {
+    /// `admin_socket_enabled = false`.
+    Disabled,
+    /// `admin_socket_path` was set: any bind failure is fatal.
+    Explicit(PathBuf),
+    /// `<parent(wab_dir)>/<basename(wab_dir)>.admin.sock`: a bind failure
+    /// disables admin with `admin_unavailable` instead.
+    Derived(PathBuf),
+    /// The derived default breaks a static rule (`reason_code` is one of
+    /// `no_parent`, `path_too_long`, `under_wab_dir`,
+    /// `collides_with_socket_path`).
+    DerivedUnusable {
+        reason_code: &'static str,
+        path: Option<PathBuf>,
+    },
+}
+
+/// A static rule an admin socket path breaks (see [`admin_path_problem`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdminPathProblem {
+    TooLong,
+    UnderWabDir,
+    SameAsSocketPath,
+}
+
+impl AdminPathProblem {
+    /// Public-safe reason code (spec §9.1: codes, never free text).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "admin::start (Task 6.14) is the caller")
+    )]
+    pub(crate) fn reason_code(self) -> &'static str {
+        match self {
+            AdminPathProblem::TooLong => "path_too_long",
+            AdminPathProblem::UnderWabDir => "under_wab_dir",
+            AdminPathProblem::SameAsSocketPath => "collides_with_socket_path",
+        }
+    }
+
+    fn message(self, p: &Path) -> String {
+        match self {
+            AdminPathProblem::TooLong => format!(
+                "'{}' is longer than {} bytes, the longest Unix socket path every \
+                 supported platform can bind",
+                p.display(),
+                weir_status::admin::MAX_SOCKET_PATH_BYTES
+            ),
+            AdminPathProblem::UnderWabDir => format!(
+                "'{}' is inside wab_dir; put the admin socket outside the WAB",
+                p.display()
+            ),
+            AdminPathProblem::SameAsSocketPath => format!(
+                "'{}' is the same path as socket_path; the admin socket needs its own path",
+                p.display()
+            ),
+        }
+    }
+}
+
+/// The static (no-I/O) rules every admin socket path must pass, explicit or
+/// derived (spec §11). The (dev, ino) collision check is done at bind time.
+///
+/// `wab_dir` is compared component-wise (`/x/wab2.sock` is not under
+/// `/x/wab`), and both comparisons use [`weir_status::admin::lexical_normalize`]
+/// so `/run/weir/./weir.sock` collides with `/run/weir/weir.sock`.
+pub(crate) fn admin_path_problem(
+    p: &Path,
+    wab_dir: &Path,
+    socket_path: &Path,
+) -> Option<AdminPathProblem> {
+    use weir_status::admin::{MAX_SOCKET_PATH_BYTES, lexical_normalize};
+    if p.as_os_str().as_encoded_bytes().len() > MAX_SOCKET_PATH_BYTES {
+        return Some(AdminPathProblem::TooLong);
+    }
+    let n = lexical_normalize(p);
+    if n.starts_with(lexical_normalize(wab_dir)) {
+        return Some(AdminPathProblem::UnderWabDir);
+    }
+    if n == lexical_normalize(socket_path) {
+        return Some(AdminPathProblem::SameAsSocketPath);
+    }
+    None
+}
+
 impl Config {
     /// Loads config from all three layers (CLI > env > file > defaults) and
     /// validates.
@@ -782,6 +884,20 @@ impl Config {
 
         let wab_dir_raw = merge!(wab_dir).unwrap_or_else(|| PathBuf::from("/var/lib/weir/wab"));
         let wab_dir = validate_path("wab_dir", &wab_dir_raw)?;
+
+        // Admin socket (Foundations spec §11). The static rules run here; the
+        // (dev, ino) collision check with socket_path runs at bind time.
+        let admin_socket_enabled = merge!(admin_socket_enabled).unwrap_or(true);
+        let admin_socket_path = merge!(admin_socket_path);
+        if let Some(p) = &admin_socket_path {
+            validate_path_format("admin_socket_path", p)?;
+            if let Some(problem) = admin_path_problem(p, &wab_dir, &socket_path) {
+                return Err(ConfigError::InvalidValue {
+                    field: "admin_socket_path",
+                    reason: problem.message(p),
+                });
+            }
+        }
 
         // ── Integer fields with bounds ────────────────────────────────────────
 
@@ -1292,6 +1408,8 @@ impl Config {
             metrics_max_connections,
             livez_checks,
             peer_uid_check,
+            admin_socket_enabled,
+            admin_socket_path,
             shutdown_timeout_secs,
             drain_shutdown_budget_secs,
             connection_read_timeout_secs,
@@ -1359,6 +1477,37 @@ impl Config {
     /// the sink's own timeout, so it fires only when a sink ignores its own.
     pub(crate) fn commit_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sink_timeout_secs.saturating_mul(2).max(60))
+    }
+
+    /// Resolves the admin socket setting (Foundations spec §11, §6 step 7):
+    /// disabled, the operator's explicit path (already validated by
+    /// `from_layers`), or the path derived from `wab_dir`, which is
+    /// `DerivedUnusable` when it breaks a static rule so admin is disabled
+    /// rather than startup failing.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "admin::start (Task 6.14) is the caller")
+    )]
+    pub(crate) fn admin_socket(&self) -> AdminSocketSetting {
+        if !self.admin_socket_enabled {
+            return AdminSocketSetting::Disabled;
+        }
+        if let Some(p) = &self.admin_socket_path {
+            return AdminSocketSetting::Explicit(p.clone());
+        }
+        let Some(p) = weir_status::admin::default_socket_path(&self.wab_dir) else {
+            return AdminSocketSetting::DerivedUnusable {
+                reason_code: "no_parent",
+                path: None,
+            };
+        };
+        match admin_path_problem(&p, &self.wab_dir, &self.socket_path) {
+            None => AdminSocketSetting::Derived(p),
+            Some(problem) => AdminSocketSetting::DerivedUnusable {
+                reason_code: problem.reason_code(),
+                path: Some(p),
+            },
+        }
     }
 
     /// Post-validation advisories about a valid but risky configuration,
@@ -3085,5 +3234,148 @@ mod tests {
         assert_knob_rejected("rng_drain_budget", "drain_shutdown_budget_secs", |p| {
             p.drain_shutdown_budget_secs = Some(3601)
         });
+    }
+
+    // ── admin socket (Foundations spec §11, Task 6.2) ─────────────────────────
+
+    #[test]
+    fn admin_socket_defaults_to_enabled_and_derived() {
+        let dir = tmp_dir("admin_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        assert!(c.admin_socket_enabled);
+        assert_eq!(c.admin_socket_path, None);
+        let want = weir_status::admin::default_socket_path(&c.wab_dir).unwrap();
+        assert_eq!(c.admin_socket(), AdminSocketSetting::Derived(want));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn admin_socket_can_be_disabled_from_the_file() {
+        let dir = tmp_dir("admin_disabled");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                admin_socket_enabled: Some(false),
+                admin_socket_path: Some(PathBuf::from("/run/weir-admin/a.sock")),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.admin_socket(), AdminSocketSetting::Disabled);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_explicit_admin_path_is_used_verbatim() {
+        let dir = tmp_dir("admin_explicit");
+        let c = Config::from_layers(
+            PartialConfig {
+                admin_socket_path: Some(PathBuf::from("/run/weir-admin/a.sock")),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            c.admin_socket(),
+            AdminSocketSetting::Explicit(PathBuf::from("/run/weir-admin/a.sock"))
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_explicit_admin_paths_are_rejected() {
+        let dir = tmp_dir("admin_invalid");
+        // wab_dir is canonicalized by `validate_path` (/var -> /private/var on
+        // macOS), so the "inside wab_dir" case must use the canonical form.
+        let under_wab = std::fs::canonicalize(&dir).unwrap().join("admin.sock");
+        let long = PathBuf::from(format!("/{}", "a".repeat(103)));
+        let cases: Vec<(PathBuf, &str)> = vec![
+            (PathBuf::from("relative.sock"), "not absolute"),
+            (PathBuf::from("/run/../weir/a.sock"), "'..'"),
+            (long, "103"),
+            (under_wab, "inside wab_dir"),
+            (
+                PathBuf::from("/run/weir//./weir.sock"),
+                "same path as socket_path",
+            ),
+        ];
+        for (p, needle) in cases {
+            let err = Config::from_layers(
+                PartialConfig {
+                    admin_socket_path: Some(p.clone()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    ..PartialConfig::empty()
+                },
+            )
+            .expect_err(&format!("{} must be rejected", p.display()))
+            .to_string();
+            assert!(err.contains("admin_socket_path"), "{err}");
+            assert!(err.contains(needle), "{}: {err}", p.display());
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A derived default that breaks a static rule disables admin; it never
+    /// fails startup (spec §6 step 7).
+    #[test]
+    fn a_derived_default_that_collides_is_unusable_not_fatal() {
+        let dir = tmp_dir("adm_dc"); // short: the derived path must stay <= 103 bytes on macOS
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let derived = weir_status::admin::default_socket_path(&canonical).unwrap();
+        let c = Config::from_layers(
+            PartialConfig {
+                socket_path: Some(derived.clone()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect("the producer socket_path itself is valid");
+        assert_eq!(
+            c.admin_socket(),
+            AdminSocketSetting::DerivedUnusable {
+                reason_code: "collides_with_socket_path",
+                path: Some(derived),
+            }
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn admin_path_problem_table() {
+        let wab = Path::new("/var/lib/weir/wab");
+        let sock = Path::new("/run/weir/weir.sock");
+        assert_eq!(
+            admin_path_problem(Path::new("/var/lib/weir/wab.admin.sock"), wab, sock),
+            None
+        );
+        assert_eq!(
+            admin_path_problem(Path::new("/var/lib/weir/wab/x.sock"), wab, sock),
+            Some(AdminPathProblem::UnderWabDir)
+        );
+        assert_eq!(
+            admin_path_problem(Path::new("/var/lib/weir/wab2.sock"), wab, sock),
+            None,
+            "component-wise, not string prefix"
+        );
+        assert_eq!(
+            admin_path_problem(Path::new("/run/weir/./weir.sock"), wab, sock),
+            Some(AdminPathProblem::SameAsSocketPath)
+        );
+        assert_eq!(AdminPathProblem::TooLong.reason_code(), "path_too_long");
     }
 }

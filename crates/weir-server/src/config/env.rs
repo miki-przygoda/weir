@@ -22,6 +22,8 @@ pub(super) fn read() -> Result<PartialConfig, ConfigError> {
         metrics_max_connections: env_parse("WEIR_METRICS_MAX_CONNECTIONS")?,
         livez_checks: env_string("WEIR_LIVEZ_CHECKS")?,
         peer_uid_check: env_bool("WEIR_PEER_UID_CHECK")?,
+        admin_socket_enabled: env_bool("WEIR_ADMIN_SOCKET_ENABLED")?,
+        admin_socket_path: env_path("WEIR_ADMIN_SOCKET_PATH")?,
         shutdown_timeout_secs: env_parse("WEIR_SHUTDOWN_TIMEOUT_SECS")?,
         drain_shutdown_budget_secs: env_parse("WEIR_DRAIN_SHUTDOWN_BUDGET_SECS")?,
         connection_read_timeout_secs: env_parse("WEIR_CONNECTION_READ_TIMEOUT_SECS")?,
