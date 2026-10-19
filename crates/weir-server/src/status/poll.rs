@@ -3,6 +3,8 @@
 //! and the drain-heartbeat stall check with its busy gauge. Later sections
 //! of this file add the cap refresh, the lag scan, the counter windows, the
 //! evaluation and the 500 ms queue-depth task.
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +14,11 @@ use tracing::{info, warn};
 
 use crate::drain::{self, DrainHeartbeat, drain_appears_stalled};
 use crate::metrics::Metrics;
+use crate::status::board::LagReport;
 use crate::status::{StatusBoard, unix_ms_now};
+use weir_wab::format::{
+    EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, confirmed_path_for, parse_segment_header,
+};
 
 /// Total live shard-segment bytes, or `None` if the WAB could not be scanned.
 ///
@@ -724,8 +730,6 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
 /// tests, which exercise the warning logic alone.
 pub(crate) struct PollStatus {
     board: Arc<StatusBoard>,
-    // Read by the lag scan (Task 1.21).
-    #[allow(dead_code)]
     wab_dir: PathBuf,
     // Read by the evaluation step (Task 1.22).
     #[allow(dead_code)]
@@ -733,6 +737,10 @@ pub(crate) struct PollStatus {
     // Read by the evaluation step (Task 1.22).
     #[allow(dead_code)]
     coalesce_hint: Arc<AtomicU64>,
+    /// `None` only while a lag scan holds it on the blocking pool.
+    footer_cache: Option<FooterCache>,
+    /// Whether the last lag scan failed: the WARN fires once per episode.
+    lag_failing: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 wires the 5 s task
@@ -747,8 +755,201 @@ impl PollStatus {
             wab_dir,
             thresholds: weir_status::Thresholds::DEFAULT,
             coalesce_hint,
+            footer_cache: Some(FooterCache::default()),
+            lag_failing: false,
         }
     }
+
+    /// Runs the lag scan off the runtime (`spawn_blocking`). The cache moves
+    /// into the blocking task and back. A failure keeps the last report
+    /// (stale, never zero) and WARNs once per failing episode.
+    pub(crate) async fn refresh_lag(&mut self, now_ms: u64) {
+        let mut cache = self.footer_cache.take().unwrap_or_default();
+        let dir = self.wab_dir.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let result = scan_wab_lag(&dir, &mut cache, now_ms);
+            (cache, result)
+        })
+        .await;
+        match joined {
+            Ok((cache, Ok(lag))) => {
+                self.footer_cache = Some(cache);
+                self.board.wab.set_lag(lag);
+                self.lag_failing = false;
+            }
+            Ok((cache, Err(e))) => {
+                self.footer_cache = Some(cache);
+                if !self.lag_failing {
+                    warn!(
+                        error = %e,
+                        "WAB lag scan failed; backlog figures stay at their last value \
+                         until it succeeds"
+                    );
+                }
+                self.lag_failing = true;
+            }
+            // Cancelled at runtime shutdown; the cache is rebuilt on the next scan.
+            Err(_) => {}
+        }
+    }
+}
+
+/// The footer cache's bound (spec §20 (c)).
+pub(crate) const FOOTER_CACHE_CAP: usize = 65_536;
+
+#[derive(Clone, Copy)]
+struct SealedMeta {
+    records: u64,
+    created_ms: Option<u64>,
+}
+
+/// Footer and header facts of sealed segments, keyed by path. A sealed
+/// segment never changes, so one read per segment lifetime. Entries not seen
+/// by a scan are dropped (the segment was delivered and deleted); new
+/// entries stop being cached at [`FOOTER_CACHE_CAP`] (spec §20 (c)).
+#[derive(Default)]
+pub(crate) struct FooterCache {
+    entries: HashMap<PathBuf, SealedMeta>,
+}
+
+impl FooterCache {
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// `created_at` from a segment header, as unix ms. `None` for a header not
+/// fully written yet (a just-created active segment) or one that does not
+/// parse.
+fn header_created_ms(path: &Path) -> io::Result<Option<u64>> {
+    let mut buf = [0u8; SEGMENT_HEADER_LEN];
+    let mut f = std::fs::File::open(path)?;
+    if f.read_exact(&mut buf).is_err() {
+        return Ok(None);
+    }
+    Ok(parse_segment_header(&buf)
+        .ok()
+        .and_then(|h| u64::try_from(h.created_at).ok())
+        .map(|ns| ns / 1_000_000))
+}
+
+/// Regular files and their total bytes directly inside `dir`. A file that
+/// vanishes between `read_dir` and `metadata` is skipped.
+fn dir_files_and_bytes(dir: &Path) -> io::Result<(u64, u64)> {
+    let mut files = 0;
+    let mut bytes = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        match entry.metadata() {
+            Ok(m) if m.is_file() => {
+                files += 1;
+                bytes += m.len();
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((files, bytes))
+}
+
+/// The read-only lag scan (spec §5.11 step 3). It never feeds `wab_bytes_now`
+/// and never calls `check_confirmed` (whose quarantine side effects belong to
+/// the drain); a sealed segment with a `.confirmed` sidecar beside it is
+/// delivered and is skipped. Files vanishing mid-scan (the drain deletes
+/// confirmed segments continuously) are tolerated.
+pub(crate) fn scan_wab_lag(
+    wab_dir: &Path,
+    cache: &mut FooterCache,
+    now_ms: u64,
+) -> io::Result<LagReport> {
+    let mut r = LagReport {
+        scanned_at_ms: now_ms,
+        ..LagReport::default()
+    };
+    let mut seen = HashSet::new();
+    for entry in std::fs::read_dir(wab_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        match name.as_ref() {
+            "dead_letter" => {
+                (r.dead_letter_files, r.dead_letter_bytes) = dir_files_and_bytes(&path)?;
+            }
+            "quarantine" => {
+                (r.quarantine_files, r.quarantine_bytes) = dir_files_and_bytes(&path)?;
+            }
+            n => {
+                let Some(shard) = n.strip_prefix("shard_").and_then(|s| s.parse::<u16>().ok())
+                else {
+                    continue;
+                };
+                scan_shard(&path, shard, cache, &mut seen, &mut r)?;
+            }
+        }
+    }
+    cache.entries.retain(|p, _| seen.contains(p));
+    Ok(r)
+}
+
+fn scan_shard(
+    dir: &Path,
+    shard: u16,
+    cache: &mut FooterCache,
+    seen: &mut HashSet<PathBuf>,
+    r: &mut LagReport,
+) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        if file.ends_with(EXT_SEALED) {
+            if confirmed_path_for(&path).exists() {
+                continue; // delivered; the drain deletes it after its sidecar
+            }
+            let meta = match cache.entries.get(&path) {
+                Some(m) => *m,
+                None => {
+                    let (records, footer_ok) = match crate::wab::read_segment_record_count(&path) {
+                        Ok(n) => (n, true),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                        // Unreadable footer: count the segment, not its records.
+                        Err(_) => (0, false),
+                    };
+                    let created_ms = header_created_ms(&path).unwrap_or(None);
+                    let m = SealedMeta {
+                        records,
+                        created_ms,
+                    };
+                    // Only a complete reading is cached: a transient read
+                    // error is retried on the next scan rather than pinned
+                    // for the segment's lifetime.
+                    if footer_ok && created_ms.is_some() && cache.len() < FOOTER_CACHE_CAP {
+                        cache.entries.insert(path.clone(), m);
+                    }
+                    m
+                }
+            };
+            seen.insert(path);
+            r.undelivered_segments += 1;
+            r.undelivered_records += meta.records;
+            if let Some(c) = meta.created_ms {
+                r.oldest_created_ms = Some(r.oldest_created_ms.map_or(c, |o| o.min(c)));
+            }
+        } else if file.ends_with(EXT_ACTIVE)
+            && let Ok(Some(c)) = header_created_ms(&path)
+        {
+            // A let-chain, not a nested `if let`: clippy's `collapsible_if`
+            // lints the nested form on edition 2024 / MSRV 1.88.
+            r.active_created_ms.push((shard, c));
+        }
+    }
+    Ok(())
 }
 
 fn flag(v: bool) -> f64 {
@@ -1929,6 +2130,105 @@ mod tests {
             board.wab.growth(),
             Some(false),
             "a one-sample window is not growth"
+        );
+    }
+
+    use crate::wab::segment::{WabSegment, segment_path};
+    use weir_wab::format::{Compression, confirmed_path_for};
+
+    fn sealed(shard_dir: &Path, counter: u64, records: usize) -> std::path::PathBuf {
+        let mut seg =
+            WabSegment::create(&segment_path(shard_dir, counter), 0, Compression::None).unwrap();
+        for i in 0..records {
+            seg.write_record(format!("r{i}").as_bytes()).unwrap();
+        }
+        seg.seal().unwrap()
+    }
+
+    #[test]
+    fn the_lag_scan_counts_undelivered_work_and_never_touches_the_wab() {
+        let root = crate::testutil::scratch_dir("poll_lag");
+        let _ = std::fs::remove_dir_all(&root);
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        sealed(&shard, 1, 3);
+        let delivered = sealed(&shard, 2, 5);
+        std::fs::write(confirmed_path_for(&delivered), b"sidecar").unwrap();
+        let mut active =
+            WabSegment::create(&segment_path(&shard, 3), 0, Compression::None).unwrap();
+        active.write_record(b"open").unwrap();
+        for (dir, files) in [("dead_letter", 1usize), ("quarantine", 2)] {
+            crate::testutil::mkdir_p(root.join(dir));
+            for i in 0..files {
+                std::fs::write(root.join(dir).join(format!("f{i}")), vec![0u8; 10]).unwrap();
+            }
+        }
+        let listing = || {
+            let mut v: Vec<_> = std::fs::read_dir(&shard)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            v.sort();
+            v
+        };
+        let before = listing();
+        let mut cache = FooterCache::default();
+        let now = unix_ms_now() + 60_000;
+        let lag = scan_wab_lag(&root, &mut cache, now).unwrap();
+        assert_eq!(
+            (lag.undelivered_segments, lag.undelivered_records),
+            (1, 3),
+            "the confirmed one is delivered"
+        );
+        assert!(lag.oldest_created_ms.is_some_and(|c| now - c >= 60_000));
+        assert_eq!(lag.active_created_ms.len(), 1);
+        assert_eq!((lag.dead_letter_files, lag.dead_letter_bytes), (1, 10));
+        assert_eq!((lag.quarantine_files, lag.quarantine_bytes), (2, 20));
+        assert_eq!(lag.scanned_at_ms, now);
+        assert_eq!(
+            before,
+            listing(),
+            "read-only: nothing created, renamed or deleted"
+        );
+        assert_eq!(cache.len(), 1);
+        drop(active);
+    }
+
+    #[test]
+    fn the_footer_cache_forgets_deleted_segments() {
+        let root = crate::testutil::scratch_dir("poll_lag_evict");
+        let _ = std::fs::remove_dir_all(&root);
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        let seg = sealed(&shard, 1, 2);
+        let mut cache = FooterCache::default();
+        scan_wab_lag(&root, &mut cache, unix_ms_now()).unwrap();
+        assert_eq!(cache.len(), 1);
+        std::fs::remove_file(&seg).unwrap();
+        let lag = scan_wab_lag(&root, &mut cache, unix_ms_now()).unwrap();
+        assert_eq!((lag.undelivered_segments, cache.len()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn refresh_lag_publishes_onto_the_board_and_keeps_the_last_report_on_failure() {
+        let root = crate::testutil::scratch_dir("poll_lag_board");
+        let _ = std::fs::remove_dir_all(&root);
+        crate::testutil::mkdir_p(root.join("shard_00"));
+        sealed(&root.join("shard_00"), 1, 4);
+        let board = StatusBoard::for_test();
+        let mut st = PollStatus::new(
+            Arc::clone(&board),
+            root.clone(),
+            Arc::new(AtomicU64::new(200)),
+        );
+        st.refresh_lag(unix_ms_now()).await;
+        assert_eq!(board.wab.lag().unwrap().undelivered_records, 4);
+        std::fs::remove_dir_all(&root).unwrap();
+        st.refresh_lag(unix_ms_now()).await;
+        assert_eq!(
+            board.wab.lag().unwrap().undelivered_records,
+            4,
+            "a failed scan leaves the last report (stale, not zero)"
         );
     }
 }
