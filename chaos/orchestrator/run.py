@@ -33,6 +33,7 @@ import time
 import tomllib
 
 import dm_stack
+import faults
 import quiescence
 import report
 import verify
@@ -100,14 +101,22 @@ def install_interrupt_handlers(signal_fn=signal.signal, getsignal_fn=signal.gets
 def fault_kind(sched):
     """Which fault this schedule injects. Defaults to Phase 1's `kill_random`.
 
+    Besides Phase 1's `kill_random` and Phase 2's `power_loss` this returns the
+    four Foundations lifecycle triggers (`faults.TRIGGER_KINDS`). A trigger's
+    episodes still END in a cut (`faults.cut_mode`), and the oracle judges
+    them under `faults.oracle_fault`, not under this name.
+
     An unknown kind raises rather than falling back: silently running a Phase 1
     episode under a Phase 2 schedule and reporting it as power loss is exactly
     the class of harness lie this project exists to avoid.
     """
     kind = (sched.get("faults") or {}).get("kind", "kill_random")
-    if kind not in ("kill_random", "power_loss"):
+    known = faults.LEGACY_KINDS + faults.TRIGGER_KINDS
+    if kind not in known:
         raise ValueError(
-            f"unknown fault kind {kind!r}; expected 'kill_random' or 'power_loss'")
+            f"unknown fault kind {kind!r}; expected one of the legacy kinds "
+            f"{list(faults.LEGACY_KINDS)} or the lifecycle triggers "
+            f"{list(faults.TRIGGER_KINDS)}")
     return kind
 
 
@@ -242,7 +251,9 @@ SCHEDULE_KEYS = {
         "drain_shutdown_budget_secs", "shutdown_timeout_secs",
     },
     "storage": {"size_mb", "dm_target"},
-    "faults": {"kind"},
+    # A superset: every key SOME fault kind reads. faults.validate_faults
+    # narrows it to the keys the schedule's own kind reads.
+    "faults": faults.ALL_FAULT_KEYS,
 }
 
 
@@ -351,17 +362,24 @@ def load_schedule(path):
     call instead of failing here before steady-state load even starts). The
     absent-target case used to be considered "caught elsewhere" and let
     through — the same justification as the linear guard applies to it
-    identically, so it is refused here too now.
+    identically, so it is refused here too now. The same guard covers a
+    lifecycle trigger whose episodes end in a power cut (`cut = "power_loss"`),
+    after `faults.validate_faults` has refused any [faults] key the
+    schedule's own kind does not read.
     """
     with open(path, "rb") as f:
         sched = tomllib.load(f)
     reject_unknown_schedule_keys(sched)
     validate_weir_table(sched.get("weir") or {})
-    if fault_kind(sched) == "power_loss":
+    faults.validate_faults(sched.get("faults") or {})
+    kind = fault_kind(sched)
+    if kind == "power_loss" or faults.cut_mode(sched) == "power_loss":
         dm_target = sched.get("storage", {}).get("dm_target")
         if dm_target != "flakey":
+            pairs = ("fault.kind='power_loss'" if kind == "power_loss"
+                     else f"fault.kind={kind!r} (cut='power_loss')")
             raise ValueError(
-                f"schedule pairs fault.kind='power_loss' with "
+                f"schedule pairs {pairs} with "
                 f"storage.dm_target={dm_target!r}: power_loss needs a REAL "
                 f"dm-flakey layer to inject into. 'linear' is dm-flakey's "
                 f"pass-through stand-in and injects nothing; an absent "

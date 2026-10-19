@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import faults
 import quiescence
 import report
 import run
@@ -1483,6 +1484,79 @@ class TestInterruptHandlers(unittest.TestCase):
         body = body[body.index("def main("):]
         self.assertLess(
             body.index("install_interrupt_handlers()"), body.index("stack.setup()"))
+
+
+
+TRIGGER_FAULTS = (
+    '[faults]\nkind = "sigterm_at"\ncut = "power_loss"\n'
+    "cut_lo_ms = 0\ncut_hi_ms = 12000\nstall_sink_probability = 0.5\n"
+)
+
+
+class TestTriggerFaultKinds(unittest.TestCase):
+    """The four Foundations lifecycle triggers (spec §16 chaos item 2) are
+    fault kinds the schedule loader knows, and each one's [faults] table is
+    validated per kind: a key the trigger does not read is refused, exactly
+    as reject_unknown_schedule_keys refuses one at table level."""
+
+    def _sched(self, faults_toml, dm_target='"flakey"'):
+        base = TestUnknownScheduleKeysRefused.VALID
+        base = base[: base.index("[faults]")] + faults_toml
+        return base.replace('dm_target = "flakey"', f"dm_target = {dm_target}")
+
+    def test_each_trigger_kind_is_a_fault_kind(self):
+        for kind in faults.TRIGGER_KINDS:
+            self.assertEqual(run.fault_kind({"faults": {"kind": kind}}), kind)
+
+    def test_a_valid_trigger_schedule_loads(self):
+        s = load_schedule_text(self._sched(TRIGGER_FAULTS))
+        self.assertEqual(faults.cut_mode(s), "power_loss")
+
+    def test_a_power_cut_without_a_real_flakey_layer_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            load_schedule_text(self._sched(TRIGGER_FAULTS, dm_target='"linear"'))
+        self.assertIn("flakey", str(cm.exception))
+
+    def test_a_kill_cut_needs_no_dm_layer(self):
+        text = self._sched(TRIGGER_FAULTS.replace('"power_loss"', '"kill"'))
+        text = text.replace('dm_target = "flakey"\n', "")
+        self.assertEqual(faults.cut_mode(load_schedule_text(text)), "kill")
+
+    def test_a_key_that_belongs_to_another_trigger_is_refused(self):
+        # Nothing reads recovery_delay_ms under sigterm_at: silently ignoring
+        # it would report a run as having measured something it did not.
+        with self.assertRaises(ValueError) as cm:
+            load_schedule_text(self._sched(TRIGGER_FAULTS + "recovery_delay_ms = 3000\n"))
+        self.assertIn("recovery_delay_ms", str(cm.exception))
+
+    def test_a_missing_required_key_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace("cut_hi_ms = 12000\n", "")))
+        self.assertIn("cut_hi_ms", str(cm.exception))
+
+    def test_an_inverted_range_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace("cut_lo_ms = 0", "cut_lo_ms = 20000")))
+
+    def test_a_probability_outside_0_1_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace("= 0.5", "= 1.5")))
+
+    def test_an_unknown_cut_mode_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace('"power_loss"', '"powerloss"')))
+
+    def test_a_legacy_kind_refuses_trigger_keys(self):
+        with self.assertRaises(ValueError):
+            faults.validate_faults({"kind": "power_loss", "cut": "kill"})
+
+    def test_the_oracle_sees_a_power_cut_as_power_loss(self):
+        # Keeps verify's tier exemption, report.powerloss_verdict and the
+        # quarantine exemption working for trigger episodes, unchanged.
+        self.assertEqual(faults.oracle_fault("sigterm_at", "power_loss"), "power_loss")
+        self.assertEqual(faults.oracle_fault("sigterm_at", "kill"), "kill_random")
+        self.assertEqual(faults.oracle_fault("power_loss", "power_loss"), "power_loss")
+        self.assertEqual(faults.oracle_fault("kill_random", "kill"), "kill_random")
 
 
 if __name__ == "__main__":
