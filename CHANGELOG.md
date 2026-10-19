@@ -376,6 +376,9 @@ nothing new is persisted.
 - `weir_records_nack_internal_total{cause}` splits the transient `InternalError` nacks into
   `queue_full`, `write_failed`, `sender_dropped`, `ack_timeout`, `wab_cap`, `coordinate` and
   `ownership_lost`. The wire bytes are unchanged.
+- `/livez`, `/readyz`, `/startupz` and `/status` on the metrics listener (exact paths, GET/HEAD;
+  every other path still returns metrics byte for byte); the `livez_checks` key
+  (`--livez-checks`, `WEIR_LIVEZ_CHECKS`); `weir_http_requests_dropped_total{reason}`.
 
 ### Changed
 
@@ -452,6 +455,9 @@ Behaviour an operator can notice on upgrade:
 - **The shipped grace periods are 45 s** (`shutdown_timeout_secs +
   drain_shutdown_budget_secs + 5`): systemd `TimeoutStopSec=45`, compose
   `stop_grace_period: 45s`.
+- A metrics client must send its complete request head within 1 s or is
+  closed; `metrics_max_connections` now counts concurrent scrapes after the
+  head, and probes use their own pool of 4.
 
 ### Upgrading from 4.0.x
 
