@@ -2,7 +2,7 @@
 //!
 //! # State machine
 //!
-//! The drain thread operates in one of three states:
+//! The drain thread operates in one of four states (`Held` only while paused):
 //!
 //! ```text
 //! Draining
@@ -19,6 +19,10 @@
 //! BlockedDeadLetterFull  ──(the blocked write fits)──▶  RetryingTransient (same
 //!                                            segment, RESUMING past already-processed
 //!                                            sub-batches — see F05)
+//!
+//! Draining / RetryingTransient ──(pause seen before a commit batch)──▶ Held
+//!   Held ──(resume)──▶ Draining (same segment first, past its cursor)
+//!                   or RetryingTransient (same episode, backoff already served)
 //! ```
 //!
 //! A sub-batch the sink committed but whose rejected records could not be
@@ -234,6 +238,15 @@ enum DrainState {
         /// episode. Carried from retry to retry so a looping caller cannot cut
         /// every backoff (spec §5.4 "Retry stranded", W2).
         backoff_cut: bool,
+        /// The backoff was already served (a hold resumed): retry at once.
+        waited: bool,
+    },
+    /// Paused mid-segment between commit batches (spec §5.4, §8). Gauged as
+    /// the state it came from; `weir_drain_paused` says it is paused.
+    Held {
+        segment: PathBuf,
+        processed: u64,
+        resume: HeldResume,
     },
     BlockedDeadLetterFull {
         segment: PathBuf,
@@ -246,6 +259,29 @@ enum DrainState {
         /// that blocked it (spec §4.5) — never on a bare `total < cap`.
         needed: u64,
     },
+}
+
+/// How a held segment continues once the pause lifts.
+enum HeldResume {
+    /// It was a first attempt: back through admission and the Draining arm.
+    Fresh,
+    /// It was a retry: continue the same episode without serving the backoff again.
+    Retry {
+        retries_left: u32,
+        next_delay: Duration,
+        cause: TransientCause,
+        backoff_cut: bool,
+    },
+}
+
+impl HeldResume {
+    /// The one-hot `weir_drain_state` a hold keeps showing (spec §5.4 "Gauges").
+    fn gauge_state(&self) -> DrainStateValue {
+        match self {
+            Self::Fresh => DrainStateValue::draining,
+            Self::Retry { .. } => DrainStateValue::retrying_transient,
+        }
+    }
 }
 
 enum ProcessResult {
@@ -290,6 +326,10 @@ enum ProcessResult {
     /// header names a newer format version). Nothing was delivered. Set it aside
     /// for the rest of the run, bytes untouched; the next start replays it.
     Parked { reason: ledger::ParkReason },
+    /// A pause was seen before the next commit batch (spec §5.4). No commit is
+    /// in flight and `processed` is exactly the committed prefix, so resuming
+    /// past it re-sends nothing.
+    Paused { processed: u64 },
 }
 
 enum BatchResult {
@@ -1438,6 +1478,9 @@ fn drain_thread_with<S: Sink>(
     // When the current pause took effect (unix ms), shared by every hold: the
     // Draining head, `Held` and a paused retry backoff. `None` while delivering.
     let mut paused_since: Option<u64> = None;
+    // The segment an exit leaves partly delivered, and its committed prefix
+    // (spec §5.4 "Stop and deadline"): reported in `DrainExit`.
+    let mut abandoned: Option<(PathBuf, u64)> = None;
 
     // The start of the current dead-letter-full blocking episode, if any. An
     // episode spans a flapping cap (unblock → reblock the same segment without
@@ -1807,152 +1850,159 @@ fn drain_thread_with<S: Sink>(
                 retries_left,
                 next_delay,
                 processed,
-                cause: _,
+                cause,
                 backoff_cut,
+                waited,
             } => {
                 set_drain_state(&metrics, DrainStateValue::retrying_transient);
-
-                // Interruptible backoff: consume next_delay in short slices via
-                // `wait_slice` so a shutdown — which a Detached drain only learns
-                // of as the drain channel disconnecting (all WAB flushers have
-                // exited), an Attached one as a passed stop deadline — cuts
-                // the wait short instead of sleeping out a multi-minute Retry-After.
-                // On disconnect we shorten the wait but STILL run the retry below
-                // (its commit is bounded by commit_timeout), preserving the existing
-                // "complete in-flight work on shutdown" behaviour; the Draining loop
-                // then observes the same disconnect and exits. In production the
-                // channel only closes on shutdown, so the Retry-After delay is only
-                // ever cut at shutdown, never during normal operation. Segments that
-                // arrive during the wait are buffered (S15).
-                //
-                // W2: the shutdown wait is CLAMPED, not eliminated. Breaking outright
-                // made every remaining attempt fire back-to-back with zero delay —
-                // the chaos harness measured four segments each burning all
-                // MAX_RETRIES inside 0.4 ms before being logged as stranded. Three
-                // attempts inside one instant against a sink that needs milliseconds
-                // to answer fail identically for the same reason, so that spent the
-                // whole budget on what was effectively one attempt and forced a
-                // strand a brief delay might have avoided — neither "retry properly"
-                // nor "don't retry". Sleeping the clamped remainder makes each retry
-                // an independent sample again. `thread::sleep` rather than another
-                // recv_timeout because a disconnected channel returns immediately and
-                // would spin; nothing is missed, since no further segment can arrive.
-                //
-                // The clamp is drawn from a per-process budget so the added shutdown
-                // time cannot compound: a segment that strands makes the Draining
-                // arm's health poll re-queue it (the 4a auto-resume edge), which
-                // starts another retry episode, and with an unbudgeted per-retry
-                // clamp a HEAD-healthy / POST-transient-failing sink would keep that
-                // cycle alive and shutdown would never finish. Once the budget is
-                // spent the waits go to zero and the loop degenerates to the previous
-                // behaviour, which terminates.
-                //
-                // A retry-stranded request may cut the backoff, at most once per
-                // retry episode and never below `base_retry_delay` from the
-                // wait's start (W2): see `RequeueService`.
-                let wait_start = Instant::now();
-                let mut wait_end = wait_start + next_delay;
+                // The episode's cut flag outlives the wait: it is passed on to
+                // the next retry, and to a hold if this attempt pauses.
                 let mut backoff_cut = backoff_cut;
-                loop {
-                    {
-                        let now = Instant::now();
-                        let base = config.base_retry_delay;
-                        requeue.service(
-                            &ctx,
-                            || {
-                                requeue_unconfirmed(
-                                    &config,
-                                    &metrics,
-                                    Some(&drain_rx),
-                                    &mut pending,
-                                    &mut backlog,
-                                    Some(&segment),
-                                    &|p| ledger.excludes(p, now),
-                                    &heartbeat,
-                                )
-                            },
-                            || {
-                                if backoff_cut {
-                                    return false;
-                                }
-                                // Never below base_retry_delay from the wait's start (W2).
-                                let cut_to = wait_end.min(Instant::now().max(wait_start + base));
-                                if cut_to < wait_end {
-                                    wait_end = cut_to;
-                                    backoff_cut = true;
-                                    true
-                                } else {
-                                    false
-                                }
-                            },
-                        );
-                    }
-                    // WAITING IS NOT WEDGED. `heartbeat.bump()` at the top of
-                    // `'outer` is never reached while this arm holds the thread,
-                    // and this single wait can legitimately run to
-                    // `MAX_RETRY_DELAY` (300 s) on a `Retry-After`-honouring
-                    // sink — far past the stall warning's
-                    // `health_poll_interval + 15 s` threshold (45 s at the
-                    // defaults). Without a bump here a merely-SLOW sink is
-                    // reported as a drain "wedged inside a sink call that blocks
-                    // its OS thread", which is the worst possible misdirection
-                    // during an incident. `wait_slice` bumps on each 50 ms
-                    // slice, which keeps the heartbeat meaning what it claims:
-                    // only a thread that cannot reach its own loop at all
-                    // freezes it.
-                    let remaining = wait_end.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    match wait_slice(
-                        &drain_rx,
-                        &ctx,
-                        remaining,
-                        &mut pending,
-                        backlog.len(),
-                        &mut channel_gone,
-                    ) {
-                        Wait::Segment(new_seg) => pending.push_back(new_seg),
-                        Wait::TimedOut => {}
-                        // Task 2.11 turns this into an exit; until then the
-                        // retry runs at once and the Draining head exits.
-                        Wait::Stop => break,
-                        // Detached shutdown: serve the clamped remainder of the
-                        // backoff (W2), then finish the retry.
-                        Wait::Disconnected => {
-                            let left = wait_end
-                                .saturating_duration_since(Instant::now())
-                                .min(SHUTDOWN_RETRY_BACKOFF_CAP)
-                                .min(shutdown_backoff_left);
-                            shutdown_backoff_left -= left;
-                            std::thread::sleep(left);
+                // A hold that resumed (`waited`) already served this backoff
+                // and ran the health poll while it held: retry at once.
+                if !waited {
+                    // Interruptible backoff: consume next_delay in short slices via
+                    // `wait_slice` so a shutdown — which a Detached drain only learns
+                    // of as the drain channel disconnecting (all WAB flushers have
+                    // exited), an Attached one as a passed stop deadline — cuts
+                    // the wait short instead of sleeping out a multi-minute Retry-After.
+                    // On disconnect we shorten the wait but STILL run the retry below
+                    // (its commit is bounded by commit_timeout), preserving the existing
+                    // "complete in-flight work on shutdown" behaviour; the Draining loop
+                    // then observes the same disconnect and exits. In production the
+                    // channel only closes on shutdown, so the Retry-After delay is only
+                    // ever cut at shutdown, never during normal operation. Segments that
+                    // arrive during the wait are buffered (S15).
+                    //
+                    // W2: the shutdown wait is CLAMPED, not eliminated. Breaking outright
+                    // made every remaining attempt fire back-to-back with zero delay —
+                    // the chaos harness measured four segments each burning all
+                    // MAX_RETRIES inside 0.4 ms before being logged as stranded. Three
+                    // attempts inside one instant against a sink that needs milliseconds
+                    // to answer fail identically for the same reason, so that spent the
+                    // whole budget on what was effectively one attempt and forced a
+                    // strand a brief delay might have avoided — neither "retry properly"
+                    // nor "don't retry". Sleeping the clamped remainder makes each retry
+                    // an independent sample again. `thread::sleep` rather than another
+                    // recv_timeout because a disconnected channel returns immediately and
+                    // would spin; nothing is missed, since no further segment can arrive.
+                    //
+                    // The clamp is drawn from a per-process budget so the added shutdown
+                    // time cannot compound: a segment that strands makes the Draining
+                    // arm's health poll re-queue it (the 4a auto-resume edge), which
+                    // starts another retry episode, and with an unbudgeted per-retry
+                    // clamp a HEAD-healthy / POST-transient-failing sink would keep that
+                    // cycle alive and shutdown would never finish. Once the budget is
+                    // spent the waits go to zero and the loop degenerates to the previous
+                    // behaviour, which terminates.
+                    //
+                    // A retry-stranded request may cut the backoff, at most once per
+                    // retry episode and never below `base_retry_delay` from the
+                    // wait's start (W2): see `RequeueService`.
+                    let wait_start = Instant::now();
+                    let mut wait_end = wait_start + next_delay;
+                    loop {
+                        {
+                            let now = Instant::now();
+                            let base = config.base_retry_delay;
+                            requeue.service(
+                                &ctx,
+                                || {
+                                    requeue_unconfirmed(
+                                        &config,
+                                        &metrics,
+                                        Some(&drain_rx),
+                                        &mut pending,
+                                        &mut backlog,
+                                        Some(&segment),
+                                        &|p| ledger.excludes(p, now),
+                                        &heartbeat,
+                                    )
+                                },
+                                || {
+                                    if backoff_cut {
+                                        return false;
+                                    }
+                                    // Never below base_retry_delay from the wait's start (W2).
+                                    let cut_to =
+                                        wait_end.min(Instant::now().max(wait_start + base));
+                                    if cut_to < wait_end {
+                                        wait_end = cut_to;
+                                        backoff_cut = true;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                },
+                            );
+                        }
+                        // WAITING IS NOT WEDGED. `heartbeat.bump()` at the top of
+                        // `'outer` is never reached while this arm holds the thread,
+                        // and this single wait can legitimately run to
+                        // `MAX_RETRY_DELAY` (300 s) on a `Retry-After`-honouring
+                        // sink — far past the stall warning's
+                        // `health_poll_interval + 15 s` threshold (45 s at the
+                        // defaults). Without a bump here a merely-SLOW sink is
+                        // reported as a drain "wedged inside a sink call that blocks
+                        // its OS thread", which is the worst possible misdirection
+                        // during an incident. `wait_slice` bumps on each 50 ms
+                        // slice, which keeps the heartbeat meaning what it claims:
+                        // only a thread that cannot reach its own loop at all
+                        // freezes it.
+                        let remaining = wait_end.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
                             break;
                         }
+                        match wait_slice(
+                            &drain_rx,
+                            &ctx,
+                            remaining,
+                            &mut pending,
+                            backlog.len(),
+                            &mut channel_gone,
+                        ) {
+                            Wait::Segment(new_seg) => pending.push_back(new_seg),
+                            Wait::TimedOut => {}
+                            // Task 2.11 turns this into an exit; until then the
+                            // retry runs at once and the Draining head exits.
+                            Wait::Stop => break,
+                            // Detached shutdown: serve the clamped remainder of the
+                            // backoff (W2), then finish the retry.
+                            Wait::Disconnected => {
+                                let left = wait_end
+                                    .saturating_duration_since(Instant::now())
+                                    .min(SHUTDOWN_RETRY_BACKOFF_CAP)
+                                    .min(shutdown_backoff_left);
+                                shutdown_backoff_left -= left;
+                                std::thread::sleep(left);
+                                break;
+                            }
+                        }
                     }
-                }
 
-                // Rescan for OTHER stranded segments before the retry (M2). A long
-                // backoff here would otherwise starve the Draining-arm rescan, so a
-                // sink that recovers mid-backoff wouldn't re-drain segments stranded
-                // by an earlier outage until this segment resolved. Excludes the
-                // segment being retried (`segment`) — this arm processes it directly
-                // below, so re-queuing it would double-process. The borrow ends
-                // before `segment` is moved into process_segment / the next state.
-                // Ledger-owned paths are skipped too (spec §4.0).
-                let now = Instant::now();
-                prev_health_ok = probe_and_resume_stranded_with(
-                    &rt,
-                    &*sink,
-                    &config,
-                    &metrics,
-                    Some(&drain_rx),
-                    &mut pending,
-                    &mut backlog,
-                    prev_health_ok,
-                    Some(&segment),
-                    &|p| ledger.excludes(p, now),
-                    &ctx,
-                );
+                    // Rescan for OTHER stranded segments before the retry (M2). A long
+                    // backoff here would otherwise starve the Draining-arm rescan, so a
+                    // sink that recovers mid-backoff wouldn't re-drain segments stranded
+                    // by an earlier outage until this segment resolved. Excludes the
+                    // segment being retried (`segment`) — this arm processes it directly
+                    // below, so re-queuing it would double-process. The borrow ends
+                    // before `segment` is moved into process_segment / the next state.
+                    // Ledger-owned paths are skipped too (spec §4.0).
+                    let now = Instant::now();
+                    prev_health_ok = probe_and_resume_stranded_with(
+                        &rt,
+                        &*sink,
+                        &config,
+                        &metrics,
+                        Some(&drain_rx),
+                        &mut pending,
+                        &mut backlog,
+                        prev_health_ok,
+                        Some(&segment),
+                        &|p| ledger.excludes(p, now),
+                        &ctx,
+                    );
+                }
 
                 // Resume past the sub-batches already durably processed (F05).
                 let result = attempt_segment(
@@ -1972,6 +2022,14 @@ fn drain_thread_with<S: Sink>(
                 next_state_after_process(
                     segment,
                     result,
+                    // A pause mid-attempt holds the same episode: same budget,
+                    // same delay, the backoff already served.
+                    HeldResume::Retry {
+                        retries_left,
+                        next_delay,
+                        cause,
+                        backoff_cut,
+                    },
                     &config,
                     &metrics,
                     &mut block_episode,
@@ -1985,6 +2043,7 @@ fn drain_thread_with<S: Sink>(
                         processed,
                         cause,
                         backoff_cut,
+                        waited: false,
                     },
                 )
             }
@@ -2139,6 +2198,7 @@ fn drain_thread_with<S: Sink>(
                         cause: TransientCause::Sink,
                         // A new retry episode.
                         backoff_cut: false,
+                        waited: false,
                     }
                 } else if channel_closed {
                     // No headroom and shutdown requested — leave segment unconfirmed.
@@ -2157,6 +2217,130 @@ fn drain_thread_with<S: Sink>(
                     }
                 }
             }
+
+            // ── Held: paused mid-segment (spec §5.4, §8) ──────────────────────
+            //
+            // Entered from a `Paused` result: the attempt stopped before a
+            // commit batch, with nothing in flight and the committed prefix
+            // recorded as the ledger's cursor. Nothing is committed here; the
+            // hold keeps emptying the channel, serving the verbs and polling
+            // sink health until the pause lifts or a stop arrives.
+            DrainState::Held {
+                segment,
+                processed,
+                resume,
+            } => {
+                set_drain_state(&metrics, resume.gauge_state());
+                let since = *paused_since.get_or_insert_with(unix_ms_now);
+                publish.paused(since, true);
+                metrics.drain_paused.set(1.0);
+                if control.stop_requested() {
+                    info!(
+                        path = %segment.display(),
+                        processed,
+                        "drain: stop while held; the segment stays sealed and unconfirmed and replays \
+                         on the next start (pause honoured)"
+                    );
+                    abandoned = Some((segment, processed));
+                    break 'outer DrainExitReason::Stopped;
+                }
+                {
+                    let now = Instant::now();
+                    requeue.service(
+                        &ctx,
+                        || {
+                            requeue_unconfirmed(
+                                &config,
+                                &metrics,
+                                Some(&drain_rx),
+                                &mut pending,
+                                &mut backlog,
+                                Some(&segment),
+                                &|p| ledger.excludes(p, now),
+                                &heartbeat,
+                            )
+                        },
+                        || false,
+                    );
+                }
+                // Health while held (spec §5.4): the wall-clock poll keeps
+                // running, with the held segment excluded from the rescan.
+                if !control.absorbing() && last_health_poll.elapsed() >= config.health_poll_interval
+                {
+                    let now = Instant::now();
+                    prev_health_ok = probe_and_resume_stranded_with(
+                        &rt,
+                        &*sink,
+                        &config,
+                        &metrics,
+                        Some(&drain_rx),
+                        &mut pending,
+                        &mut backlog,
+                        prev_health_ok,
+                        Some(&segment),
+                        &|p| ledger.excludes(p, now),
+                        &ctx,
+                    );
+                    last_health_poll = Instant::now();
+                }
+                if control.pause_requested() {
+                    match wait_slice(
+                        &drain_rx,
+                        &ctx,
+                        control::SLICE,
+                        &mut pending,
+                        backlog.len(),
+                        &mut channel_gone,
+                    ) {
+                        Wait::Segment(p) => pending.push_back(p),
+                        Wait::TimedOut | Wait::Stop => {}
+                        // A Detached shutdown while held honours the pause.
+                        Wait::Disconnected => {
+                            abandoned = Some((segment, processed));
+                            break 'outer DrainExitReason::Stopped;
+                        }
+                    }
+                    DrainState::Held {
+                        segment,
+                        processed,
+                        resume,
+                    }
+                } else {
+                    paused_since = None;
+                    publish.paused(0, false);
+                    metrics.drain_paused.set(0.0);
+                    info!(
+                        path = %segment.display(),
+                        processed,
+                        "drain: resumed; continuing the held segment past the records already delivered"
+                    );
+                    match resume {
+                        // Back through admission, which re-reads the cursor
+                        // recorded on entry, pinned to the file's (dev, ino).
+                        HeldResume::Fresh => {
+                            pending.push_front(segment);
+                            backlog_turn = false; // the held segment goes first
+                            DrainState::Draining
+                        }
+                        // The same retry episode, its backoff already served;
+                        // `attempt_segment` re-checks the cursor's pin.
+                        HeldResume::Retry {
+                            retries_left,
+                            next_delay,
+                            cause,
+                            backoff_cut,
+                        } => DrainState::RetryingTransient {
+                            segment,
+                            retries_left,
+                            next_delay,
+                            processed,
+                            cause,
+                            backoff_cut,
+                            waited: true,
+                        },
+                    }
+                }
+            }
         };
     };
 
@@ -2166,9 +2350,13 @@ fn drain_thread_with<S: Sink>(
     ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
     publish_ledger_counts(ledger.counts(), &metrics);
     info!("drain thread exiting");
+    // Every exit that leaves a segment partly delivered counts, once, here.
+    if abandoned.is_some() {
+        metrics.drain_segments_abandoned.inc();
+    }
     ThreadExit {
         reason,
-        abandoned: None,
+        abandoned,
         pending_left: pending.len() + drain_rx.len(),
         backlog_left: backlog.len(),
     }
@@ -2219,6 +2407,7 @@ fn drain_thread<S: Sink>(
 fn next_state_after_process(
     segment: PathBuf,
     result: ProcessResult,
+    resume: HeldResume,
     config: &DrainConfig,
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
@@ -2293,6 +2482,23 @@ fn next_state_after_process(
             ledger.note_quarantine_pending(&segment, reason);
             end_block_episode(block_episode, metrics);
             DrainState::Draining
+        }
+        // Paused between commit batches: record the committed prefix as the
+        // cursor, pinned to the file's (dev, ino), so a resume (or a respawn
+        // while held) continues past it.
+        ProcessResult::Paused { processed } => {
+            ledger.record_progress(&segment, processed);
+            info!(
+                path = %segment.display(),
+                processed,
+                "drain: paused between commit batches; holding the segment (nothing in flight, \
+                 nothing re-sent on resume)"
+            );
+            DrainState::Held {
+                segment,
+                processed,
+                resume,
+            }
         }
     }
 }
@@ -2534,6 +2740,7 @@ fn transition_from_draining(
     next_state_after_process(
         segment,
         result,
+        HeldResume::Fresh,
         config,
         metrics,
         block_episode,
@@ -2546,6 +2753,7 @@ fn transition_from_draining(
             processed,
             cause,
             backoff_cut: false,
+            waited: false,
         },
     )
 }
@@ -2824,6 +3032,9 @@ async fn process_segment_ctl<S: Sink>(
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
             let full_ids = std::mem::replace(&mut batch_ids, Vec::with_capacity(max_batch));
             let n = full_batch.len() as u64;
+            if let Some(stop) = batch_gate(ctx, durable_through) {
+                return stop;
+            }
             let result = commit_batch_ctl(
                 &full_batch,
                 &full_ids,
@@ -2845,6 +3056,9 @@ async fn process_segment_ctl<S: Sink>(
 
     if !batch.is_empty() {
         let n = batch.len() as u64;
+        if let Some(stop) = batch_gate(ctx, durable_through) {
+            return stop;
+        }
         let result = commit_batch_ctl(
             &batch,
             &batch_ids,
@@ -2962,6 +3176,18 @@ async fn process_segment_ctl<S: Sink>(
     ProcessResult::Confirmed {
         record_count: read_index,
     }
+}
+
+/// Checked before every `commit_batch_ctl` (spec §5.4). Nothing is in flight
+/// here and `durable_through` is the committed prefix, so stopping here costs
+/// no duplicate on resume.
+fn batch_gate(ctx: &DrainCtx<'_>, durable_through: u64) -> Option<ProcessResult> {
+    if ctx.control.pause_requested() {
+        return Some(ProcessResult::Paused {
+            processed: durable_through,
+        });
+    }
+    None
 }
 
 /// Pre-Foundations signature for the existing tests: Detached, unobserved.

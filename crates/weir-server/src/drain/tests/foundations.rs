@@ -705,3 +705,88 @@ fn a_stop_while_paused_exits_without_delivering() {
     drop(tx);
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// Spec §16 drain test 9: pause mid-segment at a commit-batch boundary. The
+/// commit in flight finishes, the next is not started, `held` is published,
+/// and resume re-sends nothing: every record reaches the sink exactly once.
+#[test]
+fn a_pause_mid_segment_holds_at_a_batch_boundary_and_resumes_without_duplicates() {
+    let dir = tmp_dir("fnd_pause_held");
+    let (sealed, records) = make_numbered_segment(&dir, 10);
+    let sink = Arc::new(MockSink {
+        yield_for: Duration::from_millis(100),
+        max_batch: 2, // 5 commits
+        ..MockSink::with_responses([])
+    });
+    let board = StatusBoard::for_test();
+    let control = DrainControl::detached();
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &metrics,
+        rt_with(control.clone(), Some(Arc::clone(&board)), Vec::new()),
+    );
+    tx.send(sealed.clone()).unwrap();
+    wait_for(5, "two commits", || sink.call_count() >= 2);
+
+    control.request_pause();
+    wait_for(5, "held is published", || board.drain.held.load(Relaxed));
+    let held_at = sink.call_count();
+    assert!(held_at < 5, "held before the segment finished");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(sink.call_count(), held_at, "no commit starts while held");
+    assert!(
+        sealed.exists(),
+        "a held segment is neither confirmed nor deleted"
+    );
+    assert!(board.drain.paused_since_ms.load(Relaxed) > 0);
+    assert_eq!(metrics.drain_paused.get(), 1.0);
+
+    control.request_resume();
+    wait_for(5, "delivered", || !sealed.exists());
+    assert_eq!(
+        committed_bytes(&sink),
+        records,
+        "every record exactly once, in order"
+    );
+    assert_eq!(sink.call_count(), 5);
+    assert!(!board.drain.held.load(Relaxed));
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn process_segment_ctl_stops_before_a_batch_when_paused() {
+    let dir = tmp_dir("fnd_batch_gate");
+    let (sealed, _) = make_numbered_segment(&dir, 6);
+    let sink = MockSink::with_batch_size(2, []);
+    let control = DrainControl::detached();
+    control.request_pause();
+    let (publish, hb) = (Publisher::none(), DrainHeartbeat::new());
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb: &hb,
+    };
+    let mut dl = DeadLetterWriter::open(&dir).unwrap();
+    let r = block_on(crate::drain::process_segment_ctl(
+        &sealed,
+        &sink,
+        &fast_config(dir.clone()),
+        &noop_metrics(),
+        &mut dl,
+        2,
+        false,
+        &ctx,
+    ));
+    assert!(
+        matches!(r, ProcessResult::Paused { processed: 2 }),
+        "the cursor is the skip, untouched"
+    );
+    assert_eq!(sink.call_count(), 0, "no commit after a pause is seen");
+    std::fs::remove_dir_all(dir).ok();
+}
