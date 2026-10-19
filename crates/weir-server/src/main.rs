@@ -469,12 +469,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.metrics_port,
         )))
         .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
-    // PR 5 swaps this for the router (HttpState); the bind point stays here.
-    metrics::server::spawn(
-        metrics_listener,
+    // The router (spec §5.8): a 1 s head phase, then separate scrape and
+    // probe pools. With no status source every path is still metrics.
+    let http_state = metrics::server::HttpState::new(
         Arc::clone(&registry),
+        Some(Arc::clone(&metrics)),
+        None, // Task 5.10 wires the status board; until then every path is metrics
+        config.livez_checks.clone(),
         config.metrics_max_connections,
     );
+    metrics::server::spawn(metrics_listener, http_state);
     info!(
         bind = %config.metrics_bind,
         port = config.metrics_port,
