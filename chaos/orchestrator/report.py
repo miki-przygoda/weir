@@ -34,6 +34,12 @@ FINAL = "final"
 #: really does leave that many segments behind.
 MAX_SURVIVORS_SHOWN = 20
 
+#: The phase-2 corpus's duplicate rate, which the Foundations gate reports
+#: against (spec §16). Exactly 1.000 across 706 Buffered power-loss episodes.
+PHASE2_DUPLICATE_RATE = 1.000
+PHASE2_DUPLICATE_RATE_SOURCE = (
+    "docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md")
+
 
 def _dash(value):
     """Renders a missing value as an em dash rather than as a zero.
@@ -333,6 +339,60 @@ def _fault_kinds(records):
     }
 
 
+def render_triggers(episodes):
+    """Foundations lifecycle triggers: where each cut landed, whether the
+    trigger bit, and the duplicate cost against the phase-2 baseline.
+
+    Returns [] for a run with no trigger records, so every Phase 1/2 report
+    renders byte-identically. An aborted episode never reached its trigger,
+    so it is not counted here (it is still an anomaly in the episode table).
+    """
+    trig = [e for e in episodes
+            if e.get("trigger") and isinstance(e.get("episode"), int)
+            and not e.get("abort_reason")]
+    if not trig:
+        return []
+    lines = ["## Lifecycle triggers\n"]
+    lines.append(
+        "Each episode provoked a lifecycle path, then cut power at a seeded point "
+        "inside or after it. `Canary bit` is I6 for that cut.\n")
+    lines.append("| Trigger | Episodes | Cut during shutdown | Cut after exit | "
+                 "Sink stalled | Forced observed | Pause observed | Canary bit | "
+                 "Trigger anomalies |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    by_kind = {}
+    for e in trig:
+        by_kind.setdefault(e["trigger"], []).append(e)
+    for kind in sorted(by_kind):
+        es = by_kind[kind]
+        tr = [e.get("trigger_result") or {} for e in es]
+        cells = (
+            len(es),
+            sum(1 for t in tr if t.get("cut_phase") == "during_shutdown"),
+            sum(1 for t in tr if t.get("cut_phase") == "after_exit"),
+            sum(1 for t in tr if t.get("stall_sink")),
+            sum(1 for t in tr if t.get("forced_observed")),
+            sum(1 for t in tr if t.get("paused") or t.get("held")),
+        )
+        bit = sum(1 for e in es if e.get("canary") == "bit")
+        anomalous = sum(1 for e in es if e.get("anomaly_reasons"))
+        lines.append(f"| {kind} | " + " | ".join(str(c) for c in cells)
+                     + f" | {bit}/{len(es)} | {anomalous} |")
+    # The accumulator's rate is cumulative, so the LAST record carrying one
+    # (the final pass, when the run reached it) is the run's rate.
+    rated = [e for e in episodes if "duplicate_rate" in e]
+    if rated:
+        rate = rated[-1]["duplicate_rate"]
+        lines.append(
+            f"\nDuplicate rate {rate:.4f} against the phase-2 baseline "
+            f"{PHASE2_DUPLICATE_RATE:.3f} (Δ {rate - PHASE2_DUPLICATE_RATE:+.4f}; "
+            f"source `{PHASE2_DUPLICATE_RATE_SOURCE}`). Bounded shutdown adds at "
+            "most one abandoned segment's committed prefix per shutdown (spec §7), "
+            "so a rise here is expected and stated, not a failure.")
+    lines.append("")
+    return lines
+
+
 def render(episodes, meta, crash=None):
     """Renders episodes (list of dicts) into markdown.
 
@@ -604,6 +664,8 @@ def render(episodes, meta, crash=None):
 
     if final is not None:
         lines.extend(render_final_pass(final))
+
+    lines.extend(render_triggers(episodes))
 
     lines.append("## Episodes\n")
     lines.append(

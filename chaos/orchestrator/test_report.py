@@ -782,3 +782,42 @@ class TestCrashPostmortemSection(unittest.TestCase):
                 json.dump(CRASH, f)
             with open(report.write_report(tmp)) as f:
                 self.assertIn("## Crash post-mortem", f.read())
+
+
+def trig_ep(i, kind, canary="bit", anomalies=(), **tr):
+    return {"episode": i, "fault": "power_loss", "trigger": kind, "cut": "power_loss",
+            "ok": True, "quiesced": True, "canary": canary, "duplicate_rate": 1.002,
+            "trigger_result": tr, "anomaly_reasons": list(anomalies), "seed": 1}
+
+
+class TestTriggerSection(unittest.TestCase):
+    """The Foundations lifecycle triggers (spec §16): where each cut landed,
+    whether it bit, and the duplicate cost against the phase-2 baseline."""
+
+    def test_a_run_without_triggers_has_no_section(self):
+        self.assertNotIn("## Lifecycle triggers", report.render(EPISODES, {}))
+
+    def test_one_row_per_trigger_with_where_the_cuts_landed(self):
+        eps = [trig_ep(0, "sigterm_at", cut_phase="during_shutdown", stall_sink=True),
+               trig_ep(1, "sigterm_at", cut_phase="during_shutdown"),
+               trig_ep(2, "sigterm_at", cut_phase="after_exit")]
+        out = report.render(eps, {})
+        self.assertIn("## Lifecycle triggers", out)
+        self.assertIn("| sigterm_at | 3 | 2 | 1 | 1 | 0 | 0 | 3/3 | 0 |", out)
+
+    def test_a_missed_canary_is_counted_against_the_trigger(self):
+        out = report.render([trig_ep(0, "admin_pause_resume", canary="did_not_bite",
+                                     paused=True)], {})
+        self.assertIn("| admin_pause_resume | 1 | 0 | 0 | 0 | 0 | 1 | 0/1 | 0 |", out)
+
+    def test_the_duplicate_rate_is_stated_against_the_phase_2_baseline(self):
+        out = report.render([trig_ep(0, "sigterm_at")], {})
+        self.assertIn("phase-2 baseline 1.000", out)
+        self.assertIn("+0.0020", out)
+        self.assertIn(report.PHASE2_DUPLICATE_RATE_SOURCE, out)
+
+    def test_a_trigger_anomaly_reaches_the_episode_notes(self):
+        out = report.render([trig_ep(0, "sigterm_at",
+                                     anomalies=["shutdown_overran_bound(alive_at=12.0s,bound=9.0s)"])], {})
+        self.assertIn("shutdown_overran_bound", out)
+        self.assertIn("| sigterm_at | 1 | 0 | 0 | 0 | 0 | 0 | 1/1 | 1 |", out)
