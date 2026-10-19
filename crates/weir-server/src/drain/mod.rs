@@ -74,7 +74,7 @@ use crate::{
 pub(crate) use control::{DrainControl, DrainExit, DrainRuntime, Lifetime};
 use publish::{CommitGuard, Publisher};
 
-use crate::status::{DrainExitReason, RequeueResult, SinkFailureKind, unix_ms_now};
+use crate::status::{DrainExitInfo, DrainExitReason, RequeueResult, SinkFailureKind, unix_ms_now};
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
 use ledger::{Admit, DeadLetterCarry, SegmentLedger, TransientCause};
@@ -500,6 +500,10 @@ fn run_drain_supervised<S: Sink>(
     // respawned drain still knows which segments are owned by a disposition,
     // parked or cooling down, and where each stranded segment resumes.
     let mut ledger = SegmentLedger::new(Arc::new(ledger::LedgerCounts::default()));
+    // The last panic's message, sanitised, carried into every later exit.
+    let mut last_panic: Option<String> = None;
+    // The replay list's size, for zeroing its progress if a panic takes it.
+    let replay_total = first_backlog.as_ref().map_or(0, |b| b.len() as u64);
     let exit = loop {
         let rx = drain_rx.clone();
         let sink = Arc::clone(&sink);
@@ -519,20 +523,45 @@ fn run_drain_supervised<S: Sink>(
         }));
         // A clean return means the incarnation ended on its own terms (a
         // Detached drain: the channel closed, all flushers gone) — done.
-        let _payload = match result {
+        let payload = match result {
             Ok(t) => {
                 break DrainExit {
                     reason: t.reason,
                     abandoned: t.abandoned.map(|(p, n)| (segment_identity(&p), n)),
                     pending_left: t.pending_left,
                     backlog_left: t.backlog_left,
-                    last_panic: None,
+                    last_panic: last_panic.clone(),
                 };
             }
             Err(payload) => payload,
         };
         attempts += 1;
         metrics.drain_panics.inc();
+        let message = publish::sanitize_admin_text(crate::wab::panic_message_str(&payload));
+        error!(attempts, panic = %message, "drain thread panicked");
+        last_panic = Some(message);
+        // A panic took the replay list with it; the respawn's rescan recovers
+        // it into the backlog, where backlog_len counts it.
+        if replay_total > 0 {
+            publish.replay(replay_total, 0);
+            metrics.drain_replay_remaining_segments.set(0.0);
+        }
+        // Never respawn after stop (spec §5.4 "Supervisor"): main is waiting
+        // on a bounded exit, and a fresh incarnation would restart delivery.
+        if control.stop_requested() {
+            warn!("drain: panicked after stop was requested; not respawning");
+            break DrainExit {
+                reason: if control.deadline_passed() {
+                    DrainExitReason::DeadlineAbandoned
+                } else {
+                    DrainExitReason::Stopped
+                },
+                abandoned: None,
+                pending_left: drain_rx.len(),
+                backlog_left: 0,
+                last_panic: last_panic.clone(),
+            };
+        }
         // Charge the panic to the segment in flight, if any, and park it at the
         // second (spec §4.12). Without this the respawn's first healthy probe
         // rescans, re-queues the same segment, and a deterministic panic
@@ -569,7 +598,7 @@ fn run_drain_supervised<S: Sink>(
                 abandoned: None,
                 pending_left: drain_rx.len(),
                 backlog_left: 0,
-                last_panic: None,
+                last_panic: last_panic.clone(),
             };
         }
         error!(
@@ -602,7 +631,22 @@ fn run_drain_supervised<S: Sink>(
     // "sink is down" signal on every SIGTERM. `drain_state{stopped}` is the
     // honest signal, and it tells the operator the health reading is stale.
     set_drain_state(&metrics, DrainStateValue::stopped);
-    info!("drain supervisor exiting");
+    publish.state(&DrainStateValue::stopped);
+    publish.in_flight(None);
+    publish.exit(DrainExitInfo {
+        reason: exit.reason,
+        abandoned: exit.abandoned.clone(),
+        pending_left: exit.pending_left,
+        backlog_left: exit.backlog_left,
+        last_panic: exit.last_panic.clone(),
+        at_ms: unix_ms_now(),
+    });
+    info!(
+        reason = ?exit.reason,
+        pending_left = exit.pending_left,
+        backlog_left = exit.backlog_left,
+        "drain supervisor exiting"
+    );
     exit
 }
 
@@ -1421,6 +1465,45 @@ fn next_queued(
     Some(p)
 }
 
+/// The drain's runtime, shut down with `shutdown_timeout(100 ms)` on every way
+/// out of `drain_thread_with`, a sink panic unwinding through it included.
+///
+/// Not a plain `Runtime`: dropping one waits, without limit, for its
+/// spawn_blocking pool, and a sink can leave work there (a DNS lookup:
+/// hyper-util's GaiResolver, tokio::net::lookup_host). On a normal return that
+/// would turn a clean exit into PR 4's orphan path; on a panic it would hold
+/// the respawn (or, after stop, the exit) for as long as that work runs. The
+/// abandoned blocking thread holds no drain state and finishes on its own
+/// (spec §5.4, engineering question (e)).
+///
+/// Engineering question (e) audit (spec §20), by grepping the clients' sources
+/// for `spawn_blocking` / `lookup_host`: every network sink resolves its host
+/// on the blocking pool. `http`, `clickhouse` and `s3` go through reqwest,
+/// whose default resolver is hyper-util's `GaiResolver`
+/// (`client/legacy/connect/dns.rs`, `spawn_blocking` around `getaddrinfo`);
+/// `postgres` calls `tokio::net::lookup_host` (tokio-postgres `connect.rs`);
+/// `mysql` calls `TcpStream::connect((host, port))` (mysql_async `io/mod.rs`),
+/// which resolves through the same `lookup_host`. `noop` does no I/O. None
+/// of them holds a lock, a file or drain state across that
+/// blocking call, so abandoning the thread after 100 ms only skips waiting for
+/// a lookup whose answer nobody reads.
+struct BoundedRuntime(Option<tokio::runtime::Runtime>);
+
+impl std::ops::Deref for BoundedRuntime {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &tokio::runtime::Runtime {
+        self.0.as_ref().expect("present until drop")
+    }
+}
+
+impl Drop for BoundedRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_timeout(Duration::from_millis(100));
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_thread_with<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
@@ -1460,10 +1543,12 @@ fn drain_thread_with<S: Sink>(
     publish.generation(generation);
     metrics.drain_generation.set(generation as f64);
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("drain tokio runtime");
+    let rt = BoundedRuntime(Some(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("drain tokio runtime"),
+    ));
 
     let mut dead_letter = match DeadLetterWriter::open(&config.wab_dir) {
         Ok(dl) => dl,

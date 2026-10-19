@@ -1394,3 +1394,199 @@ fn an_absorbing_wait_slice_empties_the_channel_into_pending() {
     assert_eq!(pending.len(), 10);
     assert!(rx.is_empty());
 }
+
+/// Commits after `delay`, then panics.
+struct PanicAfterSink {
+    delay: Duration,
+    calls: std::sync::atomic::AtomicU64,
+}
+impl crate::sink::Sink for PanicAfterSink {
+    type Error = MockError;
+    async fn commit(&self, _batch: SinkBatch) -> Result<CommitResult, MockError> {
+        self.calls.fetch_add(1, Relaxed);
+        tokio::time::sleep(self.delay).await;
+        panic!("sink exploded after the stop request");
+    }
+    async fn health(&self) -> SinkHealth {
+        SinkHealth::Healthy
+    }
+}
+
+/// Leaves a 3 s blocking task behind on every commit, like a DNS lookup on
+/// tokio's blocking pool that outlives the request that started it.
+struct LingeringTaskSink;
+impl crate::sink::Sink for LingeringTaskSink {
+    type Error = MockError;
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MockError> {
+        drop(tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_secs(3))
+        }));
+        Ok(CommitResult::new(batch.into_records(), Vec::new()))
+    }
+    async fn health(&self) -> SinkHealth {
+        SinkHealth::Healthy
+    }
+}
+
+/// Starts a 3 s blocking task, lets it start running, then panics. tokio
+/// cancels a blocking task that has not started by shutdown, so the sleep
+/// before the panic is what makes the leftover work real; it also leaves the
+/// test time to request the stop while the commit is in flight.
+struct LingeringTaskThenPanicSink {
+    calls: std::sync::atomic::AtomicU64,
+}
+impl crate::sink::Sink for LingeringTaskThenPanicSink {
+    type Error = MockError;
+    async fn commit(&self, _batch: SinkBatch) -> Result<CommitResult, MockError> {
+        drop(tokio::task::spawn_blocking(|| {
+            std::thread::sleep(Duration::from_secs(3))
+        }));
+        self.calls.fetch_add(1, Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        panic!("sink exploded with a blocking task still running");
+    }
+    async fn health(&self) -> SinkHealth {
+        SinkHealth::Healthy
+    }
+}
+
+#[test]
+fn a_drain_that_panics_after_stop_is_not_respawned() {
+    let dir = tmp_dir("fnd_panic_after_stop");
+    let s = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(PanicAfterSink {
+        delay: Duration::from_millis(300),
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let control = DrainControl::attached();
+    let metrics = noop_metrics();
+    let board = StatusBoard::for_test();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    tx.send(s.clone()).unwrap();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &metrics,
+        rt_with(control.clone(), Some(Arc::clone(&board)), Vec::new()),
+    );
+    wait_for(5, "the commit is in flight", || {
+        sink.calls.load(Relaxed) == 1
+    });
+    control.request_stop(Duration::from_secs(10));
+    let exit = join_within(h, Duration::from_secs(2));
+    assert_eq!(exit.reason, DrainExitReason::Stopped);
+    assert!(
+        exit.last_panic
+            .as_deref()
+            .is_some_and(|m| m.contains("sink exploded"))
+    );
+    assert_eq!(drain_panics(&metrics), 1);
+    assert_eq!(sink.calls.load(Relaxed), 1, "no respawn after stop");
+    assert!(s.exists());
+    let info = board.drain.exit.load_full().expect("exit published");
+    assert_eq!(info.reason, DrainExitReason::Stopped);
+    assert!(info.last_panic.is_some());
+    assert_drain_reports_stopped(&metrics, "panic after stop");
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_drain_that_spends_its_panic_budget_exits_gave_up() {
+    let dir = tmp_dir("fnd_gave_up");
+    let s = seg(&dir, 1, &[b"poison"]);
+    let sink = Arc::new(MockSink::panicking_on(b"poison"));
+    let cfg = DrainConfig {
+        max_respawns: 2,
+        ..fast_config(dir.clone())
+    };
+    let board = StatusBoard::for_test();
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    tx.send(s.clone()).unwrap();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &metrics,
+        rt_with(
+            DrainControl::detached(),
+            Some(Arc::clone(&board)),
+            Vec::new(),
+        ),
+    );
+    let exit = join_within(h, Duration::from_secs(5));
+    assert_eq!(exit.reason, DrainExitReason::GaveUp);
+    assert!(
+        exit.last_panic
+            .as_deref()
+            .is_some_and(|m| m.contains("poison payload"))
+    );
+    assert_eq!(
+        board.drain.exit.load_full().unwrap().reason,
+        DrainExitReason::GaveUp
+    );
+    assert_drain_reports_stopped(&metrics, "gave up");
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Engineering question (e): a sink's leftover spawn_blocking work must not
+/// hold the drain's exit. Runtime::drop waits for the blocking pool without
+/// limit; shutdown_timeout(100 ms) does not.
+#[test]
+fn a_sinks_leftover_blocking_task_cannot_hold_the_drain_exit() {
+    let dir = tmp_dir("fnd_shutdown_timeout");
+    let s = seg(&dir, 1, &[b"x"]);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    tx.send(s.clone()).unwrap();
+    let h = start(
+        rx,
+        &Arc::new(LingeringTaskSink),
+        quiet(dir.clone()),
+        &noop_metrics(),
+        rt_with(DrainControl::detached(), None, Vec::new()),
+    );
+    wait_for(5, "delivered", || !s.exists());
+    drop(tx);
+    join_within(h, Duration::from_secs(1));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// The same bound on the unwinding path: a sink that panics with blocking work
+/// still running must not hold the drain's exit (or, before a stop, its
+/// respawn) for as long as that work runs. Runtime::drop during the unwind
+/// would wait ~3 s here.
+#[test]
+fn a_sinks_leftover_blocking_task_cannot_hold_a_panicking_drain() {
+    let dir = tmp_dir("fnd_shutdown_timeout_panic");
+    let s = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(LingeringTaskThenPanicSink {
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let control = DrainControl::attached();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    tx.send(s.clone()).unwrap();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &noop_metrics(),
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    wait_for(5, "the commit is in flight", || {
+        sink.calls.load(Relaxed) == 1
+    });
+    control.request_stop(Duration::from_secs(10));
+    let exit = join_within(h, Duration::from_secs(1));
+    assert_eq!(exit.reason, DrainExitReason::Stopped);
+    assert!(
+        exit.last_panic
+            .as_deref()
+            .is_some_and(|m| m.contains("blocking task still running"))
+    );
+    assert!(s.exists(), "a panicked commit is never confirmed");
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
