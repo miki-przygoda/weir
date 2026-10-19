@@ -43,6 +43,7 @@
       <tr><td>Push records from your own app</td><td><code class="inline">weir-client</code></td><td>no</td></tr>
       <tr><td>Forward records to a custom destination</td><td><code class="inline">weir-sink-sdk</code></td><td>no</td></tr>
       <tr><td>Read / recover / inspect WAB segments off disk</td><td><code class="inline">weir-wab</code></td><td>no</td></tr>
+      <tr><td>Interpret a daemon's status and Conditions (offline or live)</td><td><code class="inline">weir-status</code></td><td>no</td></tr>
       <tr><td>Prove a sealed segment wasn't edited after the fact</td><td><code class="inline">weir-attest</code></td><td>no</td></tr>
       <tr><td>Operate a running daemon from the shell</td><td><code class="inline">weir-ctl</code></td><td>no</td></tr>
       <tr><td>Build a producer in another language</td><td>the <a href="https://miki-przygoda.github.io/weir/wire_protocol.html">wire protocol</a></td><td>no — zero Rust deps</td></tr>
@@ -101,6 +102,12 @@
       <p class="card-sub">Standalone, runtime-free reader of the on-disk WAB segment format. Point <code class="inline">SegmentReader</code> at any segment file and it streams each record, verifying its CRC32. The format is versioned: <code class="inline">FORMAT_VERSION_V1</code> and <code class="inline">FORMAT_VERSION_V2</code> (the zstd-compressed segment) are both readable, with <code class="inline">FORMAT_VERSION_MAX_SUPPORTED</code> naming the ceiling.</p>
       <p class="card-sub" style="margin:0"><b>Reach for it when</b> you build an offline recovery / export / inspection tool. This is the same parser the daemon and <code class="inline">weir-ctl</code> use — one implementation, no drift.</p>
       <p style="margin:10px 0 0"><a href="https://miki-przygoda.github.io/weir/wab_format.html">→ docs</a></p>
+    </div>
+
+    <div class="card">
+      <h3>weir-status</h3>
+      <div class="chips"><span class="chip">lib</span><span class="chip">Cross-platform</span><span class="chip">deps: serde</span></div>
+      <p class="card-sub">The status model the daemon and <code class="inline">weir-ctl</code> share: the Conditions catalogue, the pure evaluator and probe predicates, and the <code class="inline">weir.status/v1</code> document types. No I/O, no clock.</p>
     </div>
 
     <div class="card">

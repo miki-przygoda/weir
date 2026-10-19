@@ -1,0 +1,21 @@
+[package]
+name = "weir-status"
+description = "Status model, Conditions evaluator and probe predicates shared by the weir daemon and weir-ctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["weir", "status", "health", "readiness", "monitoring"]
+categories = ["development-tools::debugging"]
+
+[dependencies]
+# The status document is a serde type that both the daemon and weir-ctl must
+# (de)serialise identically. serde is already in the lock tree (weir-server's
+# config parsing). No I/O, no clock, no tokio: `now` is always passed in.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# Golden documents and round-trip tests only. Already in the lock tree.
+serde_json = "1"

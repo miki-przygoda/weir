@@ -2,6 +2,7 @@
 members = [
     "crates/weir-core",
     "crates/weir-wab",
+    "crates/weir-status",
     "crates/weir-sink-sdk",
     "crates/weir-attest",
     "crates/weir-sink-s3",
@@ -31,6 +32,7 @@ homepage = "https://github.com/miki-przygoda/weir"
 [workspace.dependencies]
 weir-core = { path = "crates/weir-core", version = "4.0.1" }
 weir-wab = { path = "crates/weir-wab", version = "4.0.1" }
+weir-status = { path = "crates/weir-status", version = "4.0.1" }
 weir-sink-sdk = { path = "crates/weir-sink-sdk", version = "4.0.1" }
 weir-attest = { path = "crates/weir-attest", version = "4.0.1" }
 weir-sink-s3 = { path = "crates/weir-sink-s3", version = "4.0.1" }

@@ -122,14 +122,16 @@ Details in [socket-bind](security/socket-bind.md#stale-socket-removal-and-the-li
 | `weir-core` | yes | **yes** | `windows` CI job, `cargo check --all-features` |
 | `weir-wab` | yes | **yes** | same |
 | `weir-sink-sdk` | yes | **yes** | same |
+| `weir-status` | yes | **yes** | same |
 | `weir-sink-s3` | yes | yes (no platform-specific code) | not separately gated |
 | `weir-client`, TCP + mTLS transport | yes | **yes** | `windows` CI job builds `weir-client --features tls` |
 | `weir-client`, Unix-socket transport | yes | no — `WeirClient::connect` is `#[cfg(unix)]` | — |
 | `weir-server` | Unix only | no | — |
 | `weir-ctl` | Unix only — it drives the Unix-socket client | no | — |
 
-A Rust developer on Windows can depend on `weir-core`, `weir-wab` and
-`weir-sink-sdk` for the wire codec, the on-disk format, or to write a sink, and
+A Rust developer on Windows can depend on `weir-core`, `weir-wab`, `weir-sink-sdk`
+and `weir-status` for the wire codec, the on-disk format, to write a sink, or to
+evaluate a daemon's status, and
 on `weir-client --features tls` to produce records against a remote daemon. The
 `windows` CI job exists to keep that true: it is the only thing that would catch
 an ungated `libc::` or `std::os::unix` import landing in one of them.

@@ -140,8 +140,8 @@ actually compiled in.
 
 **Windows is a separate `windows` job, and it does not build the daemon.** It
 builds `weir-client --features tls` — the supported Windows-producer
-configuration — and `cargo check`s the three published libraries (`weir-core`,
-`weir-wab`, `weir-sink-sdk`). **Cfg-gate any Unix-only code in those four
+configuration — and `cargo check`s the four published libraries (`weir-core`,
+`weir-wab`, `weir-sink-sdk`, `weir-status`). **Cfg-gate any Unix-only code in those five
 crates** or that job breaks. `weir-server` and `weir-ctl` are exempt: they are
 Unix-only by design, and 2.0.5 stopped building the Windows `weir-server.exe`
 that had no ingest path.
@@ -208,7 +208,7 @@ cargo +nightly fuzz run envelope_parse
 
 ## Releasing
 
-Cutting a release is its own checklist — publish order, the seven version
+Cutting a release is its own checklist — publish order, the eight version
 occurrences that bump together, the three lockfiles, and publish-before-tag. See
 [`RELEASING.md`](RELEASING.md).
 

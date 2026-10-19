@@ -2812,6 +2812,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "weir-status"
+version = "4.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "weir-testkit"
 version = "4.0.1"
 dependencies = [
