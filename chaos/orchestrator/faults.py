@@ -156,3 +156,67 @@ def fault_plan(seed, count, kind, faults_cfg):
         step["cut_after_secs"] = secs("cut_lo_ms", "cut_hi_ms")
         plan.append(step)
     return plan
+
+
+def power_cut(stack, daemon, episode):
+    """One dm-flakey power cut, KILL FIRST (the Phase 2 protocol; see the spec's
+    "Protocol: kill first, then drop and remount" and README "The protocol is
+    kill-first"). Moved verbatim from run.py's episode loop so the lifecycle
+    triggers end in exactly the cut the 6,129-cut corpus was measured with.
+    Returns the I6 canary verdict: "bit" / "did_not_bite" / "unexpected".
+
+    PROTOCOL: kill first, then drop and remount. Superseded from the original
+    "engage, then kill" — see the spec section above for the full
+    kernel-layering argument; summary:
+
+    drop_writes sits BELOW the page cache. A dropped write still leaves a
+    correct, resident page behind, and kill -9 does not evict it — so the only
+    way to actually lose a byte is drop_and_remount's umount/mount cycle, which
+    forces the dirty page out (discarded by the lying disk while engaged) and
+    then rebuilds the filesystem from whatever actually reached the platter.
+
+    KILLING FIRST makes the lying window EXACTLY ZERO BY CONSTRUCTION — weir is
+    already dead and cannot ack into it — rather than merely narrow. The
+    superseded ordering left two subprocess round trips (dmsetup resume plus a
+    table read-back) between engage and kill: 5-10ms at full rate, hundreds of
+    acks, each one a false Durable-tier I1 violation once C2 made the injector
+    actually bite.
+
+    I6: a canary block, written before the fault and overwritten while it's
+    engaged, converts the negative control from an INFERENCE (zero Buffered
+    loss is merely "suspicious") into a MEASUREMENT — if the overwrite
+    survives the umount/remount cycle, the injector did not bite THIS episode,
+    independent of anything weir did.
+    """
+    import run  # lazy: run imports faults
+    before = f"weir-chaos-canary ep={episode} phase=pre-fault\n".encode()
+    during = f"weir-chaos-canary ep={episode} phase=engaged\n".encode()
+    stack.write_canary(before)
+    daemon.kill9()
+    stack.engage_fault()
+    try:
+        # Overwritten HERE: inside the engaged window and still mounted, the
+        # same conditions weir's own WAB writes are under.
+        stack.write_canary(during)
+        stack.drop_and_remount(wab_dir=daemon.wab_dir)
+    finally:
+        # Disengage even if drop_and_remount raised partway through (e.g. its
+        # umount step failed while the fault was still live). A device left
+        # engaged means the NEXT episode's steady-state load runs against a
+        # lying disk, silently corrupting the run from that point on. Unlike
+        # the superseded protocol, weir is already dead here, so there is no
+        # timing pressure left on this cleanup — a redundant disengage on the
+        # success path (drop_and_remount already disengaged) costs one
+        # harmless extra round trip, not a false ack.
+        stack.disengage_fault()
+    return run.canary_verdict(before, during, stack.read_canary())
+
+
+def cut(mode, stack, daemon, episode):
+    """Ends an episode: a power cut (returns the canary) or SIGKILL (None)."""
+    if mode == "power_loss":
+        return power_cut(stack, daemon, episode)
+    if mode == "kill":
+        daemon.kill9()
+        return None
+    raise ValueError(f"unknown cut mode {mode!r}")

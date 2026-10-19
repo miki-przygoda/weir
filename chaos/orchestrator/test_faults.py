@@ -63,5 +63,78 @@ class TestFaultPlan(unittest.TestCase):
             self.assertEqual(step["recovery_delay_ms"], 3000)
 
 
+
+class FakeStack:
+    def __init__(self, readback=None, drop_raises=None):
+        self.calls = []
+        self.readback = readback
+        self.drop_raises = drop_raises
+        self.written = []
+
+    def write_canary(self, content):
+        self.calls.append("write_canary")
+        self.written.append(content)
+
+    def engage_fault(self):
+        self.calls.append("engage_fault")
+
+    def drop_and_remount(self, wab_dir=None):
+        self.calls.append("drop_and_remount")
+        if self.drop_raises:
+            raise self.drop_raises
+
+    def disengage_fault(self):
+        self.calls.append("disengage_fault")
+
+    def read_canary(self):
+        self.calls.append("read_canary")
+        return self.written[0] if self.readback is None else self.readback
+
+
+class CutDaemon:
+    wab_dir = "/mnt/weir-wab/wab"
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def kill9(self):
+        self.calls.append("kill9")
+
+
+class TestPowerCut(unittest.TestCase):
+    def test_kill_first_then_drop_and_remount_exactly_as_phase_2(self):
+        stack = FakeStack()
+        verdict = faults.power_cut(stack, CutDaemon(stack.calls), 3)
+        self.assertEqual(stack.calls, [
+            "write_canary", "kill9", "engage_fault", "write_canary",
+            "drop_and_remount", "disengage_fault", "read_canary"])
+        self.assertEqual(verdict, "bit")
+        self.assertIn(b"ep=3", stack.written[0])
+
+    def test_a_failed_remount_still_disengages(self):
+        stack = FakeStack(drop_raises=RuntimeError("umount busy"))
+        with self.assertRaises(RuntimeError):
+            faults.power_cut(stack, CutDaemon(stack.calls), 0)
+        self.assertEqual(stack.calls[-1], "disengage_fault")
+
+    def test_a_kill_cut_only_kills(self):
+        calls = []
+        self.assertIsNone(faults.cut("kill", FakeStack(), CutDaemon(calls), 0))
+        self.assertEqual(calls, ["kill9"])
+
+    def test_an_unknown_cut_mode_raises(self):
+        with self.assertRaises(ValueError):
+            faults.cut("bogus", FakeStack(), CutDaemon([]), 0)
+
+
+class TestPowerCutWiring(unittest.TestCase):
+    def test_main_uses_power_cut_and_no_longer_inlines_it(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")) as f:
+            body = f.read()
+        body = body[body.index("def main("):]
+        self.assertIn("faults.power_cut(stack, daemon, i)", body)
+        self.assertNotIn("stack.engage_fault()", body)
+
+
 if __name__ == "__main__":
     unittest.main()
