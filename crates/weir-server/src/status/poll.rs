@@ -3,19 +3,24 @@
 //! and the drain-heartbeat stall check with its busy gauge. Later sections
 //! of this file add the cap refresh, the lag scan, the counter windows, the
 //! evaluation and the 500 ms queue-depth task.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
 use crate::drain::{self, DrainHeartbeat, drain_appears_stalled};
-use crate::metrics::Metrics;
+use crate::metrics::{
+    ConditionLabel, Metrics, ShardLabel, SinkFailureLabel, SinkFailureValue, WorkerLabel,
+};
+use crate::models::WorkUnit;
+use crate::queue::QueueSender;
 use crate::status::board::LagReport;
 use crate::status::{StatusBoard, unix_ms_now};
+use weir_status::{ConditionCode, Evaluation, Evidence, RecentCounters, Severity, ShardState};
 use weir_wab::format::{
     EXT_ACTIVE, EXT_SEALED, SEGMENT_HEADER_LEN, confirmed_path_for, parse_segment_header,
 };
@@ -443,6 +448,12 @@ impl DrainLiveness {
         }
     }
 
+    /// How long the heartbeat has been frozen as of `now` (zero right after
+    /// it moved). The status steps publish it as `heartbeat_changed_ms`.
+    pub(crate) fn frozen_for(&self, now: std::time::Instant) -> Duration {
+        now.saturating_duration_since(self.heartbeat_changed_at)
+    }
+
     /// Folds one poll's reading in. Returns the verdict to log on this poll,
     /// with how long the heartbeat has been frozen, or `None` when the drain
     /// is moving, still inside the grace period, or rate-limited.
@@ -578,6 +589,39 @@ impl WabPoll {
                 );
                 self.last_growth_warned = Some(std::time::Instant::now());
             }
+        }
+        // Status steps (spec §5.11 3-6). They run on every tick, a failed size
+        // scan included: the lag scan and the counters are independent of it.
+        if let Some(mut st) = self.status.take() {
+            let now_ms = unix_ms_now();
+            let frozen = self.liveness.frozen_for(now);
+            st.board.heartbeat_changed_ms.store(
+                now_ms
+                    .saturating_sub(u64::try_from(frozen.as_millis()).unwrap_or(u64::MAX))
+                    .max(1),
+                Ordering::Relaxed,
+            );
+            // The busy signal, read after the size scan so the stamp is current; the
+            // same reading `check_drain_liveness` classifies, one tick later at worst.
+            match self.heartbeat.busy() {
+                Some((kind, busy_for)) => {
+                    st.board
+                        .drain_busy_sink_call
+                        .store(kind.is_sink_call(), Ordering::Relaxed);
+                    let since = now_ms
+                        .saturating_sub(u64::try_from(busy_for.as_millis()).unwrap_or(u64::MAX))
+                        .max(1);
+                    st.board.drain_busy_since_ms.store(since, Ordering::Release);
+                }
+                None => st.board.drain_busy_since_ms.store(0, Ordering::Release),
+            }
+            self.metrics
+                .drain_heartbeat_age_seconds
+                .set(frozen.as_secs_f64());
+            st.refresh_lag(now_ms).await;
+            st.refresh_recent(now, &self.metrics);
+            st.publish(now_ms, &self.metrics);
+            self.status = Some(st);
         }
         logged
     }
@@ -731,16 +775,22 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
 pub(crate) struct PollStatus {
     board: Arc<StatusBoard>,
     wab_dir: PathBuf,
-    // Read by the evaluation step (Task 1.22).
-    #[allow(dead_code)]
     thresholds: weir_status::Thresholds,
-    // Read by the evaluation step (Task 1.22).
-    #[allow(dead_code)]
     coalesce_hint: Arc<AtomicU64>,
     /// `None` only while a lag scan holds it on the blocking pool.
     footer_cache: Option<FooterCache>,
     /// Whether the last lag scan failed: the WARN fires once per episode.
     lag_failing: bool,
+    /// The sliding windows behind `RecentCounters`' 5 m / 15 m deltas.
+    windows: RecentWindows,
+    /// The conditions active at the last evaluation (transition logging).
+    prev_active: BTreeSet<ConditionCode>,
+    /// Spec §9.3 code 18 (`segments_stranded`): the stranded count at the last
+    /// new sink success, the count at the previous tick, and the success stamp
+    /// last seen.
+    stranded_baseline: u64,
+    stranded_prev: u64,
+    seen_success_ms: Option<u64>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 wires the 5 s task
@@ -757,7 +807,99 @@ impl PollStatus {
             coalesce_hint,
             footer_cache: Some(FooterCache::default()),
             lag_failing: false,
+            windows: RecentWindows::new(Instant::now()),
+            prev_active: BTreeSet::new(),
+            stranded_baseline: 0,
+            stranded_prev: 0,
+            seen_success_ms: None,
         }
+    }
+
+    /// Spec §5.11 step 5: counter deltas over their windows, and the
+    /// absolute counters, onto the board.
+    pub(crate) fn refresh_recent(&mut self, now: Instant, metrics: &Metrics) {
+        // Strandings since the last sink success. When a new success shows up,
+        // rebase on the count at the previous tick, so a strand inside this
+        // window is never hidden (errs toward firing). `None` while the sink
+        // cell is unpublished: the rule then stays unevaluated. PR 2 Task 2.2
+        // (`Publisher::sink_success`) publishes the cell; nothing else is needed.
+        let stranded_now = metrics.drain_segments_stranded.get();
+        let stranded = self.board.sink.evidence().map(|s| {
+            if s.last_success_unix_ms != self.seen_success_ms {
+                self.seen_success_ms = s.last_success_unix_ms;
+                self.stranded_baseline = self.stranded_prev;
+            }
+            stranded_now.saturating_sub(self.stranded_baseline)
+        });
+        self.stranded_prev = stranded_now;
+        let w = &mut self.windows;
+        let recent = RecentCounters {
+            ack_timeouts_5m: Some(w.ack_timeouts.delta(
+                now,
+                metrics.ack_timeout.get(),
+                Duration::from_secs(weir_status::ACK_TIMEOUT_WINDOW_SECS),
+            )),
+            fsync_failures_15m: Some(w.fsync_failures.delta(
+                now,
+                metrics.wab_fsync_failures.get(),
+                Duration::from_secs(weir_status::FSYNC_WINDOW_SECS),
+            )),
+            flusher_panics_15m: Some(w.flusher_panics.delta(
+                now,
+                metrics.wab_flusher_panics.get(),
+                Duration::from_secs(weir_status::PANIC_WINDOW_SECS),
+            )),
+            stranded_since_last_success: stranded,
+            drain_panics_total: Some(metrics.drain_panics.get()),
+            recovery_segments_failed: Some(metrics.recovery_segments_failed.get()),
+            recovery_quarantine_copy_failed: Some(metrics.recovery_quarantine_copy_failed.get()),
+            coalesce_ewma_us: Some(self.coalesce_hint.load(Ordering::Relaxed)),
+        };
+        self.board.recent.store(Arc::new(recent));
+    }
+
+    /// Spec §5.11 steps 6-7: evaluate, latch, publish, log transitions.
+    pub(crate) fn publish(&mut self, now_ms: u64, metrics: &Metrics) -> Evaluation {
+        let ev = self.board.evidence_at(now_ms);
+        let eval = weir_status::evaluate(&ev, &self.thresholds, &self.board.latches);
+        self.board.latches.update(&eval, now_ms);
+        let ready = weir_status::readiness(&ev).ok;
+        // PR 5 passes the configured livez_checks; none exist yet, so `[]`.
+        let live = weir_status::liveness(&ev, &self.thresholds, &[]).ok;
+        publish_gauges(metrics, &ev, &eval, ready, live);
+        self.log_transitions(&eval);
+        eval
+    }
+
+    /// Raising a warning or critical condition WARNs; raising an info one
+    /// (e.g. `starting` on every boot) and every clear log at INFO.
+    fn log_transitions(&mut self, eval: &Evaluation) {
+        let now: BTreeSet<ConditionCode> = eval.conditions.iter().map(|c| c.code).collect();
+        for c in eval
+            .conditions
+            .iter()
+            .filter(|c| !self.prev_active.contains(&c.code))
+        {
+            if c.severity == Severity::Info {
+                info!(
+                    code = c.code.as_str(),
+                    severity = "info",
+                    "condition raised: {}",
+                    c.summary
+                );
+            } else {
+                warn!(
+                    code = c.code.as_str(),
+                    severity = ?c.severity,
+                    "condition raised: {}",
+                    c.summary
+                );
+            }
+        }
+        for code in self.prev_active.difference(&now) {
+            info!(code = code.as_str(), "condition cleared");
+        }
+        self.prev_active = now;
     }
 
     /// Runs the lag scan off the runtime (`spawn_blocking`). The cache moves
@@ -954,6 +1096,161 @@ fn scan_shard(
 
 fn flag(v: bool) -> f64 {
     if v { 1.0 } else { 0.0 }
+}
+
+/// Counter increase over a sliding window, from 5 s samples. A baseline
+/// sample (start, 0) makes "younger than the window" count from process
+/// start, which is when every counter was 0.
+pub(crate) struct RecentWindow {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl RecentWindow {
+    pub(crate) fn new(start: Instant) -> Self {
+        RecentWindow {
+            samples: VecDeque::from([(start, 0)]),
+        }
+    }
+
+    /// The increase of `current` over the last `window`: against the newest
+    /// sample at least `window` old, or the baseline while none is. Samples
+    /// older than that one are dropped, so the deque holds one window.
+    pub(crate) fn delta(&mut self, now: Instant, current: u64, window: Duration) -> u64 {
+        self.samples.push_back((now, current));
+        if let Some(cutoff) = now.checked_sub(window) {
+            while self.samples.len() >= 2 && self.samples[1].0 <= cutoff {
+                self.samples.pop_front();
+            }
+        }
+        current.saturating_sub(self.samples[0].1)
+    }
+}
+
+struct RecentWindows {
+    ack_timeouts: RecentWindow,
+    fsync_failures: RecentWindow,
+    flusher_panics: RecentWindow,
+}
+
+impl RecentWindows {
+    fn new(start: Instant) -> Self {
+        RecentWindows {
+            ack_timeouts: RecentWindow::new(start),
+            fsync_failures: RecentWindow::new(start),
+            flusher_panics: RecentWindow::new(start),
+        }
+    }
+}
+
+fn age_secs(now_ms: u64, then_ms: u64) -> f64 {
+    now_ms.saturating_sub(then_ms) as f64 / 1000.0
+}
+
+/// Every gauge the evaluation and the evidence feed (spec §5.11 step 6).
+pub(crate) fn publish_gauges(
+    m: &Metrics,
+    ev: &Evidence,
+    eval: &Evaluation,
+    ready: bool,
+    live: bool,
+) {
+    let now = ev.now_unix_ms;
+    m.ready.set(flag(ready));
+    m.live.set(flag(live));
+    for e in weir_status::CATALOGUE {
+        m.condition_active
+            .get_or_create(&ConditionLabel::of(e))
+            .set(flag(eval.is_active(e.code)));
+    }
+    for s in ev.shards.iter().flatten() {
+        let l = ShardLabel::of(usize::from(s.id));
+        m.wab_shard_up.get_or_create(&l).set(flag(matches!(
+            s.state,
+            ShardState::Up | ShardState::Respawning
+        )));
+        m.wab_handoff_blocked_seconds.get_or_create(&l).set(
+            s.handoff_blocked_since_unix_ms
+                .map_or(0.0, |t| age_secs(now, t)),
+        );
+        m.wab_active_segment_age_seconds
+            .get_or_create(&l)
+            .set(s.active_segment_age_secs.unwrap_or(0.0));
+    }
+    for w in ev.workers.iter().flatten() {
+        m.worker_up
+            .get_or_create(&WorkerLabel::of(usize::from(w.id)))
+            .set(flag(w.running));
+    }
+    if let Some(c) = &ev.wab_cap {
+        m.wab_cap_rejecting.set(flag(c.rejecting));
+    }
+    if let Some(b) = &ev.backlog {
+        m.wab_undelivered_segments
+            .set(b.undelivered_segments as f64);
+        m.wab_undelivered_records.set(b.undelivered_records as f64);
+        m.wab_oldest_undelivered_age_seconds
+            .set(b.oldest_undelivered_age_secs.unwrap_or(0.0));
+        // Cadence change (spec §13): the 5 s task now also sets these.
+        m.dead_letter_bytes_on_disk.set(b.dead_letter_bytes as f64);
+        m.quarantine_bytes_on_disk.set(b.quarantine_bytes as f64);
+    }
+    if let Some(d) = &ev.drain {
+        m.drain_commit_in_flight_seconds.set(
+            d.commit_in_flight_since_unix_ms
+                .map_or(0.0, |t| age_secs(now, t)),
+        );
+    }
+    if let Some(s) = &ev.sink {
+        m.sink_last_success_timestamp_seconds
+            .set(s.last_success_unix_ms.map_or(0.0, |t| t as f64 / 1000.0));
+        m.sink_consecutive_failures
+            .set(s.consecutive_failures as f64);
+        if let (Some(t), Some(k)) = (s.last_failure_unix_ms, s.last_failure_kind) {
+            m.sink_last_failure_timestamp_seconds
+                .get_or_create(&SinkFailureLabel {
+                    kind: SinkFailureValue::of(k),
+                })
+                .set(t as f64 / 1000.0);
+        }
+    }
+}
+
+/// Stamps when the drain channel rose to `high_depth` and clears it below
+/// (spec §9.3 code 8's "≥ 230 for 10 s"). Unpublished depth is not high.
+pub(crate) fn update_channel_high(board: &StatusBoard, now_ms: u64, high_depth: u64) {
+    let depth = board.drain_depth.load(Ordering::Relaxed);
+    if depth != crate::status::board::DEPTH_UNPUBLISHED && depth as u64 >= high_depth {
+        let _ = board.channel_high_since_ms.compare_exchange(
+            0,
+            now_ms.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    } else {
+        board.channel_high_since_ms.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The 500 ms task (spec §5.11): queue depth into the gauge and the board,
+/// and the channel high-water stamp. Holds a `queue_tx` clone: main aborts
+/// and awaits it at shutdown (from PR 4; today `drop(rt)` releases it).
+#[allow(dead_code)] // Task 1.23 replaces main's 500 ms task with it
+pub(crate) fn spawn_queue_depth_task(
+    queue_tx: QueueSender<WorkUnit>,
+    metrics: Arc<Metrics>,
+    board: Arc<StatusBoard>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(500));
+        let high = weir_status::Thresholds::DEFAULT.channel_high_depth;
+        loop {
+            interval.tick().await;
+            let depth = queue_tx.len();
+            metrics.queue_depth.set(depth as f64);
+            board.queue_depth.store(depth as u64, Ordering::Relaxed);
+            update_channel_high(&board, unix_ms_now(), high);
+        }
+    })
 }
 
 /// Spec §6 step 9: the first size scan and cap evaluation run synchronously,
@@ -2229,6 +2526,169 @@ mod tests {
             board.wab.lag().unwrap().undelivered_records,
             4,
             "a failed scan leaves the last report (stale, not zero)"
+        );
+    }
+
+    use weir_status::{ConditionCode, ListenerState, Phase, SinceLookup};
+
+    #[test]
+    fn a_window_counts_increases_within_it_and_forgets_older_ones() {
+        let t0 = Instant::now();
+        let mut w = RecentWindow::new(t0);
+        assert_eq!(
+            w.delta(t0 + secs(5), 2, secs(300)),
+            2,
+            "younger than the window: counted since process start"
+        );
+        assert_eq!(w.delta(t0 + secs(200), 2, secs(300)), 2);
+        assert_eq!(
+            w.delta(t0 + secs(400), 2, secs(300)),
+            0,
+            "no increase in the last 300 s"
+        );
+        assert_eq!(w.delta(t0 + secs(405), 5, secs(300)), 3);
+    }
+
+    #[test]
+    fn the_channel_high_water_mark_is_stamped_once_and_cleared_below() {
+        let b = StatusBoard::for_test();
+        update_channel_high(&b, 100, 230);
+        assert_eq!(
+            b.channel_high_since_ms.load(Ordering::Relaxed),
+            0,
+            "unpublished depth is not high"
+        );
+        b.drain_depth.store(240, Ordering::Relaxed);
+        update_channel_high(&b, 100, 230);
+        update_channel_high(&b, 200, 230);
+        assert_eq!(b.channel_high_since_ms.load(Ordering::Relaxed), 100);
+        b.drain_depth.store(10, Ordering::Relaxed);
+        update_channel_high(&b, 300, 230);
+        assert_eq!(b.channel_high_since_ms.load(Ordering::Relaxed), 0);
+    }
+
+    fn serving_board() -> Arc<StatusBoard> {
+        let b = crate::status::test_board(2, 1);
+        b.shards.mark_up(0);
+        b.shards.mark_up(1);
+        let guard = crate::status::WorkerGuard::enter(Arc::clone(&b.shards), 0);
+        std::mem::forget(guard); // keep the worker "running" for the test's life
+        b.listeners.unix.set(ListenerState::Bound);
+        b.life.enter(Phase::Serving, unix_ms_now());
+        b
+    }
+
+    #[tokio::test]
+    async fn one_tick_evaluates_publishes_gauges_and_latches() {
+        let root = crate::testutil::scratch_dir("poll_full_tick");
+        let _ = std::fs::remove_dir_all(&root);
+        crate::testutil::mkdir_p(root.join("shard_00"));
+        sealed(&root.join("shard_00"), 1, 2);
+        let board = serving_board();
+        let (m, reg) = Metrics::new();
+        m.init_topology(2, 1);
+        let m = Arc::new(m);
+        let mut poll = poll_for(&board, &m, 0, root);
+        poll.tick(Instant::now(), || async { Ok(Some(10)) }).await;
+        assert_eq!(m.ready.get(), 1.0);
+        assert_eq!(m.live.get(), 1.0);
+        assert_eq!(m.wab_undelivered_segments.get(), 1.0);
+        assert!(board.heartbeat_changed_ms.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            board.drain_busy_since_ms.load(Ordering::Relaxed),
+            0,
+            "an idle drain publishes no busy stamp"
+        );
+        assert_eq!(board.recent.load_full().ack_timeouts_5m, Some(0));
+        // The test board's ConfigView is the noop sink: one active condition.
+        assert!(board.latches.since(ConditionCode::NoopSink).is_some());
+        let mut out = String::new();
+        prometheus_client::encoding::text::encode(&mut out, &reg).unwrap();
+        assert!(
+            out.contains("weir_condition_active{code=\"noop_sink\",severity=\"warning\"} 1"),
+            "{out}"
+        );
+        assert!(out.contains("weir_wab_shard_up{shard=\"1\"} 1"));
+        assert!(out.contains("weir_worker_up{worker=\"0\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn condition_transitions_are_logged_once_each_way() {
+        let board = serving_board();
+        let m = Arc::new(Metrics::new().0);
+        let mut st = PollStatus::new(
+            Arc::clone(&board),
+            std::path::PathBuf::from("/nonexistent"),
+            Arc::new(AtomicU64::new(200)),
+        );
+        st.refresh_recent(Instant::now(), &m);
+        let (_, first) = crate::testutil::capture_logs(|| st.publish(unix_ms_now(), &m));
+        assert!(
+            first.contains("condition raised") && first.contains("noop_sink"),
+            "{first}"
+        );
+        let (_, second) = crate::testutil::capture_logs(|| st.publish(unix_ms_now(), &m));
+        assert!(
+            !second.contains("condition raised"),
+            "no repeat while it stays active: {second}"
+        );
+        board.wab_cap_rejecting.store(true, Ordering::Relaxed);
+        let (_, third) = crate::testutil::capture_logs(|| st.publish(unix_ms_now(), &m));
+        assert!(
+            third.contains("WARN") && third.contains("wab_cap_rejecting"),
+            "{third}"
+        );
+        board.wab_cap_rejecting.store(false, Ordering::Relaxed);
+        let (_, fourth) = crate::testutil::capture_logs(|| st.publish(unix_ms_now(), &m));
+        assert!(
+            fourth.contains("condition cleared") && fourth.contains("wab_cap_rejecting"),
+            "{fourth}"
+        );
+        assert_eq!(m.ready.get(), 1.0);
+    }
+
+    #[test]
+    fn stranded_since_last_success_rebases_on_each_new_success() {
+        let board = StatusBoard::for_test();
+        let m = Metrics::new().0;
+        let mut st = PollStatus::new(
+            Arc::clone(&board),
+            std::path::PathBuf::from("/nonexistent"),
+            Arc::new(AtomicU64::new(200)),
+        );
+        st.refresh_recent(Instant::now(), &m);
+        assert_eq!(
+            board.recent.load_full().stranded_since_last_success,
+            None,
+            "unpublished sink cell"
+        );
+        board.sink.record_success();
+        m.drain_segments_stranded.inc();
+        st.refresh_recent(Instant::now(), &m);
+        assert_eq!(
+            board.recent.load_full().stranded_since_last_success,
+            Some(1)
+        );
+        // `record_success` stamps whole milliseconds; make the second one distinct.
+        std::thread::sleep(Duration::from_millis(2));
+        board.sink.record_success();
+        st.refresh_recent(Instant::now(), &m);
+        st.refresh_recent(Instant::now(), &m);
+        assert_eq!(
+            board.recent.load_full().stranded_since_last_success,
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_size_scan_still_evaluates() {
+        let board = serving_board();
+        let m = Arc::new(Metrics::new().0);
+        let mut poll = poll_for(&board, &m, 0, std::path::PathBuf::from("/nonexistent"));
+        poll.tick(Instant::now(), || async { Ok(None) }).await;
+        assert!(
+            board.latches.since(ConditionCode::WabScanStale).is_some(),
+            "the status steps ran without a size scan"
         );
     }
 }
