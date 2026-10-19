@@ -213,6 +213,41 @@ impl WeirServer {
         Some(response[idx + 4..].to_string())
     }
 
+    // ── Admin socket ─────────────────────────────────────────────────────────
+
+    /// The admin socket the daemon derives from its `wab_dir`
+    /// (`<parent>/<name>.admin.sock`, Foundations spec §5.9). With the
+    /// harness's default layout that is `tmp_dir/wab.admin.sock`.
+    pub fn admin_socket_path(&self) -> PathBuf {
+        let name = self
+            .wab_dir
+            .file_name()
+            .expect("wab_dir has a final component");
+        let mut file = name.to_os_string();
+        file.push(".admin.sock");
+        self.wab_dir
+            .parent()
+            .expect("wab_dir has a parent")
+            .join(file)
+    }
+
+    /// Sends one admin request `{"v":1,"id":1,"verb":<verb>,"args":<args_json>}`
+    /// on a fresh connection and returns the response line (without `\n`).
+    /// Waits up to 40 s, longer than the 30 s maximum `wait_ms`.
+    #[cfg(unix)]
+    pub fn admin(&self, verb: &str, args_json: &str) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let mut s = std::os::unix::net::UnixStream::connect(self.admin_socket_path())
+            .expect("connect to the admin socket");
+        s.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
+        writeln!(s, r#"{{"v":1,"id":1,"verb":"{verb}","args":{args_json}}}"#).unwrap();
+        let mut line = String::new();
+        BufReader::new(s)
+            .read_line(&mut line)
+            .expect("read the admin response");
+        line.trim_end().to_string()
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     /// Kills the server immediately with SIGKILL. The socket and temp files
@@ -626,6 +661,13 @@ impl WeirServerBuilder {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&wab_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // tmp_dir is the parent of the default wab_dir, so it is where the
+            // daemon derives its admin socket (`tmp_dir/wab.admin.sock`), and
+            // that bind refuses a group- or world-writable parent. Pin it to
+            // 0755 rather than inherit the test process's umask: under a
+            // umask of 0002 `create_dir_all` makes it 0775, and every daemon
+            // would then run with admin unavailable.
+            std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
         let mut config = format!(

@@ -622,7 +622,6 @@ pub(crate) struct AdminCell {
     path: ArcSwapOption<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // PR 6 (admin socket) writes these
 impl AdminCell {
     pub(crate) fn new() -> Self {
         AdminCell {
@@ -667,7 +666,6 @@ pub(crate) struct ReloadCell {
     tls: AtomicU8, // 0 never attempted, 1 last attempt ok, 2 last attempt failed
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // PR 6 (Reloader) publishes
 impl ReloadCell {
     pub(crate) fn new() -> Self {
         ReloadCell {

@@ -699,13 +699,6 @@ pub struct ConfigSource {
 // ── Admin socket path (Foundations spec §11) ─────────────────────────────────
 
 /// Where (and whether) the admin socket binds. Resolved once at startup.
-// Unconditional: the tests compare it only through the derived PartialEq,
-// which dead-code analysis ignores, so its fields are unread in the test
-// target too until `admin::start` destructures it.
-#[allow(
-    dead_code,
-    reason = "admin::start (Task 6.14) is the caller; Task 6.14 removes this"
-)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AdminSocketSetting {
     /// `admin_socket_enabled = false`.
@@ -734,10 +727,6 @@ pub(crate) enum AdminPathProblem {
 
 impl AdminPathProblem {
     /// Public-safe reason code (spec §9.1: codes, never free text).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "admin::start (Task 6.14) is the caller")
-    )]
     pub(crate) fn reason_code(self) -> &'static str {
         match self {
             AdminPathProblem::TooLong => "path_too_long",
@@ -1484,10 +1473,6 @@ impl Config {
     /// `from_layers`), or the path derived from `wab_dir`, which is
     /// `DerivedUnusable` when it breaks a static rule so admin is disabled
     /// rather than startup failing.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "admin::start (Task 6.14) is the caller")
-    )]
     pub(crate) fn admin_socket(&self) -> AdminSocketSetting {
         if !self.admin_socket_enabled {
             return AdminSocketSetting::Disabled;

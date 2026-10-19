@@ -145,26 +145,12 @@ impl DrainControl {
     }
 
     /// Pause delivery before the next commit batch. Returns the request's sequence number.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-        )
-    )]
     pub(crate) fn request_pause(&self) -> u64 {
         self.0.pause.store(true, Release);
         self.0.pause_seq.fetch_add(1, AcqRel) + 1
     }
 
     /// Resume delivery. Returns the request's sequence number.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-        )
-    )]
     pub(crate) fn request_resume(&self) -> u64 {
         self.0.pause.store(false, Release);
         self.0.pause_seq.fetch_add(1, AcqRel) + 1
@@ -173,13 +159,6 @@ impl DrainControl {
     /// Ask for a stranded-segment rescan. A request made while an earlier
     /// ticket is still unobserved folds into it and returns that ticket, so a
     /// caller looping on this cannot queue more than one scan (spec §5.4).
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-        )
-    )]
     pub(crate) fn request_requeue(&self) -> u64 {
         loop {
             let req = self.0.requeue_req.load(Acquire);

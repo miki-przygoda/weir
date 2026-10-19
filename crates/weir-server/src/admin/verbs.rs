@@ -93,7 +93,7 @@ fn drain_obs(board: &StatusBoard) -> DrainObs {
     }
 }
 
-/// Everything the admin verbs act on. Built once in `main` (Task 6.14) and
+/// Everything the admin verbs act on. Built once by [`super::start`] (startup step 7) and
 /// shared by every connection as `Arc<AdminState>`.
 pub(crate) struct AdminState {
     pub(crate) board: Arc<StatusBoard>,

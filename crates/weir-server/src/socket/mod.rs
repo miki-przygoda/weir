@@ -621,13 +621,6 @@ pub(crate) struct BoundSocket {
 }
 
 /// What a hardened bind does about a parent directory others can write to.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "admin::bind_admin (Task 6.6) constructs RequirePrivate; Task 6.14 removes this"
-    )
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParentPolicy {
     /// The producer socket: WARN and bind. Operators legitimately put
@@ -1025,13 +1018,6 @@ pub(crate) fn unknown_socket_refusal(path: &Path, errno: i32) -> io::Error {
 /// The producer bind does not call it: that would connect to a live daemon
 /// twice.
 #[cfg(unix)]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "PR 6's admin bind is the caller; PR 6 Task 6.14 removes this"
-    )
-)]
 pub(crate) fn refuse_if_live(path: &Path, what: &str) -> io::Result<()> {
     match probe_socket(path) {
         SocketProbe::Absent | SocketProbe::Stale => Ok(()),
@@ -1448,13 +1434,6 @@ impl std::fmt::Display for InsecureParent {
 impl std::error::Error for InsecureParent {}
 
 /// True when `e` is [`bind_hardened_with`]'s private-parent refusal.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "admin::bind_admin (Task 6.6) is the caller; Task 6.14 removes this"
-    )
-)]
 pub(crate) fn is_insecure_parent(e: &io::Error) -> bool {
     e.get_ref()
         .is_some_and(|inner| inner.is::<InsecureParent>())

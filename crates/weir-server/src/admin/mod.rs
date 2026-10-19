@@ -2,11 +2,6 @@
 //! channel for the daemon's own uid and root, separate from the producer
 //! socket and never on the producer-shared directory.
 
-// Unreachable from `main` until Task 6.14 wires it in. Unconditional, so it
-// also covers the test target that `--all-targets` lints; Task 6.14 deletes
-// this line and clippy must then pass without it.
-#![allow(dead_code, reason = "wired into main by Task 6.14")]
-
 pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod verbs;
@@ -22,15 +17,23 @@ use serde_json::Value;
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
-    sync::Semaphore,
+    sync::{Semaphore, mpsc, watch},
     task::{JoinHandle, JoinSet},
 };
-use tracing::warn;
-use weir_status::admin::{AdminError, ErrorCode, Response};
+use tracing::{error, info, warn};
+use weir_status::{
+    AdminReason, LivezCheck, Thresholds,
+    admin::{AdminError, ErrorCode, Response},
+};
 
 use crate::{
+    config::{AdminSocketSetting, Config},
+    drain::control::DrainControl,
+    lifecycle::ShutdownLevel,
     metrics::{AdminOutcomeLabel, AdminRequestLabel, AdminVerbLabel, Metrics},
+    reload::ReloadRequest,
     socket::{self, BoundSocket, ParentPolicy},
+    status::StatusBoard,
 };
 use framing::{Dispatch, Limits};
 use verbs::AdminState;
@@ -38,8 +41,8 @@ use verbs::AdminState;
 /// Why the admin socket could not be bound. Codes only, from code: they go
 /// into log fields and error messages. The status board carries PR 1's closed
 /// `weir_status::AdminReason` instead, mapped from these codes (plus the
-/// config layer's `no_parent`, `path_too_long`, `under_wab_dir`) by Task
-/// 6.14's `admin_reason`.
+/// config layer's `no_parent`, `path_too_long`, `under_wab_dir`) by
+/// [`admin_reason`].
 pub(crate) mod reason {
     pub(crate) const PARENT_INSECURE: &str = "parent_insecure";
     pub(crate) const IN_USE: &str = "in_use";
@@ -152,6 +155,111 @@ pub(crate) fn names_same_file(admin: &Path, socket_path: &Path) -> bool {
         (Some(Ok(a)), Some(Ok(b))) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
         _ => false,
     }
+}
+
+/// PR 1's closed `AdminReason` (it renders on the public `/status`) for one
+/// of this module's reason codes or the config layer's. A collision with
+/// `socket_path` is `in_use` (the producer socket holds that name);
+/// `no_parent` and `under_wab_dir`, which a derived path cannot produce, fall
+/// to `bind_failed`.
+fn admin_reason(code: &str) -> AdminReason {
+    match code {
+        reason::PARENT_INSECURE => AdminReason::ParentInsecure,
+        "path_too_long" => AdminReason::PathTooLong,
+        reason::IN_USE | reason::COLLIDES_WITH_SOCKET_PATH => AdminReason::InUse,
+        _ => AdminReason::BindFailed,
+    }
+}
+
+/// What startup step 7 hands the admin socket: the shared state its verbs
+/// read and the handles they act through.
+pub(crate) struct StartDeps {
+    pub(crate) board: Arc<StatusBoard>,
+    pub(crate) drain_ctl: DrainControl,
+    /// A clone of the reload queue SIGHUP feeds (spec §5.10: one path).
+    pub(crate) reload_tx: mpsc::Sender<ReloadRequest>,
+    pub(crate) level_rx: watch::Receiver<ShutdownLevel>,
+    pub(crate) thresholds: Arc<Thresholds>,
+    pub(crate) livez_checks: Arc<[LivezCheck]>,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) started_at_ms: u64,
+}
+
+/// Startup step 7 (spec §6): resolve, bind and serve the admin socket. Must
+/// run inside a tokio runtime (`main` holds `rt.enter()`).
+///
+/// `Err` only for an explicitly configured path (fatal, before recovery); a
+/// derived default that cannot be used disables admin with an ERROR and
+/// `AdminCell::set_unavailable`, which raises `admin_unavailable`.
+pub(crate) fn start(cfg: &Config, deps: StartDeps) -> io::Result<Option<AdminHandle>> {
+    let (path, explicit) = match cfg.admin_socket() {
+        AdminSocketSetting::Disabled => {
+            deps.board.admin.set_disabled();
+            info!("admin socket disabled (admin_socket_enabled = false)");
+            return Ok(None);
+        }
+        AdminSocketSetting::Explicit(p) => (p, true),
+        AdminSocketSetting::Derived(p) => (p, false),
+        AdminSocketSetting::DerivedUnusable { reason_code, path } => {
+            error!(
+                reason_code,
+                path = ?path,
+                "admin socket unavailable: the default path derived from wab_dir cannot be \
+                 used; set admin_socket_path to a file in a directory writable only by the \
+                 daemon user, or admin_socket_enabled = false"
+            );
+            deps.board.admin.set_unavailable(admin_reason(reason_code));
+            return Ok(None);
+        }
+    };
+    let bound = match bind_admin(&path, &cfg.socket_path) {
+        Ok(b) => b,
+        Err(e) if explicit => {
+            return Err(io::Error::new(
+                e.source.kind(),
+                format!("admin_socket_path '{}': {}", path.display(), e.source),
+            ));
+        }
+        Err(e) => {
+            error!(
+                path = %path.display(),
+                reason_code = e.reason_code,
+                error = %e.source,
+                "admin socket unavailable; the daemon runs without it. Set admin_socket_path to \
+                 a file in a directory writable only by the daemon user, or \
+                 admin_socket_enabled = false"
+            );
+            deps.board
+                .admin
+                .set_unavailable(admin_reason(e.reason_code));
+            return Ok(None);
+        }
+    };
+    let instance = match identity::instance_id(&cfg.wab_dir, &cfg.socket_path, deps.started_at_ms) {
+        Ok(i) => i,
+        Err(e) => {
+            // Bound but not served: do not leave the file behind.
+            socket::remove_own_socket(&bound.path, &bound.socket);
+            return Err(e);
+        }
+    };
+    let state = Arc::new(AdminState {
+        board: Arc::clone(&deps.board),
+        drain_ctl: deps.drain_ctl,
+        reload_tx: deps.reload_tx,
+        level_rx: deps.level_rx,
+        thresholds: deps.thresholds,
+        livez_checks: deps.livez_checks,
+        instance,
+        metrics: deps.metrics,
+        wab_max_bytes: cfg.wab_max_bytes,
+        // Safety: geteuid has no preconditions.
+        daemon_euid: unsafe { libc::geteuid() },
+        mutate: tokio::sync::Mutex::new(()),
+    });
+    deps.board.admin.set_bound(bound.path.display().to_string());
+    info!(path = %bound.path.display(), "admin socket listening");
+    Ok(Some(spawn(bound, state)))
 }
 
 /// spec §11: at most 4 concurrent admin connections per socket.

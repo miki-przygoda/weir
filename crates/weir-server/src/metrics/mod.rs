@@ -781,22 +781,8 @@ pub(crate) struct Metrics {
 
     // ── Admin socket (Foundations spec §11) ───────────────────────────────────
     /// `weir_admin_requests_total{verb,outcome}`.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read by the admin module (Tasks 6.12/6.13); Task 6.14 removes this"
-        )
-    )]
     pub admin_requests: Family<AdminRequestLabel, Counter<u64, AtomicU64>>,
     /// 1 while the admin socket is bound and served, else 0.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "read by the admin module (Tasks 6.12/6.13); Task 6.14 removes this"
-        )
-    )]
     pub admin_socket_up: Gauge<f64, AtomicU64>,
 
     // ── Drain ledger (safety floor, spec §4.0) ────────────────────────────────

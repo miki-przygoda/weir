@@ -51,33 +51,12 @@ pub(crate) const NOTE_NOTHING_RELOADABLE: &str = "nothing_reloadable";
 
 /// The wire name of the TLS material item in the admin `reload` answer
 /// (spec §11), and in the status document's reload evidence.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the admin verb (Task 6.9) and main (Task 6.14) call it"
-    )
-)]
 pub(crate) const ITEM_TLS_CERTIFICATES: &str = "tls_certificates";
 
 /// How long the admin verb waits for room in the 8-deep reload queue.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the admin verb (Task 6.9) and main (Task 6.14) call it"
-    )
-)]
 pub(crate) const ADMIN_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long the admin verb waits for the loop's answer.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the admin verb (Task 6.9) and main (Task 6.14) call it"
-    )
-)]
 pub(crate) const ADMIN_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What asked for a reload.
@@ -86,7 +65,6 @@ pub(crate) enum ReloadTrigger {
     Sighup,
     /// The admin socket's `reload` verb (Foundations), through
     /// [`request_reload_and_wait`].
-    #[cfg_attr(not(test), allow(dead_code))] // Task 6.14 wires the admin socket
     Admin,
 }
 
@@ -150,13 +128,6 @@ pub(crate) struct ReloadReport {
 impl ReloadReport {
     /// The admin wire shape (spec §5.10/§11). One item today: the TLS
     /// material. The config file is reported as not reloaded.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the admin verb (Task 6.9) and main (Task 6.14) call it"
-        )
-    )]
     pub(crate) fn to_wire(&self) -> weir_status::admin::ReloadResult {
         use weir_status::admin::{
             NotReloaded, ReloadItemOutcomeWire as Item, ReloadItemWire as ReloadItem,
@@ -246,13 +217,6 @@ impl Reloader {
 
     /// Hands the reloader the status board, so each report lands in its
     /// `reload` cell. Once: a second call is a bug and is ignored.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the admin verb (Task 6.9) and main (Task 6.14) call it"
-        )
-    )]
     pub(crate) fn attach_board(&self, board: Arc<StatusBoard>) {
         if self.board.set(board).is_err() {
             warn!("status board attached to the reloader twice; keeping the first");
@@ -439,13 +403,6 @@ fn count_dropped(metrics: &Metrics, trigger: ReloadTrigger) {
 }
 
 /// Why [`request_reload_and_wait`] has no report.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the admin verb (Task 6.9) and main (Task 6.14) call it"
-    )
-)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReloadWaitError {
     /// No room in the queue within the enqueue timeout (counted `dropped`).
@@ -463,13 +420,6 @@ pub(crate) enum ReloadWaitError {
 /// Unlike [`request_reload`] it waits for room, up to `enqueue_timeout`,
 /// then for the answer, up to `reply_timeout`. A request that never got into
 /// the queue is counted `dropped`; one that did is counted by the Reloader.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the admin verb (Task 6.9) and main (Task 6.14) call it"
-    )
-)]
 pub(crate) async fn request_reload_and_wait(
     tx: &mpsc::Sender<ReloadRequest>,
     trigger: ReloadTrigger,

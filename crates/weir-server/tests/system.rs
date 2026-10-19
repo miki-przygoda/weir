@@ -6310,3 +6310,117 @@ fn sigterm_with_a_zero_budget_is_prompt_and_loses_nothing() {
     drop(srv2);
     let _ = fs::remove_dir_all(&wab);
 }
+
+// ── Admin socket (Foundations PR 6, spec §5.9 / §11) ─────────────────────────
+
+fn admin_json(srv: &weir_testkit::WeirServer, verb: &str, args: &str) -> serde_json::Value {
+    let line = srv.admin(verb, args);
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
+}
+
+/// A counter or gauge sample from a scrape; 0 if absent.
+fn scrape_value(srv: &weir_testkit::WeirServer, series: &str) -> f64 {
+    srv.scrape_metrics()
+        .lines()
+        .find(|l| l.starts_with(series) && l[series.len()..].starts_with(' '))
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+#[test]
+fn admin_socket_serves_status_at_the_derived_path_and_is_removed_at_exit() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut srv = weir_server!("admin_status").start();
+    let path = srv.admin_socket_path();
+    let meta = fs::symlink_metadata(&path).expect("the admin socket exists at the derived path");
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.mode() & 0o777, 0o600);
+
+    let r = admin_json(&srv, "status", "{}");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["instance"]["pid"], srv.child_pid());
+    assert_eq!(
+        r["instance"]["wab_dir"],
+        fs::canonicalize(&srv.wab_dir)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert_eq!(r["result"]["schema"], "weir.status/v1");
+    assert_eq!(r["result"]["view"], "admin");
+    assert_eq!(scrape_value(&srv, "weir_admin_socket_up"), 1.0);
+
+    srv.sigterm();
+    assert!(
+        !path.exists(),
+        "a clean exit removes the admin socket (inode-checked)"
+    );
+}
+
+/// spec §5.10: SIGHUP and the admin verb are one reload path.
+#[test]
+fn admin_reload_and_sighup_share_one_reload_path() {
+    let srv = weir_server!("admin_reload").start();
+    let r = admin_json(&srv, "reload", "{}");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["trigger"], "admin");
+    assert_eq!(r["result"]["outcome"], "noop");
+    assert_eq!(
+        scrape_value(
+            &srv,
+            "weir_config_reloads_total{trigger=\"admin\",outcome=\"noop\"}"
+        ),
+        1.0
+    );
+    send_sighup(srv.child_pid());
+    assert_eq!(wait_for_sighup_reloads(&srv, "noop", 1), 1);
+    let s = admin_json(&srv, "status", "{}");
+    assert_eq!(s["result"]["reload"]["last"]["trigger"], "sighup", "{s}");
+}
+
+/// spec §6 step 7: an explicitly configured admin path that cannot be
+/// bound safely is fatal, before recovery.
+#[test]
+fn an_explicit_admin_path_in_a_shared_directory_refuses_to_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let shared = std::env::temp_dir().join(format!("weir_admin_shared_{}", std::process::id()));
+    fs::create_dir_all(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+    let sock = shared.join("a.sock");
+    let (status, log) = weir_server!("admin_explicit_shared")
+        .extra_config(format!("admin_socket_path = \"{}\"", sock.display()))
+        .spawn_expecting_exit(Duration::from_secs(15));
+    assert_eq!(status.code(), Some(1), "{log}");
+    assert!(log.contains("group- or world-writable"), "{log}");
+    assert!(!sock.exists(), "nothing was bound");
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// spec §6 step 7: the derived default failing disables admin, not the
+/// daemon (and raises admin_unavailable).
+#[test]
+fn a_derived_admin_path_in_a_shared_parent_disables_admin_not_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    // Short label: <canonical temp dir>/…/wab.admin.sock must stay <= 103
+    // bytes on macOS, or the derived path is path_too_long instead.
+    let shared = std::env::temp_dir().join(format!("weir_adm_sh_{}", std::process::id()));
+    let wab = shared.join("wab");
+    fs::create_dir_all(&wab).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let srv = weir_server!("admin_derived_shared")
+        .wab_dir(wab.clone())
+        .log_level("info")
+        .start();
+    let mut c = srv.client();
+    c.push(b"still-serving", Durability::Durable)
+        .expect("ingest is unaffected");
+    drop(c);
+    assert!(!shared.join("wab.admin.sock").exists());
+    assert_eq!(scrape_value(&srv, "weir_admin_socket_up"), 0.0);
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(log.contains("admin socket unavailable"), "{log}");
+    assert!(log.contains("parent_insecure"), "{log}");
+    drop(srv);
+    let _ = fs::remove_dir_all(&shared);
+}
