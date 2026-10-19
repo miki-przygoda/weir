@@ -1,5 +1,9 @@
 mod config;
 mod drain;
+// The shutdown level and the signal task (Foundations §5.6). Nothing in `main`
+// calls it yet: Task 4.10 uses part of it and Task 4.11 removes this allowance.
+#[allow(dead_code)]
+mod lifecycle;
 mod logging;
 mod metrics;
 mod models;
