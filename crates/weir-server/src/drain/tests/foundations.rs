@@ -2,6 +2,7 @@
 //! A child of `drain::tests`, so the existing helpers and `MockSink` are in scope.
 
 use super::*;
+use crate::drain::control::SLICE;
 use crate::drain::control::{DrainControl, DrainRuntime};
 use crate::drain::publish::Publisher;
 use crate::drain::{DrainCtx, DrainExit, Wait, spawn_with, wait_slice};
@@ -789,4 +790,96 @@ fn process_segment_ctl_stops_before_a_batch_when_paused() {
     );
     assert_eq!(sink.call_count(), 0, "no commit after a pause is seen");
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 10: pause during RetryingTransient after the backoff
+/// has elapsed. No spin (≤ 25 wait iterations in 1 s: the 50 ms floor), no
+/// retry fires, and sink health refreshes on its cadence.
+///
+/// The failing commit lasts 200 ms, so the pause is requested while it is
+/// still in flight: the backoff loop's first slice sees it, and the 10 ms
+/// backoff then elapses while paused. (Requesting the pause after the commit
+/// returned would race the 10 ms backoff against `wait_for`'s 5 ms poll.)
+#[test]
+fn a_pause_during_a_retry_backoff_holds_without_spinning_and_keeps_probing() {
+    let dir = tmp_dir("fnd_pause_retry");
+    let s = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink {
+        health_script: Mutex::new(std::iter::repeat_n(SinkHealth::Healthy, 1000).collect()),
+        yield_for: Duration::from_millis(200),
+        ..MockSink::with_responses([Err(MockError::Transient)])
+    });
+    let cfg = DrainConfig {
+        base_retry_delay: Duration::from_millis(10),
+        health_poll_interval: Duration::from_millis(200),
+        ..fast_config(dir.clone())
+    };
+    let control = DrainControl::detached();
+    let hb = DrainHeartbeat::new();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = spawn_with(
+        rx,
+        Arc::clone(&sink),
+        cfg,
+        noop_metrics(),
+        hb.clone(),
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    tx.send(s.clone()).unwrap();
+    wait_for(5, "the first attempt is in flight", || {
+        sink.call_count() == 1
+    });
+    control.request_pause(); // seen on the backoff loop's first slice; the 10 ms backoff then elapses while paused
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (beats0, polls0) = (hb.get(), health_polls_left(&sink));
+    std::thread::sleep(Duration::from_secs(1));
+    let beats = hb.get() - beats0;
+    let probes = polls0 - health_polls_left(&sink);
+    assert!(
+        beats <= 25,
+        "{beats} wait iterations in 1 s: the paused hold must sleep {SLICE:?} slices"
+    );
+    assert!(
+        probes >= 3,
+        "sink health must refresh on its cadence while held ({probes} probes)"
+    );
+    assert_eq!(sink.call_count(), 1, "no retry fires while paused");
+
+    control.request_resume();
+    wait_for(5, "the retry delivers after resume", || !s.exists());
+    assert_eq!(sink.call_count(), 2);
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_paused_wait_slice_never_returns_early_on_a_zero_duration() {
+    let (_tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let control = DrainControl::detached();
+    control.request_pause();
+    let (hb, publish) = (DrainHeartbeat::new(), Publisher::none());
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb: &hb,
+    };
+    let t = Instant::now();
+    assert_eq!(
+        wait_slice(
+            &rx,
+            &ctx,
+            Duration::ZERO,
+            &mut VecDeque::new(),
+            0,
+            &mut false
+        ),
+        Wait::TimedOut
+    );
+    assert!(
+        t.elapsed() >= SLICE - Duration::from_millis(5),
+        "the pause floor: {:?}",
+        t.elapsed()
+    );
 }

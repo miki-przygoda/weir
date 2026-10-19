@@ -1949,8 +1949,55 @@ fn drain_thread_with<S: Sink>(
                         // slice, which keeps the heartbeat meaning what it claims:
                         // only a thread that cannot reach its own loop at all
                         // freezes it.
+                        //
+                        // A pause holds the backoff (spec §5.4): the wait ends
+                        // only once it has elapsed AND no pause is requested.
+                        // While paused, `wait_slice`'s 50 ms floor keeps an
+                        // elapsed backoff from spinning, and `retries_left`,
+                        // `processed` and the episode's `backoff_cut` are kept.
+                        let paused = control.pause_requested();
+                        if paused {
+                            if control.stop_requested() {
+                                abandoned = Some((segment.clone(), processed));
+                                break 'outer DrainExitReason::Stopped; // pause honoured at stop
+                            }
+                            let since = *paused_since.get_or_insert_with(|| {
+                                info!(
+                                    path = %segment.display(),
+                                    "drain: paused during a retry backoff; holding the segment"
+                                );
+                                unix_ms_now()
+                            });
+                            publish.paused(since, true);
+                            metrics.drain_paused.set(1.0);
+                            // Health while held: the M2 probe below is not reached
+                            // until the hold ends, so the poll runs here on cadence.
+                            if !control.absorbing()
+                                && last_health_poll.elapsed() >= config.health_poll_interval
+                            {
+                                let now = Instant::now();
+                                prev_health_ok = probe_and_resume_stranded_with(
+                                    &rt,
+                                    &*sink,
+                                    &config,
+                                    &metrics,
+                                    Some(&drain_rx),
+                                    &mut pending,
+                                    &mut backlog,
+                                    prev_health_ok,
+                                    Some(&segment),
+                                    &|p| ledger.excludes(p, now),
+                                    &ctx,
+                                );
+                                last_health_poll = Instant::now();
+                            }
+                        } else if paused_since.take().is_some() {
+                            publish.paused(0, false);
+                            metrics.drain_paused.set(0.0);
+                            info!(path = %segment.display(), "drain: resumed during a retry backoff");
+                        }
                         let remaining = wait_end.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
+                        if remaining.is_zero() && !paused {
                             break;
                         }
                         match wait_slice(
@@ -1969,6 +2016,10 @@ fn drain_thread_with<S: Sink>(
                             // Detached shutdown: serve the clamped remainder of the
                             // backoff (W2), then finish the retry.
                             Wait::Disconnected => {
+                                if control.pause_requested() {
+                                    abandoned = Some((segment.clone(), processed));
+                                    break 'outer DrainExitReason::Stopped; // Detached shutdown honours the pause
+                                }
                                 let left = wait_end
                                     .saturating_duration_since(Instant::now())
                                     .min(SHUTDOWN_RETRY_BACKOFF_CAP)
