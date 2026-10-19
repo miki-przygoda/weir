@@ -2418,7 +2418,10 @@ Amend the safety-floor recovery test (rename it `sighup_during_startup_recovery_
     assert_alive_and_acking(&mut srv, "the SIGHUP during recovery");
     let log = read_log(&srv);
     assert_eq!(
-        log.matches("recovery complete").count(),
+        // Count only the per-segment lines: since PR 3, main also logs a
+        // one-off "WAB recovery complete" summary, which a bare substring
+        // count would add (TOTAL + 1) and which could hide a lost segment.
+        log.matches("recovery complete sealed=").count(),
         TOTAL,
         "every unsealed segment must be recovered\nlog:\n{log}"
     );
