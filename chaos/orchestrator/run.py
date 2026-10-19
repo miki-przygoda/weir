@@ -126,6 +126,54 @@ DEFAULT_MIN_FREE_BYTES = 5 * 2**30
 DEFAULT_MIN_FREE_DEVICE_BYTES = 128 * 2**20
 
 
+#: The drain budget the harness pins on every daemon unless the schedule sets
+#: one. weir's own default since Foundations is 10 s (spec §13); every schedule
+#: written before that was written against a SIGTERM that drained EVERYTHING,
+#: and its final pass verifies at frontier_slack=0 on that premise. 3600 is the
+#: top of weir's accepted range (0..=3600), and it puts the old behaviour back.
+FINAL_DRAIN_BUDGET_SECS = 3600
+#: weir's `shutdown_timeout_secs` default (config/mod.rs).
+WEIR_DEFAULT_SHUTDOWN_TIMEOUT_SECS = 30
+#: spec §7: the documented grace is shutdown_timeout + budget + 5.
+SHUTDOWN_GRACE_EXTRA_SECS = 5
+#: Daemon.stop's wait before SIGKILL for a full-drain stop. Unchanged from 4.0.
+LEGACY_STOP_TIMEOUT_SECS = 300
+STOP_SLACK_SECS = 10
+#: The recorder's ingest endpoint, the daemon's HTTP sink.
+SINK_URL = "http://127.0.0.1:9900/ingest"
+
+
+def stop_timeout_for(budget_secs, shutdown_timeout_secs):
+    """How long Daemon.stop waits before SIGKILL. A full-drain budget keeps the
+    4.0-era 300 s, so every historical schedule's stop is unchanged. A bounded
+    budget gets weir's documented grace plus slack, because overrunning THAT is
+    itself a finding (spec §7's bound)."""
+    if budget_secs >= FINAL_DRAIN_BUDGET_SECS:
+        return LEGACY_STOP_TIMEOUT_SECS
+    return shutdown_timeout_secs + budget_secs + SHUTDOWN_GRACE_EXTRA_SECS + STOP_SLACK_SECS
+
+
+def _is_int(value):
+    # TOML booleans are Python bools, which are ints; neither is a duration.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_weir_table(weir):
+    """Refuses `[weir]` values weir itself would refuse at startup, so the
+    error comes at schedule load and not minutes into a run."""
+    budget = weir.get("drain_shutdown_budget_secs")
+    if budget is not None and not (
+            _is_int(budget) and 0 <= budget <= FINAL_DRAIN_BUDGET_SECS):
+        raise ValueError(
+            f"[weir].drain_shutdown_budget_secs={budget!r} is outside weir's "
+            f"accepted range 0..={FINAL_DRAIN_BUDGET_SECS}")
+    timeout = weir.get("shutdown_timeout_secs")
+    if timeout is not None and not (_is_int(timeout) and timeout >= 1):
+        raise ValueError(
+            f"[weir].shutdown_timeout_secs={timeout!r} must be an integer >= 1 "
+            "(weir refuses 0)")
+
+
 def _gib(n):
     return f"{n / 2**30:.1f} GiB"
 
@@ -172,11 +220,11 @@ def disk_stop_reason(free, floor):
 #: schedule says. That is the same class of harness lie `fault_kind` refuses an
 #: unknown fault *value* for, applied to the key names.
 #:
-#: The `weir` list is exactly what `Daemon.start` passes through to the daemon —
+#: The `weir` list is exactly what `Daemon.argv` passes through to the daemon —
 #: NOT weir's whole config surface. The harness never writes a weir config file,
 #: so weir's own unknown-key advisory never sees a schedule typo and cannot
 #: catch it. When a run needs a weir knob that is not here, plumb it through
-#: `Daemon.start` and add it here in the same change; the two lists are meant to
+#: `Daemon.argv` and add it here in the same change; the two lists are meant to
 #: be read together.
 SCHEDULE_KEYS = {
     None: {
@@ -191,6 +239,7 @@ SCHEDULE_KEYS = {
     "weir": {
         "shard_count", "batch_size", "batch_deadline_ms",
         "wab_segment_max_bytes", "wab_compression", "wab_compression_level",
+        "drain_shutdown_budget_secs", "shutdown_timeout_secs",
     },
     "storage": {"size_mb", "dm_target"},
     "faults": {"kind"},
@@ -307,6 +356,7 @@ def load_schedule(path):
     with open(path, "rb") as f:
         sched = tomllib.load(f)
     reject_unknown_schedule_keys(sched)
+    validate_weir_table(sched.get("weir") or {})
     if fault_kind(sched) == "power_loss":
         dm_target = sched.get("storage", {}).get("dm_target")
         if dm_target != "flakey":
@@ -781,7 +831,8 @@ def stop_loadgen(proc, timeout_secs=LOADGEN_STOP_TIMEOUT_SECS):
 class Daemon:
     """A weir-server process under test."""
 
-    def __init__(self, binary, wab_dir, socket_path, metrics_port, cfg, log_file):
+    def __init__(self, binary, wab_dir, socket_path, metrics_port, cfg, log_file,
+                 log_path=None, admin_socket_path=None):
         self.binary = binary
         self.wab_dir = wab_dir
         self.socket_path = socket_path
@@ -792,19 +843,27 @@ class Daemon:
         # timeout blamed on weir. A file also keeps the logs for diagnosis.
         self.log_file = log_file
         self.proc = None
-        #: Generous: the shutdown drain is real now. See stop().
-        self.stop_timeout_secs = 300
+        #: The daemon log's path, for readers that scan it (the file object
+        #: above is only ever written to).
+        self.log_path = log_path
+        #: Passed as `--admin-socket-path` when set; absent, weir derives its
+        #: default from `wab_dir`.
+        self.admin_socket_path = admin_socket_path
+        #: The schedule's shutdown drain budget, or the full-drain pin.
+        self.drain_budget_secs = cfg.get(
+            "drain_shutdown_budget_secs", FINAL_DRAIN_BUDGET_SECS)
+        self.shutdown_timeout_secs = cfg.get(
+            "shutdown_timeout_secs", WEIR_DEFAULT_SHUTDOWN_TIMEOUT_SECS)
+        #: The budget the RUNNING process was started with: the drain-out
+        #: restart overrides the schedule's for one start.
+        self.active_budget_secs = self.drain_budget_secs
+        #: How long stop() waits before SIGKILL. See stop_timeout_for().
+        self.stop_timeout_secs = stop_timeout_for(
+            self.drain_budget_secs, self.shutdown_timeout_secs)
 
-    def start(self, sink_url):
-        # Remove any stale socket BEFORE spawning. `kill -9` leaves the file on
-        # disk, so the readiness poll below would be satisfied instantly by the
-        # dead process's socket — defeating the check on every restart after
-        # episode 0, and misreporting a genuine crash-on-restart as a
-        # quiescence timeout rather than the finding it is.
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
+    def argv(self, sink_url, budget_override=None):
+        """The daemon's command line. Pure: TestDaemonCliContract pins every
+        flag it emits against weir-server's CLI parser."""
         cmd = [
             self.binary,
             "--wab-dir", self.wab_dir,
@@ -832,6 +891,15 @@ class Daemon:
             # producer pause was written to cure.
             "--wab-segment-max-age-secs", "2",
         ]
+        # Always passed: weir's default (10 s) would bound the final pass's
+        # SIGTERM drain, and that pass verifies at zero slack. See
+        # FINAL_DRAIN_BUDGET_SECS.
+        budget = self.drain_budget_secs if budget_override is None else budget_override
+        cmd += ["--drain-shutdown-budget-secs", str(budget)]
+        if "shutdown_timeout_secs" in self.cfg:
+            cmd += ["--shutdown-timeout-secs", str(self.cfg["shutdown_timeout_secs"])]
+        if self.admin_socket_path:
+            cmd += ["--admin-socket-path", self.admin_socket_path]
         # On-disk format. OMITTED ENTIRELY unless the schedule asks for it, so
         # every schedule written before this knob existed keeps writing format
         # v1 — byte-identical to weir 1.x — exactly as it did on the runs those
@@ -848,6 +916,23 @@ class Daemon:
             level = self.cfg.get("wab_compression_level")
             if level is not None:
                 cmd += ["--wab-compression-level", str(level)]
+        return cmd
+
+    def start(self, sink_url, budget_override=None):
+        # Remove any stale socket BEFORE spawning. `kill -9` leaves the file on
+        # disk, so the readiness poll below would be satisfied instantly by the
+        # dead process's socket — defeating the check on every restart after
+        # episode 0, and misreporting a genuine crash-on-restart as a
+        # quiescence timeout rather than the finding it is.
+        try:
+            os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        self.active_budget_secs = (
+            self.drain_budget_secs if budget_override is None else budget_override)
+        self.stop_timeout_secs = stop_timeout_for(
+            self.active_budget_secs, self.shutdown_timeout_secs)
+        cmd = self.argv(sink_url, budget_override)
         # NO_COLOR: tracing-subscriber emits ANSI escapes unconditionally, even
         # when its output is a plain FILE rather than a terminal. Measured at
         # 28% of the daemon log here, and the escapes break naive greps when
@@ -876,9 +961,11 @@ class Daemon:
     def stop(self):
         """Graceful shutdown. Returns True if it exited cleanly, False if killed.
 
-        weir's SIGTERM path runs a FULL drain of every sealed segment, not just
-        a seal-and-exit, and `shutdown_timeout_secs` does not bound it — that
-        setting covers only the socket layer's connection drain. The old 30 s
+        Since Foundations weir's SIGTERM drain is bounded by
+        `drain_shutdown_budget_secs`; the harness pins 3600 unless a schedule
+        sets a budget, and `final_pass` runs a drain-out restart when it does.
+        `shutdown_timeout_secs` covers only the socket layer's connection
+        drain, and the wait here is `stop_timeout_for` of both. The old 30 s
         budget was never binding because the recorder was killed first, so every
         sink call failed instantly and shutdown took 24.6 ms. Now that the
         recorder outlives the daemon, the drain is real and needs a real budget.
@@ -1035,8 +1122,9 @@ def main():
             # NOT 9185: that is weir-server's compiled-in default, so a real
             # instance on this host would collide with the harness.
             19185, sched["weir"], daemon_log,
+            log_path=os.path.join(run_dir, "weir-server.log"),
         )
-        daemon.start("http://127.0.0.1:9900/ingest")
+        daemon.start(SINK_URL)
 
         delays = kill_delays(
             seed, sched["episodes"], sched["steady_lo_secs"], sched["steady_hi_secs"]
@@ -1224,7 +1312,7 @@ def main():
                 else:
                     daemon.kill9()
                     canary_result = None
-                daemon.start("http://127.0.0.1:9900/ingest")
+                daemon.start(SINK_URL)
 
                 # PAUSE THE PRODUCER before waiting for the drain.
                 #

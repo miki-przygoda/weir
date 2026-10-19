@@ -564,6 +564,103 @@ class TestDaemonCliContract(unittest.TestCase):
             )
 
 
+    def test_the_foundations_flags_are_real_weir_server_flags(self):
+        """Needs PR 4 (--drain-shutdown-budget-secs) and PR 6
+        (--admin-socket-path) merged; red until then by design."""
+        cfg = {"shard_count": 4, "batch_size": 64, "batch_deadline_ms": 2,
+               "wab_segment_max_bytes": 8388608,
+               "drain_shutdown_budget_secs": 2, "shutdown_timeout_secs": 2}
+        daemon = run.Daemon("/fake/weir-server", "/fake/wab", "/fake/weir.sock",
+                            19185, cfg, None,
+                            admin_socket_path="/run/weir-chaos/weir.admin.sock")
+        flags = [t for t in daemon.argv(run.SINK_URL) if t.startswith("--")]
+        cli_rs_path = os.path.join(
+            run.WEIR_ROOT, "crates", "weir-server", "src", "config", "cli.rs")
+        with open(cli_rs_path) as f:
+            cli_source = f.read()
+        for flag in ("--drain-shutdown-budget-secs", "--shutdown-timeout-secs",
+                     "--admin-socket-path"):
+            self.assertIn(flag, flags)
+            self.assertIn(flag, cli_source, f"{flag} is not a weir-server flag")
+
+
+def load_schedule_text(text):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sched.toml")
+        with open(path, "w") as f:
+            f.write(text)
+        return run.load_schedule(path)
+
+
+class TestDrainBudgetPin(unittest.TestCase):
+    """Oracle fix (spec §16 chaos item 1). final_pass verifies at
+    frontier_slack=0 on the premise that SIGTERM runs a FULL drain. From
+    Foundations on, weir bounds that drain at drain_shutdown_budget_secs
+    (default 10 s), so every historical schedule would report records left
+    sealed-and-intact on disk as I1 violations: a false P0. Pinning 3600 s
+    restores the stop those schedules were written against."""
+
+    CFG = {"shard_count": 4, "batch_size": 64, "batch_deadline_ms": 2,
+           "wab_segment_max_bytes": 8388608}
+
+    def _daemon(self, **over):
+        return run.Daemon("/fake/weir-server", "/fake/wab", "/fake/weir.sock",
+                          19185, dict(self.CFG, **over), None)
+
+    @staticmethod
+    def _flag(argv, flag):
+        return argv[argv.index(flag) + 1]
+
+    def test_a_schedule_without_a_budget_pins_the_full_drain(self):
+        argv = self._daemon().argv(run.SINK_URL)
+        self.assertEqual(self._flag(argv, "--drain-shutdown-budget-secs"), "3600")
+        self.assertNotIn("--shutdown-timeout-secs", argv)
+        self.assertNotIn("--admin-socket-path", argv)
+
+    def test_the_schedule_budget_reaches_the_daemon(self):
+        argv = self._daemon(drain_shutdown_budget_secs=2).argv(run.SINK_URL)
+        self.assertEqual(self._flag(argv, "--drain-shutdown-budget-secs"), "2")
+
+    def test_an_override_wins_for_the_drain_out_restart(self):
+        argv = self._daemon(drain_shutdown_budget_secs=2).argv(
+            run.SINK_URL, budget_override=run.FINAL_DRAIN_BUDGET_SECS)
+        self.assertEqual(self._flag(argv, "--drain-shutdown-budget-secs"), "3600")
+
+    def test_shutdown_timeout_is_passed_only_when_the_schedule_sets_it(self):
+        argv = self._daemon(shutdown_timeout_secs=2).argv(run.SINK_URL)
+        self.assertEqual(self._flag(argv, "--shutdown-timeout-secs"), "2")
+
+    def test_stop_timeout_keeps_the_legacy_300s_for_a_full_drain(self):
+        self.assertEqual(run.stop_timeout_for(3600, 30), 300)
+        self.assertEqual(self._daemon().stop_timeout_secs, 300)
+
+    def test_stop_timeout_covers_the_documented_grace_for_a_bounded_budget(self):
+        # spec §7: grace >= shutdown_timeout + budget + 5; plus 10 s slack.
+        self.assertEqual(run.stop_timeout_for(10, 30), 55)
+        d = self._daemon(drain_shutdown_budget_secs=2, shutdown_timeout_secs=2)
+        self.assertEqual(d.stop_timeout_secs, 19)
+
+    def _valid(self, weir_extra):
+        return TestUnknownScheduleKeysRefused.VALID.replace(
+            "wab_segment_max_bytes = 1048576\n",
+            "wab_segment_max_bytes = 1048576\n" + weir_extra)
+
+    def test_the_two_new_weir_keys_load(self):
+        s = load_schedule_text(self._valid(
+            "drain_shutdown_budget_secs = 2\nshutdown_timeout_secs = 2\n"))
+        self.assertEqual(s["weir"]["drain_shutdown_budget_secs"], 2)
+
+    def test_a_budget_outside_weirs_range_is_refused_here_not_at_daemon_start(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._valid("drain_shutdown_budget_secs = 3601\n"))
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._valid("drain_shutdown_budget_secs = -1\n"))
+
+    def test_a_zero_shutdown_timeout_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._valid("shutdown_timeout_secs = 0\n"))
+
+
 class TestLoadgenCliContract(unittest.TestCase):
     """`TestDaemonCliContract` pins the flags run.py sends to weir-server. The
     flags it sends to its OWN load generator had nothing pinning them, and that
