@@ -1085,17 +1085,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         compression_level: config.wab_compression_level,
     };
+    // The shard registry: flusher supervisors and worker drop guards record
+    // each shard's and worker's state on it (spec §5.3). Declared before
+    // `wab::spawn`, which takes a clone. Task 1.23 replaces it with the
+    // status board's registry.
+    let worker_registry = Arc::new(status::ShardRegistry::new(
+        config.shard_count,
+        config.worker_count,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    ));
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),
         wab_config,
         drain_tx,
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
-        Arc::new(status::ShardRegistry::new(
-            config.shard_count,
-            config.worker_count,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )), // Task 1.23 replaces this with the board's registry
+        Arc::clone(&worker_registry),
     )?;
 
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
@@ -1104,7 +1109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // returned by `wab::spawn`. No bridge thread: the hop is
     // worker → Batch-channel → flusher.
 
-    let worker_handles = worker::spawn_workers(
+    let worker_handles = worker::spawn_workers_with(
         &queue_rx,
         wab_handle.shard_txs,
         config.shard_count,
@@ -1112,6 +1117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.batch_size,
         Duration::from_millis(config.batch_deadline_ms),
         coalesce_hint,
+        Some(Arc::clone(&worker_registry)),
     );
 
     // ── Drain ─────────────────────────────────────────────────────────────────
