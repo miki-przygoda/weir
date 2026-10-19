@@ -1,9 +1,10 @@
 //! TCP accept loop with mutual TLS (feature = "tls").
 //!
-//! Mirrors the Unix accept loop ([`super::run`]): shares a global connection-limit
+//! Mirrors the Unix accept loop ([`super::serve`]): shares a global connection-limit
 //! semaphore (passed in by the caller; the same `Arc<Semaphore>` is also given to
 //! the Unix loop so the combined cap across both transports is exactly
-//! `max_connections`), round-robin shard assignment, and a graceful-shutdown watch
+//! `max_connections`), shard assignment through the shared
+//! [`ShardRouter`](super::route::ShardRouter), and a graceful-shutdown watch
 //! channel managed entirely inside `run`. The difference is the transport: this
 //! loop accepts TCP and requires a mutual-TLS handshake (a CA-signed client
 //! certificate) — completed under a handshake timeout — before the shared
@@ -15,8 +16,9 @@
 //! therefore read `local_addr()` before handing the listener over. This serves
 //! both consumers cleanly:
 //!
-//! * production `main.rs` binds `config.tcp_bind` (a concrete address) and logs
-//!   the bound address, then passes the listener in; and
+//! * production `main.rs` binds `config.tcp_bind` (a concrete address) through
+//!   [`super::bind_all`], together with the Unix socket and before either
+//!   accept loop serves, then passes the listener in; and
 //! * integration tests configure the daemon with a fixed loopback port (chosen
 //!   via the testkit's `free_port()` under the process lock), so the test
 //!   already knows the address it will connect to.
@@ -64,8 +66,9 @@ pub struct TcpConfig {
     pub max_payload_bytes: usize,
     /// Ceiling on records in one `PushBatch`; see `SocketConfig`.
     pub max_batch_records: usize,
-    /// Total number of WAB shards; new connections are assigned a shard_id
-    /// round-robin (counter % shard_count).
+    /// Total number of WAB shards. Informational; routing is the
+    /// [`ShardRouter`](super::route::ShardRouter)'s, which `run` is handed.
+    #[allow(dead_code, reason = "informational; routing is the ShardRouter's")]
     pub shard_count: usize,
     /// How long to wait for in-flight connections to finish after the shutdown
     /// signal before aborting them.
@@ -100,8 +103,14 @@ pub struct TcpConfig {
 /// `handler_shutdown_tx.send(true)` fires BEFORE the drain so idle handlers exit
 /// promptly without waiting out `connection_read_timeout_secs`.
 ///
+/// Each accepted connection is pinned to the shard `router` picks; with no
+/// shard able to take ingest the connection is dropped before the TLS
+/// handshake and counted. Pass a clone of the Unix loop's router so both
+/// transports share one refusal limiter.
+///
 /// Returns when `shutdown_rx` fires or is dropped, after draining in-flight
 /// connections within `shutdown_timeout_secs`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: TcpConfig,
     listener: TcpListener,
@@ -110,6 +119,7 @@ pub async fn run(
     sem: Arc<Semaphore>,
     shutdown_rx: oneshot::Receiver<()>,
     metrics: Arc<Metrics>,
+    router: crate::socket::route::ShardRouter,
 ) -> std::io::Result<()> {
     let local_addr = listener.local_addr()?;
     info!(addr = %local_addr, "TCP+mTLS listener accepting");
@@ -143,13 +153,10 @@ pub async fn run(
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown_rx);
 
-    // Round-robin connection counter for shard_id assignment. Same wrap-via-
-    // modulo story as the Unix loop; the counter can grow without bound for
-    // centuries at any realistic accept rate.
+    // Connection counter the router assigns shards from (the n-th accepted
+    // connection); it can grow without bound for centuries at any realistic
+    // accept rate.
     let conn_counter = AtomicU64::new(0);
-    // Config validation enforces shard_count >= 1; the local guard documents
-    // the invariant and keeps the modulo safe.
-    let shard_count = config.shard_count.max(1) as u64;
 
     loop {
         tokio::select! {
@@ -166,6 +173,14 @@ pub async fn run(
                         // doesn't grow one node per lifetime connection — it is
                         // otherwise only drained at shutdown. Non-blocking (F1).
                         while join_set.try_join_next().is_some() {}
+                        // Pin the connection to a shard that can take ingest
+                        // (spec §5.7); none live drops it before the handshake.
+                        let n = conn_counter.fetch_add(1, Ordering::Relaxed);
+                        let Some(shard_id) = router.pick(n) else {
+                            router.refuse(&metrics, "tcp");
+                            drop(stream);
+                            continue;
+                        };
                         // Acquire a permit from the shared semaphore. This is the
                         // same Arc<Semaphore> as the Unix listener — the combined
                         // cap across both transports is config.max_connections.
@@ -192,8 +207,7 @@ pub async fn run(
                             tokio_rustls::TlsAcceptor::from(tls.current());
                         let tx = queue_tx.clone();
                         let mut cfg = conn_cfg_template.clone();
-                        let n = conn_counter.fetch_add(1, Ordering::Relaxed);
-                        cfg.shard_id = (n % shard_count) as u32;
+                        cfg.shard_id = shard_id;
                         let m = Arc::clone(&metrics);
                         let mut handler_shutdown = handler_shutdown_rx.clone();
 

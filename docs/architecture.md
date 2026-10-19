@@ -64,15 +64,22 @@ umask 0o077 + SIGHUP ignored
                        liveness probe (never unlinks), metrics test-bind,
                        [tls + tcp_bind: TLS load + TCP test-bind]       (src/preflight.rs)
 → queue → drain channel
-→ wab::spawn           crash recovery of active segments, flushers
+→ wab::recover         private shard dirs, crash recovery of active segments
+→ wab::spawn_flushers  one flusher thread per shard
 → workers → drain thread (+ its SegmentLedger)
 → replay of sealed-but-unconfirmed segments into the drain channel
 → startup cap gate     synchronous WAB size scan + wab_max_bytes evaluation;
                        a failed scan with a cap set starts rejecting (src/status/poll.rs)
+→ settle wait          up to 10 s for every shard to leave Starting and every
+                       worker to run; routing skips a shard that has not
+                       settled
 → tokio runtime:
     reload loop + SIGHUP handler → metrics bind
-    → WAB / drain-liveness poll → [TLS load + TCP listener] → SIGTERM/Ctrl-C
-    → socket::run      bind_hardened: probe, unlink only a stale socket, bind
+    → WAB / drain-liveness poll → [TLS load]
+    → socket::bind_all [TCP bind] then socket::bind (bind_hardened: probe,
+                       unlink only a stale socket, bind); nothing serves yet
+    → [tcp::run spawned] → SIGTERM/Ctrl-C
+    → socket::serve    accept loop; each connection goes to a live shard
 → joins (workers → flushers → drain) → exit; the kernel releases the lock
 ```
 

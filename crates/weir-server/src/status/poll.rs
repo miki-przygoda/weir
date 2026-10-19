@@ -1254,6 +1254,7 @@ pub(crate) fn spawn_queue_depth_task(
             let depth = queue_tx.len();
             metrics.queue_depth.set(depth as f64);
             board.queue_depth.store(depth as u64, Ordering::Relaxed);
+            metrics.publish_drain_channel_depth(board.drain_depth.load(Ordering::Relaxed));
             update_channel_high(&board, unix_ms_now(), high);
         }
     })

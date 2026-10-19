@@ -81,11 +81,11 @@ pub struct ConnectionConfig {
     /// override this to a short value so they don't need to mock the clock.
     pub ack_timeout: Duration,
     /// Target shard for every WorkUnit pushed on this connection. The accept
-    /// loop in `socket::run` assigns this round-robin (counter % shard_count)
-    /// at connection time so a multi-shard config (shard_count > 1) actually
-    /// fans out work across the per-shard WAB flusher threads. With
-    /// shard_count = 1 every connection gets shard_id = 0, which matches the
-    /// pre-multi-shard behaviour.
+    /// loops (`socket::serve`, `socket::tcp::run`) take it from their
+    /// `ShardRouter` at connection time: in production the (n mod k)-th
+    /// ingest-capable shard, so a multi-shard config (shard_count > 1) fans
+    /// out work across the per-shard WAB flusher threads that can take it.
+    /// With shard_count = 1 every connection gets shard_id = 0.
     pub shard_id: u32,
     /// Soft cap on live WAB bytes; `0` disables the check. See
     /// `Config::wab_max_bytes`.

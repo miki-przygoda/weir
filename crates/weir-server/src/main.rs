@@ -8,6 +8,10 @@ mod queue;
 mod reload;
 mod sink;
 mod status;
+// Test-only fault hooks for the system tests (spec §16); inert unless
+// WEIR_TEST_HOOKS=1 is also set.
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
 // feature alone: `--features tls` on Windows would otherwise name `crate::socket`,
@@ -54,18 +58,31 @@ use std::{
 
 use tracing::{info, warn};
 
-use config::{Config, SinkType};
+use config::Config;
 use drain::{DrainConfig, DrainHeartbeat};
 use models::WorkUnit;
-#[cfg(feature = "clickhouse-sink")]
-use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
-#[cfg(feature = "http-sink")]
-use sink::http::{HttpBatchMode, HttpSink, HttpSinkConfig};
-#[cfg(feature = "mysql-sink")]
-use sink::mysql::{MySqlSink, MySqlSinkConfig};
-use sink::noop::NoopSink;
-#[cfg(feature = "postgres-sink")]
-use sink::postgres::{PostgresSink, PostgresSinkConfig};
+
+// ── Startup settle wait ───────────────────────────────────────────────────────
+
+/// How long startup waits for every flusher to leave `Starting` (and every
+/// worker to start) before binding the producer listeners (spec §6 step 10).
+/// Unsettled shards stay `Starting` and are not routed to.
+const SHARD_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Polls `done` every `poll` until it returns true (→ true) or `timeout`
+/// passes (→ false). `done` is always called at least once.
+fn wait_until(timeout: Duration, poll: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
 
 // ── wab_dir lock integrity ────────────────────────────────────────────────────
 
@@ -174,48 +191,6 @@ fn spawn_lock_integrity_thread(
         .map(drop)
 }
 
-/// Returns the configured sink URL, or a clear startup error if it's absent.
-/// Config validation already guarantees it's set for URL-requiring sinks, so
-/// this is belt-and-suspenders — but a `Result` beats a panic on the startup
-/// path, and one message replaces five near-identical `.expect` strings.
-#[cfg(any(
-    feature = "http-sink",
-    feature = "mysql-sink",
-    feature = "postgres-sink",
-    feature = "clickhouse-sink"
-))]
-fn require_sink_url(
-    config: &Config,
-    sink_label: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    config.sink_url.0.clone().ok_or_else(|| {
-        format!("sink_type = {sink_label} requires a sink URL (set --sink-url or WEIR_SINK_URL)")
-            .into()
-    })
-}
-
-/// Wraps a built sink and spawns the drain — the tail shared by every sink arm.
-/// `drain::spawn_with` is generic over the sink but returns the same
-/// `JoinHandle<drain::DrainExit>`, so each arm produces a uniform handle for
-/// the join sequence.
-fn build_and_spawn_drain<S: sink::Sink + 'static>(
-    sink: S,
-    drain_rx: crossbeam_channel::Receiver<std::path::PathBuf>,
-    drain_config: DrainConfig,
-    metrics: Arc<metrics::Metrics>,
-    heartbeat: DrainHeartbeat,
-    runtime: drain::DrainRuntime,
-) -> std::thread::JoinHandle<drain::DrainExit> {
-    drain::spawn_with(
-        drain_rx,
-        Arc::new(sink),
-        drain_config,
-        metrics,
-        heartbeat,
-        runtime,
-    )
-}
-
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -264,6 +239,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in &config_warnings {
         warn!("config: {w}");
     }
+    // A test-hooks build says so loudly, active or not: it must never be the
+    // binary a production host runs.
+    #[cfg(feature = "test-hooks")]
+    test_hooks::warn_if_compiled_in();
 
     // Name the config source, so "which file did it read?" is answerable from
     // the log alone. A missing file has its own WARN above (spec §3.4).
@@ -304,7 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── wab_dir ownership ─────────────────────────────────────────────────────
     //
-    // Before ANYTHING reads the WAB (recovery inside wab::spawn, the replay, the
+    // Before ANYTHING reads the WAB (recovery in wab::recover, the replay, the
     // drain) and before every other refuse-to-start check, so a duplicate on
     // the same wab_dir reports "locked by" rather than some later symptom. A
     // second daemon that got past this point would seal this one's ACTIVE
@@ -421,7 +400,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Drain channel ─────────────────────────────────────────────────────────
 
-    let (drain_tx, drain_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(256);
+    let (drain_tx, drain_rx) =
+        crossbeam_channel::bounded::<std::path::PathBuf>(wab::DRAIN_CHANNEL_CAPACITY);
+    metrics
+        .drain_channel_capacity
+        .set(wab::DRAIN_CHANNEL_CAPACITY as f64);
     // Startup-only sender for replaying sealed-but-unconfirmed segments from a
     // previous run. Replay runs AFTER the drain consumer is spawned (below) so
     // the blocking bounded-channel sends drain live instead of dead-locking the
@@ -462,23 +445,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         compression_level: config.wab_compression_level,
     };
+    // Recovery is its own step (spec §6 step 8): every shard dir made private,
+    // then each unsealed segment a crash left sealed. PR 4 runs it while the
+    // runtime already serves HTTP; here it keeps its old position.
+    board.enter_phase(weir_status::Phase::Recovering, &metrics);
+    let recovery = wab::recover(&config.wab_dir, config.shard_count, &metrics)?;
+    info!(
+        shard_dirs = recovery.shard_dirs,
+        quarantined = recovery.segments_quarantined,
+        failed = recovery.segments_failed,
+        elapsed_ms = recovery.elapsed.as_millis() as u64,
+        "WAB recovery complete"
+    );
+    // The flushers' shutdown flag (spec §5.5). The Lifecycle (PR 4) owns it and
+    // sets it at T0; until then nothing sets it, so every hand-off behaves as
+    // the blocking send it replaces.
+    let flushers_shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handoff = wab::handoff::HandoffConfig {
+        shutting_down: Arc::clone(&flushers_shutting_down),
+        drain_depth: Arc::clone(&board.drain_depth),
+        marker: Some(Arc::clone(&board) as Arc<dyn wab::handoff::HandoffMarker>),
+    };
     // The status board's shard registry: flusher supervisors and worker drop
     // guards record each shard's and worker's state on it (spec §5.3).
-    // Recovery runs inside `wab::spawn` (until PR 3 splits it out).
-    board.enter_phase(weir_status::Phase::Recovering, &metrics);
-    let wab_handle = wab::spawn(
+    let wab_handle = wab::spawn_flushers(
         config.wab_dir.clone(),
         wab_config,
         drain_tx,
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
         Arc::clone(&board.shards),
+        handoff,
     )?;
 
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
     //
     // Workers send `Batch`es directly to the WAB flusher via the shard channels
-    // returned by `wab::spawn`. No bridge thread: the hop is
+    // returned by `wab::spawn_flushers`. No bridge thread: the hop is
     // worker → Batch-channel → flusher.
 
     // The 5 s poll task reports the EWMA as evidence; the workers take the
@@ -554,275 +557,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_backlog: Vec::new(),
     };
 
-    // Sink selection. `drain::spawn_with` is generic over the sink but returns
-    // the same `JoinHandle<drain::DrainExit>`, so each arm produces a uniform
-    // handle for the join sequence. `drain_runtime` moves into whichever arm
-    // runs.
-    let drain_handle = match config.sink_type {
-        SinkType::Noop => {
-            warn!(
-                "sink: noop — records are acked and DISCARDED, not forwarded anywhere. \
-                 This is for soak-testing the pipeline; set --sink-type to deliver downstream."
-            );
-            build_and_spawn_drain(
-                NoopSink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-                drain_runtime,
-            )
-        }
-        #[cfg(feature = "http-sink")]
-        SinkType::Http => {
-            let url = require_sink_url(&config, "http")?;
-            // Bearer token read from env at startup (never from config file).
-            // Logged only as a presence boolean — the token itself never reaches
-            // a log line.
-            let bearer_token = std::env::var("WEIR_SINK_BEARER_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .map(Arc::from);
-            // One-shot startup hint: with no token set the sink POSTs
-            // unauthenticated, and the first symptom is otherwise a flood of 401
-            // dead-letters at drain time. Gated to the http arm, so it only fires
-            // when the http sink is actually selected.
-            if bearer_token.is_none() {
-                warn!(
-                    "sink: http — WEIR_SINK_BEARER_TOKEN is unset; requests will be sent \
-                     UNAUTHENTICATED (no Authorization header). If the endpoint requires auth, \
-                     set WEIR_SINK_BEARER_TOKEN or expect 401s to dead-letter at drain time."
-                );
-            }
-            // Validated to "none"|"ndjson" at config load; "ndjson" sends the
-            // whole batch as one newline-delimited POST, anything else (i.e.
-            // "none") keeps the per-record default.
-            let batch_mode = if config.sink_http_batch == "ndjson" {
-                HttpBatchMode::Ndjson
-            } else {
-                HttpBatchMode::PerRecord
-            };
-            // sink_http_concurrency only applies to per-record POSTs; in ndjson
-            // mode the whole batch is one POST, so report it as inert rather than
-            // logging a misleading "concurrency = 8".
-            let concurrency_display = match batch_mode {
-                HttpBatchMode::Ndjson => "n/a (ndjson)".to_string(),
-                HttpBatchMode::PerRecord => config.sink_http_concurrency.to_string(),
-            };
-            info!(
-                // The URL may carry userinfo (user:password@host); redact the
-                // password so it never reaches a log line (S25).
-                url = %crate::sink::redact_url_password(&url),
-                bearer = bearer_token.is_some(),
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                concurrency = %concurrency_display,
-                batch = %config.sink_http_batch,
-                "sink: http"
-            );
-            let http_cfg = HttpSinkConfig {
-                url,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-                max_batch_size: config.sink_max_batch_size,
-                batch_mode,
-                bearer_token,
-                send_idempotency_key: config.sink_send_idempotency_key,
-                concurrency: config.sink_http_concurrency,
-            };
-            let sink = HttpSink::new(http_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-                drain_runtime,
-            )
-        }
-        #[cfg(feature = "mysql-sink")]
-        SinkType::Mysql => {
-            let url = require_sink_url(&config, "mysql")?;
-            let insert_mode = config.sink_mysql_insert_mode;
-            info!(
-                // URL omitted from the log line — it contains credentials.
-                // The MySqlSink Debug impl redacts the password, but logging
-                // even the user component here gives operators no information
-                // they can't get from `weir-server --help` plus their config.
-                table = %config.sink_mysql_table,
-                column = %config.sink_mysql_column,
-                // Logged because its absence is the interesting state: without
-                // it the operator's UNIQUE constraint is on payload bytes, and
-                // that discards distinct records that share bytes.
-                id_column = ?config.sink_mysql_id_column,
-                insert_mode = ?config.sink_mysql_insert_mode,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: mysql"
-            );
-            let mysql_cfg = MySqlSinkConfig {
-                url,
-                table: config.sink_mysql_table.clone(),
-                column: config.sink_mysql_column.clone(),
-                id_column: config.sink_mysql_id_column.clone(),
-                insert_mode,
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = MySqlSink::new(mysql_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build MySQL sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-                drain_runtime,
-            )
-        }
-        #[cfg(feature = "postgres-sink")]
-        SinkType::Postgres => {
-            let url = require_sink_url(&config, "postgres")?;
-            info!(
-                // URL omitted from the log line for the same reason as MySQL.
-                table = %config.sink_postgres_table,
-                column = %config.sink_postgres_column,
-                // See the MySQL arm: absence is the interesting state.
-                id_column = ?config.sink_postgres_id_column,
-                insert_mode = ?config.sink_postgres_insert_mode,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: postgres"
-            );
-            let pg_cfg = PostgresSinkConfig {
-                url,
-                table: config.sink_postgres_table.clone(),
-                column: config.sink_postgres_column.clone(),
-                id_column: config.sink_postgres_id_column.clone(),
-                insert_mode: config.sink_postgres_insert_mode,
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = PostgresSink::new(pg_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-                drain_runtime,
-            )
-        }
-        #[cfg(feature = "clickhouse-sink")]
-        SinkType::ClickHouse => {
-            let url = require_sink_url(&config, "clickhouse")?;
-            info!(
-                // URL omitted from the log line — it may carry credentials.
-                database = %config.sink_clickhouse_database,
-                table = %config.sink_clickhouse_table,
-                column = %config.sink_clickhouse_column,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: clickhouse"
-            );
-            let ch_cfg = ClickHouseSinkConfig {
-                url,
-                database: config.sink_clickhouse_database.clone(),
-                table: config.sink_clickhouse_table.clone(),
-                column: config.sink_clickhouse_column.clone(),
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = ClickHouseSink::new(ch_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build ClickHouse sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-                drain_runtime,
-            )
-        }
-        #[cfg(feature = "s3-sink")]
-        SinkType::S3 => {
-            if config.sink_s3_bucket.is_empty() {
-                return Err(Box::<dyn std::error::Error>::from(
-                    "sink_type = \"s3\" requires sink_s3_bucket",
-                ));
-            }
-            // One object per commit batch. At the default sink_max_batch_size of
-            // 100 that is roughly a 50 KB object for a 500-byte record --
-            // hundreds of thousands per hour for a busy producer, which is
-            // expensive to PUT and pathological for every query engine.
-            if config.sink_max_batch_size < 1000 {
-                warn!(
-                    sink_max_batch_size = config.sink_max_batch_size,
-                    "s3 sink: small batches produce many small objects; consider \
-                     sink_max_batch_size = 10000. NOTE: this value determines batch \
-                     boundaries, and batch boundaries determine object keys -- changing it \
-                     after records have been written makes replayed batches land under new \
-                     keys and duplicate. Choose it once."
-                );
-            }
-            info!(
-                bucket = %config.sink_s3_bucket,
-                region = %config.sink_s3_region,
-                // Endpoint omitted: it is operator-supplied and may carry a host
-                // an operator would rather not see echoed. Bucket + region are
-                // enough to identify the target.
-                path_style = config.sink_s3_force_path_style,
-                prefix = %config.sink_s3_prefix,
-                partition = %config.sink_s3_partition,
-                framing = %config.sink_s3_framing,
-                compression = %config.sink_s3_compression,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: s3"
-            );
-            let opt = |v: &str| (!v.is_empty()).then(|| v.to_string());
-            let s3_cfg = weir_sink_s3::S3SinkConfig {
-                endpoint: opt(&config.sink_s3_endpoint),
-                bucket: config.sink_s3_bucket.clone(),
-                region: config.sink_s3_region.clone(),
-                force_path_style: config.sink_s3_force_path_style,
-                prefix: config.sink_s3_prefix.clone(),
-                partition: config.sink_s3_partition.clone(),
-                framing: weir_sink_s3::Framing::parse(&config.sink_s3_framing)
-                    .expect("sink_s3_framing validated at config parse"),
-                compression: weir_sink_s3::Compression::parse(&config.sink_s3_compression)
-                    .expect("sink_s3_compression validated at config parse"),
-                access_key_id: opt(&config.sink_s3_access_key_id),
-                secret_access_key: opt(&config.sink_s3_secret_access_key),
-                storage_class: opt(&config.sink_s3_storage_class),
-                sse: opt(&config.sink_s3_sse),
-                sse_kms_key_id: opt(&config.sink_s3_sse_kms_key_id),
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = weir_sink_s3::S3Sink::new(s3_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build S3 sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-                drain_runtime,
-            )
-        }
-    };
+    // Sink selection (spec §5.12): builds the sink, still after recovery.
+    // `drain_runtime` (detached control, the board, no backlog) moves into
+    // the one drain the spawner starts.
+    let drain_spawner = sink::select::build_drain_spawner(&config, &metrics)?;
+    let drain_handle = drain_spawner.spawn(sink::select::DrainSpawnArgs {
+        rx: drain_rx,
+        config: drain_config,
+        metrics: Arc::clone(&metrics),
+        heartbeat: drain_heartbeat.clone(),
+        runtime: drain_runtime,
+    });
 
     // ── Replay recovery backlog (drain consumer is now live) ──────────────────
     //
     // Replay sealed-but-unconfirmed segments from a previous run now that the
-    // drain thread is consuming. Done here rather than inside wab::spawn so the
+    // drain thread is consuming. Done here rather than inside wab::recover so the
     // blocking sends into the bounded drain channel are drained live — a backlog
     // larger than the channel capacity would otherwise dead-lock startup (B3).
     // Runs before the socket binds, so the recovery backlog is queued ahead of
@@ -840,6 +590,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spec §6 step 9: the first size scan and cap evaluation run here,
     // synchronously, before any producer listener exists (fail-closed).
     status::poll::startup_cap_gate(&config.wab_dir, config.wab_max_bytes, &board, &metrics);
+
+    // Spec §6 step 10: routing sends connections only to settled,
+    // ingest-capable shards, so the listeners wait for the flushers' counter
+    // scans (PR 4 moves this into its startup step 10). Routing also needs the
+    // shard's worker running (PR 1's `ingest_capable`), so wait for every
+    // worker too: a connection accepted before a worker has entered its guard
+    // would otherwise be refused as no_live_shard.
+    if !wait_until(SHARD_SETTLE_TIMEOUT, Duration::from_millis(10), || {
+        board.shards.all_settled()
+            && (0..board.shards.worker_count()).all(|w| board.shards.worker_running(w))
+    }) {
+        warn!(
+            timeout_secs = SHARD_SETTLE_TIMEOUT.as_secs(),
+            "not every WAB shard and worker settled before the producer listeners were \
+             bound; unsettled shards receive no connections until they come up"
+        );
+    }
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
 
@@ -938,7 +705,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // Shutdown coordination: signal handler → shutdown_tx → socket::run exits.
+        // Shutdown coordination: signal handler → shutdown_tx → socket::serve exits.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // ONE shared connection-cap semaphore for ALL listeners (Unix + TCP).
@@ -947,6 +714,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // two independent semaphores.
         let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
 
+        // One router for both transports: one refusal counter and one WARN
+        // limiter. It sends each connection only to an ingest-capable shard
+        // (spec §5.7).
+        #[cfg(unix)]
+        let router = socket::route::ShardRouter::live(
+            Arc::clone(&board) as Arc<dyn socket::route::LiveShards>
+        );
+
+        // TLS material loads before any bind (unchanged position relative to
+        // the TCP bind; PR 4 moves it to startup step 6). Config validation
+        // guarantees the three tls_* paths are present whenever tcp_bind is
+        // set; preflight has already loaded this material once and test-bound
+        // the address, so a failure here is a race (spec §3.0).
+        #[cfg(all(unix, feature = "tls"))]
+        let tls = match config.tcp_bind {
+            Some(_) => {
+                let (cert, key, ca) = preflight::tls_paths(&config)?;
+                let tls = socket::tls::ReloadableServerConfig::load(cert, key, ca)
+                    .map_err(|e| preflight::tls_load_error(&e))?;
+                // Register for reload before `tls` moves into tcp::run. The
+                // clone shares the same inner ArcSwap, so a reload from the
+                // reload loop is immediately visible to the accept loop's
+                // `tls.current()` call.
+                reloader.register_tls(tls.clone());
+                Some(tls)
+            }
+            None => None,
+        };
+
+        #[cfg(unix)]
+        let socket_config = socket::SocketConfig {
+            socket_path: config.socket_path.clone(),
+            max_connections: config.max_connections,
+            max_payload_bytes: config.max_payload_bytes,
+            max_batch_records: config.max_batch_records,
+            shutdown_timeout_secs: config.shutdown_timeout_secs,
+            connection_read_timeout_secs: config.connection_read_timeout_secs,
+            shard_count: config.shard_count,
+            peer_uid_check: config.peer_uid_check,
+            wab_max_bytes: config.wab_max_bytes,
+            wab_bytes_now: Arc::clone(&wab_bytes_now),
+            wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+            wab_ownership_lost: Arc::clone(&wab_ownership_lost),
+            board: Some(Arc::clone(&board)),
+        };
+
+        // Bind EVERY producer listener, then serve (spec §5.7, §6 step 11): a
+        // bind failure fails startup before any producer is acked. `bind_all`
+        // and `bind` write the listener marks (README Q6); main writes none
+        // here.
+        board.enter_phase(weir_status::Phase::Binding, &metrics);
+        #[cfg(unix)]
+        let listeners = socket::bind_all(&socket_config, config.tcp_bind).await?;
+
         // Optional TCP+mTLS listener (feature = "tls"). It runs its own accept
         // loop concurrently with the Unix loop, feeding the SAME pipeline via a
         // cloned queue_tx. Both listeners share `conn_sem` above so the combined
@@ -954,86 +775,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         //
         // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
         // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
-        board.enter_phase(weir_status::Phase::Binding, &metrics);
         #[cfg(all(unix, feature = "tls"))]
-        let (tcp_shutdown_tx, tcp_join) = {
-            use socket::tcp::{self, TcpConfig};
-            use socket::tls::ReloadableServerConfig;
+        let (tcp_shutdown_tx, tcp_join) = match (listeners.tcp, tls) {
+            (Some(listener), Some(tls)) => {
+                let tcp_config = socket::tcp::TcpConfig {
+                    max_connections: config.max_connections,
+                    max_payload_bytes: config.max_payload_bytes,
+                    max_batch_records: config.max_batch_records,
+                    shard_count: config.shard_count,
+                    shutdown_timeout_secs: config.shutdown_timeout_secs,
+                    connection_read_timeout_secs: config.connection_read_timeout_secs,
+                    handshake_timeout_secs: config.tls_handshake_timeout_secs,
+                    wab_max_bytes: config.wab_max_bytes,
+                    wab_bytes_now: Arc::clone(&wab_bytes_now),
+                    wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+                    wab_ownership_lost: Arc::clone(&wab_ownership_lost),
+                };
 
-            match config.tcp_bind {
-                Some(bind_addr) => {
-                    // Config validation guarantees the three tls_* paths are
-                    // present whenever tcp_bind is set; preflight has already
-                    // loaded this material once and test-bound this address,
-                    // so a failure here is a race (spec §3.0).
-                    let (cert, key, ca) = preflight::tls_paths(&config)?;
-                    let tls = ReloadableServerConfig::load(cert, key, ca)
-                        .map_err(|e| preflight::tls_load_error(&e))?;
-
-                    // Bind in the caller so a bad bind address fails startup
-                    // (rather than the spawned accept task) — see socket::tcp
-                    // module docs on the bound-addr design.
-                    let listener = tokio::net::TcpListener::bind(bind_addr)
-                        .await
-                        .map_err(|e| preflight::tcp_bind_error(bind_addr, &e))?;
-                    let actual_addr = listener.local_addr()?;
-                    info!(addr = %actual_addr, "TCP+mTLS listener bound");
-                    board.listeners.tcp.set(weir_status::ListenerState::Bound);
-
-                    let tcp_config = TcpConfig {
-                        max_connections: config.max_connections,
-                        max_payload_bytes: config.max_payload_bytes,
-                        max_batch_records: config.max_batch_records,
-                        shard_count: config.shard_count,
-                        shutdown_timeout_secs: config.shutdown_timeout_secs,
-                        connection_read_timeout_secs: config.connection_read_timeout_secs,
-                        handshake_timeout_secs: config.tls_handshake_timeout_secs,
-                        wab_max_bytes: config.wab_max_bytes,
-                        wab_bytes_now: Arc::clone(&wab_bytes_now),
-                        wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
-                        wab_ownership_lost: Arc::clone(&wab_ownership_lost),
-                    };
-
-                    let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-                    let tcp_queue_tx = queue_tx.clone();
-                    let tcp_metrics = Arc::clone(&metrics);
-
-                    // Register for reload before moving `tls` into tcp::run.
-                    // The clone shares the same inner ArcSwap so a reload from the
-                    // reload loop is immediately visible to the accept loop's
-                    // `tls.current()` call.
-                    reloader.register_tls(tls.clone());
-
-                    // Pass a clone of the shared semaphore so Unix + TCP draw
-                    // from the same permit pool — true global cap.
-                    let tcp_sem = Arc::clone(&conn_sem);
-                    let tcp_board = Arc::clone(&board);
-                    let tcp_join = tokio::spawn(async move {
-                        // tcp::run owns the handler-shutdown watch internally and
-                        // signals handlers BEFORE draining — no extra plumbing needed here.
-                        let res = tcp::run(
-                            tcp_config,
-                            listener,
-                            tls,
-                            tcp_queue_tx,
-                            tcp_sem,
-                            tcp_shutdown_rx,
-                            tcp_metrics,
-                        )
-                        .await;
-                        match res {
-                            Ok(()) => tcp_board.listeners.tcp.set(weir_status::ListenerState::Closed),
-                            Err(e) => {
-                                tcp_board.listeners.tcp.set(weir_status::ListenerState::Failed);
-                                tracing::error!(error = %e, "TCP+mTLS listener exited with error");
-                            }
+                let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                let tcp_queue_tx = queue_tx.clone();
+                let tcp_metrics = Arc::clone(&metrics);
+                // Pass a clone of the shared semaphore so Unix + TCP draw
+                // from the same permit pool — true global cap.
+                let tcp_sem = Arc::clone(&conn_sem);
+                let tcp_router = router.clone();
+                let tcp_board = Arc::clone(&board);
+                let tcp_join = tokio::spawn(async move {
+                    // tcp::run owns the handler-shutdown watch internally and
+                    // signals handlers BEFORE draining — no extra plumbing needed here.
+                    // PR 1's Closed / Failed marks (Task 1.23). Interim: PR 4
+                    // Task 4.7 moves them into `tcp::run` (README Q6).
+                    match socket::tcp::run(
+                        tcp_config,
+                        listener,
+                        tls,
+                        tcp_queue_tx,
+                        tcp_sem,
+                        tcp_shutdown_rx,
+                        tcp_metrics,
+                        tcp_router,
+                    )
+                    .await
+                    {
+                        Ok(()) => tcp_board.listeners.tcp.set(weir_status::ListenerState::Closed),
+                        Err(e) => {
+                            tcp_board.listeners.tcp.set(weir_status::ListenerState::Failed);
+                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
                         }
-                    });
-
-                    (Some(tcp_shutdown_tx), Some(tcp_join))
-                }
-                None => (None, None),
+                    }
+                });
+                (Some(tcp_shutdown_tx), Some(tcp_join))
             }
+            _ => (None, None),
         };
 
         let board_sig = Arc::clone(&board);
@@ -1070,25 +863,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Socket accept loop — blocks until shutdown signal.
         #[cfg(unix)]
-        {
-            use socket::SocketConfig;
-            let socket_config = SocketConfig {
-                socket_path: config.socket_path.clone(),
-                max_connections: config.max_connections,
-                max_payload_bytes: config.max_payload_bytes,
-                max_batch_records: config.max_batch_records,
-                shutdown_timeout_secs: config.shutdown_timeout_secs,
-                connection_read_timeout_secs: config.connection_read_timeout_secs,
-                shard_count: config.shard_count,
-                peer_uid_check: config.peer_uid_check,
-                wab_max_bytes: config.wab_max_bytes,
-                wab_bytes_now: Arc::clone(&wab_bytes_now),
-                wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
-                wab_ownership_lost: Arc::clone(&wab_ownership_lost),
-                board: Some(Arc::clone(&board)),
-            };
-            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
-        }
+        socket::serve(
+            socket_config,
+            listeners.unix,
+            queue_tx,
+            shutdown_rx,
+            Arc::clone(&metrics),
+            conn_sem,
+            router,
+        )
+        .await?;
         #[cfg(not(unix))]
         {
             // On non-Unix builds weir-server is not supported; just wait for shutdown.
@@ -1112,7 +896,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Graceful pipeline drain ───────────────────────────────────────────────
     //
-    // queue_tx moved into socket::run and dropped when it returns.
+    // queue_tx moved into socket::serve and dropped when it returns.
     // Workers observe Disconnected → flush remaining Batches → drop shard_txs
     //   clones → flusher Disconnected.
     // WAB flushers observe Disconnected → seal segments → exit → drop drain_tx.
@@ -1378,5 +1162,37 @@ mod lock_integrity_tests {
             "an unreadable record is still proof of loss"
         );
         assert!(lost.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::wait_until;
+    use std::time::Duration;
+
+    #[test]
+    fn wait_until_returns_true_as_soon_as_done_and_false_at_the_deadline() {
+        let mut calls = 0;
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                calls == 3
+            }
+        ));
+        assert_eq!(calls, 3);
+
+        let t0 = std::time::Instant::now();
+        assert!(!wait_until(
+            Duration::from_millis(60),
+            Duration::from_millis(5),
+            || false
+        ));
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(60) && took < Duration::from_millis(500),
+            "{took:?}"
+        );
     }
 }

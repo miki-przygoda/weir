@@ -26,6 +26,10 @@ dst = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.
 tls = ["dep:tokio-rustls", "dep:rustls-pki-types", "dep:rustls"]
+# Test-only fault hooks for the system tests (spec §16). Compiled in only with
+# this feature, and active only when WEIR_TEST_HOOKS=1 is also set; a build
+# with it logs a loud WARN at startup. Never enable it for a production build.
+test-hooks = []
 
 [package]
 name = "weir-server"

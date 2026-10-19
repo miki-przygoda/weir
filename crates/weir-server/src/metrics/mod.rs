@@ -595,6 +595,12 @@ pub(crate) struct Metrics {
     /// Configured sink type, set to 1.0 for the active sink (see [`SinkInfoLabel`]).
     pub sink_info: Family<SinkInfoLabel, Gauge<f64, AtomicU64>>,
     pub queue_depth: Gauge<f64, AtomicU64>,
+    /// Sealed segments waiting in the flusher → drain channel. Last-writer-wins
+    /// `len()` snapshots from the flushers (after each hand-off) and the drain
+    /// (each wait slice), published by the 500 ms poll task.
+    pub drain_channel_depth: Gauge<f64, AtomicU64>,
+    /// Capacity of that channel; constant `wab::DRAIN_CHANNEL_CAPACITY`.
+    pub drain_channel_capacity: Gauge<f64, AtomicU64>,
 
     // ── Recovery ──────────────────────────────────────────────────────────────
     pub recovery_records_replayed: Counter<u64, AtomicU64>,
@@ -959,6 +965,16 @@ impl Metrics {
             Gauge::<f64, AtomicU64>::default(),
             "weir_queue_depth",
             "Current number of records waiting in the work queue"
+        );
+        let drain_channel_depth = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_channel_depth",
+            "Sealed segments waiting in the bounded flusher-to-drain channel (snapshot)"
+        );
+        let drain_channel_capacity = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_channel_capacity",
+            "Capacity of the flusher-to-drain channel"
         );
         let recovery_records_replayed = reg!(
             Counter::<u64, AtomicU64>::default(),
@@ -1403,6 +1419,8 @@ impl Metrics {
             sink_health,
             sink_info,
             queue_depth,
+            drain_channel_depth,
+            drain_channel_capacity,
             recovery_records_replayed,
             recovery_segments_quarantined,
             recovery_segments_failed,
@@ -1654,6 +1672,15 @@ impl Metrics {
             .sum()
     }
 
+    /// Called by the 500 ms poll task with `board.drain_depth`. Skips PR 1's
+    /// `DEPTH_UNPUBLISHED` sentinel (usize::MAX, the value before the first
+    /// flusher hand-off or drain slice), which is "unknown", not a depth.
+    pub(crate) fn publish_drain_channel_depth(&self, depth: usize) {
+        if depth != crate::status::board::DEPTH_UNPUBLISHED {
+            self.drain_channel_depth.set(depth as f64);
+        }
+    }
+
     /// `weir_build_info` and `weir_start_time_seconds`, once at startup.
     pub(crate) fn publish_build_info(&self, version: &str, wire_version: u8) {
         self.build_info
@@ -1728,6 +1755,26 @@ mod tests {
     }
 
     #[test]
+    fn drain_channel_depth_and_capacity_are_exported() {
+        let (m, reg) = Metrics::new();
+        m.drain_channel_capacity
+            .set(crate::wab::DRAIN_CHANNEL_CAPACITY as f64);
+        m.publish_drain_channel_depth(7);
+        let out = encode_to_string(&reg);
+        assert!(out.contains("weir_drain_channel_depth 7"), "{out}");
+        assert!(out.contains("weir_drain_channel_capacity 256"), "{out}");
+        // PR 1's board holds DEPTH_UNPUBLISHED (usize::MAX) until the first
+        // hand-off or drain slice stores a real len(): never export it
+        // (README Review Focus 2).
+        m.publish_drain_channel_depth(crate::status::board::DEPTH_UNPUBLISHED);
+        let out = encode_to_string(&reg);
+        assert!(
+            out.contains("weir_drain_channel_depth 7"),
+            "the unpublished sentinel leaked: {out}"
+        );
+    }
+
+    #[test]
     fn all_metric_names_present_in_output() {
         let (_m, reg) = Metrics::new();
         let out = encode_to_string(&reg);
@@ -1755,6 +1802,8 @@ mod tests {
             "weir_sink_health",
             "weir_sink_info",
             "weir_queue_depth",
+            "weir_drain_channel_depth",
+            "weir_drain_channel_capacity",
             "weir_recovery_records_replayed",
             "weir_recovery_segments_quarantined",
             "weir_recovery_segments_failed",
