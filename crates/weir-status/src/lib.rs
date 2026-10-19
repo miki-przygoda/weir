@@ -14,6 +14,7 @@ pub mod doc;
 pub mod evidence;
 pub mod exposition;
 mod probe;
+mod public;
 mod rules;
 pub mod segment;
 mod summary;
@@ -29,5 +30,10 @@ pub use doc::*;
 pub use evidence::*;
 pub use exposition::{active_conditions_from_metrics, evidence_from_metrics};
 pub use probe::*;
+pub use public::{
+    MAX_PUBLIC_CONDITIONS, MAX_PUBLIC_SHARDS, PublicAdminSurface, PublicCondition, PublicDrainView,
+    PublicEvidenceValue, PublicReloadItem, PublicReloadLast, PublicReloadView, PublicRequeueView,
+    PublicSinkFailure, PublicSinkView, PublicStatusDoc, public,
+};
 pub use rules::evaluate;
 pub use segment::SegmentId;
