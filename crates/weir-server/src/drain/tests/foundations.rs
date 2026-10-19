@@ -462,3 +462,136 @@ fn the_idle_rescan_waits_for_the_backlog_to_empty() {
     join_within(h, Duration::from_secs(5));
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// Spec §16 drain test 11: retry-stranded while the probe says Down. The
+/// automatic resume never fires (no healthy probe), the verb bypasses that
+/// gate, drains the channel first and dedups against it, and resolves the ticket.
+#[test]
+fn retry_stranded_rescans_while_the_probe_says_down_and_dedups_the_channel() {
+    let dir = tmp_dir("fnd_retry_stranded");
+    let c = seg(&dir, 1, &[b"c"]);
+    let sink = Arc::new(MockSink {
+        yield_for: Duration::from_millis(400),
+        health_script: Mutex::new(
+            std::iter::repeat_n(SinkHealth::Down("probe refused".into()), 10_000).collect(),
+        ),
+        ..MockSink::with_responses([])
+    });
+    let board = StatusBoard::for_test();
+    let control = DrainControl::detached();
+    let cfg = DrainConfig {
+        health_poll_interval: Duration::from_millis(50),
+        ..fast_config(dir.clone())
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &noop_metrics(),
+        rt_with(control.clone(), Some(Arc::clone(&board)), Vec::new()),
+    );
+    tx.send(c.clone()).unwrap();
+    wait_for(5, "c's commit is in flight", || sink.call_count() == 1);
+
+    // While c commits: `a` is stranded on disk AND sitting in the channel; `b` only on disk.
+    let a = seg(&dir, 2, &[b"a"]);
+    let b = seg(&dir, 3, &[b"b"]);
+    tx.send(a.clone()).unwrap();
+    let ticket = control.request_requeue();
+    wait_for(5, "the ticket is observed", || {
+        control.requeue_observed() >= ticket
+    });
+
+    let r = board
+        .drain
+        .last_requeue
+        .load_full()
+        .expect("a published result");
+    assert_eq!(r.ticket, ticket);
+    assert!(!r.coalesced && r.scan_error.is_none());
+    assert_eq!(
+        (r.requeued, r.already_queued),
+        (1, 1),
+        "b requeued; a already queued (moved out of the channel before the scan)"
+    );
+    assert_eq!(board.drain.observed_requeue.load(Relaxed), ticket);
+    wait_for(10, "a and b delivered", || !a.exists() && !b.exists());
+    assert_eq!(
+        sink.call_count(),
+        3,
+        "each segment reaches the sink exactly once"
+    );
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 12: 1,000 back-to-back requests produce at most one scan
+/// per 5 s window and at most one backoff cut per retry episode, and a cut is
+/// never below base_retry_delay (W2 preserved).
+#[test]
+fn a_flood_of_retry_stranded_requests_scans_once_and_cuts_one_backoff() {
+    crate::drain::VERB_RESCANS.store(0, Relaxed);
+    let dir = tmp_dir("fnd_requeue_flood");
+    let s = seg(&dir, 1, &[b"x"]);
+    let hint = Duration::from_secs(2);
+    let sink = Arc::new(MockSink::with_responses([
+        Err(MockError::TransientWithRetryAfter(hint)),
+        Err(MockError::TransientWithRetryAfter(hint)),
+    ]));
+    let cfg = DrainConfig {
+        base_retry_delay: Duration::from_millis(100),
+        ..quiet(dir.clone())
+    };
+    let control = DrainControl::detached();
+    let board = StatusBoard::for_test();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &noop_metrics(),
+        rt_with(control.clone(), Some(Arc::clone(&board)), Vec::new()),
+    );
+    tx.send(s.clone()).unwrap();
+    wait_for(5, "the first attempt failed", || sink.call_count() == 1);
+
+    let mut tickets = std::collections::BTreeSet::new();
+    for i in 0..1000 {
+        tickets.insert(control.request_requeue());
+        if i % 100 == 99 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    wait_for(10, "delivered on the third attempt", || !s.exists());
+
+    let ts = sink.call_timestamps();
+    assert_eq!(ts.len(), 3);
+    let (first_gap, second_gap) = (ts[1] - ts[0], ts[2] - ts[1]);
+    assert!(
+        first_gap >= Duration::from_millis(100) && first_gap < Duration::from_millis(1000),
+        "the first backoff is cut once, never below base_retry_delay: {first_gap:?}"
+    );
+    assert!(
+        second_gap >= Duration::from_millis(1900),
+        "at most one cut per retry episode: {second_gap:?}"
+    );
+    assert_eq!(
+        crate::drain::VERB_RESCANS.load(Relaxed),
+        1,
+        "one scan per 5 s window"
+    );
+    assert!(
+        tickets.len() < 1000,
+        "requests fold into the outstanding ticket"
+    );
+    let last = board.drain.last_requeue.load_full().unwrap();
+    assert!(
+        last.coalesced,
+        "later requests are answered from the window's scan"
+    );
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}

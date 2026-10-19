@@ -70,7 +70,7 @@ use crate::{
 pub(crate) use control::{DrainControl, DrainExit, DrainRuntime, Lifetime};
 use publish::Publisher;
 
-use crate::status::DrainExitReason;
+use crate::status::{DrainExitReason, RequeueResult, unix_ms_now};
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
 use ledger::{Admit, DeadLetterCarry, SegmentLedger, TransientCause};
@@ -230,6 +230,10 @@ enum DrainState {
         /// bookkeeping once the budget runs out: only a sink cause counts as a
         /// sink strand and marks the sink down (D11).
         cause: TransientCause,
+        /// A retry-stranded request has already cut one backoff in this retry
+        /// episode. Carried from retry to retry so a looping caller cannot cut
+        /// every backoff (spec §5.4 "Retry stranded", W2).
+        backoff_cut: bool,
     },
     BlockedDeadLetterFull {
         segment: PathBuf,
@@ -892,6 +896,106 @@ fn probe_and_resume_stranded<S: Sink>(
     ok
 }
 
+/// Test-only count of verb-driven scans (those [`RequeueService::service`] ran).
+#[cfg(test)]
+static VERB_RESCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Resolves operator retry-stranded tickets (spec §5.4 "Retry stranded").
+///
+/// At most one scan per [`control::REQUEUE_MIN_INTERVAL`]; a ticket inside the
+/// window is answered from the previous scan with `coalesced: true`. A running
+/// retry backoff is cut at most once per retry episode (`backoff_cut` travels
+/// with the episode's `RetryingTransient` state), never below
+/// `base_retry_delay`. In absorb mode the ticket is resolved without scanning,
+/// so an admin client never waits on a drain that is shutting down.
+///
+/// Owned by one drain incarnation. A respawn starts from the control's
+/// observed ticket, so a ticket a panic interrupted is still answered.
+struct RequeueService {
+    /// The last ticket this service resolved.
+    seen: u64,
+    /// When the last real scan ran, for the coalescing window.
+    last_scan_at: Option<Instant>,
+    /// The last published result, the answer to a coalesced ticket.
+    last: Option<RequeueResult>,
+}
+
+impl RequeueService {
+    fn new(control: &DrainControl) -> Self {
+        Self {
+            seen: control.requeue_observed(),
+            last_scan_at: None,
+            last: None,
+        }
+    }
+
+    /// Resolves the outstanding ticket, if there is one. `scan` runs
+    /// [`requeue_unconfirmed`] (bypassing the health-edge gate); `cut`
+    /// shortens a running backoff and says whether it did.
+    fn service(
+        &mut self,
+        ctx: &DrainCtx<'_>,
+        scan: impl FnOnce() -> RescanOutcome,
+        cut: impl FnOnce() -> bool,
+    ) {
+        let ticket = ctx.control.requeue_requested();
+        if ticket <= self.seen {
+            return;
+        }
+        let now = Instant::now();
+        let result = match (&self.last, self.last_scan_at) {
+            (Some(last), Some(at)) if now.duration_since(at) < control::REQUEUE_MIN_INTERVAL => {
+                RequeueResult {
+                    ticket,
+                    backoff_cut: false,
+                    coalesced: true,
+                    at_ms: unix_ms_now(),
+                    ..last.clone()
+                }
+            }
+            _ => {
+                let outcome = if ctx.control.absorbing() {
+                    RescanOutcome {
+                        scan_error: Some("skipped: the daemon is shutting down".into()),
+                        ..RescanOutcome::default()
+                    }
+                } else {
+                    #[cfg(test)]
+                    VERB_RESCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    scan()
+                };
+                self.last_scan_at = Some(now);
+                let backoff_cut = cut();
+                info!(
+                    ticket,
+                    requeued = outcome.requeued,
+                    already_queued = outcome.already_queued,
+                    backoff_cut,
+                    scan_failed = outcome.scan_error.is_some(),
+                    incomplete = outcome.incomplete,
+                    "drain: retry-stranded: rescanned the WAB for stranded segments"
+                );
+                RequeueResult {
+                    ticket,
+                    requeued: outcome.requeued,
+                    already_queued: outcome.already_queued,
+                    scan_error: outcome
+                        .scan_error
+                        .as_deref()
+                        .map(publish::sanitize_admin_text),
+                    backoff_cut,
+                    coalesced: false,
+                    at_ms: unix_ms_now(),
+                }
+            }
+        };
+        self.seen = ticket;
+        ctx.publish.requeue(&result);
+        ctx.control.observe_requeue(ticket);
+        self.last = Some(result);
+    }
+}
+
 // ── Heartbeat (liveness observed from outside the drain's own runtime) ────────
 
 /// A monotonic counter the drain advances whenever it is alive.
@@ -1329,6 +1433,8 @@ fn drain_thread_with<S: Sink>(
     // `pending` and the channel; see `next_queued`.
     let mut backlog: VecDeque<PathBuf> = initial_backlog.into();
     let mut backlog_turn = false;
+    // Resolves operator retry-stranded tickets (spec §5.4).
+    let mut requeue = RequeueService::new(control);
 
     // The start of the current dead-letter-full blocking episode, if any. An
     // episode spans a flapping cap (unblock → reblock the same segment without
@@ -1433,6 +1539,28 @@ fn drain_thread_with<S: Sink>(
                     };
                     metrics.quarantine_bytes_on_disk.set(quarantined as f64);
                     last_health_poll = Instant::now();
+                }
+
+                // An operator's retry-stranded ticket: rescan now, bypassing
+                // the health-edge gate (spec §5.4 "Retry stranded").
+                {
+                    let now = Instant::now();
+                    requeue.service(
+                        &ctx,
+                        || {
+                            requeue_unconfirmed(
+                                &config,
+                                &metrics,
+                                Some(&drain_rx),
+                                &mut pending,
+                                &mut backlog,
+                                None,
+                                &|p| ledger.excludes(p, now),
+                                &heartbeat,
+                            )
+                        },
+                        || false,
+                    );
                 }
 
                 // Every source passes the ledger's admission check (spec §4.0):
@@ -1548,6 +1676,7 @@ fn drain_thread_with<S: Sink>(
                 next_delay,
                 processed,
                 cause,
+                ..
             } => {
                 ledger.set_not_before(&segment, Instant::now() + next_delay);
                 // The `processed` cursor SURVIVES the strand (spec §4.0,
@@ -1632,6 +1761,7 @@ fn drain_thread_with<S: Sink>(
                 next_delay,
                 processed,
                 cause: _,
+                backoff_cut,
             } => {
                 set_drain_state(&metrics, DrainStateValue::retrying_transient);
 
@@ -1669,8 +1799,47 @@ fn drain_thread_with<S: Sink>(
                 // cycle alive and shutdown would never finish. Once the budget is
                 // spent the waits go to zero and the loop degenerates to the previous
                 // behaviour, which terminates.
-                let wait_end = Instant::now() + next_delay;
+                //
+                // A retry-stranded request may cut the backoff, at most once per
+                // retry episode and never below `base_retry_delay` from the
+                // wait's start (W2): see `RequeueService`.
+                let wait_start = Instant::now();
+                let mut wait_end = wait_start + next_delay;
+                let mut backoff_cut = backoff_cut;
                 loop {
+                    {
+                        let now = Instant::now();
+                        let base = config.base_retry_delay;
+                        requeue.service(
+                            &ctx,
+                            || {
+                                requeue_unconfirmed(
+                                    &config,
+                                    &metrics,
+                                    Some(&drain_rx),
+                                    &mut pending,
+                                    &mut backlog,
+                                    Some(&segment),
+                                    &|p| ledger.excludes(p, now),
+                                    &heartbeat,
+                                )
+                            },
+                            || {
+                                if backoff_cut {
+                                    return false;
+                                }
+                                // Never below base_retry_delay from the wait's start (W2).
+                                let cut_to = wait_end.min(Instant::now().max(wait_start + base));
+                                if cut_to < wait_end {
+                                    wait_end = cut_to;
+                                    backoff_cut = true;
+                                    true
+                                } else {
+                                    false
+                                }
+                            },
+                        );
+                    }
                     // WAITING IS NOT WEDGED. `heartbeat.bump()` at the top of
                     // `'outer` is never reached while this arm holds the thread,
                     // and this single wait can legitimately run to
@@ -1761,12 +1930,14 @@ fn drain_thread_with<S: Sink>(
                     &mut block_episode,
                     ledger,
                     &heartbeat,
+                    // The same episode: a backoff already cut stays cut.
                     |segment, retry_after, processed, cause| DrainState::RetryingTransient {
                         segment,
                         retries_left: retries_left - 1,
                         next_delay: next_retry_delay(next_delay * 2, retry_after),
                         processed,
                         cause,
+                        backoff_cut,
                     },
                 )
             }
@@ -1797,6 +1968,25 @@ fn drain_thread_with<S: Sink>(
                     // `drain_state{blocked_dead_letter_full}` is alive; only a
                     // thread that cannot reach its own loop is wedged.
                     // `wait_slice` bumps the heartbeat on every slice.
+                    {
+                        let now = Instant::now();
+                        requeue.service(
+                            &ctx,
+                            || {
+                                requeue_unconfirmed(
+                                    &config,
+                                    &metrics,
+                                    Some(&drain_rx),
+                                    &mut pending,
+                                    &mut backlog,
+                                    Some(&segment),
+                                    &|p| ledger.excludes(p, now),
+                                    &heartbeat,
+                                )
+                            },
+                            || false,
+                        );
+                    }
                     let remaining = check_end.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
@@ -1900,6 +2090,8 @@ fn drain_thread_with<S: Sink>(
                         next_delay: config.base_retry_delay,
                         processed,
                         cause: TransientCause::Sink,
+                        // A new retry episode.
+                        backoff_cut: false,
                     }
                 } else if channel_closed {
                     // No headroom and shutdown requested — leave segment unconfirmed.
@@ -2306,6 +2498,7 @@ fn transition_from_draining(
             next_delay: next_retry_delay(config.base_retry_delay, retry_after),
             processed,
             cause,
+            backoff_cut: false,
         },
     )
 }
