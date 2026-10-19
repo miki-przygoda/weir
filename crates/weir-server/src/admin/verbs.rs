@@ -10,20 +10,21 @@ use std::{
 
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex, mpsc, watch};
+use tracing::{debug, info};
 use weir_status::{
     LivezCheck, Thresholds,
     admin::{
         AdminError, DEFAULT_PAUSE_WAIT_MS, DEFAULT_RETRY_WAIT_MS, ErrorCode, HeldSegment,
-        InstanceId, PAUSE_NOTE, PauseResult, RETRY_NOTE, ResumeResult, RetryStrandedResult, Verb,
-        WARN_UNBOUNDED_WAB,
+        InstanceId, PAUSE_NOTE, PauseResult, RETRY_NOTE, Response, ResumeResult,
+        RetryStrandedResult, Verb, WARN_UNBOUNDED_WAB,
     },
 };
 
-use super::framing::wait_arg;
+use super::framing::{Dispatch, parse_request, wait_arg};
 use crate::{
     drain::control::DrainControl,
     lifecycle::ShutdownLevel,
-    metrics::{AdminVerbLabel, Metrics},
+    metrics::{AdminOutcomeLabel, AdminRequestLabel, AdminVerbLabel, Metrics},
     reload::{self, ReloadRequest, ReloadTrigger, ReloadWaitError},
     status::{DrainExitReason, RequeueResult, StatusBoard, unix_ms_now},
 };
@@ -135,6 +136,16 @@ fn encode<T: serde::Serialize>(v: &T) -> Result<Value, AdminError> {
 }
 
 impl AdminState {
+    /// One increment of `weir_admin_requests_total{verb,outcome}`. Every
+    /// label set is pre-created by `Metrics::new` (Task 6.3), so this never
+    /// adds a series.
+    fn count(&self, verb: AdminVerbLabel, outcome: AdminOutcomeLabel) {
+        self.metrics
+            .admin_requests
+            .get_or_create(&AdminRequestLabel { verb, outcome })
+            .inc();
+    }
+
     /// The admin view of the status document: the same model and evaluator
     /// as `/status` (PR 1's renderer, PR 5's route). Loads only: never blocks
     /// the drain, a flusher or an ack.
@@ -298,6 +309,66 @@ impl AdminState {
             paused: self.drain_ctl.pause_requested(),
             note: RETRY_NOTE.to_string(),
         })
+    }
+}
+
+/// The one dispatcher (spec §11): parse the envelope, run the verb, count the
+/// request, log it, and answer with the daemon's identity on every reply
+/// (errors included; this peer already passed the uid check in the accept
+/// loop). The metric carries only `ok | error`; the precise error code goes
+/// to the log line (plan reconciliation 7).
+impl Dispatch for AdminState {
+    async fn dispatch(&self, line: &[u8], peer_uid: u32) -> Response {
+        let req = match parse_request(line) {
+            Ok(r) => r,
+            Err((id, e)) => {
+                self.count(AdminVerbLabel::Invalid, AdminOutcomeLabel::error);
+                // DEBUG, and the code only: the request text is never logged.
+                debug!(peer_uid, code = e.code.as_str(), "admin: invalid request");
+                return Response::failure(id, Some(self.instance.clone()), e);
+            }
+        };
+        let result = match req.verb {
+            Verb::Status => self.status(),
+            Verb::Reload => self.reload().await,
+            Verb::DrainPause => self.drain_pause(&req.args, peer_uid).await,
+            Verb::DrainResume => self.drain_resume(&req.args).await,
+            Verb::DrainRetryStranded => self.drain_retry_stranded(&req.args).await,
+        };
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(e) => e.code.as_str(),
+        };
+        self.count(
+            verb_label(req.verb),
+            if result.is_ok() {
+                AdminOutcomeLabel::ok
+            } else {
+                AdminOutcomeLabel::error
+            },
+        );
+        if req.verb == Verb::Status {
+            // A poller may call `status` every few seconds: keep INFO quiet.
+            debug!(peer_uid, outcome, "admin status");
+        } else {
+            // spec §11: every mutating verb is logged at INFO with
+            // {verb, peer_uid, outcome}; reload is logged the same way.
+            info!(verb = req.verb.as_str(), peer_uid, outcome, "admin request");
+        }
+        match result {
+            Ok(v) => Response::success(req.id, self.instance.clone(), v),
+            Err(e) => Response::failure(req.id, Some(self.instance.clone()), e),
+        }
+    }
+
+    fn instance(&self) -> Option<InstanceId> {
+        Some(self.instance.clone())
+    }
+
+    /// An oversized line or a missed request deadline never reaches
+    /// [`parse_request`], so it is counted here, under `_invalid`.
+    fn on_framing_error(&self, _code: ErrorCode) {
+        self.count(AdminVerbLabel::Invalid, AdminOutcomeLabel::error);
     }
 }
 
@@ -621,6 +692,131 @@ mod tests {
         assert_eq!(res["completed"], true);
         assert_eq!(res["coalesced"], true);
         assert_eq!(res["scan_error"], "permission denied on shard-0");
+    }
+
+    use crate::admin::test_support::{call, requests};
+    use crate::metrics::AdminOutcomeLabel;
+
+    #[tokio::test]
+    async fn every_verb_answers_through_the_envelope_with_identity() {
+        let h = harness(ReloadMode::Live);
+        for (verb, extra) in [
+            ("status", ""),
+            ("reload", ""),
+            ("drain.pause", r#","args":{"wait_ms":0}"#),
+            ("drain.resume", r#","args":{"wait_ms":0}"#),
+            ("drain.retry_stranded", r#","args":{"wait_ms":0}"#),
+        ] {
+            let r = call(
+                &h.st,
+                &format!(r#"{{"v":1,"id":"{verb}","verb":"{verb}"{extra}}}"#),
+            )
+            .await;
+            assert!(r.ok, "{verb}: {r:?}");
+            assert_eq!(r.id, json!(verb), "id echoed");
+            assert_eq!(
+                r.instance.as_ref().unwrap().pid,
+                std::process::id(),
+                "{verb}"
+            );
+        }
+        for verb in [
+            AdminVerbLabel::Status,
+            AdminVerbLabel::Reload,
+            AdminVerbLabel::DrainPause,
+            AdminVerbLabel::DrainResume,
+            AdminVerbLabel::DrainRetryStranded,
+        ] {
+            assert_eq!(
+                requests(&h.st.metrics, verb, AdminOutcomeLabel::ok),
+                1,
+                "{verb:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn errors_carry_identity_and_are_counted() {
+        let h = harness(ReloadMode::Live);
+        for line in [
+            "not json",
+            r#"{"v":2,"verb":"status"}"#,
+            r#"{"v":1,"verb":"nope"}"#,
+        ] {
+            let r = call(&h.st, line).await;
+            assert!(!r.ok, "{line}");
+            assert!(r.instance.is_some(), "identity on every response: {line}");
+        }
+        assert_eq!(
+            requests(
+                &h.st.metrics,
+                AdminVerbLabel::Invalid,
+                AdminOutcomeLabel::error
+            ),
+            3
+        );
+
+        h.level_tx.send(ShutdownLevel::Graceful).unwrap();
+        let r = call(
+            &h.st,
+            r#"{"v":1,"id":5,"verb":"drain.pause","args":{"wait_ms":0}}"#,
+        )
+        .await;
+        assert_eq!(r.id, json!(5));
+        assert_eq!(r.error.unwrap().code, ErrorCode::ShuttingDown);
+        assert!(r.instance.is_some());
+        assert_eq!(
+            requests(
+                &h.st.metrics,
+                AdminVerbLabel::DrainPause,
+                AdminOutcomeLabel::error
+            ),
+            1
+        );
+        assert!(
+            call(&h.st, r#"{"v":1,"verb":"status"}"#).await.ok,
+            "status still works after T0"
+        );
+    }
+
+    /// A framing-level error (here a request that misses its deadline) never
+    /// reaches `parse_request`; it is still counted under `_invalid` and its
+    /// reply still carries the identity.
+    #[tokio::test]
+    async fn a_framing_error_is_counted_as_invalid_and_carries_identity() {
+        use crate::admin::framing::{Limits, serve_connection};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let h = harness(ReloadMode::Live);
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let st = Arc::clone(&h.st);
+        let limits = Limits {
+            request_deadline: Duration::from_millis(100),
+            ..Limits::PRODUCTION
+        };
+        let served =
+            tokio::spawn(async move { serve_connection(server, uid(), &*st, &limits).await });
+        let (rd, mut wr) = client.into_split();
+        wr.write_all(br#"{"v":1"#).await.unwrap(); // no newline
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            BufReader::new(rd).read_line(&mut line),
+        )
+        .await
+        .expect("answered within 2 s")
+        .unwrap();
+        let r: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(r["error"]["code"], "bad_request", "{r}");
+        assert_eq!(r["instance"]["pid"], std::process::id());
+        served.await.unwrap();
+        assert_eq!(
+            requests(
+                &h.st.metrics,
+                AdminVerbLabel::Invalid,
+                AdminOutcomeLabel::error
+            ),
+            1
+        );
     }
 
     #[tokio::test]

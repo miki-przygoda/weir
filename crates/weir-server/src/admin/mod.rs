@@ -297,6 +297,13 @@ pub(crate) mod test_support {
         }
     }
 
+    /// One request line through the real dispatcher, as an authorized peer
+    /// with the test's own uid.
+    pub(crate) async fn call(st: &AdminState, line: &str) -> weir_status::admin::Response {
+        use super::framing::Dispatch;
+        st.dispatch(line.as_bytes(), uid()).await
+    }
+
     pub(crate) fn uid() -> u32 {
         // Safety: geteuid has no preconditions.
         unsafe { libc::geteuid() }
