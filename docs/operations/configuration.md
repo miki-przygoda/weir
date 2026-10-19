@@ -1029,6 +1029,31 @@ weir's `shutdown_timeout_secs` should be set ≤ the orchestrator
 grace minus a few seconds, so the daemon's own cleanup finishes
 before the orchestrator SIGKILLs.
 
+#### `drain_shutdown_budget_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `10`
+- **Range**: 0-3600
+- **CLI**: `--drain-shutdown-budget-secs <n>`
+- **Env**: `WEIR_DRAIN_SHUTDOWN_BUDGET_SECS`
+- **TOML**: `drain_shutdown_budget_secs`
+
+How long the drain keeps delivering after SIGTERM, counted from the moment
+every flusher has sealed and handed off its last segment. At the deadline the
+drain abandons the segment it is delivering (no `.confirmed` is written) and
+exits; that segment and every segment still queued stay sealed and unconfirmed
+on disk and are delivered by the next start. `0` abandons at once.
+
+**Effect**: shutdown no longer waits for the whole backlog. A sink that is slow
+or down cannot hold `systemctl stop` or a pod termination hostage. The cost is
+at-least-once re-delivery of the abandoned segment's committed prefix on the
+next start (see "Shutdown grace period" below).
+
+**When to tune**: raise it (up to 3600) to drain more on a planned stop; to
+decommission a host, wait for `weir_wab_undelivered_segments == 0` first
+rather than relying on the budget. Whatever you choose, keep the
+orchestrator grace at `shutdown_timeout_secs + drain_shutdown_budget_secs + 5`.
+
 ---
 
 ### Dead-letter queue

@@ -113,6 +113,7 @@ impl From<&Config> for ConfigView {
             metrics_max_connections,
             peer_uid_check,
             shutdown_timeout_secs,
+            drain_shutdown_budget_secs,
             connection_read_timeout_secs,
             sink_type,
             sink_url,
@@ -186,6 +187,7 @@ impl From<&Config> for ConfigView {
         v.public("sink_timeout_secs", u(*sink_timeout_secs));
         v.public("health_poll_interval_secs", u(*health_poll_interval_secs));
         v.public("shutdown_timeout_secs", u(*shutdown_timeout_secs));
+        v.public("drain_shutdown_budget_secs", u(*drain_shutdown_budget_secs));
         v.public("max_connections", u(*max_connections as u64));
         v.public("peer_uid_check", b(*peer_uid_check));
         v.public("tls_enabled", b(tcp_bind.is_some()));
@@ -412,7 +414,6 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        doc.retain(|k| k != "drain_shutdown_budget_secs"); // the key arrives with PR 4
         doc.sort();
         assert_eq!(public, doc);
         let p = v.public();

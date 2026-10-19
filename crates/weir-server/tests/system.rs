@@ -908,6 +908,9 @@ fn metrics_all_families_registered() {
         "weir_connections_refused_no_live_shard",
         "weir_drain_segments_abandoned",
         "weir_wab_segments_not_handed_off",
+        // Bounded shutdown (Foundations PR 4)
+        "weir_config_drain_shutdown_budget_seconds",
+        "weir_drain_shutdown_deadline_seconds",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the

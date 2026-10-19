@@ -824,6 +824,55 @@ fn the_wab_dir_lock_key_is_in_the_configuration_reference() {
     }
 }
 
+/// The bounded-shutdown budget (Foundations §7) is an operator-facing knob
+/// whose default decides how much a SIGTERM delivers; it must be findable in
+/// the reference and in the example that claims to list every option.
+#[test]
+fn the_drain_shutdown_budget_key_is_in_the_configuration_reference() {
+    assert!(
+        CONFIG_ENV_SRC.contains("\"WEIR_DRAIN_SHUTDOWN_BUDGET_SECS\""),
+        "src/config/env.rs no longer reads WEIR_DRAIN_SHUTDOWN_BUDGET_SECS; update \n\
+         this guard and the docs to the new spelling"
+    );
+    assert!(
+        CONFIG_CLI_SRC.contains("\"--drain-shutdown-budget-secs\""),
+        "src/config/cli.rs no longer parses --drain-shutdown-budget-secs"
+    );
+    // Scoped to the entry's own section: "**Default**: `10`" also appears
+    // under two other keys, so a whole-file search would stay green with
+    // this entry's default deleted.
+    let entry = CONFIGURATION
+        .split("#### `drain_shutdown_budget_secs`")
+        .nth(1)
+        .expect(
+            "docs/operations/configuration.md must have a #### `drain_shutdown_budget_secs` entry",
+        )
+        .split("\n#### ")
+        .next()
+        .unwrap();
+    for needle in [
+        "**Default**: `10`",
+        "**Range**: 0-3600",
+        "`WEIR_DRAIN_SHUTDOWN_BUDGET_SECS`",
+        "`--drain-shutdown-budget-secs",
+    ] {
+        assert!(
+            entry.contains(needle),
+            "the drain_shutdown_budget_secs entry is missing {needle:?}"
+        );
+    }
+    for needle in [
+        "drain_shutdown_budget_secs",
+        "WEIR_DRAIN_SHUTDOWN_BUDGET_SECS",
+    ] {
+        assert!(
+            CONFIG_EXAMPLE.contains(needle),
+            "deploy/docker/weir.toml.example claims to list every option; it is \n\
+             missing {needle:?}"
+        );
+    }
+}
+
 /// `test-hooks` system tests compile only under that feature. The CI line that
 /// runs the system tests with `--all-features` is what keeps them from being
 /// silently skipped forever (spec §16 "a drift guard asserts the

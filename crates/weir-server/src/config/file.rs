@@ -30,6 +30,7 @@ struct RawServer {
     metrics_max_connections: Option<usize>,
     peer_uid_check: Option<bool>,
     shutdown_timeout_secs: Option<u64>,
+    drain_shutdown_budget_secs: Option<u64>,
     connection_read_timeout_secs: Option<u64>,
     sink_type: Option<String>,
     sink_url: Option<String>,
@@ -115,6 +116,7 @@ const BASE_SERVER_KEYS: &[&str] = &[
     "metrics_max_connections",
     "peer_uid_check",
     "shutdown_timeout_secs",
+    "drain_shutdown_budget_secs",
     "connection_read_timeout_secs",
     "sink_type",
     "sink_url",
@@ -241,6 +243,7 @@ pub(super) fn read(path: &Path) -> Result<Option<(PartialConfig, Vec<String>)>, 
             metrics_max_connections: s.metrics_max_connections,
             peer_uid_check: s.peer_uid_check,
             shutdown_timeout_secs: s.shutdown_timeout_secs,
+            drain_shutdown_budget_secs: s.drain_shutdown_budget_secs,
             connection_read_timeout_secs: s.connection_read_timeout_secs,
             sink_type: s.sink_type,
             sink_url: s.sink_url,
@@ -426,5 +429,22 @@ mod tests {
         );
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drain_shutdown_budget_is_a_known_key() {
+        let dir = crate::testutil::scratch_dir("filecfg_budget");
+        crate::testutil::mkdir_p(&dir);
+        let path = dir.join("weir.toml");
+        std::fs::write(&path, "[server]\ndrain_shutdown_budget_secs = 7\n").unwrap();
+        let (partial, warnings) = read(&path).unwrap().expect("the file exists");
+        assert_eq!(partial.drain_shutdown_budget_secs, Some(7));
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.contains("drain_shutdown_budget_secs")),
+            "drain_shutdown_budget_secs must not be reported as unknown: {warnings:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
