@@ -2424,7 +2424,7 @@ fn second_daemon_refuses_a_live_socket() {
         "B must say why it refused\nlog:\n{log}"
     );
     // At info, these absences prove the refusal came from preflight: the late
-    // bind in socket::run runs only after recovery and the metrics bind.
+    // bind in socket::bind runs only after recovery and the metrics bind.
     assert!(
         log.contains("weir starting"),
         "B's log must be at info\nlog:\n{log}"

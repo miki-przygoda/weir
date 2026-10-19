@@ -16,8 +16,9 @@
 //! therefore read `local_addr()` before handing the listener over. This serves
 //! both consumers cleanly:
 //!
-//! * production `main.rs` binds `config.tcp_bind` (a concrete address) and logs
-//!   the bound address, then passes the listener in; and
+//! * production `main.rs` binds `config.tcp_bind` (a concrete address) through
+//!   [`super::bind_all`], together with the Unix socket and before either
+//!   accept loop serves, then passes the listener in; and
 //! * integration tests configure the daemon with a fixed loopback port (chosen
 //!   via the testkit's `free_port()` under the process lock), so the test
 //!   already knows the address it will connect to.

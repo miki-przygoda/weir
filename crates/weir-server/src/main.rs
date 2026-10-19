@@ -67,6 +67,28 @@ use sink::noop::NoopSink;
 #[cfg(feature = "postgres-sink")]
 use sink::postgres::{PostgresSink, PostgresSinkConfig};
 
+// ── Startup settle wait ───────────────────────────────────────────────────────
+
+/// How long startup waits for every flusher to leave `Starting` (and every
+/// worker to start) before binding the producer listeners (spec §6 step 10).
+/// Unsettled shards stay `Starting` and are not routed to.
+const SHARD_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Polls `done` every `poll` until it returns true (→ true) or `timeout`
+/// passes (→ false). `done` is always called at least once.
+fn wait_until(timeout: Duration, poll: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if done() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 // ── wab_dir lock integrity ────────────────────────────────────────────────────
 
 /// How often the integrity thread re-checks `.weir.lock`. Bounds the residual
@@ -865,6 +887,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // synchronously, before any producer listener exists (fail-closed).
     status::poll::startup_cap_gate(&config.wab_dir, config.wab_max_bytes, &board, &metrics);
 
+    // Spec §6 step 10: routing sends connections only to settled,
+    // ingest-capable shards, so the listeners wait for the flushers' counter
+    // scans (PR 4 moves this into its startup step 10). Routing also needs the
+    // shard's worker running (PR 1's `ingest_capable`), so wait for every
+    // worker too: a connection accepted before a worker has entered its guard
+    // would otherwise be refused as no_live_shard.
+    if !wait_until(SHARD_SETTLE_TIMEOUT, Duration::from_millis(10), || {
+        board.shards.all_settled()
+            && (0..board.shards.worker_count()).all(|w| board.shards.worker_running(w))
+    }) {
+        warn!(
+            timeout_secs = SHARD_SETTLE_TIMEOUT.as_secs(),
+            "not every WAB shard and worker settled before the producer listeners were \
+             bound; unsettled shards receive no connections until they come up"
+        );
+    }
+
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -962,7 +1001,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // Shutdown coordination: signal handler → shutdown_tx → socket::run exits.
+        // Shutdown coordination: signal handler → shutdown_tx → socket::serve exits.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         // ONE shared connection-cap semaphore for ALL listeners (Unix + TCP).
@@ -971,6 +1010,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // two independent semaphores.
         let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
 
+        // One router for both transports: one refusal counter and one WARN
+        // limiter. It sends each connection only to an ingest-capable shard
+        // (spec §5.7).
+        #[cfg(unix)]
+        let router = socket::route::ShardRouter::live(
+            Arc::clone(&board) as Arc<dyn socket::route::LiveShards>
+        );
+
+        // TLS material loads before any bind (unchanged position relative to
+        // the TCP bind; PR 4 moves it to startup step 6). Config validation
+        // guarantees the three tls_* paths are present whenever tcp_bind is
+        // set; preflight has already loaded this material once and test-bound
+        // the address, so a failure here is a race (spec §3.0).
+        #[cfg(all(unix, feature = "tls"))]
+        let tls = match config.tcp_bind {
+            Some(_) => {
+                let (cert, key, ca) = preflight::tls_paths(&config)?;
+                let tls = socket::tls::ReloadableServerConfig::load(cert, key, ca)
+                    .map_err(|e| preflight::tls_load_error(&e))?;
+                // Register for reload before `tls` moves into tcp::run. The
+                // clone shares the same inner ArcSwap, so a reload from the
+                // reload loop is immediately visible to the accept loop's
+                // `tls.current()` call.
+                reloader.register_tls(tls.clone());
+                Some(tls)
+            }
+            None => None,
+        };
+
+        #[cfg(unix)]
+        let socket_config = socket::SocketConfig {
+            socket_path: config.socket_path.clone(),
+            max_connections: config.max_connections,
+            max_payload_bytes: config.max_payload_bytes,
+            max_batch_records: config.max_batch_records,
+            shutdown_timeout_secs: config.shutdown_timeout_secs,
+            connection_read_timeout_secs: config.connection_read_timeout_secs,
+            shard_count: config.shard_count,
+            peer_uid_check: config.peer_uid_check,
+            wab_max_bytes: config.wab_max_bytes,
+            wab_bytes_now: Arc::clone(&wab_bytes_now),
+            wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+            wab_ownership_lost: Arc::clone(&wab_ownership_lost),
+            board: Some(Arc::clone(&board)),
+        };
+
+        // Bind EVERY producer listener, then serve (spec §5.7, §6 step 11): a
+        // bind failure fails startup before any producer is acked. `bind_all`
+        // and `bind` write the listener marks (README Q6); main writes none
+        // here.
+        board.enter_phase(weir_status::Phase::Binding, &metrics);
+        #[cfg(unix)]
+        let listeners = socket::bind_all(&socket_config, config.tcp_bind).await?;
+
         // Optional TCP+mTLS listener (feature = "tls"). It runs its own accept
         // loop concurrently with the Unix loop, feeding the SAME pipeline via a
         // cloned queue_tx. Both listeners share `conn_sem` above so the combined
@@ -978,88 +1071,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         //
         // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
         // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
-        board.enter_phase(weir_status::Phase::Binding, &metrics);
         #[cfg(all(unix, feature = "tls"))]
-        let (tcp_shutdown_tx, tcp_join) = {
-            use socket::tcp::{self, TcpConfig};
-            use socket::tls::ReloadableServerConfig;
+        let (tcp_shutdown_tx, tcp_join) = match (listeners.tcp, tls) {
+            (Some(listener), Some(tls)) => {
+                let tcp_config = socket::tcp::TcpConfig {
+                    max_connections: config.max_connections,
+                    max_payload_bytes: config.max_payload_bytes,
+                    max_batch_records: config.max_batch_records,
+                    shard_count: config.shard_count,
+                    shutdown_timeout_secs: config.shutdown_timeout_secs,
+                    connection_read_timeout_secs: config.connection_read_timeout_secs,
+                    handshake_timeout_secs: config.tls_handshake_timeout_secs,
+                    wab_max_bytes: config.wab_max_bytes,
+                    wab_bytes_now: Arc::clone(&wab_bytes_now),
+                    wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+                    wab_ownership_lost: Arc::clone(&wab_ownership_lost),
+                };
 
-            match config.tcp_bind {
-                Some(bind_addr) => {
-                    // Config validation guarantees the three tls_* paths are
-                    // present whenever tcp_bind is set; preflight has already
-                    // loaded this material once and test-bound this address,
-                    // so a failure here is a race (spec §3.0).
-                    let (cert, key, ca) = preflight::tls_paths(&config)?;
-                    let tls = ReloadableServerConfig::load(cert, key, ca)
-                        .map_err(|e| preflight::tls_load_error(&e))?;
-
-                    // Bind in the caller so a bad bind address fails startup
-                    // (rather than the spawned accept task) — see socket::tcp
-                    // module docs on the bound-addr design.
-                    let listener = tokio::net::TcpListener::bind(bind_addr)
-                        .await
-                        .map_err(|e| preflight::tcp_bind_error(bind_addr, &e))?;
-                    let actual_addr = listener.local_addr()?;
-                    info!(addr = %actual_addr, "TCP+mTLS listener bound");
-                    board.listeners.tcp.set(weir_status::ListenerState::Bound);
-
-                    let tcp_config = TcpConfig {
-                        max_connections: config.max_connections,
-                        max_payload_bytes: config.max_payload_bytes,
-                        max_batch_records: config.max_batch_records,
-                        shard_count: config.shard_count,
-                        shutdown_timeout_secs: config.shutdown_timeout_secs,
-                        connection_read_timeout_secs: config.connection_read_timeout_secs,
-                        handshake_timeout_secs: config.tls_handshake_timeout_secs,
-                        wab_max_bytes: config.wab_max_bytes,
-                        wab_bytes_now: Arc::clone(&wab_bytes_now),
-                        wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
-                        wab_ownership_lost: Arc::clone(&wab_ownership_lost),
-                    };
-
-                    let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-                    let tcp_queue_tx = queue_tx.clone();
-                    let tcp_metrics = Arc::clone(&metrics);
-
-                    // Register for reload before moving `tls` into tcp::run.
-                    // The clone shares the same inner ArcSwap so a reload from the
-                    // reload loop is immediately visible to the accept loop's
-                    // `tls.current()` call.
-                    reloader.register_tls(tls.clone());
-
-                    // Pass a clone of the shared semaphore so Unix + TCP draw
-                    // from the same permit pool — true global cap.
-                    let tcp_sem = Arc::clone(&conn_sem);
-                    let tcp_board = Arc::clone(&board);
-                    let tcp_router = socket::route::ShardRouter::round_robin(config.shard_count);
-                    let tcp_join = tokio::spawn(async move {
-                        // tcp::run owns the handler-shutdown watch internally and
-                        // signals handlers BEFORE draining — no extra plumbing needed here.
-                        let res = tcp::run(
-                            tcp_config,
-                            listener,
-                            tls,
-                            tcp_queue_tx,
-                            tcp_sem,
-                            tcp_shutdown_rx,
-                            tcp_metrics,
-                            tcp_router,
-                        )
-                        .await;
-                        match res {
-                            Ok(()) => tcp_board.listeners.tcp.set(weir_status::ListenerState::Closed),
-                            Err(e) => {
-                                tcp_board.listeners.tcp.set(weir_status::ListenerState::Failed);
-                                tracing::error!(error = %e, "TCP+mTLS listener exited with error");
-                            }
+                let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                let tcp_queue_tx = queue_tx.clone();
+                let tcp_metrics = Arc::clone(&metrics);
+                // Pass a clone of the shared semaphore so Unix + TCP draw
+                // from the same permit pool — true global cap.
+                let tcp_sem = Arc::clone(&conn_sem);
+                let tcp_router = router.clone();
+                let tcp_board = Arc::clone(&board);
+                let tcp_join = tokio::spawn(async move {
+                    // tcp::run owns the handler-shutdown watch internally and
+                    // signals handlers BEFORE draining — no extra plumbing needed here.
+                    // PR 1's Closed / Failed marks (Task 1.23). Interim: PR 4
+                    // Task 4.7 moves them into `tcp::run` (README Q6).
+                    match socket::tcp::run(
+                        tcp_config,
+                        listener,
+                        tls,
+                        tcp_queue_tx,
+                        tcp_sem,
+                        tcp_shutdown_rx,
+                        tcp_metrics,
+                        tcp_router,
+                    )
+                    .await
+                    {
+                        Ok(()) => tcp_board.listeners.tcp.set(weir_status::ListenerState::Closed),
+                        Err(e) => {
+                            tcp_board.listeners.tcp.set(weir_status::ListenerState::Failed);
+                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
                         }
-                    });
-
-                    (Some(tcp_shutdown_tx), Some(tcp_join))
-                }
-                None => (None, None),
+                    }
+                });
+                (Some(tcp_shutdown_tx), Some(tcp_join))
             }
+            _ => (None, None),
         };
 
         let board_sig = Arc::clone(&board);
@@ -1096,36 +1159,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Socket accept loop — blocks until shutdown signal.
         #[cfg(unix)]
-        {
-            use socket::SocketConfig;
-            let socket_config = SocketConfig {
-                socket_path: config.socket_path.clone(),
-                max_connections: config.max_connections,
-                max_payload_bytes: config.max_payload_bytes,
-                max_batch_records: config.max_batch_records,
-                shutdown_timeout_secs: config.shutdown_timeout_secs,
-                connection_read_timeout_secs: config.connection_read_timeout_secs,
-                shard_count: config.shard_count,
-                peer_uid_check: config.peer_uid_check,
-                wab_max_bytes: config.wab_max_bytes,
-                wab_bytes_now: Arc::clone(&wab_bytes_now),
-                wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
-                wab_ownership_lost: Arc::clone(&wab_ownership_lost),
-                board: Some(Arc::clone(&board)),
-            };
-            let bound = socket::bind(&socket_config)?;
-            let router = socket::route::ShardRouter::round_robin(config.shard_count);
-            socket::serve(
-                socket_config,
-                bound,
-                queue_tx,
-                shutdown_rx,
-                Arc::clone(&metrics),
-                conn_sem,
-                router,
-            )
-            .await?;
-        }
+        socket::serve(
+            socket_config,
+            listeners.unix,
+            queue_tx,
+            shutdown_rx,
+            Arc::clone(&metrics),
+            conn_sem,
+            router,
+        )
+        .await?;
         #[cfg(not(unix))]
         {
             // On non-Unix builds weir-server is not supported; just wait for shutdown.
@@ -1149,7 +1192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Graceful pipeline drain ───────────────────────────────────────────────
     //
-    // queue_tx moved into socket::run and dropped when it returns.
+    // queue_tx moved into socket::serve and dropped when it returns.
     // Workers observe Disconnected → flush remaining Batches → drop shard_txs
     //   clones → flusher Disconnected.
     // WAB flushers observe Disconnected → seal segments → exit → drop drain_tx.
@@ -1415,5 +1458,37 @@ mod lock_integrity_tests {
             "an unreadable record is still proof of loss"
         );
         assert!(lost.load(Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::wait_until;
+    use std::time::Duration;
+
+    #[test]
+    fn wait_until_returns_true_as_soon_as_done_and_false_at_the_deadline() {
+        let mut calls = 0;
+        assert!(wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                calls == 3
+            }
+        ));
+        assert_eq!(calls, 3);
+
+        let t0 = std::time::Instant::now();
+        assert!(!wait_until(
+            Duration::from_millis(60),
+            Duration::from_millis(5),
+            || false
+        ));
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(60) && took < Duration::from_millis(500),
+            "{took:?}"
+        );
     }
 }

@@ -70,10 +70,15 @@ umask 0o077 + SIGHUP ignored
 → replay of sealed-but-unconfirmed segments into the drain channel
 → startup cap gate     synchronous WAB size scan + wab_max_bytes evaluation;
                        a failed scan with a cap set starts rejecting (src/status/poll.rs)
+→ settle wait          up to 10 s for every shard to leave Starting and every
+                       worker to run; routing skips a shard that has not
 → tokio runtime:
     reload loop + SIGHUP handler → metrics bind
-    → WAB / drain-liveness poll → [TLS load + TCP listener] → SIGTERM/Ctrl-C
-    → socket::run      bind_hardened: probe, unlink only a stale socket, bind
+    → WAB / drain-liveness poll → [TLS load]
+    → socket::bind_all [TCP bind] then socket::bind (bind_hardened: probe,
+                       unlink only a stale socket, bind); nothing serves yet
+    → [tcp::run spawned] → SIGTERM/Ctrl-C
+    → socket::serve    accept loop; each connection goes to a live shard
 → joins (workers → flushers → drain) → exit; the kernel releases the lock
 ```
 

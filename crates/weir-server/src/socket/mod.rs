@@ -18,12 +18,6 @@
 
 mod connection;
 mod peer;
-// The accept loops take a `ShardRouter` from Task 3.10 and `main` builds a
-// live one in Task 3.11, which removes this allowance.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "no production caller until PR 3 Task 3.11")
-)]
 pub(crate) mod route;
 
 #[cfg(feature = "tls")]
@@ -142,6 +136,64 @@ pub(crate) fn bind(config: &SocketConfig) -> io::Result<BoundUnix> {
         path: config.socket_path.clone(),
         socket,
     })
+}
+
+/// Every producer listener, bound and not yet served (spec §6 step 11).
+#[derive(Debug)]
+pub(crate) struct BoundListeners {
+    pub(crate) unix: BoundUnix,
+    /// `Some` only with `tcp_bind`, which config validation allows only in a
+    /// `tls` build. Only main's `tls` block reads it, hence the same
+    /// non-tls dead-code allowance `Config::tcp_bind` carries.
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+    pub(crate) tcp: Option<tokio::net::TcpListener>,
+}
+
+/// Binds TCP (if configured), then the Unix socket, and serves neither.
+///
+/// Why before any accept loop (spec §5.7): a bind failure then fails startup
+/// before a single producer is acked, and no producer traffic overlaps the
+/// `umask(0o177)` window inside [`bind_hardened`]. TCP goes first because a
+/// failed Unix bind then only has to drop a `TcpListener`; the reverse would
+/// leave a socket file to clean up. Binding here, in the caller of the accept
+/// loops, also keeps "a bad bind address fails startup" out of the spawned
+/// accept task (see `socket::tcp`'s module docs on the bound-addr design).
+///
+/// README Q6: this is the one writer of the TCP listener's `Bound` / `Failed`
+/// marks ([`bind`] writes the Unix ones). `Bound` is written only once the
+/// whole step has succeeded, so a TCP listener dropped because the Unix bind
+/// failed is never reported Bound.
+#[cfg(unix)]
+pub(crate) async fn bind_all(
+    config: &SocketConfig,
+    tcp: Option<std::net::SocketAddr>,
+) -> io::Result<BoundListeners> {
+    let tcp_failed = |_: &io::Error| {
+        if let Some(b) = &config.board {
+            b.listeners.tcp.set(weir_status::ListenerState::Failed);
+        }
+    };
+    let tcp = match tcp {
+        Some(addr) => {
+            let bound = tokio::net::TcpListener::bind(addr).await;
+            // A tls build words the error the way preflight does (spec §3.0);
+            // without tls, config validation never lets `tcp_bind` reach here.
+            #[cfg(feature = "tls")]
+            let bound = bound.map_err(|e| crate::preflight::tcp_bind_error(addr, &e));
+            let listener = bound.inspect_err(tcp_failed)?;
+            let local = listener.local_addr().inspect_err(tcp_failed)?;
+            info!(addr = %local, "TCP+mTLS listener bound");
+            Some(listener)
+        }
+        None => None,
+    };
+    let unix = bind(config)?;
+    if tcp.is_some()
+        && let Some(b) = &config.board
+    {
+        b.listeners.tcp.set(weir_status::ListenerState::Bound);
+    }
+    Ok(BoundListeners { unix, tcp })
 }
 
 /// bind + serve with today's round-robin routing. Test-only: production binds
@@ -2489,13 +2541,17 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn bind_returns_a_bound_socket_that_serve_then_serves() {
-        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = umask_immune_dir("bind_then_serve");
         let path = dir.join("weir.sock");
         let board = crate::status::test_board(1, 1);
         let mut cfg = default_config(path.clone());
         cfg.board = Some(std::sync::Arc::clone(&board));
-        let bound = bind(&cfg).unwrap();
+        // The umask lock covers the bind only: a std Mutex is not held
+        // across an await.
+        let bound = {
+            let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+            bind(&cfg).unwrap()
+        };
         assert_eq!(bound.path, path);
         assert!(path.exists());
         // README Q6: `bind` is the one writer of the Unix Bound mark; Serving
@@ -2557,11 +2613,13 @@ mod tests {
                 None
             }
         }
-        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = umask_immune_dir("no_live_shard");
         let path = dir.join("weir.sock");
         let cfg = default_config(path.clone());
-        let bound = bind(&cfg).unwrap();
+        let bound = {
+            let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+            bind(&cfg).unwrap()
+        };
         let metrics = test_metrics();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
@@ -2594,6 +2652,130 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── bind every producer listener before serving any (PR 3 Task 3.11) ───
+
+    fn free_loopback_addr() -> std::net::SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "bind_all awaits the TCP bind; the umask lock must cover its bind_hardened, and a current-thread test runtime runs nothing else that could take the lock"
+    )]
+    async fn bind_all_binds_tcp_and_unix_and_serves_neither() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("bind_all_ok");
+        let path = dir.join("weir.sock");
+        let addr = free_loopback_addr();
+        let board = crate::status::test_board(1, 1);
+        let mut cfg = default_config(path.clone());
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let bound = bind_all(&cfg, Some(addr)).await.unwrap();
+        assert_eq!(bound.tcp.as_ref().unwrap().local_addr().unwrap(), addr);
+        assert_eq!(bound.unix.path, path);
+        // README Q6: bind_all / bind mark Bound; nothing enters Serving yet.
+        assert_eq!(board.listeners.tcp.get(), weir_status::ListenerState::Bound);
+        assert_eq!(
+            board.listeners.unix.get(),
+            weir_status::ListenerState::Bound
+        );
+        assert_ne!(board.life.phase(), weir_status::Phase::Serving);
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Without a TCP address only the Unix socket is bound, and the TCP
+    /// listener's mark is left alone.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "bind_all awaits the TCP bind; the umask lock must cover its bind_hardened, and a current-thread test runtime runs nothing else that could take the lock"
+    )]
+    async fn bind_all_without_tcp_binds_only_the_unix_socket() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("bind_all_unix_only");
+        let path = dir.join("weir.sock");
+        let board = crate::status::test_board(1, 1);
+        let mut cfg = default_config(path.clone());
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let tcp_before = board.listeners.tcp.get();
+        let bound = bind_all(&cfg, None).await.unwrap();
+        assert!(bound.tcp.is_none());
+        assert!(path.exists());
+        assert_eq!(board.listeners.tcp.get(), tcp_before);
+        drop(bound);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Unix bind failure after the TCP bind fails the whole step and leaves
+    /// nothing listening: startup fails before any producer could be acked.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "bind_all awaits the TCP bind; the umask lock must cover its bind_hardened, and a current-thread test runtime runs nothing else that could take the lock"
+    )]
+    async fn bind_all_releases_the_tcp_port_when_the_unix_bind_fails() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("bind_all_fail");
+        let path = dir.join("weir.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        let addr = free_loopback_addr();
+        let board = crate::status::test_board(1, 1);
+        let mut cfg = default_config(path.clone());
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let err = bind_all(&cfg, Some(addr)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(
+            board.listeners.unix.get(),
+            weir_status::ListenerState::Failed
+        );
+        assert_ne!(
+            board.listeners.tcp.get(),
+            weir_status::ListenerState::Bound,
+            "a TCP listener dropped with the failed step is never reported Bound"
+        );
+        assert!(
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err(),
+            "the TCP listener must be dropped with the failed step"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A TCP bind failure (the address is taken) marks the TCP listener
+    /// Failed and never creates the Unix socket.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "bind_all awaits the TCP bind; the umask lock must cover its bind_hardened, and a current-thread test runtime runs nothing else that could take the lock"
+    )]
+    async fn bind_all_fails_on_a_taken_tcp_address_before_the_unix_bind() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("bind_all_tcp_taken");
+        let path = dir.join("weir.sock");
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let board = crate::status::test_board(1, 1);
+        let mut cfg = default_config(path.clone());
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let unix_before = board.listeners.unix.get();
+        let err = bind_all(&cfg, Some(addr)).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        assert_eq!(
+            board.listeners.tcp.get(),
+            weir_status::ListenerState::Failed
+        );
+        assert_eq!(board.listeners.unix.get(), unix_before);
+        assert!(!path.exists(), "the Unix socket is never bound");
+        drop(taken);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

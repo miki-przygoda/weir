@@ -335,8 +335,8 @@ The unit tests in `crates/weir-server/src/socket/mod.rs::tests` cover:
   `remove_own_socket_refuses_non_socket`, `remove_own_socket_missing_is_noop`
   — shutdown removes only the inode it bound.
 - `full_run_start_then_shutdown_removes_its_own_socket` — the regression
-  for the self-probe trap: a clean `socket::run` start and shutdown leaves no
-  socket behind.
+  for the self-probe trap: a clean start and shutdown (`socket::bind`
+  then `socket::serve`) leaves no socket behind.
 - `o_path_pin_opens_on_socket_inode` (Linux) — the `O_PATH` pin opens on a
   socket inode.
 - `bind_hardened_succeeds_when_no_file_exists` — happy path: clean parent.
@@ -396,8 +396,8 @@ WAB directories go through `wab::create_dir_private`, which chmods after mkdir.
 before any producer can connect, so no records exist and no segment is being
 created. The WAB flushers and workers are running by then, but idle. (The
 earlier justification — that startup is single-threaded — was wrong: `main.rs`
-calls `wab::spawn` and then `worker::spawn_workers`, both well before
-`socket::run` binds. The correct reason is that the process is *idle*, not that
+calls `wab::spawn_flushers` and then `worker::spawn_workers_with`, both well
+before `socket::bind` binds. The correct reason is that the process is *idle*, not that
 it is single-threaded. Symbol names rather than line numbers, deliberately: the
 numbers this paragraph originally carried had drifted by ~250 lines before anyone
 noticed, which made a true claim look false.)
