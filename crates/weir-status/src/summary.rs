@@ -4,7 +4,7 @@
 //! `summary_templates_take_no_free_text` enforces this on the source itself.
 //! Keep each signature on ONE line; the test parses them.
 
-use crate::evidence::{ListenerKind, OfflineReason, Phase, SinkFailureKind};
+use crate::evidence::{AdminReason, ListenerKind, OfflineReason, Phase, SinkFailureKind};
 use crate::rules::AckTimeoutCause;
 
 fn join_ids(ids: &[u16]) -> String {
@@ -183,6 +183,37 @@ pub(crate) fn active_segment_aging(shard: u16, secs: u64) -> String {
     )
 }
 
+pub(crate) fn fsync_failures_recent(n: u64) -> String {
+    format!(
+        "{n} WAB fsync failure(s) in the last 15 min; the records in those groups were nacked, not acked"
+    )
+}
+
+pub(crate) fn flusher_respawned_recent(n: u64) -> String {
+    format!("{n} WAB flusher panic(s) in the last 15 min; every shard is back up")
+}
+
+pub(crate) fn quarantine_nonempty(bytes: u64, files: u64) -> String {
+    format!("quarantine/ holds {files} file(s), {bytes} bytes; inspect with weir-ctl quarantine")
+}
+
+pub(crate) fn recovery_incomplete(failed: u64, copy_failed: u64) -> String {
+    format!(
+        "startup recovery failed for {failed} segment(s) and could not keep {copy_failed} quarantine copy(ies) in this process"
+    )
+}
+
+pub(crate) fn tls_reload_failed() -> String {
+    "the last TLS reload failed; previous certificates still served".to_string()
+}
+
+pub(crate) fn admin_unavailable(reason: Option<AdminReason>) -> String {
+    format!(
+        "admin socket not bound ({}); weir-ctl drain/reload unavailable, kill -HUP still reloads",
+        reason.map_or("unknown", AdminReason::as_str)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -216,6 +247,6 @@ mod tests {
                 }
             }
         }
-        assert!(n == 0 || n >= 1, "parsed {n} templates");
+        assert_eq!(n, 30, "one template per daemon code");
     }
 }

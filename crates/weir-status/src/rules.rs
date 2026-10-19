@@ -131,8 +131,15 @@ pub(crate) fn rule(c: ConditionCode, e: &Evidence, t: &Thresholds) -> Outcome {
         C::DeadLetterNearCap => dead_letter_near_cap(e, t),
         C::NoopSink => noop_sink(e),
         C::ActiveSegmentAging => active_segment_aging(e, t),
-        // Task 1.6 replaces this arm with the remaining rules.
-        _ => Outcome::Unevaluated,
+        C::FsyncFailuresRecent => fsync_failures_recent(e),
+        C::FlusherRespawnedRecent => flusher_respawned_recent(e),
+        C::QuarantineNonempty => quarantine_nonempty(e),
+        C::RecoveryIncomplete => recovery_incomplete(e),
+        C::TlsReloadFailed => tls_reload_failed(e),
+        C::AdminUnavailable => admin_unavailable(e),
+        // Never evaluated by the daemon: weir-ctl emits the offline-only codes
+        // itself, and Unknown only arrives from a newer daemon's document.
+        C::DaemonUnreachable | C::RecoveryPending | C::Unknown => Outcome::Inactive,
     }
 }
 
@@ -670,6 +677,99 @@ fn active_segment_aging(e: &Evidence, t: &Thresholds) -> Outcome {
         .with("shard", u(u64::from(shard)))
         .with("age_secs", EvidenceValue::F64(secs))
         .into()
+}
+
+fn fsync_failures_recent(e: &Evidence) -> Outcome {
+    let Some(n) = e.recent.as_ref().and_then(|r| r.fsync_failures_15m) else {
+        return Outcome::Unevaluated;
+    };
+    if n == 0 {
+        return Outcome::Inactive;
+    }
+    Fired::new(summary::fsync_failures_recent(n))
+        .with("fsync_failures", u(n))
+        .into()
+}
+
+fn flusher_respawned_recent(e: &Evidence) -> Outcome {
+    let (Some(n), Some(shards)) = (
+        e.recent.as_ref().and_then(|r| r.flusher_panics_15m),
+        &e.shards,
+    ) else {
+        return Outcome::Unevaluated;
+    };
+    if n == 0 || !shards.iter().all(|s| s.state == ShardState::Up) {
+        return Outcome::Inactive;
+    }
+    Fired::new(summary::flusher_respawned_recent(n))
+        .with("panics", u(n))
+        .into()
+}
+
+fn quarantine_nonempty(e: &Evidence) -> Outcome {
+    let Some(b) = &e.backlog else {
+        return Outcome::Unevaluated;
+    };
+    if b.quarantine_bytes == 0 {
+        return Outcome::Inactive;
+    }
+    Fired::new(summary::quarantine_nonempty(
+        b.quarantine_bytes,
+        b.quarantine_files,
+    ))
+    .with("bytes", u(b.quarantine_bytes))
+    .with("files", u(b.quarantine_files))
+    .into()
+}
+
+fn recovery_incomplete(e: &Evidence) -> Outcome {
+    let Some(r) = &e.recent else {
+        return Outcome::Unevaluated;
+    };
+    let (Some(failed), Some(copy)) = (
+        r.recovery_segments_failed,
+        r.recovery_quarantine_copy_failed,
+    ) else {
+        return Outcome::Unevaluated;
+    };
+    if failed == 0 && copy == 0 {
+        return Outcome::Inactive;
+    }
+    Fired::new(summary::recovery_incomplete(failed, copy))
+        .with("segments_failed", u(failed))
+        .with("quarantine_copy_failed", u(copy))
+        .into()
+}
+
+fn tls_reload_failed(e: &Evidence) -> Outcome {
+    let Some(r) = &e.reload else {
+        return Outcome::Unevaluated;
+    };
+    if !r.tls_last_failed {
+        return Outcome::Inactive;
+    }
+    let detail = r
+        .items
+        .iter()
+        .find(|i| i.item == ReloadItem::TlsCertificates)
+        .and_then(|i| i.detail.clone());
+    Fired::new(summary::tls_reload_failed())
+        .detail(detail)
+        .into()
+}
+
+fn admin_unavailable(e: &Evidence) -> Outcome {
+    let Some(a) = &e.admin else {
+        return Outcome::Unevaluated;
+    };
+    if !(a.enabled && a.state == AdminState::Unavailable) {
+        return Outcome::Inactive;
+    }
+    let mut f = Fired::new(summary::admin_unavailable(a.reason));
+    if let Some(r) = a.reason {
+        f = f.with("reason", code(r.as_str()));
+    }
+    f.into()
 }
 
 #[cfg(test)]
@@ -1298,5 +1398,118 @@ mod tests {
             "unevaluated",
             "ages come from the lag scan"
         );
+    }
+
+    #[test]
+    fn durability_and_control_surface_conditions() {
+        let e = serving_evidence(NOW);
+        for c in [
+            C::FsyncFailuresRecent,
+            C::FlusherRespawnedRecent,
+            C::QuarantineNonempty,
+            C::RecoveryIncomplete,
+            C::TlsReloadFailed,
+            C::AdminUnavailable,
+        ] {
+            assert_eq!(outcome(c, &e), "inactive", "{c:?}");
+        }
+        assert_eq!(
+            outcome(
+                C::FsyncFailuresRecent,
+                &with(|e| e.recent.as_mut().unwrap().fsync_failures_15m = Some(1))
+            ),
+            "active"
+        );
+        let respawned = with(|e| e.recent.as_mut().unwrap().flusher_panics_15m = Some(2));
+        assert_eq!(outcome(C::FlusherRespawnedRecent, &respawned), "active");
+        let mut one_down = respawned.clone();
+        one_down.shards.as_mut().unwrap()[0].state = ShardState::Offline;
+        assert_eq!(
+            outcome(C::FlusherRespawnedRecent, &one_down),
+            "inactive",
+            "only once every shard is back up"
+        );
+        assert_eq!(
+            outcome(
+                C::QuarantineNonempty,
+                &with(|e| e.backlog.as_mut().unwrap().quarantine_bytes = 1)
+            ),
+            "active"
+        );
+        assert_eq!(
+            outcome(
+                C::RecoveryIncomplete,
+                &with(|e| e.recent.as_mut().unwrap().recovery_quarantine_copy_failed = Some(1))
+            ),
+            "active"
+        );
+        let tls = with(|e| {
+            let r = e.reload.as_mut().unwrap();
+            r.tls_last_failed = true;
+            r.items = vec![ReloadItemEvidence {
+                item: ReloadItem::TlsCertificates,
+                outcome: ReloadItemOutcome::Failed,
+                detail: Some("bad key".into()),
+            }];
+        });
+        let f = fired(C::TlsReloadFailed, &tls);
+        assert_eq!(f.detail.as_deref(), Some("bad key"));
+        assert!(!f.summary.contains("bad key"));
+        let admin = with(|e| {
+            let a = e.admin.as_mut().unwrap();
+            a.state = AdminState::Unavailable;
+            a.reason = Some(AdminReason::ParentInsecure);
+        });
+        assert!(
+            fired(C::AdminUnavailable, &admin)
+                .summary
+                .starts_with("admin socket not bound (parent_insecure)")
+        );
+        let disabled = with(|e| {
+            let a = e.admin.as_mut().unwrap();
+            a.enabled = false;
+            a.state = AdminState::Unavailable;
+        });
+        assert_eq!(outcome(C::AdminUnavailable, &disabled), "inactive");
+    }
+
+    #[test]
+    fn full_evidence_decides_every_code_and_empty_evidence_decides_none() {
+        let ev = evaluate(
+            &serving_evidence(NOW),
+            &Thresholds::DEFAULT,
+            &crate::NoLatches,
+        );
+        assert!(
+            ev.unevaluated.is_empty(),
+            "undecided on full evidence: {:?}",
+            ev.unevaluated
+        );
+        assert!(
+            ev.conditions.is_empty(),
+            "a healthy daemon raised: {:?}",
+            ev.conditions
+        );
+        let ev = evaluate(
+            &Evidence::empty(NOW, Source::Disk),
+            &Thresholds::DEFAULT,
+            &crate::NoLatches,
+        );
+        assert_eq!(
+            ev.unevaluated,
+            crate::ALL.to_vec(),
+            "missing evidence must never read as healthy"
+        );
+        assert!(ev.conditions.is_empty());
+    }
+
+    #[test]
+    fn evaluate_never_emits_an_offline_only_or_unknown_code() {
+        for code in [C::DaemonUnreachable, C::RecoveryPending, C::Unknown] {
+            assert_eq!(
+                outcome(code, &Evidence::empty(NOW, Source::Daemon)),
+                "inactive"
+            );
+        }
     }
 }
