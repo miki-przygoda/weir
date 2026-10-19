@@ -5894,3 +5894,121 @@ fn a_second_sigterm_forces_a_prompt_exit_and_loses_nothing() {
     drop(srv2);
     let _ = fs::remove_dir_all(&wab);
 }
+
+// ── No zombie drain, and a zero budget (PR 4 Task 4.12) ───────────────────────
+
+/// Behaviour change "no more zombie drain" (Foundations §5.4, §17 item 8):
+/// shard_count = 1 and its only flusher goes offline at startup (the
+/// counter-scan hook), so every drain-channel Sender is dropped. The attached
+/// drain must keep delivering the on-disk backlog and stay alive afterwards;
+/// before, it exited on Disconnected and reported `stopped` while the daemon
+/// kept running.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_dead_only_flusher_does_not_stop_the_drain() {
+    let wab = fresh_wab_dir("zombie");
+    seed_sealed_backlog("zombie_seed", &wab);
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("zombie")
+        .wab_dir(&wab)
+        .shard_count(1)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_FAIL_SHARD_COUNTER_SCAN", "0")
+        .log_level("info")
+        .spawn();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while count_wab_files(&wab, ".wab.sealed") > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the backlog must be delivered with the only flusher offline\nlog:\n{}",
+            read_log(&srv)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    // The WARN lands at the drain's next wait slice, which can be after the
+    // last segment went; read the log only after the 2 s settle.
+    thread::sleep(Duration::from_secs(2));
+    let log = read_log(&srv);
+    assert!(
+        log.contains("segment-counter scan failed repeatedly"),
+        "the hook did not fire\n{log}"
+    );
+    assert!(
+        log.contains("all flushers gone; continuing to deliver the on-disk backlog"),
+        "{log}"
+    );
+    let body = srv.try_scrape_metrics().expect("metrics up");
+    assert_eq!(
+        parse_metric_f64(&body, "weir_drain_state{state=\"stopped\"} "),
+        0.0,
+        "zombie: the drain stopped while the daemon runs\n{body}"
+    );
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 10 + 6))
+        .expect("an attached drain with no flushers must still stop on SIGTERM");
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// Spec §16 system test 11: the ordinary SIGTERM path with a ZERO budget is
+/// prompt and loses nothing: what the drain abandons replays on the next start.
+/// `sink_http_concurrency = 1` serializes the POSTs (60 records at 500 ms is
+/// ~30 s), so a drain that ignores the budget cannot pass by luck.
+#[test]
+fn sigterm_with_a_zero_budget_is_prompt_and_loses_nothing() {
+    let wab = fresh_wab_dir("budget_zero");
+    let slow = RecordingSink::start_slow(Duration::from_millis(500));
+    let mut srv = weir_server!("budget_zero")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\nwab_segment_max_bytes = 4096\nsink_http_concurrency = 1\n\
+             drain_shutdown_budget_secs = 0",
+        )
+        .env("WEIR_SINK_URL", slow.url())
+        .start();
+    let mut c = srv.client();
+    let tags: Vec<String> = (0..60).map(|i| format!("zero-budget-{i:03}")).collect();
+    for t in &tags {
+        let mut p = t.clone().into_bytes();
+        p.resize(1024, b'z');
+        c.push(p, Durability::Durable).unwrap();
+    }
+    drop(c);
+    let took = srv.sigterm();
+    assert!(
+        // shutdown_timeout (3) + the budget (0) + 6 s.
+        took < Duration::from_secs(3 + 6),
+        "budget 0: SIGTERM must not wait on a 500 ms/POST sink, took {took:?}"
+    );
+    drop(srv);
+
+    let sink = RecordingSink::start();
+    let srv2 = weir_server!("budget_zero_2")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    // Delivered across both runs: whatever run 1 confirmed is gone from disk.
+    let mut seen: Vec<Vec<u8>> = slow.bodies();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        seen.extend(sink.bodies());
+        let missing = tags
+            .iter()
+            .filter(|t| !seen.iter().any(|b| b.starts_with(t.as_bytes())))
+            .count();
+        if missing == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{missing} acked records were lost"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    drop(srv2);
+    let _ = fs::remove_dir_all(&wab);
+}
