@@ -7,6 +7,7 @@
 // this line and clippy must then pass without it.
 #![allow(dead_code, reason = "wired into main by Task 6.14")]
 
+pub(crate) mod framing;
 pub(crate) mod identity;
 
 use std::{
