@@ -156,9 +156,13 @@ impl Publisher {
 
 /// RAII marker for "a sink commit is in flight" (spec §5.4 CommitGuard).
 ///
-/// Construction stores `commit_in_flight_since = now`, stamps
-/// `last_progress_ms` and bumps the heartbeat; `Drop` clears the marker and does
-/// the same stamp and bump. Taken immediately before the commit `select!` in
+/// Construction stores `commit_in_flight_since = now` and stamps
+/// `last_progress_ms`; `Drop` clears the marker, does the same stamp and bumps
+/// the heartbeat. That drop bump is the drain's one heartbeat bump per commit
+/// (it replaced the bump `process_segment_ctl` made after each commit), so a
+/// commit moves the heartbeat exactly once, as it always has; a second bump at
+/// construction would only change the count, since the commit's `BusyGuard`
+/// already tells a long commit from a wedge (spec §4.8). Taken immediately before the commit `select!` in
 /// `commit_batch_ctl`, so every way out of a commit — success, the
 /// `commit_timeout` early return, the contract-violation return, `Abandoned` at
 /// the deadline, and a panic unwinding through it — clears the marker. A
@@ -173,7 +177,6 @@ impl<'a> CommitGuard<'a> {
         if let Some(b) = &publish.board {
             b.drain.commit_started();
         }
-        hb.bump();
         Self { publish, hb }
     }
 }
@@ -235,7 +238,7 @@ mod tests {
         {
             let _g = CommitGuard::new(&p, &hb);
         }
-        assert!(hb.get() >= 2, "the heartbeat moves with or without a board");
+        assert!(hb.get() >= 1, "the heartbeat moves with or without a board");
     }
 
     #[test]
@@ -250,7 +253,7 @@ mod tests {
             assert!(board.drain.last_progress_ms.load(Relaxed) > 0);
         }
         assert_eq!(board.drain.commit_in_flight_since_ms.load(Relaxed), 0);
-        assert!(hb.get() >= before + 2, "bumped on construction and on drop");
+        assert_eq!(hb.get(), before + 1, "bumped once, on drop");
     }
 
     #[test]

@@ -1079,3 +1079,238 @@ fn process_segment_ctl_abandons_before_a_batch_once_the_deadline_has_passed() {
     assert_eq!(sink.call_count(), 0);
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// A sink that records whether the commit marker is set WHILE it runs.
+struct BoardSpySink {
+    board: Arc<StatusBoard>,
+    seen: Mutex<Vec<u64>>,
+}
+
+impl crate::sink::Sink for BoardSpySink {
+    type Error = MockError;
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, MockError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(self.board.drain.commit_in_flight_since_ms.load(Relaxed));
+        Ok(CommitResult::new(batch.into_records(), Vec::new()))
+    }
+    async fn health(&self) -> SinkHealth {
+        SinkHealth::Healthy
+    }
+}
+
+/// A transient error with a caller-chosen message.
+#[derive(Debug)]
+struct LoudError(String);
+impl std::fmt::Display for LoudError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for LoudError {}
+impl crate::sink::SinkError for LoudError {
+    fn is_transient(&self) -> bool {
+        true
+    }
+}
+
+/// Fails its first commit with `message`, then commits everything.
+struct LoudSink {
+    message: String,
+    calls: std::sync::atomic::AtomicU64,
+}
+impl crate::sink::Sink for LoudSink {
+    type Error = LoudError;
+    async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, LoudError> {
+        if self.calls.fetch_add(1, Relaxed) == 0 {
+            return Err(LoudError(self.message.clone()));
+        }
+        Ok(CommitResult::new(batch.into_records(), Vec::new()))
+    }
+    async fn health(&self) -> SinkHealth {
+        SinkHealth::Healthy
+    }
+}
+
+#[test]
+fn the_commit_guard_spans_exactly_the_sink_call() {
+    let dir = tmp_dir("fnd_guard_span");
+    let board = StatusBoard::for_test();
+    let sink = BoardSpySink {
+        board: Arc::clone(&board),
+        seen: Mutex::new(Vec::new()),
+    };
+    let control = DrainControl::detached();
+    let publish = Publisher::new(Some(Arc::clone(&board)));
+    let hb = DrainHeartbeat::new();
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb: &hb,
+    };
+    let mut dl = DeadLetterWriter::open(&dir).unwrap();
+    let payloads = vec![Payload::from(b"r".as_ref())];
+    let ids = test_record_ids(&payloads);
+    let r = block_on(crate::drain::commit_batch_ctl(
+        &payloads,
+        &ids,
+        0,
+        &sink,
+        &fast_config(dir.clone()),
+        &noop_metrics(),
+        &mut dl,
+        &ctx,
+    ));
+    assert!(matches!(r, BatchResult::Ok));
+    assert!(
+        sink.seen.lock().unwrap()[0] > 0,
+        "marked while the sink runs"
+    );
+    assert_eq!(
+        board.drain.commit_in_flight_since_ms.load(Relaxed),
+        0,
+        "cleared after"
+    );
+    assert!(board.sink.last_success_ms.load(Relaxed) > 0);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 16, first half: a commit that exceeds commit_timeout.
+#[test]
+fn a_commit_timeout_leaves_no_commit_marked_in_flight() {
+    let dir = tmp_dir("fnd_guard_timeout");
+    let s = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink::with_hang(1, []));
+    let board = StatusBoard::for_test();
+    let cfg = DrainConfig {
+        commit_timeout: Duration::from_millis(100),
+        base_retry_delay: Duration::from_secs(2),
+        ..quiet(dir.clone())
+    };
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &metrics,
+        rt_with(
+            DrainControl::detached(),
+            Some(Arc::clone(&board)),
+            Vec::new(),
+        ),
+    );
+    tx.send(s.clone()).unwrap();
+    wait_for(5, "the commit timed out", || records_retried(&metrics) == 1);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        board.drain.commit_in_flight_since_ms.load(Relaxed),
+        0,
+        "the timeout's early return clears it"
+    );
+    assert!(board.drain.last_progress_ms.load(Relaxed) > 0);
+    assert_eq!(board.sink.consecutive_failures.load(Relaxed), 1);
+    assert!(
+        board
+            .sink
+            .last_error
+            .load_full()
+            .is_some_and(|e| e.contains("commit_timeout"))
+    );
+    drop(tx); // Detached: the retry fires after the clamped remainder and succeeds
+    join_within(h, Duration::from_secs(5));
+    assert_eq!(
+        board.sink.consecutive_failures.load(Relaxed),
+        0,
+        "a success resets the streak"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 16, second half: a sink that breaks the CommitResult contract.
+#[test]
+fn a_contract_violation_leaves_no_commit_marked_in_flight() {
+    let dir = tmp_dir("fnd_guard_contract");
+    let s = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink::with_responses([MockSink::ok(vec![])])); // accounts for 0 of 1
+    let board = StatusBoard::for_test();
+    let cfg = DrainConfig {
+        base_retry_delay: Duration::from_secs(2),
+        ..quiet(dir.clone())
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &noop_metrics(),
+        rt_with(
+            DrainControl::detached(),
+            Some(Arc::clone(&board)),
+            Vec::new(),
+        ),
+    );
+    tx.send(s.clone()).unwrap();
+    // Published after the guard dropped (the violation is detected after the
+    // timed block), so this wait orders the two without a sleep.
+    wait_for(5, "the violation is published", || {
+        board.sink.last_error.load_full().is_some()
+    });
+    assert_eq!(board.drain.commit_in_flight_since_ms.load(Relaxed), 0);
+    assert!(
+        board
+            .sink
+            .last_error
+            .load_full()
+            .is_some_and(|e| e.contains("accounts for 0 of 1"))
+    );
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 17: `last_error` is redacted and capped.
+#[test]
+fn the_sinks_last_error_is_redacted_and_capped() {
+    let dir = tmp_dir("fnd_last_error");
+    let s = seg(&dir, 1, &[b"x"]);
+    let message = format!(
+        "error sending request for url (https://user:hunter2@sink.example/ingest?token=s3cr3t): \
+         \u{1b}[31m{}",
+        "z".repeat(5000)
+    );
+    let sink = Arc::new(LoudSink {
+        message,
+        calls: std::sync::atomic::AtomicU64::new(0),
+    });
+    let board = StatusBoard::for_test();
+    let cfg = DrainConfig {
+        base_retry_delay: Duration::from_secs(2),
+        ..quiet(dir.clone())
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &noop_metrics(),
+        rt_with(
+            DrainControl::detached(),
+            Some(Arc::clone(&board)),
+            Vec::new(),
+        ),
+    );
+    tx.send(s.clone()).unwrap();
+    wait_for(5, "the failure is published", || {
+        board.sink.last_error.load_full().is_some()
+    });
+    let e = board.sink.last_error.load_full().unwrap();
+    assert!(!e.contains("hunter2") && !e.contains("s3cr3t"), "{e}");
+    assert!(!e.chars().any(char::is_control));
+    assert!(e.len() <= crate::drain::publish::ADMIN_TEXT_MAX);
+    assert_eq!(board.sink.consecutive_failures.load(Relaxed), 1);
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}

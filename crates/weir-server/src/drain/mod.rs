@@ -72,9 +72,9 @@ use crate::{
 };
 
 pub(crate) use control::{DrainControl, DrainExit, DrainRuntime, Lifetime};
-use publish::Publisher;
+use publish::{CommitGuard, Publisher};
 
-use crate::status::{DrainExitReason, RequeueResult, unix_ms_now};
+use crate::status::{DrainExitReason, RequeueResult, SinkFailureKind, unix_ms_now};
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
 use ledger::{Admit, DeadLetterCarry, SegmentLedger, TransientCause};
@@ -88,6 +88,13 @@ pub(crate) struct DrainCtx<'a> {
     pub(crate) control: &'a DrainControl,
     pub(crate) publish: &'a Publisher,
     pub(crate) hb: &'a DrainHeartbeat,
+}
+
+impl<'a> DrainCtx<'a> {
+    /// See [`CommitGuard`]: taken immediately before the commit `select!`.
+    pub(crate) fn commit_guard(&self) -> CommitGuard<'a> {
+        CommitGuard::new(self.publish, self.hb)
+    }
 }
 
 /// How one `drain_thread_with` incarnation ended (a panic never returns one).
@@ -2953,9 +2960,10 @@ async fn process_segment_ctl<S: Sink>(
     let hb = ctx.hb;
     // The whole attempt is reading the segment, except where a nested guard
     // says otherwise: each commit (`SinkCommit`), a dead-letter write, a
-    // quarantine move. The heartbeat itself moves after every commit and every
-    // READ_HEARTBEAT_EVERY records (spec §4.8), so one large segment no longer
-    // freezes it for as long as the whole segment takes.
+    // quarantine move. The heartbeat itself moves after every commit (the
+    // commit's `CommitGuard` bumps it on drop) and every READ_HEARTBEAT_EVERY
+    // records (spec §4.8), so one large segment no longer freezes it for as
+    // long as the whole segment takes.
     let _busy = BusyGuard::new(hb, BusyKind::SegmentRead);
     let reader = match open_segment(segment) {
         Ok(r) => r,
@@ -3157,7 +3165,7 @@ async fn process_segment_ctl<S: Sink>(
             )
             .instrument(segment_span.clone())
             .await;
-            hb.bump();
+            // The commit's own `CommitGuard` bumped the heartbeat on its way out.
             if let Err(setback) = apply_batch(result, &mut durable_through, n) {
                 return setback;
             }
@@ -3181,7 +3189,6 @@ async fn process_segment_ctl<S: Sink>(
         )
         .instrument(segment_span.clone())
         .await;
-        hb.bump();
         if let Err(setback) = apply_batch(result, &mut durable_through, n) {
             return setback;
         }
@@ -3822,6 +3829,9 @@ async fn commit_batch_ctl<S: Sink>(
     // of commit and nothing else.
     let timed = {
         let _busy = BusyGuard::new(hb, BusyKind::SinkCommit);
+        // Every way out of this block (completion, commit_timeout, the
+        // deadline, an unwinding panic) clears the commit marker (spec §5.4).
+        let _commit = ctx.commit_guard();
         tokio::select! {
             biased;
             r = tokio::time::timeout(config.commit_timeout, sink.commit(batch)) => Some(r),
@@ -3853,6 +3863,13 @@ async fn commit_batch_ctl<S: Sink>(
                 timeout_secs = config.commit_timeout.as_secs(),
                 "drain: sink commit exceeded commit_timeout; treating as transient, retrying segment"
             );
+            ctx.publish.sink_failure(
+                SinkFailureKind::Timeout,
+                &format!(
+                    "sink commit exceeded commit_timeout ({}s)",
+                    config.commit_timeout.as_secs()
+                ),
+            );
             return BatchResult::Transient {
                 retry_after: None,
                 cause: TransientCause::Sink,
@@ -3880,12 +3897,22 @@ async fn commit_batch_ctl<S: Sink>(
                     "drain: sink CommitResult does not account for every record; preserving \
                      segment instead of confirming (likely a Sink contract violation)"
                 );
+                ctx.publish.sink_failure(
+                    SinkFailureKind::ContractViolation,
+                    &format!(
+                        "sink CommitResult accounts for {accounted} of {} records",
+                        payloads.len()
+                    ),
+                );
                 return BatchResult::Transient {
                     retry_after: None,
                     cause: TransientCause::Sink,
                     owed: None,
                 };
             }
+            // The sink did its part, whatever the dead-letter write that may
+            // follow does.
+            ctx.publish.sink_success();
             metrics
                 .sink_commit_duration
                 .observe(t.elapsed().as_secs_f64());
@@ -3935,6 +3962,8 @@ async fn commit_batch_ctl<S: Sink>(
                 })
                 .inc_by(payloads.len() as u64);
             let retry_after = e.retry_after();
+            ctx.publish
+                .sink_failure(SinkFailureKind::Transient, &e.to_string());
             warn!(
                 error = %e,
                 retry_after_secs = retry_after.map(|d| d.as_secs()),
@@ -3953,6 +3982,8 @@ async fn commit_batch_ctl<S: Sink>(
                 .sink_commit_duration
                 .observe(t.elapsed().as_secs_f64());
             error!(error = %e, "drain: permanent sink error; dead-lettering batch");
+            ctx.publish
+                .sink_failure(SinkFailureKind::Permanent, &e.to_string());
 
             // Same silent-data-loss guard as the partial-rejection path above: a
             // failed dead-letter write (or a cap block) preserves the segment for
