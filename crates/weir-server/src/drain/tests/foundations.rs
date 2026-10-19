@@ -595,3 +595,113 @@ fn a_flood_of_retry_stranded_requests_scans_once_and_cuts_one_backoff() {
     join_within(h, Duration::from_secs(5));
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// Spec §16 drain test 8: pause in Draining. 300 timed sends into a small
+/// channel never time out (the paused drain keeps emptying it), nothing is
+/// committed, and resume delivers everything in arrival order.
+#[test]
+fn a_paused_drain_keeps_taking_from_the_channel_and_resumes_in_order() {
+    let dir = tmp_dir("fnd_pause_head");
+    let control = DrainControl::detached();
+    control.request_pause(); // before spawn: the pause lives in DrainControl
+    let sink = Arc::new(MockSink::with_responses([]));
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(16);
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &metrics,
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    let mut expected = Vec::new();
+    for n in 1..=300u64 {
+        let rec = format!("r{n:03}");
+        let p = seg(&dir, n, &[rec.as_bytes()]);
+        expected.push(rec.into_bytes());
+        tx.send_timeout(p, Duration::from_millis(500))
+            .expect("a paused drain must keep taking from the channel");
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(sink.call_count(), 0, "nothing is committed while paused");
+    assert_eq!(metrics.drain_paused.get(), 1.0);
+    control.request_resume();
+    wait_for(30, "all 300 delivered", || sink.call_count() == 300);
+    assert_eq!(
+        committed_bytes(&sink),
+        expected,
+        "resume delivers in arrival order"
+    );
+    assert_eq!(metrics.drain_paused.get(), 0.0);
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 18: a respawn while paused stays paused.
+#[test]
+fn a_respawned_drain_is_still_paused() {
+    let dir = tmp_dir("fnd_pause_respawn");
+    let first = seg(&dir, 1, &[b"boom"]);
+    let sink = Arc::new(MockSink::with_panic(1, []));
+    let control = DrainControl::detached();
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        fast_config(dir.clone()),
+        &metrics,
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    tx.send(first.clone()).unwrap();
+    wait_for(5, "the first commit panicked", || {
+        drain_panics(&metrics) == 1
+    });
+    control.request_pause(); // inside the supervisor's 100 ms respawn backoff
+    // Respawn, then several 50 ms health polls whose rescan re-queues `first`.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        sink.call_count(),
+        1,
+        "the respawned drain honours the pause it inherited"
+    );
+    assert!(first.exists());
+    assert_eq!(metrics.drain_paused.get(), 1.0);
+    control.request_resume();
+    wait_for(5, "delivered after resume", || !first.exists());
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A stop while paused exits at once: the pause is honoured (owner decision).
+#[test]
+fn a_stop_while_paused_exits_without_delivering() {
+    let dir = tmp_dir("fnd_pause_stop");
+    let s = seg(&dir, 1, &[b"x"]);
+    let control = DrainControl::attached();
+    control.request_pause();
+    let sink = Arc::new(MockSink::with_responses([]));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    tx.send(s.clone()).unwrap();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &noop_metrics(),
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    control.request_stop(Duration::from_secs(10));
+    let exit = join_within(h, Duration::from_millis(500));
+    assert_eq!(exit.reason, DrainExitReason::Stopped);
+    assert_eq!(
+        exit.pending_left, 1,
+        "the queued segment is left for replay"
+    );
+    assert_eq!(sink.call_count(), 0);
+    assert!(s.exists());
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}

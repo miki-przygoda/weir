@@ -1435,6 +1435,9 @@ fn drain_thread_with<S: Sink>(
     let mut backlog_turn = false;
     // Resolves operator retry-stranded tickets (spec §5.4).
     let mut requeue = RequeueService::new(control);
+    // When the current pause took effect (unix ms), shared by every hold: the
+    // Draining head, `Held` and a paused retry backoff. `None` while delivering.
+    let mut paused_since: Option<u64> = None;
 
     // The start of the current dead-letter-full blocking episode, if any. An
     // episode spans a flapping cap (unblock → reblock the same segment without
@@ -1563,92 +1566,136 @@ fn drain_thread_with<S: Sink>(
                     );
                 }
 
-                // Every source passes the ledger's admission check (spec §4.0):
-                // the channel is not enumerable, so a path can sit in it AND in
-                // a queue (re-queued by a rescan, or buffered by one of the
-                // waits below). A copy the ledger owns is dropped here; the
-                // rescan is its way back once it becomes admissible.
-                //
-                // `next_queued` alternates the live side (`pending`, then the
-                // channel) with the `backlog` (the replay list and rescan
-                // finds), so a long replay never holds the flushers' hand-off
-                // up for more than one backlog segment (spec §5.4).
-                let next_segment = loop {
-                    if let Some(p) =
-                        next_queued(&mut pending, &mut backlog, &drain_rx, &mut backlog_turn)
-                    {
-                        match ledger.admit(&p, Instant::now()) {
-                            Admit::Process { skip } => break Some((p, skip)),
-                            Admit::Drop(owner) => {
-                                debug!(path = %p.display(), owner, "drain: not admitting queued segment");
-                                continue;
-                            }
-                        }
+                // Pause (spec §5.4): after the health poll and the verbs, so
+                // probes and gauges keep running; before taking a segment. The
+                // channel keeps being emptied into `pending`, one 50 ms slice
+                // at a time, so the flushers never block on a paused drain.
+                if control.pause_requested() {
+                    // Pause honoured at stop (owner decision): queued segments
+                    // stay sealed and replay on the next start.
+                    if control.stop_requested() {
+                        info!(
+                            "drain: stop while paused; queued segments stay sealed and replay on \
+                             the next start (pause honoured)"
+                        );
+                        break 'outer DrainExitReason::Stopped;
                     }
-                    // Idle: nothing queued on either side and the channel is
-                    // empty. Wait for a new segment, but no longer than the time
-                    // left until the next health poll (and one slice at most),
-                    // then re-enter Draining so the wall-clock poll above runs.
-                    // A Detached drain's channel closure (all WAB flushers
-                    // exited) still ends the loop; an Attached drain's does not.
-                    let until_next_poll = config
-                        .health_poll_interval
-                        .saturating_sub(last_health_poll.elapsed())
-                        .max(Duration::from_millis(1));
+                    let since = *paused_since.get_or_insert_with(|| {
+                        info!(
+                            "drain: paused before the next segment; ingest keeps buffering on disk"
+                        );
+                        unix_ms_now()
+                    });
+                    publish.paused(since, false);
+                    metrics.drain_paused.set(1.0);
                     match wait_slice(
                         &drain_rx,
                         &ctx,
-                        until_next_poll,
+                        control::SLICE,
                         &mut pending,
                         backlog.len(),
                         &mut channel_gone,
                     ) {
-                        Wait::Segment(p) => match ledger.admit(&p, Instant::now()) {
-                            Admit::Process { skip } => break Some((p, skip)),
-                            Admit::Drop(owner) => {
-                                debug!(path = %p.display(), owner, "drain: not admitting segment from the channel");
-                                break None;
-                            }
-                        },
-                        // Back to the head: the poll, the stop check and the
-                        // verbs run there, at least once per slice.
-                        Wait::TimedOut | Wait::Stop => break None,
+                        Wait::Segment(p) => pending.push_back(p),
+                        Wait::TimedOut | Wait::Stop => {}
+                        // A Detached shutdown while paused honours the pause too.
                         Wait::Disconnected => break 'outer DrainExitReason::Stopped,
                     }
-                };
+                    DrainState::Draining
+                } else {
+                    if paused_since.take().is_some() {
+                        publish.paused(0, false);
+                        metrics.drain_paused.set(0.0);
+                        info!("drain: resumed");
+                    }
 
-                match next_segment {
-                    // Idle timeout with nothing queued (or a dropped channel
-                    // copy): re-enter Draining so the wall-clock health poll
-                    // above runs on schedule.
-                    None => DrainState::Draining,
-                    Some((segment, skip)) => {
-                        // A fresh segment starts at 0; one the ledger holds a
-                        // cursor for (it stranded earlier in this run) resumes
-                        // past its durable prefix. The health gauge + rescan are
-                        // refreshed by the wall-clock poll above, so we no longer
-                        // probe the sink after every segment (which, under
-                        // sustained load, meant a HEAD request per segment).
-                        let result = attempt_segment(
-                            &rt,
-                            &segment,
-                            &*sink,
-                            &config,
-                            &metrics,
-                            &mut dead_letter,
-                            ledger,
-                            skip,
+                    // Every source passes the ledger's admission check (spec §4.0):
+                    // the channel is not enumerable, so a path can sit in it AND in
+                    // a queue (re-queued by a rescan, or buffered by one of the
+                    // waits below). A copy the ledger owns is dropped here; the
+                    // rescan is its way back once it becomes admissible.
+                    //
+                    // `next_queued` alternates the live side (`pending`, then the
+                    // channel) with the `backlog` (the replay list and rescan
+                    // finds), so a long replay never holds the flushers' hand-off
+                    // up for more than one backlog segment (spec §5.4).
+                    let next_segment = loop {
+                        if let Some(p) =
+                            next_queued(&mut pending, &mut backlog, &drain_rx, &mut backlog_turn)
+                        {
+                            match ledger.admit(&p, Instant::now()) {
+                                Admit::Process { skip } => break Some((p, skip)),
+                                Admit::Drop(owner) => {
+                                    debug!(path = %p.display(), owner, "drain: not admitting queued segment");
+                                    continue;
+                                }
+                            }
+                        }
+                        // Idle: nothing queued on either side and the channel is
+                        // empty. Wait for a new segment, but no longer than the time
+                        // left until the next health poll (and one slice at most),
+                        // then re-enter Draining so the wall-clock poll above runs.
+                        // A Detached drain's channel closure (all WAB flushers
+                        // exited) still ends the loop; an Attached drain's does not.
+                        let until_next_poll = config
+                            .health_poll_interval
+                            .saturating_sub(last_health_poll.elapsed())
+                            .max(Duration::from_millis(1));
+                        match wait_slice(
+                            &drain_rx,
                             &ctx,
-                        );
-                        transition_from_draining(
-                            segment,
-                            result,
-                            &config,
-                            &metrics,
-                            &mut block_episode,
-                            ledger,
-                            &heartbeat,
-                        )
+                            until_next_poll,
+                            &mut pending,
+                            backlog.len(),
+                            &mut channel_gone,
+                        ) {
+                            Wait::Segment(p) => match ledger.admit(&p, Instant::now()) {
+                                Admit::Process { skip } => break Some((p, skip)),
+                                Admit::Drop(owner) => {
+                                    debug!(path = %p.display(), owner, "drain: not admitting segment from the channel");
+                                    break None;
+                                }
+                            },
+                            // Back to the head: the poll, the stop check and the
+                            // verbs run there, at least once per slice.
+                            Wait::TimedOut | Wait::Stop => break None,
+                            Wait::Disconnected => break 'outer DrainExitReason::Stopped,
+                        }
+                    };
+
+                    match next_segment {
+                        // Idle timeout with nothing queued (or a dropped channel
+                        // copy): re-enter Draining so the wall-clock health poll
+                        // above runs on schedule.
+                        None => DrainState::Draining,
+                        Some((segment, skip)) => {
+                            // A fresh segment starts at 0; one the ledger holds a
+                            // cursor for (it stranded earlier in this run) resumes
+                            // past its durable prefix. The health gauge + rescan are
+                            // refreshed by the wall-clock poll above, so we no longer
+                            // probe the sink after every segment (which, under
+                            // sustained load, meant a HEAD request per segment).
+                            let result = attempt_segment(
+                                &rt,
+                                &segment,
+                                &*sink,
+                                &config,
+                                &metrics,
+                                &mut dead_letter,
+                                ledger,
+                                skip,
+                                &ctx,
+                            );
+                            transition_from_draining(
+                                segment,
+                                result,
+                                &config,
+                                &metrics,
+                                &mut block_episode,
+                                ledger,
+                                &heartbeat,
+                            )
+                        }
                     }
                 }
             }
