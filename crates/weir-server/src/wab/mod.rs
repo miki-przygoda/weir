@@ -122,10 +122,6 @@ fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
     wab_dir.join(format!("shard_{shard_id:02}"))
 }
 
-/// Best-effort string extraction from a `catch_unwind` payload. `panic!` with
-/// a string literal lands in `&'static str`; `panic!("{}", ...)` lands in
-/// `String`. Anything else gets a placeholder so the log line still says
-/// *something*.
 /// How a flusher body ended (spec §5.3). A panic is not a value: the
 /// supervisor sees it as `Err` from `catch_unwind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +132,10 @@ pub(crate) enum FlusherExit {
     CounterScanFailed,
 }
 
+/// Best-effort string extraction from a `catch_unwind` payload. `panic!` with
+/// a string literal lands in `&'static str`; `panic!("{}", ...)` lands in
+/// `String`. Anything else gets a placeholder so the log line still says
+/// *something*.
 fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return s;
