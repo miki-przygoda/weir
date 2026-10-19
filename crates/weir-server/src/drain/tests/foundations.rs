@@ -304,3 +304,85 @@ fn wait_slice_returns_stop_once_the_deadline_has_passed() {
         "Stop is returned without waiting"
     );
 }
+
+/// Spec §16 drain test 14 (alternation). The spec's figure is a 300-segment
+/// backlog; 30 keeps the run short and still separates the two behaviours by
+/// an order of magnitude: without alternation the second live send waits for
+/// the whole backlog (~1.5 s), with it for at most one backlog segment and one
+/// live segment.
+#[test]
+fn live_segments_alternate_with_a_long_backlog() {
+    let dir = tmp_dir("fnd_alternate");
+    let backlog: Vec<PathBuf> = (1..=30).map(|n| seg(&dir, n, &[b"b"])).collect();
+    let per_commit = Duration::from_millis(50);
+    let sink = Arc::new(MockSink::with_yielding_commit(per_commit, 1000));
+    let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(1);
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &noop_metrics(),
+        rt_with(DrainControl::detached(), None, backlog),
+    );
+    wait_for(5, "replay under way", || sink.call_count() >= 1);
+    let mut worst = Duration::ZERO;
+    for n in 1001..=1006 {
+        let live = seg(&dir, n, &[b"l"]);
+        let t = Instant::now();
+        tx.send(live).unwrap();
+        worst = worst.max(t.elapsed());
+    }
+    // A send on a bounded(1) channel waits for the drain to take the previous
+    // live segment: at most one backlog segment plus one live segment (2× the
+    // segment time), plus 100 ms of scheduling and fsync slack.
+    assert!(
+        worst <= per_commit * 2 + Duration::from_millis(100),
+        "a live sender waited {worst:?} behind the replay backlog"
+    );
+    drop(tx);
+    join_within(h, Duration::from_secs(10));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 15: the replay list plus a panic on its first segment.
+/// The respawn has no backlog (the panic took it), but its first healthy probe
+/// is a recovery edge, so the rescan finds every segment on disk again.
+#[test]
+fn an_initial_backlog_survives_a_panic_on_its_first_segment() {
+    let dir = tmp_dir("fnd_backlog_panic");
+    let segs: Vec<PathBuf> = (1..=3).map(|n| seg(&dir, n, &[b"r"])).collect();
+    let sink = Arc::new(MockSink::with_panic(1, []));
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let h = start(
+        rx,
+        &sink,
+        fast_config(dir.clone()),
+        &metrics,
+        rt_with(DrainControl::detached(), None, segs.clone()),
+    );
+    wait_for(
+        10,
+        "every replayed segment is delivered after the respawn",
+        || segs.iter().all(|s| !s.exists()),
+    );
+    assert_eq!(drain_panics(&metrics), 1);
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn next_queued_alternates_and_falls_back_to_whichever_side_has_work() {
+    let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let p = |s: &str| PathBuf::from(s);
+    let mut pending = VecDeque::from([p("l1"), p("l2")]);
+    let mut backlog = VecDeque::from([p("b1"), p("b2"), p("b3")]);
+    tx.send(p("c1")).unwrap();
+    let mut turn = false;
+    let mut got = Vec::new();
+    while let Some(x) = crate::drain::next_queued(&mut pending, &mut backlog, &rx, &mut turn) {
+        got.push(x);
+    }
+    assert_eq!(got, ["l1", "b1", "l2", "b2", "c1", "b3"].map(PathBuf::from));
+}

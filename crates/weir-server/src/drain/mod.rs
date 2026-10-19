@@ -1118,6 +1118,28 @@ fn stop_exit(
     (control.input_closed() && nothing_left).then_some(DrainExitReason::Stopped)
 }
 
+/// Picks the next queued segment, alternating the live side (`pending`, then
+/// the channel) with the `backlog` (spec §5.4 "Two queues"). While both have
+/// work, the channel is served at least every other segment, so a long replay
+/// or a large requeue never stalls the flushers' hand-off for more than one
+/// backlog segment. Either side alone is drained in FIFO order.
+fn next_queued(
+    pending: &mut VecDeque<PathBuf>,
+    backlog: &mut VecDeque<PathBuf>,
+    rx: &crossbeam_channel::Receiver<PathBuf>,
+    backlog_turn: &mut bool,
+) -> Option<PathBuf> {
+    if !(*backlog_turn && !backlog.is_empty())
+        && let Some(p) = pending.pop_front().or_else(|| rx.try_recv().ok())
+    {
+        *backlog_turn = true;
+        return Some(p);
+    }
+    let p = backlog.pop_front()?;
+    *backlog_turn = false;
+    Some(p)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_thread_with<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
@@ -1183,8 +1205,13 @@ fn drain_thread_with<S: Sink>(
     // Set once an Attached drain sees its channel disconnect (every flusher
     // gone): from then on `wait_slice` sleeps its slices instead of spinning.
     let mut channel_gone = false;
-    // Task 2.5 moves the replay list into its own `backlog` queue.
-    let mut pending: VecDeque<PathBuf> = initial_backlog.into();
+    // Live segments the drain has taken off the channel but not yet
+    // processed (buffered by the waits below, or by a rescan's channel drain).
+    let mut pending: VecDeque<PathBuf> = VecDeque::new();
+    // The startup replay list and every rescan's finds. Alternates with
+    // `pending` and the channel; see `next_queued`.
+    let mut backlog: VecDeque<PathBuf> = initial_backlog.into();
+    let mut backlog_turn = false;
 
     // The start of the current dead-letter-full blocking episode, if any. An
     // episode spans a flapping cap (unblock → reblock the same segment without
@@ -1234,7 +1261,9 @@ fn drain_thread_with<S: Sink>(
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
                 set_drain_state(&metrics, DrainStateValue::draining);
-                if let Some(reason) = stop_exit(control, pending.is_empty(), &drain_rx) {
+                if let Some(reason) =
+                    stop_exit(control, pending.is_empty() && backlog.is_empty(), &drain_rx)
+                {
                     break 'outer reason;
                 }
 
@@ -1287,13 +1316,20 @@ fn drain_thread_with<S: Sink>(
                     last_health_poll = Instant::now();
                 }
 
-                // Both sources pass the ledger's admission check (spec §4.0):
+                // Every source passes the ledger's admission check (spec §4.0):
                 // the channel is not enumerable, so a path can sit in it AND in
-                // `pending` (re-queued by a rescan, or buffered by one of the
+                // a queue (re-queued by a rescan, or buffered by one of the
                 // waits below). A copy the ledger owns is dropped here; the
                 // rescan is its way back once it becomes admissible.
+                //
+                // `next_queued` alternates the live side (`pending`, then the
+                // channel) with the `backlog` (the replay list and rescan
+                // finds), so a long replay never holds the flushers' hand-off
+                // up for more than one backlog segment (spec §5.4).
                 let next_segment = loop {
-                    if let Some(p) = pending.pop_front() {
+                    if let Some(p) =
+                        next_queued(&mut pending, &mut backlog, &drain_rx, &mut backlog_turn)
+                    {
                         match ledger.admit(&p, Instant::now()) {
                             Admit::Process { skip } => break Some((p, skip)),
                             Admit::Drop(owner) => {
@@ -1302,7 +1338,8 @@ fn drain_thread_with<S: Sink>(
                             }
                         }
                     }
-                    // Idle: wait for a new segment, but no longer than the time
+                    // Idle: nothing queued on either side and the channel is
+                    // empty. Wait for a new segment, but no longer than the time
                     // left until the next health poll (and one slice at most),
                     // then re-enter Draining so the wall-clock poll above runs.
                     // A Detached drain's channel closure (all WAB flushers
@@ -1316,7 +1353,7 @@ fn drain_thread_with<S: Sink>(
                         &ctx,
                         until_next_poll,
                         &mut pending,
-                        0,
+                        backlog.len(),
                         &mut channel_gone,
                     ) {
                         Wait::Segment(p) => match ledger.admit(&p, Instant::now()) {
@@ -1537,7 +1574,7 @@ fn drain_thread_with<S: Sink>(
                         &ctx,
                         remaining,
                         &mut pending,
-                        0,
+                        backlog.len(),
                         &mut channel_gone,
                     ) {
                         Wait::Segment(new_seg) => pending.push_back(new_seg),
@@ -1648,7 +1685,7 @@ fn drain_thread_with<S: Sink>(
                         &ctx,
                         remaining,
                         &mut pending,
-                        0,
+                        backlog.len(),
                         &mut channel_gone,
                     ) {
                         Wait::Segment(new_seg) => pending.push_back(new_seg),
@@ -1771,7 +1808,7 @@ fn drain_thread_with<S: Sink>(
         reason,
         abandoned: None,
         pending_left: pending.len() + drain_rx.len(),
-        backlog_left: 0,
+        backlog_left: backlog.len(),
     }
 }
 
