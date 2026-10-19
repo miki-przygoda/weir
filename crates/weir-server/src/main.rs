@@ -543,9 +543,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .set(1.0);
 
+    // Foundations PR 2: the drain publishes to the status board. It stays
+    // Detached ("channel closed = deliver what is queued, then exit") until
+    // PR 4 flips it to Attached together with the lifecycle that calls
+    // request_stop. No drain-channel handle is created here: the drain owns
+    // the only Receiver, the flushers the only Senders.
+    let drain_runtime = drain::DrainRuntime {
+        control: drain::DrainControl::detached(),
+        board: Some(Arc::clone(&board)),
+        initial_backlog: Vec::new(),
+    };
+
     // Sink selection. `drain::spawn_with` is generic over the sink but returns
     // the same `JoinHandle<drain::DrainExit>`, so each arm produces a uniform
-    // handle for the join sequence.
+    // handle for the join sequence. `drain_runtime` moves into whichever arm
+    // runs.
     let drain_handle = match config.sink_type {
         SinkType::Noop => {
             warn!(
@@ -558,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
-                drain::DrainRuntime::detached(),
+                drain_runtime,
             )
         }
         #[cfg(feature = "http-sink")]
@@ -626,7 +638,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
-                drain::DrainRuntime::detached(),
+                drain_runtime,
             )
         }
         #[cfg(feature = "mysql-sink")]
@@ -667,7 +679,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
-                drain::DrainRuntime::detached(),
+                drain_runtime,
             )
         }
         #[cfg(feature = "postgres-sink")]
@@ -702,7 +714,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
-                drain::DrainRuntime::detached(),
+                drain_runtime,
             )
         }
         #[cfg(feature = "clickhouse-sink")]
@@ -734,7 +746,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
-                drain::DrainRuntime::detached(),
+                drain_runtime,
             )
         }
         #[cfg(feature = "s3-sink")]
@@ -802,7 +814,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
-                drain::DrainRuntime::detached(),
+                drain_runtime,
             )
         }
     };

@@ -4,13 +4,6 @@
 //! sink cells. Every write is a wait-free atomic or ArcSwap store; with no
 //! board (the detached test wiring) every write is a no-op, so the drain's
 //! logic never branches on whether it is observed.
-// Unconditional, not `cfg_attr(not(test), ..)`: `Publisher::exit` has no caller
-// in either build until Task 2.14, and `clippy --all-targets` lints the test
-// build too.
-#![allow(
-    dead_code,
-    reason = "wired in Tasks 2.3-2.15; replaced by item-level allows in Task 2.17"
-)]
 
 use std::sync::{Arc, atomic::Ordering::Relaxed};
 
@@ -56,6 +49,8 @@ impl Publisher {
         Self { board }
     }
 
+    /// The unobserved publisher of the pre-Foundations test wrappers.
+    #[cfg(test)]
     pub(crate) fn none() -> Self {
         Self { board: None }
     }

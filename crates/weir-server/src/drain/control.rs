@@ -5,13 +5,6 @@
 //! Every field is an atomic on one `Arc`, so a control handle is cheap to clone
 //! and never blocks the drain. There is no channel handle here, by design
 //! (spec §4): the drain owns the only Receiver of the drain channel.
-// Unconditional, not `cfg_attr(not(test), ..)`: `REQUEUE_MIN_INTERVAL` has no
-// caller in either build until Task 2.7, and `clippy --all-targets` lints the
-// test build too.
-#![allow(
-    dead_code,
-    reason = "wired in Tasks 2.3-2.15; replaced by item-level allows in Task 2.17"
-)]
 
 use std::{
     path::PathBuf,
@@ -39,6 +32,13 @@ pub(crate) const SLICE: Duration = Duration::from_millis(50);
 const NO_DEADLINE: u64 = u64::MAX;
 
 /// How the drain treats its channel disconnecting.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+    )
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lifetime {
     /// Production from PR 4: `Disconnected` is a non-event; the drain exits only
@@ -93,6 +93,13 @@ impl DrainControl {
         }))
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn attached() -> Self {
         Self::new(Lifetime::Attached)
     }
@@ -121,6 +128,13 @@ impl DrainControl {
 
     /// T0 (first SIGTERM): absorb mode — move channel arrivals into `pending`
     /// on every wait slice; skip probes, rescans and gauge walks.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn begin_shutdown(&self) {
         self.0.absorb.store(true, Release);
     }
@@ -128,6 +142,13 @@ impl DrainControl {
     /// T2 (after the flusher joins): input is closed, deliver until `budget`
     /// from now, then abandon. The deadline only ever moves earlier, and is
     /// stored before `stop` so a drain that sees `stop` sees the deadline.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn request_stop(&self, budget: Duration) {
         self.0.input_closed.store(true, Release);
         let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
@@ -138,6 +159,13 @@ impl DrainControl {
 
     /// Second signal: absorb, and a deadline of now. A later `request_stop`
     /// cannot raise it (both use `fetch_min`).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn force_stop(&self) {
         self.0.absorb.store(true, Release);
         self.0.deadline_ms.fetch_min(self.now_ms(), AcqRel);
@@ -145,12 +173,26 @@ impl DrainControl {
     }
 
     /// Pause delivery before the next commit batch. Returns the request's sequence number.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn request_pause(&self) -> u64 {
         self.0.pause.store(true, Release);
         self.0.pause_seq.fetch_add(1, AcqRel) + 1
     }
 
     /// Resume delivery. Returns the request's sequence number.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn request_resume(&self) -> u64 {
         self.0.pause.store(false, Release);
         self.0.pause_seq.fetch_add(1, AcqRel) + 1
@@ -159,6 +201,13 @@ impl DrainControl {
     /// Ask for a stranded-segment rescan. A request made while an earlier
     /// ticket is still unobserved folds into it and returns that ticket, so a
     /// caller looping on this cannot queue more than one scan (spec §5.4).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn request_requeue(&self) -> u64 {
         loop {
             let req = self.0.requeue_req.load(Acquire);
@@ -229,6 +278,13 @@ impl DrainControl {
         self.0.pause.load(Acquire)
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn pause_seq(&self) -> u64 {
         self.0.pause_seq.load(Acquire)
     }
@@ -251,6 +307,13 @@ impl DrainControl {
         self.0.generation.fetch_add(1, AcqRel) + 1
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
+        )
+    )]
     pub(crate) fn generation(&self) -> u64 {
         self.0.generation.load(Acquire)
     }
@@ -269,7 +332,9 @@ pub(crate) struct DrainRuntime {
 }
 
 impl DrainRuntime {
-    /// Today's wiring: Detached, no board, no backlog.
+    /// Detached, no board, no backlog: the pre-Foundations test wiring.
+    /// Production builds its runtime with the board (`main`).
+    #[cfg(test)]
     pub(crate) fn detached() -> Self {
         Self {
             control: DrainControl::detached(),
