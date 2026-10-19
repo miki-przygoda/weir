@@ -85,11 +85,10 @@ impl ShardRegistry {
         Arc::new(Self::new(1, 1, Arc::new(AtomicBool::new(false))))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // PR 3/4 read it
+    #[cfg_attr(not(test), allow(dead_code))] // only tests read it so far
     pub(crate) fn shard_count(&self) -> usize {
         self.shards.len()
     }
-    #[cfg_attr(not(test), allow(dead_code))] // PR 3/4 read it
     pub(crate) fn worker_count(&self) -> usize {
         self.workers.len()
     }
@@ -134,7 +133,6 @@ impl ShardRegistry {
 
     /// The hand-off-blocked marker (spec §5.3). The first timeout of an
     /// episode stamps it; later stamps keep the first; 0 clears it.
-    #[cfg_attr(not(test), allow(dead_code))] // PR 3's hand_off writes this
     pub(crate) fn set_handoff_blocked_since_ms(&self, shard: usize, since_unix_ms: u64) {
         let cell = &self.shards[shard].handoff_blocked_since_ms;
         if since_unix_ms == 0 {
@@ -165,7 +163,6 @@ impl ShardRegistry {
             && self.worker_running(shard % self.workers.len().max(1))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // PR 3 routes with this
     pub(crate) fn ingest_capable_count(&self) -> usize {
         (0..self.shards.len())
             .filter(|&s| self.ingest_capable(s))
@@ -175,7 +172,6 @@ impl ShardRegistry {
     /// The (n mod k)-th ingest-capable shard. A shard that changes state
     /// between the count and the walk is tolerated: the walk falls back to
     /// the first capable shard, or `None`.
-    #[cfg_attr(not(test), allow(dead_code))] // PR 3 routes with this
     pub(crate) fn pick_live(&self, n: u64) -> Option<u32> {
         let k = self.ingest_capable_count();
         if k == 0 {
@@ -190,7 +186,6 @@ impl ShardRegistry {
             .map(|s| s as u32)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // PR 3's settle wait reads this
     pub(crate) fn all_settled(&self) -> bool {
         self.shards
             .iter()
@@ -281,7 +276,7 @@ impl ShardSlot {
     pub(crate) fn registry(&self) -> &Arc<ShardRegistry> {
         &self.registry
     }
-    #[cfg_attr(not(test), allow(dead_code))] // PR 3's hand-off marker reads it
+    #[cfg_attr(not(test), allow(dead_code))] // only tests read it so far
     pub(crate) fn shard(&self) -> usize {
         self.shard
     }

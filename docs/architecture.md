@@ -72,6 +72,7 @@ umask 0o077 + SIGHUP ignored
                        a failed scan with a cap set starts rejecting (src/status/poll.rs)
 → settle wait          up to 10 s for every shard to leave Starting and every
                        worker to run; routing skips a shard that has not
+                       settled
 → tokio runtime:
     reload loop + SIGHUP handler → metrics bind
     → WAB / drain-liveness poll → [TLS load]
