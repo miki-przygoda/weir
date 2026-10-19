@@ -44,6 +44,10 @@ OPTIONS:
                                                on the network) [default: 127.0.0.1]
     --metrics-max-connections <n>            Concurrent metrics scrapes cap
                                                (1-1024) [default: 8]
+    --livez-checks <a,b>                     /livez fails on these (listener_down,
+                                               no_live_shard, worker_exited,
+                                               drain_stopped, drain_wedged)
+                                               [default: none]
     --peer-uid-check <bool>                  Refuse connections from uids other
                                                than the daemon's [default: true]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
@@ -204,6 +208,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         metrics_max_connections: pargs
             .opt_value_from_str("--metrics-max-connections")
+            .map_err(pico_err)?,
+        livez_checks: pargs
+            .opt_value_from_str("--livez-checks")
             .map_err(pico_err)?,
         peer_uid_check: opt_bool(&mut pargs, "--peer-uid-check")?,
         shutdown_timeout_secs: pargs
@@ -408,6 +415,20 @@ mod tests {
     fn args(parts: &[&str]) -> pico_args::Arguments {
         // from_vec excludes the executable path, matching how we'd parse real argv.
         pico_args::Arguments::from_vec(parts.iter().map(OsString::from).collect())
+    }
+
+    #[test]
+    fn livez_checks_flag_is_parsed() {
+        let (partial, _) =
+            parse_from(args(&["--livez-checks", "no_live_shard,listener_down"])).unwrap();
+        assert_eq!(
+            partial.livez_checks.as_deref(),
+            Some("no_live_shard,listener_down")
+        );
+        assert!(
+            HELP.contains("--livez-checks"),
+            "the flag must be in --help"
+        );
     }
 
     #[test]

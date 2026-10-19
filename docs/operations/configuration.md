@@ -955,6 +955,13 @@ knob from the bind **host** ([`metrics_bind`](#metrics_bind)); the two combine
 into the listen socket `<metrics_bind>:<metrics_port>` (default
 `127.0.0.1:9185`).
 
+The same listener serves four read-only health routes: `/livez`, `/readyz`,
+`/startupz` and `/status` (exact, case-sensitive paths; GET and HEAD only).
+Every other path returns the metrics exposition exactly as before, so
+existing scrape configs keep working. **Behaviour change:** a client must send its
+complete request head within 1 s, or the connection is closed. Prometheus,
+curl and `weir-ctl` send it at once.
+
 An address that is already in use refuses startup before recovery (a
 test-bind, released at once, runs right after the `wab_dir` lock), with
 `failed to bind metrics endpoint to <bind>:<port> (<error>) — another
@@ -995,9 +1002,38 @@ explicit decision. To scrape from another host, sidecar, or container, set
 - **Env**: `WEIR_METRICS_MAX_CONNECTIONS`
 - **TOML**: `metrics_max_connections`
 
-Maximum number of concurrent scrape connections to the `/metrics`
-endpoint. Bounds the resource cost of a misbehaving or hostile
-scraper; the default of 8 is generous for normal Prometheus scraping.
+Maximum number of concurrent **scrapes** of the metrics exposition. A
+connection takes a permit only after its request head has arrived; before
+that it holds one of 64 head slots for at most 1 s, so an idle peer can no
+longer hold a scrape permit. The four health routes use their own pool of 4
+and are not limited by this setting, so a burst of scrapes cannot starve
+kubelet probes. A scrape over the cap is closed at once and counted in
+`weir_http_requests_dropped_total{reason="metrics_pool_full"}`; Prometheus
+retries on its next interval.
+
+#### `livez_checks`
+
+- **Type**: list of liveness check names
+- **Default**: `[]` (none: `/livez` answers 200 whenever the daemon's runtime answers)
+- **Values**: any subset of `listener_down`, `no_live_shard`, `worker_exited`, `drain_stopped`, `drain_wedged`
+- **CLI**: `--livez-checks <a,b>`
+- **Env**: `WEIR_LIVEZ_CHECKS` (comma-separated)
+- **TOML**: `livez_checks = ["no_live_shard", "listener_down"]`
+
+The conditions that make `/livez` return 503. Only states a restart fixes
+are selectable, and each is evaluated only once startup has finished, so
+`/livez` never fails during recovery, during shutdown, or because the sink
+is down, a retry is backing off, delivery is blocked or paused. A liveness
+probe that restarts weir for a down sink would only replay the backlog into
+the same down sink.
+
+**Recommended:** `["no_live_shard", "listener_down", "worker_exited"]`, the
+ingest-dead set. `drain_stopped` restarts a daemon whose drain supervisor
+gave up (ingest still works; nothing is delivered until a restart).
+`drain_wedged` restarts a drain blocked inside a sink call that never yields;
+enable it only after watching the `drain_wedged` condition in production for
+a while, because a restart re-delivers the in-flight segment from record 0.
+An unknown name refuses startup.
 
 ---
 

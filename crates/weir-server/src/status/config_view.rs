@@ -111,6 +111,7 @@ impl From<&Config> for ConfigView {
             metrics_port,
             metrics_bind,
             metrics_max_connections,
+            livez_checks,
             peer_uid_check,
             shutdown_timeout_secs,
             drain_shutdown_budget_secs,
@@ -215,6 +216,17 @@ impl From<&Config> for ConfigView {
         v.admin(
             "metrics_max_connections",
             u(*metrics_max_connections as u64),
+        );
+        // Admin, not public: the §9.1 public config subset is numbers and
+        // booleans only; the public document carries the list as
+        // `verdict.livez_checks` instead.
+        v.admin(
+            "livez_checks",
+            s(livez_checks
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>()
+                .join(",")),
         );
         v.admin(
             "connection_read_timeout_secs",
@@ -464,6 +476,29 @@ mod tests {
             ConfigValue::Bool(true)
         );
         assert!(v.disclosure("sink_s3_secret_access_key").is_none());
+    }
+
+    /// `livez_checks` is an admin key (not in the §9.1 public subset),
+    /// rendered as the comma-joined catalogue codes.
+    #[test]
+    fn livez_checks_is_an_admin_key_rendered_comma_joined() {
+        let v = ConfigView::from(&config(
+            "livez",
+            PartialConfig {
+                livez_checks: Some("worker_exited,listener_down".into()),
+                ..PartialConfig::empty()
+            },
+        ));
+        assert_eq!(v.disclosure("livez_checks"), Some(Disclosure::Admin));
+        assert_eq!(
+            v.view()["livez_checks"],
+            ConfigValue::Str("listener_down,worker_exited".into())
+        );
+        let empty = ConfigView::from(&config("livez_empty", PartialConfig::empty()));
+        assert_eq!(
+            empty.view()["livez_checks"],
+            ConfigValue::Str(String::new())
+        );
     }
 
     #[test]

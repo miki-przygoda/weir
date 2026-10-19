@@ -5,6 +5,7 @@
 //! (spec §9.2 rule 5); `no_blocking_locks_under_status` enforces it.
 pub(crate) mod board;
 pub(crate) mod config_view;
+mod http;
 pub(crate) mod poll;
 pub(crate) mod render;
 pub(crate) mod shards;

@@ -33,9 +33,8 @@ impl StatusSnapshot {
 }
 
 /// One snapshot, one evaluation, the configured liveness checks. Loads only.
-/// PR 5 (`/status`) and PR 6 (admin `status`) are its callers; until they
-/// land only the tests call it.
-#[cfg_attr(not(test), allow(dead_code, reason = "PR 5 and PR 6 call it"))]
+/// PR 5 (`/status`, `status::http`) and PR 6 (admin `status`) are its
+/// callers.
 pub(crate) fn render_admin_doc(
     board: &StatusBoard,
     thresholds: &Thresholds,

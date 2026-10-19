@@ -28,6 +28,7 @@ struct RawServer {
     metrics_port: Option<u16>,
     metrics_bind: Option<String>,
     metrics_max_connections: Option<usize>,
+    livez_checks: Option<Vec<String>>,
     peer_uid_check: Option<bool>,
     shutdown_timeout_secs: Option<u64>,
     drain_shutdown_budget_secs: Option<u64>,
@@ -114,6 +115,7 @@ const BASE_SERVER_KEYS: &[&str] = &[
     "metrics_port",
     "metrics_bind",
     "metrics_max_connections",
+    "livez_checks",
     "peer_uid_check",
     "shutdown_timeout_secs",
     "drain_shutdown_budget_secs",
@@ -241,6 +243,7 @@ pub(super) fn read(path: &Path) -> Result<Option<(PartialConfig, Vec<String>)>, 
             metrics_port: s.metrics_port,
             metrics_bind: s.metrics_bind,
             metrics_max_connections: s.metrics_max_connections,
+            livez_checks: s.livez_checks.map(|v| v.join(",")),
             peer_uid_check: s.peer_uid_check,
             shutdown_timeout_secs: s.shutdown_timeout_secs,
             drain_shutdown_budget_secs: s.drain_shutdown_budget_secs,
@@ -378,6 +381,28 @@ mod tests {
     /// is tolerated (warn-only) — `read` must not error on either. This is the
     /// long-standing behaviour; F55 only changed which keys get a warning, not
     /// whether parsing fails.
+    #[test]
+    fn livez_checks_is_a_known_array_key() {
+        let dir = crate::testutil::scratch_dir("filecfg_livez");
+        crate::testutil::mkdir_p(&dir);
+        let path = dir.join("weir.toml");
+        std::fs::write(
+            &path,
+            "[server]\nlivez_checks = [\"no_live_shard\", \"listener_down\"]\n",
+        )
+        .unwrap();
+        let (partial, warnings) = read(&path).unwrap().expect("the file exists");
+        assert_eq!(
+            partial.livez_checks.as_deref(),
+            Some("no_live_shard,listener_down")
+        );
+        assert!(
+            warnings.iter().all(|w| !w.contains("livez_checks")),
+            "{warnings:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn wab_dir_lock_is_a_known_key() {
         let dir = crate::testutil::scratch_dir("filecfg_lock");

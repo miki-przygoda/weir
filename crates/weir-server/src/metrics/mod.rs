@@ -10,6 +10,7 @@
 //! appends it automatically in the text output. All names in this file match the
 //! plan's metric names after that suffix is accounted for.
 
+pub(crate) mod router;
 pub(crate) mod server;
 
 use prometheus_client::{
@@ -293,6 +294,31 @@ pub enum ConfigReloadOutcome {
     failed,
     noop,
     dropped,
+}
+
+/// Labels for `weir_http_requests_dropped_total` (Foundations, spec §5.8,
+/// §13): why the metrics/health listener closed a connection without a
+/// response.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct HttpDroppedLabel {
+    pub reason: HttpDropReason,
+}
+
+/// Why a metrics/health listener connection was closed before a response.
+/// Lowercase to match Prometheus naming conventions.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum HttpDropReason {
+    /// No complete request head within 1 s (`HEAD_READ_TIMEOUT`): a stalled
+    /// or slowloris peer.
+    head_timeout,
+    /// All 64 head-reading slots (`HEAD_READ_SLOTS`) were busy.
+    head_pool_full,
+    /// More concurrent scrapes than `metrics_max_connections`.
+    metrics_pool_full,
+    /// More than 4 (`PROBE_SLOTS`) concurrent `/livez`, `/readyz`,
+    /// `/startupz` or `/status` requests.
+    probe_pool_full,
 }
 
 // ── Foundations: status, lifecycle and conditions (spec §13) ────────────────
@@ -687,6 +713,12 @@ pub(crate) struct Metrics {
     /// what asked for it and how it went. `weir_tls_config_reloads_total` is
     /// unchanged and still counts the TLS part on its own.
     pub config_reloads: Family<ConfigReloadLabel, Counter<u64, AtomicU64>>,
+
+    // ── Metrics / health listener (Foundations, spec §5.8) ───────────────────
+    /// `weir_http_requests_dropped_total{reason}`: connections to the
+    /// metrics/health listener closed without a response, by reason. All four
+    /// reasons are pre-created at 0; the router's pools increment them.
+    pub http_requests_dropped: Family<HttpDroppedLabel, Counter<u64, AtomicU64>>,
 
     // ── Drain ledger (safety floor, spec §4.0) ────────────────────────────────
     /// Segments set aside after exhausting `max_retries` on a LOCAL I/O failure,
@@ -1124,6 +1156,17 @@ impl Metrics {
              full, as in a SIGHUP flood, so the request never ran)"
         );
 
+        // ── Metrics / health listener (Foundations, spec §5.8) ───────────────
+        let http_requests_dropped = reg!(
+            Family::<HttpDroppedLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_http_requests_dropped",
+            "Connections to the metrics/health listener closed without a response, by reason: \
+             head_timeout (no complete request head within 1 s), head_pool_full (all 64 \
+             head slots busy), metrics_pool_full (more concurrent scrapes than \
+             metrics_max_connections), probe_pool_full (more than 4 concurrent /livez, \
+             /readyz, /startupz or /status requests)"
+        );
+
         // ── Drain ledger (safety floor, spec §4.0) ───────────────────────────
         let drain_local_io_strands = reg!(
             Family::<LocalIoStrandLabel, Counter<u64, AtomicU64>>::default(),
@@ -1454,6 +1497,7 @@ impl Metrics {
             wab_dir_lock_held,
             wab_dir_lock_integrity_failures,
             config_reloads,
+            http_requests_dropped,
             drain_local_io_strands,
             drain_segments_parked,
             drain_segments_disposition_pending,
@@ -1552,6 +1596,19 @@ impl Metrics {
                 state: SinkHealthState::down,
             })
             .set(0.0);
+
+        // Every metrics-listener drop reason exists at 0 from boot (spec §13),
+        // so `rate()` works before the first drop.
+        for reason in [
+            HttpDropReason::head_timeout,
+            HttpDropReason::head_pool_full,
+            HttpDropReason::metrics_pool_full,
+            HttpDropReason::probe_pool_full,
+        ] {
+            let _ = metrics
+                .http_requests_dropped
+                .get_or_create(&HttpDroppedLabel { reason });
+        }
 
         // Every drain-ledger series exists at 0 from boot, so a scraper can
         // baseline and alert on them before the first strand or park.
@@ -1897,6 +1954,8 @@ mod tests {
             "weir_wab_segments_not_handed_off",
             "weir_config_drain_shutdown_budget_seconds",
             "weir_drain_shutdown_deadline_seconds",
+            // Metrics / health listener (Foundations PR 5)
+            "weir_http_requests_dropped",
         ];
         if cfg!(feature = "bench-trace") {
             expected.extend([
@@ -2143,5 +2202,31 @@ mod tests {
             );
             assert!(out.contains(&series), "{series:?} missing:\n{out}");
         }
+    }
+
+    /// All four drop reasons exist at 0 from boot (spec §13: every new family
+    /// pre-creates its label set), so `rate()` works before the first drop.
+    #[test]
+    fn http_requests_dropped_series_are_pre_initialised_to_zero() {
+        let (m, reg) = Metrics::new();
+        let out = encode_to_string(&reg);
+        for reason in [
+            "head_timeout",
+            "head_pool_full",
+            "metrics_pool_full",
+            "probe_pool_full",
+        ] {
+            let series = format!("weir_http_requests_dropped_total{{reason=\"{reason}\"}} 0");
+            assert!(out.contains(&series), "{series:?} missing:\n{out}");
+        }
+        m.http_requests_dropped
+            .get_or_create(&HttpDroppedLabel {
+                reason: HttpDropReason::head_timeout,
+            })
+            .inc();
+        assert!(
+            encode_to_string(&reg)
+                .contains("weir_http_requests_dropped_total{reason=\"head_timeout\"} 1")
+        );
     }
 }

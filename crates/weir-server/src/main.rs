@@ -469,17 +469,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.metrics_port,
         )))
         .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
-    // PR 5 swaps this for the router (HttpState); the bind point stays here.
-    metrics::server::spawn(
-        metrics_listener,
+    // The router (spec §5.8, §10): a 1 s head phase, then separate scrape
+    // and probe pools. /livez /readyz /startupz /status read the status
+    // board (loads only, spec §9.2); every other path is today's metrics.
+    let http_state = metrics::server::HttpState::new(
         Arc::clone(&registry),
+        Some(Arc::clone(&metrics)),
+        Some(Arc::clone(&board) as Arc<dyn metrics::router::StatusSource>),
+        config.livez_checks.clone(),
         config.metrics_max_connections,
     );
+    metrics::server::spawn(metrics_listener, http_state);
     info!(
         bind = %config.metrics_bind,
         port = config.metrics_port,
         max_connections = config.metrics_max_connections,
-        "metrics endpoint listening"
+        livez_checks = ?config.livez_checks,
+        "metrics and health endpoint listening (/livez /readyz /startupz /status; any other path: metrics)"
     );
 
     // ── Step 6: TLS material, before a long recovery ──────────────────────────
@@ -706,11 +712,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commit_timeout_for_stall,
         ),
     )
-    .with_status(status::poll::PollStatus::new(
-        Arc::clone(&board),
-        config.wab_dir.clone(),
-        coalesce_hint_for_poll,
-    ));
+    .with_status(
+        status::poll::PollStatus::new(
+            Arc::clone(&board),
+            config.wab_dir.clone(),
+            coalesce_hint_for_poll,
+        )
+        .with_livez_checks(config.livez_checks.clone()),
+    );
     let wab_dir_bg = config.wab_dir.clone();
     rt.spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
