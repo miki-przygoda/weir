@@ -67,7 +67,7 @@ use crate::{
     wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
 };
 
-pub(crate) use control::{DrainControl, DrainExit, DrainRuntime};
+pub(crate) use control::{DrainControl, DrainExit, DrainRuntime, Lifetime};
 use publish::Publisher;
 
 use crate::status::DrainExitReason;
@@ -80,10 +80,6 @@ use ledger::{ErrClass, ParkReason};
 /// What the drain's inner functions need besides their data: the intent to
 /// obey, the board to publish to, the heartbeat to bump. Borrowed for one
 /// drain incarnation.
-#[allow(
-    dead_code,
-    reason = "control and publish are first read in Task 2.4, which removes this"
-)]
 pub(crate) struct DrainCtx<'a> {
     pub(crate) control: &'a DrainControl,
     pub(crate) publish: &'a Publisher,
@@ -1027,6 +1023,101 @@ fn quarantine_bytes_on_disk(wab_dir: &Path) -> u64 {
     total
 }
 
+/// What one [`wait_slice`] produced.
+#[derive(Debug, PartialEq, Eq)]
+enum Wait {
+    /// A segment arrived on the channel.
+    Segment(PathBuf),
+    /// The slice elapsed (in Attached mode, also after the channel is gone).
+    TimedOut,
+    /// `stop` is set and its deadline has passed: stop waiting.
+    Stop,
+    /// The channel disconnected and the drain is Detached: today's shutdown.
+    Disconnected,
+}
+
+/// The drain's single way to wait (spec §5.4 "Wait helper"), replacing the
+/// three `recv_timeout` sites: the Draining idle wait, the retry backoff and the
+/// dead-letter-full block.
+///
+/// One slice of at most [`control::SLICE`], with a [`control::SLICE`] FLOOR
+/// while a pause is requested, so a paused hold whose deadline has already
+/// elapsed can never spin on `recv_timeout(0)`; never past a stop deadline. In
+/// absorb mode it first moves everything already in the channel into
+/// `pending`. Every slice bumps the heartbeat (a waiting drain is alive: see
+/// [`DrainHeartbeat`]) and publishes the channel depth and the queue lengths.
+///
+/// Attached mode: a disconnected channel is a non-event. One WARN, then plain
+/// sleeps (a disconnected `recv_timeout` returns at once and would spin); the
+/// drain keeps delivering its queues and rescans until stopped.
+fn wait_slice(
+    rx: &crossbeam_channel::Receiver<PathBuf>,
+    ctx: &DrainCtx<'_>,
+    dur: Duration,
+    pending: &mut VecDeque<PathBuf>,
+    backlog_len: usize,
+    channel_gone: &mut bool,
+) -> Wait {
+    ctx.hb.bump();
+    if ctx.control.absorbing() {
+        while let Ok(p) = rx.try_recv() {
+            pending.push_back(p);
+        }
+    }
+    ctx.publish.channel_depth(rx.len());
+    ctx.publish.queue_lens(pending.len(), backlog_len);
+    if ctx.control.stop_requested() && ctx.control.deadline_passed() {
+        return Wait::Stop;
+    }
+    let mut slice = dur.min(control::SLICE);
+    if ctx.control.pause_requested() {
+        slice = control::SLICE;
+    }
+    if let Some(left) = ctx.control.time_left() {
+        slice = slice.min(left.max(Duration::from_millis(1)));
+    }
+    if *channel_gone {
+        std::thread::sleep(slice);
+        return Wait::TimedOut;
+    }
+    match rx.recv_timeout(slice) {
+        Ok(p) => Wait::Segment(p),
+        Err(RecvTimeoutError::Timeout) => Wait::TimedOut,
+        Err(RecvTimeoutError::Disconnected) => match ctx.control.mode() {
+            Lifetime::Detached => Wait::Disconnected,
+            Lifetime::Attached => {
+                warn!("drain: all flushers gone; continuing to deliver the on-disk backlog");
+                *channel_gone = true;
+                std::thread::sleep(slice);
+                Wait::TimedOut
+            }
+        },
+    }
+}
+
+/// The Draining head's exit check (spec §5.4 "Lifetime"). With `stop` set: exit
+/// at the deadline, or once input is closed and nothing is left (no queued
+/// path, nothing in the channel). Without `stop`: never. Held and in-flight
+/// segments are the arms' own business; the head holds neither.
+fn stop_exit(
+    control: &DrainControl,
+    queues_empty: bool,
+    rx: &crossbeam_channel::Receiver<PathBuf>,
+) -> Option<DrainExitReason> {
+    if !control.stop_requested() {
+        return None;
+    }
+    let nothing_left = queues_empty && rx.is_empty();
+    if control.deadline_passed() {
+        return Some(if nothing_left {
+            DrainExitReason::Stopped
+        } else {
+            DrainExitReason::DeadlineAbandoned
+        });
+    }
+    (control.input_closed() && nothing_left).then_some(DrainExitReason::Stopped)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_thread_with<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
@@ -1089,6 +1180,9 @@ fn drain_thread_with<S: Sink>(
     };
 
     let mut state = DrainState::Draining;
+    // Set once an Attached drain sees its channel disconnect (every flusher
+    // gone): from then on `wait_slice` sleeps its slices instead of spinning.
+    let mut channel_gone = false;
     // Task 2.5 moves the replay list into its own `backlog` queue.
     let mut pending: VecDeque<PathBuf> = initial_backlog.into();
 
@@ -1140,6 +1234,9 @@ fn drain_thread_with<S: Sink>(
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
                 set_drain_state(&metrics, DrainStateValue::draining);
+                if let Some(reason) = stop_exit(control, pending.is_empty(), &drain_rx) {
+                    break 'outer reason;
+                }
 
                 // Wall-clock health poll + stranded-segment rescan. Runs on the
                 // `health_poll_interval` cadence regardless of channel activity, so
@@ -1206,25 +1303,33 @@ fn drain_thread_with<S: Sink>(
                         }
                     }
                     // Idle: wait for a new segment, but no longer than the time
-                    // left until the next health poll, then re-enter Draining so
-                    // the wall-clock poll above runs. Channel closure (all WAB
-                    // flushers exited) still ends the loop.
+                    // left until the next health poll (and one slice at most),
+                    // then re-enter Draining so the wall-clock poll above runs.
+                    // A Detached drain's channel closure (all WAB flushers
+                    // exited) still ends the loop; an Attached drain's does not.
                     let until_next_poll = config
                         .health_poll_interval
                         .saturating_sub(last_health_poll.elapsed())
                         .max(Duration::from_millis(1));
-                    match drain_rx.recv_timeout(until_next_poll) {
-                        Ok(p) => match ledger.admit(&p, Instant::now()) {
+                    match wait_slice(
+                        &drain_rx,
+                        &ctx,
+                        until_next_poll,
+                        &mut pending,
+                        0,
+                        &mut channel_gone,
+                    ) {
+                        Wait::Segment(p) => match ledger.admit(&p, Instant::now()) {
                             Admit::Process { skip } => break Some((p, skip)),
                             Admit::Drop(owner) => {
                                 debug!(path = %p.display(), owner, "drain: not admitting segment from the channel");
                                 break None;
                             }
                         },
-                        Err(RecvTimeoutError::Timeout) => break None,
-                        Err(RecvTimeoutError::Disconnected) => {
-                            break 'outer DrainExitReason::Stopped;
-                        }
+                        // Back to the head: the poll, the stop check and the
+                        // verbs run there, at least once per slice.
+                        Wait::TimedOut | Wait::Stop => break None,
+                        Wait::Disconnected => break 'outer DrainExitReason::Stopped,
                     }
                 };
 
@@ -1375,8 +1480,9 @@ fn drain_thread_with<S: Sink>(
                 set_drain_state(&metrics, DrainStateValue::retrying_transient);
 
                 // Interruptible backoff: consume next_delay in short slices via
-                // recv_timeout so a shutdown — which the drain only learns of as the
-                // drain channel disconnecting (all WAB flushers have exited) — cuts
+                // `wait_slice` so a shutdown — which a Detached drain only learns
+                // of as the drain channel disconnecting (all WAB flushers have
+                // exited), an Attached one as a passed stop deadline — cuts
                 // the wait short instead of sleeping out a multi-minute Retry-After.
                 // On disconnect we shorten the wait but STILL run the retry below
                 // (its commit is bounded by commit_timeout), preserving the existing
@@ -1418,21 +1524,30 @@ fn drain_thread_with<S: Sink>(
                     // defaults). Without a bump here a merely-SLOW sink is
                     // reported as a drain "wedged inside a sink call that blocks
                     // its OS thread", which is the worst possible misdirection
-                    // during an incident. Bumping on each 50 ms slice keeps the
-                    // heartbeat meaning what it claims: only a thread that
-                    // cannot reach its own loop at all freezes it.
-                    heartbeat.bump();
+                    // during an incident. `wait_slice` bumps on each 50 ms
+                    // slice, which keeps the heartbeat meaning what it claims:
+                    // only a thread that cannot reach its own loop at all
+                    // freezes it.
                     let remaining = wait_end.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
-                    let poll = remaining.min(Duration::from_millis(50));
-                    match drain_rx.recv_timeout(poll) {
-                        Ok(new_seg) => pending.push_back(new_seg),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        // Channel closed (shutdown): serve the clamped remainder of
-                        // the backoff, then finish the retry.
-                        Err(RecvTimeoutError::Disconnected) => {
+                    match wait_slice(
+                        &drain_rx,
+                        &ctx,
+                        remaining,
+                        &mut pending,
+                        0,
+                        &mut channel_gone,
+                    ) {
+                        Wait::Segment(new_seg) => pending.push_back(new_seg),
+                        Wait::TimedOut => {}
+                        // Task 2.11 turns this into an exit; until then the
+                        // retry runs at once and the Draining head exits.
+                        Wait::Stop => break,
+                        // Detached shutdown: serve the clamped remainder of the
+                        // backoff (W2), then finish the retry.
+                        Wait::Disconnected => {
                             let left = wait_end
                                 .saturating_duration_since(Instant::now())
                                 .min(SHUTDOWN_RETRY_BACKOFF_CAP)
@@ -1511,7 +1626,8 @@ fn drain_thread_with<S: Sink>(
                     .set(blocked_since.elapsed().as_secs_f64());
 
                 // Drain new segments into the pending buffer while waiting.
-                // Use recv_timeout in short slices to detect channel disconnection.
+                // Wait in `wait_slice` slices to notice a shutdown: a Detached
+                // channel disconnecting or a passed stop deadline.
                 let mut channel_closed = false;
                 let check_end = Instant::now() + config.dead_letter_check_interval;
                 loop {
@@ -1522,16 +1638,22 @@ fn drain_thread_with<S: Sink>(
                     // never reached. A drain that is blocked and SAYING SO via
                     // `drain_state{blocked_dead_letter_full}` is alive; only a
                     // thread that cannot reach its own loop is wedged.
-                    heartbeat.bump();
+                    // `wait_slice` bumps the heartbeat on every slice.
                     let remaining = check_end.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
-                    let poll = remaining.min(Duration::from_millis(50));
-                    match drain_rx.recv_timeout(poll) {
-                        Ok(new_seg) => pending.push_back(new_seg),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => {
+                    match wait_slice(
+                        &drain_rx,
+                        &ctx,
+                        remaining,
+                        &mut pending,
+                        0,
+                        &mut channel_gone,
+                    ) {
+                        Wait::Segment(new_seg) => pending.push_back(new_seg),
+                        Wait::TimedOut => {}
+                        Wait::Stop | Wait::Disconnected => {
                             channel_closed = true;
                             break;
                         }
