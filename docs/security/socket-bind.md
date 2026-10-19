@@ -388,8 +388,9 @@ duration.
 
 Specifying mode bits explicitly does not escape it — `mkdir(2)` and `open(2)`
 both mask the requested mode. A directory created by another thread inside the
-window lands at `0o700 & !0o177 = 0o600`, losing its execute bit; a WAB segment
-lands at `0o600 & !0o177 = 0o400`.
+window lands at `0o700 & !0o177 = 0o600`, losing its execute bit; a 0o600 file
+(a WAB segment, a `.confirmed` sidecar) is unaffected (`0o600 & !0o177 = 0o600`);
+WAB directories go through `wab::create_dir_private`, which chmods after mkdir.
 
 **In the daemon this is not exploitable and not reachable.** The bind happens
 before any producer can connect, so no records exist and no segment is being

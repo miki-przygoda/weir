@@ -464,17 +464,19 @@ pub(crate) fn bind_hardened(path: &Path) -> io::Result<BoundSocket> {
     // propagate to the bind path's mode bits).
     //
     // umask is process-global and applies to other threads for the duration of
-    // the bind(2) below. Specifying mode bits explicitly does NOT escape it:
-    // mkdir(2) and open(2) both mask the requested mode, so a directory created
-    // by another thread in this window lands at 0o700 & !0o177 = 0o600 — no
-    // execute bit, nothing can be created inside it — and a segment file at
-    // 0o600 & !0o177 = 0o400. In the daemon nothing is created here because no
-    // producer can connect before the socket exists, so the process is idle
-    // (not single-threaded: the WAB flushers spawned at main.rs:292 and the
-    // workers at main.rs:306 are already running). Under `cargo test` the
-    // window is real and hit constantly, which is why weir-server's bin unit
-    // tests run with --test-threads=1 — see CONTRIBUTING.md and
-    // docs/security/socket-bind.md.
+    // the bind(2) below. Requested mode bits are masked by it, so the window
+    // only matters for bits the mask removes: 0o177 removes owner-x and every
+    // group/other bit. A 0o600 file (segments, `.confirmed`) is therefore
+    // unaffected: 0o600 & !0o177 = 0o600. A directory made with a plain
+    // mkdir(0o700) would land at 0o700 & !0o177 = 0o600 (no execute bit,
+    // nothing can be created inside it), which is why every WAB directory goes
+    // through `wab::create_dir_private`, which chmods after mkdir. For today's
+    // call sites the window is benign. It is still kept short, and from PR 3
+    // no producer listener serves before every listener is bound (spec §5.7),
+    // so no producer traffic overlaps it. Under `cargo test` other test
+    // threads create directories without that helper, which is why
+    // weir-server's bin unit tests run with --test-threads=1 — see
+    // CONTRIBUTING.md and docs/security/socket-bind.md.
     //
     // The restore is RAII-guarded so an unwind (or the `?` below) between
     // tightening and restoring cannot leak umask 0o177 process-wide, silently
@@ -791,6 +793,44 @@ pub(crate) fn unknown_socket_refusal(path: &Path, errno: i32) -> io::Error {
         path.display(),
         io::Error::from_raw_os_error(errno)
     ))
+}
+
+/// Fails if something is listening at `path` (spec §5.7, §18). The probe is
+/// the safety floor's connect-only [`probe_socket`]; nothing is unlinked.
+///
+/// `bind_hardened` already refuses a live socket for every caller (through
+/// `remove_stale_socket_at_startup`), with the producer socket's wording. This
+/// helper is for a caller that wants the refusal before the bind, worded for
+/// its own socket: the admin socket (PR 6) passes `what = "admin socket"`.
+/// The producer bind does not call it: that would connect to a live daemon
+/// twice.
+#[cfg(unix)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "PR 6's admin bind is the caller; PR 6 Task 6.14 removes this"
+    )
+)]
+pub(crate) fn refuse_if_live(path: &Path, what: &str) -> io::Result<()> {
+    match probe_socket(path) {
+        SocketProbe::Absent | SocketProbe::Stale => Ok(()),
+        SocketProbe::Live => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another daemon is serving '{}'; refusing to bind the {what} there. Stop \
+                 the other weir-server or choose another path.",
+                path.display()
+            ),
+        )),
+        SocketProbe::Unknown(errno) => Err(io::Error::other(format!(
+            "cannot tell whether the {what} path '{}' is in use: the liveness probe's \
+             connect failed with {} (errno {errno}); refusing to bind. If no weir-server \
+             is using it, remove the file manually and start again.",
+            path.display(),
+            io::Error::from_raw_os_error(errno)
+        ))),
+    }
 }
 
 /// What a connect-only probe says about the socket path.
@@ -2303,5 +2343,69 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             std::fs::remove_file(&path).ok();
         });
+    }
+
+    // ── refuse_if_live and the bind umask window (PR 3 Task 3.8) ─────────────
+
+    #[test]
+    #[cfg(unix)]
+    fn refuse_if_live_refuses_a_live_socket_and_allows_absent_or_stale() {
+        let dir = umask_immune_dir("refuse_if_live");
+        let path = dir.join("admin.sock");
+
+        refuse_if_live(&path, "admin socket").expect("nothing at the path");
+
+        leave_stale_socket(&path);
+        refuse_if_live(&path, "admin socket").expect("a stale socket is not a live daemon");
+        std::fs::remove_file(&path).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let live = UnixListener::bind(&path).unwrap();
+        let err = refuse_if_live(&path, "admin socket").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("another daemon is serving"), "{msg}");
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains("admin socket"), "{msg}");
+        assert!(path.exists(), "refuse_if_live never unlinks");
+        drop(live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pins the corrected comment in `bind_hardened`: under the 0o177 bind
+    /// window a 0o600 file keeps 0o600 (owner rw is not in the mask), and a
+    /// directory from `create_dir_private` keeps 0o700 (it chmods after mkdir).
+    #[test]
+    #[cfg(unix)]
+    fn the_bind_umask_window_leaves_segment_files_and_private_dirs_intact() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("umask_window");
+        let file = dir.join("seg.wab");
+        let sub = dir.join("shard_00");
+        {
+            let _umask = UmaskGuard(umask_set(0o177));
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .open(&file)
+                .unwrap();
+            crate::wab::create_dir_private(sub.clone()).unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
