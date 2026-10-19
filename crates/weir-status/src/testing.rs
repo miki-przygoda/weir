@@ -170,3 +170,88 @@ pub fn serving_evidence(now: u64) -> Evidence {
         }),
     }
 }
+
+/// A latch table where every active condition was first seen at `.0`.
+pub struct FixedLatches(pub u64);
+
+impl SinceLookup for FixedLatches {
+    fn since(&self, _code: ConditionCode) -> Option<u64> {
+        Some(self.0)
+    }
+}
+
+/// `serving_evidence` with every admin-only free-text field populated and
+/// three conditions active (drain_paused, sink_failing, tls_reload_failed),
+/// so the golden document exercises every Option PR 5's sentinel test plants
+/// into. Strings are recognisable, never real secrets.
+pub fn full_evidence(now: u64) -> Evidence {
+    let mut e = serving_evidence(now);
+    let d = e.drain.as_mut().unwrap();
+    d.pause_requested = true;
+    d.paused = true;
+    d.held = true;
+    d.paused_since_unix_ms = Some(now - 30_000);
+    d.paused_by_uid = Some(1000);
+    d.in_flight = Some(InFlightEvidence {
+        segment: SegmentId {
+            shard: 1,
+            counter: 42,
+        },
+        attempt: 2,
+        retries_left: 1,
+        processed_records: 512,
+        next_retry_at_unix_ms: Some(now + 4_000),
+    });
+    d.commit_in_flight_since_unix_ms = Some(now - 500);
+    d.last_requeue = Some(RequeueEvidence {
+        ticket: 3,
+        requeued: 2,
+        already_queued: 1,
+        backoff_cut: true,
+        coalesced: false,
+        scan_error: Some("fixture scan error text".into()),
+        at_unix_ms: now - 10_000,
+    });
+    d.last_panic = Some("fixture panic text".into());
+    d.replay_total = 300;
+    d.replay_remaining = 12;
+    d.pending_segments = 3;
+    d.backlog_segments = 12;
+    let s = e.sink.as_mut().unwrap();
+    s.consecutive_failures = 4;
+    s.last_failure_unix_ms = Some(now - 2_000);
+    s.last_failure_kind = Some(SinkFailureKind::Transient);
+    s.last_error = Some("fixture sink error text".into());
+    s.probe_reason = Some("fixture probe reason text".into());
+    let b = e.backlog.as_mut().unwrap();
+    b.undelivered_segments = 15;
+    b.undelivered_records = 4_096;
+    b.oldest_undelivered_age_secs = Some(120.5);
+    b.dead_letter_bytes = 1_024;
+    let r = e.reload.as_mut().unwrap();
+    r.outcome = ReloadOutcomeCode::Failed;
+    r.tls_last_failed = true;
+    r.items = vec![ReloadItemEvidence {
+        item: ReloadItem::TlsCertificates,
+        outcome: ReloadItemOutcome::Failed,
+        detail: Some("fixture reload detail text".into()),
+    }];
+    let c = e.config.as_mut().unwrap();
+    c.view.insert(
+        "wab_dir".into(),
+        ConfigValue::Str("/var/lib/weir/wab".into()),
+    );
+    c.view.insert(
+        "sink_url".into(),
+        ConfigValue::Str("https://sink.example:443".into()),
+    );
+    c.view
+        .insert("sink_url_path_redacted".into(), ConfigValue::Bool(true));
+    e.queue_depth = Some(7);
+    e.channel = Some(ChannelEvidence {
+        depth: 17,
+        capacity: 256,
+        high_since_unix_ms: None,
+    });
+    e
+}

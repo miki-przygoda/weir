@@ -10,6 +10,7 @@
 pub mod codes;
 pub mod condition;
 pub mod config;
+pub mod doc;
 pub mod evidence;
 mod probe;
 mod rules;
@@ -23,6 +24,7 @@ pub use codes::{
 };
 pub use condition::*;
 pub use config::{ConfigValue, PublicConfig};
+pub use doc::*;
 pub use evidence::*;
 pub use probe::*;
 pub use rules::evaluate;

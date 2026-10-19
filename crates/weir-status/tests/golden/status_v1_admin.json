@@ -1,0 +1,255 @@
+{
+  "admin": {
+    "path": "/var/lib/weir/wab.admin.sock",
+    "protocol": 1,
+    "reason_code": null,
+    "state": "bound",
+    "verbs": [
+      "status",
+      "reload",
+      "drain.pause",
+      "drain.resume",
+      "drain.retry_stranded"
+    ]
+  },
+  "backlog": {
+    "dead_letter_bytes": 1024,
+    "dead_letter_max_bytes": 100000000,
+    "oldest_undelivered_age_secs": 120.5,
+    "quarantine_bytes": 0,
+    "quarantine_files": 0,
+    "scanned_at_ms": 1799999998000,
+    "undelivered_records": 4096,
+    "undelivered_segments": 15
+  },
+  "conditions": [
+    {
+      "affects": "delivery",
+      "code": "drain_paused",
+      "detail": "paused by uid 1000",
+      "evidence": {
+        "held": true,
+        "held_at_record": 512,
+        "in_effect": true,
+        "segment": "shard_01/seg_00000042"
+      },
+      "gates": [],
+      "runbook": "docs/monitoring.md#cond-drain_paused",
+      "severity": "warning",
+      "since_ms": 1799999940000,
+      "summary": "delivery paused since 1799999970000 (held: mid-segment at record 512); ingest keeps buffering; WAB grows; restart also resumes"
+    },
+    {
+      "affects": "delivery",
+      "code": "sink_failing",
+      "detail": "fixture sink error text",
+      "evidence": {
+        "consecutive_failures": 4,
+        "kind": "transient"
+      },
+      "gates": [],
+      "runbook": "docs/monitoring.md#cond-sink_failing",
+      "severity": "warning",
+      "since_ms": 1799999940000,
+      "summary": "4 consecutive commits failed while the probe passes; last kind transient"
+    },
+    {
+      "affects": "ingest",
+      "code": "tls_reload_failed",
+      "detail": "fixture reload detail text",
+      "evidence": {},
+      "gates": [],
+      "runbook": "docs/monitoring.md#cond-tls_reload_failed",
+      "severity": "warning",
+      "since_ms": 1799999940000,
+      "summary": "the last TLS reload failed; previous certificates still served"
+    }
+  ],
+  "config": {
+    "public": {
+      "dead_letter_max_bytes": 100000000,
+      "drain_shutdown_budget_secs": 10,
+      "health_poll_interval_secs": 30,
+      "max_connections": 1024,
+      "peer_uid_check": true,
+      "shard_count": 2,
+      "shutdown_timeout_secs": 30,
+      "sink_max_retries": 3,
+      "sink_timeout_secs": 30,
+      "tls_enabled": false,
+      "wab_max_bytes": 1000000000,
+      "wab_segment_max_age_secs": 0,
+      "wab_segment_max_bytes": 268435456,
+      "wab_segment_max_lifetime_secs": 0,
+      "worker_count": 2
+    },
+    "view": {
+      "dead_letter_max_bytes": 100000000,
+      "drain_shutdown_budget_secs": 10,
+      "health_poll_interval_secs": 30,
+      "max_connections": 1024,
+      "peer_uid_check": true,
+      "shard_count": 2,
+      "shutdown_timeout_secs": 30,
+      "sink_max_retries": 3,
+      "sink_timeout_secs": 30,
+      "sink_type": "http",
+      "sink_url": "https://sink.example:443",
+      "sink_url_path_redacted": true,
+      "tls_enabled": false,
+      "wab_dir": "/var/lib/weir/wab",
+      "wab_max_bytes": 1000000000,
+      "wab_segment_max_age_secs": 0,
+      "wab_segment_max_bytes": 268435456,
+      "wab_segment_max_lifetime_secs": 0,
+      "worker_count": 2
+    }
+  },
+  "drain": {
+    "backlog_segments": 12,
+    "blocked_since_ms": null,
+    "channel_capacity": 256,
+    "channel_depth": 17,
+    "exit": "running",
+    "generation": 1,
+    "heartbeat_age_secs": 1.0,
+    "held": true,
+    "in_flight": {
+      "attempt": 2,
+      "commit_in_flight_since_ms": 1799999999500,
+      "next_retry_at_ms": 1800000004000,
+      "processed_records": 512,
+      "retries_left": 1,
+      "segment": "shard_01/seg_00000042"
+    },
+    "last_panic": "fixture panic text",
+    "last_requeue": {
+      "already_queued": 1,
+      "at_ms": 1799999990000,
+      "backoff_cut": true,
+      "coalesced": false,
+      "requeued": 2,
+      "scan_error": "fixture scan error text",
+      "scan_failed": true,
+      "ticket": 3
+    },
+    "observed_requeue": 0,
+    "pause_requested": true,
+    "paused": true,
+    "paused_by_uid": 1000,
+    "paused_since_ms": 1799999970000,
+    "pending_segments": 3,
+    "state": "draining",
+    "state_since_ms": 1799999410000
+  },
+  "generated_at_ms": 1800000000000,
+  "ingest": {
+    "listeners": [
+      {
+        "kind": "unix",
+        "state": "bound"
+      }
+    ],
+    "queue_depth": 7,
+    "wab_cap": {
+      "bytes_now": 10000,
+      "last_scan_ok_ms": 1799999998000,
+      "low_water_bytes": 900000000,
+      "max_bytes": 1000000000,
+      "rejecting": false
+    }
+  },
+  "instance": {
+    "socket_path": "/run/weir/weir.sock",
+    "wab_dir": "/var/lib/weir/wab",
+    "wab_dir_dev": 66306,
+    "wab_dir_ino": 1048577
+  },
+  "lifecycle": {
+    "drain_deadline_ms": null,
+    "forced": false,
+    "shutting_down": false,
+    "shutting_down_since_ms": null
+  },
+  "pid": 4242,
+  "reload": {
+    "last": {
+      "at_ms": 1799999700000,
+      "items": [
+        {
+          "detail": "fixture reload detail text",
+          "item": "tls_certificates",
+          "outcome": "failed"
+        }
+      ],
+      "not_reloaded": [
+        {
+          "item": "config_file",
+          "reason_code": "restart_required"
+        }
+      ],
+      "outcome": "failed",
+      "trigger": "sighup"
+    }
+  },
+  "schema": "weir.status/v1",
+  "shards": [
+    {
+      "active_segment_age_secs": 12.0,
+      "handoff_blocked_since_ms": null,
+      "id": 0,
+      "reason": null,
+      "respawns": 0,
+      "since_ms": 1799999410000,
+      "state": "up",
+      "worker_running": true
+    },
+    {
+      "active_segment_age_secs": 12.0,
+      "handoff_blocked_since_ms": null,
+      "id": 1,
+      "reason": null,
+      "respawns": 0,
+      "since_ms": 1799999410000,
+      "state": "up",
+      "worker_running": true
+    }
+  ],
+  "sink": {
+    "consecutive_failures": 4,
+    "health": "healthy",
+    "health_since_ms": 1799999410000,
+    "last_failure": {
+      "at_ms": 1799999998000,
+      "kind": "transient",
+      "message": "fixture sink error text"
+    },
+    "last_success_ms": 1799999999000,
+    "probe_reason": "fixture probe reason text",
+    "type": "http"
+  },
+  "started_at_ms": 1799999400000,
+  "startup": {
+    "phase": "serving",
+    "phase_since_ms": 1799999410000,
+    "replay": {
+      "remaining": 12,
+      "total": 300
+    }
+  },
+  "unevaluated": [],
+  "uptime_secs": 600.0,
+  "verdict": {
+    "live": true,
+    "liveness_failing": [],
+    "livez_checks": [
+      "no_live_shard"
+    ],
+    "readiness_failing": [],
+    "ready": true,
+    "startup_complete": true
+  },
+  "version": "4.1.0",
+  "view": "admin",
+  "wire_version": 1
+}
