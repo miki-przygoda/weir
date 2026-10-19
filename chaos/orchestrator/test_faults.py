@@ -336,6 +336,52 @@ class TestDoubleSigterm(unittest.TestCase):
         self.assertEqual(r["anomaly_reasons"], [])
 
 
+class TestSigtermInRecovery(unittest.TestCase):
+    STEP = {"recovery_delay_ms": 3000, "cut_after_secs": 1.0}
+    R = faults.RECOVERING_SERIES
+
+    def test_kill_then_spawn_with_hooks_then_signal_inside_recovery_then_cut(self):
+        ops = FakeOps(scrapes=[OSError("refused"), {self.R: 0.0}, {self.R: 1.0}],
+                      on_signal=exits_after(0.5), log=b"recovery complete\n")
+        r = faults.run_trigger("sigterm_in_recovery", self.STEP, ops)
+        self.assertEqual(ops.names(),
+                         ["kill", "spawn", "scrape", "scrape", "scrape", "signal", "cut"])
+        self.assertEqual(ops.calls[1][1], {"WEIR_TEST_HOOKS": "1",
+                                           "WEIR_TEST_STARTUP_DELAY_MS": "3000"})
+        self.assertTrue(r["recovery_phase_observed"])
+        self.assertFalse(r["served"])
+        self.assertEqual(r["exit_code"], 0)
+        self.assertEqual(r["anomaly_reasons"], [])
+
+    def test_serving_after_a_pre_serving_signal_is_an_anomaly(self):
+        ops = FakeOps(scrapes=[{self.R: 1.0}], on_signal=exits_after(0.5),
+                      log=b"weir serving elapsed=3.1s\n")
+        r = faults.run_trigger("sigterm_in_recovery", self.STEP, ops)
+        self.assertIn("served_after_pre_serving_signal", r["anomaly_reasons"])
+
+    def test_a_producer_socket_left_after_the_exit_is_an_anomaly(self):
+        ops = FakeOps(scrapes=[{self.R: 1.0}], on_signal=exits_after(0.5),
+                      socket_left=True)
+        r = faults.run_trigger("sigterm_in_recovery", self.STEP, ops)
+        self.assertIn("producer_socket_left_after_pre_serving_exit", r["anomaly_reasons"])
+
+    def test_never_seeing_recovering_is_an_anomaly_not_a_silent_pass(self):
+        # e.g. the binary was built without --features test-hooks.
+        ops = FakeOps(scrapes=[{self.R: 0.0}], on_signal=exits_after(0.5))
+        r = faults.run_trigger("sigterm_in_recovery", self.STEP, ops)
+        self.assertFalse(r["recovery_phase_observed"])
+        self.assertIn("recovery_phase_not_observed", r["anomaly_reasons"])
+        self.assertEqual(ops.names()[-2:], ["signal", "cut"], "it still cuts")
+
+    def test_a_cut_while_recovery_still_runs_is_during_shutdown(self):
+        ops = FakeOps(scrapes=[{self.R: 1.0}])
+        r = faults.run_trigger("sigterm_in_recovery", self.STEP, ops)
+        self.assertEqual(r["cut_phase"], "during_shutdown")
+        self.assertIsNone(r["producer_socket_left"])
+        self.assertEqual(r["anomaly_reasons"], [],
+                         "recovery has no bound of its own, so alive is not an anomaly")
+
+
 class TestDaemonLogContract(unittest.TestCase):
     """The triggers judge weir by two log lines, two env vars and two series
     that PR 1, PR 2 and PR 4 introduce. Pin them against the source so a

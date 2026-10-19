@@ -345,9 +345,63 @@ def _double_sigterm(step, ops):
     return result
 
 
+RECOVERY_PHASE_TIMEOUT_SECS = 10.0
+SERIES_POLL_SECS = 0.05
+
+
+def _wait_for_series(ops, series, timeout_secs):
+    deadline = ops.now() + timeout_secs
+    while ops.now() < deadline:
+        try:
+            if ops.scrape().get(series) == 1.0:
+                return True
+        except Exception:
+            pass  # the metrics listener binds at startup step 5; early polls fail
+        ops.sleep(min(SERIES_POLL_SECS, max(0.0, deadline - ops.now())))
+    return False
+
+
+def _sigterm_in_recovery(step, ops):
+    """SIGKILL (so recovery has work), restart held in `recovering` by the
+    test-hooks delay, SIGTERM inside recovery, then cut. spec §6: recovery is
+    never interrupted, steps 11-12 are skipped, exit 0, no producer socket."""
+    delay_ms = step["recovery_delay_ms"]
+    result = {"trigger": "sigterm_in_recovery", "recovery_delay_ms": delay_ms,
+              "cut_after_secs": round(step["cut_after_secs"], 3)}
+    ops.kill_daemon()
+    ops.spawn_daemon({TEST_HOOK_ENV[0]: "1", TEST_HOOK_ENV[1]: str(delay_ms)})
+    observed = _wait_for_series(
+        ops, RECOVERING_SERIES, delay_ms / 1000.0 + RECOVERY_PHASE_TIMEOUT_SECS)
+    t0 = ops.now()
+    sent = ops.signal_daemon(signal.SIGTERM)
+    code, exited_at = _watch_until(ops, t0 + step["cut_after_secs"])
+    served = SERVING_LOG_LINE in ops.daemon_log_since_spawn()
+    socket_left = ops.producer_socket_exists() if code is not None else None
+    result.update(recovery_phase_observed=observed, signal_sent=sent,
+                  served=served, producer_socket_left=socket_left,
+                  cut_phase=_cut_phase(code))
+    result.update(_exit_fields(code, exited_at, t0))
+    result["canary"] = ops.cut()
+    reasons = []
+    if not observed:
+        reasons.append("recovery_phase_not_observed")
+    if not sent:
+        reasons.append("daemon_dead_before_signal")
+    else:
+        if observed and served:
+            reasons.append("served_after_pre_serving_signal")
+        if code is not None and code != 0:
+            reasons.append(f"daemon_exit_code={code}")
+    if socket_left:
+        reasons.append("producer_socket_left_after_pre_serving_exit")
+    result["anomaly_reasons"] = reasons
+    return result
+
+
 def run_trigger(kind, step, ops):
     """Runs one lifecycle trigger and the cut that ends it. Returns its record."""
-    handlers = {"sigterm_at": _sigterm_at, "double_sigterm": _double_sigterm}
+    handlers = {"sigterm_at": _sigterm_at, "double_sigterm": _double_sigterm,
+                "sigterm_in_recovery": _sigterm_in_recovery}
     handler = handlers.get(kind)
     if handler is None:
         raise ValueError(f"not a lifecycle trigger: {kind!r}")
