@@ -321,6 +321,65 @@ pub enum HttpDropReason {
     probe_pool_full,
 }
 
+/// Labels for `weir_admin_requests_total` (Foundations spec §11).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AdminRequestLabel {
+    pub verb: AdminVerbLabel,
+    pub outcome: AdminOutcomeLabel,
+}
+
+/// The admin verb, spelled exactly as on the wire, plus `_connect` (a
+/// connection refused before any request) and `_invalid` (a line that is
+/// not a valid request). Hand-encoded because the wire spellings contain
+/// dots, which a derived `EncodeLabelValue` cannot produce.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum AdminVerbLabel {
+    Status,
+    Reload,
+    DrainPause,
+    DrainResume,
+    DrainRetryStranded,
+    Connect,
+    Invalid,
+}
+
+impl AdminVerbLabel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdminVerbLabel::Status => "status",
+            AdminVerbLabel::Reload => "reload",
+            AdminVerbLabel::DrainPause => "drain.pause",
+            AdminVerbLabel::DrainResume => "drain.resume",
+            AdminVerbLabel::DrainRetryStranded => "drain.retry_stranded",
+            AdminVerbLabel::Connect => "_connect",
+            AdminVerbLabel::Invalid => "_invalid",
+        }
+    }
+}
+
+impl EncodeLabelValue for AdminVerbLabel {
+    fn encode(
+        &self,
+        encoder: &mut prometheus_client::encoding::LabelValueEncoder,
+    ) -> Result<(), std::fmt::Error> {
+        use std::fmt::Write;
+        encoder.write_str(self.as_str())
+    }
+}
+
+/// `ok` (the verb answered `ok:true`), `error` (an error response; the exact
+/// error code is in the daemon log), `refused` (`_connect`: the peer is
+/// neither the daemon's uid nor root, or has no credentials), `busy`
+/// (`_connect`: the 4-connection cap).
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum AdminOutcomeLabel {
+    ok,
+    error,
+    refused,
+    busy,
+}
+
 // ── Foundations: status, lifecycle and conditions (spec §13) ────────────────
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -719,6 +778,26 @@ pub(crate) struct Metrics {
     /// metrics/health listener closed without a response, by reason. All four
     /// reasons are pre-created at 0; the router's pools increment them.
     pub http_requests_dropped: Family<HttpDroppedLabel, Counter<u64, AtomicU64>>,
+
+    // ── Admin socket (Foundations spec §11) ───────────────────────────────────
+    /// `weir_admin_requests_total{verb,outcome}`.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read by the admin module (Tasks 6.12/6.13); Task 6.14 removes this"
+        )
+    )]
+    pub admin_requests: Family<AdminRequestLabel, Counter<u64, AtomicU64>>,
+    /// 1 while the admin socket is bound and served, else 0.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read by the admin module (Tasks 6.12/6.13); Task 6.14 removes this"
+        )
+    )]
+    pub admin_socket_up: Gauge<f64, AtomicU64>,
 
     // ── Drain ledger (safety floor, spec §4.0) ────────────────────────────────
     /// Segments set aside after exhausting `max_retries` on a LOCAL I/O failure,
@@ -1149,8 +1228,9 @@ impl Metrics {
         let config_reloads = reg!(
             Family::<ConfigReloadLabel, Counter<u64, AtomicU64>>::default(),
             "weir_config_reloads",
-            "Config reload requests, by trigger (sighup; admin is reserved) and outcome: ok \
-             (something was reloaded), failed (a reload was attempted and rejected; the \
+            "Config reload requests, by trigger (sighup, or admin for the admin socket's reload \
+             verb) and outcome: ok (something was reloaded), failed (a reload was attempted \
+             and rejected; the \
              previous config stays in force), noop (nothing reloadable: the config is read \
              once at startup, and only TLS material reloads), dropped (the reload queue was \
              full, as in a SIGHUP flood, so the request never ran)"
@@ -1165,6 +1245,44 @@ impl Metrics {
              head slots busy), metrics_pool_full (more concurrent scrapes than \
              metrics_max_connections), probe_pool_full (more than 4 concurrent /livez, \
              /readyz, /startupz or /status requests)"
+        );
+
+        // ── Admin socket (Foundations spec §11) ───────────────────────────────
+        let admin_requests = reg!(
+            Family::<AdminRequestLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_admin_requests",
+            "Admin socket requests, by verb (status, reload, drain.pause, drain.resume, \
+             drain.retry_stranded; _connect for a connection refused before any request; \
+             _invalid for a line that is not a valid request) and outcome (ok, error, \
+             refused, busy)"
+        );
+        // The 13 meaningful series exist from the first scrape (spec §13).
+        for verb in [
+            AdminVerbLabel::Status,
+            AdminVerbLabel::Reload,
+            AdminVerbLabel::DrainPause,
+            AdminVerbLabel::DrainResume,
+            AdminVerbLabel::DrainRetryStranded,
+        ] {
+            for outcome in [AdminOutcomeLabel::ok, AdminOutcomeLabel::error] {
+                let _ = admin_requests.get_or_create(&AdminRequestLabel { verb, outcome });
+            }
+        }
+        for outcome in [AdminOutcomeLabel::refused, AdminOutcomeLabel::busy] {
+            let _ = admin_requests.get_or_create(&AdminRequestLabel {
+                verb: AdminVerbLabel::Connect,
+                outcome,
+            });
+        }
+        let _ = admin_requests.get_or_create(&AdminRequestLabel {
+            verb: AdminVerbLabel::Invalid,
+            outcome: AdminOutcomeLabel::error,
+        });
+        let admin_socket_up = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_admin_socket_up",
+            "1 while the admin Unix socket is bound and served; 0 when it is disabled, \
+             unavailable, or closed at exit"
         );
 
         // ── Drain ledger (safety floor, spec §4.0) ───────────────────────────
@@ -1498,6 +1616,8 @@ impl Metrics {
             wab_dir_lock_integrity_failures,
             config_reloads,
             http_requests_dropped,
+            admin_requests,
+            admin_socket_up,
             drain_local_io_strands,
             drain_segments_parked,
             drain_segments_disposition_pending,
@@ -1956,6 +2076,9 @@ mod tests {
             "weir_drain_shutdown_deadline_seconds",
             // Metrics / health listener (Foundations PR 5)
             "weir_http_requests_dropped",
+            // Foundations PR 6 (admin socket)
+            "weir_admin_requests",
+            "weir_admin_socket_up",
         ];
         if cfg!(feature = "bench-trace") {
             expected.extend([
@@ -2227,6 +2350,46 @@ mod tests {
         assert!(
             encode_to_string(&reg)
                 .contains("weir_http_requests_dropped_total{reason=\"head_timeout\"} 1")
+        );
+    }
+
+    /// spec §11/§13: the verb label is bounded and spelled exactly as on the
+    /// wire, and every meaningful series exists from the first scrape.
+    #[test]
+    fn admin_series_are_pre_created_with_wire_verb_names() {
+        let (m, reg) = Metrics::new();
+        let out = encode_to_string(&reg);
+        for verb in [
+            "status",
+            "reload",
+            "drain.pause",
+            "drain.resume",
+            "drain.retry_stranded",
+        ] {
+            for outcome in ["ok", "error"] {
+                let s =
+                    format!("weir_admin_requests_total{{verb=\"{verb}\",outcome=\"{outcome}\"}} 0");
+                assert!(out.contains(&s), "missing {s}\n{out}");
+            }
+        }
+        for s in [
+            "weir_admin_requests_total{verb=\"_connect\",outcome=\"refused\"} 0",
+            "weir_admin_requests_total{verb=\"_connect\",outcome=\"busy\"} 0",
+            "weir_admin_requests_total{verb=\"_invalid\",outcome=\"error\"} 0",
+            "weir_admin_socket_up 0",
+        ] {
+            assert!(out.contains(s), "missing {s}\n{out}");
+        }
+        m.admin_socket_up.set(1.0);
+        assert!(encode_to_string(&reg).contains("weir_admin_socket_up 1"));
+        let ok_status = AdminRequestLabel {
+            verb: AdminVerbLabel::Status,
+            outcome: AdminOutcomeLabel::ok,
+        };
+        m.admin_requests.get_or_create(&ok_status).inc();
+        assert!(
+            encode_to_string(&reg)
+                .contains("weir_admin_requests_total{verb=\"status\",outcome=\"ok\"} 1")
         );
     }
 }
