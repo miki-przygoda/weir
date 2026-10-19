@@ -10,6 +10,7 @@
 //! appends it automatically in the text output. All names in this file match the
 //! plan's metric names after that suffix is accounted for.
 
+pub(crate) mod router;
 pub(crate) mod server;
 
 use prometheus_client::{
