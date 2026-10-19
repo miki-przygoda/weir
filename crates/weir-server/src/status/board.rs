@@ -102,7 +102,6 @@ impl LifecycleCell {
         true
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // PR 4 (second signal) writes this
     pub(crate) fn mark_forced(&self) {
         self.forced.store(true, Ordering::Relaxed);
     }
@@ -127,7 +126,6 @@ impl LifecycleCell {
         self.ever_served.load(Ordering::Acquire)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // PR 4 (T2 request_stop) writes this
     pub(crate) fn set_drain_deadline(&self, deadline_unix_ms: u64, budget_secs: u64) {
         self.drain_budget_secs.store(budget_secs, Ordering::Relaxed);
         self.drain_deadline_ms

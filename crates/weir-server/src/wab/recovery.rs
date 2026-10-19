@@ -678,7 +678,7 @@ pub(crate) fn recover_segment(
     // `quarantined` (the preserved forensic copy) and `sealed` (the truncated
     // prefix, which the drain will confirm) — both transitions really happened.
     //
-    // Not double-counted anywhere: `replay_unconfirmed` only *queues* pre-existing
+    // Not double-counted anywhere: `scan_replay` only *lists* pre-existing
     // .wab.sealed files, which were counted by whichever process sealed them; a
     // replay is not a transition, so it must not bump this counter. Idempotency:
     // recovery runs once per process (wab::recover) and only ever sees unsealed
@@ -1057,7 +1057,7 @@ mod tests {
 
     /// W1. A `.wab.sealed` left by a previous process was already counted as
     /// sealed by whichever process sealed it. Startup must NOT re-count it: the
-    /// replay path (`wab::replay_unconfirmed`) only *queues* it for the drain, and
+    /// replay path (`wab::scan_replay`) only *lists* it for the drain, and
     /// `recover_open_segments` only touches unsealed `.wab` files. Exactly one
     /// sealed transition is counted here — for the active segment recovery
     /// actually seals.

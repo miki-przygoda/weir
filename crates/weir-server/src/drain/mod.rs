@@ -402,9 +402,11 @@ enum DeadLetterFailure {
 // ── Public interface ──────────────────────────────────────────────────────────
 
 /// Spawns the supervised drain thread. The handle yields how the drain ended
-/// ([`DrainExit`]). A Detached drain (today's production wiring) ends once the
-/// `drain_rx` channel closes (all WAB flusher threads have exited) and every
-/// queued segment has been processed or explicitly abandoned.
+/// ([`DrainExit`]). An Attached drain (production since PR 4) ends only on
+/// `request_stop` / `force_stop`: a closed `drain_rx` (every WAB flusher gone)
+/// is a non-event, and it keeps delivering the on-disk backlog. A Detached
+/// drain (tests) ends once `drain_rx` closes and every queued segment has been
+/// processed or explicitly abandoned.
 pub(crate) fn spawn_with<S: Sink + 'static>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,

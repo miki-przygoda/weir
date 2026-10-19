@@ -1024,10 +1024,70 @@ already be on disk).
 **When to tune**: deployments with long-running batched producers
 should raise this to match their batch flush interval. Container
 orchestrators usually have their own termination-grace setting
-(Kubernetes `terminationGracePeriodSeconds`, ECS `stopTimeout`) —
-weir's `shutdown_timeout_secs` should be set ≤ the orchestrator
-grace minus a few seconds, so the daemon's own cleanup finishes
-before the orchestrator SIGKILLs.
+(Kubernetes `terminationGracePeriodSeconds`, ECS `stopTimeout`). See
+[Shutdown grace period](#shutdown-grace-period) below for the
+orchestrator grace this implies.
+
+#### `drain_shutdown_budget_secs`
+
+- **Type**: u64 (seconds)
+- **Default**: `10`
+- **Range**: 0-3600
+- **CLI**: `--drain-shutdown-budget-secs <n>`
+- **Env**: `WEIR_DRAIN_SHUTDOWN_BUDGET_SECS`
+- **TOML**: `drain_shutdown_budget_secs`
+
+How long the drain keeps delivering after SIGTERM, counted from the moment
+every flusher has sealed and handed off its last segment. At the deadline the
+drain abandons the segment it is delivering (no `.confirmed` is written) and
+exits; that segment and every segment still queued stay sealed and unconfirmed
+on disk and are delivered by the next start. `0` abandons at once.
+
+**Effect**: shutdown no longer waits for the whole backlog. A sink that is slow
+or down cannot hold `systemctl stop` or a pod termination hostage. The cost is
+at-least-once re-delivery of the abandoned segment's committed prefix on the
+next start (see "Shutdown grace period" below).
+
+**When to tune**: raise it (up to 3600) to drain more on a planned stop; to
+decommission a host, wait for `weir_wab_undelivered_segments == 0` first
+rather than relying on the budget. Whatever you choose, keep the
+orchestrator grace at `shutdown_timeout_secs + drain_shutdown_budget_secs + 5`.
+
+#### Shutdown grace period
+
+SIGTERM (or SIGINT) runs a bounded sequence:
+
+1. **Lame duck, at once.** The producer socket is unlinked and the TCP listener
+   closed, so new connects fail fast; open connections finish the frame they
+   are on.
+2. **Connection drain**, at most `shutdown_timeout_secs`.
+3. **Seal.** Workers and flushers join; every flusher seals, fsyncs and hands
+   off its active segment. If the drain is stuck, a flusher gives its hand-off
+   at most 1 s; that segment is durable and replays on the next start.
+4. **Drain budget**, at most `drain_shutdown_budget_secs`, then the in-flight
+   segment is abandoned without a `.confirmed`.
+5. **Exit 0**, with one log line naming how many segments are left for replay.
+
+A **second** SIGTERM at any point forces: open connections are aborted and the
+drain deadline becomes "now". The seal (step 3) still runs, so no acked record
+is lost. A third signal only logs. Exit status is 0 in every case.
+
+**Grace period.** Give the orchestrator at least
+`shutdown_timeout_secs + drain_shutdown_budget_secs + 5` seconds: **45 s** at
+the defaults (30 + 10 + 5). systemd `TimeoutStopSec=45`, compose
+`stop_grace_period: 45s`, Kubernetes `terminationGracePeriodSeconds: 45`.
+
+**Duplicates.** For the one segment abandoned at the deadline (at most one per
+shutdown, forced or not): its committed prefix is re-delivered on replay; a
+commit cancelled at the deadline may already have been applied by the sink;
+and records the sink rejected permanently in that prefix are dead-lettered
+again, counting against `dead_letter_max_bytes`. A segment a flusher did not
+hand off was never started and adds no duplicates. This is the same window as
+a crash.
+
+**Decommissioning** a host: stop the producers, wait for
+`weir_wab_undelivered_segments` to reach 0, then stop the daemon; or raise
+`drain_shutdown_budget_secs` for that one stop.
 
 ---
 
@@ -2341,7 +2401,8 @@ max_payload_bytes = 1048576  # 1 MiB
 # Metrics on a non-standard port to avoid colliding with node_exporter.
 metrics_port = 9186
 
-# Long-running batch producers; match the orchestrator's grace period (45s).
+# Long-running batch producers. The orchestrator's grace must then be at least
+# 40 + drain_shutdown_budget_secs (10) + 5 = 55s.
 shutdown_timeout_secs = 40
 
 # Bigger dead-letter cap; operator response loop can be 30+ minutes.
@@ -2520,7 +2581,8 @@ failures.
 - **No hot reload (except TLS material)**: config is read once at startup.
   SIGHUP reloads **TLS cert/key/CA only** — all other configuration changes
   require a daemon restart. SIGHUP never terminates the daemon: it is ignored
-  during recovery and the startup replay, and on a daemon with nothing to reload (no
+  only before the runtime starts (configuration load, lock and preflight); from
+  before WAB recovery onward it is served, and on a daemon with nothing to reload (no
   `tcp_bind`, or a build without `tls`) it logs `SIGHUP received: nothing
   reloadable in this build/config (config is read once at startup); nothing
   changed` and counts `weir_config_reloads_total{trigger="sighup",outcome="noop"}`.

@@ -47,6 +47,8 @@ OPTIONS:
     --peer-uid-check <bool>                  Refuse connections from uids other
                                                than the daemon's [default: true]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
+    --drain-shutdown-budget-secs <secs>      Drain delivery budget after SIGTERM, once
+                                               ingest is sealed (0-3600) [default: 10]
     --sink-type <type>                       Sink: noop | http | mysql | postgres |
                                                clickhouse [default: noop]
     --sink-url <url>                         Sink URL (required for http/mysql/postgres/
@@ -206,6 +208,9 @@ pub(super) fn parse_from(
         peer_uid_check: opt_bool(&mut pargs, "--peer-uid-check")?,
         shutdown_timeout_secs: pargs
             .opt_value_from_str("--shutdown-timeout-secs")
+            .map_err(pico_err)?,
+        drain_shutdown_budget_secs: pargs
+            .opt_value_from_str("--drain-shutdown-budget-secs")
             .map_err(pico_err)?,
         connection_read_timeout_secs: pargs
             .opt_value_from_str("--connection-read-timeout-secs")
@@ -505,5 +510,15 @@ mod tests {
                 "{flag} names an unknown feature {feature}"
             );
         }
+    }
+
+    #[test]
+    fn drain_shutdown_budget_flag_is_parsed() {
+        let (partial, _) = parse_from(args(&["--drain-shutdown-budget-secs", "42"])).unwrap();
+        assert_eq!(partial.drain_shutdown_budget_secs, Some(42));
+        assert!(
+            HELP.contains("--drain-shutdown-budget-secs"),
+            "the flag must be in --help"
+        );
     }
 }

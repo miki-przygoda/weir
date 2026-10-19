@@ -226,8 +226,8 @@ Neither is published yet.
 For a non-container host, a ready-to-adapt hardened unit ships in
 [`deploy/systemd/`](https://github.com/miki-przygoda/weir/tree/main/deploy/systemd):
 
-- `weir.service` — graceful-shutdown wiring (`TimeoutStopSec` aligned to the
-  daemon's `shutdown_timeout_secs`), `RuntimeDirectory`/`StateDirectory` for the
+- `weir.service` — graceful-shutdown wiring (`TimeoutStopSec=45`, covering the
+  daemon's `shutdown_timeout_secs + drain_shutdown_budget_secs + 5`), `RuntimeDirectory`/`StateDirectory` for the
   socket and WAB dirs, an `ExecStartPre` that creates the `wab/` subdir (the
   daemon refuses to start if `wab_dir` is missing), resource limits, and the
   sandbox the [threat model](../security/threat-model.md) recommends.

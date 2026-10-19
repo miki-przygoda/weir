@@ -26,9 +26,12 @@ dst = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.
 tls = ["dep:tokio-rustls", "dep:rustls-pki-types", "dep:rustls"]
-# Test-only fault hooks for the system tests (spec §16). Compiled in only with
-# this feature, and active only when WEIR_TEST_HOOKS=1 is also set; a build
-# with it logs a loud WARN at startup. Never enable it for a production build.
+# System-test fault hooks (Foundations §16): a startup delay inside the
+# recovering phase and a forced segment-counter-scan failure. Compiled only
+# with this feature AND inert unless WEIR_TEST_HOOKS=1 is set at runtime; the
+# release workflow and the Dockerfile build `--features tls` only. CI's
+# `--all-features` test line runs the `#[cfg(feature = "test-hooks")]` tests.
+# A build with it logs a loud WARN at startup.
 test-hooks = []
 
 [package]

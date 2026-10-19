@@ -30,6 +30,7 @@ const CONFIGURATION: &str = include_str!("../../../docs/operations/configuration
 const CONFIG_EXAMPLE: &str = include_str!("../../../deploy/docker/weir.toml.example");
 const CONFIG_ENV_SRC: &str = include_str!("../src/config/env.rs");
 const CONFIG_CLI_SRC: &str = include_str!("../src/config/cli.rs");
+const CI_YML: &str = include_str!("../../../.github/workflows/ci.yml");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -824,6 +825,55 @@ fn the_wab_dir_lock_key_is_in_the_configuration_reference() {
     }
 }
 
+/// The bounded-shutdown budget (Foundations §7) is an operator-facing knob
+/// whose default decides how much a SIGTERM delivers; it must be findable in
+/// the reference and in the example that claims to list every option.
+#[test]
+fn the_drain_shutdown_budget_key_is_in_the_configuration_reference() {
+    assert!(
+        CONFIG_ENV_SRC.contains("\"WEIR_DRAIN_SHUTDOWN_BUDGET_SECS\""),
+        "src/config/env.rs no longer reads WEIR_DRAIN_SHUTDOWN_BUDGET_SECS; update \n\
+         this guard and the docs to the new spelling"
+    );
+    assert!(
+        CONFIG_CLI_SRC.contains("\"--drain-shutdown-budget-secs\""),
+        "src/config/cli.rs no longer parses --drain-shutdown-budget-secs"
+    );
+    // Scoped to the entry's own section: "**Default**: `10`" also appears
+    // under two other keys, so a whole-file search would stay green with
+    // this entry's default deleted.
+    let entry = CONFIGURATION
+        .split("#### `drain_shutdown_budget_secs`")
+        .nth(1)
+        .expect(
+            "docs/operations/configuration.md must have a #### `drain_shutdown_budget_secs` entry",
+        )
+        .split("\n#### ")
+        .next()
+        .unwrap();
+    for needle in [
+        "**Default**: `10`",
+        "**Range**: 0-3600",
+        "`WEIR_DRAIN_SHUTDOWN_BUDGET_SECS`",
+        "`--drain-shutdown-budget-secs",
+    ] {
+        assert!(
+            entry.contains(needle),
+            "the drain_shutdown_budget_secs entry is missing {needle:?}"
+        );
+    }
+    for needle in [
+        "drain_shutdown_budget_secs",
+        "WEIR_DRAIN_SHUTDOWN_BUDGET_SECS",
+    ] {
+        assert!(
+            CONFIG_EXAMPLE.contains(needle),
+            "deploy/docker/weir.toml.example claims to list every option; it is \n\
+             missing {needle:?}"
+        );
+    }
+}
+
 /// `test-hooks` system tests compile only under that feature. The CI line that
 /// runs the system tests with `--all-features` is what keeps them from being
 /// silently skipped forever (spec §16 "a drift guard asserts the
@@ -835,7 +885,7 @@ fn the_test_hooks_system_tests_run_in_ci() {
         cargo.contains("\ntest-hooks = []"),
         "the test-hooks feature is gone from Cargo.toml"
     );
-    let ci = include_str!("../../../.github/workflows/ci.yml");
+    let ci = CI_YML;
     assert!(
         ci.lines().any(|l| l.contains("cargo test -p weir-server")
             && l.contains("--test system")
@@ -843,4 +893,99 @@ fn the_test_hooks_system_tests_run_in_ci() {
         "no CI line runs tests/system.rs with --all-features, so every \
          #[cfg(feature = \"test-hooks\")] system test is skipped"
     );
+    // And no release build may carry the hooks (Foundations §16).
+    assert!(
+        !RELEASE_YML.contains("test-hooks") && !RELEASE_YML.contains("--all-features"),
+        "the release workflow must never build weir-server with the test hooks"
+    );
+}
+
+const ARCHITECTURE: &str = include_str!("../../../docs/architecture.md");
+
+/// The startup order in architecture.md names the six lifecycle phases in the
+/// order the daemon publishes them (Foundations §6), and no longer claims the
+/// metrics endpoint binds after recovery.
+#[test]
+fn the_startup_order_doc_lists_the_phases_in_order() {
+    let section = ARCHITECTURE
+        .split("### Startup order")
+        .nth(1)
+        .and_then(|s| s.split("\n## ").next())
+        .expect("docs/architecture.md must keep a `### Startup order` section");
+    let mut at = 0;
+    for phase in [
+        "initializing",
+        "recovering",
+        "handoff",
+        "binding",
+        "serving",
+        "shutting_down",
+    ] {
+        // Anchored on the diagram's arrow: the bare word also occurs in prose
+        // ("something binding in between"), which let a swapped diagram pass.
+        let step = format!("→ {phase}");
+        let pos = section[at..].find(&step).unwrap_or_else(|| {
+            panic!("`### Startup order` must name phase `{phase}` after the previous one")
+        });
+        at += pos + step.len();
+    }
+    assert!(
+        !section.contains("replay of sealed-but-unconfirmed segments into the drain channel"),
+        "the blocking replay is gone; the replay list is handed to the drain in memory"
+    );
+    assert!(
+        !ARCHITECTURE.contains("CancellationToken"),
+        "the socket layer takes a watch<ShutdownLevel>, not a CancellationToken"
+    );
+}
+
+const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/weir.service");
+const SYSTEMD_README: &str = include_str!("../../../deploy/systemd/README.md");
+const COMPOSE: &str = include_str!("../../../deploy/docker/docker-compose.yml");
+
+/// `[default: N]` from the CLI help line naming `flag`.
+fn help_default(flag: &str) -> u64 {
+    let line = CONFIG_CLI_SRC
+        .lines()
+        .skip_while(|l| !l.contains(flag))
+        .take(3)
+        .collect::<String>();
+    line.split("[default: ")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no `[default: N]` for {flag} in src/config/cli.rs HELP"))
+}
+
+/// Foundations §7: the orchestrator grace must be at least
+/// shutdown_timeout_secs + drain_shutdown_budget_secs + 5, derived here from
+/// the defaults the binary actually ships, and stated identically in every
+/// deploy file and doc that states it.
+#[test]
+fn the_shutdown_grace_follows_the_shutdown_bound_everywhere() {
+    let grace =
+        help_default("--shutdown-timeout-secs") + help_default("--drain-shutdown-budget-secs") + 5;
+    assert!(
+        SYSTEMD_UNIT
+            .lines()
+            .any(|l| l.trim() == format!("TimeoutStopSec={grace}")),
+        "deploy/systemd/weir.service must set TimeoutStopSec={grace}"
+    );
+    assert!(
+        COMPOSE.contains(&format!("stop_grace_period: {grace}s")),
+        "deploy/docker/docker-compose.yml must set stop_grace_period: {grace}s"
+    );
+    for (name, doc) in [
+        ("configuration.md", CONFIGURATION),
+        ("deploy/systemd/README.md", SYSTEMD_README),
+    ] {
+        assert!(
+            doc.contains("shutdown_timeout_secs + drain_shutdown_budget_secs + 5"),
+            "{name} must state the grace formula"
+        );
+        assert!(
+            doc.contains(&format!("{grace} s")) || doc.contains(&format!("**{grace}**")),
+            "{name} must state the resulting grace ({grace} s)"
+        );
+    }
 }

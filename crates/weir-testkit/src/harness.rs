@@ -178,6 +178,41 @@ impl WeirServer {
         }
     }
 
+    /// Sends `sig` to the daemon and returns at once (unlike
+    /// [`sigterm`](Self::sigterm), which waits for the exit). For tests that
+    /// act on the daemon WHILE it shuts down: a second signal, a scrape
+    /// during the drain budget, a lame-duck check.
+    #[cfg(unix)]
+    pub fn signal(&self, sig: i32) {
+        let pid = self.child_pid();
+        // SAFETY: kill(2) on our own child, which has not been reaped (the
+        // handle still owns it, so the pid cannot have been reused).
+        let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+        assert_eq!(
+            rc,
+            0,
+            "kill -{sig} {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Like [`scrape_metrics`](Self::scrape_metrics), but `None` instead of a
+    /// panic when the endpoint is not (or no longer) reachable, with a 2 s
+    /// I/O bound. For polling during startup and shutdown.
+    pub fn try_scrape_metrics(&self) -> Option<String> {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        let addr = SocketAddr::from(([127, 0, 0, 1], self.metrics_port));
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        s.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+        s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").ok()?;
+        let mut response = String::new();
+        s.read_to_string(&mut response).ok()?;
+        let idx = response.find("\r\n\r\n")?;
+        Some(response[idx + 4..].to_string())
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     /// Kills the server immediately with SIGKILL. The socket and temp files

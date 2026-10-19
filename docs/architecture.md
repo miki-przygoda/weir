@@ -49,7 +49,8 @@ Under sustained load, if every active connection is simultaneously blocked in th
 ### Startup order
 
 Ownership first, then every refuse-to-start check that can run early, then the
-WAB (`src/main.rs`):
+health surface, and only then the WAB (`src/main.rs`; Foundations §6). Each
+step publishes a phase in `weir_startup_phase{phase}`:
 
 ```
 umask 0o077 + SIGHUP ignored
@@ -60,38 +61,61 @@ umask 0o077 + SIGHUP ignored
                        scheme://host:port                (src/status/config_view.rs)
 → wab_dir lock         flock(LOCK_EX|LOCK_NB) on <wab_dir>/.weir.lock   (src/wab/lock.rs)
 → Metrics::new → lock-integrity thread (1 s, from here to exit)
+→ initializing         StatusBoard                        (src/status/board.rs)
 → preflight            socket_path format + length, non-socket refusal, connect-only
                        liveness probe (never unlinks), metrics test-bind,
                        [tls + tcp_bind: TLS load + TCP test-bind]       (src/preflight.rs)
-→ queue → drain channel
-→ wab::recover         private shard dirs, crash recovery of active segments
-→ wab::spawn_flushers  one flusher thread per shard
-→ workers → drain thread (+ its SegmentLedger)
-→ replay of sealed-but-unconfirmed segments into the drain channel
-→ startup cap gate     synchronous WAB size scan + wab_max_bytes evaluation;
-                       a failed scan with a cap set starts rejecting (src/status/poll.rs)
-→ settle wait          up to 10 s for every shard to leave Starting and every
-                       worker to run; routing skips a shard that has not
-                       settled
-→ tokio runtime:
-    reload loop + SIGHUP handler → metrics bind
-    → WAB / drain-liveness poll → [TLS load]
-    → socket::bind_all [TCP bind] then socket::bind (bind_hardened: probe,
-                       unlink only a stale socket, bind); nothing serves yet
-    → [tcp::run spawned] → SIGTERM/Ctrl-C
-    → socket::serve    accept loop; each connection goes to a live shard
-→ joins (workers → flushers → drain) → exit; the kernel releases the lock
+→ queue, drain channel, DrainControl (attached), Lifecycle   (src/lifecycle.rs)
+→ tokio runtime        reload loop + SIGHUP handler, SIGTERM/SIGINT task,
+                       metrics bind (answers from here), [TLS load], [admin socket]
+→ recovering           wab::recover on the main thread (HTTP keeps answering)
+→ handoff              wab::scan_replay (in memory, no sends), first WAB size +
+                       wab_max_bytes scan; a failed scan with a cap set starts
+                       rejecting                          (src/status/poll.rs)
+→ pipeline             flushers, workers, drain (replay list = its backlog), poll tasks,
+                       wait ≤ 10 s for every shard and worker to settle; routing
+                       skips a shard that has not settled
+→ binding              socket::bind_all: TCP, then the Unix socket (bind_hardened:
+                       probe, unlink only a stale socket, bind); all listeners
+                       before any accept loop
+→ serving              accept loops start; "weir serving"
+→ shutting_down        on SIGTERM/SIGINT; see "Shutdown order"
 ```
 
 Any refusal up to and including preflight exits 1 before recovery has touched a
 segment. The lock comes before the other checks so that a duplicate on the same
 `wab_dir` reports `locked by` rather than a port or socket conflict. Preflight
-test-binds and releases; the real binds and the real TLS load stay late and
-authoritative, so they can still fail after delivery has begun, but only on a
-race (something binding in between). Two late failures remain outside
-preflight: a scan error in the startup replay, and a `bind_hardened` error
-other than a live socket. The producer socket still binds only after recovery
-has sealed the open segments, which keeps the segment counter safe.
+test-binds and releases; the real binds stay late and authoritative, so they
+can still fail, but only on a race (something binding in between). Two late
+failures remain outside preflight: a scan error in `wab::scan_replay` and a
+`bind_all` error other than a live socket; both exit before any producer is
+served. A slow or unreachable sink no longer delays the producer socket: the
+replay backlog is handed to the drain in memory and alternates with live
+segments (they share no connection, so per-connection order is unchanged). The
+producer socket still binds only after recovery has sealed the open segments,
+which keeps the segment counter safe. A signal before `serving` lets the
+current step finish (recovery is never interrupted) and skips the producer
+listeners.
+
+### Shutdown order
+
+```
+T0 first SIGTERM/SIGINT   phase shutting_down; drain absorb mode; flushers' flag;
+                          lame duck: socket unlinked (inode-checked), TCP listener closed
+   connection drain       ≤ shutdown_timeout_secs (aborted at once on a second signal)
+T1 ingest closed          queue-depth task stopped; workers joined; flushers joined
+                          (each seals, fsyncs, hands off; ≤ 1 s if the drain is stuck)
+T2 drain budget           drain_shutdown_budget_secs, then the in-flight segment is
+                          abandoned (no .confirmed); main waits ≤ budget + 2 s
+T3 exit                   one summary line (no I/O), runtime stops, exit 0
+second signal (any time)  forced: connection drains abort, the drain deadline is now;
+                          the worker and flusher joins still run
+```
+
+`/metrics` answers until T3. If the drain is inside a sink call that never
+yields, the daemon exits 0 at budget + 2 s with the segment unconfirmed; it
+replays on the next start. The kernel releases the `wab_dir` lock at exit,
+after everything above.
 
 ---
 
@@ -120,8 +144,8 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 - **A second transport lives in the same module**: `tcp.rs` + `tls.rs` (behind the `tls` feature) mirror the Unix accept loop — same global connection-limit semaphore, same round-robin shard assignment, and the same `handle_connection` — so everything below the accept loop is transport-agnostic. Operator setup is in [operations/tcp-mtls.md](operations/tcp-mtls.md). The `#[cfg(unix)]` gate above still applies: the module as a whole is Unix-only, TCP included.
 - `QueueSender::push_timeout` is used with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.
-- SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer receives a `CancellationToken` and drains the `JoinSet` before returning.
-- SIGHUP is ignored (`SIG_IGN`) from the top of `main` and handled once the runtime exists, through the one reload path in `src/reload.rs`: a TLS reload when TLS is loaded, otherwise a logged no-op. Both count in `weir_config_reloads_total{trigger,outcome}`. SIGHUP never terminates the daemon.
+- SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer follows a `watch<ShutdownLevel>` from `src/lifecycle.rs`: on the first signal it unlinks its socket and closes the listener at once, then drains the `JoinSet` for at most `shutdown_timeout_secs`, and aborts it on a second signal.
+- SIGHUP is ignored (`SIG_IGN`) from the top of `main` and handled once the runtime exists (right after the lock and preflight, before WAB recovery), through the one reload path in `src/reload.rs`: a TLS reload when TLS is loaded, otherwise a logged no-op. Both count in `weir_config_reloads_total{trigger,outcome}`. SIGHUP never terminates the daemon.
 - Each push checks one `AtomicBool`, `wab_ownership_lost`, before the WAB-cap check; once the lock-integrity thread has proven another daemon owns the `wab_dir`, pushes are NACKed `InternalError` and the process exits 3.
 
 ### Work queue (`src/queue.rs`)
@@ -148,7 +172,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - One flusher thread per shard; each holds an active `WabSegment`.
 - Two durability tiers. `Durable` upholds "ack ⇒ durable": it group-fdatasyncs at the batch boundary before acking every record in the batch. `Buffered` trades durability for latency — it acks after the in-memory write, before any fsync, so it does **not** uphold "ack ⇒ durable" (a Buffered ack survives a process crash but not power loss). (Historically there was a third tier: `Sync` fsynced once per record while `Batched` fsynced once per batch, until both moved onto the same batch-boundary group fsync and the distinction between them stopped existing — one fsync at the end of the batch already covered every record written during it, so a single-producer serial workload saw no difference, and under concurrent producers `Sync` amortised into the group fsync just like `Batched`. weir 2.0 removed the now-redundant tier: wire byte `0x02` is retired and permanently reserved, still decodes to `Durable` for old producers, and is never emitted by the encoder. See [wire_protocol.md → Durability tiers](wire_protocol.md#durability-tiers).)
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
-- Ownership: `src/wab/lock.rs` takes an exclusive `flock` on `<wab_dir>/.weir.lock` before anything reads the WAB, keeps the fd in a process-wide static until exit (never released explicitly, never unlinked, never re-opened), and is re-checked once a second by its own thread from right after acquisition (so through recovery and the startup replay too): a deleted lock file is re-created (`O_EXCL`) and re-locked, and a replacement nobody holds is re-locked unless its record names another daemon; one another instance holds, or one carrying another daemon's record, is proof of lost ownership, and the daemon exits 3 without sealing. `wab_dir_lock = "best-effort"` only covers a filesystem that cannot lock; then orphan deletion is off. File format: [wab_format.md](wab_format.md#the-wab_dir-lock-file).
+- Ownership: `src/wab/lock.rs` takes an exclusive `flock` on `<wab_dir>/.weir.lock` before anything reads the WAB, keeps the fd in a process-wide static until exit (never released explicitly, never unlinked, never re-opened), and is re-checked once a second by its own thread from right after acquisition (so through recovery too): a deleted lock file is re-created (`O_EXCL`) and re-locked, and a replacement nobody holds is re-locked unless its record names another daemon; one another instance holds, or one carrying another daemon's record, is proof of lost ownership, and the daemon exits 3 without sealing. `wab_dir_lock = "best-effort"` only covers a filesystem that cannot lock; then orphan deletion is off. File format: [wab_format.md](wab_format.md#the-wab_dir-lock-file).
 - Path validation (`validate_path`) is consolidated in `src/config/mod.rs` and used for `wab_dir` and `socket_path` at config-load time. The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
 
 ### Sink (`src/sink/`)
@@ -277,7 +301,7 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 
 Each test spawns a real `weir-server` binary via `env!("CARGO_BIN_EXE_weir-server")` with its own temp directory, socket path, WAB directory, and metrics port. A global process mutex serialises server spawning so the suite runs safely with any `--test-threads` value. Tests are written against the client library (`weir-client`) and the raw wire protocol where needed.
 
-Coverage includes: basic push/ack round-trips, both durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, a second daemon refused on a live socket or a locked `wab_dir` (and the first one's ownership-loss exit when the lock file is stolen, at runtime or during a blocked startup replay), refused duplicates delivering nothing, SIGHUP surviving at every startup phase, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
+Coverage includes: basic push/ack round-trips, both durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, a second daemon refused on a live socket or a locked `wab_dir` (and the first one's ownership-loss exit when the lock file is stolen, at runtime or during recovery), refused duplicates delivering nothing, SIGHUP served as a reload from before recovery onward, bounded shutdown with a full drain channel, a forcing second SIGTERM, and a drain that outlives its flushers, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
 
 **Load tests** (`crates/weir-server/tests/load.rs`):
 

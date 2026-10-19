@@ -788,6 +788,8 @@ Added by Foundations. The conditions behind `weir_condition_active` get their ow
 | `weir_config_segment_max_lifetime_seconds` | gauge | Effective `wab_segment_max_lifetime_secs` (0 = off). |
 | `weir_config_sink_max_retries` | gauge | Effective `sink_max_retries`. |
 | `weir_config_shutdown_timeout_seconds` | gauge | Effective `shutdown_timeout_secs`. |
+| `weir_config_drain_shutdown_budget_seconds` | gauge | Effective `drain_shutdown_budget_secs`: how long the drain keeps delivering after SIGTERM once everything is sealed. |
+| `weir_drain_shutdown_deadline_seconds` | gauge | Unix time at which the current bounded shutdown abandons the drain's in-flight work; 0 when not shutting down. `weir_drain_shutdown_deadline_seconds - time()` is the budget left. |
 | `weir_records_nack_internal_total{cause}` | counter | Transient `InternalError` nacks by cause: `queue_full`, `write_failed`, `sender_dropped`, `ack_timeout`, `wab_cap`, `coordinate`, `ownership_lost`. The wire reason is the same for all of them; this is how to tell them apart. |
 | `weir_connections_refused_no_live_shard_total` | counter | New connections refused because no shard could accept records. *(written from PR 3)* |
 | `weir_drain_segments_abandoned_total` | counter | Segments left partly delivered when the drain thread exited on a stop: at the shutdown deadline, or while the segment was held by a pause or blocked on a full dead letter. They stay sealed and unconfirmed and are re-delivered from record 0 on the next start. *(written from PR 2)* |

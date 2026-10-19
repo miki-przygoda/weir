@@ -344,10 +344,10 @@ pub(crate) fn recover(
 
 /// Startup phase `handoff` (spec §6 step 9): the sealed-but-unconfirmed
 /// backlog, in the order the drain must deliver it, with the same footer
-/// accounting the old `replay_unconfirmed` did, and NO sends: it logs
-/// "queuing segment for drain replay" for every segment up front. In PR 3 the
-/// list is still pushed through the channel by [`replay_unconfirmed`]; from
-/// PR 4 it moves into the drain in memory as `initial_backlog`.
+/// accounting the old blocking `replay_unconfirmed` did, and NO sends: it
+/// logs "queuing segment for drain replay" for every segment. `main` hands the
+/// list to the drain in memory as `DrainRuntime::initial_backlog`, so a
+/// backlog larger than the drain channel can no longer block startup (B3).
 ///
 /// `Some(shard_count)` is passed to the scan, so an unlistable shard fails
 /// startup (no later rescan is guaranteed), exactly as before.
@@ -748,39 +748,6 @@ pub(crate) fn confirmed_tmp_path(confirmed: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Replays sealed-but-unconfirmed segments from a previous run by sending their
-/// paths to the drain. MUST be called only after the drain consumer is running:
-/// the sends block on the bounded drain channel, so with no consumer a backlog
-/// larger than the channel capacity would dead-lock the caller (B3).
-///
-/// PR 3 keeps this as the channel-fed replay over [`scan_replay`]; PR 4 deletes
-/// it when the list moves into the drain as `initial_backlog`.
-///
-/// The scan logs "queuing segment for drain replay" for the whole backlog
-/// before the first send, so those lines no longer say how far the sends got.
-/// The line after the loop does: until it appears, the replay is still handing
-/// segments to the drain (and, with a stalled drain, blocked on a send).
-pub(crate) fn replay_unconfirmed(
-    wab_dir: &Path,
-    shard_count: usize,
-    drain_tx: &Sender<PathBuf>,
-    metrics: &Arc<Metrics>,
-    orphan_cleanup: bool,
-) -> io::Result<()> {
-    let backlog = scan_replay(wab_dir, shard_count, metrics, orphan_cleanup)?;
-    let segments = backlog.len();
-    for sealed in backlog {
-        drain_tx.send(sealed).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "drain channel closed during startup replay",
-            )
-        })?;
-    }
-    info!(segments, "startup replay handed to the drain");
-    Ok(())
-}
-
 /// Reads `record_count` from the footer of a sealed segment file without reading
 /// all records. The footer occupies the last `SEGMENT_FOOTER_LEN` bytes; its first
 /// 8 bytes are `record_count` as a u64 LE (see wab/format.rs for the layout).
@@ -982,18 +949,18 @@ fn flusher_thread<C: BlockingClock>(
     {
         let mut attempt = 0u32;
         loop {
-            let scan = writer.scan_and_advance_counter();
             // System-test hook (spec §16 system test 8): force this shard's
-            // scan to fail so it ends Offline(CounterScanFailed). Compiled
-            // out without `test-hooks`, and inert unless WEIR_TEST_HOOKS=1.
-            #[cfg(feature = "test-hooks")]
-            let scan = if crate::test_hooks::fail_counter_scan(shard_id) {
-                Err(io::Error::other(
-                    "test hook: WEIR_TEST_FAIL_SHARD_COUNTER_SCAN",
-                ))
-            } else {
-                scan
-            };
+            // scan to fail so it ends Offline(CounterScanFailed). An inlined
+            // `false` without `test-hooks`, and inert unless WEIR_TEST_HOOKS=1.
+            let scan = writer.scan_and_advance_counter().and_then(|()| {
+                if crate::test_hooks::fail_counter_scan(shard_id) {
+                    Err(io::Error::other(
+                        "test hook: WEIR_TEST_FAIL_SHARD_COUNTER_SCAN",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
             match scan {
                 Ok(()) => {
                     // The counter is established: this shard can seal safely.
@@ -1623,61 +1590,6 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
-    // ── B3: recovery replay must not dead-lock on the bounded drain channel ──
-    #[test]
-    fn replay_needs_a_live_consumer_for_backlog_over_channel_capacity() {
-        // replay_unconfirmed blocking-sends each sealed-but-unconfirmed segment
-        // into the bounded drain channel. If the backlog exceeds the channel
-        // capacity and no consumer is draining, the send blocks forever — the
-        // startup deadlock (B3). The fix is in the startup wiring: the drain
-        // consumer is spawned BEFORE replay runs. This test characterises the
-        // hazard — replay blocks without a consumer, and streams the whole backlog
-        // once one exists.
-        let dir = tmp_dir("replay_consumer");
-        let shard_dir = shard_dir_path(&dir, 0);
-        crate::testutil::mkdir_p(&shard_dir);
-
-        const N: u64 = 300; // > the bounded(256) drain channel capacity
-        for i in 1..=N {
-            let path = segment_path(&shard_dir, i);
-            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
-            seg.write_record(b"replayed").unwrap();
-            seg.seal().unwrap();
-        }
-
-        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
-        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
-        let dir_for_replay = dir.clone();
-        let replay = std::thread::spawn(move || {
-            let metrics = Arc::new(crate::metrics::Metrics::new().0);
-            replay_unconfirmed(&dir_for_replay, 1, &tx, &metrics, false).unwrap();
-            let _ = done_tx.send(());
-            // tx dropped here → the consumer below sees the channel disconnect.
-        });
-
-        // No consumer yet: replay fills the channel and blocks (the deadlock).
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "replay must block on a full channel with no consumer (the B3 deadlock)"
-        );
-
-        // Live consumer → replay streams the remaining backlog and completes.
-        let consumer = std::thread::spawn(move || {
-            let mut count = 0u64;
-            while rx.recv().is_ok() {
-                count += 1;
-            }
-            count
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("replay must complete once a consumer drains the channel");
-        let received = consumer.join().unwrap();
-        replay.join().unwrap();
-        assert_eq!(received, N, "every backlog segment must reach the drain");
-        fs::remove_dir_all(dir).ok();
-    }
-
     // ── S05: replay must drain shard dirs beyond the configured shard_count ──────
     #[test]
     fn replay_drains_shard_dirs_beyond_configured_count() {
@@ -1695,13 +1607,13 @@ mod tests {
             seg.seal().unwrap();
         }
 
-        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
         let metrics = Arc::new(crate::metrics::Metrics::new().0);
         // Configured shard_count = 2, but 4 shard dirs hold backlog on disk.
-        replay_unconfirmed(&dir, 2, &tx, &metrics, false).unwrap();
-        drop(tx);
-
-        let received: Vec<String> = rx.iter().map(|p| p.display().to_string()).collect();
+        let received: Vec<String> = scan_replay(&dir, 2, &metrics, false)
+            .unwrap()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         assert_eq!(
             received.len(),
             4,
@@ -1742,12 +1654,8 @@ mod tests {
         s2.write_record(b"needs-delivery").unwrap();
         let sealed2 = s2.seal().unwrap();
 
-        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
         let metrics = Arc::new(crate::metrics::Metrics::new().0);
-        replay_unconfirmed(&dir, 1, &tx, &metrics, false).unwrap();
-        drop(tx);
-
-        let queued: Vec<PathBuf> = rx.iter().collect();
+        let queued: Vec<PathBuf> = scan_replay(&dir, 1, &metrics, false).unwrap();
         assert_eq!(
             queued.len(),
             1,
@@ -1897,13 +1805,11 @@ mod tests {
             fs::write(confirmed_path_for(&orphan), build_confirmed(0, 1, 1)).unwrap();
             let pending = sealed_in_shard(&sd0, 2, b"undelivered");
 
-            let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
             let metrics = Arc::new(crate::metrics::Metrics::new().0);
-            replay_unconfirmed(&dir, 1, &tx, &metrics, orphan_cleanup).unwrap();
-            drop(tx);
+            let replay = scan_replay(&dir, 1, &metrics, orphan_cleanup).unwrap();
 
             assert_eq!(
-                rx.iter().collect::<Vec<_>>(),
+                replay,
                 vec![pending],
                 "an orphan is never replayed, deleted or not"
             );
@@ -2078,13 +1984,8 @@ mod tests {
 
         let metrics = Arc::new(crate::metrics::Metrics::new().0);
         for _ in 0..2 {
-            let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
-            replay_unconfirmed(&dir, 1, &tx, &metrics, true).unwrap();
-            drop(tx);
-            assert!(
-                rx.iter().next().is_none(),
-                "a quarantined segment is not replayed"
-            );
+            let replay = scan_replay(&dir, 1, &metrics, true).unwrap();
+            assert!(replay.is_empty(), "a quarantined segment is not replayed");
         }
         assert_eq!(
             metrics.recovery_segments_quarantined.get(),

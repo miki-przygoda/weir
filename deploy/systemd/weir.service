@@ -62,13 +62,15 @@ ExecStartPre=/usr/bin/install -d -m0700 /var/lib/weir/wab
 # (this IS the default path, but spell it out for clarity).
 ExecStart=/usr/local/bin/weir-server --config /etc/weir/weir.toml
 
-# Graceful shutdown: weir traps SIGTERM, seals the open WAB segment, drains
-# in-flight connections, then exits — bounded by its own shutdown_timeout_secs
-# (default 30s). Keep TimeoutStopSec a few seconds ABOVE shutdown_timeout_secs so
-# systemd lets the daemon finish its own drain instead of SIGKILLing mid-flush.
-# If you raise shutdown_timeout_secs in weir.toml, raise this to match (+5s).
+# Graceful shutdown (bounded): on SIGTERM weir goes lame duck (unlinks its
+# socket), waits up to shutdown_timeout_secs (default 30s) for open connections,
+# seals every active WAB segment, then gives the drain drain_shutdown_budget_secs
+# (default 10s) before exiting; what is left replays at the next start. Keep
+# TimeoutStopSec >= shutdown_timeout_secs + drain_shutdown_budget_secs + 5 (45s
+# at the defaults) so systemd never SIGKILLs a shutdown that is still bounded.
+# Raise it with either knob.
 KillSignal=SIGTERM
-TimeoutStopSec=35
+TimeoutStopSec=45
 
 # Exit status 1 = refused to start (wab_dir locked by another weir-server, a
 # live socket at socket_path, metrics/TCP port taken, bad TLS material). These

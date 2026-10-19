@@ -117,9 +117,16 @@ metrics_max_connections = 8
 
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.
-# Set <= the orchestrator's terminationGracePeriodSeconds minus a few seconds.
+# Keep the orchestrator grace >= shutdown_timeout_secs + drain_shutdown_budget_secs + 5.
 # Env: WEIR_SHUTDOWN_TIMEOUT_SECS
 shutdown_timeout_secs = 30
+
+# Bounded shutdown: how long the drain keeps delivering after SIGTERM, counted
+# from the moment ingest is sealed. What is left replays on the next start.
+# Keep the orchestrator grace >= shutdown_timeout_secs + this + 5 (45 s at the
+# defaults). Range 0-3600.
+# Env: WEIR_DRAIN_SHUTDOWN_BUDGET_SECS
+drain_shutdown_budget_secs = 10
 
 # Maximum total size (bytes) of the dead-letter directory. When this cap would
 # be exceeded, the drain transitions to BlockedDeadLetterFull and pauses until

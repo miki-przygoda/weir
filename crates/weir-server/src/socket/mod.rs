@@ -33,12 +33,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{
-    net::UnixListener,
-    sync::{Semaphore, oneshot},
-    task::JoinSet,
-    time,
-};
+use tokio::{net::UnixListener, sync::Semaphore, task::JoinSet, time};
 use tracing::{error, info, warn};
 
 use crate::{metrics::Metrics, models::WorkUnit, queue::QueueSender};
@@ -202,13 +197,13 @@ pub(crate) async fn bind_all(
 pub async fn run(
     config: SocketConfig,
     queue_tx: QueueSender<WorkUnit>,
-    shutdown_rx: oneshot::Receiver<()>,
+    level_rx: tokio::sync::watch::Receiver<crate::lifecycle::ShutdownLevel>,
     metrics: std::sync::Arc<Metrics>,
     sem: std::sync::Arc<Semaphore>,
 ) -> io::Result<()> {
     let bound = bind(&config)?;
     let router = route::ShardRouter::round_robin(config.shard_count);
-    serve(config, bound, queue_tx, shutdown_rx, metrics, sem, router).await
+    serve(config, bound, queue_tx, level_rx, metrics, sem, router).await
 }
 
 /// Accepts on an already-bound socket (see [`bind`]) and drives the
@@ -219,8 +214,10 @@ pub async fn run(
 /// and counted (`weir_connections_refused_no_live_shard_total`), and the loop
 /// keeps accepting.
 ///
-/// Returns when `shutdown_rx` fires or is dropped. Before returning, waits up to
-/// `config.shutdown_timeout_secs` for all in-flight connections to finish.
+/// Returns once the shutdown level leaves `Running` (a dropped level sender
+/// counts as Graceful) and the connection drain has ended: all in-flight
+/// connections finished, `config.shutdown_timeout_secs` passed, or the level
+/// became `Forced` (see [`drain_connections`]).
 ///
 /// `sem` is the shared connection-cap semaphore. Both the Unix listener and the
 /// TCP+mTLS listener (when enabled) receive a clone of the SAME `Arc<Semaphore>`
@@ -241,22 +238,25 @@ pub async fn run(
 /// remaining race window that the operator's directory permissions are
 /// expected to close.
 ///
-/// # Shutdown removal
+/// # Lame duck and shutdown removal
 ///
-/// On the way out `serve` removes the socket file only if the path still names
-/// the inode it bound ([`remove_own_socket`]). A successor that replaced the
-/// socket while this instance was running keeps its socket.
+/// At the first shutdown level past `Running` (Foundations §5.7, §7) the accept
+/// loop stops, and BEFORE the connection drain `serve` unlinks the socket file
+/// and closes the listener, so a new connect fails at once with `ENOENT`
+/// instead of queueing in the backlog for up to `shutdown_timeout_secs`. The
+/// unlink removes the file only if the path still names the inode this
+/// instance bound ([`remove_own_socket`]): a successor that replaced the socket
+/// keeps it. The Unix listener is then marked `Closed` on the board. Accepted
+/// connections finish within the bounded drain; `Forced` aborts them at once.
 pub async fn serve(
     config: SocketConfig,
     bound: BoundUnix,
     queue_tx: QueueSender<WorkUnit>,
-    shutdown_rx: oneshot::Receiver<()>,
+    mut level_rx: tokio::sync::watch::Receiver<crate::lifecycle::ShutdownLevel>,
     metrics: std::sync::Arc<Metrics>,
     sem: std::sync::Arc<Semaphore>,
     router: route::ShardRouter,
 ) -> io::Result<()> {
-    let listener = &bound.socket.listener;
-
     info!(path = %bound.path.display(), "socket listening");
     // README Q6: `serve` is the only writer of the Serving phase. The Bound
     // mark is `bind`'s.
@@ -281,7 +281,6 @@ pub async fn serve(
         wab_ownership_lost: std::sync::Arc::clone(&config.wab_ownership_lost),
     };
     let mut join_set: JoinSet<()> = JoinSet::new();
-    let mut shutdown = std::pin::pin!(shutdown_rx);
 
     // Broadcasts shutdown to every in-flight handler so they can exit
     // cleanly between frames instead of being abort_all'd mid-await. Sender
@@ -301,11 +300,11 @@ pub async fn serve(
     loop {
         tokio::select! {
             biased;
-            _ = &mut shutdown => {
-                info!("socket manager: shutdown signal received, stopping accept loop");
+            _ = crate::lifecycle::shutdown_requested(&mut level_rx) => {
+                info!("socket manager: shutdown requested, stopping accept loop");
                 break;
             }
-            res = listener.accept() => {
+            res = bound.socket.listener.accept() => {
                 let accept_start = Instant::now();
                 match res {
                     Ok((stream, _addr)) => {
@@ -399,54 +398,116 @@ pub async fn serve(
         }
     }
 
-    // Broadcast shutdown to every in-flight handler so they exit at the
-    // top of their next read-loop iteration (after acking any push they
-    // were processing). Doing this BEFORE the drain timeout means most
-    // handlers complete naturally; abort_all becomes the emergency fallback.
-    let _ = handler_shutdown_tx.send(true);
-
-    // Drain in-flight connections within the configured timeout. With
-    // handler_shutdown signalling, idle handlers exit immediately on the
-    // next loop check; active handlers exit after their current push
-    // completes (ack/nack capped by ACK_TIMEOUT). The timeout should be
-    // >= ACK_TIMEOUT + buffer so legitimate in-flight work completes
-    // before abort_all is reached.
-    let timeout = Duration::from_secs(config.shutdown_timeout_secs);
-    match time::timeout(timeout, drain_join_set(&mut join_set)).await {
-        Ok(()) => {
-            info!("socket manager: all connections drained cleanly");
-        }
-        Err(_elapsed) => {
-            error!(
-                remaining = join_set.len(),
-                timeout_secs = config.shutdown_timeout_secs,
-                "socket manager: shutdown timeout reached; aborting remaining connections \
-                 — producers of those records may see no ack/nack response"
-            );
-            metrics
-                .connections_aborted_at_shutdown
-                .inc_by(join_set.len() as u64);
-            join_set.abort_all();
-        }
-    }
-
-    // Remove the socket file, but only if the path still names the inode we
-    // bound. The listener is still open here, so a liveness probe would see
-    // our OWN socket as live and leave it behind on every clean shutdown (the
-    // self-probe trap, spec §3.3); identity, not liveness, is the test. The
-    // removal uses the hardened dirfd + fstatat + unlinkat sequence so a
-    // by-name remove can't be redirected by a swapped-in inode (F28).
-    // Best-effort: the daemon is exiting, so a failure is logged, not fatal.
+    // Lame duck (Foundations §5.7, §7): stop being reachable BEFORE the
+    // connection drain, so new connects fail fast instead of piling up in the
+    // backlog for up to shutdown_timeout_secs. The unlink runs first, while
+    // the listener (and on Linux its O_PATH pin) still holds the inode, so the
+    // identity check in remove_own_socket has no window; then the listener
+    // closes (README Q15). Identity, not liveness, is the test: our own
+    // listener is still open, so a liveness probe would see it as live and
+    // leave the file behind (the self-probe trap, spec §3.3). The removal is
+    // the hardened dirfd + fstatat + unlinkat sequence (F28), best-effort:
+    // a failure is logged, not fatal. A successor that replaced our socket
+    // keeps its file.
     remove_own_socket(&bound.path, &bound.socket);
     drop(bound);
     if let Some(b) = &config.board {
         b.listeners.unix.set(weir_status::ListenerState::Closed);
     }
+    info!(
+        path = %config.socket_path.display(),
+        "socket manager: lame duck: socket unlinked and listener closed; draining connections"
+    );
+
+    // Handlers exit between frames (after acking a push they already read).
+    // Sent BEFORE the bounded drain, so idle handlers exit at once and the
+    // abort in drain_connections is the fallback.
+    let _ = handler_shutdown_tx.send(true);
+    drain_connections(
+        &mut join_set,
+        Duration::from_secs(config.shutdown_timeout_secs),
+        &mut level_rx,
+        &metrics,
+        "socket manager",
+    )
+    .await;
     Ok(())
 }
 
 async fn drain_join_set(join_set: &mut JoinSet<()>) {
     while join_set.join_next().await.is_some() {}
+}
+
+/// How a listener's connection drain ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConnDrain {
+    Clean,
+    TimedOut { aborted: usize },
+    Forced { aborted: usize },
+}
+
+/// Waits for in-flight connections after the accept loop broke: up to
+/// `timeout` (`shutdown_timeout_secs`), or until the level becomes `Forced`,
+/// whichever comes first; then aborts what is left and counts it in
+/// `weir_connections_aborted_at_shutdown`. Shared by the Unix and TCP
+/// listeners (Foundations §5.7).
+///
+/// The aborted tasks are awaited before returning, so every handler's
+/// `QueueSender` clone is dropped by then. Only a push already parked in
+/// `spawn_blocking` can outlive that, for at most `QUEUE_PUSH_TIMEOUT`, which
+/// is why main waits on the queue's live-sender count (Task 4.8) rather than
+/// asserting it.
+pub(crate) async fn drain_connections(
+    join_set: &mut JoinSet<()>,
+    timeout: Duration,
+    level: &mut tokio::sync::watch::Receiver<crate::lifecycle::ShutdownLevel>,
+    metrics: &Metrics,
+    who: &'static str,
+) -> ConnDrain {
+    enum Why {
+        Done,
+        Timeout,
+        Forced,
+    }
+    // The select's futures borrow `join_set`; decide first, act after they drop.
+    let why = tokio::select! {
+        biased;
+        _ = crate::lifecycle::forced(level) => Why::Forced,
+        r = time::timeout(timeout, drain_join_set(join_set)) => {
+            if r.is_ok() { Why::Done } else { Why::Timeout }
+        }
+    };
+    let remaining = join_set.len();
+    let out = match why {
+        Why::Done => {
+            info!("{who}: all connections drained cleanly");
+            return ConnDrain::Clean;
+        }
+        Why::Timeout => {
+            error!(
+                remaining,
+                timeout_secs = timeout.as_secs(),
+                "{who}: shutdown timeout reached; aborting remaining connections — producers \
+                 of those records may see no ack/nack response"
+            );
+            ConnDrain::TimedOut { aborted: remaining }
+        }
+        Why::Forced => {
+            warn!(
+                remaining,
+                "{who}: forced shutdown; aborting remaining connections now"
+            );
+            ConnDrain::Forced { aborted: remaining }
+        }
+    };
+    metrics
+        .connections_aborted_at_shutdown
+        .inc_by(remaining as u64);
+    join_set.abort_all();
+    // Reap the aborted tasks so every handler's queue sender is dropped
+    // before the caller moves on.
+    while join_set.join_next().await.is_some() {}
+    out
 }
 
 /// Backoff applied when `accept(2)` fails with a resource-exhaustion errno.
@@ -1346,7 +1407,7 @@ mod tests {
     use super::*;
     use crate::{models::WorkUnit, queue};
     use std::time::Duration;
-    use tokio::{io::AsyncReadExt, net::UnixStream, sync::oneshot};
+    use tokio::{io::AsyncReadExt, net::UnixStream};
 
     fn tmp_socket_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("weir_sock_{label}_{}.sock", std::process::id()))
@@ -1959,7 +2020,7 @@ mod tests {
         let dir = umask_immune_dir("full_run_own");
         let path = dir.join("weir.sock");
         let cfg = default_config(path.clone());
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
 
         let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
@@ -1975,7 +2036,7 @@ mod tests {
         };
         drop(conn);
 
-        shutdown_tx.send(()).unwrap();
+        shutdown_tx.send_replace(ShutdownLevel::Graceful);
         time::timeout(Duration::from_secs(3), handle)
             .await
             .expect("run() should complete after shutdown")
@@ -1999,7 +2060,7 @@ mod tests {
         let board = crate::status::test_board(1, 1);
         let mut cfg = default_config(path.clone());
         cfg.board = Some(std::sync::Arc::clone(&board));
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
         assert_eq!(board.listeners.unix.get(), ListenerState::Pending);
@@ -2012,7 +2073,7 @@ mod tests {
         assert_eq!(board.listeners.unix.get(), ListenerState::Bound);
         assert_eq!(board.life.phase(), Phase::Serving);
         assert!(board.life.ever_served());
-        shutdown_tx.send(()).unwrap();
+        shutdown_tx.send_replace(ShutdownLevel::Graceful);
         time::timeout(Duration::from_secs(3), handle)
             .await
             .unwrap()
@@ -2030,7 +2091,7 @@ mod tests {
         let board = crate::status::test_board(1, 1);
         let mut cfg = default_config(PathBuf::from("relative/weir.sock"));
         cfg.board = Some(std::sync::Arc::clone(&board));
-        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let sem = std::sync::Arc::new(Semaphore::new(1));
         assert!(
@@ -2346,7 +2407,7 @@ mod tests {
             shutdown_timeout_secs: 2,
             ..default_config(path.clone())
         };
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let _rx = queue_rx.get(0); // keep receiver alive
 
@@ -2365,7 +2426,7 @@ mod tests {
         // server did not accept a second active connection beyond the cap.
         let _ = time::timeout(Duration::from_millis(200), conn2.read(&mut buf)).await;
 
-        shutdown_tx.send(()).ok();
+        shutdown_tx.send_replace(ShutdownLevel::Graceful);
         std::fs::remove_file(&path).ok();
     }
 
@@ -2385,7 +2446,7 @@ mod tests {
         let mut cfg = default_config(path.clone());
         cfg.connection_read_timeout_secs = 30; // long, to prove the race wins
         cfg.shutdown_timeout_secs = 2;
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
         let _rx = queue_rx.get(0); // keep receiver alive
 
@@ -2398,7 +2459,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let t0 = Instant::now();
-        shutdown_tx.send(()).unwrap();
+        shutdown_tx.send_replace(ShutdownLevel::Graceful);
         time::timeout(Duration::from_millis(500), run_handle)
             .await
             .expect("run() should complete well before read_timeout")
@@ -2419,14 +2480,14 @@ mod tests {
     async fn run_exits_cleanly_after_shutdown_signal() {
         let path = tmp_socket_path("shutdown");
         let cfg = default_config(path.clone());
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
 
         let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
         let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics(), sem));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        shutdown_tx.send(()).unwrap();
+        shutdown_tx.send_replace(ShutdownLevel::Graceful);
         time::timeout(Duration::from_secs(3), handle)
             .await
             .expect("run() should complete within timeout after shutdown signal")
@@ -2447,7 +2508,7 @@ mod tests {
         rt.block_on(async {
             let path = tmp_socket_path("perms");
             let cfg = default_config(path.clone());
-            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
             let (queue_tx, _) = queue::new::<WorkUnit>(1);
 
             let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
@@ -2463,7 +2524,7 @@ mod tests {
                 mode & 0o777
             );
 
-            shutdown_tx.send(()).ok();
+            shutdown_tx.send_replace(ShutdownLevel::Graceful);
             tokio::time::sleep(Duration::from_millis(50)).await;
             std::fs::remove_file(&path).ok();
         });
@@ -2562,7 +2623,7 @@ mod tests {
         );
         assert_ne!(board.life.phase(), weir_status::Phase::Serving);
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
         let handle = tokio::spawn(serve(
@@ -2588,7 +2649,7 @@ mod tests {
             weir_status::ListenerState::Bound,
             "serve does not write Bound"
         );
-        shutdown_tx.send(()).unwrap();
+        shutdown_tx.send_replace(ShutdownLevel::Graceful);
         time::timeout(Duration::from_secs(3), handle)
             .await
             .unwrap()
@@ -2621,7 +2682,7 @@ mod tests {
             bind(&cfg).unwrap()
         };
         let metrics = test_metrics();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
         let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
         let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
         let router = route::ShardRouter::live(std::sync::Arc::new(NoneLive));
@@ -2646,7 +2707,7 @@ mod tests {
         }
         assert_eq!(metrics.connections_refused_no_live_shard.get(), 2);
 
-        shutdown_tx.send(()).unwrap();
+        shutdown_tx.send_replace(ShutdownLevel::Graceful);
         time::timeout(Duration::from_secs(3), handle)
             .await
             .unwrap()
@@ -2776,6 +2837,170 @@ mod tests {
         assert_eq!(board.listeners.unix.get(), unix_before);
         assert!(!path.exists(), "the Unix socket is never bound");
         drop(taken);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Bounded connection drain (Foundations §5.7) ───────────────────────────
+
+    use crate::lifecycle::ShutdownLevel;
+
+    #[tokio::test]
+    async fn drain_connections_aborts_at_forced_without_waiting_out_the_timeout() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(std::future::pending::<()>());
+        let (tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Graceful);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send_replace(ShutdownLevel::Forced);
+            // Keep the sender alive past the abort.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let t0 = Instant::now();
+        let out =
+            drain_connections(&mut js, Duration::from_secs(30), &mut rx, &metrics, "test").await;
+        assert_eq!(out, ConnDrain::Forced { aborted: 1 });
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 1);
+        assert!(
+            js.is_empty(),
+            "aborted handlers must be reaped before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_connections_aborts_at_the_timeout() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(std::future::pending::<()>());
+        let (_tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Graceful);
+        let out = drain_connections(
+            &mut js,
+            Duration::from_millis(100),
+            &mut rx,
+            &metrics,
+            "test",
+        )
+        .await;
+        assert_eq!(out, ConnDrain::TimedOut { aborted: 1 });
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 1);
+        assert!(js.is_empty(), "the aborted handler is reaped");
+    }
+
+    #[tokio::test]
+    async fn drain_connections_is_clean_when_handlers_finish() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(async { tokio::time::sleep(Duration::from_millis(20)).await });
+        let (_tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Graceful);
+        let out =
+            drain_connections(&mut js, Duration::from_secs(5), &mut rx, &metrics, "test").await;
+        assert_eq!(out, ConnDrain::Clean);
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_connections_aborts_at_once_when_already_forced() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(std::future::pending::<()>());
+        let (_tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Forced);
+        let t0 = Instant::now();
+        let out =
+            drain_connections(&mut js, Duration::from_secs(30), &mut rx, &metrics, "test").await;
+        assert_eq!(out, ConnDrain::Forced { aborted: 1 });
+        assert!(t0.elapsed() < Duration::from_millis(100));
+    }
+
+    /// Lame duck (Foundations §5.7, §7): on Graceful the socket file is gone
+    /// and new connects fail at once, BEFORE the connection drain finishes,
+    /// and a later Forced cuts that drain short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn lame_duck_unlinks_before_the_connection_drain_and_forced_cuts_it_short() {
+        let dir = umask_immune_dir("lame_duck");
+        let path = dir.join("weir.sock");
+        let board = crate::status::StatusBoard::for_test_with(1, 1);
+        let mut cfg = default_config(path.clone());
+        cfg.shutdown_timeout_secs = 30; // the drain is NOT what removes the socket
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let (level_tx, level_rx) = tokio::sync::watch::channel(ShutdownLevel::Running);
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        // Kept alive and never consumed: a push waits for an ack that never comes,
+        // so one handler (and therefore the drain) stays busy.
+        let held = queue_rx.get(0);
+        let metrics = test_metrics();
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        // The umask lock covers the bind only: a std Mutex is not held
+        // across an await.
+        let bound = {
+            let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+            bind(&cfg).expect("bind")
+        };
+        let handle = tokio::spawn(serve(
+            cfg,
+            bound,
+            queue_tx,
+            level_rx,
+            std::sync::Arc::clone(&metrics),
+            sem,
+            route::ShardRouter::round_robin(1),
+        ));
+
+        let p = path.clone();
+        let pusher = tokio::task::spawn_blocking(move || {
+            let mut c = weir_client::WeirClient::connect(&p).expect("connect");
+            c.push(b"in-flight", weir_core::Durability::Durable)
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while held.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the push never reached the queue"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        level_tx.send_replace(ShutdownLevel::Graceful);
+        let t0 = Instant::now();
+        while path.exists() {
+            assert!(
+                t0.elapsed() < Duration::from_millis(200),
+                "lame duck: the socket must be unlinked within 200 ms"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            UnixStream::connect(&path).await.is_err(),
+            "a new connect must fail fast once the lame duck began"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the connection drain must still be waiting on the in-flight push"
+        );
+        // The lame duck marks the listener Closed right after the unlink and
+        // before the connection drain.
+        let t1 = Instant::now();
+        while board.listeners.unix.get() != weir_status::ListenerState::Closed {
+            assert!(
+                t1.elapsed() < Duration::from_millis(200),
+                "the listener was never marked Closed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        level_tx.send_replace(ShutdownLevel::Forced);
+        time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("Forced must end the 30 s drain at once")
+            .expect("task should not panic")
+            .expect("run() should return Ok");
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 1);
+        let _ = pusher.await; // the aborted connection fails the push with Io
         std::fs::remove_dir_all(&dir).ok();
     }
 }

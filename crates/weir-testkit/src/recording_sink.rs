@@ -9,7 +9,9 @@
 //! [`RecordingSink::start_hanging`] is the black-hole variant: it accepts every
 //! connection and never answers, so a sink call waits for its timeout. Dropping
 //! it closes every held connection and the listener, so the daemon's next
-//! attempt is refused.
+//! attempt is refused. [`RecordingSink::start_slow`] is the slow-but-healthy
+//! variant: it answers and records every request, each after a fixed delay, so
+//! a test can make sink latency (not availability) the bottleneck.
 //!
 //! Deliberately minimal: one thread per connection, keep-alive, and only the
 //! request framing the HTTP sink produces (`Content-Length`, plus `chunked` for
@@ -19,6 +21,15 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// How the fixture answers.
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Answer every request, after `delay`.
+    Answer { delay: std::time::Duration },
+    /// Accept and never answer (the black hole).
+    Hang,
+}
 
 /// A running recording endpoint. Dropping it stops accepting new connections.
 pub struct RecordingSink {
@@ -31,7 +42,9 @@ pub struct RecordingSink {
 impl RecordingSink {
     /// Binds `127.0.0.1:0` and starts serving on a background thread.
     pub fn start() -> RecordingSink {
-        Self::start_mode(false)
+        Self::start_mode(Mode::Answer {
+            delay: std::time::Duration::ZERO,
+        })
     }
 
     /// A black hole: binds `127.0.0.1:0`, accepts every connection (counted by
@@ -40,10 +53,18 @@ impl RecordingSink {
     /// is recorded. Dropping the sink closes the held connections and the
     /// listener: the hung call fails at once and later ones are refused.
     pub fn start_hanging() -> RecordingSink {
-        Self::start_mode(true)
+        Self::start_mode(Mode::Hang)
     }
 
-    fn start_mode(hang: bool) -> RecordingSink {
+    /// A slow but healthy endpoint: every request (the `HEAD` probe
+    /// included) is answered `200` after `per_request`, and POST bodies are
+    /// recorded as with [`start`](Self::start). Models a sink whose commit
+    /// latency, not its availability, is the bottleneck.
+    pub fn start_slow(per_request: std::time::Duration) -> RecordingSink {
+        Self::start_mode(Mode::Answer { delay: per_request })
+    }
+
+    fn start_mode(mode: Mode) -> RecordingSink {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind recording sink");
         let addr = listener.local_addr().expect("recording sink local_addr");
         let bodies: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
@@ -68,12 +89,9 @@ impl RecordingSink {
                     let s = Arc::clone(&s);
                     let _ = std::thread::Builder::new()
                         .name("recording-sink-conn".into())
-                        .spawn(move || {
-                            if hang {
-                                hold(conn, &s)
-                            } else {
-                                serve(conn, &b)
-                            }
+                        .spawn(move || match mode {
+                            Mode::Hang => hold(conn, &s),
+                            Mode::Answer { delay } => serve(conn, &b, delay),
                         });
                 }
             })
@@ -127,8 +145,10 @@ fn hold(_conn: TcpStream, stop: &AtomicBool) {
 }
 
 /// Serves one keep-alive connection until the peer closes it or sends
-/// something this fixture does not understand.
-fn serve(conn: TcpStream, bodies: &Mutex<Vec<Vec<u8>>>) {
+/// something this fixture does not understand. Each answer waits `delay`
+/// first (zero for [`RecordingSink::start`]); the body is recorded before the
+/// wait, as a real sink commits before it acknowledges.
+fn serve(conn: TcpStream, bodies: &Mutex<Vec<Vec<u8>>>, delay: std::time::Duration) {
     let Ok(mut writer) = conn.try_clone() else {
         return;
     };
@@ -188,6 +208,9 @@ fn serve(conn: TcpStream, bodies: &Mutex<Vec<Vec<u8>>>) {
         if method == "POST" {
             bodies.lock().unwrap_or_else(|e| e.into_inner()).push(body);
         }
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         if writer
             .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
             .is_err()
@@ -225,6 +248,7 @@ fn read_chunked(reader: &mut BufReader<TcpStream>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn request(stream: &mut TcpStream, raw: &[u8]) -> String {
         stream.write_all(raw).unwrap();
@@ -294,5 +318,23 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "listener still open");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn start_slow_delays_every_answer_and_still_records() {
+        let sink = RecordingSink::start_slow(Duration::from_millis(200));
+        let mut s = TcpStream::connect(sink.addr).unwrap();
+        let t0 = Instant::now();
+        s.write_all(b"POST /sink HTTP/1.1\r\ncontent-length: 3\r\n\r\nabc")
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(200),
+            "the answer must wait the configured delay, took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(sink.bodies(), vec![b"abc".to_vec()]);
     }
 }

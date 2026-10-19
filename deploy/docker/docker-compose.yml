@@ -11,6 +11,10 @@ services:
     # each instance its own WAB volume. Exit status 1 = refused to start; 3 = WAB
     # ownership lost to another instance at runtime.
     restart: unless-stopped
+    # Bounded shutdown: shutdown_timeout_secs (30) + drain_shutdown_budget_secs
+    # (10) + 5 = 45 s. Docker's default of 10 s would SIGKILL a shutdown that is
+    # still within its bound (crash-safe, but it skips the seal and the summary).
+    stop_grace_period: 45s
 
     volumes:
       # WAB segments persist across restarts. The daemon keeps an exclusive
@@ -43,8 +47,8 @@ services:
     user: weir
 
     healthcheck:
-      # The metrics endpoint doubles as a liveness probe. It binds after WAB
-      # recovery and the startup replay, shortly before the producer socket.
+      # The metrics endpoint doubles as a liveness probe. It binds before WAB
+      # recovery, so it answers during a long recovery too.
       #
       # The runtime image (debian:bookworm-slim) ships ONLY ca-certificates —
       # there is NO wget or curl — so an HTTP-client probe would always fail with

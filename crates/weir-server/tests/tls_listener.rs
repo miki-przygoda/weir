@@ -385,3 +385,61 @@ fn sighup_reloads_tls_when_configured() {
 
     srv.shutdown();
 }
+
+/// Lame duck on the TCP side (Foundations §7): within 200 ms of SIGTERM the
+/// TCP listener refuses new connections, while the process is still alive
+/// (its drain is spending the budget on a black-holed sink), and the exit is
+/// bounded by shutdown_timeout + budget + 6 s. The 200 ms half is pinned
+/// in-process by Task 4.7's `tcp_lame_duck_closes_the_listener_before_the_connection_drain`.
+#[test]
+fn sigterm_closes_the_tcp_listener_at_once() {
+    let fx = TlsFixture::generate("tcp_lame_duck");
+    let hole = weir_testkit::RecordingSink::start_hanging();
+    let mut srv = weir_server!("tcp_lame_duck")
+        .tls(&fx)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 4",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .start();
+    let addr = srv.tcp_addr();
+    // A sealed segment for the drain to hang on.
+    let cfg = client_config_with_cert(&fx.ca_cert_path, &fx.client_cert_path, &fx.client_key_path);
+    let mut stream = tls_connect(addr, cfg).expect("handshake");
+    for i in 0..8 {
+        let mut p = format!("tcp-ld-{i}-").into_bytes();
+        p.resize(2048, b't');
+        assert_eq!(push_one(&mut stream, &p).unwrap(), MessageType::Ack);
+    }
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let t0 = Instant::now();
+    srv.signal(libc::SIGTERM);
+    loop {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+            Err(_) => break,
+            Ok(_) => assert!(
+                t0.elapsed() < Duration::from_millis(200),
+                "the TCP listener must close within 200 ms of SIGTERM"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        srv.wait_for_exit(Duration::from_millis(100)).is_none(),
+        "the process must still be in its drain budget"
+    );
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 4 + 6))
+        .expect("shutdown not bounded");
+    assert!(status.success());
+}

@@ -754,6 +754,11 @@ pub(crate) struct Metrics {
     pub config_segment_max_lifetime_seconds: Gauge<f64, AtomicU64>,
     pub config_sink_max_retries: Gauge<f64, AtomicU64>,
     pub config_shutdown_timeout_seconds: Gauge<f64, AtomicU64>,
+    /// Effective `drain_shutdown_budget_secs` (Foundations §7).
+    pub config_drain_shutdown_budget_seconds: Gauge<f64, AtomicU64>,
+    /// Unix time (seconds) at which a bounded shutdown abandons the drain's
+    /// in-flight work. 0 until T2 (`request_stop`) sets it.
+    pub drain_shutdown_deadline_seconds: Gauge<f64, AtomicU64>,
     pub records_nack_internal: Family<NackInternalLabel, Counter<u64, AtomicU64>>,
     #[allow(dead_code)] // written from PR 3 (the accept loop)
     pub connections_refused_no_live_shard: Counter<u64, AtomicU64>,
@@ -1342,6 +1347,17 @@ impl Metrics {
             "weir_config_shutdown_timeout_seconds",
             "Effective shutdown_timeout_secs"
         );
+        let config_drain_shutdown_budget_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_drain_shutdown_budget_seconds",
+            "Effective drain_shutdown_budget_secs"
+        );
+        let drain_shutdown_deadline_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_shutdown_deadline_seconds",
+            "Unix time at which a bounded shutdown abandons the drain's in-flight work \
+             (0 = not shutting down)"
+        );
         let records_nack_internal = reg!(
             Family::<NackInternalLabel, Counter<u64, AtomicU64>>::default(),
             "weir_records_nack_internal",
@@ -1475,6 +1491,8 @@ impl Metrics {
             config_segment_max_lifetime_seconds,
             config_sink_max_retries,
             config_shutdown_timeout_seconds,
+            config_drain_shutdown_budget_seconds,
+            drain_shutdown_deadline_seconds,
             records_nack_internal,
             connections_refused_no_live_shard,
             drain_segments_abandoned,
@@ -1711,6 +1729,8 @@ impl Metrics {
             .set(f64::from(c.sink_max_retries));
         self.config_shutdown_timeout_seconds
             .set(c.shutdown_timeout_secs as f64);
+        self.config_drain_shutdown_budget_seconds
+            .set(c.drain_shutdown_budget_secs as f64);
     }
 
     /// Sets `weir_startup_phase` one-hot on `phase`.
@@ -1875,6 +1895,8 @@ mod tests {
             "weir_connections_refused_no_live_shard",
             "weir_drain_segments_abandoned",
             "weir_wab_segments_not_handed_off",
+            "weir_config_drain_shutdown_budget_seconds",
+            "weir_drain_shutdown_deadline_seconds",
         ];
         if cfg!(feature = "bench-trace") {
             expected.extend([
@@ -2080,6 +2102,26 @@ mod tests {
         assert_eq!(
             m.config_shutdown_timeout_seconds.get(),
             c.shutdown_timeout_secs as f64
+        );
+        assert_eq!(
+            m.config_drain_shutdown_budget_seconds.get(),
+            c.drain_shutdown_budget_secs as f64
+        );
+    }
+
+    #[test]
+    fn the_shutdown_budget_and_deadline_gauges_are_exported() {
+        let (m, reg) = Metrics::new();
+        m.config_drain_shutdown_budget_seconds.set(10.0);
+        m.drain_shutdown_deadline_seconds.set(1_800_000_000.5);
+        let out = encode_to_string(&reg);
+        assert!(
+            out.contains("weir_config_drain_shutdown_budget_seconds 10"),
+            "{out}"
+        );
+        assert!(
+            out.contains("weir_drain_shutdown_deadline_seconds 1800000000.5"),
+            "{out}"
         );
     }
 

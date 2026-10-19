@@ -241,6 +241,7 @@ pub(crate) struct PartialConfig {
     pub metrics_max_connections: Option<usize>,
     pub peer_uid_check: Option<bool>,
     pub shutdown_timeout_secs: Option<u64>,
+    pub drain_shutdown_budget_secs: Option<u64>,
     pub connection_read_timeout_secs: Option<u64>,
     pub sink_type: Option<String>,
     pub sink_url: Option<String>,
@@ -455,6 +456,11 @@ pub struct Config {
     /// permissions are the chosen trust boundary.
     pub peer_uid_check: bool,
     pub shutdown_timeout_secs: u64,
+    /// How long the drain may keep delivering after every flusher has joined
+    /// (spec §7 T2). At the deadline the in-flight segment is abandoned without
+    /// a `.confirmed` and everything left replays on the next start. 0 =
+    /// abandon at once. Default 10.
+    pub drain_shutdown_budget_secs: u64,
     pub connection_read_timeout_secs: u64,
     pub sink_type: SinkType,
     // These fields are read by the non-noop sink arms in main.rs (http / mysql /
@@ -917,6 +923,18 @@ impl Config {
             });
         }
 
+        // Bounded shutdown (Foundations §7): the drain's budget after the
+        // flusher joins. 0 is legal (seal, hand off, abandon what is in
+        // flight); the hour cap keeps a typo from turning SIGTERM back into
+        // "deliver the whole backlog".
+        let drain_shutdown_budget_secs = merge!(drain_shutdown_budget_secs).unwrap_or(10);
+        check_range(
+            "drain_shutdown_budget_secs",
+            drain_shutdown_budget_secs,
+            0,
+            3600,
+        )?;
+
         // Per-connection read timeout. Caps how long a connection handler can
         // sit in read_exact waiting for the next byte. Without this a slow or
         // silent client can hold a semaphore permit indefinitely (slowloris).
@@ -1239,6 +1257,7 @@ impl Config {
             metrics_max_connections,
             peer_uid_check,
             shutdown_timeout_secs,
+            drain_shutdown_budget_secs,
             connection_read_timeout_secs,
             sink_type,
             sink_url: RedactedUrl(sink_url),
@@ -2942,5 +2961,37 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("wab_max_bytes"), "{err}");
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn drain_shutdown_budget_defaults_to_ten_seconds() {
+        let dir = tmp_dir("budget_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        // Spec §13: 10 s, counted from the flusher joins (owner decision).
+        assert_eq!(c.drain_shutdown_budget_secs, 10);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn drain_shutdown_budget_accepts_zero_and_an_hour_and_rejects_more() {
+        for ok in [0u64, 3600] {
+            let dir = tmp_dir(&format!("budget_ok_{ok}"));
+            let c = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    drain_shutdown_budget_secs: Some(ok),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .unwrap();
+            // 0 is legal: "seal, hand off, abandon whatever is in flight".
+            assert_eq!(c.drain_shutdown_budget_secs, ok);
+            fs::remove_dir_all(dir).ok();
+        }
+        assert_knob_rejected("rng_drain_budget", "drain_shutdown_budget_secs", |p| {
+            p.drain_shutdown_budget_secs = Some(3601)
+        });
     }
 }

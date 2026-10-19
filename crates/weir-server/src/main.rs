@@ -1,5 +1,8 @@
 mod config;
 mod drain;
+// The shutdown level, the signal task and the bounded drain wait (Foundations
+// §5.6, §7).
+mod lifecycle;
 mod logging;
 mod metrics;
 mod models;
@@ -10,7 +13,6 @@ mod sink;
 mod status;
 // Test-only fault hooks for the system tests (spec §16); inert unless
 // WEIR_TEST_HOOKS=1 is also set.
-#[cfg(feature = "test-hooks")]
 mod test_hooks;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
@@ -61,28 +63,6 @@ use tracing::{info, warn};
 use config::Config;
 use drain::{DrainConfig, DrainHeartbeat};
 use models::WorkUnit;
-
-// ── Startup settle wait ───────────────────────────────────────────────────────
-
-/// How long startup waits for every flusher to leave `Starting` (and every
-/// worker to start) before binding the producer listeners (spec §6 step 10).
-/// Unsettled shards stay `Starting` and are not routed to.
-const SHARD_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Polls `done` every `poll` until it returns true (→ true) or `timeout`
-/// passes (→ false). `done` is always called at least once.
-fn wait_until(timeout: Duration, poll: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if done() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(poll);
-    }
-}
 
 // ── wab_dir lock integrity ────────────────────────────────────────────────────
 
@@ -161,11 +141,11 @@ fn apply_lock_integrity(
 
 /// Spawns the once-a-second `wab_dir` lock integrity check (spec §3.1) on its
 /// own thread, right after the lock is acquired and only when it is actually
-/// held. A plain thread, not a runtime task, because the long startup phases
-/// (recovery, and a replay that blocks at sink speed for as long as the
-/// backlog lasts) run before the runtime exists: a check that only started
-/// with the runtime left the stated ~1 s window unbounded there
-/// (conf-durability-3). Not part of the 5 s WAB poll either, which skips
+/// held. A plain thread, not a runtime task, so it already runs during
+/// preflight, before the runtime exists: a check that only started with the
+/// runtime once left the stated ~1 s window unbounded through the long
+/// startup phases (conf-durability-3), and recovery still runs on main's
+/// thread, outside any runtime task. Not part of the 5 s WAB poll either, which skips
 /// everything when its scan returns `None`. The first check runs at once.
 fn spawn_lock_integrity_thread(
     wab_dir: std::path::PathBuf,
@@ -193,6 +173,25 @@ fn spawn_lock_integrity_thread(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// The daemon. Startup is spec §6 (lock, preflight, runtime and signals,
+/// metrics, recovery, the replay handed to the drain, producer listeners);
+/// shutdown is the bounded §7 sequence:
+///
+/// - **T0** (the signal task, `Lifecycle::request_shutdown`): readiness off,
+///   phase `shutting_down`, drain absorb, the flushers' shutdown flag, and the
+///   lame duck (the producer socket unlinked, the TCP listener closed).
+/// - **T1** (here): await both listeners' bounded connection drains, abort the
+///   queue-depth task, wait up to `QUEUE_SENDERS_GRACE` for every work-queue
+///   sender to go, then join the workers and the flushers (each seals, fsyncs
+///   and hands off within its 1 s budget).
+/// - **T2**: `request_stop(drain_shutdown_budget_secs)`, publish the deadline,
+///   and wait for the drain at most `DRAIN_EXIT_GRACE` past it.
+/// - **T3**: one no-I/O summary line, `shutdown_timeout(1 s)`, exit 0. A drain
+///   that never returned takes the orphan exit, `process::exit(0)`.
+///
+/// A second SIGTERM/SIGINT forces: connection drains abort and the drain
+/// deadline becomes now, but the worker and flusher joins still run. Exit
+/// status is 0 for clean, forced and orphaned exits alike.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Tighten process umask to 0o077 immediately. Defense-in-depth: every
     // file-creation path in weir specifies its mode bits explicitly today, so
@@ -206,14 +205,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // That nested tightening sees the value set here as its "previous", so
     // restoration is consistent.
     //
-    // SIGHUP is ignored from here until the runtime installs the reload
-    // handler (reload::spawn_sighup_task, first thing inside `block_on`). With
-    // the default disposition a HUP (a `systemctl reload`, a log-rotation
-    // script, a terminal hang-up) killed the daemon outright, skipping the seal
-    // and the drain, and before this only a TLS build with tcp_bind ever
-    // installed a handler. Set before Config::load so a HUP during recovery or
-    // the blocking replay is dropped too: safe, because the real TLS load
-    // happens later and reads the current files (spec §3.2).
+    // SIGHUP is ignored from here until startup step 4 installs the reload
+    // handler (reload::spawn_sighup_task, right after the runtime is built and
+    // before recovery). With the default disposition a HUP (a `systemctl
+    // reload`, a log-rotation script, a terminal hang-up) killed the daemon
+    // outright, skipping the seal and the drain, and before this only a TLS
+    // build with tcp_bind ever installed a handler. Set before Config::load so
+    // a HUP during the config load, the lock or preflight is dropped: safe,
+    // because the real TLS load happens later and reads the current files
+    // (spec §3.2). From step 4 on, a HUP is served as a reload.
     //
     // Safety: libc::umask is always safe; it swaps the process umask and
     // returns the previous value. libc::signal with SIG_IGN installs no handler
@@ -239,11 +239,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in &config_warnings {
         warn!("config: {w}");
     }
-    // A test-hooks build says so loudly, active or not: it must never be the
-    // binary a production host runs.
-    #[cfg(feature = "test-hooks")]
-    test_hooks::warn_if_compiled_in();
-
     // Name the config source, so "which file did it read?" is answerable from
     // the log alone. A missing file has its own WARN above (spec §3.4).
     info!(
@@ -280,6 +275,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config = ?config_view,
         "weir starting"
     );
+    // A test-hooks build says so loudly, armed or not: it must never be the
+    // binary a production host runs. A no-op without the feature.
+    test_hooks::warn_if_compiled_in();
 
     // ── wab_dir ownership ─────────────────────────────────────────────────────
     //
@@ -317,10 +315,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
     // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
     // (created with the status board below); the integrity thread is the only
-    // writer. The thread starts now,
-    // so the check covers preflight, recovery and the startup replay as well
-    // as the runtime: a deletion during those phases is caught within a tick,
-    // and proven loss exits 3 before anything is served.
+    // writer. The thread starts now, so the check covers preflight and
+    // recovery as well as serving: a deletion during those phases is caught
+    // within a tick, and proven loss exits 3 before anything is served.
     let wab_ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if lock_outcome == wab::lock::LockOutcome::Held {
         spawn_lock_integrity_thread(
@@ -391,39 +388,184 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // discover it by benchmarking.
     advise_agent_count(config.shard_count, config.worker_count);
 
-    // ── Queue ─────────────────────────────────────────────────────────────────
+    // ── Step 3: in-memory setup (Foundations §6) ──────────────────────────────
+    //
+    // Metrics, the status board, the ownership flag and its integrity thread
+    // already exist (above preflight). This step adds the queue, the drain
+    // channel, the drain's control and the Lifecycle.
 
     // One queue partition per worker. Pushes are routed by shard_id so every
     // record for a given shard lands on a single worker's partition — see
     // worker::spawn_workers for the per-shard FIFO invariant.
     let (queue_tx, queue_rx) = queue::new::<WorkUnit>(config.worker_count);
+    // Held in an Option so every path names where main's sender is dropped
+    // (§5.7): `serve` takes it, or the pre-serving path drops it.
+    let mut queue_tx = Some(queue_tx);
 
-    // ── Drain channel ─────────────────────────────────────────────────────────
-
+    // ONE Receiver (the drain), Senders only in the flushers (§4). There is no
+    // startup replay sender any more: the replay list goes to the drain in
+    // memory (step 10).
     let (drain_tx, drain_rx) =
         crossbeam_channel::bounded::<std::path::PathBuf>(wab::DRAIN_CHANNEL_CAPACITY);
     metrics
         .drain_channel_capacity
         .set(wab::DRAIN_CHANNEL_CAPACITY as f64);
-    // Startup-only sender for replaying sealed-but-unconfirmed segments from a
-    // previous run. Replay runs AFTER the drain consumer is spawned (below) so
-    // the blocking bounded-channel sends drain live instead of dead-locking the
-    // startup thread on a recovery backlog larger than the channel capacity (B3).
-    // Dropped immediately after replay so it doesn't keep the channel open at
-    // shutdown.
-    let replay_tx = drain_tx.clone();
 
-    // ── Coalesce hint: shared EWMA of fsync latency ───────────────────────────
+    // ATTACHED (Foundations §5.4): the drain's lifetime is this control, not the
+    // channel. A closed channel (every flusher gone, e.g. shard_count=1 and the
+    // only flusher offline) no longer ends delivery; only request_stop /
+    // force_stop do. Every path past the drain spawn therefore reaches
+    // request_stop below, or exits the process.
+    let drain_ctl = drain::control::DrainControl::attached();
+    // The flushers' shutdown flag (spec §5.5); the Lifecycle sets it at T0.
+    let flushers_shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lifecycle = Arc::new(lifecycle::Lifecycle::new(
+        Arc::clone(&board),
+        Arc::clone(&metrics),
+        drain_ctl.clone(),
+        Arc::clone(&flushers_shutting_down),
+    ));
+    // The status-board block above already entered `initializing`.
+    let started = std::time::Instant::now();
+
+    // ── Step 4: runtime, signals, reload ──────────────────────────────────────
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // Held for the rest of main: the sync binds (bind_hardened's
+    // UnixListener::from_std) and every spawn below need a reactor. Recovery,
+    // the scans and the joins run on this thread OUTSIDE any block_on, while
+    // the runtime's workers serve HTTP and the signal handlers.
+    let rt_guard = rt.enter();
+
+    // The one reload path (spec §3.2). The SIGHUP handler replaces the SIG_IGN
+    // set at the top of main; from here, which is now before recovery, a HUP
+    // is a counted reload request instead of a dropped signal. The TLS step
+    // below registers its config once it has loaded it.
+    let reloader = reload::Reloader::new(Arc::clone(&metrics), tcp_configured);
+    let reload_tx = reload::spawn_reload_loop(Arc::clone(&reloader));
+    // [PR 6 slot] `reloader.attach_board(..)` and a `reload_tx.clone()` for the
+    // admin `reload` verb, which reuses this queue.
+    #[cfg(unix)]
+    reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
+    #[cfg(not(unix))]
+    drop(reload_tx);
+    // SIGTERM/SIGINT are handled from here on (§6 step 4), every delivery, not
+    // only the first. A signal before this line takes the default disposition:
+    // nothing is in flight yet. The lock-integrity thread has run since right
+    // after the lock; nothing to start for it here.
+    lifecycle.spawn_signal_task()?;
+
+    // ── Step 5: metrics/health listener ───────────────────────────────────────
     //
-    // Flusher threads update this after each fsync; worker threads read it once
-    // per batch to size their coalesce window. Lock-free, Relaxed ordering —
-    // it is a heuristic, not a correctness signal.
+    // Before recovery, so `/metrics` (and the startup phase in it) answers
+    // during a long recovery. Default metrics_bind is 127.0.0.1 — see
+    // Config::metrics_bind for the security reasoning around exposing this
+    // surface on the network. Preflight test-bound it, so a failure here is a
+    // race (spec §3.0).
+    let metrics_listener = rt
+        .block_on(tokio::net::TcpListener::bind((
+            config.metrics_bind,
+            config.metrics_port,
+        )))
+        .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
+    // PR 5 swaps this for the router (HttpState); the bind point stays here.
+    metrics::server::spawn(
+        metrics_listener,
+        Arc::clone(&registry),
+        config.metrics_max_connections,
+    );
+    info!(
+        bind = %config.metrics_bind,
+        port = config.metrics_port,
+        max_connections = config.metrics_max_connections,
+        "metrics endpoint listening"
+    );
+
+    // ── Step 6: TLS material, before a long recovery ──────────────────────────
     //
-    // Initial value 200 µs matches the old fixed COALESCE_WINDOW constant so
-    // behaviour before the first fsync is unchanged.
+    // Config validation guarantees the three tls_* paths are present whenever
+    // tcp_bind is set; preflight has already loaded this material once, so a
+    // failure here is a race (spec §3.0).
+    #[cfg(all(unix, feature = "tls"))]
+    let tls = match config.tcp_bind {
+        Some(_) => {
+            let (cert, key, ca) = preflight::tls_paths(&config)?;
+            let tls = socket::tls::ReloadableServerConfig::load(cert, key, ca)
+                .map_err(|e| preflight::tls_load_error(&e))?;
+            // Register for reload before `tls` moves into tcp::run. The clone
+            // shares the same inner ArcSwap, so a reload from the reload loop
+            // is immediately visible to the accept loop's `tls.current()`.
+            reloader.register_tls(tls.clone());
+            Some(tls)
+        }
+        None => None,
+    };
+
+    // ── Step 7: [PR 6 slot] admin socket ──────────────────────────────────────
+    // admin path → refuse_if_live → bind_hardened_with → admin::spawn(..,
+    // lifecycle.subscribe()). `drain.pause` is accepted from here on.
+
+    // ── Step 8: recovery, on this thread, while HTTP is served ────────────────
+    //
+    // Every shard dir made private, then each unsealed segment a crash left
+    // sealed. A signal here sets the level, but recovery is never interrupted:
+    // main finishes the step and skips the producer side below.
+    lifecycle.publish_phase(weir_status::Phase::Recovering);
+    if let Some(d) = test_hooks::startup_delay() {
+        warn!(
+            delay_ms = d.as_millis() as u64,
+            "test hook: delaying the recovering phase"
+        );
+        std::thread::sleep(d);
+    }
+    let recovery = wab::recover(&config.wab_dir, config.shard_count, &metrics)?;
+    info!(
+        shard_dirs = recovery.shard_dirs,
+        quarantined = recovery.segments_quarantined,
+        failed = recovery.segments_failed,
+        elapsed_ms = recovery.elapsed.as_millis() as u64,
+        "WAB recovery complete"
+    );
+
+    // ── Step 9: hand-off: the replay list in memory, then the first cap scan ──
+    lifecycle.publish_phase(weir_status::Phase::Handoff);
+    // Orphan deletion (spec §4.3, D7) is safe only while this daemon owns the
+    // wab_dir: with a second daemon on the same directory, a sealed segment
+    // beside a valid sidecar may be that daemon's confirm in progress. The
+    // ownership comes from the wab_dir lock: under `wab_dir_lock =
+    // "best-effort"` on a filesystem that cannot lock, nothing proves we are
+    // alone, so orphans are kept exactly as before.
+    let orphan_cleanup = lock_outcome == wab::lock::LockOutcome::Held;
+    // The sealed-but-unconfirmed backlog from a previous run. It becomes the
+    // drain's `backlog`, which alternates with live segments (spec §5.4);
+    // the two share no connection, so per-connection order is unchanged. No
+    // sends: a backlog larger than the drain channel can no longer block
+    // startup (B3), and the producer socket no longer waits on the sink.
+    let replay = wab::scan_replay(
+        &config.wab_dir,
+        config.shard_count,
+        &metrics,
+        orphan_cleanup,
+    )?;
+    let replay_len = replay.len();
+    // Spec §6 step 9: the first size scan and cap evaluation run here,
+    // synchronously, before any producer listener exists (fail-closed): a
+    // restart over the cap must not read wab_bytes_now = 0 and admit pushes.
+    status::poll::startup_cap_gate(&config.wab_dir, config.wab_max_bytes, &board, &metrics);
+
+    // ── Step 10: pipeline ─────────────────────────────────────────────────────
+
+    // Coalesce hint: the shared EWMA of fsync latency. Flusher threads update
+    // it after each fsync; worker threads read it once per batch to size
+    // their coalesce window. Lock-free, Relaxed ordering — it is a heuristic,
+    // not a correctness signal. Initial value 200 µs matches the old fixed
+    // COALESCE_WINDOW constant so behaviour before the first fsync is
+    // unchanged.
     let coalesce_hint = Arc::new(AtomicU64::new(200));
-
-    // ── WAB (one flusher thread per shard) ────────────────────────────────────
+    // The 5 s poll task reports the EWMA as evidence; the workers take the
+    // original.
+    let coalesce_hint_for_poll = Arc::clone(&coalesce_hint);
 
     let wab_config = wab::WabConfig {
         shard_count: config.shard_count,
@@ -445,29 +587,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         compression_level: config.wab_compression_level,
     };
-    // Recovery is its own step (spec §6 step 8): every shard dir made private,
-    // then each unsealed segment a crash left sealed. PR 4 runs it while the
-    // runtime already serves HTTP; here it keeps its old position.
-    board.enter_phase(weir_status::Phase::Recovering, &metrics);
-    let recovery = wab::recover(&config.wab_dir, config.shard_count, &metrics)?;
-    info!(
-        shard_dirs = recovery.shard_dirs,
-        quarantined = recovery.segments_quarantined,
-        failed = recovery.segments_failed,
-        elapsed_ms = recovery.elapsed.as_millis() as u64,
-        "WAB recovery complete"
-    );
-    // The flushers' shutdown flag (spec §5.5). The Lifecycle (PR 4) owns it and
-    // sets it at T0; until then nothing sets it, so every hand-off behaves as
-    // the blocking send it replaces.
-    let flushers_shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handoff = wab::handoff::HandoffConfig {
-        shutting_down: Arc::clone(&flushers_shutting_down),
-        drain_depth: Arc::clone(&board.drain_depth),
-        marker: Some(Arc::clone(&board) as Arc<dyn wab::handoff::HandoffMarker>),
-    };
-    // The status board's shard registry: flusher supervisors and worker drop
-    // guards record each shard's and worker's state on it (spec §5.3).
+    // One flusher thread per shard. MUST run after recovery: each flusher
+    // establishes its segment counter from what recovery left on disk. The
+    // flusher supervisors record each shard's state on the board's registry
+    // (spec §5.3).
     let wab_handle = wab::spawn_flushers(
         config.wab_dir.clone(),
         wab_config,
@@ -475,18 +598,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
         Arc::clone(&board.shards),
-        handoff,
+        wab::handoff::HandoffConfig {
+            shutting_down: Arc::clone(&flushers_shutting_down),
+            drain_depth: Arc::clone(&board.drain_depth),
+            marker: Some(Arc::clone(&board) as Arc<dyn wab::handoff::HandoffMarker>),
+        },
     )?;
 
-    // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
-    //
     // Workers send `Batch`es directly to the WAB flusher via the shard channels
-    // returned by `wab::spawn_flushers`. No bridge thread: the hop is
-    // worker → Batch-channel → flusher.
-
-    // The 5 s poll task reports the EWMA as evidence; the workers take the
-    // original.
-    let coalesce_hint_for_poll = Arc::clone(&coalesce_hint);
+    // returned by `wab::spawn_flushers`: worker → Batch-channel → flusher.
     let worker_handles = worker::spawn_workers_with(
         &queue_rx,
         wab_handle.shard_txs,
@@ -498,15 +618,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Arc::clone(&board.shards)),
     );
 
-    // ── Drain ─────────────────────────────────────────────────────────────────
-
-    // Orphan deletion (spec §4.3, D7) is safe only while this daemon owns the
-    // wab_dir: with a second daemon on the same directory, a sealed segment
-    // beside a valid sidecar may be that daemon's confirm in progress. The
-    // ownership comes from the wab_dir lock: under `wab_dir_lock =
-    // "best-effort"` on a filesystem that cannot lock, nothing proves we are
-    // alone, so orphans are kept exactly as before.
-    let orphan_cleanup = lock_outcome == wab::lock::LockOutcome::Held;
     let drain_config = DrainConfig {
         wab_dir: config.wab_dir.clone(),
         dead_letter_max_bytes: config.dead_letter_max_bytes,
@@ -522,6 +633,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // commit_timeout: 5s, or the sink's own timeout if that's shorter.
         health_probe_timeout: Duration::from_secs(config.sink_timeout_secs.min(5)),
         orphan_cleanup,
+        // The safety floor's escalation floor (3 strand cycles AND 10 minutes).
         local_read_escalation_min_age: drain::LOCAL_READ_ESCALATION_MIN_AGE,
     };
     // The stall verdict tells a slow sink call from a sink blocking the drain's
@@ -546,204 +658,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .set(1.0);
 
-    // Foundations PR 2: the drain publishes to the status board. It stays
-    // Detached ("channel closed = deliver what is queued, then exit") until
-    // PR 4 flips it to Attached together with the lifecycle that calls
-    // request_stop. No drain-channel handle is created here: the drain owns
-    // the only Receiver, the flushers the only Senders.
-    let drain_runtime = drain::DrainRuntime {
-        control: drain::DrainControl::detached(),
-        board: Some(Arc::clone(&board)),
-        initial_backlog: Vec::new(),
-    };
-
-    // Sink selection (spec §5.12): builds the sink, still after recovery.
-    // `drain_runtime` (detached control, the board, no backlog) moves into
-    // the one drain the spawner starts.
+    // Sink selection (spec §5.12). The drain owns the drain channel's only
+    // Receiver; the flushers hold the only Senders.
     let drain_spawner = sink::select::build_drain_spawner(&config, &metrics)?;
     let drain_handle = drain_spawner.spawn(sink::select::DrainSpawnArgs {
         rx: drain_rx,
         config: drain_config,
         metrics: Arc::clone(&metrics),
         heartbeat: drain_heartbeat.clone(),
-        runtime: drain_runtime,
+        runtime: drain::DrainRuntime {
+            control: drain_ctl.clone(),
+            board: Some(Arc::clone(&board)),
+            // The replay list, in memory: no blocking sends (§5.5).
+            initial_backlog: replay,
+        },
     });
 
-    // ── Replay recovery backlog (drain consumer is now live) ──────────────────
-    //
-    // Replay sealed-but-unconfirmed segments from a previous run now that the
-    // drain thread is consuming. Done here rather than inside wab::recover so the
-    // blocking sends into the bounded drain channel are drained live — a backlog
-    // larger than the channel capacity would otherwise dead-lock startup (B3).
-    // Runs before the socket binds, so the recovery backlog is queued ahead of
-    // any newly-accepted traffic.
-    board.enter_phase(weir_status::Phase::Handoff, &metrics);
-    wab::replay_unconfirmed(
-        &config.wab_dir,
-        config.shard_count,
-        &replay_tx,
-        &metrics,
-        orphan_cleanup,
-    )?;
-    drop(replay_tx); // release the startup sender so shutdown can close the drain channel
+    // Background: queue depth and the drain channel's high-water stamp every
+    // 500 ms (spec §5.11). It holds a queue sender, so shutdown aborts it
+    // before the worker joins.
+    let queue_depth_task = status::poll::spawn_queue_depth_task(
+        queue_tx
+            .as_ref()
+            .expect("queue_tx is still owned by main")
+            .clone(),
+        Arc::clone(&metrics),
+        Arc::clone(&board),
+    );
 
-    // Spec §6 step 9: the first size scan and cap evaluation run here,
-    // synchronously, before any producer listener exists (fail-closed).
-    status::poll::startup_cap_gate(&config.wab_dir, config.wab_max_bytes, &board, &metrics);
+    // Background: scan WAB shard dirs for on-disk byte usage every 5 s. The
+    // scan is synchronous I/O (read_dir + metadata per entry) so it runs
+    // inside spawn_blocking — putting it directly on a tokio worker would
+    // stall the runtime in proportion to the number of segments. It also
+    // evaluates the conditions, latches them and publishes the status gauges
+    // (spec §5.11), on every tick. The drain's `health_poll_interval` sets
+    // the idle grace of the heartbeat-stall check: the long deliberate waits
+    // inside the drain loop bump the heartbeat themselves, and a single long
+    // sink call or local I/O operation is named by the busy signal.
+    let mut poll = status::poll::WabPoll::new(
+        Arc::clone(&metrics),
+        Arc::clone(&wab_bytes_now),
+        config.wab_max_bytes,
+        drain_heartbeat,
+        status::poll::DrainLiveness::new(
+            std::time::Instant::now(),
+            Duration::from_secs(config.health_poll_interval_secs),
+            commit_timeout_for_stall,
+        ),
+    )
+    .with_status(status::poll::PollStatus::new(
+        Arc::clone(&board),
+        config.wab_dir.clone(),
+        coalesce_hint_for_poll,
+    ));
+    let wab_dir_bg = config.wab_dir.clone();
+    rt.spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let wab_dir = wab_dir_bg.clone();
+            poll.tick(std::time::Instant::now(), move || {
+                tokio::task::spawn_blocking(move || {
+                    status::poll::compute_wab_bytes_on_disk(&wab_dir)
+                })
+            })
+            .await;
+        }
+    });
 
-    // Spec §6 step 10: routing sends connections only to settled,
-    // ingest-capable shards, so the listeners wait for the flushers' counter
-    // scans (PR 4 moves this into its startup step 10). Routing also needs the
-    // shard's worker running (PR 1's `ingest_capable`), so wait for every
+    // Routing sends connections only to settled, ingest-capable shards, so
+    // the listeners wait for the flushers' counter scans. Routing also needs
+    // the shard's worker running (PR 1's `ingest_capable`), so wait for every
     // worker too: a connection accepted before a worker has entered its guard
     // would otherwise be refused as no_live_shard.
-    if !wait_until(SHARD_SETTLE_TIMEOUT, Duration::from_millis(10), || {
-        board.shards.all_settled()
-            && (0..board.shards.worker_count()).all(|w| board.shards.worker_running(w))
+    // A shutdown already requested skips the wait: nothing will be bound.
+    if !lifecycle::wait_until(lifecycle::SETTLE_WAIT, Duration::from_millis(10), || {
+        lifecycle.level() != lifecycle::ShutdownLevel::Running
+            || (board.shards.all_settled()
+                && (0..board.shards.worker_count()).all(|w| board.shards.worker_running(w)))
     }) {
         warn!(
-            timeout_secs = SHARD_SETTLE_TIMEOUT.as_secs(),
+            timeout_secs = lifecycle::SETTLE_WAIT.as_secs(),
             "not every WAB shard and worker settled before the producer listeners were \
              bound; unsettled shards receive no connections until they come up"
         );
     }
 
-    // ── Tokio runtime: socket accept loop + metrics server ────────────────────
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async {
-        // The one reload path (spec §3.2), first in the runtime: the SIGHUP
-        // handler replaces the SIG_IGN set at the top of main, and from here a
-        // HUP is a counted reload request instead of a no-op drop. The TLS
-        // branch below registers its config once it has loaded it.
-        let reloader = reload::Reloader::new(Arc::clone(&metrics), tcp_configured);
-        let reload_tx = reload::spawn_reload_loop(Arc::clone(&reloader));
-        #[cfg(unix)]
-        reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
-        #[cfg(not(unix))]
-        drop(reload_tx);
-
-        // Bind metrics listener before starting the socket loop. Default
-        // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the
-        // security reasoning around exposing this surface on the network.
-        let metrics_listener =
-            tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port))
-                .await
-                .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
-        metrics::server::spawn(
-            metrics_listener,
-            Arc::clone(&registry),
-            config.metrics_max_connections,
-        );
-
-        info!(
-            bind = %config.metrics_bind,
-            port = config.metrics_port,
-            max_connections = config.metrics_max_connections,
-            "metrics endpoint listening"
-        );
-
-        // Background: queue depth and the drain channel's high-water stamp
-        // every 500 ms (spec §5.11).
-        let _queue_depth_task = status::poll::spawn_queue_depth_task(
-            queue_tx.clone(),
-            Arc::clone(&metrics),
-            Arc::clone(&board),
-        );
-
-        // Background: scan WAB shard dirs for on-disk byte usage every 5 s.
-        // The scan is synchronous I/O (read_dir + metadata per entry) so it
-        // runs inside spawn_blocking — putting it directly on a tokio worker
-        // would stall the runtime in proportion to the number of segments.
-        // It also evaluates the conditions, latches them and publishes the
-        // status gauges (spec §5.11), on every tick.
-        let wab_dir_bg = config.wab_dir.clone();
-        let metrics_w = Arc::clone(&metrics);
-        let wab_bytes_bg = Arc::clone(&wab_bytes_now);
-        // Captured before the task is spawned so the growth-warning predicate
-        // sees the operator's configured cap without reaching back into `config`.
-        let cap_for_warning = config.wab_max_bytes;
-        // Same idea for the heartbeat-stall check below: the drain's own
-        // `health_poll_interval` sets the grace period in
-        // `drain_heartbeat_looks_wedged`. The grace period only has to cover an
-        // IDLE drain now — the two long deliberate waits inside the drain loop
-        // bump the heartbeat themselves, as do commits and segment reads (see
-        // `drain::DrainHeartbeat`), and a single long sink call or local I/O
-        // operation is named by the busy signal, so a slow sink or a slow disk
-        // no longer has to be absorbed by this threshold.
-        let health_poll_interval_for_stall = Duration::from_secs(config.health_poll_interval_secs);
-        let drain_heartbeat_for_poll = drain_heartbeat;
-        let mut poll = status::poll::WabPoll::new(
-            metrics_w,
-            wab_bytes_bg,
-            cap_for_warning,
-            drain_heartbeat_for_poll,
-            status::poll::DrainLiveness::new(
-                std::time::Instant::now(),
-                health_poll_interval_for_stall,
-                commit_timeout_for_stall,
-            ),
-        )
-        .with_status(status::poll::PollStatus::new(
-            Arc::clone(&board),
-            config.wab_dir.clone(),
-            coalesce_hint_for_poll,
-        ));
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                let wab_dir = wab_dir_bg.clone();
-                poll.tick(std::time::Instant::now(), move || {
-                    tokio::task::spawn_blocking(move || status::poll::compute_wab_bytes_on_disk(&wab_dir))
-                })
-                .await;
-            }
-        });
-
-        // Shutdown coordination: signal handler → shutdown_tx → socket::serve exits.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        // ONE shared connection-cap semaphore for ALL listeners (Unix + TCP).
-        // Both listeners clone this Arc, so the COMBINED cap across all transports
-        // is exactly max_connections — not 2×max_connections as it would be with
-        // two independent semaphores.
-        let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
-
-        // One router for both transports: one refusal counter and one WARN
-        // limiter. It sends each connection only to an ingest-capable shard
-        // (spec §5.7).
-        #[cfg(unix)]
-        let router = socket::route::ShardRouter::live(
-            Arc::clone(&board) as Arc<dyn socket::route::LiveShards>
-        );
-
-        // TLS material loads before any bind (unchanged position relative to
-        // the TCP bind; PR 4 moves it to startup step 6). Config validation
-        // guarantees the three tls_* paths are present whenever tcp_bind is
-        // set; preflight has already loaded this material once and test-bound
-        // the address, so a failure here is a race (spec §3.0).
-        #[cfg(all(unix, feature = "tls"))]
-        let tls = match config.tcp_bind {
-            Some(_) => {
-                let (cert, key, ca) = preflight::tls_paths(&config)?;
-                let tls = socket::tls::ReloadableServerConfig::load(cert, key, ca)
-                    .map_err(|e| preflight::tls_load_error(&e))?;
-                // Register for reload before `tls` moves into tcp::run. The
-                // clone shares the same inner ArcSwap, so a reload from the
-                // reload loop is immediately visible to the accept loop's
-                // `tls.current()` call.
-                reloader.register_tls(tls.clone());
-                Some(tls)
-            }
-            None => None,
-        };
-
-        #[cfg(unix)]
+    // ── Steps 11-12: bind ALL producer listeners, then serve ─────────────────
+    //
+    // A signal during steps 4-10 set Graceful; main finished the step it was
+    // in and skips the producer side from here (spec §6 "A signal before
+    // serving"): nothing is bound, served or left on disk.
+    #[cfg(unix)]
+    let mut unix_join: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+    #[cfg(all(unix, feature = "tls"))]
+    let mut tcp_join: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+    #[cfg(unix)]
+    if lifecycle.level() == lifecycle::ShutdownLevel::Running {
+        lifecycle.publish_phase(weir_status::Phase::Binding);
+        // The producer socket's config (PR 1's `board` hook included), built
+        // once: `bind_all` reads it, then it moves into `serve`. Inline, so main
+        // keeps exactly two cloned ownership fields (this one and the TCP one).
         let socket_config = socket::SocketConfig {
             socket_path: config.socket_path.clone(),
             max_connections: config.max_connections,
@@ -759,25 +774,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             wab_ownership_lost: Arc::clone(&wab_ownership_lost),
             board: Some(Arc::clone(&board)),
         };
-
-        // Bind EVERY producer listener, then serve (spec §5.7, §6 step 11): a
-        // bind failure fails startup before any producer is acked. `bind_all`
-        // and `bind` write the listener marks (README Q6); main writes none
-        // here.
-        board.enter_phase(weir_status::Phase::Binding, &metrics);
-        #[cfg(unix)]
-        let listeners = socket::bind_all(&socket_config, config.tcp_bind).await?;
-
-        // Optional TCP+mTLS listener (feature = "tls"). It runs its own accept
-        // loop concurrently with the Unix loop, feeding the SAME pipeline via a
-        // cloned queue_tx. Both listeners share `conn_sem` above so the combined
-        // connection cap is the single global max_connections value.
-        //
-        // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
-        // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
-        #[cfg(all(unix, feature = "tls"))]
-        let (tcp_shutdown_tx, tcp_join) = match (listeners.tcp, tls) {
-            (Some(listener), Some(tls)) => {
+        // Bind EVERY producer listener, TCP first, then Unix, before serving
+        // any (spec §5.7, §6 step 11): a bind failure fails startup before any
+        // producer is acked. `bind` / `bind_all` mark the listeners Bound or
+        // Failed (README Q6); main marks nothing here.
+        let listeners = rt.block_on(socket::bind_all(&socket_config, config.tcp_bind))?;
+        if lifecycle.level() == lifecycle::ShutdownLevel::Running {
+            // ONE shared connection-cap semaphore for ALL listeners (Unix +
+            // TCP), so the COMBINED cap is exactly max_connections.
+            let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+            // One router for both transports: one refusal counter and one WARN
+            // limiter. It sends each connection only to an ingest-capable
+            // shard (spec §5.7).
+            let router = socket::route::ShardRouter::live(
+                Arc::clone(&board) as Arc<dyn socket::route::LiveShards>
+            );
+            let socket::BoundListeners { unix, tcp } = listeners;
+            // Optional TCP+mTLS listener: its own accept loop feeding the SAME
+            // pipeline through a cloned queue sender, on the same shutdown
+            // level, so SIGTERM puts both listeners into lame duck. `tcp::run`
+            // owns its handlers' shutdown watch, and is the one writer of the
+            // TCP listener's Closed and Failed marks (README Q6).
+            #[cfg(feature = "tls")]
+            if let (Some(listener), Some(tls)) = (tcp, tls) {
                 let tcp_config = socket::tcp::TcpConfig {
                     max_connections: config.max_connections,
                     max_payload_bytes: config.max_payload_bytes,
@@ -791,134 +810,212 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
                     wab_ownership_lost: Arc::clone(&wab_ownership_lost),
                 };
-
-                let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-                let tcp_queue_tx = queue_tx.clone();
-                let tcp_metrics = Arc::clone(&metrics);
-                // Pass a clone of the shared semaphore so Unix + TCP draw
-                // from the same permit pool — true global cap.
-                let tcp_sem = Arc::clone(&conn_sem);
-                let tcp_router = router.clone();
-                let tcp_board = Arc::clone(&board);
-                let tcp_join = tokio::spawn(async move {
-                    // tcp::run owns the handler-shutdown watch internally and
-                    // signals handlers BEFORE draining — no extra plumbing needed here.
-                    // PR 1's Closed / Failed marks (Task 1.23). Interim: PR 4
-                    // Task 4.7 moves them into `tcp::run` (README Q6).
-                    match socket::tcp::run(
+                tcp_join = Some(
+                    rt.spawn(socket::tcp::run(
                         tcp_config,
                         listener,
                         tls,
-                        tcp_queue_tx,
-                        tcp_sem,
-                        tcp_shutdown_rx,
-                        tcp_metrics,
-                        tcp_router,
-                    )
-                    .await
-                    {
-                        Ok(()) => tcp_board.listeners.tcp.set(weir_status::ListenerState::Closed),
-                        Err(e) => {
-                            tcp_board.listeners.tcp.set(weir_status::ListenerState::Failed);
-                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
-                        }
-                    }
-                });
-                (Some(tcp_shutdown_tx), Some(tcp_join))
+                        queue_tx
+                            .as_ref()
+                            .expect("queue_tx is still owned by main")
+                            .clone(),
+                        Arc::clone(&conn_sem),
+                        lifecycle.subscribe(),
+                        Arc::clone(&metrics),
+                        router.clone(),
+                        Arc::clone(&board),
+                    )),
+                );
             }
-            _ => (None, None),
-        };
-
-        let board_sig = Arc::clone(&board);
-        let metrics_sig = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                let mut sigterm = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::terminate(),
-                )
-                .expect("failed to install SIGTERM handler");
-                tokio::select! {
-                    _ = sigterm.recv() => { info!("received SIGTERM, initiating shutdown"); }
-                    _ = tokio::signal::ctrl_c() => { info!("received Ctrl-C, initiating shutdown"); }
-                }
+            #[cfg(not(feature = "tls"))]
+            drop(tcp); // always None: config validation rejects tcp_bind without tls
+            unix_join = Some(rt.spawn(socket::serve(
+                socket_config,
+                unix,
+                queue_tx.take().expect("queue_tx is served exactly once"),
+                lifecycle.subscribe(),
+                Arc::clone(&metrics),
+                conn_sem,
+                router,
+            )));
+            // `serve` enters Serving at its start, the phase's only writer
+            // (README Q6). Log once it has; a signal that wins that race makes
+            // `enter` refuse, and the line is skipped.
+            if lifecycle::wait_until(Duration::from_secs(1), Duration::from_millis(1), || {
+                board.life.ever_served()
+            }) {
+                info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    recovery_shard_dirs = recovery.shard_dirs,
+                    recovery_quarantined = recovery.segments_quarantined,
+                    replay_segments = replay_len,
+                    "weir serving"
+                );
             }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to install Ctrl-C handler");
-                info!("received Ctrl-C, initiating shutdown");
-            }
-            // T0 (spec §7 a-b): the board says shutting_down before any listener
-            // closes, so a flusher whose input closes from here on reads as a clean
-            // `Stopped`, not `Offline(FlusherExited)`. PR 4's Lifecycle takes this over.
-            board_sig.begin_shutdown(&metrics_sig);
-            #[cfg(all(unix, feature = "tls"))]
-            if let Some(tx) = tcp_shutdown_tx {
-                let _ = tx.send(());
-            }
-            let _ = shutdown_tx.send(());
-        });
-
-        // Socket accept loop — blocks until shutdown signal.
-        #[cfg(unix)]
-        socket::serve(
-            socket_config,
-            listeners.unix,
-            queue_tx,
-            shutdown_rx,
-            Arc::clone(&metrics),
-            conn_sem,
-            router,
-        )
-        .await?;
-        #[cfg(not(unix))]
-        {
-            // On non-Unix builds weir-server is not supported; just wait for shutdown.
-            board.enter_phase(weir_status::Phase::Serving, &metrics);
-            let _ = shutdown_rx.await;
+        } else {
+            // A signal landed between the binds and the spawns: unlink what was
+            // bound (inode-checked) and serve nothing.
+            discard_listeners(listeners, &board);
         }
+    }
+    #[cfg(unix)]
+    if queue_tx.is_some() {
+        warn!("shutdown requested during startup; the producer listeners were not served");
+        drop(queue_tx.take());
+    }
+    #[cfg(not(unix))]
+    {
+        // weir-server has no producer listener off Unix; it only waits for
+        // shutdown.
+        let _ = (&recovery, replay_len, started);
+        lifecycle.publish_phase(weir_status::Phase::Serving);
+    }
 
-        // Await the TCP+mTLS listener's graceful drain before leaving the runtime.
-        // The signal handler already fired `tcp_shutdown_tx`, so `tcp::run` is
-        // draining its in-flight connections; without this await `drop(rt)` below
-        // would cancel that drain the moment the Unix loop returns (e.g. when there
-        // are no Unix connections), severing live TCP connections instead of
-        // letting them finish within `shutdown_timeout_secs` (S09).
+    // ── T0 ran in the signal task (Lifecycle::request_shutdown): readiness off,
+    //    phase shutting_down, drain absorb, flushers' flag, the lame duck. ──
+    let level = rt.block_on(lifecycle.wait_shutdown());
+    info!(?level, "shutdown: lame duck; draining producer connections");
+
+    // ── T1: ingest closed. The runtime stays up: /metrics, the poll tasks and
+    //    (PR 6) admin `status` keep answering through the joins. Both accept
+    //    loops follow the level into lame duck and their bounded connection
+    //    drain; wait for both before the joins. ──
+    rt.block_on(async {
+        #[cfg(unix)]
+        if let Some(h) = unix_join {
+            log_listener_exit(h.await, "unix socket");
+        }
         #[cfg(all(unix, feature = "tls"))]
         if let Some(h) = tcp_join {
-            let _ = h.await;
+            log_listener_exit(h.await, "TCP+mTLS");
         }
-
-        Ok::<(), std::io::Error>(())
-    })?;
-
-    // ── Graceful pipeline drain ───────────────────────────────────────────────
-    //
-    // queue_tx moved into socket::serve and dropped when it returns.
-    // Workers observe Disconnected → flush remaining Batches → drop shard_txs
-    //   clones → flusher Disconnected.
-    // WAB flushers observe Disconnected → seal segments → exit → drop drain_tx.
-    // Drain thread observes drain_rx Disconnected → drains pending segments → exits.
-    //
-    // The queue-depth background task holds a `queue_tx.clone()`. Dropping the
-    // runtime aborts that task so the clone is released — otherwise workers
-    // never observe `Disconnected` and `worker_handles.join()` deadlocks.
-    drop(rt);
-
-    info!("socket layer shut down; waiting for pipeline to drain");
-
+    });
+    // Off Unix main still holds its sender here; every path ends with none.
+    drop(queue_tx.take());
+    // The queue-depth task holds the last queue_tx clone: it must go before
+    // the worker join (abort + await, which replaces the old `drop(rt)`).
+    queue_depth_task.abort();
+    let _ = rt.block_on(queue_depth_task);
+    // An aborted connection task can still own a sender inside its
+    // spawn_blocking push for up to QUEUE_PUSH_TIMEOUT (§5.7).
+    if !lifecycle::wait_until(
+        lifecycle::QUEUE_SENDERS_GRACE,
+        Duration::from_millis(10),
+        || queue_rx.live_senders() == 0,
+    ) {
+        tracing::error!(
+            live = queue_rx.live_senders(),
+            "a work-queue sender outlived ingest; the worker join waits for it"
+        );
+    }
+    debug_assert_eq!(queue_rx.live_senders(), 0, "a QueueSender outlived ingest");
+    info!(
+        "shutdown: ingest closed; joining workers and flushers (each flusher seals, \
+         fsyncs and hands off)"
+    );
     for h in worker_handles {
         h.join().ok();
     }
+    // Bounded in every drain state: PR 3's hand_off gives up after the
+    // per-flusher 1 s budget once `flushers_shutting_down` is set.
     for h in wab_handle.join_handles {
         h.join().ok();
     }
-    drain_handle.join().ok();
 
-    info!("weir shut down cleanly");
-    Ok(())
+    // ── T2: the drain's budget starts now that everything ingested is sealed. ──
+    let budget = Duration::from_secs(config.drain_shutdown_budget_secs);
+    drain_ctl.request_stop(budget); // fetch_min: a forced deadline stays forced
+    // The deadline actually in force (a forced one stays earlier), for
+    // /status, lifecycle.drain_deadline_ms and the gauge.
+    if let Some(deadline_ms) = drain_ctl.deadline_unix_ms() {
+        board
+            .life
+            .set_drain_deadline(deadline_ms, config.drain_shutdown_budget_secs);
+        metrics
+            .drain_shutdown_deadline_seconds
+            .set(deadline_ms as f64 / 1000.0);
+    }
+    info!(
+        budget_secs = config.drain_shutdown_budget_secs,
+        "shutdown: everything ingested is sealed; delivering until the budget ends"
+    );
+    let waited = lifecycle::wait_for_drain(
+        drain_handle,
+        &drain_ctl,
+        lifecycle::DRAIN_EXIT_GRACE,
+        lifecycle::DRAIN_JOIN_POLL,
+    );
+
+    // ── T3: exit. The summary does no I/O (no scan_unconfirmed_sealed). ──
+    // Both `reason` series (budget, disconnected; README Q7).
+    let not_handed_off = metrics.wab_segments_not_handed_off_total();
+    // The last successful size scan (PR 1's poll task writes both).
+    let on_disk = board.wab.last_scan_ok_ms().map(|as_of| lifecycle::OnDisk {
+        bytes: board
+            .wab_bytes_now
+            .load(std::sync::atomic::Ordering::Relaxed),
+        as_of_unix_ms: as_of,
+    });
+    match waited {
+        lifecycle::DrainWait::Joined(exit) => {
+            let facts = lifecycle::ShutdownFacts::from_exit(exit.as_ref(), not_handed_off, on_disk);
+            if facts.left_for_replay() == 0 {
+                info!("{}", lifecycle::shutdown_summary(&facts));
+            } else {
+                warn!("{}", lifecycle::shutdown_summary(&facts));
+            }
+            drop(rt_guard);
+            rt.shutdown_timeout(Duration::from_secs(1));
+            // [PR 6 slot] unlink the admin socket here (remove_own_socket on its
+            // BoundSocket: inode-checked).
+            // The wab_dir lock (wab::lock's process-lifetime static) is released
+            // by the kernel at exit, after everything above.
+            info!("weir shut down cleanly");
+            Ok(())
+        }
+        lifecycle::DrainWait::Orphaned => {
+            let in_flight = board
+                .drain
+                .in_flight
+                .load_full()
+                .map(|f| (f.segment.clone(), f.processed));
+            let facts = lifecycle::ShutdownFacts::orphaned(in_flight, not_handed_off, on_disk);
+            tracing::error!(
+                "drain did not stop within budget; exiting with its in-flight segment \
+                 unconfirmed. {}",
+                lifecycle::shutdown_summary(&facts)
+            );
+            // Without dropping the runtime or the lock: the kernel releases the
+            // flock only once the whole process, orphaned drain thread included,
+            // is gone. Exit status 0 (owner decision).
+            std::process::exit(0);
+        }
+    }
+}
+
+/// The pre-serving shutdown path (spec §6 "A signal before serving"): unlink
+/// the Unix socket we bound (inode-checked), close every listener, and serve
+/// nothing. The one place main marks listener state: `serve` / `tcp::run`,
+/// which own the `Closed` marks otherwise, never run on this path.
+#[cfg(unix)]
+fn discard_listeners(listeners: socket::BoundListeners, board: &status::StatusBoard) {
+    socket::remove_own_socket(&listeners.unix.path, &listeners.unix.socket);
+    drop(listeners.unix);
+    board.listeners.unix.set(weir_status::ListenerState::Closed);
+    if let Some(l) = listeners.tcp {
+        drop(l);
+        board.listeners.tcp.set(weir_status::ListenerState::Closed);
+    }
+}
+
+/// Logs a listener task's exit if it was not a clean `Ok`.
+#[cfg(unix)]
+fn log_listener_exit(r: Result<std::io::Result<()>, tokio::task::JoinError>, which: &str) {
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = %e, "{which} listener exited with an error"),
+        Err(e) => tracing::error!(error = %e, "{which} listener task failed"),
+    }
 }
 
 /// Logs a recommendation if `shard_count` / `worker_count` look unusual
@@ -1162,37 +1259,5 @@ mod lock_integrity_tests {
             "an unreadable record is still proof of loss"
         );
         assert!(lost.load(Ordering::Relaxed));
-    }
-}
-
-#[cfg(test)]
-mod settle_tests {
-    use super::wait_until;
-    use std::time::Duration;
-
-    #[test]
-    fn wait_until_returns_true_as_soon_as_done_and_false_at_the_deadline() {
-        let mut calls = 0;
-        assert!(wait_until(
-            Duration::from_secs(5),
-            Duration::from_millis(1),
-            || {
-                calls += 1;
-                calls == 3
-            }
-        ));
-        assert_eq!(calls, 3);
-
-        let t0 = std::time::Instant::now();
-        assert!(!wait_until(
-            Duration::from_millis(60),
-            Duration::from_millis(5),
-            || false
-        ));
-        let took = t0.elapsed();
-        assert!(
-            took >= Duration::from_millis(60) && took < Duration::from_millis(500),
-            "{took:?}"
-        );
     }
 }
