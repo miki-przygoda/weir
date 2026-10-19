@@ -150,6 +150,11 @@ LEGACY_STOP_TIMEOUT_SECS = 300
 STOP_SLACK_SECS = 10
 #: The recorder's ingest endpoint, the daemon's HTTP sink.
 SINK_URL = "http://127.0.0.1:9900/ingest"
+#: Socket-appearance wait. 10 s before Foundations; Foundations adds a settle
+#: wait of up to 10 s before the producer bind (spec §6 step 10), so a healthy
+#: restart can legitimately take longer. A crash on startup is still caught
+#: on the next 50 ms poll, not at this timeout.
+DAEMON_STARTUP_TIMEOUT_SECS = 30
 
 
 def stop_timeout_for(budget_secs, shutdown_timeout_secs):
@@ -1006,12 +1011,16 @@ class Daemon:
                 cmd += ["--wab-compression-level", str(level)]
         return cmd
 
-    def start(self, sink_url, budget_override=None):
+    def spawn(self, sink_url, budget_override=None, extra_env=None):
+        """Starts weir-server and returns at once, without waiting for its
+        socket: a lifecycle trigger may need to signal a process that is
+        still recovering. `start()` is spawn + wait_serving. `extra_env` is
+        merged over the inherited environment (the test-hook variables)."""
         # Remove any stale socket BEFORE spawning. `kill -9` leaves the file on
-        # disk, so the readiness poll below would be satisfied instantly by the
-        # dead process's socket — defeating the check on every restart after
-        # episode 0, and misreporting a genuine crash-on-restart as a
-        # quiescence timeout rather than the finding it is.
+        # disk, so the readiness poll in wait_serving would be satisfied
+        # instantly by the dead process's socket — defeating the check on every
+        # restart after episode 0, and misreporting a genuine crash-on-restart
+        # as a quiescence timeout rather than the finding it is.
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
@@ -1020,17 +1029,28 @@ class Daemon:
             self.drain_budget_secs if budget_override is None else budget_override)
         self.stop_timeout_secs = stop_timeout_for(
             self.active_budget_secs, self.shutdown_timeout_secs)
-        cmd = self.argv(sink_url, budget_override)
+        # Where THIS process's output starts in the shared log, so the
+        # triggers judge it by its own lines and never a predecessor's.
+        self.log_offset = (os.path.getsize(self.log_path)
+                           if self.log_path and os.path.exists(self.log_path) else 0)
         # NO_COLOR: tracing-subscriber emits ANSI escapes unconditionally, even
         # when its output is a plain FILE rather than a terminal. Measured at
         # 28% of the daemon log here, and the escapes break naive greps when
         # reconstructing what the daemon did around a violation.
+        env = dict(os.environ, NO_COLOR="1")
+        if extra_env:
+            env.update(extra_env)
         self.proc = subprocess.Popen(
-            cmd, stdout=self.log_file, stderr=self.log_file,
-            env=dict(os.environ, NO_COLOR="1"),
+            self.argv(sink_url, budget_override),
+            stdout=self.log_file, stderr=self.log_file, env=env,
         )
-        # Wait for the socket to appear rather than sleeping a fixed interval.
-        for _ in range(200):
+
+    def wait_serving(self, timeout_secs=DAEMON_STARTUP_TIMEOUT_SECS):
+        """Waits for the producer socket to appear rather than sleeping a fixed
+        interval. Raises RuntimeError if the process exits first or the socket
+        does not appear within `timeout_secs`."""
+        deadline = time.monotonic() + timeout_secs
+        while True:
             if os.path.exists(self.socket_path):
                 return
             if self.proc.poll() is not None:
@@ -1038,8 +1058,44 @@ class Daemon:
                     f"weir-server exited during startup (code {self.proc.returncode}); "
                     f"see the daemon log in the run directory"
                 )
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"weir-server did not create its socket within {timeout_secs:g}s")
             time.sleep(0.05)
-        raise RuntimeError("weir-server did not create its socket within 10s")
+
+    def start(self, sink_url, budget_override=None):
+        self.spawn(sink_url, budget_override)
+        self.wait_serving()
+
+    def signal(self, sig):
+        """Sends `sig` to a live process. False, and nothing sent, if there is
+        no process or it has already exited (a reaped pid may be reused)."""
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        self.proc.send_signal(sig)
+        return True
+
+    def exit_code(self):
+        """The exit status, or None while running (or before any spawn)."""
+        return None if self.proc is None else self.proc.poll()
+
+    def log_since_spawn(self):
+        """The daemon log from this process's spawn onward (b"" without a
+        log path)."""
+        if not self.log_path:
+            return b""
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(getattr(self, "log_offset", 0))
+                return f.read()
+        except FileNotFoundError:
+            return b""
+
+    def bound_secs(self):
+        """spec §7's documented grace for THIS process's budget:
+        shutdown_timeout_secs + active budget + 5."""
+        return (self.shutdown_timeout_secs + self.active_budget_secs
+                + SHUTDOWN_GRACE_EXTRA_SECS)
 
     def kill9(self):
         if self.proc and self.proc.poll() is None:

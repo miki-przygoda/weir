@@ -18,6 +18,15 @@ TRIGGER_KINDS = ("sigterm_at", "double_sigterm", "sigterm_in_recovery",
 SHUTDOWN_TRIGGERS = ("sigterm_at", "double_sigterm")
 CUT_MODES = ("power_loss", "kill")
 
+#: Text and series the triggers judge weir by. One constant each, pinned
+#: against weir-server's source by TestDaemonLogContract. If the merged
+#: Foundations text differs, change these, never the daemon.
+SERVING_LOG_LINE = b"weir serving"            # spec §6 step 12
+FORCED_LOG_LINE = b"forced shutdown"          # spec §7, second signal
+RECOVERING_SERIES = 'weir_startup_phase{phase="recovering"}'
+PAUSED_SERIES = "weir_drain_paused"
+TEST_HOOK_ENV = ("WEIR_TEST_HOOKS", "WEIR_TEST_STARTUP_DELAY_MS")
+
 _COMMON = frozenset({"kind", "cut", "cut_lo_ms", "cut_hi_ms"})
 #: Every [faults] key a trigger reads. A key outside its kind's set is
 #: refused — the same "nothing reads it, so the run lies" rule as

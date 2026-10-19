@@ -136,5 +136,32 @@ class TestPowerCutWiring(unittest.TestCase):
         self.assertNotIn("stack.engage_fault()", body)
 
 
+class TestDaemonLogContract(unittest.TestCase):
+    """The triggers judge weir by two log lines, two env vars and two series
+    that PR 1, PR 2 and PR 4 introduce. Pin them against the source so a
+    rename cannot turn every sigterm_in_recovery episode into a silent pass.
+    Red until PR 1, PR 2 and PR 4 merge."""
+
+    def _server_source(self):
+        root = os.path.join(run.WEIR_ROOT, "crates", "weir-server", "src")
+        chunks = []
+        for dirpath, _d, files in os.walk(root):
+            for name in files:
+                if name.endswith(".rs"):
+                    with open(os.path.join(dirpath, name), encoding="utf-8") as f:
+                        chunks.append(f.read())
+        return "\n".join(chunks)
+
+    def test_every_string_the_triggers_rely_on_exists_in_weir_server(self):
+        src = self._server_source()
+        for needle in (faults.SERVING_LOG_LINE.decode(),
+                       faults.FORCED_LOG_LINE.decode(),
+                       *faults.TEST_HOOK_ENV,
+                       "weir_startup_phase", "weir_drain_paused",
+                       "weir_wab_undelivered_segments"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, src)
+
+
 if __name__ == "__main__":
     unittest.main()

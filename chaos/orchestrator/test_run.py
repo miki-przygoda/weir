@@ -1559,5 +1559,83 @@ class TestTriggerFaultKinds(unittest.TestCase):
         self.assertEqual(faults.oracle_fault("kill_random", "kill"), "kill_random")
 
 
+class TestDaemonLifecycle(unittest.TestCase):
+    """spawn / wait_serving / signal / exit_code / log_since_spawn /
+    bound_secs: the primitives the lifecycle triggers drive a daemon with,
+    split out of the old start() so a trigger can signal a process that has
+    not finished starting (sigterm_in_recovery)."""
+
+    CFG = {"shard_count": 1, "batch_size": 8, "batch_deadline_ms": 2,
+           "wab_segment_max_bytes": 1048576,
+           "drain_shutdown_budget_secs": 2, "shutdown_timeout_secs": 2}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.log_path = os.path.join(self.tmp, "weir-server.log")
+        with open(self.log_path, "wb") as f:
+            f.write(b"previous process\n")
+        self.d = run.Daemon("/fake/weir-server", "/fake/wab",
+                            os.path.join(self.tmp, "weir.sock"), 19185,
+                            dict(self.CFG), None, log_path=self.log_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _spawn(self, **kw):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured.update(cmd=cmd, **kwargs)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return proc
+
+        with mock.patch.object(run.subprocess, "Popen", fake_popen):
+            self.d.spawn(run.SINK_URL, **kw)
+        return captured
+
+    def test_spawn_returns_without_waiting_and_merges_extra_env(self):
+        c = self._spawn(extra_env={"WEIR_TEST_HOOKS": "1"})
+        self.assertEqual(c["env"]["WEIR_TEST_HOOKS"], "1")
+        self.assertEqual(c["env"]["NO_COLOR"], "1")
+
+    def test_log_since_spawn_is_only_this_processs_output(self):
+        self._spawn()
+        with open(self.log_path, "ab") as f:
+            f.write(b"weir serving\n")
+        self.assertEqual(self.d.log_since_spawn(), b"weir serving\n")
+
+    def test_signal_is_not_sent_to_a_dead_process(self):
+        self.d.proc = FakeProc(returncode=0)
+        self.assertFalse(self.d.signal(signal.SIGTERM))
+        self.assertEqual(self.d.proc.signals, [])
+
+    def test_signal_reaches_a_live_process(self):
+        self.d.proc = FakeProc()
+        self.assertTrue(self.d.signal(signal.SIGTERM))
+        self.assertEqual(self.d.proc.signals, [signal.SIGTERM])
+        self.assertIsNone(self.d.exit_code())
+
+    def test_bound_secs_is_the_documented_grace(self):
+        self.assertEqual(self.d.bound_secs(), 2 + 2 + 5)
+
+    def test_bound_secs_follows_a_budget_override(self):
+        self._spawn(budget_override=run.FINAL_DRAIN_BUDGET_SECS)
+        self.assertEqual(self.d.bound_secs(), 2 + 3600 + 5)
+        self.assertEqual(self.d.stop_timeout_secs, 300)
+
+    def test_wait_serving_reports_a_crash_on_startup(self):
+        self.d.proc = FakeProc(returncode=1)
+        with self.assertRaises(RuntimeError) as cm:
+            self.d.wait_serving(timeout_secs=1)
+        self.assertIn("exited during startup", str(cm.exception))
+
+    def test_wait_serving_returns_once_the_socket_exists(self):
+        self.d.proc = FakeProc()
+        open(self.d.socket_path, "w").close()
+        self.d.wait_serving(timeout_secs=1)
+
+
 if __name__ == "__main__":
     unittest.main()
