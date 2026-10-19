@@ -4,7 +4,7 @@
 //! `summary_templates_take_no_free_text` enforces this on the source itself.
 //! Keep each signature on ONE line; the test parses them.
 
-use crate::evidence::{ListenerKind, OfflineReason, Phase};
+use crate::evidence::{ListenerKind, OfflineReason, Phase, SinkFailureKind};
 use crate::rules::AckTimeoutCause;
 
 fn join_ids(ids: &[u16]) -> String {
@@ -91,6 +91,96 @@ pub(crate) fn wab_scan_stale(never: bool, age_secs: u64) -> String {
 
 pub(crate) fn wab_growing_unbounded() -> String {
     "the WAB is growing while delivery is unhealthy and no wab_max_bytes is set; producers are acked into an unbounded buffer".to_string()
+}
+
+pub(crate) fn drain_stopped(panics: u64) -> String {
+    format!(
+        "drain supervisor gave up after {panics} panics; ingest continues, nothing is delivered, the WAB grows; sink_health is stale; restart resumes"
+    )
+}
+
+pub(crate) fn drain_wedged(in_sink_call: bool, secs: u64) -> String {
+    let at = if in_sink_call {
+        "inside a sink call"
+    } else {
+        "with no sink call in flight"
+    };
+    format!(
+        "drain thread has made no progress for {secs}s ({at}); it is blocked inside a sink call that does not yield; a restart re-delivers the in-flight segment from record 0"
+    )
+}
+
+pub(crate) fn drain_paused(since_ms: u64, held_at: Option<u64>, unbounded: bool) -> String {
+    let held = held_at.map_or_else(String::new, |n| {
+        format!(" (held: mid-segment at record {n})")
+    });
+    let grows = if unbounded {
+        "WAB grows without bound: wab_max_bytes=0"
+    } else {
+        "WAB grows"
+    };
+    format!(
+        "delivery paused since {since_ms}{held}; ingest keeps buffering; {grows}; restart also resumes"
+    )
+}
+
+pub(crate) fn drain_blocked(dl_bytes: Option<u64>, cap: Option<u64>) -> String {
+    let n = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |v| v.to_string());
+    format!(
+        "dead_letter/ at {}/{}; free space (weir-ctl dl requeue/drop) or raise the cap",
+        n(dl_bytes),
+        n(cap)
+    )
+}
+
+pub(crate) fn delivery_stalled(undelivered: u64, secs: u64) -> String {
+    format!("{undelivered} undelivered segment(s) and no successful commit for {secs}s")
+}
+
+pub(crate) fn delivery_lagging(age_secs: u64) -> String {
+    format!("the oldest undelivered segment is up to {age_secs}s old")
+}
+
+pub(crate) fn segments_stranded(n: u64) -> String {
+    format!(
+        "{n} segment(s) exhausted retries; auto-resumed on a healthy probe or via `weir-ctl drain retry-stranded`; each resume re-delivers from record 0"
+    )
+}
+
+pub(crate) fn sink_down(since_ms: Option<u64>) -> String {
+    match since_ms {
+        Some(t) => format!(
+            "sink unreachable since {t}; weir keeps buffering durably (not a readiness failure)"
+        ),
+        None => {
+            "sink unreachable; weir keeps buffering durably (not a readiness failure)".to_string()
+        }
+    }
+}
+
+pub(crate) fn sink_degraded() -> String {
+    "the sink's health probe reports degraded".to_string()
+}
+
+pub(crate) fn sink_failing(failures: u64, kind: Option<SinkFailureKind>) -> String {
+    format!(
+        "{failures} consecutive commits failed while the probe passes; last kind {}",
+        kind.map_or("unknown", SinkFailureKind::as_str)
+    )
+}
+
+pub(crate) fn dead_letter_near_cap(bytes: u64, cap: u64) -> String {
+    format!("dead_letter/ holds {bytes} of its {cap}-byte cap")
+}
+
+pub(crate) fn noop_sink() -> String {
+    "records are acked and DISCARDED".to_string()
+}
+
+pub(crate) fn active_segment_aging(shard: u16, secs: u64) -> String {
+    format!(
+        "shard {shard}'s active segment is {secs}s old and both seal timers are 0; its records wait for a size rotation or shutdown"
+    )
 }
 
 #[cfg(test)]

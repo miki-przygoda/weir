@@ -1,7 +1,6 @@
 //! One rule per catalogue code (spec §9.3), plus `evaluate`. A rule returns
 //! `Unevaluated` when the evidence it needs is missing, never `Inactive`.
 use crate::codes::{CATALOGUE, ConditionCode};
-#[allow(unused_imports)] // DETAIL_PANIC_MAX_BYTES is first used by Task 1.5's drain_stopped
 use crate::condition::{
     Condition, DETAIL_PANIC_MAX_BYTES, Evaluation, EvidenceValue, SinceLookup, Thresholds,
 };
@@ -52,7 +51,6 @@ impl Fired {
         self.evidence.insert(key.to_string(), v);
         self
     }
-    #[allow(dead_code)] // first used by Task 1.5's drain_stopped; Task 1.5 drops this allow
     fn detail(mut self, d: Option<String>) -> Self {
         self.detail = d;
         self
@@ -120,7 +118,20 @@ pub(crate) fn rule(c: ConditionCode, e: &Evidence, t: &Thresholds) -> Outcome {
         C::AckTimeoutsRecent => ack_timeouts_recent(e, t),
         C::WabScanStale => wab_scan_stale(e, t),
         C::WabGrowingUnbounded => wab_growing_unbounded(e),
-        // Tasks 1.5 and 1.6 replace this arm with the remaining rules.
+        C::DrainStopped => drain_stopped(e),
+        C::DrainWedged => drain_wedged(e, t),
+        C::DrainPaused => drain_paused(e),
+        C::DrainBlockedDeadLetterFull => drain_blocked_dead_letter_full(e),
+        C::DeliveryStalled => delivery_stalled(e, t),
+        C::DeliveryLagging => delivery_lagging(e, t),
+        C::SegmentsStranded => segments_stranded(e),
+        C::SinkDown => sink_down(e),
+        C::SinkDegraded => sink_degraded(e),
+        C::SinkFailing => sink_failing(e, t),
+        C::DeadLetterNearCap => dead_letter_near_cap(e, t),
+        C::NoopSink => noop_sink(e),
+        C::ActiveSegmentAging => active_segment_aging(e, t),
+        // Task 1.6 replaces this arm with the remaining rules.
         _ => Outcome::Unevaluated,
     }
 }
@@ -369,6 +380,296 @@ fn wab_growing_unbounded(e: &Evidence) -> Outcome {
         Some(false) => Outcome::Inactive,
         Some(true) => Fired::new(summary::wab_growing_unbounded()).into(),
     }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn drain_stopped(e: &Evidence) -> Outcome {
+    let (Some(d), Some(sd)) = (&e.drain, e.shutting_down) else {
+        return Outcome::Unevaluated;
+    };
+    if d.exit != DrainExitCode::GaveUp || sd {
+        return Outcome::Inactive;
+    }
+    let panics = e
+        .recent
+        .as_ref()
+        .and_then(|r| r.drain_panics_total)
+        .unwrap_or(0);
+    Fired::new(summary::drain_stopped(panics))
+        .with("panics", u(panics))
+        .detail(
+            d.last_panic
+                .as_deref()
+                .map(|p| truncate(p, DETAIL_PANIC_MAX_BYTES)),
+        )
+        .into()
+}
+
+fn drain_wedged(e: &Evidence, t: &Thresholds) -> Outcome {
+    let (Some(d), Some(c)) = (&e.drain, &e.config) else {
+        return Outcome::Unevaluated;
+    };
+    if d.exit != DrainExitCode::Running {
+        return Outcome::Inactive;
+    }
+    let now = e.now_unix_ms;
+    if let Some(since) = d.commit_in_flight_since_unix_ms {
+        let Some(ct) = c.commit_timeout_secs else {
+            return Outcome::Unevaluated;
+        };
+        let age = age_ms(now, since);
+        return if age > ct.saturating_mul(1000).saturating_add(t.wedge_grace_ms) {
+            Fired::new(summary::drain_wedged(true, age / 1000))
+                .with("commit_age_secs", u(age / 1000))
+                .into()
+        } else {
+            Outcome::Inactive
+        };
+    }
+    // The safety floor's verdict table (main.rs `classify_drain_stall`, spec
+    // safety floor §4.8): busy in local I/O is `SlowLocalIo`, never a wedge;
+    // busy in a sink call (a non-yielding probe) is `SlowSinkCall` until
+    // commit_timeout + 15 s. One verdict for the log line and the condition (G2).
+    if let Some(b) = d.busy {
+        if !b.sink_call {
+            return Outcome::Inactive;
+        }
+        let Some(ct) = c.commit_timeout_secs else {
+            return Outcome::Unevaluated;
+        };
+        let age = age_ms(now, b.since_unix_ms);
+        return if age > ct.saturating_mul(1000).saturating_add(t.wedge_grace_ms) {
+            Fired::new(summary::drain_wedged(true, age / 1000))
+                .with("busy_secs", u(age / 1000))
+                .into()
+        } else {
+            Outcome::Inactive
+        };
+    }
+    let (Some(p), Some(hp)) = (d.last_progress_unix_ms, c.public.health_poll_interval_secs) else {
+        return Outcome::Unevaluated;
+    };
+    let age = age_ms(now, p);
+    if age >= hp.saturating_mul(1000).saturating_add(t.wedge_grace_ms) {
+        Fired::new(summary::drain_wedged(false, age / 1000))
+            .with("progress_age_secs", u(age / 1000))
+            .into()
+    } else {
+        Outcome::Inactive
+    }
+}
+
+fn drain_paused(e: &Evidence) -> Outcome {
+    let Some(d) = &e.drain else {
+        return Outcome::Unevaluated;
+    };
+    if !(d.pause_requested || d.paused) {
+        return Outcome::Inactive;
+    }
+    let unbounded = e
+        .config
+        .as_ref()
+        .is_some_and(|c| c.public.wab_max_bytes == Some(0));
+    let held = d.in_flight.filter(|_| d.held);
+    let since = d.paused_since_unix_ms.unwrap_or(e.now_unix_ms);
+    let mut f = Fired::new(summary::drain_paused(
+        since,
+        held.map(|i| i.processed_records),
+        unbounded,
+    ))
+    .with("held", EvidenceValue::Bool(d.held))
+    .with("in_effect", EvidenceValue::Bool(d.paused))
+    .detail(d.paused_by_uid.map(|uid| format!("paused by uid {uid}")));
+    if let Some(i) = held {
+        f = f
+            .with("held_at_record", u(i.processed_records))
+            .with("segment", EvidenceValue::Segment(i.segment));
+    }
+    f.into()
+}
+
+fn drain_blocked_dead_letter_full(e: &Evidence) -> Outcome {
+    let Some(d) = &e.drain else {
+        return Outcome::Unevaluated;
+    };
+    if d.state != DrainStateCode::BlockedDeadLetterFull {
+        return Outcome::Inactive;
+    }
+    let dl = e.backlog.as_ref().map(|b| b.dead_letter_bytes);
+    let cap = e
+        .config
+        .as_ref()
+        .and_then(|c| c.public.dead_letter_max_bytes);
+    let mut f = Fired::new(summary::drain_blocked(dl, cap));
+    if let Some(b) = d.blocked_since_unix_ms {
+        f = f.with("blocked_since_ms", u(b));
+    }
+    f.into()
+}
+
+fn delivery_stalled(e: &Evidence, t: &Thresholds) -> Outcome {
+    let (Some(b), Some(s), Some(d)) = (&e.backlog, &e.sink, &e.drain) else {
+        return Outcome::Unevaluated;
+    };
+    if b.undelivered_segments == 0 || d.paused || d.pause_requested {
+        return Outcome::Inactive;
+    }
+    let Some(reference) = s.last_success_unix_ms.or(e.started_at_unix_ms) else {
+        return Outcome::Unevaluated;
+    };
+    let idle = age_ms(e.now_unix_ms, reference);
+    if idle < t.delivery_stalled_ms {
+        return Outcome::Inactive;
+    }
+    Fired::new(summary::delivery_stalled(
+        b.undelivered_segments,
+        idle / 1000,
+    ))
+    .with("undelivered_segments", u(b.undelivered_segments))
+    .with("idle_secs", u(idle / 1000))
+    .into()
+}
+
+fn delivery_lagging(e: &Evidence, t: &Thresholds) -> Outcome {
+    let Some(b) = &e.backlog else {
+        return Outcome::Unevaluated;
+    };
+    match b.oldest_undelivered_age_secs {
+        Some(a) if a > t.delivery_lagging_secs => Fired::new(summary::delivery_lagging(a as u64))
+            .with("oldest_age_secs", EvidenceValue::F64(a))
+            .into(),
+        _ => Outcome::Inactive,
+    }
+}
+
+fn segments_stranded(e: &Evidence) -> Outcome {
+    let Some(n) = e
+        .recent
+        .as_ref()
+        .and_then(|r| r.stranded_since_last_success)
+    else {
+        return Outcome::Unevaluated;
+    };
+    if n == 0 {
+        return Outcome::Inactive;
+    }
+    Fired::new(summary::segments_stranded(n))
+        .with("stranded", u(n))
+        .into()
+}
+
+fn sink_down(e: &Evidence) -> Outcome {
+    let Some(s) = &e.sink else {
+        return Outcome::Unevaluated;
+    };
+    match s.health {
+        None => Outcome::Unevaluated,
+        Some(SinkHealthCode::Down) => Fired::new(summary::sink_down(s.health_since_unix_ms))
+            .detail(s.probe_reason.clone())
+            .into(),
+        Some(_) => Outcome::Inactive,
+    }
+}
+
+fn sink_degraded(e: &Evidence) -> Outcome {
+    let Some(s) = &e.sink else {
+        return Outcome::Unevaluated;
+    };
+    match s.health {
+        None => Outcome::Unevaluated,
+        Some(SinkHealthCode::Degraded) => Fired::new(summary::sink_degraded())
+            .detail(s.probe_reason.clone())
+            .into(),
+        Some(_) => Outcome::Inactive,
+    }
+}
+
+fn sink_failing(e: &Evidence, t: &Thresholds) -> Outcome {
+    let Some(s) = &e.sink else {
+        return Outcome::Unevaluated;
+    };
+    if s.consecutive_failures < t.sink_failing_consecutive || s.health == Some(SinkHealthCode::Down)
+    {
+        return Outcome::Inactive;
+    }
+    let mut f = Fired::new(summary::sink_failing(
+        s.consecutive_failures,
+        s.last_failure_kind,
+    ))
+    .with("consecutive_failures", u(s.consecutive_failures))
+    .detail(s.last_error.clone());
+    if let Some(k) = s.last_failure_kind {
+        f = f.with("kind", code(k.as_str()));
+    }
+    f.into()
+}
+
+fn dead_letter_near_cap(e: &Evidence, t: &Thresholds) -> Outcome {
+    let (Some(b), Some(c)) = (&e.backlog, &e.config) else {
+        return Outcome::Unevaluated;
+    };
+    let Some(cap) = c.public.dead_letter_max_bytes else {
+        return Outcome::Unevaluated;
+    };
+    if cap == 0
+        || b.dead_letter_bytes.saturating_mul(100)
+            < cap.saturating_mul(t.dead_letter_near_cap_percent)
+    {
+        return Outcome::Inactive;
+    }
+    Fired::new(summary::dead_letter_near_cap(b.dead_letter_bytes, cap))
+        .with("bytes", u(b.dead_letter_bytes))
+        .with("cap", u(cap))
+        .into()
+}
+
+fn noop_sink(e: &Evidence) -> Outcome {
+    let Some(c) = &e.config else {
+        return Outcome::Unevaluated;
+    };
+    if c.sink_type == "noop" {
+        Fired::new(summary::noop_sink()).into()
+    } else {
+        Outcome::Inactive
+    }
+}
+
+fn active_segment_aging(e: &Evidence, t: &Thresholds) -> Outcome {
+    // Ages come from the lag scan; without a backlog record it has not run.
+    let (Some(shards), Some(c), Some(_)) = (&e.shards, &e.config, &e.backlog) else {
+        return Outcome::Unevaluated;
+    };
+    let (Some(age), Some(life)) = (
+        c.public.wab_segment_max_age_secs,
+        c.public.wab_segment_max_lifetime_secs,
+    ) else {
+        return Outcome::Unevaluated;
+    };
+    if age != 0 || life != 0 {
+        return Outcome::Inactive;
+    }
+    let oldest = shards
+        .iter()
+        .filter_map(|s| s.active_segment_age_secs.map(|a| (s.id, a)))
+        .filter(|(_, a)| *a > t.active_segment_aging_secs)
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    let Some((shard, secs)) = oldest else {
+        return Outcome::Inactive;
+    };
+    Fired::new(summary::active_segment_aging(shard, secs as u64))
+        .with("shard", u(u64::from(shard)))
+        .with("age_secs", EvidenceValue::F64(secs))
+        .into()
 }
 
 #[cfg(test)]
@@ -716,5 +1017,286 @@ mod tests {
         assert_eq!(c.runbook, "docs/monitoring.md#cond-wab_cap_rejecting");
         assert_eq!(c.gates, vec![Gate::Readiness]);
         assert!(!ev.unevaluated.contains(&C::WabCapRejecting));
+    }
+
+    use crate::segment::SegmentId;
+
+    const DELIVERY: [ConditionCode; 13] = [
+        C::DrainStopped,
+        C::DrainWedged,
+        C::DrainPaused,
+        C::DrainBlockedDeadLetterFull,
+        C::DeliveryStalled,
+        C::DeliveryLagging,
+        C::SegmentsStranded,
+        C::SinkDown,
+        C::SinkDegraded,
+        C::SinkFailing,
+        C::DeadLetterNearCap,
+        C::NoopSink,
+        C::ActiveSegmentAging,
+    ];
+
+    #[test]
+    fn a_healthy_serving_daemon_raises_no_delivery_condition() {
+        let e = serving_evidence(NOW);
+        for c in DELIVERY {
+            assert_eq!(outcome(c, &e), "inactive", "{c:?}");
+        }
+    }
+
+    #[test]
+    fn missing_evidence_makes_every_delivery_rule_unevaluated() {
+        let e = Evidence::empty(NOW, Source::Daemon);
+        for c in DELIVERY {
+            assert_eq!(outcome(c, &e), "unevaluated", "{c:?}");
+        }
+    }
+
+    #[test]
+    fn drain_stopped_is_gave_up_outside_shutdown_with_a_capped_panic_detail() {
+        let gave_up = with(|e| {
+            let d = e.drain.as_mut().unwrap();
+            d.exit = DrainExitCode::GaveUp;
+            d.last_panic = Some("x".repeat(1_000));
+            e.recent.as_mut().unwrap().drain_panics_total = Some(10);
+        });
+        let f = fired(C::DrainStopped, &gave_up);
+        assert!(
+            f.summary
+                .starts_with("drain supervisor gave up after 10 panics")
+        );
+        assert_eq!(
+            f.detail.as_deref().map(str::len),
+            Some(DETAIL_PANIC_MAX_BYTES)
+        );
+        let mut stopping = gave_up.clone();
+        stopping.shutting_down = Some(true);
+        assert_eq!(outcome(C::DrainStopped, &stopping), "inactive");
+        assert_eq!(
+            outcome(
+                C::DrainStopped,
+                &with(|e| e.drain.as_mut().unwrap().exit = DrainExitCode::Stopped)
+            ),
+            "inactive"
+        );
+    }
+
+    #[test]
+    fn drain_wedged_uses_the_commit_timer_or_the_progress_timer() {
+        // commit_timeout 60 s + 15 s grace
+        let commit = |age| {
+            with(|e| e.drain.as_mut().unwrap().commit_in_flight_since_unix_ms = Some(NOW - age))
+        };
+        assert_eq!(outcome(C::DrainWedged, &commit(75_000)), "inactive");
+        assert_eq!(outcome(C::DrainWedged, &commit(75_001)), "active");
+        // health_poll_interval 30 s + 15 s grace
+        let progress =
+            |age| with(|e| e.drain.as_mut().unwrap().last_progress_unix_ms = Some(NOW - age));
+        assert_eq!(outcome(C::DrainWedged, &progress(44_999)), "inactive");
+        assert_eq!(outcome(C::DrainWedged, &progress(45_000)), "active");
+        let none = with(|e| e.drain.as_mut().unwrap().last_progress_unix_ms = None);
+        assert_eq!(outcome(C::DrainWedged, &none), "unevaluated");
+        let gone = with(|e| {
+            let d = e.drain.as_mut().unwrap();
+            d.exit = DrainExitCode::GaveUp;
+            d.last_progress_unix_ms = Some(NOW - 600_000);
+        });
+        assert_eq!(
+            outcome(C::DrainWedged, &gone),
+            "inactive",
+            "a stopped drain is drain_stopped, not wedged"
+        );
+        // The safety floor's busy signal (main.rs `classify_drain_stall`): local
+        // I/O is a slow disk, never a wedge, however long; a sink call is a wedge
+        // only past commit_timeout + 15 s.
+        let busy = |sink_call, age| {
+            with(|e| {
+                let d = e.drain.as_mut().unwrap();
+                d.busy = Some(BusyEvidence {
+                    sink_call,
+                    since_unix_ms: NOW - age,
+                });
+                d.last_progress_unix_ms = Some(NOW - age);
+            })
+        };
+        assert_eq!(
+            outcome(C::DrainWedged, &busy(false, 600_000)),
+            "inactive",
+            "SlowLocalIo is never a wedge"
+        );
+        assert_eq!(
+            outcome(C::DrainWedged, &busy(true, 50_000)),
+            "inactive",
+            "SlowSinkCall inside the limit"
+        );
+        assert_eq!(outcome(C::DrainWedged, &busy(true, 75_000)), "inactive");
+        assert_eq!(outcome(C::DrainWedged, &busy(true, 75_001)), "active");
+        assert_eq!(
+            fired(C::DrainWedged, &busy(true, 80_000)).evidence["busy_secs"],
+            EvidenceValue::U64(80)
+        );
+    }
+
+    #[test]
+    fn drain_paused_reports_held_records_unbounded_growth_and_the_uid_as_admin_detail() {
+        let e = with(|e| {
+            let d = e.drain.as_mut().unwrap();
+            d.pause_requested = true;
+            d.paused = true;
+            d.held = true;
+            d.paused_since_unix_ms = Some(NOW - 30_000);
+            d.paused_by_uid = Some(1000);
+            d.in_flight = Some(InFlightEvidence {
+                segment: SegmentId {
+                    shard: 0,
+                    counter: 9,
+                },
+                attempt: 1,
+                retries_left: 3,
+                processed_records: 512,
+                next_retry_at_unix_ms: None,
+            });
+            e.config.as_mut().unwrap().public.wab_max_bytes = Some(0);
+        });
+        let f = fired(C::DrainPaused, &e);
+        assert!(
+            f.summary.contains("(held: mid-segment at record 512)"),
+            "{}",
+            f.summary
+        );
+        assert!(
+            f.summary.contains("without bound: wab_max_bytes=0"),
+            "{}",
+            f.summary
+        );
+        assert!(
+            !f.summary.contains("1000"),
+            "the uid is admin-only: {}",
+            f.summary
+        );
+        assert_eq!(f.detail.as_deref(), Some("paused by uid 1000"));
+        assert_eq!(
+            f.evidence["segment"],
+            EvidenceValue::Segment(SegmentId {
+                shard: 0,
+                counter: 9
+            })
+        );
+        let requested = with(|e| e.drain.as_mut().unwrap().pause_requested = true);
+        assert_eq!(
+            outcome(C::DrainPaused, &requested),
+            "active",
+            "requested counts before it takes effect"
+        );
+    }
+
+    #[test]
+    fn blocked_stalled_lagging_and_stranded() {
+        let blocked =
+            with(|e| e.drain.as_mut().unwrap().state = DrainStateCode::BlockedDeadLetterFull);
+        assert!(
+            fired(C::DrainBlockedDeadLetterFull, &blocked)
+                .summary
+                .starts_with("dead_letter/ at 0/100000000")
+        );
+        let stalled = with(|e| {
+            e.backlog.as_mut().unwrap().undelivered_segments = 4;
+            e.sink.as_mut().unwrap().last_success_unix_ms = Some(NOW - 300_000);
+        });
+        assert_eq!(outcome(C::DeliveryStalled, &stalled), "active");
+        let mut paused = stalled.clone();
+        paused.drain.as_mut().unwrap().paused = true;
+        assert_eq!(
+            outcome(C::DeliveryStalled, &paused),
+            "inactive",
+            "a pause is not a stall"
+        );
+        let never = with(|e| {
+            e.backlog.as_mut().unwrap().undelivered_segments = 1;
+            e.sink.as_mut().unwrap().last_success_unix_ms = None;
+        });
+        assert_eq!(
+            outcome(C::DeliveryStalled, &never),
+            "active",
+            "measured from process start (10 min ago)"
+        );
+        let lag = with(|e| e.backlog.as_mut().unwrap().oldest_undelivered_age_secs = Some(901.0));
+        assert_eq!(
+            fired(C::DeliveryLagging, &lag).evidence["oldest_age_secs"],
+            EvidenceValue::F64(901.0)
+        );
+        let stranded = with(|e| e.recent.as_mut().unwrap().stranded_since_last_success = Some(2));
+        assert_eq!(outcome(C::SegmentsStranded, &stranded), "active");
+        let unknown = with(|e| e.recent.as_mut().unwrap().stranded_since_last_success = None);
+        assert_eq!(outcome(C::SegmentsStranded, &unknown), "unevaluated");
+    }
+
+    #[test]
+    fn sink_health_failing_and_noop() {
+        let down = with(|e| {
+            let s = e.sink.as_mut().unwrap();
+            s.health = Some(SinkHealthCode::Down);
+            s.probe_reason = Some("connect refused".into());
+        });
+        let f = fired(C::SinkDown, &down);
+        assert_eq!(f.detail.as_deref(), Some("connect refused"));
+        assert!(!f.summary.contains("refused"), "probe reason is admin-only");
+        assert_eq!(
+            outcome(
+                C::SinkDegraded,
+                &with(|e| e.sink.as_mut().unwrap().health = Some(SinkHealthCode::Degraded))
+            ),
+            "active"
+        );
+        let failing = |health| {
+            with(|e| {
+                let s = e.sink.as_mut().unwrap();
+                s.consecutive_failures = 3;
+                s.health = Some(health);
+                s.last_failure_kind = Some(SinkFailureKind::Timeout);
+                s.last_error = Some("POST failed".into());
+            })
+        };
+        let f = fired(C::SinkFailing, &failing(SinkHealthCode::Healthy));
+        assert!(f.summary.ends_with("last kind timeout"));
+        assert_eq!(f.detail.as_deref(), Some("POST failed"));
+        assert_eq!(
+            outcome(C::SinkFailing, &failing(SinkHealthCode::Down)),
+            "inactive",
+            "sink_down covers it"
+        );
+        assert_eq!(
+            outcome(
+                C::NoopSink,
+                &with(|e| e.config.as_mut().unwrap().sink_type = "noop".into())
+            ),
+            "active"
+        );
+    }
+
+    #[test]
+    fn dead_letter_near_cap_and_active_segment_aging() {
+        let near = |bytes| with(|e| e.backlog.as_mut().unwrap().dead_letter_bytes = bytes);
+        assert_eq!(outcome(C::DeadLetterNearCap, &near(79_999_999)), "inactive");
+        assert_eq!(outcome(C::DeadLetterNearCap, &near(80_000_000)), "active");
+        let aging = with(|e| e.shards.as_mut().unwrap()[1].active_segment_age_secs = Some(3_601.0));
+        let f = fired(C::ActiveSegmentAging, &aging);
+        assert_eq!(f.evidence["shard"], EvidenceValue::U64(1));
+        let mut timer_set = aging.clone();
+        timer_set
+            .config
+            .as_mut()
+            .unwrap()
+            .public
+            .wab_segment_max_age_secs = Some(60);
+        assert_eq!(outcome(C::ActiveSegmentAging, &timer_set), "inactive");
+        let mut no_lag = aging.clone();
+        no_lag.backlog = None;
+        assert_eq!(
+            outcome(C::ActiveSegmentAging, &no_lag),
+            "unevaluated",
+            "ages come from the lag scan"
+        );
     }
 }
