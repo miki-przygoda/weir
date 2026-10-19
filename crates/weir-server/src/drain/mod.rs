@@ -43,6 +43,7 @@ mod confirmed;
 pub(crate) mod control;
 pub mod dead_letter;
 pub(crate) mod ledger;
+mod publish;
 
 use std::{
     collections::VecDeque,
