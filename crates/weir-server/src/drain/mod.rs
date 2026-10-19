@@ -654,22 +654,207 @@ fn probe_health<S: Sink>(
     }
 }
 
-/// Probes sink health, updates the `weir_sink_health` gauge, and — on a down→up
-/// recovery edge (was not-healthy, now healthy) — rescans the WAB for stranded
-/// (sealed-but-unconfirmed) segments and re-queues any not already pending, so a
-/// recovered sink drains its backlog automatically rather than waiting for a
-/// daemon restart. Returns the new health-ok state for the caller's
-/// `prev_health_ok`.
+/// Test-only count of stranded-segment scans (every [`requeue_unconfirmed`]
+/// call that reached the directory walk).
+#[cfg(test)]
+static RESCAN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What one stranded-segment rescan did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RescanOutcome {
+    /// Paths found on disk and pushed onto the backlog.
+    pub(crate) requeued: u64,
+    /// Paths found on disk that were already queued (or in flight / held).
+    pub(crate) already_queued: u64,
+    /// The scan failed outright (the caller logs it).
+    pub(crate) scan_error: Option<String>,
+    /// A shard could not be listed (already logged by the scan); the list is
+    /// partial.
+    pub(crate) incomplete: bool,
+}
+
+/// The single rescan path, shared by the automatic resume and the operator's
+/// retry-stranded verb (spec §5.4).
 ///
-/// `in_flight` is the segment the caller is *currently* holding outside `pending`
-/// — the one being retried (`RetryingTransient`) or parked (`BlockedDeadLetterFull`).
-/// It is excluded from the re-queue so the rescan can run from those arms (M2)
-/// without double-queuing the segment the arm is about to resume on its own. The
-/// `Draining` caller holds nothing across the rescan and passes `None`.
+/// 1. Moves whatever is already in the drain channel into `pending`, so the
+///    up-to-256 sealed paths still in flight there are visible to the dedup.
+/// 2. Scans for sealed-but-unconfirmed segments, skipping ledger-owned paths
+///    (`exclude`, the ledger's `excludes`, spec §4.0: segments owned by an
+///    outstanding disposition, parked, or cooling down; the scan skips them
+///    before its confirmed-check, so they are neither re-queued nor touched).
+/// 3. Dedups against `pending ∪ backlog ∪ {in_flight}`, through a HashSet
+///    membership view (O(n+m), not `VecDeque::contains` per segment: matters
+///    when a long outage strands many segments, F-rescan). `in_flight` is the
+///    segment the calling arm is retrying, blocked on, or holding, so it is
+///    never re-queued from under the arm about to resume it (M2).
+/// 4. Pushes the rest onto `backlog` and counts them in
+///    `weir_drain_segments_resumed_total`.
 ///
-/// `exclude` is the drain ledger's `excludes` (spec §4.0): segments owned by an
-/// outstanding disposition, parked, or cooling down. The scan skips them before
-/// its confirmed-check, so they are neither re-queued nor touched.
+/// Any residual double-queue is absorbed by the ledger's admission check and
+/// the NotFound no-op in `process_segment`.
+#[allow(clippy::too_many_arguments)]
+fn requeue_unconfirmed(
+    config: &DrainConfig,
+    metrics: &Metrics,
+    rx: Option<&crossbeam_channel::Receiver<PathBuf>>,
+    pending: &mut VecDeque<PathBuf>,
+    backlog: &mut VecDeque<PathBuf>,
+    in_flight: Option<&Path>,
+    exclude: &dyn Fn(&Path) -> bool,
+    hb: &DrainHeartbeat,
+) -> RescanOutcome {
+    if let Some(rx) = rx {
+        while let Ok(p) = rx.try_recv() {
+            pending.push_back(p);
+        }
+    }
+    #[cfg(test)]
+    RESCAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scan = {
+        let _busy = BusyGuard::new(hb, BusyKind::DirScan);
+        // `None` shard_count: skip the beyond-configured-count advisory — that's
+        // a startup-replay concern, not a recovery one.
+        crate::wab::scan_unconfirmed_sealed(
+            &config.wab_dir,
+            None,
+            metrics,
+            exclude,
+            config.orphan_cleanup,
+        )
+    };
+    match scan {
+        Ok(crate::wab::SealedScan {
+            segments,
+            incomplete,
+        }) => {
+            let (fresh, already_queued) = {
+                let mut queued: std::collections::HashSet<&Path> = pending
+                    .iter()
+                    .chain(backlog.iter())
+                    .map(PathBuf::as_path)
+                    .collect();
+                if let Some(seg) = in_flight {
+                    queued.insert(seg);
+                }
+                let (dupes, fresh): (Vec<PathBuf>, Vec<PathBuf>) = segments
+                    .into_iter()
+                    .partition(|s| queued.contains(s.as_path()));
+                (fresh, dupes.len() as u64)
+            };
+            let requeued = fresh.len() as u64;
+            backlog.extend(fresh);
+            if requeued > 0 {
+                metrics.drain_segments_resumed.inc_by(requeued);
+            }
+            RescanOutcome {
+                requeued,
+                already_queued,
+                scan_error: None,
+                incomplete,
+            }
+        }
+        Err(e) => RescanOutcome {
+            scan_error: Some(e.to_string()),
+            ..RescanOutcome::default()
+        },
+    }
+}
+
+/// Probes sink health, publishes it (the `weir_sink_health` gauge and the
+/// board's sink cell), and — on a down→up recovery edge (was not-healthy, now
+/// healthy), or while the drain is idle — runs [`requeue_unconfirmed`], so a
+/// recovered sink drains its stranded backlog automatically rather than
+/// waiting for a daemon restart. Returns the new health-ok state for the
+/// caller's `prev_health_ok`.
+///
+/// "Idle" means BOTH queues are empty: during a replay the backlog is
+/// non-empty, and rescanning on every poll would only find the backlog again
+/// (spec §5.4).
+///
+/// `in_flight` is the segment the caller is *currently* holding outside the
+/// queues — the one being retried (`RetryingTransient`) or parked
+/// (`BlockedDeadLetterFull`). It is excluded from the re-queue so the rescan
+/// can run from those arms (M2) without double-queuing the segment the arm is
+/// about to resume on its own. The `Draining` caller holds nothing across the
+/// rescan and passes `None`.
+///
+/// `exclude` is the drain ledger's `excludes` (spec §4.0); see
+/// [`requeue_unconfirmed`]. `rx` is the drain channel, drained into `pending`
+/// before the scan so its paths take part in the dedup; `None` skips that.
+#[allow(clippy::too_many_arguments)]
+fn probe_and_resume_stranded_with<S: Sink>(
+    rt: &tokio::runtime::Runtime,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    rx: Option<&crossbeam_channel::Receiver<PathBuf>>,
+    pending: &mut VecDeque<PathBuf>,
+    backlog: &mut VecDeque<PathBuf>,
+    prev_health_ok: bool,
+    in_flight: Option<&Path>,
+    exclude: &dyn Fn(&Path) -> bool,
+    ctx: &DrainCtx<'_>,
+) -> bool {
+    let health = probe_health(rt, sink, config.health_probe_timeout, ctx.hb);
+    // Deliverable, not perfect. `Degraded` means "reachable but not fully
+    // healthy" — the HTTP probe returns it for any 4xx outside 401/403/405/501,
+    // which includes 404, what a method-routed framework answers for HEAD on a
+    // POST-only ingest path (`sink/http.rs:645`). Commits over such a sink
+    // succeed; only the probe 4xxes. Requiring `Healthy` here made Degraded a
+    // STICKIER failure than Down — a sink that went down and came back healthy
+    // un-stranded its backlog, while one that came back degraded never did, for
+    // the life of the process. Only `Down` means "do not bother".
+    let now_ok = !matches!(health, SinkHealth::Down(_));
+    ctx.publish.sink_health(&health);
+    set_sink_health(metrics, health);
+
+    // Recovered, or idle. The edge alone is not enough: a segment strands after
+    // `sink_max_retries` transient COMMIT failures, which need not change what
+    // the PROBE answers, so a sink that holds one health state across the whole
+    // episode strands a segment with no edge on either side of it. An idle drain
+    // is precisely when such a segment is invisible and when a directory walk
+    // costs nothing, so it rescans unconditionally. The edge stays as the cost
+    // control for the busy case: with either queue non-empty the scan is
+    // skipped, and the segments in them are about to be processed anyway.
+    if now_ok && (!prev_health_ok || (pending.is_empty() && backlog.is_empty())) {
+        let out = requeue_unconfirmed(
+            config, metrics, rx, pending, backlog, in_flight, exclude, ctx.hb,
+        );
+        if out.requeued > 0 {
+            info!(
+                resumed = out.requeued,
+                "drain: sink recovered; re-queued stranded segment(s) for delivery"
+            );
+        }
+        if let Some(e) = &out.scan_error {
+            warn!(
+                error = %e,
+                "drain: sink recovered but the stranded-segment rescan failed; will retry on the next recovery edge"
+            );
+            // Keep the recovery edge LIVE: return the caller's previous
+            // health-ok state (still `false` on a down→up edge) rather than
+            // `now_ok`. If we returned `now_ok` (true), `prev_health_ok` would
+            // flip true and the `now_ok && !prev_health_ok` edge would never
+            // fire again, so a transient rescan failure would strand segments
+            // until restart — contradicting the "will retry on the next
+            // recovery edge" promise (H1). The gauge above already reflects the
+            // healthy probe; only the edge-tracking state is held back.
+            return prev_health_ok;
+        }
+        // A shard could not be listed (already logged by the scan): the
+        // readable shards are resumed above, and the edge is held live exactly
+        // as for a failed scan (H1, above), so the next poll scans again and
+        // picks up the skipped shard once it reads.
+        if out.incomplete {
+            return prev_health_ok;
+        }
+    }
+    now_ok
+}
+
+/// The pre-Foundations signature, kept for the existing tests: no channel, no
+/// board, and the rescan's finds land in `pending` as they used to.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn probe_and_resume_stranded<S: Sink>(
     rt: &tokio::runtime::Runtime,
@@ -682,97 +867,29 @@ fn probe_and_resume_stranded<S: Sink>(
     exclude: &dyn Fn(&Path) -> bool,
     hb: &DrainHeartbeat,
 ) -> bool {
-    let health = probe_health(rt, sink, config.health_probe_timeout, hb);
-    // Deliverable, not perfect. `Degraded` means "reachable but not fully
-    // healthy" — the HTTP probe returns it for any 4xx outside 401/403/405/501,
-    // which includes 404, what a method-routed framework answers for HEAD on a
-    // POST-only ingest path (`sink/http.rs:645`). Commits over such a sink
-    // succeed; only the probe 4xxes. Requiring `Healthy` here made Degraded a
-    // STICKIER failure than Down — a sink that went down and came back healthy
-    // un-stranded its backlog, while one that came back degraded never did, for
-    // the life of the process. Only `Down` means "do not bother".
-    let now_ok = !matches!(health, SinkHealth::Down(_));
-    set_sink_health(metrics, health);
-
-    // Recovered, or idle. The edge alone is not enough: a segment strands after
-    // `sink_max_retries` transient COMMIT failures, which need not change what
-    // the PROBE answers, so a sink that holds one health state across the whole
-    // episode strands a segment with no edge on either side of it. An idle drain
-    // is precisely when such a segment is invisible and when a directory walk
-    // costs nothing, so it rescans unconditionally. The edge stays as the cost
-    // control for the busy case: with `pending` non-empty the scan is skipped,
-    // and the segments in it are about to be processed anyway.
-    if now_ok && (!prev_health_ok || pending.is_empty()) {
-        // `None` shard_count: skip the beyond-configured-count advisory — that's
-        // a startup-replay concern, not a recovery one.
-        let scan = {
-            let _busy = BusyGuard::new(hb, BusyKind::DirScan);
-            crate::wab::scan_unconfirmed_sealed(
-                &config.wab_dir,
-                None,
-                metrics,
-                exclude,
-                config.orphan_cleanup,
-            )
-        };
-        match scan {
-            Ok(crate::wab::SealedScan {
-                segments: sealed,
-                incomplete,
-            }) => {
-                // Dedup against what's already queued via a HashSet membership view
-                // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
-                // matters when a long outage strands many segments (F-rescan). The
-                // caller's in-flight segment (if any) is folded into the same view
-                // so it is never re-queued from under the arm resuming it (M2).
-                let mut already: std::collections::HashSet<&Path> =
-                    pending.iter().map(PathBuf::as_path).collect();
-                if let Some(seg) = in_flight {
-                    already.insert(seg);
-                }
-                let fresh: Vec<PathBuf> = sealed
-                    .into_iter()
-                    .filter(|seg| !already.contains(seg.as_path()))
-                    .collect();
-                let mut resumed = 0u64;
-                for seg in fresh {
-                    pending.push_back(seg);
-                    resumed += 1;
-                }
-                if resumed > 0 {
-                    metrics.drain_segments_resumed.inc_by(resumed);
-                    info!(
-                        resumed,
-                        "drain: sink recovered; re-queued stranded segment(s) for delivery"
-                    );
-                }
-                // A shard could not be listed (already logged by the scan): the
-                // readable shards are resumed above, and the edge is held live
-                // exactly as for a failed scan (H1, below), so the next poll
-                // scans again and picks up the skipped shard once it reads.
-                if incomplete {
-                    return prev_health_ok;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "drain: sink recovered but the stranded-segment rescan failed; will retry on the next recovery edge"
-                );
-                // Keep the recovery edge LIVE: return the caller's previous
-                // health-ok state (still `false` here, since we only reach this
-                // arm on a down→up edge) rather than `now_ok`. If we returned
-                // `now_ok` (true), `prev_health_ok` would flip true and the
-                // `now_ok && !prev_health_ok` edge would never fire again, so a
-                // transient rescan failure would strand segments until restart —
-                // contradicting the "will retry on the next recovery edge"
-                // promise (H1). The gauge above already reflects the healthy
-                // probe; only the edge-tracking state is held back.
-                return prev_health_ok;
-            }
-        }
-    }
-    now_ok
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb,
+    };
+    let mut backlog = VecDeque::new();
+    let ok = probe_and_resume_stranded_with(
+        rt,
+        sink,
+        config,
+        metrics,
+        None,
+        pending,
+        &mut backlog,
+        prev_health_ok,
+        in_flight,
+        exclude,
+        &ctx,
+    );
+    pending.extend(backlog);
+    ok
 }
 
 // ── Heartbeat (liveness observed from outside the drain's own runtime) ────────
@@ -1271,8 +1388,8 @@ fn drain_thread_with<S: Sink>(
                 // `health_poll_interval` cadence regardless of channel activity, so
                 // a recovered sink re-drains its stranded backlog even while ingest
                 // is saturating the drain channel (the old idle-only poll never
-                // fired under sustained load). `pending` is drained in submission
-                // order, so re-queued stranded segments interleave with new ones.
+                // fired under sustained load). Re-queued stranded segments go to
+                // the `backlog`, which alternates with live segments (spec §5.4).
                 //
                 // Order (spec §4.0): outstanding dispositions first — they never
                 // deliver, and finishing one can change what the rescan may
@@ -1280,16 +1397,18 @@ fn drain_thread_with<S: Sink>(
                 if last_health_poll.elapsed() >= config.health_poll_interval {
                     ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
                     let now = Instant::now();
-                    prev_health_ok = probe_and_resume_stranded(
+                    prev_health_ok = probe_and_resume_stranded_with(
                         &rt,
                         &*sink,
                         &config,
                         &metrics,
+                        Some(&drain_rx),
                         &mut pending,
+                        &mut backlog,
                         prev_health_ok,
                         None,
                         &|p| ledger.excludes(p, now),
-                        &heartbeat,
+                        &ctx,
                     );
                     // Refresh the dead-letter size gauge too, so an out-of-band
                     // `weir-ctl dl drop` (an operator deleting files while the
@@ -1605,16 +1724,18 @@ fn drain_thread_with<S: Sink>(
                 // before `segment` is moved into process_segment / the next state.
                 // Ledger-owned paths are skipped too (spec §4.0).
                 let now = Instant::now();
-                prev_health_ok = probe_and_resume_stranded(
+                prev_health_ok = probe_and_resume_stranded_with(
                     &rt,
                     &*sink,
                     &config,
                     &metrics,
+                    Some(&drain_rx),
                     &mut pending,
+                    &mut backlog,
                     prev_health_ok,
                     Some(&segment),
                     &|p| ledger.excludes(p, now),
-                    &heartbeat,
+                    &ctx,
                 );
 
                 // Resume past the sub-batches already durably processed (F05).
@@ -1724,21 +1845,23 @@ fn drain_thread_with<S: Sink>(
                 // Draining arm would otherwise be starved here: a sink that
                 // recovers while we're parked would not re-drain segments stranded
                 // by an *earlier* outage until the cap cleared. Reusing
-                // probe_and_resume_stranded does the same gauge update plus the
+                // probe_and_resume_stranded_with does the same gauge update plus the
                 // down→up re-queue, excluding `segment` (this arm resumes it on its
                 // own via the RetryingTransient transition below, so re-queuing it
                 // would double-process). Ledger-owned paths are skipped too.
                 let now = Instant::now();
-                prev_health_ok = probe_and_resume_stranded(
+                prev_health_ok = probe_and_resume_stranded_with(
                     &rt,
                     &*sink,
                     &config,
                     &metrics,
+                    Some(&drain_rx),
                     &mut pending,
+                    &mut backlog,
                     prev_health_ok,
                     Some(&segment),
                     &|p| ledger.excludes(p, now),
-                    &heartbeat,
+                    &ctx,
                 );
                 // Unblock on the SAME predicate that blocked: the blocked write
                 // fits. A bare `total < cap` unblocked while the total sat in

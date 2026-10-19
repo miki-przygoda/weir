@@ -13,7 +13,7 @@ use crate::wab::{
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering::Relaxed},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -385,4 +385,80 @@ fn next_queued_alternates_and_falls_back_to_whichever_side_has_work() {
         got.push(x);
     }
     assert_eq!(got, ["l1", "b1", "l2", "b2", "c1", "b3"].map(PathBuf::from));
+}
+
+/// The rescan drains the channel into `pending` FIRST, so a path that is both
+/// in the channel and on disk is counted as already queued, never queued twice.
+#[test]
+fn a_rescan_drains_the_channel_first_and_never_double_queues() {
+    let dir = tmp_dir("fnd_rescan_dedup");
+    let a = seg(&dir, 1, &[b"a"]);
+    let b = seg(&dir, 2, &[b"b"]);
+    let (tx, rx) = crossbeam_channel::bounded(256);
+    tx.send(a.clone()).unwrap();
+    let (mut pending, mut backlog) = (VecDeque::new(), VecDeque::new());
+    let out = crate::drain::requeue_unconfirmed(
+        &fast_config(dir.clone()),
+        &noop_metrics(),
+        Some(&rx),
+        &mut pending,
+        &mut backlog,
+        None,
+        &|_| false,
+        &DrainHeartbeat::new(),
+    );
+    assert_eq!(pending, VecDeque::from([a.clone()]));
+    assert_eq!(backlog, VecDeque::from([b.clone()]));
+    assert_eq!(
+        (out.requeued, out.already_queued, out.scan_error),
+        (1, 1, None)
+    );
+    assert!(rx.is_empty());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 13: auto-resume during replay. With the replay list
+/// still in the backlog, a healthy health poll must not rescan (the old gate
+/// looked only at `pending`, so it rescanned every poll for the whole replay
+/// and double-queued whatever sat in the channel).
+#[test]
+fn the_idle_rescan_waits_for_the_backlog_to_empty() {
+    crate::drain::RESCAN_CALLS.store(0, Relaxed);
+    let dir = tmp_dir("fnd_idle_gate");
+    let backlog: Vec<PathBuf> = (1..=5).map(|n| seg(&dir, n, &[b"b"])).collect();
+    let sink = Arc::new(MockSink::with_yielding_commit(
+        Duration::from_millis(100),
+        1000,
+    ));
+    let cfg = DrainConfig {
+        health_poll_interval: Duration::from_millis(20),
+        ..fast_config(dir.clone())
+    };
+    let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &noop_metrics(),
+        rt_with(DrainControl::detached(), None, backlog),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        sink.call_count() < 5,
+        "the replay must still be running for this to prove anything"
+    );
+    assert_eq!(
+        crate::drain::RESCAN_CALLS.load(Relaxed),
+        0,
+        "a health poll during replay must not rescan"
+    );
+    wait_for(5, "replay finished", || sink.call_count() == 5);
+    wait_for(
+        2,
+        "the idle rescan resumes once both queues are empty",
+        || crate::drain::RESCAN_CALLS.load(Relaxed) > 0,
+    );
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
 }
