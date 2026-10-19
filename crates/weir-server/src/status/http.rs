@@ -307,7 +307,6 @@ mod tests {
             last_panic: Some(format!("{S} panic")),
             at_ms: now_ms(),
         });
-        // PR 6 Task 6.8 adds `at_unix_ms` to `ReloadReport`; it adds `at_unix_ms: 0` here.
         b.reload.publish(
             crate::reload::ReloadReport {
                 trigger: crate::reload::ReloadTrigger::Sighup,
@@ -315,6 +314,7 @@ mod tests {
                 changed: vec![],
                 rejected: vec![("tls", format!("{S} reload detail"))],
                 note: None,
+                at_unix_ms: 0,
             },
             now_ms(),
         );

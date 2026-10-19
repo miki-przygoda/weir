@@ -297,6 +297,43 @@ other means. Network filesystems are not a supported guard either way:
 NFS can grant the lock with weaker, emulated semantics. See
 [Platform support](../platform-support.md#untested-and-unsupported).
 
+#### `admin_socket_enabled`
+
+- **Type**: bool
+- **Default**: `true`
+- **CLI**: none
+- **Env**: `WEIR_ADMIN_SOCKET_ENABLED`
+- **TOML**: `admin_socket_enabled`
+
+Serve the admin Unix socket: `weir-ctl status`, `reload` and
+`drain pause|resume|retry-stranded` talk to it. Only the daemon's own uid
+and root may connect. Set `false` to run without it; nothing else changes.
+
+#### `admin_socket_path`
+
+- **Type**: absolute path, at most 103 bytes
+- **Default**: `<parent of wab_dir>/<name of wab_dir>.admin.sock` —
+  `/var/lib/weir/wab.admin.sock` for the default `wab_dir`
+- **Validation**: absolute, no `..`, not inside `wab_dir`, not the same file
+  as `socket_path` (compared after removing `.` and doubled `/`, and again by
+  parent directory identity, so `/var/run/x` and `/run/x` collide)
+- **CLI**: `--admin-socket-path <path>`
+- **Env**: `WEIR_ADMIN_SOCKET_PATH` (weir-ctl reads the same variable)
+- **TOML**: `admin_socket_path`
+
+The default deliberately avoids the producer socket's directory: `/run/weir`
+is shared with producer containers by design, and a socket there would be
+reachable by every producer running as the daemon's uid. The parent
+directory must be writable only by the daemon user (not group- or
+world-writable, owned by the daemon's uid or root).
+
+An explicit path that fails this, or any other bind check, stops startup
+before recovery. The derived default failing only disables the admin socket:
+the daemon logs an ERROR starting `admin socket unavailable` with the reason
+code, and raises the `admin_unavailable` condition. Under Kubernetes with
+`readOnlyRootFilesystem`, set this to a private `emptyDir` that is not
+mounted into producer containers.
+
 ---
 
 ### Sharding and worker pool

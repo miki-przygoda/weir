@@ -182,6 +182,30 @@ What this means for orchestration:
   process`. A stale socket left by a killed container is still removed on
   the next start.
 
+### Admin socket
+
+In the image the admin socket lives at `/var/lib/weir/wab.admin.sock`, the
+path derived from `wab_dir = /var/lib/weir/wab`. That is inside the image's
+`/var/lib/weir` (chowned to uid 10001, not a `VOLUME`), not in the
+`/run/weir` volume that producer containers mount. A sidecar running as uid
+10001 so that `peer_uid_check` admits it to the producer socket therefore has
+no admin access: it cannot see the admin socket, and the daemon's peer check
+would only matter if it could.
+
+The shipped image contains only `weir-server`, not `weir-ctl`. In an image
+that adds `weir-ctl`, `docker exec <container> weir-ctl status` reaches the
+admin socket, since the exec runs as the image's user (uid 10001) in the
+daemon's filesystem. Without it, the read-only `/status` document on the
+metrics port is the way in from outside the container.
+
+With a read-only root filesystem (`docker run --read-only`, or Kubernetes
+`readOnlyRootFilesystem: true`), `/var/lib/weir` is not writable, so the
+bind fails, the daemon logs `admin socket unavailable` at ERROR, raises the
+`admin_unavailable` condition and carries on without it. To keep the admin
+socket, set `WEIR_ADMIN_SOCKET_PATH` to a file in a private writable mount
+(a `tmpfs` or an `emptyDir` that is not mounted into producer containers),
+whose directory is writable only by uid 10001.
+
 ### Healthcheck
 
 `HEALTHCHECK` opens a TCP connection to the metrics port (9185) using
@@ -321,6 +345,8 @@ docker run \
     -v weir-wab:/var/lib/weir/wab \
     -v weir-run:/run/weir \
     -v $(pwd)/weir.toml:/etc/weir/weir.toml:ro \
+    --tmpfs /run/weir-admin:rw,noexec,nosuid,size=1m,uid=10001,gid=10001,mode=0700 \
+    -e WEIR_ADMIN_SOCKET_PATH=/run/weir-admin/wab.admin.sock \
     -p 127.0.0.1:9185:9185 \
     --name weir \
     weir:latest
@@ -328,7 +354,10 @@ docker run \
 
 The `127.0.0.1:9185` binding matches the recommendation in
 [`threat-model.md`](threat-model.md): the metrics port is not part of
-the trust boundary and should not be exposed publicly.
+the trust boundary and should not be exposed publicly. `--read-only`
+makes `/var/lib/weir` unwritable, so the private `/run/weir-admin` tmpfs
+holds the admin socket instead (see [Admin socket](#admin-socket)); it is
+not the `/run/weir` volume, and no producer container mounts it.
 
 ## Updating this document
 
@@ -345,7 +374,9 @@ When changing the Dockerfile, update this document if you change:
   documents env as the only path.
 - The HEALTHCHECK (orchestrators may rely on the default behaviour).
 - The WAB or socket volume layout, or the compose `restart`/port mapping
-  (the one-daemon-per-volume section describes how a second replica fails).
+  (the one-daemon-per-volume section describes how a second replica fails),
+  or anything that moves the admin socket onto a volume producers mount
+  (the admin-socket section relies on `/var/lib/weir` being private).
 - Anything in the `What the image does NOT do` section (operators
   reading this document trust that the image leaves those concerns to
   them).

@@ -30,6 +30,8 @@ struct RawServer {
     metrics_max_connections: Option<usize>,
     livez_checks: Option<Vec<String>>,
     peer_uid_check: Option<bool>,
+    admin_socket_enabled: Option<bool>,
+    admin_socket_path: Option<String>,
     shutdown_timeout_secs: Option<u64>,
     drain_shutdown_budget_secs: Option<u64>,
     connection_read_timeout_secs: Option<u64>,
@@ -117,6 +119,8 @@ const BASE_SERVER_KEYS: &[&str] = &[
     "metrics_max_connections",
     "livez_checks",
     "peer_uid_check",
+    "admin_socket_enabled",
+    "admin_socket_path",
     "shutdown_timeout_secs",
     "drain_shutdown_budget_secs",
     "connection_read_timeout_secs",
@@ -245,6 +249,8 @@ pub(super) fn read(path: &Path) -> Result<Option<(PartialConfig, Vec<String>)>, 
             metrics_max_connections: s.metrics_max_connections,
             livez_checks: s.livez_checks.map(|v| v.join(",")),
             peer_uid_check: s.peer_uid_check,
+            admin_socket_enabled: s.admin_socket_enabled,
+            admin_socket_path: s.admin_socket_path.map(PathBuf::from),
             shutdown_timeout_secs: s.shutdown_timeout_secs,
             drain_shutdown_budget_secs: s.drain_shutdown_budget_secs,
             connection_read_timeout_secs: s.connection_read_timeout_secs,
@@ -469,6 +475,29 @@ mod tests {
                 .iter()
                 .all(|w| !w.contains("drain_shutdown_budget_secs")),
             "drain_shutdown_budget_secs must not be reported as unknown: {warnings:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn admin_socket_keys_are_known() {
+        let dir = crate::testutil::scratch_dir("filecfg_admin");
+        crate::testutil::mkdir_p(&dir);
+        let path = dir.join("weir.toml");
+        std::fs::write(
+            &path,
+            "[server]\nadmin_socket_enabled = false\nadmin_socket_path = \"/run/weir-admin/a.sock\"\n",
+        )
+        .unwrap();
+        let (partial, warnings) = read(&path).unwrap().expect("the file exists");
+        assert_eq!(partial.admin_socket_enabled, Some(false));
+        assert_eq!(
+            partial.admin_socket_path,
+            Some(PathBuf::from("/run/weir-admin/a.sock"))
+        );
+        assert!(
+            warnings.iter().all(|w| !w.contains("admin_socket")),
+            "admin keys must not be reported as unknown: {warnings:?}"
         );
         std::fs::remove_dir_all(dir).ok();
     }

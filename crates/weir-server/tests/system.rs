@@ -913,6 +913,9 @@ fn metrics_all_families_registered() {
         "weir_drain_shutdown_deadline_seconds",
         // Metrics / health listener (Foundations PR 5)
         "weir_http_requests_dropped",
+        // Admin socket (Foundations PR 6)
+        "weir_admin_requests",
+        "weir_admin_socket_up",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
@@ -6306,4 +6309,240 @@ fn sigterm_with_a_zero_budget_is_prompt_and_loses_nothing() {
     }
     drop(srv2);
     let _ = fs::remove_dir_all(&wab);
+}
+
+// ── Admin socket (Foundations PR 6, spec §5.9 / §11) ─────────────────────────
+
+fn admin_json(srv: &weir_testkit::WeirServer, verb: &str, args: &str) -> serde_json::Value {
+    let line = srv.admin(verb, args);
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
+}
+
+/// A counter or gauge sample from a scrape; 0 if absent.
+fn scrape_value(srv: &weir_testkit::WeirServer, series: &str) -> f64 {
+    srv.scrape_metrics()
+        .lines()
+        .find(|l| l.starts_with(series) && l[series.len()..].starts_with(' '))
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+#[test]
+fn admin_socket_serves_status_at_the_derived_path_and_is_removed_at_exit() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut srv = weir_server!("admin_status").start();
+    let path = srv.admin_socket_path();
+    let meta = fs::symlink_metadata(&path).expect("the admin socket exists at the derived path");
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.mode() & 0o777, 0o600);
+
+    let r = admin_json(&srv, "status", "{}");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["instance"]["pid"], srv.child_pid());
+    assert_eq!(
+        r["instance"]["wab_dir"],
+        fs::canonicalize(&srv.wab_dir)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert_eq!(r["result"]["schema"], "weir.status/v1");
+    assert_eq!(r["result"]["view"], "admin");
+    assert_eq!(scrape_value(&srv, "weir_admin_socket_up"), 1.0);
+
+    srv.sigterm();
+    assert!(
+        !path.exists(),
+        "a clean exit removes the admin socket (inode-checked)"
+    );
+}
+
+/// spec §5.10: SIGHUP and the admin verb are one reload path.
+#[test]
+fn admin_reload_and_sighup_share_one_reload_path() {
+    let srv = weir_server!("admin_reload").start();
+    let r = admin_json(&srv, "reload", "{}");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["trigger"], "admin");
+    assert_eq!(r["result"]["outcome"], "noop");
+    assert_eq!(
+        scrape_value(
+            &srv,
+            "weir_config_reloads_total{trigger=\"admin\",outcome=\"noop\"}"
+        ),
+        1.0
+    );
+    send_sighup(srv.child_pid());
+    assert_eq!(wait_for_sighup_reloads(&srv, "noop", 1), 1);
+    let s = admin_json(&srv, "status", "{}");
+    assert_eq!(s["result"]["reload"]["last"]["trigger"], "sighup", "{s}");
+}
+
+/// spec §6 step 7: an explicitly configured admin path that cannot be
+/// bound safely is fatal, before recovery.
+#[test]
+fn an_explicit_admin_path_in_a_shared_directory_refuses_to_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let shared = std::env::temp_dir().join(format!("weir_admin_shared_{}", std::process::id()));
+    fs::create_dir_all(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+    let sock = shared.join("a.sock");
+    let (status, log) = weir_server!("admin_explicit_shared")
+        .extra_config(format!("admin_socket_path = \"{}\"", sock.display()))
+        .spawn_expecting_exit(Duration::from_secs(15));
+    assert_eq!(status.code(), Some(1), "{log}");
+    assert!(log.contains("group- or world-writable"), "{log}");
+    assert!(!sock.exists(), "nothing was bound");
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// spec §6 step 7: the derived default failing disables admin, not the
+/// daemon (and raises admin_unavailable).
+#[test]
+fn a_derived_admin_path_in_a_shared_parent_disables_admin_not_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    // Short label: <canonical temp dir>/…/wab.admin.sock must stay <= 103
+    // bytes on macOS, or the derived path is path_too_long instead.
+    let shared = std::env::temp_dir().join(format!("weir_adm_sh_{}", std::process::id()));
+    let wab = shared.join("wab");
+    fs::create_dir_all(&wab).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let srv = weir_server!("admin_derived_shared")
+        .wab_dir(wab.clone())
+        .log_level("info")
+        .start();
+    let mut c = srv.client();
+    c.push(b"still-serving", Durability::Durable)
+        .expect("ingest is unaffected");
+    drop(c);
+    assert!(!shared.join("wab.admin.sock").exists());
+    assert_eq!(scrape_value(&srv, "weir_admin_socket_up"), 0.0);
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(log.contains("admin socket unavailable"), "{log}");
+    assert!(log.contains("parent_insecure"), "{log}");
+    drop(srv);
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// spec §16 system test 6: pause, then 1,000 pushes, then resume. Ingest
+/// keeps acking while delivery holds; everything arrives after resume.
+#[test]
+fn admin_pause_holds_delivery_while_ingest_acks_and_resume_delivers_all() {
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("admin_pause")
+        .extra_config("sink_type = \"http\"")
+        // Small segments, so sealed segments exist during the pushes and
+        // an unpaused drain WOULD deliver them.
+        .extra_config("wab_segment_max_bytes = 4096")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let r = admin_json(&srv, "drain.pause", r#"{"wait_ms":5000}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(
+        r["result"]["paused"], true,
+        "an idle drain observes a pause within a 50 ms slice: {r}"
+    );
+
+    let before = sink.bodies().len();
+    let payloads: Vec<String> = (0..1000)
+        .map(|i| format!("paused-{i:04}-{}", "x".repeat(48)))
+        .collect();
+    let mut c = srv.client();
+    for p in &payloads {
+        c.push(p.as_bytes(), Durability::Durable)
+            .expect("ingest keeps acking while paused");
+    }
+    drop(c);
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        sink.bodies().len(),
+        before,
+        "nothing is delivered while paused"
+    );
+    assert_eq!(
+        admin_json(&srv, "status", "{}")["result"]["drain"]["paused"],
+        true
+    );
+
+    let r = admin_json(&srv, "drain.resume", r#"{"wait_ms":5000}"#);
+    assert_eq!(r["result"]["was_paused"], true, "{r}");
+    assert_eq!(r["result"]["resumed"], true, "{r}");
+
+    // SIGTERM seals the active segment; the drain budget (10 s default)
+    // covers 1,000 local POSTs with room to spare.
+    srv.sigterm();
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<&String> = payloads
+        .iter()
+        .filter(|p| !delivered.contains(*p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of 1000 never delivered, e.g. {:?}",
+        missing.len(),
+        missing.first()
+    );
+}
+
+/// spec §16 system test 7: a stranded segment is redelivered by
+/// drain.retry_stranded, without waiting for the (here hour-long) health
+/// poll that would otherwise resume it.
+#[test]
+fn admin_retry_stranded_redelivers_without_waiting_for_the_health_poll() {
+    let port = free_port(); // nothing listens yet: every delivery is refused
+    let srv = weir_server!("admin_retry")
+        .extra_config("sink_type = \"http\"")
+        .extra_config("sink_max_retries = 0")
+        .extra_config("health_poll_interval_secs = 3600")
+        // A strand holds its segment off for the backoff it would have
+        // served (the safety floor's `not_before` cool-down, which the rescan
+        // honours so a Retry-After is never violated): 100 ms here.
+        .extra_config("sink_retry_base_delay_ms = 100")
+        .extra_config("wab_segment_max_bytes = 4096")
+        .env("WEIR_SINK_URL", format!("http://127.0.0.1:{port}/sink"))
+        .start();
+    let mut c = srv.client();
+    for i in 0..40 {
+        c.push(
+            format!("stranded-{i:02}-{}", "y".repeat(200)).as_bytes(),
+            Durability::Durable,
+        )
+        .unwrap();
+    }
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while scrape_value(&srv, "weir_drain_segments_stranded_total") < 1.0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        scrape_value(&srv, "weir_drain_segments_stranded_total") >= 1.0,
+        "nothing stranded"
+    );
+    // Let every sealed segment strand and every 100 ms cool-down elapse: the
+    // verb rescans the WAB, and a segment still cooling down is (rightly)
+    // excluded from it. Nothing else re-queues it: the next health poll is
+    // an hour away.
+    thread::sleep(Duration::from_secs(1));
+
+    let sink = RecordingSink::start_on(port);
+    let r = admin_json(&srv, "drain.retry_stranded", r#"{"wait_ms":10000}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["completed"], true, "{r}");
+    assert!(r["result"]["requeued"].as_u64().unwrap_or(0) >= 1, "{r}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while sink.bodies().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        sink.bodies().iter().any(|b| b.starts_with(b"stranded-")),
+        "the requeued segment reached the recovered sink"
+    );
 }

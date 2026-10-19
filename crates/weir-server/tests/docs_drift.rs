@@ -825,6 +825,53 @@ fn the_wab_dir_lock_key_is_in_the_configuration_reference() {
     }
 }
 
+/// The admin socket is on by default and refuses an insecure parent, so an
+/// operator who meets `admin_unavailable` must find both keys, under the
+/// spellings the daemon parses, in the reference and the example file.
+#[test]
+fn the_admin_socket_keys_are_in_the_configuration_reference() {
+    assert!(
+        CONFIG_ENV_SRC.contains("\"WEIR_ADMIN_SOCKET_ENABLED\""),
+        "src/config/env.rs no longer reads WEIR_ADMIN_SOCKET_ENABLED; update this \n\
+         guard and the docs to the new spelling"
+    );
+    assert!(
+        CONFIG_ENV_SRC.contains("\"WEIR_ADMIN_SOCKET_PATH\""),
+        "src/config/env.rs no longer reads WEIR_ADMIN_SOCKET_PATH; update this \n\
+         guard and the docs to the new spelling"
+    );
+    assert!(
+        CONFIG_CLI_SRC.contains("\"--admin-socket-path\""),
+        "src/config/cli.rs no longer parses --admin-socket-path; update this guard \n\
+         and the docs to the new spelling"
+    );
+    for needle in [
+        "#### `admin_socket_enabled`",
+        "#### `admin_socket_path`",
+        "`WEIR_ADMIN_SOCKET_ENABLED`",
+        "`WEIR_ADMIN_SOCKET_PATH`",
+        "`--admin-socket-path",
+        ".admin.sock",
+    ] {
+        assert!(
+            CONFIGURATION.contains(needle),
+            "docs/operations/configuration.md must document the admin socket keys \n\
+             (missing {needle:?})"
+        );
+    }
+    for needle in [
+        "admin_socket_enabled",
+        "admin_socket_path",
+        "WEIR_ADMIN_SOCKET_PATH",
+    ] {
+        assert!(
+            CONFIG_EXAMPLE.contains(needle),
+            "deploy/docker/weir.toml.example claims to list every option; it is \n\
+             missing {needle:?}"
+        );
+    }
+}
+
 /// The bounded-shutdown budget (Foundations §7) is an operator-facing knob
 /// whose default decides how much a SIGTERM delivers; it must be findable in
 /// the reference and in the example that claims to list every option.

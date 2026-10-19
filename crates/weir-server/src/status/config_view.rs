@@ -113,6 +113,8 @@ impl From<&Config> for ConfigView {
             metrics_max_connections,
             livez_checks,
             peer_uid_check,
+            admin_socket_enabled,
+            admin_socket_path,
             shutdown_timeout_secs,
             drain_shutdown_budget_secs,
             connection_read_timeout_secs,
@@ -195,6 +197,11 @@ impl From<&Config> for ConfigView {
         // Admin.
         v.admin("socket_path", s(socket_path.display()));
         v.admin("wab_dir", s(wab_dir.display()));
+        v.admin("admin_socket_enabled", b(*admin_socket_enabled));
+        v.admin(
+            "admin_socket_path",
+            opt_s(admin_socket_path.as_ref().map(|p| p.display())),
+        );
         v.admin("batch_size", u(*batch_size as u64));
         v.admin("batch_deadline_ms", u(*batch_deadline_ms));
         v.admin("wab_compression", s(wab_compression));

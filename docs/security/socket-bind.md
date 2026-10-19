@@ -186,7 +186,8 @@ so it does not close the rename race. The daemon does **not** refuse to start:
 operators legitimately place sockets under `/tmp` during development, and a
 hard refusal would break them. A future change could add an opt-in
 `require_private_parent` config flag that promotes this warning to a
-start-time refusal for hardened deployments.
+start-time refusal for hardened deployments. The admin socket already
+refuses; see [The admin socket](#the-admin-socket).
 
 ## Stale socket removal and the liveness probe
 
@@ -312,6 +313,37 @@ and re-create a running daemon's socket path.
 The residual `fstatat` → `unlinkat` window at shutdown is the same class as
 the `bind(2)` → `fstatat` window above, and the same private-parent-directory
 assumption closes it.
+
+## The admin socket
+
+The admin socket reuses `bind_hardened` with one difference: the
+parent-directory check refuses instead of warning
+(`bind_hardened_with(path, ParentPolicy::RequirePrivate)`). A parent that is
+group- or world-writable, or owned by a non-root user other than the
+daemon's, is a place where someone else could create the socket name first
+and impersonate the control plane, so the bind stops with reason code
+`parent_insecure`. An explicit `admin_socket_path` refused this way stops
+startup; the default path derived from `wab_dir` only disables the admin
+socket and raises the `admin_unavailable` condition.
+
+Before that bind, `bind_admin` refuses a path that names the same file as
+`socket_path` (lexically, or the same basename in the same parent directory
+by (dev, ino), which catches `/var/run` → `/run`), and refuses a live socket
+at the path with the admin socket's own wording (`in_use`). The stale-socket
+probe, the `umask(0o177)` bind, the inode re-check and the own-inode-only
+removal at exit are the same code as the producer socket's.
+
+It is never on a shared volume: the default sits beside `wab_dir`
+(`/var/lib/weir/wab.admin.sock`), not in `/run/weir`, which producer
+containers mount.
+
+The bind happens at startup step 7, while the runtime already serves
+`/metrics` and the probes but before recovery. The process-global umask
+window (see [below](#known-limitation--the-umask-window-is-process-global))
+then overlaps only the runtime's own threads, which create no files, and the
+lock-integrity thread, whose only file creation (an `O_EXCL` re-create of
+`.weir.lock` at mode 0o600) is unchanged by umask 0o177. No flusher, worker
+or drain exists yet at step 7.
 
 ## What is tested
 

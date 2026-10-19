@@ -7,6 +7,7 @@
 //! *unevaluated*, never "false". Nothing here performs I/O or reads a clock.
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod codes;
 pub mod condition;
 pub mod config;

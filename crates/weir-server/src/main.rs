@@ -22,6 +22,10 @@ mod test_hooks;
 // is exactly why the mistake was invisible.
 #[cfg(unix)]
 mod socket;
+// The admin socket (Foundations spec §5.9, §11) is Unix-only, like the listener
+// layer it builds on.
+#[cfg(unix)]
+mod admin;
 // Also under `dst`: the simulation harness is compiled into a non-test build
 // by that feature, and it needs the same umask-immune scratch directories.
 #[cfg(any(test, feature = "dst"))]
@@ -443,9 +447,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is a counted reload request instead of a dropped signal. The TLS step
     // below registers its config once it has loaded it.
     let reloader = reload::Reloader::new(Arc::clone(&metrics), tcp_configured);
+    // Each report lands in the board's reload cell (admin `status`, /status).
+    reloader.attach_board(Arc::clone(&board));
     let reload_tx = reload::spawn_reload_loop(Arc::clone(&reloader));
-    // [PR 6 slot] `reloader.attach_board(..)` and a `reload_tx.clone()` for the
-    // admin `reload` verb, which reuses this queue.
+    // The admin `reload` verb's handle on the SAME queue SIGHUP feeds (spec
+    // §5.10: one reload path, serialized).
+    #[cfg(unix)]
+    let admin_reload_tx = reload_tx.clone();
     #[cfg(unix)]
     reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
     #[cfg(not(unix))]
@@ -508,9 +516,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // ── Step 7: [PR 6 slot] admin socket ──────────────────────────────────────
-    // admin path → refuse_if_live → bind_hardened_with → admin::spawn(..,
-    // lifecycle.subscribe()). `drain.pause` is accepted from here on.
+    // ── Step 7: admin socket, before recovery ─────────────────────────────────
+    //
+    // admin path → refuse_if_live → bind_hardened_with → serve (spec §5.9,
+    // §11). An explicit admin_socket_path that cannot be bound is fatal here,
+    // before recovery; a derived default that cannot be bound disables admin
+    // (admin_unavailable) and the daemon runs on. `drain.pause` is accepted
+    // from here on. The same thresholds and liveness checks the HTTP router
+    // (step 5) uses, so admin `status`, /status and /readyz agree (G2).
+    #[cfg(unix)]
+    let admin_handle = admin::start(
+        &config,
+        admin::StartDeps {
+            board: Arc::clone(&board),
+            drain_ctl: drain_ctl.clone(),
+            reload_tx: admin_reload_tx,
+            level_rx: lifecycle.subscribe(),
+            thresholds: Arc::new(weir_status::Thresholds::DEFAULT),
+            livez_checks: Arc::from(config.livez_checks.clone()),
+            metrics: Arc::clone(&metrics),
+            started_at_ms: board.statik.started_at_ms,
+        },
+    )
+    .inspect_err(|e| tracing::error!("{e}"))?;
 
     // ── Step 8: recovery, on this thread, while HTTP is served ────────────────
     //
@@ -975,8 +1003,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             drop(rt_guard);
             rt.shutdown_timeout(Duration::from_secs(1));
-            // [PR 6 slot] unlink the admin socket here (remove_own_socket on its
-            // BoundSocket: inode-checked).
+            // spec §7 T3: unlink the admin socket (inode-checked: only the
+            // inode this daemon bound). The only close site: the pre-serving
+            // skip path falls through to this same T0-T3 sequence. The orphan
+            // arm below deliberately leaves it as a stale socket, which the
+            // next start's refuse_if_live / bind_hardened probes as Stale and
+            // replaces.
+            #[cfg(unix)]
+            if let Some(a) = admin_handle {
+                a.close();
+            }
             // The wab_dir lock (wab::lock's process-lifetime static) is released
             // by the kernel at exit, after everything above.
             info!("weir shut down cleanly");

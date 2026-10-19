@@ -50,6 +50,9 @@ OPTIONS:
                                                [default: none]
     --peer-uid-check <bool>                  Refuse connections from uids other
                                                than the daemon's [default: true]
+    --admin-socket-path <path>               Admin Unix socket path (ABSOLUTE, <= 103 bytes)
+                                               [default: <wab_dir parent>/<wab_dir name>.admin.sock]
+                                               [env: WEIR_ADMIN_SOCKET_PATH]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
     --drain-shutdown-budget-secs <secs>      Drain delivery budget after SIGTERM, once
                                                ingest is sealed (0-3600) [default: 10]
@@ -114,6 +117,9 @@ NOTES:
     clickhouse-sink). On a binary built without a feature, passing its flag
     is rejected with a message naming the feature to rebuild with.
     Boolean flags accept true/false, 1/0, yes/no, or on/off.
+    The admin socket is on by default; turn it off with
+    WEIR_ADMIN_SOCKET_ENABLED=false or admin_socket_enabled = false in the
+    config file (there is no flag for it).
 ";
 
 /// The config file path used when `--config` is not passed.
@@ -213,6 +219,10 @@ pub(super) fn parse_from(
             .opt_value_from_str("--livez-checks")
             .map_err(pico_err)?,
         peer_uid_check: opt_bool(&mut pargs, "--peer-uid-check")?,
+        admin_socket_enabled: None, // env/TOML only (spec §13)
+        admin_socket_path: pargs
+            .opt_value_from_str("--admin-socket-path")
+            .map_err(pico_err)?,
         shutdown_timeout_secs: pargs
             .opt_value_from_str("--shutdown-timeout-secs")
             .map_err(pico_err)?,
@@ -539,6 +549,20 @@ mod tests {
         assert_eq!(partial.drain_shutdown_budget_secs, Some(42));
         assert!(
             HELP.contains("--drain-shutdown-budget-secs"),
+            "the flag must be in --help"
+        );
+    }
+
+    #[test]
+    fn admin_socket_path_flag_is_parsed() {
+        let (partial, _) =
+            parse_from(args(&["--admin-socket-path", "/run/weir-admin/a.sock"])).unwrap();
+        assert_eq!(
+            partial.admin_socket_path,
+            Some(PathBuf::from("/run/weir-admin/a.sock"))
+        );
+        assert!(
+            HELP.contains("--admin-socket-path"),
             "the flag must be in --help"
         );
     }
