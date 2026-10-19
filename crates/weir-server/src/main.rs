@@ -712,11 +712,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commit_timeout_for_stall,
         ),
     )
-    .with_status(status::poll::PollStatus::new(
-        Arc::clone(&board),
-        config.wab_dir.clone(),
-        coalesce_hint_for_poll,
-    ));
+    .with_status(
+        status::poll::PollStatus::new(
+            Arc::clone(&board),
+            config.wab_dir.clone(),
+            coalesce_hint_for_poll,
+        )
+        .with_livez_checks(config.livez_checks.clone()),
+    );
     let wab_dir_bg = config.wab_dir.clone();
     rt.spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));

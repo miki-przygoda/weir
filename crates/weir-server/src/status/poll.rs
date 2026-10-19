@@ -799,6 +799,9 @@ pub(crate) struct PollStatus {
     stranded_baseline: u64,
     stranded_prev: u64,
     seen_success_ms: Option<u64>,
+    /// The configured `livez_checks` (spec §12), so `weir_live` answers what
+    /// `/livez` answers. Empty unless `with_livez_checks` sets it.
+    livez_checks: Vec<weir_status::LivezCheck>,
 }
 
 impl PollStatus {
@@ -819,7 +822,15 @@ impl PollStatus {
             stranded_baseline: 0,
             stranded_prev: 0,
             seen_success_ms: None,
+            livez_checks: Vec::new(),
         }
+    }
+
+    /// The configured `livez_checks`, so `weir_live` answers exactly what
+    /// `/livez` answers (G2).
+    pub(crate) fn with_livez_checks(mut self, checks: Vec<weir_status::LivezCheck>) -> Self {
+        self.livez_checks = checks;
+        self
     }
 
     /// Spec §5.11 step 5: counter deltas over their windows, and the
@@ -871,8 +882,7 @@ impl PollStatus {
         let eval = weir_status::evaluate(&ev, &self.thresholds, &self.board.latches);
         self.board.latches.update(&eval, now_ms);
         let ready = weir_status::readiness(&ev).ok;
-        // PR 5 passes the configured livez_checks; none exist yet, so `[]`.
-        let live = weir_status::liveness(&ev, &self.thresholds, &[]).ok;
+        let live = weir_status::liveness(&ev, &self.thresholds, &self.livez_checks).ok;
         publish_gauges(metrics, &ev, &eval, ready, live);
         self.log_transitions(&eval);
         eval
@@ -2710,6 +2720,35 @@ mod tests {
         assert!(
             board.latches.since(ConditionCode::WabScanStale).is_some(),
             "the status steps ran without a size scan"
+        );
+    }
+
+    /// Review Focus 4: `weir_live` (and so dashboards and alerts) answers
+    /// exactly what `/livez` answers for the configured `livez_checks`.
+    #[test]
+    fn weir_live_follows_the_configured_livez_checks() {
+        use weir_status::LivezCheck;
+        let b = crate::status::test_board(1, 1);
+        b.shards.mark_up(0);
+        // Worker 0 ran and exited: `worker_exited` holds once serving.
+        drop(crate::status::WorkerGuard::enter(Arc::clone(&b.shards), 0));
+        b.listeners.unix.set(ListenerState::Bound);
+        b.life.enter(Phase::Serving, crate::status::unix_ms_now());
+        let (m, _reg) = Metrics::new();
+        let now = crate::status::unix_ms_now();
+        let root = crate::testutil::scratch_dir("poll_livez_checks");
+
+        let mut none = PollStatus::new(Arc::clone(&b), root.clone(), Arc::new(AtomicU64::new(200)));
+        none.publish(now, &m);
+        assert_eq!(m.live.get(), 1.0, "livez_checks = [] never fails weir_live");
+
+        let mut sel = PollStatus::new(Arc::clone(&b), root, Arc::new(AtomicU64::new(200)))
+            .with_livez_checks(vec![LivezCheck::WorkerExited]);
+        sel.publish(now, &m);
+        assert_eq!(
+            m.live.get(),
+            0.0,
+            "a selected failing check sets weir_live = 0, as /livez answers 503"
         );
     }
 }
