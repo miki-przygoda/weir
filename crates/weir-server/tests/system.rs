@@ -911,6 +911,8 @@ fn metrics_all_families_registered() {
         // Bounded shutdown (Foundations PR 4)
         "weir_config_drain_shutdown_budget_seconds",
         "weir_drain_shutdown_deadline_seconds",
+        // Metrics / health listener (Foundations PR 5)
+        "weir_http_requests_dropped",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
