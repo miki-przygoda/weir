@@ -386,6 +386,72 @@ fn sighup_reloads_tls_when_configured() {
     srv.shutdown();
 }
 
+/// spec §16 (Admin): reload with good certificates → applied; a corrupt key
+/// → failed, and the certificates in force still handshake.
+#[test]
+fn admin_reload_applies_rotated_certs_and_keeps_them_on_a_corrupt_key() {
+    let fx = TlsFixture::generate("admin_rotate_old");
+    let next = TlsFixture::generate("admin_rotate_new");
+    // Short label: the derived <tmp>/weir_test_<label>_<pid>/wab.admin.sock
+    // must stay <= 103 bytes on macOS, or admin is disabled (path_too_long).
+    let srv = weir_server!("tls_adm_rl").tls(&fx).start();
+    let addr = srv.tcp_addr();
+    let new_client = client_config_with_cert(
+        &next.ca_cert_path,
+        &next.client_cert_path,
+        &next.client_key_path,
+    );
+    for (from, to) in [
+        (&next.server_cert_path, &fx.server_cert_path),
+        (&next.server_key_path, &fx.server_key_path),
+        (&next.ca_cert_path, &fx.ca_cert_path),
+    ] {
+        std::fs::copy(from, to).unwrap();
+    }
+
+    let r: serde_json::Value = serde_json::from_str(&srv.admin("reload", "{}")).unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["outcome"], "applied", "{r}");
+    assert_eq!(r["result"]["items"][0]["item"], "tls_certificates");
+    assert_eq!(r["result"]["items"][0]["outcome"], "reloaded");
+    assert_eq!(
+        metric(
+            &srv,
+            "weir_config_reloads_total{trigger=\"admin\",outcome=\"ok\"}"
+        ),
+        1
+    );
+    assert!(
+        acked(addr, Arc::clone(&new_client)),
+        "the rotated identity is served"
+    );
+
+    std::fs::write(&fx.server_key_path, "not a key").unwrap();
+    let r: serde_json::Value = serde_json::from_str(&srv.admin("reload", "{}")).unwrap();
+    assert_eq!(
+        r["ok"], true,
+        "a failed reload is ok:true with outcome failed: {r}"
+    );
+    assert_eq!(r["result"]["outcome"], "failed");
+    assert_eq!(r["result"]["items"][0]["outcome"], "failed");
+    assert!(
+        r["result"]["items"][0]["detail"].is_string(),
+        "admin detail says why"
+    );
+    assert_eq!(
+        metric(
+            &srv,
+            "weir_config_reloads_total{trigger=\"admin\",outcome=\"failed\"}"
+        ),
+        1
+    );
+    assert!(
+        acked(addr, new_client),
+        "the certificates in force still handshake"
+    );
+    srv.shutdown();
+}
+
 /// Lame duck on the TCP side (Foundations §7): within 200 ms of SIGTERM the
 /// TCP listener refuses new connections, while the process is still alive
 /// (its drain is spending the budget on a black-holed sink), and the exit is
