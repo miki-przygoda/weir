@@ -212,9 +212,15 @@ last row of the report:
 1. the load generator is stopped and **reaped** (it catches SIGTERM and
    flushes its ledger, so its exit status says whether the ledger is complete);
 2. `/metrics` is scraped once more **while the daemon is still alive**;
-3. the daemon is asked to shut down — weir's SIGTERM path is a *full drain*,
-   not a seal-and-exit, so this is where the last tens of thousands of records
-   are actually delivered;
+3. the daemon is asked to shut down. Since Foundations, weir bounds its
+   SIGTERM drain at `drain_shutdown_budget_secs` (default 10 s), so run.py
+   passes `--drain-shutdown-budget-secs 3600` unless the schedule sets a
+   budget, which restores the full drain this check needs. A schedule with
+   a smaller budget gets a **drain-out restart** after this stop: the
+   daemon is restarted with the budget at 3600, run.py waits for
+   quiescence (including `weir_wab_undelivered_segments == 0`), then stops
+   it again. A drain-out that does not quiesce makes step 4 advisory
+   (`drain_out_not_quiesced`);
 4. verification runs at **`frontier_slack=0`**. This is the only moment in a
    run where zero slack is a true statement rather than a stricter-than-reality
    one: the producer is stopped and both logs are complete. If any precondition

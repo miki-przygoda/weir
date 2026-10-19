@@ -539,10 +539,51 @@ def write_crash_postmortem(run_dir, record):
     return path
 
 
+#: How long the drain-out restart may take to deliver what a bounded shutdown
+#: left behind. The quiescence timeout of a soak schedule is 180 s for ONE
+#: episode's backlog; the final drain-out may hold several abandoned segments.
+DRAIN_OUT_TIMEOUT_SECS = 600
+
+
+def needs_drain_out(daemon):
+    """True when the daemon's shutdown drain was bounded below a full drain,
+    so its SIGTERM may legitimately leave sealed, unconfirmed segments."""
+    return getattr(daemon, "drain_budget_secs", FINAL_DRAIN_BUDGET_SECS) < FINAL_DRAIN_BUDGET_SECS
+
+
+def drain_out(daemon, sink_url=SINK_URL, timeout_secs=DRAIN_OUT_TIMEOUT_SECS,
+              quiesce_fn=None):
+    """Restart, deliver everything on disk, stop. Spec §16 chaos item 1:
+    "restart and wait for weir_wab_undelivered_segments == 0 before the
+    frontier_slack=0 verify". The restart replays every sealed, unconfirmed
+    segment the bounded shutdown left. The budget is pinned so this stop is
+    itself a full drain.
+
+    Returns `{"ran", "quiesced", "reason", "clean_stop"}`. If the restart or
+    the wait raises, the daemon is stopped before the exception propagates:
+    `Daemon.start` can raise with the process still alive, and the caller
+    goes on to scan, then unmount, the WAB it would be running on.
+    """
+    quiesce_fn = quiesce_fn or quiescence.wait_for_quiescence
+    try:
+        daemon.start(sink_url, budget_override=FINAL_DRAIN_BUDGET_SECS)
+        ok, reason = quiesce_fn(daemon.metrics_url, timeout_secs, wab_dir=daemon.wab_dir)
+    except BaseException:
+        try:
+            daemon.stop()
+        except Exception as exc:
+            print(f"drain-out: stop after a failed restart failed: {exc}",
+                  file=sys.stderr)
+        raise
+    clean = daemon.stop()
+    return {"ran": True, "quiesced": ok, "reason": reason, "clean_stop": clean}
+
+
 def final_pass(
     loadgen, daemon, recorder, acc, ledger_tail, delivered_tail, wab_dir,
     frontier_slack, seed, prev_totals=None, scrape_fn=None, residue_fn=None,
     sleep_fn=None, stop_loadgen_fn=None, settle_secs=1.0, tier=None, fault=None,
+    drain_out_fn=None,
 ):
     """The verification pass that runs AFTER the last episode. D1.
 
@@ -553,7 +594,8 @@ def final_pass(
     run simply stopped, which threw away the cheapest, highest-signal evidence
     in the whole harness:
 
-    - weir's SIGTERM path runs a FULL drain, not a seal-and-exit, so it
+    - the final stop runs a full drain (budget pinned at 3600 s, or a bounded
+      stop plus the drain-out restart of step 3b), so it
       delivers the final tens of thousands of records — and nothing read them
       before `stack.teardown()` unmounted and deleted the backing image.
     - The last episode's frontier-exempt records were never re-judged.
@@ -568,8 +610,12 @@ def final_pass(
        nothing left to scrape, and stranded/resumed and queue depth at the
        moment of shutdown are exactly the numbers a stranded-segment finding
        would need.
-    3. `daemon.stop()` — the real graceful drain. Having to `kill9` is an
-       anomaly, recorded.
+    3. `daemon.stop()`: the SIGTERM stop, bounded by the daemon's
+       `drain_shutdown_budget_secs`. Having to `kill9` is an anomaly.
+    3b. When `needs_drain_out(daemon)` holds (a bounded budget), restart with
+       the budget at 3600, wait for quiescence, stop again (`drain_out`), so
+       step 4's zero slack is not judged against segments the bounded stop
+       left on disk. A drain-out that does not quiesce makes step 4 advisory.
     4. Verify with `frontier_slack=0`. Zero slack is legitimate HERE AND ONLY
        HERE: the producer is stopped and both logs are complete, so "no
        exemption" is a true statement rather than a stricter-than-reality one.
@@ -591,6 +637,7 @@ def final_pass(
     residue_fn = residue_fn or quiescence.scan_wab_residue
     sleep_fn = sleep_fn or time.sleep
     stop_loadgen_fn = stop_loadgen_fn or stop_loadgen
+    drain_out_fn = drain_out_fn or drain_out
     prev_totals = prev_totals or {}
 
     # I1 (final review): the REAL fault, not a hardcoded "none" — a Buffered
@@ -677,6 +724,29 @@ def final_pass(
             "the shutdown drain overran its budget and the daemon was killed, "
             "so undrained segments are expected"
         )
+
+    # 3b. Drain-out. A bounded shutdown (Foundations, spec §7) leaves sealed,
+    # unconfirmed segments ON PURPOSE; verifying at zero slack on top of that
+    # would report records sitting intact on disk as lost — a false P0.
+    # Not into a dead recorder: the restart would strand everything it
+    # replays, and step 4 is already advisory for that reason.
+    record["drain_out"] = None
+    if daemon is not None and needs_drain_out(daemon) and recorder_alive:
+        try:
+            out = drain_out_fn(daemon)
+        except Exception as exc:
+            out = {"ran": True, "quiesced": False,
+                   "reason": f"{type(exc).__name__}: {exc}", "clean_stop": False}
+        record["drain_out"] = out
+        if not out["quiesced"]:
+            anomaly_reasons.append("drain_out_not_quiesced")
+            advisory_reasons.append(
+                f"the drain-out restart did not quiesce ({out['reason']}), so "
+                "acked records may still be on disk, undelivered")
+        elif not out["clean_stop"]:
+            # Quiesced, but its own full-budget stop overran and was SIGKILLed:
+            # the same finding as a killed shutdown drain at step 3.
+            anomaly_reasons.append("drain_out_kill_at_stop")
 
     # 4. Final verification.
     advisory = bool(advisory_reasons)

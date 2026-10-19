@@ -103,8 +103,10 @@ def render_final_pass(final):
     lines = ["## Final pass\n"]
     lines.append(
         "One verification pass after the last episode, with the producer "
-        "stopped and weir's SIGTERM drain — a **full** drain, not a "
-        "seal-and-exit — given a real chance to finish.\n"
+        "stopped and weir's SIGTERM drain given a real chance to finish: a "
+        "full drain (budget pinned at 3600 s), or, for a schedule with a "
+        "bounded `drain_shutdown_budget_secs`, the bounded stop followed by a "
+        "drain-out restart that delivers whatever it left.\n"
     )
 
     advisory = final.get("advisory")
@@ -145,6 +147,15 @@ def render_final_pass(final):
         f"| Shutdown drain completed without a kill | "
         f"{_yes_no(final.get('daemon_clean_stop'))} |"
     )
+    # Table rows, not bullets: a bullet here would end the table and every
+    # row after it would render as plain text.
+    do = final.get("drain_out")
+    if do:
+        lines.append(
+            f"| Drain-out restart quiesced | {_yes_no(do.get('quiesced'))}"
+            f"{' (' + do['reason'] + ')' if do.get('reason') else ''} |")
+        lines.append(
+            f"| Drain-out stop completed without a kill | {_yes_no(do.get('clean_stop'))} |")
     lines.append(
         f"| Recorder still answering | {_yes_no(final.get('recorder_alive'))} |"
     )

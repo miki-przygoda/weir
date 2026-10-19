@@ -355,6 +355,22 @@ class TestFinalPassSection(unittest.TestCase):
         self.assertIn("Shutdown drain completed without a kill | **NO**", out)
         self.assertIn("1 anomaly", out)
 
+    def test_a_drain_out_renders_as_two_rows_inside_the_teardown_table(self):
+        final = final_record(
+            drain_out={"ran": True, "quiesced": False,
+                       "reason": "timeout after 600s", "clean_stop": True},
+            advisory=True, frontier_slack=2048,
+            anomaly_reasons=["drain_out_not_quiesced"])
+        out = report.render([final], {})
+        table = out.split("| Teardown step | Result |")[1].split("\n\n")[0]
+        self.assertIn(
+            "| Drain-out restart quiesced | **NO** (timeout after 600s) |", table)
+        self.assertIn("| Drain-out stop completed without a kill | yes |", table)
+
+    def test_no_drain_out_rows_without_a_drain_out(self):
+        out = report.render([final_record(drain_out=None)], {})
+        self.assertNotIn("Drain-out", out)
+
     def test_a_run_with_no_final_pass_says_so(self):
         out = report.render(EPISODES, {})
         self.assertIn("No final verification pass is recorded", out)

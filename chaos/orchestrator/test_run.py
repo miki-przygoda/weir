@@ -59,12 +59,21 @@ class FakeProc:
 class FakeDaemon:
     """A `run.Daemon` stand-in whose shutdown is scripted."""
 
-    def __init__(self, alive=True, clean_stop=True, log=None):
+    def __init__(self, alive=True, clean_stop=True, log=None,
+                 drain_budget_secs=None):
         self.proc = FakeProc(returncode=None if alive else 0)
         self.metrics_url = "http://127.0.0.1:19185/metrics"
         self.wab_dir = "/unused/wab"
         self._clean_stop = clean_stop
         self.log = log if log is not None else []
+        self.drain_budget_secs = (run.FINAL_DRAIN_BUDGET_SECS
+                                  if drain_budget_secs is None else drain_budget_secs)
+        self.starts = []
+
+    def start(self, sink_url, budget_override=None):
+        self.log.append("daemon.start")
+        self.starts.append(budget_override)
+        self.proc.returncode = None
 
     def stop(self):
         self.log.append("daemon.stop")
@@ -93,7 +102,7 @@ class FakeTailer:
 def final_pass_fixture(
     log=None, loadgen=None, daemon=None, recorder_alive=True, ledger=(),
     delivered=(), ledger_raises=None, residue=None, scrape_raises=None,
-    frontier_slack=2048, run_id=7,
+    frontier_slack=2048, run_id=7, drain_out=None,
 ):
     """Builds the collaborators `run.final_pass` needs, all fake but for the
     accumulator — the real oracle, so these tests exercise the real I1."""
@@ -113,6 +122,13 @@ def final_pass_fixture(
             raise residue
         return residue
 
+    def drain_out_fn(daemon):
+        log.append("drain_out")
+        if isinstance(drain_out, Exception):
+            raise drain_out
+        return drain_out or {"ran": True, "quiesced": True, "reason": "",
+                             "clean_stop": True}
+
     return dict(
         loadgen=FakeProc(log=log) if loadgen is None else loadgen,
         daemon=FakeDaemon(log=log) if daemon is None else daemon,
@@ -126,6 +142,7 @@ def final_pass_fixture(
         scrape_fn=scrape_fn,
         residue_fn=residue_fn,
         sleep_fn=lambda _s: None,
+        drain_out_fn=drain_out_fn,
     ), log
 
 
@@ -1177,6 +1194,98 @@ class TestFinalPass(unittest.TestCase):
         record, violations, anomalies = run.final_pass(**kwargs)
         self.assertGreater(len(record["anomaly_reasons"]), 3)
         self.assertEqual((violations, anomalies), (0, 1))
+
+
+class TestFinalPassDrainOut(unittest.TestCase):
+    """Oracle fix, part 2 (spec §16 chaos item 1). A schedule with a bounded
+    drain_shutdown_budget_secs exits on its final SIGTERM with sealed,
+    unconfirmed segments BY DESIGN, so the zero-slack check must wait for a
+    restart that delivers them."""
+
+    def test_a_bounded_budget_gets_a_drain_out_before_the_zero_slack_check(self):
+        kwargs, log = final_pass_fixture(daemon=FakeDaemon(drain_budget_secs=2))
+        kwargs["daemon"].log = log
+        record, v, a = run.final_pass(**kwargs)
+        self.assertEqual(
+            log, ["loadgen.wait", "scrape", "daemon.stop", "drain_out",
+                  "ledger.read_new", "delivered.read_new", "residue_scan"])
+        self.assertTrue(record["drain_out"]["quiesced"])
+        self.assertEqual(record["frontier_slack"], 0)
+        self.assertEqual((v, a), (0, 0))
+
+    def test_a_full_drain_budget_needs_no_drain_out(self):
+        kwargs, log = final_pass_fixture()
+        record, _, _ = run.final_pass(**kwargs)
+        self.assertNotIn("drain_out", log)
+        self.assertIsNone(record["drain_out"])
+
+    def test_a_drain_out_that_never_quiesced_makes_the_check_advisory(self):
+        kwargs, _ = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2),
+            drain_out={"ran": True, "quiesced": False,
+                       "reason": "timeout after 600s", "clean_stop": True},
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"])
+        record, v, a = run.final_pass(**kwargs)
+        self.assertTrue(record["advisory"])
+        self.assertIn("drain_out_not_quiesced", record["anomaly_reasons"])
+        self.assertEqual((v, a), (0, 1),
+                         "segments left on disk must not read as lost records")
+
+    def test_a_drain_out_stop_that_needed_a_kill_is_an_anomaly(self):
+        kwargs, _ = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2),
+            drain_out={"ran": True, "quiesced": True, "reason": "", "clean_stop": False})
+        record, v, a = run.final_pass(**kwargs)
+        self.assertIn("drain_out_kill_at_stop", record["anomaly_reasons"])
+        self.assertEqual((v, a), (0, 1))
+
+    def test_a_drain_out_that_raises_is_recorded_and_the_post_mortem_still_runs(self):
+        kwargs, log = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2),
+            drain_out=RuntimeError("weir-server exited during startup"))
+        kwargs["daemon"].log = log
+        record, _, a = run.final_pass(**kwargs)
+        self.assertIn("RuntimeError", record["drain_out"]["reason"])
+        self.assertEqual(log[-1], "residue_scan")
+        self.assertEqual(a, 1)
+
+    def test_no_drain_out_into_a_dead_recorder(self):
+        kwargs, log = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2), recorder_alive=False)
+        run.final_pass(**kwargs)
+        self.assertNotIn("drain_out", log)
+
+    def test_drain_out_restarts_with_the_full_budget_waits_then_stops(self):
+        d = FakeDaemon(drain_budget_secs=2)
+        seen = []
+
+        def quiesce(url, timeout, wab_dir=None):
+            seen.append((url, timeout, wab_dir))
+            return True, ""
+
+        out = run.drain_out(d, quiesce_fn=quiesce, timeout_secs=42)
+        self.assertEqual(d.starts, [run.FINAL_DRAIN_BUDGET_SECS])
+        self.assertEqual(d.log, ["daemon.start", "daemon.stop"])
+        self.assertEqual(seen, [(d.metrics_url, 42, d.wab_dir)])
+        self.assertEqual(out, {"ran": True, "quiesced": True, "reason": "",
+                               "clean_stop": True})
+
+    def test_a_drain_out_whose_restart_fails_still_stops_the_daemon(self):
+        # Daemon.start can raise with the process still alive ("did not
+        # create its socket within 10s"). final_pass's step 5 then scans the
+        # WAB, and the caller unmounts it, so the restarted daemon must not be
+        # left running underneath either.
+        d = FakeDaemon(drain_budget_secs=2)
+
+        def failing_start(sink_url, budget_override=None):
+            d.log.append("daemon.start")
+            d.proc.returncode = None
+            raise RuntimeError("weir-server did not create its socket within 10s")
+
+        d.start = failing_start
+        with self.assertRaises(RuntimeError):
+            run.drain_out(d, quiesce_fn=lambda *a, **k: (True, ""))
+        self.assertEqual(d.log, ["daemon.start", "daemon.stop"])
 
 
 class TestCanaryVerdict(unittest.TestCase):
