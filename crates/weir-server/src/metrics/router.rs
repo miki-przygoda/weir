@@ -4,13 +4,6 @@
 //! functions map a probe answer to a `Response`. No I/O, no clock, no
 //! lock. `server.rs` does the socket work, and a `StatusSource` does the
 //! board loads.
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "wired into metrics::server in Task 5.8 and status::http in Task 5.9"
-    )
-)]
 
 /// The four reserved, read-only routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
