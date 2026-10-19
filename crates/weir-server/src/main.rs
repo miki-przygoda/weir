@@ -1,7 +1,8 @@
 mod config;
 mod drain;
-// The shutdown level and the signal task (Foundations §5.6). Nothing in `main`
-// calls it yet: Task 4.10 uses part of it and Task 4.11 removes this allowance.
+// The shutdown level, the signal task and the bounded drain wait (Foundations
+// §5.6, §7). `main` calls only `wait_until` and `SETTLE_WAIT` so far: Task 4.10
+// uses more of it and Task 4.11 removes this allowance.
 #[allow(dead_code)]
 mod lifecycle;
 mod logging;
@@ -64,28 +65,6 @@ use tracing::{info, warn};
 use config::Config;
 use drain::{DrainConfig, DrainHeartbeat};
 use models::WorkUnit;
-
-// ── Startup settle wait ───────────────────────────────────────────────────────
-
-/// How long startup waits for every flusher to leave `Starting` (and every
-/// worker to start) before binding the producer listeners (spec §6 step 10).
-/// Unsettled shards stay `Starting` and are not routed to.
-const SHARD_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Polls `done` every `poll` until it returns true (→ true) or `timeout`
-/// passes (→ false). `done` is always called at least once.
-fn wait_until(timeout: Duration, poll: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if done() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(poll);
-    }
-}
 
 // ── wab_dir lock integrity ────────────────────────────────────────────────────
 
@@ -598,12 +577,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shard's worker running (PR 1's `ingest_capable`), so wait for every
     // worker too: a connection accepted before a worker has entered its guard
     // would otherwise be refused as no_live_shard.
-    if !wait_until(SHARD_SETTLE_TIMEOUT, Duration::from_millis(10), || {
+    if !lifecycle::wait_until(lifecycle::SETTLE_WAIT, Duration::from_millis(10), || {
         board.shards.all_settled()
             && (0..board.shards.worker_count()).all(|w| board.shards.worker_running(w))
     }) {
         warn!(
-            timeout_secs = SHARD_SETTLE_TIMEOUT.as_secs(),
+            timeout_secs = lifecycle::SETTLE_WAIT.as_secs(),
             "not every WAB shard and worker settled before the producer listeners were \
              bound; unsettled shards receive no connections until they come up"
         );
@@ -1160,37 +1139,5 @@ mod lock_integrity_tests {
             "an unreadable record is still proof of loss"
         );
         assert!(lost.load(Ordering::Relaxed));
-    }
-}
-
-#[cfg(test)]
-mod settle_tests {
-    use super::wait_until;
-    use std::time::Duration;
-
-    #[test]
-    fn wait_until_returns_true_as_soon_as_done_and_false_at_the_deadline() {
-        let mut calls = 0;
-        assert!(wait_until(
-            Duration::from_secs(5),
-            Duration::from_millis(1),
-            || {
-                calls += 1;
-                calls == 3
-            }
-        ));
-        assert_eq!(calls, 3);
-
-        let t0 = std::time::Instant::now();
-        assert!(!wait_until(
-            Duration::from_millis(60),
-            Duration::from_millis(5),
-            || false
-        ));
-        let took = t0.elapsed();
-        assert!(
-            took >= Duration::from_millis(60) && took < Duration::from_millis(500),
-            "{took:?}"
-        );
     }
 }
