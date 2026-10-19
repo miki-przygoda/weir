@@ -17,7 +17,7 @@
 //! because the pool limit is a runtime tunable.
 
 mod connection;
-mod peer;
+pub(crate) mod peer;
 pub(crate) mod route;
 
 #[cfg(feature = "tls")]
@@ -514,7 +514,7 @@ pub(crate) async fn drain_connections(
 /// Long enough to yield the CPU and let a descriptor or buffer be returned,
 /// short enough that throughput recovers promptly once pressure clears.
 #[cfg(unix)]
-pub(super) const ACCEPT_BACKOFF_ON_EXHAUSTION: Duration = Duration::from_millis(50);
+pub(crate) const ACCEPT_BACKOFF_ON_EXHAUSTION: Duration = Duration::from_millis(50);
 
 /// True if an `accept(2)` error is a transient resource-exhaustion condition
 /// (out of file descriptors or socket buffers). On these the pending
@@ -526,7 +526,7 @@ pub(super) const ACCEPT_BACKOFF_ON_EXHAUSTION: Duration = Duration::from_millis(
 /// `accept` completed, the queue entry is consumed, and retrying immediately
 /// is correct (no spin).
 #[cfg(unix)]
-pub(super) fn is_accept_resource_exhaustion(e: &io::Error) -> bool {
+pub(crate) fn is_accept_resource_exhaustion(e: &io::Error) -> bool {
     matches!(
         e.raw_os_error(),
         Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
@@ -620,17 +620,52 @@ pub(crate) struct BoundSocket {
     birthtime: (libc::time_t, libc::c_long),
 }
 
+/// What a hardened bind does about a parent directory others can write to.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "admin::bind_admin (Task 6.6) constructs RequirePrivate; Task 6.14 removes this"
+    )
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParentPolicy {
+    /// The producer socket: WARN and bind. Operators legitimately put
+    /// development sockets under `/tmp`.
+    Warn,
+    /// The admin socket (Foundations spec §11): refuse. Anyone who can create
+    /// entries in the parent could squat the name and impersonate the control
+    /// plane.
+    RequirePrivate,
+}
+
+/// The producer socket's hardened bind: a group/world-writable parent is
+/// warned about, not refused. See [`bind_hardened_with`].
 #[cfg(unix)]
 pub(crate) fn bind_hardened(path: &Path) -> io::Result<BoundSocket> {
+    bind_hardened_with(path, ParentPolicy::Warn)
+}
+
+/// The hardened bind with an explicit parent-directory policy:
+/// [`ParentPolicy::Warn`] for the producer socket, [`ParentPolicy::RequirePrivate`]
+/// for the admin socket, which refuses (and creates nothing) unless the parent
+/// is private by [`parent_private_verdict`].
+#[cfg(unix)]
+pub(crate) fn bind_hardened_with(path: &Path, policy: ParentPolicy) -> io::Result<BoundSocket> {
     let (parent, basename) = split_parent_basename(path)?;
     let dirfd = open_parent_dirfd(parent)?;
     let _dirfd_guard = OwnedDirFd(dirfd);
 
     // The one irreducible bind(2)→fstatat race window (below) is fully closed
     // only when the socket's parent directory is writable by the daemon user
-    // alone. Warn if it is group/world-writable (e.g. /tmp) so the operator can
-    // move the socket somewhere private — see docs/security/socket-bind.md.
-    warn_if_parent_world_writable(dirfd, parent);
+    // alone. The producer socket warns if it is group/world-writable (e.g.
+    // /tmp) so the operator can move the socket somewhere private — see
+    // docs/security/socket-bind.md. The admin socket refuses before touching
+    // the path, so a refused bind removes and creates nothing.
+    match policy {
+        ParentPolicy::Warn => warn_if_parent_world_writable(dirfd, parent),
+        ParentPolicy::RequirePrivate => refuse_unless_parent_private(dirfd, parent)?,
+    }
 
     // Remove a STALE socket only: one nobody is listening on (a SIGKILLed
     // predecessor's). A live socket is refused, never unlinked.
@@ -1368,6 +1403,93 @@ fn warn_if_parent_world_writable(dirfd: libc::c_int, parent: &Path) {
 #[cfg(unix)]
 fn is_group_or_other_writable(mode: libc::mode_t) -> bool {
     (mode & 0o022) != 0
+}
+
+/// Why a parent directory is not private enough for the admin socket.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParentProblem {
+    GroupOrOtherWritable,
+    ForeignOwner,
+}
+
+/// A parent is private when only the daemon user (or root) can create entries
+/// in it: not group- or world-writable, and owned by the daemon's euid or by
+/// root.
+///
+/// The ownership half is stricter than spec §11 (decision Q8, flagged for the
+/// owner's security review): a 0755 directory owned by another non-root user
+/// passes the mode test, but that user can still create the socket's name in
+/// it and squat the control plane.
+#[cfg(unix)]
+pub(crate) fn parent_private_verdict(
+    mode: libc::mode_t,
+    owner: libc::uid_t,
+    euid: libc::uid_t,
+) -> Result<(), ParentProblem> {
+    if is_group_or_other_writable(mode) {
+        return Err(ParentProblem::GroupOrOtherWritable);
+    }
+    if owner != euid && owner != 0 {
+        return Err(ParentProblem::ForeignOwner);
+    }
+    Ok(())
+}
+
+/// The refusal's marker, so a caller can tell it from an `EACCES` on open.
+#[derive(Debug)]
+pub(crate) struct InsecureParent(String);
+
+impl std::fmt::Display for InsecureParent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InsecureParent {}
+
+/// True when `e` is [`bind_hardened_with`]'s private-parent refusal.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "admin::bind_admin (Task 6.6) is the caller; Task 6.14 removes this"
+    )
+)]
+pub(crate) fn is_insecure_parent(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<InsecureParent>())
+}
+
+/// `fstat`s the pinned parent dirfd (no re-resolution by path, as in
+/// `warn_if_parent_world_writable`) and refuses a non-private parent.
+#[cfg(unix)]
+fn refuse_unless_parent_private(dirfd: libc::c_int, parent: &Path) -> io::Result<()> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // Safety: dirfd is a valid directory fd held by the caller; &mut st is a
+    // writable libc::stat the kernel fills in.
+    if unsafe { libc::fstat(dirfd, &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Safety: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    parent_private_verdict(st.st_mode, st.st_uid, euid).map_err(|why| {
+        let what = match why {
+            ParentProblem::GroupOrOtherWritable => "it is group- or world-writable",
+            ParentProblem::ForeignOwner => "it is owned by another non-root user",
+        };
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            InsecureParent(format!(
+                "refusing to bind a control socket in '{}' (mode {:#o}, owner uid {}): {what}. \
+                 Anyone who can create entries there could put their own socket at this path \
+                 and impersonate the daemon's admin interface. Use a directory writable only \
+                 by the daemon user.",
+                parent.display(),
+                st.st_mode & 0o7777,
+                st.st_uid
+            )),
+        )
+    })
 }
 
 /// RAII guard that closes a directory fd on drop. The dirfd is held only as
@@ -3002,5 +3124,72 @@ mod tests {
         assert_eq!(metrics.connections_aborted_at_shutdown.get(), 1);
         let _ = pusher.await; // the aborted connection fails the push with Io
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── The admin bind's private-parent policy (PR 6 Task 6.4) ───────────────
+
+    /// Foundations §11: the admin bind REFUSES a parent others can write to
+    /// (the producer bind keeps warning), and leaves nothing behind.
+    /// A tokio test: the binds go through tokio's `UnixListener::bind`, which
+    /// panics outside a runtime with IO enabled.
+    #[tokio::test]
+    async fn require_private_refuses_a_group_or_world_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let root = crate::testutil::scratch_dir("bind_private");
+        for mode in [0o770, 0o707, 0o1777] {
+            let dir = root.join(format!("m{mode:o}"));
+            crate::testutil::mkdir_p(&dir);
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let path = dir.join("a.sock");
+            let err = bind_hardened_with(&path, ParentPolicy::RequirePrivate)
+                .expect_err("a shared parent must be refused");
+            assert!(is_insecure_parent(&err), "{mode:o}: {err}");
+            assert!(
+                err.to_string().contains("group- or world-writable"),
+                "{err}"
+            );
+            assert!(!path.exists(), "a refused bind creates nothing");
+            // The producer policy is unchanged: it warns and binds.
+            let bound = bind_hardened(&path).expect("Warn policy still binds");
+            remove_own_socket(&path, &bound);
+        }
+        let private = root.join("private");
+        crate::testutil::mkdir_p(&private);
+        let path = private.join("a.sock");
+        let bound =
+            bind_hardened_with(&path, ParentPolicy::RequirePrivate).expect("0700 parent binds");
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().mode() & 0o777,
+            0o600
+        );
+        remove_own_socket(&path, &bound);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parent_private_verdict_table() {
+        assert_eq!(parent_private_verdict(0o700, 1000, 1000), Ok(()));
+        assert_eq!(parent_private_verdict(0o755, 1000, 1000), Ok(()));
+        assert_eq!(
+            parent_private_verdict(0o755, 0, 1000),
+            Ok(()),
+            "root-owned is fine"
+        );
+        assert_eq!(
+            parent_private_verdict(0o755, 1234, 1000),
+            Err(ParentProblem::ForeignOwner),
+            "another user can create entries in a directory they own"
+        );
+        assert_eq!(
+            parent_private_verdict(0o775, 1000, 1000),
+            Err(ParentProblem::GroupOrOtherWritable)
+        );
+        assert_eq!(
+            parent_private_verdict(0o1777, 0, 1000),
+            Err(ParentProblem::GroupOrOtherWritable),
+            "the sticky bit does not stop a squatter creating the name"
+        );
     }
 }
