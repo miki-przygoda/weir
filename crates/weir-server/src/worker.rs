@@ -263,6 +263,9 @@ impl Worker {
 /// Workers send `Batch`es directly to the flusher — no intermediate bridge
 /// thread. Returns one `JoinHandle` per worker. Workers exit cleanly when all
 /// `QueueSender` clones are dropped.
+///
+/// Test-only wrapper over [`spawn_workers_with`] with no shard registry.
+#[cfg(test)]
 pub fn spawn_workers(
     queue_rx: &QueueReceiver<WorkUnit>,
     shard_txs: Vec<Sender<Batch>>,
@@ -271,6 +274,33 @@ pub fn spawn_workers(
     batch_size: usize,
     batch_deadline: Duration,
     coalesce_hint: Arc<AtomicU64>,
+) -> Vec<thread::JoinHandle<()>> {
+    spawn_workers_with(
+        queue_rx,
+        shard_txs,
+        shard_count,
+        worker_count,
+        batch_size,
+        batch_deadline,
+        coalesce_hint,
+        None,
+    )
+}
+
+/// Spawns the worker threads (see `spawn_workers`, test-only, for the routing and
+/// ordering contract). With a `registry`, each worker holds a
+/// [`crate::status::WorkerGuard`] for its whole life, so the registry knows
+/// whether the worker owning a shard's partition is running (spec §5.3).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_workers_with(
+    queue_rx: &QueueReceiver<WorkUnit>,
+    shard_txs: Vec<Sender<Batch>>,
+    shard_count: usize,
+    worker_count: usize,
+    batch_size: usize,
+    batch_deadline: Duration,
+    coalesce_hint: Arc<AtomicU64>,
+    registry: Option<Arc<crate::status::ShardRegistry>>,
 ) -> Vec<thread::JoinHandle<()>> {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
@@ -286,6 +316,7 @@ pub fn spawn_workers(
         let work_rx = queue_rx.get(worker_idx);
         let txs = shard_txs.clone();
         let hint = Arc::clone(&coalesce_hint);
+        let registry = registry.clone();
         let core_id = if core_ids.is_empty() {
             None
         } else {
@@ -295,6 +326,11 @@ pub fn spawn_workers(
         let handle = thread::Builder::new()
             .name(format!("weir-worker-{worker_idx}"))
             .spawn(move || {
+                // Spec §5.3: a worker that exits or panics takes the shards it owns
+                // (shard % worker_count) out of routing and readiness. Dropped on a
+                // normal return and during unwinding alike.
+                let _alive = registry.map(|r| crate::status::WorkerGuard::enter(r, worker_idx));
+
                 // ── Core affinity ────────────────────────────────────────────
                 if let Some(id) = core_id
                     && !core_affinity::set_for_current(id)
@@ -808,5 +844,41 @@ mod tests {
         // Releasing the receiver makes the producer's next send fail and exit.
         drop(rx);
         producer.join().unwrap();
+    }
+
+    #[test]
+    fn a_worker_marks_itself_running_and_exited_on_the_registry() {
+        use crate::status::ShardRegistry;
+        let registry = Arc::new(ShardRegistry::new(
+            1,
+            1,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        let (queue_tx, queue_rx) = crate::queue::new::<WorkUnit>(1);
+        let (shard_txs, _shard_rxs) = make_shard_channels(1);
+        let handles = spawn_workers_with(
+            &queue_rx,
+            shard_txs,
+            1,
+            1,
+            8,
+            Duration::from_millis(5),
+            default_hint(),
+            Some(Arc::clone(&registry)),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !registry.worker_running(0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never marked itself running"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(queue_tx);
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(!registry.worker_running(0));
+        assert!(registry.worker_evidence()[0].exited_at_unix_ms.is_some());
     }
 }

@@ -12,6 +12,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/weir-core/Cargo.toml     crates/weir-core/Cargo.toml
 COPY crates/weir-wab/Cargo.toml      crates/weir-wab/Cargo.toml
+COPY crates/weir-status/Cargo.toml   crates/weir-status/Cargo.toml
 COPY crates/weir-server/Cargo.toml   crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml   crates/weir-client/Cargo.toml
 # weir-sink-sdk is a real dependency of weir-server (the Sink trait contract);
@@ -33,6 +34,7 @@ COPY crates/weir-attest/Cargo.toml   crates/weir-attest/Cargo.toml
 RUN mkdir -p \
         crates/weir-core/src \
         crates/weir-wab/src \
+        crates/weir-status/src \
         crates/weir-server/src \
         crates/weir-client/src \
         crates/weir-sink-sdk/src \
@@ -46,6 +48,7 @@ RUN mkdir -p \
     touch \
         crates/weir-core/src/lib.rs \
         crates/weir-wab/src/lib.rs \
+        crates/weir-status/src/lib.rs \
         crates/weir-client/src/lib.rs \
         crates/weir-sink-sdk/src/lib.rs \
         crates/weir-sink-s3/src/lib.rs \

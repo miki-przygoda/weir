@@ -25,7 +25,7 @@ bench-trace = []
 dst = []
 # TCP listener with mutual TLS. Off by default: weir-server stays Unix-only
 # unless explicitly built with --features tls.
-tls = ["dep:tokio-rustls", "dep:rustls-pki-types", "dep:arc-swap", "dep:rustls"]
+tls = ["dep:tokio-rustls", "dep:rustls-pki-types", "dep:rustls"]
 
 [package]
 name = "weir-server"
@@ -147,8 +147,19 @@ webpki-roots = { version = "1", optional = true }
 # Pinned to the `ring` crypto provider used across the workspace.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 rustls-pki-types = { version = "1", optional = true }
-# Hot-reloadable ServerConfig (SIGHUP cert rotation without dropping conns).
-arc-swap = { version = "1", optional = true }
+# Shared status model and evaluator (spec §5.1): the daemon and weir-ctl
+# must compute the same Conditions from the same facts.
+weir-status = { workspace = true }
+# Wait-free cells on the status board (ArcSwap/ArcSwapOption, spec §9.2) and
+# the hot-reloadable TLS ServerConfig (SIGHUP cert rotation without dropping
+# conns). Unconditional since Foundations: the board exists in every build.
+# Already in the lock (it was optional behind `tls`).
+arc-swap = "1"
+# Rendering the status document (PR 5's /status, PR 6's admin socket). Also
+# loads/saves pinned DST regression seeds (tests/dst_seeds/*.json) for the
+# wab::dst harness: the seed-regression replay test also uses it. Already in
+# the lock as a dev-dependency.
+serde_json = "1"
 
 [dev-dependencies]
 # `tls` is enabled so the mTLS benchmark (tests/load_tls.rs) can use the client's
@@ -158,10 +169,6 @@ weir-testkit = { path = "../weir-testkit" }
 ureq = "2"
 # Generates throwaway CA / server / client certs for the TLS integration tests.
 rcgen = "0.13"
-# Loads/saves pinned DST regression seeds (tests/dst_seeds/*.json) for the
-# wab::dst harness. Only the seed-regression replay test touches JSON; the
-# harness itself needs no serialisation at runtime.
-serde_json = "1"
 # Property-based fault-list exploration for the wab::dst harness: generates and
 # SHRINKS (seed, fault-list, record-count) triples against the durability
 # invariants, so any future regression auto-minimises to a smallest reproducer.

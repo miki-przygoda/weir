@@ -870,6 +870,41 @@ fn metrics_all_families_registered() {
         "weir_drain_dead_letter_write_failures",
         // Drain liveness (safety floor)
         "weir_drain_busy_seconds",
+        // Foundations PR 1 (status, lifecycle and conditions)
+        "weir_build_info",
+        "weir_start_time_seconds",
+        "weir_startup_phase",
+        "weir_ready",
+        "weir_live",
+        "weir_condition_active",
+        "weir_wab_shard_up",
+        "weir_wab_handoff_blocked_seconds",
+        "weir_worker_up",
+        "weir_wab_cap_rejecting",
+        "weir_wab_undelivered_segments",
+        "weir_wab_undelivered_records",
+        "weir_wab_oldest_undelivered_age_seconds",
+        "weir_wab_active_segment_age_seconds",
+        "weir_drain_pending_segments",
+        "weir_drain_replay_remaining_segments",
+        "weir_drain_heartbeat_age_seconds",
+        "weir_drain_commit_in_flight_seconds",
+        "weir_drain_paused",
+        "weir_drain_generation",
+        "weir_sink_last_success_timestamp_seconds",
+        "weir_sink_last_failure_timestamp_seconds",
+        "weir_sink_consecutive_failures",
+        "weir_config_wab_max_bytes",
+        "weir_config_dead_letter_max_bytes",
+        "weir_config_wab_segment_max_bytes",
+        "weir_config_segment_max_age_seconds",
+        "weir_config_segment_max_lifetime_seconds",
+        "weir_config_sink_max_retries",
+        "weir_config_shutdown_timeout_seconds",
+        "weir_records_nack_internal",
+        "weir_connections_refused_no_live_shard",
+        "weir_drain_segments_abandoned",
+        "weir_wab_segments_not_handed_off",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
@@ -991,6 +1026,79 @@ fn server_exits_and_socket_disappears_after_sigterm() {
         !socket_path.exists(),
         "socket should be removed after clean shutdown"
     );
+}
+
+/// Spec §16 system test 13, a gate from PR 1 onward: SIGTERM exits within
+/// shutdown_timeout + 5 s with an idle producer connection still open, and
+/// exits 0. It guards the sequencing every later Foundations PR rewrites
+/// (signal task, lame duck, joins, drain stop).
+#[test]
+fn sigterm_exits_within_the_bound_with_an_idle_connection_open() {
+    const SHUTDOWN_TIMEOUT_SECS: u64 = 2;
+    let bound = Duration::from_secs(SHUTDOWN_TIMEOUT_SECS + 5);
+    let mut srv = weir_server!("sigterm_bound")
+        .shutdown_timeout_secs(SHUTDOWN_TIMEOUT_SECS)
+        .start();
+    let mut busy = srv.client();
+    busy.push(b"acked-before-sigterm", Durability::Durable)
+        .unwrap();
+    let mut idle = srv.client();
+    idle.health_check().unwrap(); // connected, then left idle across the signal
+    let t0 = Instant::now();
+    unsafe {
+        libc::kill(srv.child_pid() as libc::pid_t, libc::SIGTERM);
+    }
+    let status = srv
+        .wait_for_exit(bound)
+        .unwrap_or_else(|| panic!("weir-server still running {bound:?} after SIGTERM"));
+    assert!(status.success(), "exit status {status}");
+    assert!(t0.elapsed() < bound, "took {:?}", t0.elapsed());
+    drop((busy, idle));
+}
+
+/// The PR 1 status gauges on a real daemon: after the first 5 s poll a
+/// serving daemon reports ready, serving, every shard up, the cap clear,
+/// and the noop sink as an active warning condition.
+#[test]
+fn a_serving_daemon_reports_ready_through_the_new_gauges() {
+    let srv = weir_server!("status_gauges").shard_count(2).start();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let body = srv.scrape_metrics();
+        if body.contains("weir_ready 1") {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "weir_ready never reached 1:\n{body}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    };
+    for series in [
+        "weir_startup_phase{phase=\"serving\"} 1",
+        "weir_wab_shard_up{shard=\"0\"} 1",
+        "weir_wab_shard_up{shard=\"1\"} 1",
+        "weir_wab_cap_rejecting 0",
+        "weir_condition_active{code=\"noop_sink\",severity=\"warning\"} 1",
+        "weir_condition_active{code=\"starting\",severity=\"info\"} 0",
+    ] {
+        assert!(body.contains(series), "{series:?} missing:\n{body}");
+    }
+    assert!(
+        body.contains(&format!(
+            "weir_build_info{{version=\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{body}"
+    );
+    // Spec §16: weir-status's `evidence_from_metrics` is tested against a
+    // captured 4.1 exposition. This is the capture; re-bless on an intended
+    // family change and review the diff.
+    if std::env::var_os("WEIR_BLESS").is_some() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../weir-status/tests/fixtures/metrics_4_1.txt");
+        std::fs::write(&path, &body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
 }
 
 // ── Reconnect / restart ───────────────────────────────────────────────────────
@@ -5345,4 +5453,27 @@ fn the_client_refuses_a_locally_invalid_batch_without_poisoning() {
     client
         .push(b"still works", Durability::Durable)
         .expect("push after refusals");
+}
+
+/// SP-D (spec §5.13): the startup line names the version, the wire version
+/// and the effective config, and a log redirected to a file carries no
+/// ANSI escape codes.
+#[test]
+fn startup_log_names_version_and_config_and_carries_no_ansi() {
+    let srv = weir_server!("startup_line").log_level("info").start();
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap();
+    let line = log
+        .lines()
+        .find(|l| l.contains("weir starting"))
+        .unwrap_or_else(|| panic!("no startup line:\n{log}"));
+    assert!(
+        line.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))),
+        "{line}"
+    );
+    assert!(line.contains("wire_version=1"), "{line}");
+    assert!(
+        line.contains("\"wab_dir_lock\": \"required\""),
+        "the ConfigView rides the line: {line}"
+    );
+    assert!(!log.contains('\u{1b}'), "no ANSI escapes in a file:\n{log}");
 }

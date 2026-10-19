@@ -1,0 +1,389 @@
+# HELP weir_records_accepted Total records accepted from producers, by durability tier.
+# TYPE weir_records_accepted counter
+# HELP weir_records_ack Total records acknowledged to producers, by durability tier.
+# TYPE weir_records_ack counter
+# HELP weir_records_nack Total records rejected (Nack), by durability tier and rejection reason.
+# TYPE weir_records_nack counter
+weir_records_nack_total{tier="durable",reason="bad_header_crc"} 0
+weir_records_nack_total{tier="durable",reason="bad_magic"} 0
+weir_records_nack_total{tier="durable",reason="internal_error"} 0
+weir_records_nack_total{tier="durable",reason="reserved_flags_set"} 0
+weir_records_nack_total{tier="durable",reason="empty_payload"} 0
+weir_records_nack_total{tier="durable",reason="bad_batch_framing"} 0
+weir_records_nack_total{tier="durable",reason="payload_too_large"} 0
+weir_records_nack_total{tier="durable",reason="version_mismatch"} 0
+weir_records_nack_total{tier="durable",reason="unknown_message"} 0
+weir_records_nack_total{tier="durable",reason="bad_payload_crc"} 0
+# HELP weir_accept_latency_seconds Wall-clock time from socket accept to spawn of the connection handler.
+# TYPE weir_accept_latency_seconds histogram
+weir_accept_latency_seconds_sum 0.000023167
+weir_accept_latency_seconds_count 1
+weir_accept_latency_seconds_bucket{le="0.00001"} 0
+weir_accept_latency_seconds_bucket{le="0.000025"} 1
+weir_accept_latency_seconds_bucket{le="0.00005"} 1
+weir_accept_latency_seconds_bucket{le="0.0001"} 1
+weir_accept_latency_seconds_bucket{le="0.00025"} 1
+weir_accept_latency_seconds_bucket{le="0.0005"} 1
+weir_accept_latency_seconds_bucket{le="0.001"} 1
+weir_accept_latency_seconds_bucket{le="0.0025"} 1
+weir_accept_latency_seconds_bucket{le="0.005"} 1
+weir_accept_latency_seconds_bucket{le="0.01"} 1
+weir_accept_latency_seconds_bucket{le="+Inf"} 1
+# HELP weir_connection_idle_timeout Connections dropped because a frame read phase (header, payload, or CRC) exceeded connection_read_timeout_secs — whether the client was idle or merely streaming pathologically slowly.
+# TYPE weir_connection_idle_timeout counter
+weir_connection_idle_timeout_total 0
+# HELP weir_connection_rejected_peer_uid Connections refused by the peer-credential check (peer uid != daemon uid, or credential lookup failed). Any non-zero value suggests an attempted bypass of the socket file's 0o600 mode or a misconfigured producer.
+# TYPE weir_connection_rejected_peer_uid counter
+weir_connection_rejected_peer_uid_total 0
+# HELP weir_accept_resource_exhaustion accept(2) failures due to resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM). The accept loop backs off briefly on each. A rising value means the daemon is out of file descriptors or socket buffers.
+# TYPE weir_accept_resource_exhaustion counter
+weir_accept_resource_exhaustion_total 0
+# HELP weir_connections_aborted_at_shutdown Connections force-aborted at shutdown because they didn't drain within shutdown_timeout_secs. Each may correspond to a push whose record was written to the WAB but whose producer never received an ack/nack. Increase shutdown_timeout_secs if this is non-zero on graceful shutdown.
+# TYPE weir_connections_aborted_at_shutdown counter
+weir_connections_aborted_at_shutdown_total 0
+# HELP weir_ack_timeout Pushes nacked because the WAB ack channel did not fire within ACK_TIMEOUT. Indicates a wedged flusher (slow fsync, lock contention) that hasn't panicked. Investigate alongside weir_wab_fsync_duration_seconds.
+# TYPE weir_ack_timeout counter
+weir_ack_timeout_total 0
+# HELP weir_tls_handshake_failures TLS handshakes rejected, by reason.
+# TYPE weir_tls_handshake_failures counter
+# HELP weir_tls_config_reloads SIGHUP TLS config reloads, by outcome.
+# TYPE weir_tls_config_reloads counter
+# HELP weir_wab_segments Cumulative WAB segment transitions by state (open, sealed, confirmed, quarantined).
+# TYPE weir_wab_segments counter
+# HELP weir_wab_bytes_on_disk Current bytes used by live WAB shard segments on disk: the open active segment (.wab) plus sealed segments awaiting drain (.wab.sealed). Excludes drained-marker segments (.wab.confirmed) and the dead_letter/ and quarantine/ subdirs (which have their own accounting).
+# TYPE weir_wab_bytes_on_disk gauge
+weir_wab_bytes_on_disk 0.0
+# HELP weir_wab_fsync_duration_seconds Wall-clock time of WAB fdatasync calls.
+# TYPE weir_wab_fsync_duration_seconds histogram
+weir_wab_fsync_duration_seconds_sum 0.0
+weir_wab_fsync_duration_seconds_count 0
+weir_wab_fsync_duration_seconds_bucket{le="0.001"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.002"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.005"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.01"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.025"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.05"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.1"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.25"} 0
+weir_wab_fsync_duration_seconds_bucket{le="0.5"} 0
+weir_wab_fsync_duration_seconds_bucket{le="1.0"} 0
+weir_wab_fsync_duration_seconds_bucket{le="2.5"} 0
+weir_wab_fsync_duration_seconds_bucket{le="5.0"} 0
+weir_wab_fsync_duration_seconds_bucket{le="10.0"} 0
+weir_wab_fsync_duration_seconds_bucket{le="+Inf"} 0
+# HELP weir_wab_group_commit_records Records covered by one WAB group fsync (the fsync amortisation factor; 1.0 means every record paid its own fsync).
+# TYPE weir_wab_group_commit_records histogram
+weir_wab_group_commit_records_sum 0.0
+weir_wab_group_commit_records_count 0
+weir_wab_group_commit_records_bucket{le="1.0"} 0
+weir_wab_group_commit_records_bucket{le="2.0"} 0
+weir_wab_group_commit_records_bucket{le="4.0"} 0
+weir_wab_group_commit_records_bucket{le="8.0"} 0
+weir_wab_group_commit_records_bucket{le="16.0"} 0
+weir_wab_group_commit_records_bucket{le="32.0"} 0
+weir_wab_group_commit_records_bucket{le="64.0"} 0
+weir_wab_group_commit_records_bucket{le="128.0"} 0
+weir_wab_group_commit_records_bucket{le="256.0"} 0
+weir_wab_group_commit_records_bucket{le="512.0"} 0
+weir_wab_group_commit_records_bucket{le="1024.0"} 0
+weir_wab_group_commit_records_bucket{le="+Inf"} 0
+# HELP weir_batch_records Records carried by one PushBatch frame.
+# TYPE weir_batch_records histogram
+weir_batch_records_sum 0.0
+weir_batch_records_count 0
+weir_batch_records_bucket{le="1.0"} 0
+weir_batch_records_bucket{le="2.0"} 0
+weir_batch_records_bucket{le="4.0"} 0
+weir_batch_records_bucket{le="8.0"} 0
+weir_batch_records_bucket{le="16.0"} 0
+weir_batch_records_bucket{le="32.0"} 0
+weir_batch_records_bucket{le="64.0"} 0
+weir_batch_records_bucket{le="128.0"} 0
+weir_batch_records_bucket{le="256.0"} 0
+weir_batch_records_bucket{le="512.0"} 0
+weir_batch_records_bucket{le="1024.0"} 0
+weir_batch_records_bucket{le="2048.0"} 0
+weir_batch_records_bucket{le="+Inf"} 0
+# HELP weir_batch_partial PushBatch frames answered with at least one record not durable.
+# TYPE weir_batch_partial counter
+weir_batch_partial_total 0
+# HELP weir_wab_flusher_panics WAB flusher thread panics. A panicked flusher leaves its shard offline (records routed to it receive Nack(InternalError)) until the daemon restarts. Any non-zero value requires operator attention; check logs for the shard_id and panic payload.
+# TYPE weir_wab_flusher_panics counter
+weir_wab_flusher_panics_total 0
+# HELP weir_drain_panics weir-drain thread panics caught and respawned by its supervisor. Sustained values indicate a logic bug in the sink/drain path; if the supervisor exhausts its respawn budget, delivery stops and the WAB accumulates on disk until restart.
+# TYPE weir_drain_panics counter
+weir_drain_panics_total 0
+# HELP weir_wab_fsync_failures fsync/fdatasync calls that returned an error. Durability hazard: the kernel buffered the write but couldn't push it to stable storage. Producers whose records were in the failed fsync receive Nack(InternalError). Check logs for the shard_id and error string.
+# TYPE weir_wab_fsync_failures counter
+weir_wab_fsync_failures_total 0
+# HELP weir_sink_commit_duration_seconds Wall-clock time of Sink::commit calls.
+# TYPE weir_sink_commit_duration_seconds histogram
+weir_sink_commit_duration_seconds_sum 0.0
+weir_sink_commit_duration_seconds_count 0
+weir_sink_commit_duration_seconds_bucket{le="0.001"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.002"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.005"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.01"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.025"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.05"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.1"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.25"} 0
+weir_sink_commit_duration_seconds_bucket{le="0.5"} 0
+weir_sink_commit_duration_seconds_bucket{le="1.0"} 0
+weir_sink_commit_duration_seconds_bucket{le="2.5"} 0
+weir_sink_commit_duration_seconds_bucket{le="5.0"} 0
+weir_sink_commit_duration_seconds_bucket{le="10.0"} 0
+weir_sink_commit_duration_seconds_bucket{le="+Inf"} 0
+# HELP weir_sink_commit_records Records processed by the drain, by outcome (committed, retried, dead_lettered).
+# TYPE weir_sink_commit_records counter
+# HELP weir_sink_health Current sink health state (1 = active, 0 = inactive for each state label).
+# TYPE weir_sink_health gauge
+weir_sink_health{state="degraded"} 0.0
+weir_sink_health{state="healthy"} 1.0
+weir_sink_health{state="down"} 0.0
+# HELP weir_sink_info Configured sink type, set to 1 for the active sink. sink_type="noop" means records are acked then DISCARDED (not forwarded downstream).
+# TYPE weir_sink_info gauge
+weir_sink_info{sink_type="noop"} 1.0
+# HELP weir_queue_depth Current number of records waiting in the work queue.
+# TYPE weir_queue_depth gauge
+weir_queue_depth 0.0
+# HELP weir_recovery_records_replayed Records replayed from WAB segments during crash recovery.
+# TYPE weir_recovery_records_replayed counter
+weir_recovery_records_replayed_total 0
+# HELP weir_recovery_segments_quarantined WAB segments quarantined due to corruption detected during crash recovery.
+# TYPE weir_recovery_segments_quarantined counter
+weir_recovery_segments_quarantined_total 0
+# HELP weir_recovery_segments_failed WAB segments whose crash recovery failed AND left the segment at its original path, so nothing will ever reach it. Deliberately excludes segments that were quarantined: those are counted by weir_recovery_segments_quarantined_total and are listed by `weir-ctl quarantine`. Non-zero means acked records may be unreachable — check the startup logs for the path and the cause.
+# TYPE weir_recovery_segments_failed counter
+weir_recovery_segments_failed_total 0
+# HELP weir_quarantine_bytes_on_disk Bytes held in the quarantine/ subdirectory: forensic copies of corrupt segments preserved because acked records may sit after the corruption. Unlike the quarantine counters this survives a restart. Recover them with `weir-ctl quarantine requeue`.
+# TYPE weir_quarantine_bytes_on_disk gauge
+weir_quarantine_bytes_on_disk 0.0
+# HELP weir_wab_record_logical_bytes Cumulative record payload bytes as accepted from producers, before any compression. Divide by weir_wab_record_stored_bytes_total for the live compression ratio; the two are equal when compression is off.
+# TYPE weir_wab_record_logical_bytes counter
+weir_wab_record_logical_bytes_total 0
+# HELP weir_wab_record_stored_bytes Cumulative record payload bytes as written to disk, after compression. Excludes the 8-byte per-record framing, the segment header and the footer, so it is not the segment file size.
+# TYPE weir_wab_record_stored_bytes counter
+weir_wab_record_stored_bytes_total 0
+# HELP weir_recovery_quarantine_copy_failed Mid-file-corrupt WAB segments whose quarantine copy failed during recovery; the valid prefix was left un-truncated to preserve any acked-durable tail records (recovery is stuck until the operator clears disk space / read-only state).
+# TYPE weir_recovery_quarantine_copy_failed counter
+weir_recovery_quarantine_copy_failed_total 0
+# HELP weir_wab_cap_rejections Pushes Nacked because live WAB bytes exceeded wab_max_bytes. These surface to clients as NackReason::InternalError (the same byte as queue saturation), so this counter is how the two are told apart.
+# TYPE weir_wab_cap_rejections counter
+weir_wab_cap_rejections_total 0
+# HELP weir_wab_unexpected_mode WAB segment files seen during recovery whose permissions are not 0o600. Non-zero values indicate tampering or operator error.
+# TYPE weir_wab_unexpected_mode counter
+weir_wab_unexpected_mode_total 0
+# HELP weir_dead_letter_bytes_on_disk Current total bytes used by dead-letter segment files on disk.
+# TYPE weir_dead_letter_bytes_on_disk gauge
+weir_dead_letter_bytes_on_disk 0.0
+# HELP weir_dead_letter_full Number of times the drain entered BlockedDeadLetterFull state. Each increment represents a distinct episode where a permanently-rejected record could not be dead-lettered due to cap exhaustion. Operator intervention required.
+# TYPE weir_dead_letter_full counter
+weir_dead_letter_full_total 0
+# HELP weir_drain_segments_stranded WAB segments abandoned by the drain after exhausting max_retries transient sink failures. The segment is left on disk and is re-drained automatically when the sink health recovers (see weir_drain_segments_resumed) or on daemon restart, so a rising value means delivery has stalled for at least one segment. Investigate the sink (see weir_sink_health). Distinct from weir_dead_letter_full, which counts PERMANENT rejections; this counts TRANSIENT failures that never succeeded.
+# TYPE weir_drain_segments_stranded counter
+weir_drain_segments_stranded_total 0
+# HELP weir_drain_segments_resumed Stranded WAB segments re-queued for delivery after the sink health recovered (down to up). Convergence with weir_drain_segments_stranded means an outage's backlog has been picked back up; a persistent gap means segments are still stranded (sink not yet recovered, or recovering then re-failing).
+# TYPE weir_drain_segments_resumed counter
+weir_drain_segments_resumed_total 0
+# HELP weir_drain_state Current drain state (1 = active, 0 = inactive). Exactly one state label value is 1 at any time; the others are 0. NOTE: state="draining" does NOT imply delivery progress — a segment stranded waiting on a fully-down sink still reads draining. Watch weir_sink_health{state="down"} and weir_drain_segments_stranded for that case, not this gauge alone. state="stopped" is terminal: the drain supervisor has exited (clean shutdown, the respawn budget exhausted, or the dead-letter writer failing to open at start) and NOTHING is being delivered until the daemon restarts — alert on it.
+# TYPE weir_drain_state gauge
+weir_drain_state{state="draining"} 1.0
+weir_drain_state{state="stopped"} 0.0
+weir_drain_state{state="retrying_transient"} 0.0
+weir_drain_state{state="blocked_dead_letter_full"} 0.0
+# HELP weir_dead_letter_blocked_duration_seconds Seconds elapsed since the drain entered BlockedDeadLetterFull. Resets to 0 on transition out. Fire an alert if this gauge exceeds your operator-defined threshold (e.g. 300 s).
+# TYPE weir_dead_letter_blocked_duration_seconds gauge
+weir_dead_letter_blocked_duration_seconds 0.0
+# HELP weir_wab_dir_lock_held 1 while this daemon holds the exclusive flock on <wab_dir>/.weir.lock, so no second weir-server can recover or drain its live segments. 0 means it runs WITHOUT that guard: wab_dir_lock = "best-effort" on a filesystem that cannot lock, or ownership was lost just before exit. Alert on 0.
+# TYPE weir_wab_dir_lock_held gauge
+weir_wab_dir_lock_held 1.0
+# HELP weir_wab_dir_lock_integrity_failures Once-a-second integrity checks of <wab_dir>/.weir.lock that found the file deleted or replaced (the daemon re-created and re-locked it) or that failed with an error. Any increase means someone is tampering with the lock file: while it is missing, a second weir-server can start on this wab_dir. Proven loss to another instance does not count here; the daemon exits with status 3 instead.
+# TYPE weir_wab_dir_lock_integrity_failures counter
+weir_wab_dir_lock_integrity_failures_total 0
+# HELP weir_config_reloads Config reload requests, by trigger (sighup; admin is reserved) and outcome: ok (something was reloaded), failed (a reload was attempted and rejected; the previous config stays in force), noop (nothing reloadable: the config is read once at startup, and only TLS material reloads), dropped (the reload queue was full, as in a SIGHUP flood, so the request never ran).
+# TYPE weir_config_reloads counter
+# HELP weir_drain_local_io_strands WAB segments the drain set aside after exhausting max_retries on a LOCAL I/O failure rather than a sink failure: cause="read" is reading the sealed segment, cause="write" is writing dead-letter records after a successful commit. Unlike weir_drain_segments_stranded these do not mark the sink down; the idle rescan resumes them past their committed prefix. Investigate the WAB and dead-letter device (I/O errors, ENOSPC, permissions, descriptor exhaustion), not the sink.
+# TYPE weir_drain_local_io_strands counter
+weir_drain_local_io_strands_total{cause="write"} 0
+weir_drain_local_io_strands_total{cause="read"} 0
+# HELP weir_drain_segments_parked WAB segments the drain has parked: kept on disk, not re-queued this run, and replayed on the next start. reason="local_read_failed" is a persistent permission-class read error, "unsupported_version" a segment written by a newer weir, "drain_panic" a segment the drain panicked on twice.
+# TYPE weir_drain_segments_parked gauge
+weir_drain_segments_parked{reason="drain_panic"} 0.0
+weir_drain_segments_parked{reason="local_read_failed"} 0.0
+weir_drain_segments_parked{reason="unsupported_version"} 0.0
+# HELP weir_drain_segments_disposition_pending Delivered or set-aside WAB segments with a local step still outstanding and retried on every health poll: kind="confirm" is the .confirmed sidecar write or the segment delete, kind="quarantine" the move into quarantine/. These are never re-delivered.
+# TYPE weir_drain_segments_disposition_pending gauge
+weir_drain_segments_disposition_pending{kind="confirm"} 0.0
+weir_drain_segments_disposition_pending{kind="quarantine"} 0.0
+# HELP weir_drain_confirm_failures Failed steps confirming a delivered WAB segment: stage="sidecar" is the atomic .confirmed write (tmp, fsync, rename, directory fsync), stage="delete" the removal of the segment after a durable sidecar. Each is retried on every health poll; the segment is never re-delivered. A rising sidecar count usually means the WAB device is full or read-only.
+# TYPE weir_drain_confirm_failures counter
+weir_drain_confirm_failures_total{stage="sidecar"} 0
+weir_drain_confirm_failures_total{stage="delete"} 0
+# HELP weir_drain_quarantine_failures WAB segments the drain could not move into quarantine/ (corrupt, truncated or persistently unreadable segments whose readable prefix was already delivered). Counted once per segment; the move is retried on every health poll, the bytes stay in place, and the prefix is never re-delivered. Usually a full or read-only WAB device, or something other than a directory at <wab_dir>/quarantine.
+# TYPE weir_drain_quarantine_failures counter
+weir_drain_quarantine_failures_total 0
+# HELP weir_drain_dead_letter_write_failures Failed attempts to write sink-rejected records into dead_letter/ after the sink commit succeeded. The drain keeps the rejected records in memory and retries only the write, so the accepted records are not re-committed; the segment stays on disk until the write lands. Usually a full or read-only WAB device (ENOSPC, EROFS, EACCES).
+# TYPE weir_drain_dead_letter_write_failures counter
+weir_drain_dead_letter_write_failures_total 0
+# HELP weir_drain_busy_seconds Seconds the drain thread has spent in its current operation, by kind: sink_commit and sink_probe are calls into the sink; segment_read, local_fsync, dead_letter_write, quarantine_move and dir_scan are local I/O on the WAB device (dir_scan includes the rescan's orphan-file cleanup fsync). Only the current kind is non-zero; all read 0 between operations. Sampled every 5 s. A large local value means a slow disk, which a restart does not fix; a sink_commit value past commit_timeout means a sink blocking the drain thread.
+# TYPE weir_drain_busy_seconds gauge
+weir_drain_busy_seconds{kind="quarantine_move"} 0.0
+weir_drain_busy_seconds{kind="local_fsync"} 0.0
+weir_drain_busy_seconds{kind="segment_read"} 0.0
+weir_drain_busy_seconds{kind="dead_letter_write"} 0.0
+weir_drain_busy_seconds{kind="dir_scan"} 0.0
+weir_drain_busy_seconds{kind="sink_commit"} 0.0
+weir_drain_busy_seconds{kind="sink_probe"} 0.0
+# HELP weir_build_info Always 1; the labels carry the daemon version and the wire protocol version.
+# TYPE weir_build_info gauge
+weir_build_info{version="4.0.1",wire_version="1"} 1.0
+# HELP weir_start_time_seconds Unix time the daemon process started.
+# TYPE weir_start_time_seconds gauge
+weir_start_time_seconds 1792419531.490253
+# HELP weir_startup_phase Lifecycle phase, one-hot: initializing, recovering, handoff, binding, serving, shutting_down.
+# TYPE weir_startup_phase gauge
+weir_startup_phase{phase="binding"} 0.0
+weir_startup_phase{phase="recovering"} 0.0
+weir_startup_phase{phase="shutting_down"} 0.0
+weir_startup_phase{phase="initializing"} 0.0
+weir_startup_phase{phase="handoff"} 0.0
+weir_startup_phase{phase="serving"} 1.0
+# HELP weir_ready 1 when the daemon can accept ingest (the /readyz verdict), refreshed every 5 s.
+# TYPE weir_ready gauge
+weir_ready 1.0
+# HELP weir_live 1 unless a selected liveness check fails (the /livez verdict), refreshed every 5 s.
+# TYPE weir_live gauge
+weir_live 1.0
+# HELP weir_condition_active 1 while the condition is active, 0 otherwise (also 0 while unevaluated); one series per catalogue code.
+# TYPE weir_condition_active gauge
+weir_condition_active{code="delivery_lagging",severity="warning"} 0.0
+weir_condition_active{code="starting",severity="info"} 0.0
+weir_condition_active{code="shard_offline",severity="critical"} 0.0
+weir_condition_active{code="no_live_shard",severity="critical"} 0.0
+weir_condition_active{code="drain_wedged",severity="critical"} 0.0
+weir_condition_active{code="sink_degraded",severity="info"} 0.0
+weir_condition_active{code="admin_unavailable",severity="warning"} 0.0
+weir_condition_active{code="wab_growing_unbounded",severity="warning"} 0.0
+weir_condition_active{code="segments_stranded",severity="warning"} 0.0
+weir_condition_active{code="recovery_incomplete",severity="critical"} 0.0
+weir_condition_active{code="shutting_down",severity="info"} 0.0
+weir_condition_active{code="drain_stopped",severity="critical"} 0.0
+weir_condition_active{code="drain_blocked_dead_letter_full",severity="critical"} 0.0
+weir_condition_active{code="drain_paused",severity="warning"} 0.0
+weir_condition_active{code="wab_cap_rejecting",severity="critical"} 0.0
+weir_condition_active{code="delivery_stalled",severity="warning"} 0.0
+weir_condition_active{code="active_segment_aging",severity="info"} 0.0
+weir_condition_active{code="wab_scan_stale",severity="warning"} 0.0
+weir_condition_active{code="worker_exited",severity="critical"} 0.0
+weir_condition_active{code="sink_down",severity="warning"} 0.0
+weir_condition_active{code="fsync_failures_recent",severity="critical"} 0.0
+weir_condition_active{code="flusher_respawned_recent",severity="warning"} 0.0
+weir_condition_active{code="quarantine_nonempty",severity="warning"} 0.0
+weir_condition_active{code="sink_failing",severity="warning"} 0.0
+weir_condition_active{code="listener_down",severity="critical"} 0.0
+weir_condition_active{code="noop_sink",severity="warning"} 1.0
+weir_condition_active{code="dead_letter_near_cap",severity="warning"} 0.0
+weir_condition_active{code="tls_reload_failed",severity="warning"} 0.0
+weir_condition_active{code="drain_backpressure",severity="warning"} 0.0
+weir_condition_active{code="ack_timeouts_recent",severity="warning"} 0.0
+# HELP weir_wab_shard_up 1 while the shard's flusher is up or respawning, 0 while starting, offline or stopped.
+# TYPE weir_wab_shard_up gauge
+weir_wab_shard_up{shard="1"} 1.0
+weir_wab_shard_up{shard="0"} 1.0
+# HELP weir_wab_handoff_blocked_seconds Seconds the shard's flusher has been blocked handing a sealed segment to a full drain channel; 0 when not blocked.
+# TYPE weir_wab_handoff_blocked_seconds gauge
+weir_wab_handoff_blocked_seconds{shard="1"} 0.0
+weir_wab_handoff_blocked_seconds{shard="0"} 0.0
+# HELP weir_worker_up 1 while the worker thread is running.
+# TYPE weir_worker_up gauge
+weir_worker_up{worker="0"} 1.0
+weir_worker_up{worker="1"} 1.0
+# HELP weir_wab_cap_rejecting 1 while the wab_max_bytes cap is rejecting pushes.
+# TYPE weir_wab_cap_rejecting gauge
+weir_wab_cap_rejecting 0.0
+# HELP weir_wab_undelivered_segments Sealed segments not yet confirmed delivered (5 s scan).
+# TYPE weir_wab_undelivered_segments gauge
+weir_wab_undelivered_segments 0.0
+# HELP weir_wab_undelivered_records Records in sealed, undelivered segments, from segment footers (5 s scan).
+# TYPE weir_wab_undelivered_records gauge
+weir_wab_undelivered_records 0.0
+# HELP weir_wab_oldest_undelivered_age_seconds Upper bound on the age of the oldest undelivered record, from its segment header; 0 when none.
+# TYPE weir_wab_oldest_undelivered_age_seconds gauge
+weir_wab_oldest_undelivered_age_seconds 0.0
+# HELP weir_wab_active_segment_age_seconds Age of the shard's active (open) segment; 0 when none.
+# TYPE weir_wab_active_segment_age_seconds gauge
+weir_wab_active_segment_age_seconds{shard="1"} 0.0
+weir_wab_active_segment_age_seconds{shard="0"} 0.0
+# HELP weir_drain_pending_segments Segments queued in the drain, by queue (live channel items, backlog).
+# TYPE weir_drain_pending_segments gauge
+weir_drain_pending_segments{queue="live"} 0.0
+weir_drain_pending_segments{queue="backlog"} 0.0
+# HELP weir_drain_replay_remaining_segments Startup replay segments not yet delivered.
+# TYPE weir_drain_replay_remaining_segments gauge
+weir_drain_replay_remaining_segments 0.0
+# HELP weir_drain_heartbeat_age_seconds Seconds since the drain heartbeat last moved (5 s poll).
+# TYPE weir_drain_heartbeat_age_seconds gauge
+weir_drain_heartbeat_age_seconds 0.0
+# HELP weir_drain_commit_in_flight_seconds Seconds the current sink commit has been in flight; 0 when none.
+# TYPE weir_drain_commit_in_flight_seconds gauge
+weir_drain_commit_in_flight_seconds 0.0
+# HELP weir_drain_paused 1 while delivery is paused by an operator.
+# TYPE weir_drain_paused gauge
+weir_drain_paused 0.0
+# HELP weir_drain_generation Drain thread starts in this process (1 + respawns).
+# TYPE weir_drain_generation gauge
+weir_drain_generation 0.0
+# HELP weir_sink_last_success_timestamp_seconds Unix time of the last successful sink commit; 0 before the first.
+# TYPE weir_sink_last_success_timestamp_seconds gauge
+weir_sink_last_success_timestamp_seconds 0.0
+# HELP weir_sink_last_failure_timestamp_seconds Unix time of the last failed sink commit, by failure kind.
+# TYPE weir_sink_last_failure_timestamp_seconds gauge
+weir_sink_last_failure_timestamp_seconds{kind="transient"} 0.0
+weir_sink_last_failure_timestamp_seconds{kind="contract_violation"} 0.0
+weir_sink_last_failure_timestamp_seconds{kind="timeout"} 0.0
+weir_sink_last_failure_timestamp_seconds{kind="permanent"} 0.0
+# HELP weir_sink_consecutive_failures Sink commits failed in a row since the last success.
+# TYPE weir_sink_consecutive_failures gauge
+weir_sink_consecutive_failures 0.0
+# HELP weir_config_wab_max_bytes Effective wab_max_bytes (0 = no cap).
+# TYPE weir_config_wab_max_bytes gauge
+weir_config_wab_max_bytes 0.0
+# HELP weir_config_dead_letter_max_bytes Effective dead_letter_max_bytes.
+# TYPE weir_config_dead_letter_max_bytes gauge
+weir_config_dead_letter_max_bytes 1073741824.0
+# HELP weir_config_wab_segment_max_bytes Effective wab_segment_max_bytes.
+# TYPE weir_config_wab_segment_max_bytes gauge
+weir_config_wab_segment_max_bytes 268435456.0
+# HELP weir_config_segment_max_age_seconds Effective wab_segment_max_age_secs (0 = idle seal off).
+# TYPE weir_config_segment_max_age_seconds gauge
+weir_config_segment_max_age_seconds 0.0
+# HELP weir_config_segment_max_lifetime_seconds Effective wab_segment_max_lifetime_secs (0 = lifetime seal off).
+# TYPE weir_config_segment_max_lifetime_seconds gauge
+weir_config_segment_max_lifetime_seconds 0.0
+# HELP weir_config_sink_max_retries Effective sink_max_retries.
+# TYPE weir_config_sink_max_retries gauge
+weir_config_sink_max_retries 3.0
+# HELP weir_config_shutdown_timeout_seconds Effective shutdown_timeout_secs.
+# TYPE weir_config_shutdown_timeout_seconds gauge
+weir_config_shutdown_timeout_seconds 3.0
+# HELP weir_records_nack_internal Transient InternalError nacks, by cause.
+# TYPE weir_records_nack_internal counter
+weir_records_nack_internal_total{cause="sender_dropped"} 0
+weir_records_nack_internal_total{cause="ack_timeout"} 0
+weir_records_nack_internal_total{cause="ownership_lost"} 0
+weir_records_nack_internal_total{cause="write_failed"} 0
+weir_records_nack_internal_total{cause="wab_cap"} 0
+weir_records_nack_internal_total{cause="queue_full"} 0
+weir_records_nack_internal_total{cause="coordinate"} 0
+# HELP weir_connections_refused_no_live_shard New connections refused because no shard could accept records.
+# TYPE weir_connections_refused_no_live_shard counter
+weir_connections_refused_no_live_shard_total 0
+# HELP weir_drain_segments_abandoned Segments the drain thread left partly delivered when it exited on a stop (the shutdown deadline, or a stop while the segment was paused or blocked); they stay sealed and unconfirmed and are re-delivered from record 0 on the next start.
+# TYPE weir_drain_segments_abandoned counter
+weir_drain_segments_abandoned_total 0
+# HELP weir_wab_segments_not_handed_off Sealed segments a flusher could not hand to the drain, by reason: budget (the 1 s shutdown hand-off budget ran out) or disconnected (the drain was gone); durable, delivered on restart.
+# TYPE weir_wab_segments_not_handed_off counter
+weir_wab_segments_not_handed_off_total{reason="budget"} 0
+weir_wab_segments_not_handed_off_total{reason="disconnected"} 0
+# EOF

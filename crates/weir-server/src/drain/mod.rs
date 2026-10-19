@@ -51,7 +51,7 @@ use std::{
 };
 
 use crossbeam_channel::RecvTimeoutError;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use weir_core::Payload;
 use weir_sink_sdk::RecordId;
 
@@ -715,7 +715,7 @@ fn probe_and_resume_stranded<S: Sink>(
 /// 1.214 s and still confirmed the batch; a 50 ms health-probe timeout
 /// against a 1.5 s blocking health elapsed 1.504 s and returned healthy.
 /// Liveness therefore cannot be observed from inside the drain — this counter
-/// lets a task on another runtime (see `main.rs`'s WAB-growth poll) see it.
+/// lets a task on another runtime (see the WAB-growth poll in `status::poll`) see it.
 ///
 /// Deliberately NOT a fix: the drain still wedges forever against a sink that
 /// never yields. This only makes that state visible in the logs instead of
@@ -906,7 +906,7 @@ impl Drop for BusyGuard<'_> {
 /// an idle-but-healthy drain only bumps the heartbeat that often) before it
 /// warns. Nor is a long freeze on its own proof of a WEDGE specifically: a
 /// drain that has exited leaves the heartbeat frozen forever too, which is why
-/// the poll task also reads `drain_state` (`main.rs`'s `drain_stall_verdict`).
+/// the poll task also reads `drain_state` (`status::poll::drain_stall_verdict`).
 pub(crate) fn drain_appears_stalled(previous: u64, current: u64) -> bool {
     previous == current
 }
@@ -1927,6 +1927,15 @@ fn enter_blocked(
     // instant so `dead_letter_full` counts distinct episodes and the duration
     // gauge keeps climbing rather than resetting (F09).
     let blocked_since = *block_episode.get_or_insert_with(|| {
+        // SP-D (spec §5.13): once per episode, when it starts, so a flapping
+        // cap does not repeat it.
+        warn!(
+            segment = %segment_identity(&segment),
+            needed_bytes = needed,
+            "drain: dead_letter/ is full; delivery is blocked until space is freed \
+             (weir-ctl dl requeue / dl drop) or dead_letter_max_bytes is raised. Ingest \
+             continues and the WAB grows (condition drain_blocked_dead_letter_full)"
+        );
         metrics.dead_letter_full.inc();
         Instant::now()
     });
@@ -2057,6 +2066,10 @@ async fn process_segment<S: Sink>(
     // same string at ack time for a tracked push's `RecordCoordinate`, and the
     // two must agree or the coordinate names a record the sink never keyed.
     let segment_name = segment_identity(segment);
+    // SP-D (spec §5.13): every line logged inside a commit names the segment.
+    // ERROR level so the span is enabled under any `log_level` that lets a
+    // commit-path WARN or ERROR through.
+    let segment_span = tracing::error_span!("segment", segment = %segment_name);
     let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
 
     // Set when the record loop stops on a record it cannot read and the segment
@@ -2157,6 +2170,7 @@ async fn process_segment<S: Sink>(
                 dead_letter,
                 hb,
             )
+            .instrument(segment_span.clone())
             .await;
             hb.bump();
             if let Err(setback) = apply_batch(result, &mut durable_through, n) {
@@ -2177,6 +2191,7 @@ async fn process_segment<S: Sink>(
             dead_letter,
             hb,
         )
+        .instrument(segment_span.clone())
         .await;
         hb.bump();
         if let Err(setback) = apply_batch(result, &mut durable_through, n) {
@@ -6555,7 +6570,7 @@ mod tests {
     /// closed, delivery is finished," and neither respawned nor counted a
     /// panic; before an earlier, separate fix, `drain_state` also stayed
     /// pre-initialised at `draining = 1` forever, which kept `drain_is_healthy`
-    /// (main.rs) true and the WAB growth warning permanently silent.)
+    /// (`status::poll`) true and the WAB growth warning permanently silent.)
     #[test]
     fn drain_supervisor_publishes_stopped_when_the_dead_letter_writer_cannot_open() {
         let dir = tmp_dir("drain_dl_open_fails");
@@ -9258,12 +9273,18 @@ mod tests {
             longest_freeze = longest_freeze.max(frozen_for);
             let busy = heartbeat.busy();
             assert_ne!(
-                crate::drain_stall_verdict(frozen_for, interval, false, busy, commit_timeout),
-                Some(crate::DrainStallVerdict::Wedged),
+                crate::status::poll::drain_stall_verdict(
+                    frozen_for,
+                    interval,
+                    false,
+                    busy,
+                    commit_timeout
+                ),
+                Some(crate::status::poll::DrainStallVerdict::Wedged),
                 "a slow, yielding sink read as a wedged drain (frozen {frozen_for:?}, busy \
                  {busy:?})"
             );
-            let scaled = crate::classify_drain_stall(
+            let scaled = crate::status::poll::classify_drain_stall(
                 frozen_for >= Duration::from_millis(500),
                 false,
                 busy,
@@ -9271,10 +9292,13 @@ mod tests {
             );
             assert_ne!(
                 scaled,
-                Some(crate::DrainStallVerdict::Wedged),
+                Some(crate::status::poll::DrainStallVerdict::Wedged),
                 "frozen {frozen_for:?}, busy {busy:?}"
             );
-            if matches!(scaled, Some(crate::DrainStallVerdict::SlowSinkCall { .. })) {
+            if matches!(
+                scaled,
+                Some(crate::status::poll::DrainStallVerdict::SlowSinkCall { .. })
+            ) {
                 slow_sink_calls += 1;
             }
         }
@@ -9327,13 +9351,16 @@ mod tests {
         while heartbeat.get() == frozen_at && since.elapsed() < Duration::from_millis(1400) {
             std::thread::sleep(Duration::from_millis(20));
             let busy = heartbeat.busy();
-            if let Some(v) =
-                crate::classify_drain_stall(since.elapsed() >= STALL_AFTER, false, busy, limit)
-            {
+            if let Some(v) = crate::status::poll::classify_drain_stall(
+                since.elapsed() >= STALL_AFTER,
+                false,
+                busy,
+                limit,
+            ) {
                 if verdicts.last() != Some(&std::mem::discriminant(&v)) {
                     verdicts.push(std::mem::discriminant(&v));
                 }
-                if v == crate::DrainStallVerdict::Wedged {
+                if v == crate::status::poll::DrainStallVerdict::Wedged {
                     let (kind, busy_for) = busy.expect("the blocked commit is still busy");
                     assert_eq!(kind, BusyKind::SinkCommit);
                     assert!(busy_for > limit, "{busy_for:?}");
@@ -9341,11 +9368,11 @@ mod tests {
                 }
             }
         }
-        let slow = std::mem::discriminant(&crate::DrainStallVerdict::SlowSinkCall {
+        let slow = std::mem::discriminant(&crate::status::poll::DrainStallVerdict::SlowSinkCall {
             kind: BusyKind::SinkCommit,
             busy_for: Duration::ZERO,
         });
-        let wedged = std::mem::discriminant(&crate::DrainStallVerdict::Wedged);
+        let wedged = std::mem::discriminant(&crate::status::poll::DrainStallVerdict::Wedged);
         assert_eq!(
             verdicts,
             vec![slow, wedged],
@@ -9356,5 +9383,55 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(heartbeat.busy(), None);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ── SP-D logging (spec §5.13) ───────────────────────────────────────────
+
+    #[test]
+    fn commit_path_log_lines_name_the_segment() {
+        use super::dead_letter::DeadLetterWriter;
+        let dir = tmp_dir("commit_log_segment");
+        let segment = make_sealed_segment(&dir, 0, &[b"r1"]);
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        let config = fast_config(dir.clone());
+        let metrics = noop_metrics();
+        let sink = MockSink::with_responses([Err(MockError::Transient)]);
+        let (_, logs) = crate::testutil::capture_logs(|| {
+            block_on(process_segment(
+                &segment, &sink, &config, &metrics, &mut dl, 0,
+            ))
+        });
+        let line = logs
+            .lines()
+            .find(|l| l.contains("transient sink error"))
+            .unwrap_or_else(|| panic!("no transient line:\n{logs}"));
+        assert!(
+            line.contains("shard_00/seg_00000001"),
+            "the commit line must name its segment: {line}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_dead_letter_blocked_episode_warns_once_when_it_starts() {
+        let metrics = noop_metrics();
+        let mut episode = None;
+        let seg = PathBuf::from("/w/shard_00/seg_00000004.wab.sealed");
+        let (_, first) = crate::testutil::capture_logs(|| {
+            super::enter_blocked(seg.clone(), &metrics, &mut episode, 0, 4096)
+        });
+        assert!(
+            first.contains("WARN")
+                && first.contains("dead_letter/ is full")
+                && first.contains("shard_00/seg_00000004"),
+            "{first}"
+        );
+        let (_, again) = crate::testutil::capture_logs(|| {
+            super::enter_blocked(seg.clone(), &metrics, &mut episode, 0, 4096)
+        });
+        assert!(
+            !again.contains("dead_letter/ is full"),
+            "the same episode does not repeat it: {again}"
+        );
     }
 }

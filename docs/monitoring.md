@@ -750,6 +750,47 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. Unchanged by `weir_config_reloads_total` below, which counts the same reloads again among every other SIGHUP. |
 | `weir_config_reloads_total{trigger,outcome}` | counter | Every config reload request, on every build. `trigger` is `sighup` (`admin` is reserved; nothing sends it yet). `outcome` is `ok` (something was reloaded — today only TLS material), `failed` (a reload was attempted and rejected; the previous config stays in force), `noop` (nothing reloadable: the config is read once at startup, so a daemon without TLS answers every SIGHUP this way and keeps running), or `dropped` (the request never ran: the 8-deep reload queue was full, as in a SIGHUP flood, or the reload loop had stopped). A SIGHUP that arrives before the handler is installed, during startup, is ignored and not counted. |
 
+### Status, lifecycle and conditions
+
+Added by Foundations. The conditions behind `weir_condition_active` get their own section on this page, one `cond-<code>` heading each (the runbook link every condition carries) *(written from PR 8)*. Families marked *(written from PR n)* exist at 0 from boot and move once the named part of Foundations is in the build.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `weir_build_info{version,wire_version}` | gauge | Always 1; the labels carry the daemon and wire-protocol versions. Join on it to label dashboards by version. |
+| `weir_start_time_seconds` | gauge | Unix time the process started. `time() - weir_start_time_seconds` is uptime; a reset means a restart. |
+| `weir_startup_phase{phase}` | gauge | One-hot lifecycle phase: `initializing`, `recovering`, `handoff`, `binding`, `serving`, `shutting_down`. A daemon stuck in `recovering` is replaying a large or slow WAB. |
+| `weir_ready` | gauge | 1 when the daemon can accept ingest: serving, not shutting down, not cap-rejecting, at least one live shard, no listener down. Refreshed every 5 s. Sink health never gates it. |
+| `weir_live` | gauge | 1 unless a check selected in `livez_checks` fails. With the default empty list it is always 1 while the process answers. |
+| `weir_condition_active{code,severity}` | gauge | 1 while the condition is active; 0 when inactive **or unevaluated** (missing evidence). One pre-created series per code. Alert on `severity="critical"`. |
+| `weir_wab_shard_up{shard}` | gauge | 1 while the shard's flusher is up or respawning. 0 means new pushes for that shard nack; see `shard_offline`. |
+| `weir_wab_handoff_blocked_seconds{shard}` | gauge | Seconds the shard's flusher has been blocked handing a sealed segment to a full drain channel. Non-zero means delivery is stalling ingest (acks wait), not slow storage. *(written from PR 3)* |
+| `weir_worker_up{worker}` | gauge | 1 while the worker thread runs. 0 after startup means the shards it owns cannot accept records. |
+| `weir_wab_cap_rejecting` | gauge | 1 while `wab_max_bytes` is rejecting pushes. Since Foundations it clears on its own once the WAB drains below 90% of the cap, without traffic. |
+| `weir_wab_undelivered_segments` | gauge | Sealed segments not yet confirmed delivered, from a read-only 5 s scan. |
+| `weir_wab_undelivered_records` | gauge | Records in those segments, from their footers. |
+| `weir_wab_oldest_undelivered_age_seconds` | gauge | Upper bound on the age of the oldest undelivered record (from its segment header); 0 when nothing is undelivered. |
+| `weir_wab_active_segment_age_seconds{shard}` | gauge | Age of the shard's open segment. With both seal timers 0 a quiet shard's records wait here until rotation or shutdown. |
+| `weir_drain_pending_segments{queue}` | gauge | Segments queued in the drain: `live` (from the channel) and `backlog` (startup replay and rescans). *(written from PR 2)* |
+| `weir_drain_replay_remaining_segments` | gauge | Startup replay segments not yet delivered. *(written from PR 2)* |
+| `weir_drain_heartbeat_age_seconds` | gauge | Seconds since the drain heartbeat last moved. Read with `weir_drain_busy_seconds`. |
+| `weir_drain_commit_in_flight_seconds` | gauge | Seconds the current sink commit has been in flight; 0 when none. *(written from PR 2)* |
+| `weir_drain_paused` | gauge | 1 while an operator has paused delivery. Ingest keeps buffering. *(written from PR 2)* |
+| `weir_drain_generation` | gauge | Drain thread starts in this process (1 + respawns). *(written from PR 2)* |
+| `weir_sink_last_success_timestamp_seconds` | gauge | Unix time of the last successful sink commit; 0 before the first. *(written from PR 2)* |
+| `weir_sink_last_failure_timestamp_seconds{kind}` | gauge | Unix time of the last failed commit, by `kind`: `transient`, `permanent`, `timeout`, `contract_violation`. *(written from PR 2)* |
+| `weir_sink_consecutive_failures` | gauge | Commits failed in a row since the last success. *(written from PR 2)* |
+| `weir_config_wab_max_bytes` | gauge | Effective `wab_max_bytes` (0 = no cap). |
+| `weir_config_dead_letter_max_bytes` | gauge | Effective `dead_letter_max_bytes`. |
+| `weir_config_wab_segment_max_bytes` | gauge | Effective `wab_segment_max_bytes`. |
+| `weir_config_segment_max_age_seconds` | gauge | Effective `wab_segment_max_age_secs` (0 = off). |
+| `weir_config_segment_max_lifetime_seconds` | gauge | Effective `wab_segment_max_lifetime_secs` (0 = off). |
+| `weir_config_sink_max_retries` | gauge | Effective `sink_max_retries`. |
+| `weir_config_shutdown_timeout_seconds` | gauge | Effective `shutdown_timeout_secs`. |
+| `weir_records_nack_internal_total{cause}` | counter | Transient `InternalError` nacks by cause: `queue_full`, `write_failed`, `sender_dropped`, `ack_timeout`, `wab_cap`, `coordinate`, `ownership_lost`. The wire reason is the same for all of them; this is how to tell them apart. |
+| `weir_connections_refused_no_live_shard_total` | counter | New connections refused because no shard could accept records. *(written from PR 3)* |
+| `weir_drain_segments_abandoned_total` | counter | Segments left partly delivered when the drain thread exited on a stop: at the shutdown deadline, or while the segment was held by a pause or blocked on a full dead letter. They stay sealed and unconfirmed and are re-delivered from record 0 on the next start. *(written from PR 2)* |
+| `weir_wab_segments_not_handed_off_total{reason}` | counter | Sealed segments a flusher could not hand to the drain, by `reason`: `budget` (shutdown hand-off budget spent) or `disconnected` (drain gone). Durable; delivered on restart. *(written from PR 3)* |
+
 ### Integrity / tamper evidence (weir-attest)
 
 > **Unlike every other row on this page, these do not come from the daemon's

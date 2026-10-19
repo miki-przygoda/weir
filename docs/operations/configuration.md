@@ -645,6 +645,14 @@ boundary). This state is shared daemon-wide across every listener — the Unix
 socket and the TCP/mTLS listener alike — so one connection observing recovery
 releases all of them, and one observing the cap holds all of them.
 
+The cap flag is refreshed every 5 s without traffic: the periodic size scan
+re-evaluates it, so a daemon whose drain has brought the WAB below the resume
+line accepts again before the next push arrives, and `weir_wab_cap_rejecting`
+(and `weir_ready`) follow on their own. A scan that fails leaves the flag as it
+was (fail-closed). A restart over the cap rejects from the first push: a
+synchronous size scan runs after recovery, before the producer socket binds,
+and if that scan fails with a cap set, pushes nack until a scan succeeds.
+
 **This is a soft high-water mark, not a hard limit.** The value it is checked
 against is refreshed every 5 seconds, so the WAB can overshoot by up to 5
 seconds of peak ingest. An operator who sets the cap at their exact free space

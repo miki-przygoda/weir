@@ -2780,6 +2780,7 @@ dependencies = [
  "weir-core",
  "weir-sink-s3",
  "weir-sink-sdk",
+ "weir-status",
  "weir-testkit",
  "weir-wab",
  "zstd",
@@ -2809,6 +2810,14 @@ version = "4.0.1"
 dependencies = [
  "sha2 0.10.9",
  "weir-core",
+]
+
+[[package]]
+name = "weir-status"
+version = "4.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

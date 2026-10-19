@@ -938,6 +938,7 @@ fn drive_sync_flusher_with(
             store,
             compression,
             1,
+            &crate::status::ShardSlot::detached(),
         );
     });
     handle.join().expect("flusher thread join");
@@ -1140,12 +1141,13 @@ fn run_panic_during_flush(
     let faults_for_store = Arc::clone(&sim_faults);
     let ledger_for_store = ledger.clone();
     let clock = SimClock::new();
+    let slot = crate::status::ShardSlot::detached();
 
     let handle = std::thread::spawn(move || {
         // Mirror production: the flusher body runs under panic supervision, which
         // catches the injected panic and respawns. The body factory re-clones the
         // shared handles per attempt; the fault state + ledger are shared (Arc).
-        super::run_with_panic_supervision(0, metrics_for_panic, &clock, || {
+        super::run_with_panic_supervision(0, metrics_for_panic, &clock, &slot, || {
             let shard_dir = shard_dir.clone();
             let work_rx = work_rx.clone();
             let drain_tx = drain_tx.clone();
@@ -1156,6 +1158,7 @@ fn run_panic_during_flush(
                 ledger_for_store.clone(),
             ));
             let clock = clock.clone();
+            let slot = slot.clone();
             move || {
                 super::flusher_thread(
                     0,
@@ -1174,7 +1177,8 @@ fn run_panic_during_flush(
                     store,
                     compression,
                     1,
-                );
+                    &slot,
+                )
             }
         });
     });
@@ -1274,9 +1278,13 @@ fn run_panic_supervisor(seed: u64) -> SimReport {
     let clock = SimClock::new();
 
     let real_start = Instant::now();
-    super::run_with_panic_supervision(0, Arc::clone(&metrics), &clock, || {
-        || panic!("DST: persistent flusher panic")
-    });
+    super::run_with_panic_supervision(
+        0,
+        Arc::clone(&metrics),
+        &clock,
+        &crate::status::ShardSlot::detached(),
+        || || -> super::FlusherExit { panic!("DST: persistent flusher panic") },
+    );
     let real_elapsed = real_start.elapsed();
 
     let flusher_panics = metrics.wab_flusher_panics.get();
@@ -1488,6 +1496,7 @@ fn run_interleaved_flush(
             store,
             compression,
             1,
+            &crate::status::ShardSlot::detached(),
         );
         sched_f.finish(FLUSHER);
     });
@@ -1651,6 +1660,7 @@ mod tests {
                 store,
                 Compression::None,
                 1,
+                &crate::status::ShardSlot::detached(),
             );
         });
         handle.join().expect("flusher join");

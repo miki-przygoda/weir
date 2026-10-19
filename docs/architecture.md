@@ -53,7 +53,11 @@ WAB (`src/main.rs`):
 
 ```
 umask 0o077 + SIGHUP ignored
-→ Config::load → tracing → "config source", "weir starting"
+→ Config::load → tracing (colour only on a terminal; a bad log_level WARNs)
+→ "config source", "weir starting"
+                       carries version, wire_version and the effective config
+                       as a ConfigView: no secrets, sink URLs reduced to
+                       scheme://host:port                (src/status/config_view.rs)
 → wab_dir lock         flock(LOCK_EX|LOCK_NB) on <wab_dir>/.weir.lock   (src/wab/lock.rs)
 → Metrics::new → lock-integrity thread (1 s, from here to exit)
 → preflight            socket_path format + length, non-socket refusal, connect-only
@@ -63,6 +67,8 @@ umask 0o077 + SIGHUP ignored
 → wab::spawn           crash recovery of active segments, flushers
 → workers → drain thread (+ its SegmentLedger)
 → replay of sealed-but-unconfirmed segments into the drain channel
+→ startup cap gate     synchronous WAB size scan + wab_max_bytes evaluation;
+                       a failed scan with a cap set starts rejecting (src/status/poll.rs)
 → tokio runtime:
     reload loop + SIGHUP handler → metrics bind
     → WAB / drain-liveness poll → [TLS load + TCP listener] → SIGTERM/Ctrl-C
@@ -311,6 +317,7 @@ dependency graph, not just convention — verify with `cargo tree`.
 |-------|---------------------|-----------------------------------|
 | `weir-core` | — (just `bytes`, `crc32fast`) | The wire types + `Payload`. Build a producer or a non-Rust client against the frozen v1 wire protocol. |
 | `weir-wab` | `weir-core`, `crc32fast` | Read/inspect/recover on-disk WAB segments. No async runtime, no daemon. `SegmentReader::open(path)` streams CRC-verified records straight off disk — useful for a recovery tool, an offline inspector, or a custom reader. |
+| `weir-status` | — (just `serde`) | The `weir.status/v1` model, Conditions evaluator and probe predicates shared by the daemon and `weir-ctl`; pure Rust, no I/O. Evaluate a daemon from its metrics exposition or from disk facts without linking the daemon. |
 | `weir-sink-sdk` | `weir-core` | Implement **and unit-test** a custom `Sink` against the stable trait — no `weir-server`, no tokio required (the crate's own tests drive `commit`/`health` with a tiny `block_on`). `BasicSinkError` / `Infallible` cover quick error types. |
 | `weir-client` | `weir-core` | The synchronous producer client. Push records over the socket from your own app. |
 | `weir-ctl` | `weir-core`, `weir-client`, `weir-wab` | The admin CLI. Notably does **not** depend on `weir-server` — it's a thin tool over the wire client + the segment reader, so it (and the WAB-reading capability it's built on) work independently of the daemon binary. |

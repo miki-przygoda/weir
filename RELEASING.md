@@ -5,7 +5,7 @@ previous release, and the commit that broke it is named.
 
 ## What gets published
 
-**Nine crates.** `weir-testkit` is `publish = false` (test harness only) and is
+**Ten crates.** `weir-testkit` is `publish = false` (test harness only) and is
 the sole workspace member that stays off crates.io.
 
 **A published version can never be replaced** — only yanked. So everything a user
@@ -20,7 +20,7 @@ order is a topological sort of the intra-workspace `[dependencies]`:
 
 ```
 weir-core → weir-wab → weir-sink-sdk → weir-attest → weir-client
-          → weir-ctl → weir-rs → weir-sink-s3 → weir-server
+          → weir-status → weir-ctl → weir-rs → weir-sink-s3 → weir-server
 ```
 
 **Any valid topological order works** — only "dependencies before dependents"
@@ -54,12 +54,12 @@ PY
 
 ## The version bump
 
-**Bump all seven occurrences in `Cargo.toml` in one commit**: `[workspace.package]
-version` *and* the six intra-workspace `[workspace.dependencies]` pins. 3.0.0
+**Bump all eight occurrences in `Cargo.toml` in one commit**: `[workspace.package]
+version` *and* the seven intra-workspace `[workspace.dependencies]` pins. 3.0.0
 bumped the first and forgot the pins, which needed the follow-up `952863a`.
 
 ```sh
-sed -i '' 's/version = "OLD"/version = "NEW"/g' Cargo.toml   # expect 7 replacements
+sed -i '' 's/version = "OLD"/version = "NEW"/g' Cargo.toml   # expect 8 replacements
 ```
 
 **Never hand-edit `demo/version.js`.** It is generated, and the `lint` job fails

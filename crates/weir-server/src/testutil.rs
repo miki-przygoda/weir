@@ -75,3 +75,33 @@ pub(crate) fn mkdir_p(path: impl AsRef<std::path::Path>) {
             .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
     }
 }
+
+/// Runs `f` with a thread-local tracing subscriber writing to a buffer, and
+/// returns its result and everything logged (no ANSI, TRACE and up). For
+/// tests that assert on log lines; `with_default` is per thread, so `f` must
+/// log on the calling thread (a current-thread `block_on` inside is fine).
+#[cfg(test)]
+pub(crate) fn capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf::default();
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let r = tracing::subscriber::with_default(subscriber, f);
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (r, out)
+}
